@@ -1,14 +1,27 @@
+# FLASH Roadmap
 
-from collections import defaultdict
-from typing import Callable, Dict, List, Any
+## SP1 — Core Foundation
 
-class EventBus:
-    def __init__(self):
-        self._subscribers: Dict[str, List[Callable[[Any], None]]] = defaultdict(list)
+Current target: Bootstrap v0.1
 
-    def subscribe(self, event: str, handler: Callable[[Any], None]):
-        self._subscribers[event].append(handler)
+- [x] Application entrypoint
+- [x] Config manager
+- [x] Path manager
+- [x] App context
+- [x] Event bus
+- [x] Logger service
+- [x] Test boundary
+- [x] Plugin-ready package boundary
+- [x] Workspace package boundary
 
-    def publish(self, event: str, payload: Any = None):
-        for h in self._subscribers.get(event, []):
-            h(payload)
+Next SP1 work:
+
+- [ ] Recovery boundary
+- [ ] Smart Reconnect boundary
+- [ ] API Boundary specification in code
+- [ ] CI workflow
+- [ ] Full SP1 verification checklist
+
+## SP2 — Product Design
+
+Product design continues separately and should be integrated after SP1 foundation is verified.
