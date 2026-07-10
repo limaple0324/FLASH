@@ -65,6 +65,9 @@ class SelfCheck:
         sprint = config.get("sprint", "")
         if not version or sprint != "SP1":
             raise RuntimeError("SP1 configuration is incomplete.")
+        if config.recovered_from_corruption:
+            backup = config.corrupt_backup_path.name if config.corrupt_backup_path else "unknown"
+            return f"Configuration was recovered from corruption; backup saved as {backup}."
         return f"Configuration loaded for SP1 version {version}."
 
     def _check_logger(self) -> str:
