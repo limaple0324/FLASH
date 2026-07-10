@@ -20,13 +20,8 @@ class Bootstrap:
 
     def start(self) -> dict[str, object]:
         self.logger.info("FLASH SP1 bootstrap starting.")
-        self.config.ensure_defaults(
-            {
-                "version": VERSION,
-                "sprint": MILESTONE,
-                "workspace_enabled": False,
-            }
-        )
+        self.config.ensure_defaults({"workspace_enabled": False})
+        self.config.update_values({"version": VERSION, "sprint": MILESTONE})
         self.event_bus.publish("startup", {"message": "Application started"})
 
         self_check = SelfCheck(context=self.context, paths=self.paths).run_all()
