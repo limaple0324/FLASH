@@ -17,8 +17,8 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] Core services are registered through `AppContext`.
 - [x] Bootstrap returns structured startup status.
 - [x] Startup exceptions are logged and shown to the user.
-- [x] CI smoke test launches the packaged executable and confirms it remains running.
-- [x] CI smoke test verifies packaged config and log files are created.
+- [x] Packaged executable supports non-GUI `--self-check` verification.
+- [x] CI verifies packaged config, log, and self-check report creation.
 - [ ] Run the packaged executable on a clean Windows user account.
 
 ## C. SP1 self-check
@@ -31,6 +31,7 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] Smart Reconnect boundary check.
 - [x] External adapter boundary check.
 - [x] Desktop window displays detailed results.
+- [x] Corrupt configuration is preserved and rebuilt automatically.
 - [ ] Confirm all checks pass in the packaged executable on the target desktop.
 
 ## D. Recovery and reconnect
@@ -38,8 +39,12 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] Stable Recovery contract exists.
 - [x] Stable Smart Reconnect contract exists.
 - [x] Structured operation result exists.
-- [ ] Implement a concrete game/window adapter.
-- [ ] Detect missing, disconnected, unreadable, or overlapped game window.
+- [x] Read-only Windows top-level window enumeration adapter exists.
+- [x] Adapter rejects missing, ambiguous, minimized, or invalid-bounds targets.
+- [x] Adapter never sends input and clears cached targets on shutdown.
+- [ ] Configure the real game-window title identity.
+- [ ] Register the adapter in the application lifecycle after configuration.
+- [ ] Detect unreadable or overlapped game-window conditions on the target desktop.
 - [ ] Prevent input when the target window cannot be verified safely.
 - [ ] Implement and test a real reconnect sequence.
 - [ ] Verify the player remains in control outside explicitly automated modes.
@@ -51,17 +56,19 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] Boundary contract tests.
 - [x] Self-check tests.
 - [x] User-facing status formatting tests.
+- [x] Configuration recovery and atomic-write tests.
+- [x] Read-only Windows target-window adapter tests.
 - [x] Windows workflow is configured to run all tests on Python 3.12.
 - [ ] Confirm the current Windows workflow run passes.
-- [ ] Add concrete adapter and recovery integration tests.
+- [ ] Add target-desktop integration tests for overlap and reconnect behavior.
 
 ## F. Build and delivery
 
 - [x] PyInstaller specification exists.
 - [x] Windows workflow installs dependencies and runs tests.
 - [x] Workflow verifies `dist/FLASH.exe` exists.
-- [x] Workflow smoke-tests the packaged executable.
-- [x] Workflow verifies persistent config and log creation.
+- [x] Workflow runs packaged `--self-check` mode.
+- [x] Workflow verifies persistent config, log, and JSON report creation.
 - [x] Workflow records version, commit, build time, and SHA-256.
 - [x] Workflow uploads a complete verification bundle.
 - [ ] Confirm a successful GitHub Actions run for current `main`.
