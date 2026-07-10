@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import traceback
 from pathlib import Path
@@ -15,6 +16,7 @@ from services.event_bus import EventBus
 from services.logger_service import LoggerService
 
 APP_TITLE = "輔｜FLASH SP1"
+SELF_CHECK_ARGUMENT = "--self-check"
 
 
 def build_services(root: Path | None = None):
@@ -32,16 +34,23 @@ def build_services(root: Path | None = None):
     return paths, logger
 
 
+def _self_check_items(status: dict[str, object]) -> list[dict[str, object]]:
+    """Normalize current and legacy self-check report shapes."""
+    report = status.get("self_check", [])
+    if isinstance(report, dict):
+        report = report.get("checks", [])
+    if not isinstance(report, list):
+        return []
+    return [item for item in report if isinstance(item, dict)]
+
+
 def format_self_check(status: dict[str, object]) -> tuple[str, str]:
     """Return a user-facing summary and detail text for the SP1 self-check."""
     passed = bool(status.get("self_check_passed", False))
-    report = status.get("self_check", {})
-    checks = report.get("checks", []) if isinstance(report, dict) else []
+    checks = _self_check_items(status)
 
     lines: list[str] = []
     for item in checks:
-        if not isinstance(item, dict):
-            continue
         name = str(item.get("name", "unknown"))
         item_passed = bool(item.get("passed", False))
         message = str(item.get("message", ""))
@@ -117,12 +126,27 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     return window
 
 
-def run() -> int:
+def write_self_check_report(status: dict[str, object], paths: PathManager) -> Path:
+    """Persist a machine-readable report for packaged and CI verification."""
+    report_path = paths.data_dir() / "self_check.json"
+    report_path.write_text(
+        json.dumps(status, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return report_path
+
+
+def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
     paths: PathManager | None = None
     logger: LoggerService | None = None
     try:
-        paths, logger = build_services()
+        paths, logger = build_services(root=root)
         status = Bootstrap(context=AppContext).start()
+        write_self_check_report(status, paths)
+
+        if self_check_only:
+            return 0 if bool(status.get("self_check_passed", False)) else 2
+
         window = create_main_window(status, paths)
         window.mainloop()
         logger.info("FLASH SP1 closed normally.")
@@ -138,23 +162,27 @@ def run() -> int:
             except OSError:
                 pass
 
+        if self_check_only:
+            return 1
+
         try:
-            root = Tk()
-            root.withdraw()
+            root_window = Tk()
+            root_window.withdraw()
             messagebox.showerror(
                 "輔｜啟動失敗",
                 "FLASH 無法啟動。錯誤已寫入紀錄檔。\n\n"
                 f"原因：{exc}",
-                parent=root,
+                parent=root_window,
             )
-            root.destroy()
+            root_window.destroy()
         except Exception:
             print(details, file=sys.stderr)
         return 1
 
 
 def main() -> None:
-    raise SystemExit(run())
+    self_check_only = SELF_CHECK_ARGUMENT in sys.argv[1:]
+    raise SystemExit(run(self_check_only=self_check_only))
 
 
 if __name__ == "__main__":
