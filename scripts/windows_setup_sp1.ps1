@@ -6,6 +6,21 @@ Write-Host "Project: $PSScriptRoot\.."
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $projectRoot
 
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$Arguments
+    )
+
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code $LASTEXITCODE: $FilePath $($Arguments -join ' ')"
+    }
+}
+
 function Test-RealPython {
     param([string]$PythonExe)
 
@@ -14,7 +29,7 @@ function Test-RealPython {
     }
 
     $output = & $PythonExe -c "print('FLASH OK')" 2>$null
-    return ($output -eq "FLASH OK")
+    return (($LASTEXITCODE -eq 0) -and ($output -eq "FLASH OK"))
 }
 
 $pythonCandidates = @(
@@ -37,10 +52,10 @@ if (-not $pythonExe) {
 
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if (-not $winget) {
-        throw "winget is not available. Please install Python 3.12 manually from python.org, then run this script again."
+        throw "winget is not available. Install Python 3.12 manually, then run this script again."
     }
 
-    winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
+    Invoke-NativeCommand $winget.Source install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
 
     $pythonExe = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
     if (-not (Test-RealPython $pythonExe)) {
@@ -49,16 +64,18 @@ if (-not $pythonExe) {
 }
 
 Write-Host "Using Python: $pythonExe" -ForegroundColor Green
-& $pythonExe --version
+Invoke-NativeCommand $pythonExe --version
 
 Write-Host "Installing requirements..." -ForegroundColor Cyan
-& $pythonExe -m pip install --upgrade pip
-& $pythonExe -m pip install -r requirements.txt
+Invoke-NativeCommand $pythonExe -m pip install --upgrade pip
+Invoke-NativeCommand $pythonExe -m pip install -r requirements.txt
 
-Write-Host "Running FLASH SP1 bootstrap..." -ForegroundColor Cyan
-& $pythonExe main.py
+Write-Host "Running automated tests..." -ForegroundColor Cyan
+Invoke-NativeCommand $pythonExe -m pytest -q
 
-Write-Host "Running tests..." -ForegroundColor Cyan
-& $pythonExe -m pytest
+Write-Host "Checking imports and bootstrap without opening the desktop window..." -ForegroundColor Cyan
+Invoke-NativeCommand $pythonExe -c "from main import build_services; from core.bootstrap import Bootstrap; from services.app_context import AppContext; build_services(); status=Bootstrap(context=AppContext).start(); assert status['sprint']=='SP1'; print('FLASH SP1 bootstrap verified:', status['version'])"
 
 Write-Host "FLASH SP1 verification complete." -ForegroundColor Green
+Write-Host "Starting the desktop verification window. Close it to finish." -ForegroundColor Cyan
+Invoke-NativeCommand $pythonExe main.py
