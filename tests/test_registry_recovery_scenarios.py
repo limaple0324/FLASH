@@ -59,3 +59,22 @@ def test_corrupt_primary_and_corrupt_backup_rebuilds_empty_safely(tmp_path):
     assert store.recovered_from_backup is False
     assert store.corrupt_backup is not None
     assert store.corrupt_backup.exists()
+
+
+def test_recovery_from_corrupt_primary_remains_stable_on_next_load(tmp_path):
+    path = tmp_path / "window_registry.json"
+    store = WindowRegistryStore(path)
+    registry = WindowRegistry()
+    registry.register_character("100", "100古")
+    store.save(registry)
+    registry.register_character("120", "120古")
+    store.save(registry)
+    path.write_text('{"characters": [', encoding="utf-8")
+
+    first = store.load().to_dict()
+    second = store.load().to_dict()
+
+    assert first == second
+    assert [item["character_id"] for item in second["characters"]] == ["100"]
+    assert store.recovered_from_backup is True
+    assert store.recovered_from_corruption is False
