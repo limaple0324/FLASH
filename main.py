@@ -8,15 +8,27 @@ import traceback
 from pathlib import Path
 from tkinter import BOTH, LEFT, X, Button, Frame, Label, Tk, messagebox
 
+from adapters.windows_window import WindowsWindowAdapter
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.bootstrap import Bootstrap
+from core.sp1_boundaries import ExternalAdapter
 from services.app_context import AppContext
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 
 APP_TITLE = "輔｜FLASH SP1"
 SELF_CHECK_ARGUMENT = "--self-check"
+TARGET_WINDOW_KEY = "target_window_keywords"
+
+
+def _normalize_window_keywords(value: object) -> list[str]:
+    """Return a clean keyword list from persisted user configuration."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
 def build_services(root: Path | None = None):
@@ -31,7 +43,35 @@ def build_services(root: Path | None = None):
     AppContext.register(LoggerService, logger)
     AppContext.register(ConfigManager, config)
     AppContext.register(EventBus, event_bus)
+
+    keywords = _normalize_window_keywords(config.get(TARGET_WINDOW_KEY, []))
+    if keywords:
+        adapter = WindowsWindowAdapter(title_keywords=keywords)
+        AppContext.register(ExternalAdapter, adapter)
+
     return paths, logger
+
+
+def detect_target_window() -> dict[str, object]:
+    """Run one read-only target-window safety check."""
+    adapter = AppContext.get(ExternalAdapter)
+    if adapter is None:
+        return {
+            "configured": False,
+            "safe": False,
+            "code": "window.not_configured",
+            "message": "尚未設定遊戲主視窗關鍵字；不會執行任何遊戲操作。",
+            "details": None,
+        }
+
+    result = adapter.health_check()
+    return {
+        "configured": True,
+        "safe": bool(result.success),
+        "code": result.code,
+        "message": result.message,
+        "details": dict(result.details) if result.details is not None else None,
+    }
 
 
 def _self_check_items(status: dict[str, object]) -> list[dict[str, object]]:
@@ -65,12 +105,26 @@ def format_self_check(status: dict[str, object]) -> tuple[str, str]:
     return headline, "\n".join(lines)
 
 
+def format_window_status(status: dict[str, object]) -> str:
+    """Return a concise, safety-first target-window summary."""
+    window_status = status.get("target_window", {})
+    if not isinstance(window_status, dict):
+        return "主視窗狀態：無法取得；操作保持停用。"
+
+    safe = bool(window_status.get("safe", False))
+    code = str(window_status.get("code", "window.unknown"))
+    message = str(window_status.get("message", ""))
+    mark = "✓" if safe else "—"
+    safety = "可安全辨識（仍未啟用輸入）" if safe else "不可操作"
+    return f"{mark} 主視窗：{safety}\n代碼：{code}\n說明：{message}"
+
+
 def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     """Create the persistent SP1 verification window."""
     window = Tk()
     window.title(APP_TITLE)
-    window.geometry("720x520")
-    window.minsize(620, 430)
+    window.geometry("760x620")
+    window.minsize(660, 500)
 
     body = Frame(window, padx=28, pady=24)
     body.pack(fill=BOTH, expand=True)
@@ -100,7 +154,23 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     Label(
         body,
-        text="檢查明細",
+        text="遊戲主視窗（只讀偵測）",
+        font=("Microsoft JhengHei UI", 11, "bold"),
+        anchor="w",
+        pady=(16, 4),
+    ).pack(fill=X)
+    Label(
+        body,
+        text=format_window_status(status),
+        font=("Microsoft JhengHei UI", 10),
+        justify=LEFT,
+        anchor="nw",
+        wraplength=690,
+    ).pack(fill=X)
+
+    Label(
+        body,
+        text="核心檢查明細",
         font=("Microsoft JhengHei UI", 11, "bold"),
         anchor="w",
         pady=(16, 4),
@@ -111,7 +181,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         font=("Consolas", 9),
         justify=LEFT,
         anchor="nw",
-        wraplength=650,
+        wraplength=690,
     ).pack(fill=BOTH, expand=True)
 
     footer = Frame(body)
@@ -142,6 +212,7 @@ def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
     try:
         paths, logger = build_services(root=root)
         status = Bootstrap(context=AppContext).start()
+        status["target_window"] = detect_target_window()
         write_self_check_report(status, paths)
 
         if self_check_only:
