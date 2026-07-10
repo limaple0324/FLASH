@@ -44,9 +44,8 @@ class SelfCheck:
             self._run("smart_reconnect_boundary", lambda: self._check_optional(SmartReconnectBoundary)),
             self._run("external_adapter", lambda: self._check_optional(ExternalAdapter)),
         ]
-        passed = all(item.passed for item in checks)
         return {
-            "passed": passed,
+            "passed": all(item.passed for item in checks),
             "checks": [asdict(item) for item in checks],
         }
 
@@ -60,6 +59,8 @@ class SelfCheck:
 
     def _check_config(self) -> str:
         config = self.context.get(ConfigManager)
+        if config is None:
+            raise RuntimeError("ConfigManager is not registered.")
         version = config.get("version", "")
         sprint = config.get("sprint", "")
         if not version or sprint != "SP1":
@@ -68,6 +69,8 @@ class SelfCheck:
 
     def _check_logger(self) -> str:
         logger = self.context.get(LoggerService)
+        if logger is None:
+            raise RuntimeError("LoggerService is not registered.")
         logger.info("FLASH SP1 self-check logger test.")
         if not self.paths.log_file("flash.log").exists():
             raise RuntimeError("Logger did not create flash.log.")
@@ -75,6 +78,8 @@ class SelfCheck:
 
     def _check_event_bus(self) -> str:
         bus = self.context.get(EventBus)
+        if bus is None:
+            raise RuntimeError("EventBus is not registered.")
         received: list[dict[str, object]] = []
         bus.subscribe("self_check", received.append)
         bus.publish("self_check", {"ok": True})
@@ -83,9 +88,8 @@ class SelfCheck:
         return "Event bus delivery succeeded."
 
     def _check_optional(self, contract: type[object]) -> str:
-        try:
-            service = self.context.get(contract)
-        except KeyError:
+        service = self.context.get(contract)
+        if service is None:
             return "Boundary is defined; concrete adapter is not registered yet."
         if not isinstance(service, contract):
             raise RuntimeError(f"Registered service does not satisfy {contract.__name__}.")
