@@ -9,6 +9,8 @@ from typing import Callable
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.sp1_boundaries import ExternalAdapter, RecoveryBoundary, SmartReconnectBoundary
+from core.window_registry import WindowRegistry
+from core.window_registry_store import WindowRegistryStore
 from services.app_context import AppContext
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
@@ -31,7 +33,7 @@ class SelfCheck:
     def _run(self, name: str, check: Callable[[], str]) -> CheckResult:
         try:
             return CheckResult(name=name, passed=True, message=check())
-        except Exception as exc:  # self-check must report instead of aborting early
+        except Exception as exc:
             return CheckResult(name=name, passed=False, message=str(exc))
 
     def run_all(self) -> dict[str, object]:
@@ -40,6 +42,7 @@ class SelfCheck:
             self._run("config_manager", self._check_config),
             self._run("logger_service", self._check_logger),
             self._run("event_bus", self._check_event_bus),
+            self._run("window_registry", self._check_window_registry),
             self._run("recovery_boundary", lambda: self._check_optional(RecoveryBoundary)),
             self._run("smart_reconnect_boundary", lambda: self._check_optional(SmartReconnectBoundary)),
             self._run("external_adapter", lambda: self._check_optional(ExternalAdapter)),
@@ -52,7 +55,7 @@ class SelfCheck:
     def _check_paths(self) -> str:
         config_path = self.paths.config_file("settings.json")
         log_path = self.paths.log_file("flash.log")
-        for path in (config_path.parent, log_path.parent):
+        for path in (config_path.parent, log_path.parent, self.paths.data_dir()):
             if not Path(path).exists():
                 raise RuntimeError(f"Required directory is missing: {path}")
         return "Persistent directories are available."
@@ -89,6 +92,20 @@ class SelfCheck:
         if received != [{"ok": True}]:
             raise RuntimeError("Event bus did not deliver the test event.")
         return "Event bus delivery succeeded."
+
+    def _check_window_registry(self) -> str:
+        registry = self.context.get(WindowRegistry)
+        store = self.context.get(WindowRegistryStore)
+        if registry is None:
+            raise RuntimeError("WindowRegistry is not registered.")
+        if store is None:
+            raise RuntimeError("WindowRegistryStore is not registered.")
+        if store.path.parent != self.paths.data_dir():
+            raise RuntimeError("Window registry storage path is outside the managed data directory.")
+        if store.recovered_from_corruption:
+            backup = store.corrupt_backup.name if store.corrupt_backup else "unknown"
+            return f"Character registry recovered from corruption; backup saved as {backup}."
+        return f"Character registry loaded with {len(registry.all())} character(s)."
 
     def _check_optional(self, contract: type[object]) -> str:
         service = self.context.get(contract)
