@@ -2,11 +2,25 @@ from adapters.windows_window import WindowInfo, WindowsWindowAdapter
 
 
 class FakeBackend:
-    def __init__(self, windows):
+    def __init__(self, windows, *, foreground=None, covered_points=None):
         self._windows = windows
+        self._foreground = foreground
+        self._covered_points = covered_points or {}
 
     def list_windows(self):
         return list(self._windows)
+
+    def foreground_handle(self):
+        if self._foreground is not None:
+            return self._foreground
+        if len(self._windows) == 1:
+            return self._windows[0].handle
+        return None
+
+    def top_window_at(self, x, y):
+        if (x, y) in self._covered_points:
+            return self._covered_points[(x, y)]
+        return self.foreground_handle()
 
 
 def make_window(title="LaTale", *, handle=100, minimized=False, rect=(10, 20, 810, 620)):
@@ -76,9 +90,49 @@ def test_adapter_rejects_invalid_bounds():
     assert adapter.last_match is None
 
 
-def test_adapter_accepts_exactly_one_safe_window():
+def test_adapter_rejects_unknown_foreground():
+    target = make_window(handle=321)
+    adapter = WindowsWindowAdapter(["latale"], backend=FakeBackend([target], foreground=0))
+
+    result = adapter.find_target()
+
+    assert result.success is False
+    assert result.code == "window.not_foreground"
+    assert adapter.last_match is None
+
+
+def test_adapter_rejects_target_that_is_not_foreground():
+    target = make_window(handle=321)
+    adapter = WindowsWindowAdapter(["latale"], backend=FakeBackend([target], foreground=999))
+
+    result = adapter.find_target()
+
+    assert result.success is False
+    assert result.code == "window.not_foreground"
+    assert result.details["foreground_handle"] == 999
+    assert adapter.last_match is None
+
+
+def test_adapter_rejects_overlapped_target():
+    target = make_window(handle=321, rect=(0, 0, 100, 100))
+    center = (50, 50)
+    backend = FakeBackend([target], foreground=321, covered_points={center: 999})
+    adapter = WindowsWindowAdapter(["latale"], backend=backend)
+
+    result = adapter.find_target()
+
+    assert result.success is False
+    assert result.code == "window.overlapped"
+    assert result.details["covered_points"]
+    assert adapter.last_match is None
+
+
+def test_adapter_accepts_exactly_one_foreground_unobstructed_window():
     target = make_window("LaTale - 嘻", handle=321)
-    adapter = WindowsWindowAdapter(["latale", "嘻"], backend=FakeBackend([target]))
+    adapter = WindowsWindowAdapter(
+        ["latale", "嘻"],
+        backend=FakeBackend([target], foreground=321),
+    )
 
     result = adapter.find_target()
 
@@ -89,7 +143,8 @@ def test_adapter_accepts_exactly_one_safe_window():
 
 
 def test_shutdown_clears_cached_target():
-    adapter = WindowsWindowAdapter(["latale"], backend=FakeBackend([make_window()]))
+    target = make_window(handle=100)
+    adapter = WindowsWindowAdapter(["latale"], backend=FakeBackend([target], foreground=100))
     assert adapter.find_target().success is True
 
     adapter.shutdown()
