@@ -41,6 +41,53 @@ def test_confirm_window_records_current_observation():
     assert record.process_id == 9520
     assert record.confirmed is True
     assert record.last_seen_utc
+    assert registry.character_for_handle(321).character_id == "160-ancient"
+
+
+def test_same_window_cannot_bind_to_two_characters():
+    registry = WindowRegistry()
+    registry.register_character("character-a", "160古")
+    registry.register_character("character-b", "160法")
+    registry.confirm_window(
+        "character-a",
+        handle=321,
+        rect=(0, 0, 800, 600),
+        health=WindowHealth.READY,
+    )
+
+    with pytest.raises(ValueError, match="already bound"):
+        registry.confirm_window(
+            "character-b",
+            handle=321,
+            rect=(0, 0, 800, 600),
+            health=WindowHealth.READY,
+        )
+
+    assert registry.get("character-a").handle == 321
+    assert registry.get("character-b").handle is None
+
+
+def test_offline_character_releases_window_for_another_character():
+    registry = WindowRegistry()
+    registry.register_character("character-a", "160古")
+    registry.register_character("character-b", "160法")
+    registry.confirm_window(
+        "character-a",
+        handle=321,
+        rect=(0, 0, 800, 600),
+        health=WindowHealth.READY,
+    )
+
+    registry.mark_offline("character-a")
+    rebound = registry.confirm_window(
+        "character-b",
+        handle=321,
+        rect=(0, 0, 800, 600),
+        health=WindowHealth.WARNING,
+    )
+
+    assert rebound.handle == 321
+    assert registry.character_for_handle(321).character_id == "character-b"
 
 
 def test_duplicate_character_id_cannot_change_identity_silently():
