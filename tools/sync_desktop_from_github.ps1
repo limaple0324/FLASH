@@ -1,11 +1,11 @@
 # FLASH Desktop Auto Sync
-# Purpose: keep Desktop\FLASH synced with GitHub develop branch.
+# Purpose: keep Desktop\FLASH synced with the GitHub main branch.
 # Run once manually, or register it with Windows Task Scheduler.
 
 $ErrorActionPreference = "Stop"
 
 $RepoUrl = "https://github.com/limaple0324/FLASH.git"
-$Branch = "develop"
+$Branch = "main"
 $Desktop = [Environment]::GetFolderPath("Desktop")
 $RepoPath = Join-Path $Desktop "FLASH"
 $LogPath = Join-Path $RepoPath "sync.log"
@@ -27,7 +27,7 @@ try {
     if (-not (Test-Path $RepoPath)) {
         Write-Host "Cloning FLASH to $RepoPath ..."
         git clone --branch $Branch $RepoUrl $RepoPath
-        Write-Log "Initial clone complete."
+        Write-Log "Initial clone complete from origin/$Branch."
         exit 0
     }
 
@@ -35,6 +35,10 @@ try {
 
     if (-not (Test-Path ".git")) {
         throw "$RepoPath exists but is not a Git repository. Rename or remove it first."
+    }
+
+    if (git status --porcelain) {
+        throw "Local changes were detected. Sync stopped to avoid overwriting desktop work."
     }
 
     git fetch origin
