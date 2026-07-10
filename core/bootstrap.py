@@ -14,9 +14,19 @@ class Bootstrap:
         self.config: ConfigManager = context.get(ConfigManager)
         self.event_bus: EventBus = context.get(EventBus)
 
-    def start(self) -> None:
+    def start(self) -> dict[str, str | bool]:
         self.logger.info("FLASH SP1 bootstrap starting.")
-        self.config.ensure_defaults({"version": "0.1.0", "sprint": "SP1", "workspace_enabled": False})
+        self.config.ensure_defaults(
+            {
+                "version": "0.1.1",
+                "sprint": "SP1",
+                "workspace_enabled": False,
+            }
+        )
         self.event_bus.publish("startup", {"message": "Application started"})
         self.logger.info("FLASH SP1 bootstrap completed.")
-        print("FLASH SP1 bootstrap running.")
+        return {
+            "version": str(self.config.get("version", "0.1.1")),
+            "sprint": str(self.config.get("sprint", "SP1")),
+            "workspace_enabled": bool(self.config.get("workspace_enabled", False)),
+        }
