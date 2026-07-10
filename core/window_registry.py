@@ -2,6 +2,8 @@
 
 A character ID is a permanent identity. Display names may change without
 changing that identity. Transient Windows handles are never trusted after load.
+A game window may contain multiple characters, while each character record
+tracks at most one current window at a time.
 """
 
 from __future__ import annotations
@@ -123,14 +125,15 @@ class WindowRegistry:
         self._records[character_id] = record
         return record
 
-    def character_for_handle(self, handle: int) -> CharacterWindowRecord | None:
-        """Return the currently confirmed owner of a live window handle."""
+    def characters_for_handle(self, handle: int) -> tuple[CharacterWindowRecord, ...]:
+        """Return all currently confirmed characters associated with a live window."""
         if handle <= 0:
-            return None
-        for record in self._records.values():
-            if record.confirmed and record.handle == handle:
-                return record
-        return None
+            return ()
+        return tuple(
+            record
+            for record in self.all()
+            if record.confirmed and record.handle == handle
+        )
 
     def confirm_window(
         self,
@@ -149,13 +152,9 @@ class WindowRegistry:
         if right <= left or bottom <= top:
             raise ValueError("rect must have positive width and height.")
 
-        owner = self.character_for_handle(handle)
-        if owner is not None and owner.character_id != current.character_id:
-            raise ValueError(
-                "Window handle is already bound to another character: "
-                f"{owner.character_id}."
-            )
-
+        # A character record contains only one current handle, so confirming a new
+        # handle replaces that character's previous window association. Multiple
+        # different characters may legitimately share the same game window.
         record = CharacterWindowRecord(
             **{
                 **current.to_dict(),
