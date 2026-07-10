@@ -32,20 +32,47 @@ def build_services(root: Path | None = None):
     return paths, logger
 
 
-def create_main_window(status: dict[str, str | bool], paths: PathManager) -> Tk:
+def format_self_check(status: dict[str, object]) -> tuple[str, str]:
+    """Return a user-facing summary and detail text for the SP1 self-check."""
+    passed = bool(status.get("self_check_passed", False))
+    report = status.get("self_check", {})
+    checks = report.get("checks", []) if isinstance(report, dict) else []
+
+    lines: list[str] = []
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "unknown"))
+        item_passed = bool(item.get("passed", False))
+        message = str(item.get("message", ""))
+        mark = "✓" if item_passed else "✗"
+        lines.append(f"{mark} {name}：{message}")
+
+    if not lines:
+        lines.append("✗ self_check：沒有取得檢查結果。")
+        passed = False
+
+    headline = "自我檢查通過" if passed else "自我檢查發現問題"
+    return headline, "\n".join(lines)
+
+
+def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     """Create the persistent SP1 verification window."""
     window = Tk()
     window.title(APP_TITLE)
-    window.geometry("520x300")
-    window.minsize(480, 270)
+    window.geometry("720x520")
+    window.minsize(620, 430)
 
     body = Frame(window, padx=28, pady=24)
     body.pack(fill=BOTH, expand=True)
 
+    headline, details = format_self_check(status)
+    passed = bool(status.get("self_check_passed", False))
+
     Label(body, text="輔", font=("Microsoft JhengHei UI", 24, "bold"), anchor="w").pack(fill=X)
     Label(
         body,
-        text="FLASH SP1 已正常啟動",
+        text=f"FLASH SP1 已啟動｜{headline}",
         font=("Microsoft JhengHei UI", 15, "bold"),
         anchor="w",
         pady=8,
@@ -53,15 +80,30 @@ def create_main_window(status: dict[str, str | bool], paths: PathManager) -> Tk:
     Label(
         body,
         text=(
-            f"版本：{status['version']}\n"
-            f"階段：{status['sprint']}\n"
-            "狀態：基礎服務、設定與事件系統運作正常\n\n"
-            "這是 SP1 啟動驗證視窗。關閉此視窗後程式才會結束。"
+            f"版本：{status.get('version', 'unknown')}\n"
+            f"階段：{status.get('sprint', 'SP1')}\n"
+            f"整體狀態：{'核心檢查正常' if passed else '需要檢查下列失敗項目'}"
         ),
         font=("Microsoft JhengHei UI", 10),
         justify=LEFT,
         anchor="nw",
     ).pack(fill=X)
+
+    Label(
+        body,
+        text="檢查明細",
+        font=("Microsoft JhengHei UI", 11, "bold"),
+        anchor="w",
+        pady=(16, 4),
+    ).pack(fill=X)
+    Label(
+        body,
+        text=details,
+        font=("Consolas", 9),
+        justify=LEFT,
+        anchor="nw",
+        wraplength=650,
+    ).pack(fill=BOTH, expand=True)
 
     footer = Frame(body)
     footer.pack(side="bottom", fill=X, pady=(16, 0))
