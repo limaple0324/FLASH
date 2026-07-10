@@ -34,18 +34,23 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] Corrupt configuration is preserved and rebuilt automatically.
 - [ ] Confirm all checks pass in the packaged executable on the target desktop.
 
-## D. Recovery and reconnect
+## D. Recovery, target window, and background capability
 
 - [x] Stable Recovery contract exists.
 - [x] Stable Smart Reconnect contract exists.
 - [x] Structured operation result exists.
 - [x] Read-only Windows top-level window enumeration adapter exists.
 - [x] Adapter rejects missing, ambiguous, minimized, or invalid-bounds targets.
+- [x] Adapter distinguishes whole-window state from operation-area safety.
+- [x] Minor overlap outside the configured operation area does not block readiness.
 - [x] Adapter never sends input and clears cached targets on shutdown.
-- [ ] Configure the real game-window title identity.
-- [ ] Register the adapter in the application lifecycle after configuration.
-- [ ] Detect unreadable or overlapped game-window conditions on the target desktop.
-- [ ] Prevent input when the target window cannot be verified safely.
+- [x] Background capability probe contract and structured report exist.
+- [x] Probe distinguishes supported, unsupported, unknown, untested, and error states.
+- [x] Probe does not run without a selected target window.
+- [ ] Implement a non-destructive Adobe Flash Player 11 capture probe.
+- [ ] Implement a user-approved harmless background-input probe.
+- [ ] Verify behavior while obscured, unfocused, and minimized on the target desktop.
+- [ ] Configure the real game-window identity for multiple Adobe Flash Player 11 windows.
 - [ ] Implement and test a real reconnect sequence.
 - [ ] Verify the player remains in control outside explicitly automated modes.
 
@@ -58,9 +63,11 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] User-facing status formatting tests.
 - [x] Configuration recovery and atomic-write tests.
 - [x] Read-only Windows target-window adapter tests.
+- [x] Operation-area overlap safety tests.
+- [x] Background capability reporting tests.
 - [x] Windows workflow is configured to run all tests on Python 3.12.
 - [ ] Confirm the current Windows workflow run passes.
-- [ ] Add target-desktop integration tests for overlap and reconnect behavior.
+- [ ] Add target-desktop integration tests for capture, background input, and reconnect behavior.
 
 ## F. Build and delivery
 
