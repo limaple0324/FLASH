@@ -52,8 +52,19 @@ jobs:
           status = Bootstrap(context=AppContext).start()
           if not status.get("self_check_passed", False):
               raise SystemExit(f"SP1 self-check failed: {status.get('self_check')}")
-          print("SP1 self-check passed.")
+          print(f"SP1 self-check passed for {status['version']}.")
           '@ | python -
+
+      - name: Read application version
+        shell: pwsh
+        run: |
+          $metadata = python -c "from core.version import VERSION, MILESTONE; print(f'{VERSION}|{MILESTONE}')"
+          $parts = $metadata.Trim().Split('|')
+          if ($parts.Count -ne 2 -or [string]::IsNullOrWhiteSpace($parts[0]) -or [string]::IsNullOrWhiteSpace($parts[1])) {
+            throw "Could not read application version metadata."
+          }
+          "FLASH_VERSION=$($parts[0])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "FLASH_MILESTONE=$($parts[1])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build windowed executable
         run: python -m PyInstaller --clean --noconfirm FLASH.spec
@@ -74,7 +85,8 @@ jobs:
 
           @(
             "product=FLASH"
-            "milestone=SP1"
+            "version=$env:FLASH_VERSION"
+            "milestone=$env:FLASH_MILESTONE"
             "commit=${{ github.sha }}"
             "run_id=${{ github.run_id }}"
             "built_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
@@ -102,7 +114,7 @@ jobs:
       - name: Upload Windows release bundle
         uses: actions/upload-artifact@v4
         with:
-          name: FLASH-Windows-SP1-${{ github.sha }}
+          name: FLASH-Windows-${{ env.FLASH_MILESTONE }}-${{ env.FLASH_VERSION }}-${{ github.sha }}
           path: release/*
           if-no-files-found: error
           retention-days: 30
