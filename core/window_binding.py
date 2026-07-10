@@ -1,8 +1,8 @@
 """Conservative character-to-window rebinding for FLASH SP1.
 
-The engine scores current window observations against an existing confirmed
-registry record. It never guesses between close candidates and never creates a
-new character identity automatically.
+The engine scores current window observations against an existing registry
+record. It never guesses between close candidates and never creates a new
+character identity automatically.
 """
 
 from __future__ import annotations
@@ -65,37 +65,50 @@ class CharacterBindingEngine:
         penalty = min(1.0, (size_delta + position_delta) / 4.0)
         return 1.0 - penalty
 
+    @staticmethod
+    def _has_persisted_identity(record: CharacterWindowRecord) -> bool:
+        """Return whether the record has enough history for automatic rebinding.
+
+        A PID alone is deliberately insufficient because Windows may reuse PIDs
+        after the previous process exits or after a reboot.
+        """
+        return bool(record.window_class and record.rect is not None)
+
     @classmethod
     def score(cls, record: CharacterWindowRecord, candidate: WindowCandidate) -> float:
+        """Return fixed-weight confidence without normalizing weak evidence.
+
+        Fixed weights prevent a single matching PID from becoming 100% confidence.
+        Persisted history without a live handle can still reach the default 0.80
+        threshold through matching class and geometry.
+        """
         score = 0.0
-        weight = 0.0
 
-        if record.handle is not None:
-            weight += 0.45
-            if record.handle == candidate.handle:
-                score += 0.45
+        if record.handle is not None and record.handle == candidate.handle:
+            score += 0.45
 
-        if record.process_id is not None and candidate.process_id is not None:
-            weight += 0.25
-            if record.process_id == candidate.process_id:
-                score += 0.25
+        if (
+            record.process_id is not None
+            and candidate.process_id is not None
+            and record.process_id == candidate.process_id
+        ):
+            score += 0.10
 
-        if record.window_class and candidate.window_class:
-            weight += 0.15
-            if record.window_class.casefold() == candidate.window_class.casefold():
-                score += 0.15
+        if (
+            record.window_class
+            and candidate.window_class
+            and record.window_class.casefold() == candidate.window_class.casefold()
+        ):
+            score += 0.35
 
         if record.rect is not None:
-            weight += 0.15
-            score += 0.15 * cls._rect_similarity(record.rect, candidate.rect)
+            score += 0.45 * cls._rect_similarity(record.rect, candidate.rect)
 
-        if weight == 0.0:
-            return 0.0
-        return min(1.0, score / weight)
+        return min(1.0, score)
 
     def bind(self, character_id: str, candidates: Iterable[WindowCandidate]) -> BindingDecision:
         record = self._registry.get(character_id)
-        if not record.confirmed:
+        if not record.confirmed and not self._has_persisted_identity(record):
             return BindingDecision(
                 character_id=character_id,
                 bound=False,
