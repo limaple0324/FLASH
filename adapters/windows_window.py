@@ -1,7 +1,7 @@
 """Read-only Windows target-window detection for FLASH SP1.
 
-This adapter never sends input. It only enumerates visible top-level windows and
-reports whether a configured target can be identified safely.
+This adapter never sends input. It identifies a target window and verifies only
+explicit operation areas before future automation is allowed.
 """
 
 from __future__ import annotations
@@ -20,6 +20,21 @@ class WindowInfo:
     visible: bool
     minimized: bool
     rect: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class OperationArea:
+    """A named rectangle relative to the target window, using values from 0 to 1."""
+
+    name: str
+    rect: tuple[float, float, float, float]
+
+    def validate(self) -> None:
+        left, top, right, bottom = self.rect
+        if not self.name.strip():
+            raise ValueError("Operation area name must not be empty.")
+        if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
+            raise ValueError(f"Invalid relative operation area: {self.rect}")
 
 
 class WindowBackend(Protocol):
@@ -107,8 +122,6 @@ class Win32WindowBackend:
         if not handle:
             return None
 
-        # WindowFromPoint may return a child control. GA_ROOT resolves the
-        # containing top-level window used by the rest of the adapter.
         ga_root = 2
         root = int(user32.GetAncestor(ctypes.c_void_p(handle), ga_root))
         return root or handle
@@ -131,21 +144,31 @@ class WindowsWindowAdapter(ExternalAdapter):
         return self._last_match
 
     @staticmethod
-    def _sample_points(rect: tuple[int, int, int, int]) -> tuple[tuple[int, int], ...]:
-        left, top, right, bottom = rect
-        inset_x = max(1, min(24, (right - left) // 10))
-        inset_y = max(1, min(24, (bottom - top) // 10))
-        center_x = (left + right) // 2
-        center_y = (top + bottom) // 2
+    def _area_sample_points(
+        window_rect: tuple[int, int, int, int], area: OperationArea
+    ) -> tuple[tuple[int, int], ...]:
+        area.validate()
+        win_left, win_top, win_right, win_bottom = window_rect
+        width = win_right - win_left
+        height = win_bottom - win_top
+        rel_left, rel_top, rel_right, rel_bottom = area.rect
+
+        left = win_left + int(width * rel_left)
+        top = win_top + int(height * rel_top)
+        right = win_left + int(width * rel_right)
+        bottom = win_top + int(height * rel_bottom)
+        inset_x = max(1, min(8, (right - left) // 5))
+        inset_y = max(1, min(8, (bottom - top) // 5))
+
         return (
-            (center_x, center_y),
+            ((left + right) // 2, (top + bottom) // 2),
             (left + inset_x, top + inset_y),
             (right - inset_x - 1, top + inset_y),
             (left + inset_x, bottom - inset_y - 1),
             (right - inset_x - 1, bottom - inset_y - 1),
         )
 
-    def _check_focus_and_overlap(self, match: WindowInfo) -> OperationResult | None:
+    def _check_foreground(self, match: WindowInfo) -> OperationResult | None:
         foreground = self._backend.foreground_handle()
         if foreground is None:
             return OperationResult(
@@ -161,34 +184,46 @@ class WindowsWindowAdapter(ExternalAdapter):
                 message="The target window is not in the foreground; input must remain disabled.",
                 details={"title": match.title, "handle": match.handle, "foreground_handle": foreground},
             )
+        return None
 
-        covered_points: list[tuple[int, int, int | None]] = []
-        for x, y in self._sample_points(match.rect):
-            top_handle = self._backend.top_window_at(x, y)
-            if top_handle != match.handle:
-                covered_points.append((x, y, top_handle))
+    def _check_operation_areas(
+        self, match: WindowInfo, operation_areas: Iterable[OperationArea]
+    ) -> OperationResult | None:
+        covered: list[dict[str, object]] = []
+        checked_names: list[str] = []
 
-        if covered_points:
+        for area in operation_areas:
+            area.validate()
+            checked_names.append(area.name)
+            for x, y in self._area_sample_points(match.rect, area):
+                top_handle = self._backend.top_window_at(x, y)
+                if top_handle != match.handle:
+                    covered.append(
+                        {
+                            "area": area.name,
+                            "point": (x, y),
+                            "covering_handle": top_handle,
+                        }
+                    )
+
+        if covered:
             return OperationResult(
                 success=False,
-                code="window.overlapped",
-                message="Another window covers part of the target; input must remain disabled.",
+                code="operation_area.overlapped",
+                message="A required operation area is covered; input must remain disabled.",
                 details={
                     "title": match.title,
                     "handle": match.handle,
-                    "covered_points": tuple(covered_points),
+                    "covered": tuple(covered),
+                    "checked_areas": tuple(checked_names),
                 },
             )
         return None
 
-    def find_target(self) -> OperationResult:
+    def find_target(self, operation_areas: Iterable[OperationArea] = ()) -> OperationResult:
         self._last_match = None
         if not self._keywords:
-            return OperationResult(
-                success=False,
-                code="window.not_configured",
-                message="No target-window title keyword is configured.",
-            )
+            return OperationResult(False, "window.not_configured", "No target-window title keyword is configured.")
 
         matches = [
             window
@@ -198,51 +233,65 @@ class WindowsWindowAdapter(ExternalAdapter):
 
         if not matches:
             return OperationResult(
-                success=False,
-                code="window.not_found",
-                message="No visible window matched the configured title keywords.",
-                details={"keywords": self._keywords},
+                False,
+                "window.not_found",
+                "No visible window matched the configured title keywords.",
+                {"keywords": self._keywords},
             )
-
         if len(matches) > 1:
             return OperationResult(
-                success=False,
-                code="window.ambiguous",
-                message="More than one visible window matched; input must remain disabled.",
-                details={"count": len(matches), "titles": tuple(item.title for item in matches)},
+                False,
+                "window.ambiguous",
+                "More than one visible window matched; input must remain disabled.",
+                {"count": len(matches), "titles": tuple(item.title for item in matches)},
             )
 
         match = matches[0]
         left, top, right, bottom = match.rect
         if right <= left or bottom <= top:
             return OperationResult(
-                success=False,
-                code="window.invalid_bounds",
-                message="The target window has invalid screen bounds.",
-                details={"title": match.title, "rect": match.rect},
+                False,
+                "window.invalid_bounds",
+                "The target window has invalid screen bounds.",
+                {"title": match.title, "rect": match.rect},
             )
-
         if match.minimized:
             return OperationResult(
-                success=False,
-                code="window.minimized",
-                message="The target window is minimized; input must remain disabled.",
-                details={"title": match.title, "handle": match.handle},
+                False,
+                "window.minimized",
+                "The target window is minimized; input must remain disabled.",
+                {"title": match.title, "handle": match.handle},
             )
 
-        safety_issue = self._check_focus_and_overlap(match)
-        if safety_issue is not None:
-            return safety_issue
+        focus_issue = self._check_foreground(match)
+        if focus_issue is not None:
+            return focus_issue
+
+        areas = tuple(operation_areas)
+        area_issue = self._check_operation_areas(match, areas)
+        if area_issue is not None:
+            return area_issue
 
         self._last_match = match
         return OperationResult(
             success=True,
             code="window.ready",
-            message="The target window is uniquely identified, foreground, and unobstructed.",
-            details={"title": match.title, "handle": match.handle, "rect": match.rect},
+            message=(
+                "The target window is ready and all requested operation areas are unobstructed."
+                if areas
+                else "The target window is ready; no operation area was requested."
+            ),
+            details={
+                "title": match.title,
+                "handle": match.handle,
+                "rect": match.rect,
+                "checked_areas": tuple(area.name for area in areas),
+                "input_enabled": False,
+            },
         )
 
     def health_check(self) -> OperationResult:
+        """Check target identity and focus without assuming any future click location."""
         return self.find_target()
 
     def shutdown(self) -> None:
