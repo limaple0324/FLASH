@@ -250,6 +250,8 @@ class WindowRegistry:
                 created_at = last_seen or datetime.now(timezone.utc).isoformat()
 
             key = registry._normalize_character_id(character_id)
+            if key in registry._records:
+                raise ValueError(f"Duplicate character ID in registry: {key}")
             registry._records[key] = CharacterWindowRecord(
                 character_id=key,
                 display_name=registry._clean(display_name, "display_name"),
