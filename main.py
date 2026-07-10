@@ -217,10 +217,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         ("遊戲主視窗（只讀偵測）", format_window_status(status)),
         ("背景能力（不送出輸入）", format_background_status(status)),
     ):
-        Label(body, text=title, font=("Microsoft JhengHei UI", 11, "bold"), anchor="w", pady=(14, 4)).pack(fill=X)
+        Label(body, text=title, font=("Microsoft JhengHei UI", 11, "bold"), anchor="w").pack(fill=X, pady=(14, 4))
         Label(body, text=text, font=("Microsoft JhengHei UI", 10), justify=LEFT, anchor="nw", wraplength=690).pack(fill=X)
 
-    Label(body, text="核心檢查明細", font=("Microsoft JhengHei UI", 11, "bold"), anchor="w", pady=(14, 4)).pack(fill=X)
+    Label(body, text="核心檢查明細", font=("Microsoft JhengHei UI", 11, "bold"), anchor="w").pack(fill=X, pady=(14, 4))
     Label(body, text=details, font=("Consolas", 9), justify=LEFT, anchor="nw", wraplength=690).pack(fill=BOTH, expand=True)
 
     footer = Frame(body)
