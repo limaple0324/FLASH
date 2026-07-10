@@ -21,7 +21,7 @@ def test_registry_round_trip_preserves_identity_but_not_stale_handle(tmp_path):
     store.save(registry)
     restored = store.load().get("160")
 
-    assert restored.character_uuid == created.character_uuid
+    assert restored.character_id == created.character_id
     assert restored.display_name == "160戰神"
     assert restored.aliases == ("160古",)
     assert restored.handle is None
@@ -42,7 +42,7 @@ def test_store_uses_current_schema_version_and_removes_temp_file(tmp_path):
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema_version"] == WindowRegistry.SCHEMA_VERSION == 2
-    assert payload["characters"][0]["character_uuid"] == record.character_uuid
+    assert payload["characters"][0]["character_id"] == record.character_id
     assert payload["characters"][0]["display_name"] == "100古"
     assert not path.with_suffix(".json.tmp").exists()
 
@@ -74,7 +74,7 @@ def test_v1_registry_migrates_and_is_saved_as_v2(tmp_path):
     registry = store.load()
     migrated = registry.get("120")
 
-    assert migrated.character_uuid
+    assert migrated.character_id == "120"
     assert migrated.display_name == "120古"
     assert migrated.handle is None
     assert migrated.health is WindowHealth.UNKNOWN
@@ -83,10 +83,45 @@ def test_v1_registry_migrates_and_is_saved_as_v2(tmp_path):
     store.save(registry)
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 2
-    assert payload["characters"][0]["character_uuid"] == migrated.character_uuid
+    assert payload["characters"][0]["character_id"] == migrated.character_id
 
 
-def test_corrupt_registry_is_preserved_and_rebuilt_empty(tmp_path):
+def test_save_keeps_previous_valid_file_as_backup(tmp_path):
+    path = tmp_path / "window_registry.json"
+    store = WindowRegistryStore(path)
+    registry = WindowRegistry()
+    registry.register_character("first", "第一角")
+    store.save(registry)
+
+    registry.register_character("second", "第二角")
+    store.save(registry)
+
+    backup_payload = json.loads(store.backup_path.read_text(encoding="utf-8"))
+    current_payload = json.loads(path.read_text(encoding="utf-8"))
+    assert [item["character_id"] for item in backup_payload["characters"]] == ["first"]
+    assert [item["character_id"] for item in current_payload["characters"]] == ["first", "second"]
+
+
+def test_corrupt_registry_recovers_from_last_valid_backup(tmp_path):
+    path = tmp_path / "window_registry.json"
+    store = WindowRegistryStore(path)
+    registry = WindowRegistry()
+    registry.register_character("first", "第一角")
+    store.save(registry)
+
+    registry.register_character("second", "第二角")
+    store.save(registry)
+    path.write_text('{"characters": [', encoding="utf-8")
+
+    restored = store.load()
+
+    assert [item.character_id for item in restored.all()] == ["first"]
+    assert store.recovered_from_corruption is True
+    assert store.recovered_from_backup is True
+    assert store.corrupt_backup is not None
+
+
+def test_corrupt_registry_without_backup_is_preserved_and_rebuilt_empty(tmp_path):
     path = tmp_path / "window_registry.json"
     path.write_text('{"characters": [', encoding="utf-8")
     store = WindowRegistryStore(path)
@@ -95,6 +130,7 @@ def test_corrupt_registry_is_preserved_and_rebuilt_empty(tmp_path):
 
     assert registry.all() == ()
     assert store.recovered_from_corruption is True
+    assert store.recovered_from_backup is False
     assert store.corrupt_backup is not None
     assert store.corrupt_backup.read_text(encoding="utf-8") == '{"characters": ['
     assert not path.exists()
