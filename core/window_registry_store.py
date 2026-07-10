@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 from core.window_registry import WindowRegistry
@@ -14,23 +15,44 @@ class WindowRegistryStore:
 
     def __init__(self, path: Path):
         self.path = Path(path)
+        self.backup_path = self.path.with_suffix(self.path.suffix + ".bak")
         self.recovered_from_corruption = False
+        self.recovered_from_backup = False
         self.corrupt_backup: Path | None = None
+
+    @staticmethod
+    def _load_path(path: Path) -> WindowRegistry:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Registry root must be an object.")
+        return WindowRegistry.from_dict(payload)
 
     def load(self) -> WindowRegistry:
         self.recovered_from_corruption = False
+        self.recovered_from_backup = False
         self.corrupt_backup = None
         if not self.path.exists():
+            if self.backup_path.exists():
+                try:
+                    registry = self._load_path(self.backup_path)
+                    self.recovered_from_backup = True
+                    return registry
+                except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+                    pass
             return WindowRegistry()
 
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("Registry root must be an object.")
-            return WindowRegistry.from_dict(payload)
+            return self._load_path(self.path)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
             self.corrupt_backup = self._preserve_corrupt_file()
             self.recovered_from_corruption = True
+            if self.backup_path.exists():
+                try:
+                    registry = self._load_path(self.backup_path)
+                    self.recovered_from_backup = True
+                    return registry
+                except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+                    pass
             return WindowRegistry()
 
     def save(self, registry: WindowRegistry) -> None:
@@ -43,6 +65,9 @@ class WindowRegistryStore:
                 file.write("\n")
                 file.flush()
                 os.fsync(file.fileno())
+
+            if self.path.exists():
+                shutil.copy2(self.path, self.backup_path)
             temporary.replace(self.path)
         finally:
             temporary.unlink(missing_ok=True)
