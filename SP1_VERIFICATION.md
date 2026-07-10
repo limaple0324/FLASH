@@ -17,6 +17,8 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] Core services are registered through `AppContext`.
 - [x] Bootstrap returns structured startup status.
 - [x] Startup exceptions are logged and shown to the user.
+- [x] CI smoke test launches the packaged executable and confirms it remains running.
+- [x] CI smoke test verifies packaged config and log files are created.
 - [ ] Run the packaged executable on a clean Windows user account.
 
 ## C. SP1 self-check
@@ -29,7 +31,7 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] Smart Reconnect boundary check.
 - [x] External adapter boundary check.
 - [x] Desktop window displays detailed results.
-- [ ] Confirm all checks pass in the packaged executable.
+- [ ] Confirm all checks pass in the packaged executable on the target desktop.
 
 ## D. Recovery and reconnect
 
@@ -49,7 +51,8 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] Boundary contract tests.
 - [x] Self-check tests.
 - [x] User-facing status formatting tests.
-- [ ] Run all tests successfully on Windows Python 3.12.
+- [x] Windows workflow is configured to run all tests on Python 3.12.
+- [ ] Confirm the current Windows workflow run passes.
 - [ ] Add concrete adapter and recovery integration tests.
 
 ## F. Build and delivery
@@ -57,7 +60,10 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] PyInstaller specification exists.
 - [x] Windows workflow installs dependencies and runs tests.
 - [x] Workflow verifies `dist/FLASH.exe` exists.
-- [x] Workflow uploads the executable as an artifact.
+- [x] Workflow smoke-tests the packaged executable.
+- [x] Workflow verifies persistent config and log creation.
+- [x] Workflow records version, commit, build time, and SHA-256.
+- [x] Workflow uploads a complete verification bundle.
 - [ ] Confirm a successful GitHub Actions run for current `main`.
 - [ ] Download and launch the current artifact.
 - [ ] Confirm config and log persistence after closing and reopening.
