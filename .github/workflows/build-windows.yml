@@ -3,7 +3,16 @@ name: Build Windows FLASH
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-and-build:
@@ -16,6 +25,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
 
       - name: Install dependencies
         shell: pwsh
@@ -24,24 +34,60 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
+      - name: Compile Python sources
+        run: python -m compileall -q .
+
       - name: Run tests
         run: python -m pytest -q
+
+      - name: Run headless SP1 self-check
+        shell: pwsh
+        run: |
+          @'
+          from core.bootstrap import Bootstrap
+          from main import build_services
+          from services.app_context import AppContext
+
+          build_services()
+          status = Bootstrap(context=AppContext).start()
+          if not status.get("self_check_passed", False):
+              raise SystemExit(f"SP1 self-check failed: {status.get('self_check')}")
+          print("SP1 self-check passed.")
+          '@ | python -
 
       - name: Build windowed executable
         run: python -m PyInstaller --clean --noconfirm FLASH.spec
 
-      - name: Verify executable exists
+      - name: Create release bundle
         shell: pwsh
         run: |
           if (-not (Test-Path 'dist/FLASH.exe')) {
             throw 'dist/FLASH.exe was not created.'
           }
-          Get-Item 'dist/FLASH.exe' | Format-List Name,Length,LastWriteTime
 
-      - name: Upload Windows executable
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item 'dist/FLASH.exe' 'release/FLASH.exe'
+
+          $hash = (Get-FileHash 'release/FLASH.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  FLASH.exe" | Set-Content 'release/SHA256SUMS.txt' -Encoding ascii
+
+          @(
+            "product=FLASH"
+            "milestone=SP1"
+            "commit=${{ github.sha }}"
+            "run_id=${{ github.run_id }}"
+            "built_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+            "python=$(python --version 2>&1)"
+            "sha256=$hash"
+          ) | Set-Content 'release/BUILD_INFO.txt' -Encoding utf8
+
+          Get-Item 'release/FLASH.exe' | Format-List Name,Length,LastWriteTime
+          Get-Content 'release/BUILD_INFO.txt'
+
+      - name: Upload Windows release bundle
         uses: actions/upload-artifact@v4
         with:
-          name: FLASH-Windows-SP1
-          path: dist/FLASH.exe
+          name: FLASH-Windows-SP1-${{ github.sha }}
+          path: release/*
           if-no-files-found: error
           retention-days: 30
