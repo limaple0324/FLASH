@@ -1,6 +1,7 @@
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.bootstrap import Bootstrap
+from core.version import MILESTONE, VERSION
 from main import build_services
 from services.app_context import AppContext
 from services.event_bus import EventBus
@@ -29,7 +30,7 @@ def test_bootstrap_creates_persistent_files_and_returns_status(tmp_path):
     paths, _logger = build_services(root=tmp_path)
     status = Bootstrap(context=AppContext).start()
 
-    assert status["sprint"] == "SP1"
-    assert status["version"] == "0.1.1"
+    assert status["sprint"] == MILESTONE
+    assert status["version"] == VERSION
     assert paths.config_file("settings.json").exists()
     assert paths.log_file("flash.log").exists()
