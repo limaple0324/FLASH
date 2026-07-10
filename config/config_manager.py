@@ -32,6 +32,16 @@ class ConfigManager:
         self.data[key] = value
         self.save()
 
+    def update_values(self, values: dict[str, Any]) -> None:
+        """Persist only values that actually changed."""
+        changed = False
+        for key, value in values.items():
+            if self.data.get(key) != value:
+                self.data[key] = value
+                changed = True
+        if changed:
+            self.save()
+
     def ensure_defaults(self, defaults: dict[str, Any]) -> None:
         changed = False
         for key, value in defaults.items():
