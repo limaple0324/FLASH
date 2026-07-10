@@ -3,6 +3,7 @@
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.self_check import SelfCheck
+from core.version import MILESTONE, VERSION
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 
@@ -21,8 +22,8 @@ class Bootstrap:
         self.logger.info("FLASH SP1 bootstrap starting.")
         self.config.ensure_defaults(
             {
-                "version": "0.1.1",
-                "sprint": "SP1",
+                "version": VERSION,
+                "sprint": MILESTONE,
                 "workspace_enabled": False,
             }
         )
@@ -36,8 +37,8 @@ class Bootstrap:
 
         self.logger.info("FLASH SP1 bootstrap completed.")
         return {
-            "version": str(self.config.get("version", "0.1.1")),
-            "sprint": str(self.config.get("sprint", "SP1")),
+            "version": str(self.config.get("version", VERSION)),
+            "sprint": str(self.config.get("sprint", MILESTONE)),
             "workspace_enabled": bool(self.config.get("workspace_enabled", False)),
             "self_check_passed": bool(self_check["passed"]),
             "self_check": self_check["checks"],
