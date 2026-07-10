@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -16,7 +16,9 @@ concurrency:
 
 jobs:
   test-and-build:
+    name: Test and build Windows package
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,20 +42,41 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-      - name: Run source SP1 self-check
+      - name: Run full source application self-check
         shell: pwsh
         run: |
-          @'
-          from core.bootstrap import Bootstrap
-          from main import build_services
-          from services.app_context import AppContext
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'flash-source-check'
+          Remove-Item -Recurse -Force $sourceRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+          $env:FLASH_TEST_ROOT = $sourceRoot
 
-          build_services()
-          status = Bootstrap(context=AppContext).start()
-          if not status.get("self_check_passed", False):
-              raise SystemExit(f"SP1 self-check failed: {status.get('self_check')}")
-          print(f"SP1 self-check passed for {status['version']}.")
+          @'
+          import os
+          from pathlib import Path
+          from main import run
+
+          code = run(self_check_only=True, root=Path(os.environ["FLASH_TEST_ROOT"]))
+          raise SystemExit(code)
           '@ | python -
+
+          foreach ($required in @(
+            (Join-Path $sourceRoot 'config\settings.json'),
+            (Join-Path $sourceRoot 'logs\flash.log'),
+            (Join-Path $sourceRoot 'data\self_check.json'),
+            (Join-Path $sourceRoot 'data\window_registry.json')
+          )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Source self-check did not create required file: $required"
+            }
+          }
+
+          $report = Get-Content -LiteralPath (Join-Path $sourceRoot 'data\self_check.json') -Raw | ConvertFrom-Json
+          if (-not $report.self_check_passed) {
+            throw 'Source application self-check report did not pass.'
+          }
+          if (-not $report.window_registry.loaded) {
+            throw 'Source application did not load the window registry.'
+          }
 
       - name: Read application version
         shell: pwsh
@@ -87,7 +110,8 @@ jobs:
           $configPath = Join-Path $smokeRoot 'FLASH\config\settings.json'
           $logPath = Join-Path $smokeRoot 'FLASH\logs\flash.log'
           $reportPath = Join-Path $smokeRoot 'FLASH\data\self_check.json'
-          foreach ($required in @($configPath, $logPath, $reportPath)) {
+          $registryPath = Join-Path $smokeRoot 'FLASH\data\window_registry.json'
+          foreach ($required in @($configPath, $logPath, $reportPath, $registryPath)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
               throw "Packaged FLASH.exe did not create required file: $required"
             }
@@ -96,6 +120,9 @@ jobs:
           $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
           if (-not $report.self_check_passed) {
             throw "Packaged self-check report did not pass."
+          }
+          if (-not $report.window_registry.loaded) {
+            throw 'Packaged application did not load the window registry.'
           }
           if ($report.version -ne $env:FLASH_VERSION -or $report.sprint -ne $env:FLASH_MILESTONE) {
             throw "Packaged self-check metadata does not match source version."
