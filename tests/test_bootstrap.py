@@ -34,3 +34,16 @@ def test_bootstrap_creates_persistent_files_and_returns_status(tmp_path):
     assert status["version"] == VERSION
     assert paths.config_file("settings.json").exists()
     assert paths.log_file("flash.log").exists()
+
+
+def test_bootstrap_migrates_stale_release_identity(tmp_path):
+    paths, _logger = build_services(root=tmp_path)
+    config = AppContext.get(ConfigManager)
+    config.update_values({"version": "0.1.1", "sprint": "OLD"})
+
+    status = Bootstrap(context=AppContext).start()
+
+    assert status["version"] == VERSION
+    assert status["sprint"] == MILESTONE
+    assert config.get("version") == VERSION
+    assert config.get("sprint") == MILESTONE
