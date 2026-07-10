@@ -8,6 +8,8 @@ import traceback
 from pathlib import Path
 from tkinter import BOTH, LEFT, X, Button, Frame, Label, Tk, messagebox
 
+from adapters.background_capability import BackgroundCapabilityProbe
+from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
 from adapters.windows_window import WindowsWindowAdapter
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
@@ -74,6 +76,18 @@ def detect_target_window() -> dict[str, object]:
     }
 
 
+def detect_background_capabilities() -> dict[str, object]:
+    """Probe read-only background capture after a unique target is selected."""
+    adapter = AppContext.get(ExternalAdapter)
+    handle = None
+    if isinstance(adapter, WindowsWindowAdapter) and adapter.last_match is not None:
+        handle = adapter.last_match.handle
+
+    probe = BackgroundCapabilityProbe(WindowsBackgroundCaptureBackend())
+    report = probe.run(handle)
+    return report.to_dict()
+
+
 def _self_check_items(status: dict[str, object]) -> list[dict[str, object]]:
     """Normalize current and legacy self-check report shapes."""
     report = status.get("self_check", [])
@@ -119,12 +133,42 @@ def format_window_status(status: dict[str, object]) -> str:
     return f"{mark} 主視窗：{safety}\n代碼：{code}\n說明：{message}"
 
 
+def format_background_status(status: dict[str, object]) -> str:
+    """Return the current background capability result in user-facing language."""
+    report = status.get("background_capabilities", {})
+    if not isinstance(report, dict):
+        return "背景能力：無法取得。"
+    capabilities = report.get("capabilities", {})
+    if not isinstance(capabilities, dict):
+        return "背景能力：尚未測試。"
+
+    labels = {
+        "background_capture": "被遮擋時讀取畫面",
+        "background_input": "非前景背景操作",
+        "minimized_input": "最小化背景操作",
+    }
+    state_text = {
+        "supported": "支援",
+        "unsupported": "不支援",
+        "unknown": "無法確認",
+        "untested": "尚未測試",
+        "error": "測試錯誤",
+    }
+    lines = []
+    for key, label in labels.items():
+        item = capabilities.get(key, {})
+        state = str(item.get("state", "unknown")) if isinstance(item, dict) else "unknown"
+        lines.append(f"{label}：{state_text.get(state, state)}")
+    lines.append("背景輸入目前仍為停用。")
+    return "\n".join(lines)
+
+
 def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     """Create the persistent SP1 verification window."""
     window = Tk()
     window.title(APP_TITLE)
-    window.geometry("760x620")
-    window.minsize(660, 500)
+    window.geometry("760x700")
+    window.minsize(660, 560)
 
     body = Frame(window, padx=28, pady=24)
     body.pack(fill=BOTH, expand=True)
@@ -162,6 +206,22 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     Label(
         body,
         text=format_window_status(status),
+        font=("Microsoft JhengHei UI", 10),
+        justify=LEFT,
+        anchor="nw",
+        wraplength=690,
+    ).pack(fill=X)
+
+    Label(
+        body,
+        text="背景能力（不送出輸入）",
+        font=("Microsoft JhengHei UI", 11, "bold"),
+        anchor="w",
+        pady=(16, 4),
+    ).pack(fill=X)
+    Label(
+        body,
+        text=format_background_status(status),
         font=("Microsoft JhengHei UI", 10),
         justify=LEFT,
         anchor="nw",
@@ -213,6 +273,7 @@ def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
         paths, logger = build_services(root=root)
         status = Bootstrap(context=AppContext).start()
         status["target_window"] = detect_target_window()
+        status["background_capabilities"] = detect_background_capabilities()
         write_self_check_report(status, paths)
 
         if self_check_only:
