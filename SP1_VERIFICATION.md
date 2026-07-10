@@ -34,23 +34,26 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] Corrupt configuration is preserved and rebuilt automatically.
 - [ ] Confirm all checks pass in the packaged executable on the target desktop.
 
-## D. Recovery, target window, and background capability
+## D. Recovery, reconnect, and window safety
 
 - [x] Stable Recovery contract exists.
 - [x] Stable Smart Reconnect contract exists.
 - [x] Structured operation result exists.
 - [x] Read-only Windows top-level window enumeration adapter exists.
 - [x] Adapter rejects missing, ambiguous, minimized, or invalid-bounds targets.
-- [x] Adapter distinguishes whole-window state from operation-area safety.
-- [x] Minor overlap outside the configured operation area does not block readiness.
+- [x] Adapter supports operation-area-specific overlap checks.
 - [x] Adapter never sends input and clears cached targets on shutdown.
-- [x] Background capability probe contract and structured report exist.
-- [x] Probe distinguishes supported, unsupported, unknown, untested, and error states.
-- [x] Probe does not run without a selected target window.
-- [ ] Implement a non-destructive Adobe Flash Player 11 capture probe.
-- [ ] Implement a user-approved harmless background-input probe.
-- [ ] Verify behavior while obscured, unfocused, and minimized on the target desktop.
-- [ ] Configure the real game-window identity for multiple Adobe Flash Player 11 windows.
+- [x] Background capability report model exists.
+- [x] Read-only Windows `PrintWindow` capture probe exists.
+- [x] Blank or failed background captures are rejected conservatively.
+- [x] Background capture result is shown in the SP1 window and JSON report.
+- [ ] Configure the real Adobe Flash Player 11 window identity.
+- [ ] Verify background capture while the game is partially covered.
+- [ ] Verify background capture while the game is not foreground.
+- [ ] Verify background capture while the game is minimized.
+- [ ] Add a user-approved harmless background-input probe.
+- [ ] Verify non-foreground background input on the target desktop.
+- [ ] Verify minimized background input on the target desktop.
 - [ ] Implement and test a real reconnect sequence.
 - [ ] Verify the player remains in control outside explicitly automated modes.
 
@@ -63,11 +66,11 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [x] User-facing status formatting tests.
 - [x] Configuration recovery and atomic-write tests.
 - [x] Read-only Windows target-window adapter tests.
-- [x] Operation-area overlap safety tests.
-- [x] Background capability reporting tests.
+- [x] Background capability framework tests.
+- [x] Windows background capture probe tests.
 - [x] Windows workflow is configured to run all tests on Python 3.12.
 - [ ] Confirm the current Windows workflow run passes.
-- [ ] Add target-desktop integration tests for capture, background input, and reconnect behavior.
+- [ ] Add target-desktop integration tests for capture, overlap, and reconnect behavior.
 
 ## F. Build and delivery
 
