@@ -69,6 +69,35 @@ jobs:
       - name: Build windowed executable
         run: python -m PyInstaller --clean --noconfirm FLASH.spec
 
+      - name: Smoke-test packaged executable
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'dist/FLASH.exe'
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'flash-smoke'
+          $env:LOCALAPPDATA = $smokeRoot
+          $env:APPDATA = $smokeRoot
+          Remove-Item -Recurse -Force $smokeRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
+
+          $process = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+
+          if ($process.HasExited) {
+            throw "Packaged FLASH.exe exited during smoke test with code $($process.ExitCode)."
+          }
+
+          $configPath = Join-Path $smokeRoot 'FLASH\config\settings.json'
+          $logPath = Join-Path $smokeRoot 'FLASH\logs\flash.log'
+          foreach ($required in @($configPath, $logPath)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              throw "Packaged FLASH.exe did not create required file: $required"
+            }
+          }
+
+          Stop-Process -Id $process.Id -Force
+          Write-Host "Packaged FLASH.exe stayed alive and created persistent files."
+
       - name: Create release bundle
         shell: pwsh
         run: |
