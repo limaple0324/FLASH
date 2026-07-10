@@ -39,7 +39,7 @@ foreach ($line in Get-Content -LiteralPath $InfoPath) {
     }
 }
 
-foreach ($requiredKey in @('product', 'milestone', 'commit', 'run_id', 'built_utc', 'sha256')) {
+foreach ($requiredKey in @('product', 'version', 'milestone', 'commit', 'run_id', 'built_utc', 'sha256')) {
     if (-not $buildInfo.ContainsKey($requiredKey) -or [string]::IsNullOrWhiteSpace($buildInfo[$requiredKey])) {
         throw "BUILD_INFO.txt is missing required key: $requiredKey"
     }
@@ -49,19 +49,25 @@ if ($buildInfo['product'] -ne 'FLASH' -or $buildInfo['milestone'] -ne 'SP1') {
     throw "Release metadata does not describe FLASH SP1."
 }
 
+if ($buildInfo['version'] -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Release version has an invalid format: $($buildInfo['version'])"
+}
+
+if ($buildInfo['commit'] -notmatch '^[0-9a-fA-F]{40}$') {
+    throw "Release commit SHA has an invalid format."
+}
+
 if ($buildInfo['sha256'].ToLowerInvariant() -ne $actualHash) {
     throw "BUILD_INFO.txt hash does not match FLASH.exe."
 }
 
-$version = (Get-Item -LiteralPath $ExePath).VersionInfo.FileVersion
 Write-Host "Verification passed." -ForegroundColor Green
+Write-Host "Version: $($buildInfo['version'])"
+Write-Host "Milestone: $($buildInfo['milestone'])"
 Write-Host "Commit: $($buildInfo['commit'])"
 Write-Host "Run ID: $($buildInfo['run_id'])"
 Write-Host "Built UTC: $($buildInfo['built_utc'])"
 Write-Host "SHA256: $actualHash"
-if ($version) {
-    Write-Host "File version: $version"
-}
 
 Write-Host "Starting FLASH.exe for the final visual self-check..." -ForegroundColor Cyan
 Start-Process -FilePath $ExePath -WorkingDirectory $ReleaseDir
