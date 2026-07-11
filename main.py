@@ -6,7 +6,7 @@ import json
 import sys
 import traceback
 from pathlib import Path
-from tkinter import Tk, messagebox
+from tkinter import PhotoImage, TclError, Tk, messagebox
 
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
@@ -26,6 +26,27 @@ APP_TITLE = "輔｜FLASH SP1"
 SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_WINDOW_KEY = "target_window_keywords"
 REGISTRY_FILENAME = "window_registry.json"
+APP_ICON_PNG = Path("assets") / "flash_icon.png"
+
+
+def resource_path(relative_path: Path) -> Path:
+    """Resolve files both from source and from a PyInstaller bundle."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        return Path(bundle_root) / relative_path
+    return Path(__file__).resolve().parent / relative_path
+
+
+def apply_window_icon(window: Tk) -> None:
+    icon_path = resource_path(APP_ICON_PNG)
+    if not icon_path.exists():
+        return
+    try:
+        icon = PhotoImage(file=str(icon_path))
+        window.iconphoto(True, icon)
+        window._flash_icon = icon
+    except TclError:
+        return
 
 
 def _normalize_window_keywords(value: object) -> list[str]:
@@ -202,6 +223,7 @@ def format_registry_status(status: dict[str, object]) -> str:
 def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window = Tk()
     window.title(APP_TITLE)
+    apply_window_icon(window)
     window.geometry("760x760")
     window.minsize(660, 600)
 
