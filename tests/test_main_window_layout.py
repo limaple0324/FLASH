@@ -1,8 +1,8 @@
 from pathlib import Path
 
 
-def test_tuple_padding_is_applied_by_pack_not_label_constructor():
+def test_main_window_uses_home_view():
     source = Path("main.py").read_text(encoding="utf-8")
 
-    assert 'anchor="w").pack(fill=X, pady=(14, 4))' in source
-    assert 'anchor="w", pady=(14, 4)).pack' not in source
+    assert "from ui.home import HomeView" in source
+    assert "HomeView(window, status, on_start=show_start_status).build()" in source
