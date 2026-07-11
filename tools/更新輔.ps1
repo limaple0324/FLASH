@@ -12,6 +12,7 @@ $InstallDir = Join-Path $Desktop "輔"
 $DownloadDir = Join-Path $InstallDir "下載"
 $ReleaseDir = Join-Path $InstallDir "目前版本"
 $DesktopExe = Join-Path $Desktop "FLASH.exe"
+$DesktopShortcut = Join-Path $Desktop "輔.lnk"
 $LogPath = Join-Path $InstallDir "更新紀錄.txt"
 
 function Write-Step([string]$Message) {
@@ -36,13 +37,14 @@ try {
 
     $baseUrl = "https://raw.githubusercontent.com/$Repo/$ReleaseBranch"
     $files = @("FLASH.exe", "SHA256SUMS.txt", "BUILD_INFO.txt", "verify_windows_release.ps1")
+    $cacheBreaker = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
     if (Test-Path -LiteralPath $ReleaseDir) {
         Get-ChildItem -LiteralPath $ReleaseDir -Force | Remove-Item -Recurse -Force
     }
 
     foreach ($file in $files) {
-        $source = "$baseUrl/$file"
+        $source = "$baseUrl/$file`?t=$cacheBreaker"
         $target = Join-Path $ReleaseDir $file
         Write-Step "下載：$file"
         Invoke-WebRequest -Uri $source -OutFile $target
@@ -71,9 +73,18 @@ try {
     Write-Step "核對通過，放置 FLASH.exe 到桌面。"
     Copy-Item -LiteralPath $exePath -Destination $DesktopExe -Force
 
+    Write-Step "建立桌面捷徑：輔。"
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($DesktopShortcut)
+    $shortcut.TargetPath = $DesktopExe
+    $shortcut.WorkingDirectory = $Desktop
+    $shortcut.IconLocation = "$DesktopExe,0"
+    $shortcut.Save()
+
     Write-Step "更新完成。桌面位置：$DesktopExe"
+    Write-Step "捷徑位置：$DesktopShortcut"
     Write-Host ""
-    Write-Host "更新完成，可以直接打開桌面的 FLASH.exe。" -ForegroundColor Green
+    Write-Host "更新完成，可以直接打開桌面的「輔」。" -ForegroundColor Green
 }
 catch {
     Write-Step "更新失敗：$($_.Exception.Message)"
