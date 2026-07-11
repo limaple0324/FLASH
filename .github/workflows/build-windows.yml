@@ -1,0 +1,180 @@
+name: Build Windows FLASH
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    name: Test and build Windows package
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Compile Python sources
+        run: python -m compileall -q .
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Run full source application self-check
+        shell: pwsh
+        run: |
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'flash-source-check'
+          Remove-Item -Recurse -Force $sourceRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+          $env:FLASH_TEST_ROOT = $sourceRoot
+
+          @'
+          import os
+          from pathlib import Path
+          from main import run
+
+          code = run(self_check_only=True, root=Path(os.environ["FLASH_TEST_ROOT"]))
+          raise SystemExit(code)
+          '@ | python -
+
+          foreach ($required in @(
+            (Join-Path $sourceRoot 'config\settings.json'),
+            (Join-Path $sourceRoot 'logs\flash.log'),
+            (Join-Path $sourceRoot 'data\self_check.json'),
+            (Join-Path $sourceRoot 'data\window_registry.json')
+          )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Source self-check did not create required file: $required"
+            }
+          }
+
+          $report = Get-Content -LiteralPath (Join-Path $sourceRoot 'data\self_check.json') -Raw | ConvertFrom-Json
+          if (-not $report.self_check_passed) {
+            throw 'Source application self-check report did not pass.'
+          }
+          if (-not $report.window_registry.loaded) {
+            throw 'Source application did not load the window registry.'
+          }
+
+      - name: Read application version
+        shell: pwsh
+        run: |
+          $metadata = python -c "from core.version import VERSION, MILESTONE; print(f'{VERSION}|{MILESTONE}')"
+          $parts = $metadata.Trim().Split('|')
+          if ($parts.Count -ne 2 -or [string]::IsNullOrWhiteSpace($parts[0]) -or [string]::IsNullOrWhiteSpace($parts[1])) {
+            throw "Could not read application version metadata."
+          }
+          "FLASH_VERSION=$($parts[0])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "FLASH_MILESTONE=$($parts[1])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build windowed executable
+        run: python -m PyInstaller --clean --noconfirm FLASH.spec
+
+      - name: Verify packaged executable self-check
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'dist/FLASH.exe'
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'flash-smoke'
+          $env:LOCALAPPDATA = $smokeRoot
+          $env:APPDATA = $smokeRoot
+          Remove-Item -Recurse -Force $smokeRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
+
+          $process = Start-Process -FilePath $exe -ArgumentList '--self-check' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged FLASH.exe self-check failed with code $($process.ExitCode)."
+          }
+
+          $configPath = Join-Path $smokeRoot 'FLASH\config\settings.json'
+          $logPath = Join-Path $smokeRoot 'FLASH\logs\flash.log'
+          $reportPath = Join-Path $smokeRoot 'FLASH\data\self_check.json'
+          $registryPath = Join-Path $smokeRoot 'FLASH\data\window_registry.json'
+          foreach ($required in @($configPath, $logPath, $reportPath, $registryPath)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Packaged FLASH.exe did not create required file: $required"
+            }
+          }
+
+          $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+          if (-not $report.self_check_passed) {
+            throw "Packaged self-check report did not pass."
+          }
+          if (-not $report.window_registry.loaded) {
+            throw 'Packaged application did not load the window registry.'
+          }
+          if ($report.version -ne $env:FLASH_VERSION -or $report.sprint -ne $env:FLASH_MILESTONE) {
+            throw "Packaged self-check metadata does not match source version."
+          }
+          Write-Host "Packaged FLASH.exe self-check passed for $($report.version)."
+
+      - name: Create release bundle
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist/FLASH.exe')) {
+            throw 'dist/FLASH.exe was not created.'
+          }
+
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item 'dist/FLASH.exe' 'release/FLASH.exe'
+          Copy-Item 'tools/verify_windows_release.ps1' 'release/verify_windows_release.ps1'
+
+          $hash = (Get-FileHash 'release/FLASH.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  FLASH.exe" | Set-Content 'release/SHA256SUMS.txt' -Encoding ascii
+
+          @(
+            "product=FLASH"
+            "version=$env:FLASH_VERSION"
+            "milestone=$env:FLASH_MILESTONE"
+            "commit=${{ github.sha }}"
+            "run_id=${{ github.run_id }}"
+            "built_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+            "python=$(python --version 2>&1)"
+            "sha256=$hash"
+          ) | Set-Content 'release/BUILD_INFO.txt' -Encoding utf8
+
+          Get-Item 'release/FLASH.exe' | Format-List Name,Length,LastWriteTime
+          Get-Content 'release/BUILD_INFO.txt'
+
+      - name: Verify release bundle layout
+        shell: pwsh
+        run: |
+          foreach ($required in @(
+            'release/FLASH.exe',
+            'release/SHA256SUMS.txt',
+            'release/BUILD_INFO.txt',
+            'release/verify_windows_release.ps1'
+          )) {
+            if (-not (Test-Path $required -PathType Leaf)) {
+              throw "Release bundle is missing: $required"
+            }
+          }
+
+      - name: Upload Windows release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: FLASH-Windows-${{ env.FLASH_MILESTONE }}-${{ env.FLASH_VERSION }}-${{ github.sha }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
