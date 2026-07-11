@@ -174,15 +174,14 @@ jobs:
       - name: Publish latest desktop updater files
         shell: pwsh
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           $publishRoot = Join-Path $env:RUNNER_TEMP 'flash-latest-release'
           Remove-Item -Recurse -Force $publishRoot -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $publishRoot | Out-Null
 
           git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" $publishRoot
           Set-Location $publishRoot
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           $branchExists = $true
           git fetch origin release/latest
