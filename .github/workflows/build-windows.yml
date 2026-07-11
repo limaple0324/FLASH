@@ -8,7 +8,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: windows-build-${{ github.ref }}
@@ -170,6 +170,52 @@ jobs:
               throw "Release bundle is missing: $required"
             }
           }
+
+      - name: Publish latest desktop updater files
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          $publishRoot = Join-Path $env:RUNNER_TEMP 'flash-latest-release'
+          Remove-Item -Recurse -Force $publishRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $publishRoot | Out-Null
+
+          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" $publishRoot
+          Set-Location $publishRoot
+
+          $branchExists = $true
+          git fetch origin release/latest
+          if ($LASTEXITCODE -ne 0) {
+            $branchExists = $false
+          }
+
+          if ($branchExists) {
+            git checkout release/latest
+          }
+          else {
+            git checkout --orphan release/latest
+          }
+
+          Get-ChildItem -Force |
+            Where-Object { $_.Name -ne '.git' } |
+            Remove-Item -Recurse -Force
+
+          Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\SHA256SUMS.txt" ".\SHA256SUMS.txt"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\BUILD_INFO.txt" ".\BUILD_INFO.txt"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\verify_windows_release.ps1" ".\verify_windows_release.ps1"
+
+          @(
+            "branch=${{ github.head_ref || github.ref_name }}"
+            "commit=${{ github.sha }}"
+            "run_id=${{ github.run_id }}"
+            "updated_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+          ) | Set-Content ".\LATEST.txt" -Encoding utf8
+
+          git add FLASH.exe SHA256SUMS.txt BUILD_INFO.txt verify_windows_release.ps1 LATEST.txt
+          git commit -m "Update latest Windows FLASH build"
+          git push origin release/latest --force
 
       - name: Upload Windows release bundle
         uses: actions/upload-artifact@v4
