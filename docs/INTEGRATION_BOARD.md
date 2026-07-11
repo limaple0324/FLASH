@@ -20,8 +20,8 @@
 - ✅ 建立整合分支
 - ✅ 建立 Integration Board
 - ✅ 盤點現有程式結構與可接入邊界
-- ⬜ 建立 SP2／SP3／SP3.5 對應表
-- ⬜ 鎖定第一批低風險整合項目
+- ✅ 建立 SP2／SP3／SP3.5 對應表
+- ✅ 鎖定第一批低風險整合項目
 
 ## Sprint 1｜產品語意與資料骨架
 
@@ -64,6 +64,7 @@
 
 ### Sprint 0
 
-- 狀態：進行中
-- 已完成：整合分支、Integration Board、現有架構與接入邊界盤點
-- 下一步：建立 SP2／SP3／SP3.5 對應表
+- 狀態：✅ 已完成
+- 已完成：整合分支、Integration Board、架構接入邊界、Blueprint 對應表、第一批低風險範圍
+- 產出：`INTEGRATION_ARCHITECTURE_BASELINE.md`、`INTEGRATION_BLUEPRINT_MAP.md`、`INTEGRATION_FIRST_BATCH.md`
+- 下一步：Sprint 1｜將「輔」設為產品主名稱
