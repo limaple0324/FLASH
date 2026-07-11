@@ -6,7 +6,7 @@ import json
 import sys
 import traceback
 from pathlib import Path
-from tkinter import BOTH, LEFT, X, Button, Frame, Label, Tk, messagebox
+from tkinter import Tk, messagebox
 
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
@@ -20,6 +20,7 @@ from core.window_registry_store import WindowRegistryStore
 from services.app_context import AppContext
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
+from ui.home import HomeView
 
 APP_TITLE = "輔｜FLASH SP1"
 SELF_CHECK_ARGUMENT = "--self-check"
@@ -203,30 +204,19 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window.title(APP_TITLE)
     window.geometry("760x760")
     window.minsize(660, 600)
-    body = Frame(window, padx=28, pady=24)
-    body.pack(fill=BOTH, expand=True)
 
-    headline, details = format_self_check(status)
-    passed = bool(status.get("self_check_passed", False))
-    Label(body, text="輔", font=("Microsoft JhengHei UI", 24, "bold"), anchor="w").pack(fill=X)
-    Label(body, text=f"FLASH SP1 已啟動｜{headline}", font=("Microsoft JhengHei UI", 15, "bold"), anchor="w", pady=8).pack(fill=X)
-    Label(body, text=f"版本：{status.get('version', 'unknown')}\n階段：{status.get('sprint', 'SP1')}\n整體狀態：{'核心檢查正常' if passed else '需要檢查下列失敗項目'}", font=("Microsoft JhengHei UI", 10), justify=LEFT, anchor="nw").pack(fill=X)
+    def show_start_status() -> None:
+        messagebox.showinfo(
+            "輔｜啟動入口",
+            (
+                "啟動入口已接入首頁。\n\n"
+                "目前 RC-01 僅完成首頁接入，不會執行任何遊戲操作。\n"
+                f"紀錄位置：{paths.logs_dir()}"
+            ),
+            parent=window,
+        )
 
-    for title, text in (
-        ("角色註冊表", format_registry_status(status)),
-        ("遊戲主視窗（只讀偵測）", format_window_status(status)),
-        ("背景能力（不送出輸入）", format_background_status(status)),
-    ):
-        Label(body, text=title, font=("Microsoft JhengHei UI", 11, "bold"), anchor="w").pack(fill=X, pady=(14, 4))
-        Label(body, text=text, font=("Microsoft JhengHei UI", 10), justify=LEFT, anchor="nw", wraplength=690).pack(fill=X)
-
-    Label(body, text="核心檢查明細", font=("Microsoft JhengHei UI", 11, "bold"), anchor="w").pack(fill=X, pady=(14, 4))
-    Label(body, text=details, font=("Consolas", 9), justify=LEFT, anchor="nw", wraplength=690).pack(fill=BOTH, expand=True)
-
-    footer = Frame(body)
-    footer.pack(side="bottom", fill=X, pady=(16, 0))
-    Button(footer, text="關閉", width=12, command=window.destroy).pack(side="right")
-    Label(footer, text=f"紀錄位置：{paths.logs_dir()}", font=("Microsoft JhengHei UI", 8), anchor="w").pack(side="left")
+    HomeView(window, status, on_start=show_start_status).build()
     return window
 
 
