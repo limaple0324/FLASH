@@ -11,16 +11,25 @@ def test_app_icon_asset_exists():
 
 
 def test_app_icon_has_transparent_corners():
-    for icon_path in (resource_path(APP_ICON_PNG), resource_path(APP_ICON_ICO)):
-        icon = Image.open(icon_path).convert("RGBA")
-        corners = [
-            icon.getpixel((0, 0)),
-            icon.getpixel((icon.width - 1, 0)),
-            icon.getpixel((0, icon.height - 1)),
-            icon.getpixel((icon.width - 1, icon.height - 1)),
-        ]
+    png = Image.open(resource_path(APP_ICON_PNG)).convert("RGBA")
+    png_corners = [
+        png.getpixel((0, 0)),
+        png.getpixel((png.width - 1, 0)),
+        png.getpixel((0, png.height - 1)),
+        png.getpixel((png.width - 1, png.height - 1)),
+    ]
+    assert all(pixel == (0, 0, 0, 0) for pixel in png_corners)
 
-        assert all(alpha == 0 for *_, alpha in corners)
+    ico = Image.open(resource_path(APP_ICON_ICO))
+    for size in ico.ico.sizes():
+        frame = ico.ico.getimage(size).convert("RGBA")
+        corners = [
+            frame.getpixel((0, 0)),
+            frame.getpixel((frame.width - 1, 0)),
+            frame.getpixel((0, frame.height - 1)),
+            frame.getpixel((frame.width - 1, frame.height - 1)),
+        ]
+        assert all(pixel == (0, 0, 0, 0) for pixel in corners), size
 
 
 def test_windows_build_uses_the_confirmed_icon():

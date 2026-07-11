@@ -196,6 +196,7 @@ jobs:
           }
 
       - name: Publish latest desktop updater files
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           $publishRoot = Join-Path $env:RUNNER_TEMP 'flash-latest-release'
@@ -236,7 +237,8 @@ jobs:
             "updated_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
           ) | Set-Content ".\LATEST.txt" -Encoding utf8
 
-          git add .gitattributes FLASH.exe 更新輔.cmd 輔系統 LATEST.txt
+          # 同時登記刪除舊版發布分支殘留的原始碼與過期檔案。
+          git add -A
           git commit -m "Update latest Windows FLASH build"
           git push origin release/latest --force
 
