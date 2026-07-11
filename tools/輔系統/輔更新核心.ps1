@@ -1,5 +1,5 @@
-# 更新輔
-# 用途：下載最新通過建置的 Windows 成品，核對後更新目前資料夾與桌面捷徑。
+# 輔更新核心
+# 用途：由「更新輔.cmd」呼叫，下載最新成品並更新目前資料夾與桌面捷徑。
 
 $ErrorActionPreference = "Stop"
 
@@ -7,10 +7,10 @@ $ErrorActionPreference = "Stop"
 
 $Repo = "limaple0324/FLASH"
 $ReleaseBranch = "release/latest"
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$SystemDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$InstallDir = Split-Path -Parent $SystemDir
 $Desktop = [Environment]::GetFolderPath("Desktop")
-$InstallDir = $ScriptDir
-$DownloadDir = Join-Path $InstallDir "下載暫存"
+$DownloadDir = Join-Path $SystemDir "下載暫存"
 $ReleaseDir = $InstallDir
 $ExePath = Join-Path $ReleaseDir "FLASH.exe"
 $DesktopExe = $ExePath
@@ -29,6 +29,19 @@ function Require-File([string]$Path) {
     }
 }
 
+function Download-File([string]$Url, [string]$Target, [string]$Name) {
+    Write-Step "下載：$Name"
+    Invoke-WebRequest -Uri $Url -OutFile $Target
+    Require-File $Target
+}
+
+function Copy-RequiredFile([string]$Source, [string]$Target, [string]$Name) {
+    Require-File $Source
+    Write-Step "更新：$Name"
+    Copy-Item -LiteralPath $Source -Destination $Target -Force
+    Require-File $Target
+}
+
 New-Item -ItemType Directory -Force -Path $InstallDir, $DownloadDir | Out-Null
 if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
     New-Item -ItemType File -Force -Path $LogPath | Out-Null
@@ -37,8 +50,22 @@ if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
 try {
     Write-Step "開始更新輔。"
 
+    $running = Get-Process | Where-Object { $_.ProcessName -eq "FLASH" }
+    if ($running) {
+        throw "輔正在執行，請先關閉後再更新。"
+    }
+
     $baseUrl = "https://raw.githubusercontent.com/$Repo/$ReleaseBranch"
-    $files = @("FLASH.exe", "SHA256SUMS.txt", "BUILD_INFO.txt", "verify_windows_release.ps1")
+    $files = @(
+        @{ Remote = "FLASH.exe"; Local = Join-Path $InstallDir "FLASH.exe"; Name = "FLASH.exe" },
+        @{ Remote = "更新輔.cmd"; Local = Join-Path $InstallDir "更新輔.cmd"; Name = "更新輔.cmd" },
+        @{ Remote = "輔系統/SHA256SUMS.txt"; Local = Join-Path $SystemDir "SHA256SUMS.txt"; Name = "SHA256SUMS.txt" },
+        @{ Remote = "輔系統/BUILD_INFO.txt"; Local = Join-Path $SystemDir "BUILD_INFO.txt"; Name = "BUILD_INFO.txt" },
+        @{ Remote = "輔系統/verify_windows_release.ps1"; Local = Join-Path $SystemDir "verify_windows_release.ps1"; Name = "verify_windows_release.ps1" },
+        @{ Remote = "輔系統/輔更新核心.ps1"; Local = Join-Path $SystemDir "輔更新核心.ps1"; Name = "輔更新核心.ps1" },
+        @{ Remote = "輔系統/檢查輔同步狀態.cmd"; Local = Join-Path $SystemDir "檢查輔同步狀態.cmd"; Name = "檢查輔同步狀態.cmd" },
+        @{ Remote = "輔系統/檢查輔同步狀態.ps1"; Local = Join-Path $SystemDir "檢查輔同步狀態.ps1"; Name = "檢查輔同步狀態.ps1" }
+    )
     $cacheBreaker = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
     if (Test-Path -LiteralPath $DownloadDir) {
@@ -46,10 +73,9 @@ try {
     }
 
     foreach ($file in $files) {
-        $source = "$baseUrl/$file`?t=$cacheBreaker"
-        $target = Join-Path $DownloadDir $file
-        Write-Step "下載：$file"
-        Invoke-WebRequest -Uri $source -OutFile $target
+        $source = "$baseUrl/$($file.Remote)`?t=$cacheBreaker"
+        $target = Join-Path $DownloadDir $file.Name
+        Download-File -Url $source -Target $target -Name $file.Name
     }
 
     $downloadedExe = Join-Path $DownloadDir "FLASH.exe"
@@ -73,8 +99,14 @@ try {
     }
 
     Write-Step "核對通過，更新目前資料夾。"
-    foreach ($file in $files) {
-        Copy-Item -LiteralPath (Join-Path $DownloadDir $file) -Destination (Join-Path $ReleaseDir $file) -Force
+    $selfUpdateNames = @("更新輔.cmd", "輔更新核心.ps1")
+    $regularFiles = $files | Where-Object { $selfUpdateNames -notcontains $_.Name }
+
+    foreach ($file in $regularFiles) {
+        Copy-RequiredFile `
+            -Source (Join-Path $DownloadDir $file.Name) `
+            -Target $file.Local `
+            -Name $file.Name
     }
 
     Write-Step "建立桌面捷徑：輔。"
@@ -85,7 +117,7 @@ try {
     $shortcut.IconLocation = "$ExePath,0"
     $shortcut.Save()
 
-    $buildInfo = Get-Content -LiteralPath (Join-Path $ReleaseDir "BUILD_INFO.txt") -Raw
+    $buildInfo = Get-Content -LiteralPath (Join-Path $SystemDir "BUILD_INFO.txt") -Raw
     Write-Step "更新完成。目前資料夾：$ReleaseDir"
     Write-Step "捷徑位置：$DesktopShortcut"
     Write-Step "最新建置資訊："
@@ -94,6 +126,15 @@ try {
             Write-Step $line
         }
     }
+
+    Write-Step "更新工具本身。"
+    foreach ($file in ($files | Where-Object { $selfUpdateNames -contains $_.Name })) {
+        Copy-RequiredFile `
+            -Source (Join-Path $DownloadDir $file.Name) `
+            -Target $file.Local `
+            -Name $file.Name
+    }
+
     Write-Host ""
     Write-Host "更新完成，可以直接打開桌面的「輔」。" -ForegroundColor Green
 }

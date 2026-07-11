@@ -137,11 +137,16 @@ jobs:
           }
 
           New-Item -ItemType Directory -Force -Path release | Out-Null
+          New-Item -ItemType Directory -Force -Path 'release/輔系統' | Out-Null
           Copy-Item 'dist/FLASH.exe' 'release/FLASH.exe'
-          Copy-Item 'tools/verify_windows_release.ps1' 'release/verify_windows_release.ps1'
+          Copy-Item 'tools/更新輔.cmd' 'release/更新輔.cmd'
+          Copy-Item 'tools/verify_windows_release.ps1' 'release/輔系統/verify_windows_release.ps1'
+          Copy-Item 'tools/輔系統/輔更新核心.ps1' 'release/輔系統/輔更新核心.ps1'
+          Copy-Item 'tools/檢查輔同步狀態.cmd' 'release/輔系統/檢查輔同步狀態.cmd'
+          Copy-Item 'tools/檢查輔同步狀態.ps1' 'release/輔系統/檢查輔同步狀態.ps1'
 
           $hash = (Get-FileHash 'release/FLASH.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  FLASH.exe" | Set-Content 'release/SHA256SUMS.txt' -Encoding ascii
+          "$hash  FLASH.exe" | Set-Content 'release/輔系統/SHA256SUMS.txt' -Encoding ascii
 
           @(
             "product=FLASH"
@@ -152,19 +157,23 @@ jobs:
             "built_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
             "python=$(python --version 2>&1)"
             "sha256=$hash"
-          ) | Set-Content 'release/BUILD_INFO.txt' -Encoding utf8
+          ) | Set-Content 'release/輔系統/BUILD_INFO.txt' -Encoding utf8
 
           Get-Item 'release/FLASH.exe' | Format-List Name,Length,LastWriteTime
-          Get-Content 'release/BUILD_INFO.txt'
+          Get-Content 'release/輔系統/BUILD_INFO.txt'
 
       - name: Verify release bundle layout
         shell: pwsh
         run: |
           foreach ($required in @(
             'release/FLASH.exe',
-            'release/SHA256SUMS.txt',
-            'release/BUILD_INFO.txt',
-            'release/verify_windows_release.ps1'
+            'release/更新輔.cmd',
+            'release/輔系統/SHA256SUMS.txt',
+            'release/輔系統/BUILD_INFO.txt',
+            'release/輔系統/verify_windows_release.ps1',
+            'release/輔系統/輔更新核心.ps1',
+            'release/輔系統/檢查輔同步狀態.cmd',
+            'release/輔系統/檢查輔同步狀態.ps1'
           )) {
             if (-not (Test-Path $required -PathType Leaf)) {
               throw "Release bundle is missing: $required"
@@ -201,9 +210,8 @@ jobs:
             Remove-Item -Recurse -Force
 
           Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\SHA256SUMS.txt" ".\SHA256SUMS.txt"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\BUILD_INFO.txt" ".\BUILD_INFO.txt"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\verify_windows_release.ps1" ".\verify_windows_release.ps1"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\更新輔.cmd" ".\更新輔.cmd"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\輔系統" ".\輔系統" -Recurse -Force
 
           @(
             "branch=${{ github.head_ref || github.ref_name }}"
@@ -212,7 +220,7 @@ jobs:
             "updated_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
           ) | Set-Content ".\LATEST.txt" -Encoding utf8
 
-          git add FLASH.exe SHA256SUMS.txt BUILD_INFO.txt verify_windows_release.ps1 LATEST.txt
+          git add FLASH.exe 更新輔.cmd 輔系統 LATEST.txt
           git commit -m "Update latest Windows FLASH build"
           git push origin release/latest --force
 

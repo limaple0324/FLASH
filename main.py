@@ -22,7 +22,7 @@ from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from ui.home import HomeView
 
-APP_TITLE = "輔｜FLASH SP1"
+APP_TITLE = "輔"
 SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_WINDOW_KEY = "target_window_keywords"
 REGISTRY_FILENAME = "window_registry.json"
@@ -211,13 +211,13 @@ def format_background_status(status: dict[str, object]) -> str:
 def format_registry_status(status: dict[str, object]) -> str:
     item = status.get("window_registry", {})
     if not isinstance(item, dict) or not item.get("loaded"):
-        return "角色註冊表：未載入。"
+        return "角色資料：未載入。"
     count = int(item.get("count", 0))
     recovered = bool(item.get("recovered", False))
-    message = f"角色註冊表：已載入 {count} 個角色。"
+    message = f"角色資料：已載入 {count} 個角色。"
     if recovered:
         message += " 本次已從損壞狀態重建。"
-    return message + "\n舊 Handle 不會在重開後直接視為有效。"
+    return message + "\n舊視窗紀錄不會在重開後直接視為有效。"
 
 
 def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
@@ -229,10 +229,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     def show_start_status() -> None:
         messagebox.showinfo(
-            "輔｜啟動入口",
+            "輔｜目前狀態",
             (
-                "啟動入口已接入首頁。\n\n"
-                "目前 RC-01 僅完成首頁接入，不會執行任何遊戲操作。\n"
+                "目前可以查看狀態與紀錄。\n\n"
+                "遊戲操作尚未啟用，輔不會自動點擊或控制遊戲。\n"
                 f"紀錄位置：{paths.logs_dir()}"
             ),
             parent=window,
@@ -282,7 +282,7 @@ def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
         try:
             root_window = Tk()
             root_window.withdraw()
-            messagebox.showerror("輔｜啟動失敗", f"FLASH 無法啟動。錯誤已寫入紀錄檔。\n\n原因：{exc}", parent=root_window)
+            messagebox.showerror("輔｜啟動失敗", f"輔無法啟動。錯誤已寫入紀錄檔。\n\n原因：{exc}", parent=root_window)
             root_window.destroy()
         except Exception:
             print(details, file=sys.stderr)

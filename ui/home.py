@@ -53,17 +53,17 @@ def _status_text(status: dict[str, object]) -> str:
 def _workspace_text(status: dict[str, object]) -> str:
     characters = _characters(status)
     if characters:
-        return f"Workspace\n已載入 {len(characters)} 個角色"
-    return "Workspace\n等待設定組別"
+        return f"工作區\n已載入 {len(characters)} 個角色"
+    return "工作區\n等待設定組別"
 
 
 def _card_text(status: dict[str, object]) -> str:
     if not bool(status.get("self_check_passed", False)):
-        return "Card\n自我檢查發現問題"
+        return "提醒卡\n自我檢查發現問題"
     target = status.get("target_window", {})
     if isinstance(target, dict) and target.get("configured") is False:
-        return "Card\n尚未設定遊戲主視窗"
-    return "Card\n系統正常"
+        return "提醒卡\n尚未設定遊戲主視窗"
+    return "提醒卡\n系統正常"
 
 
 class HomeView:
@@ -94,7 +94,7 @@ class HomeView:
 
         Button(
             body,
-            text="啟動輔助",
+            text="查看目前狀態",
             width=18,
             command=self.on_start,
         ).pack(pady=12)

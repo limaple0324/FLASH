@@ -7,3 +7,12 @@ logs/
 *.log
 .pytest_cache/
 .DS_Store
+config/settings.json
+data/
+latest-package/
+updater-package*/
+updater-bat/
+one-updater*/
+force-updater-package/
+sync-check-package/
+*.zip
