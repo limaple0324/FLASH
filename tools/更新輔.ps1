@@ -1,5 +1,5 @@
 # 更新輔
-# 用途：下載最新通過建置的 Windows 成品，核對後把 FLASH.exe 放到桌面。
+# 用途：下載最新通過建置的 Windows 成品，核對後更新目前資料夾與桌面捷徑。
 
 $ErrorActionPreference = "Stop"
 
@@ -7,11 +7,13 @@ $ErrorActionPreference = "Stop"
 
 $Repo = "limaple0324/FLASH"
 $ReleaseBranch = "release/latest"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Desktop = [Environment]::GetFolderPath("Desktop")
-$InstallDir = Join-Path $Desktop "輔"
-$DownloadDir = Join-Path $InstallDir "下載"
-$ReleaseDir = Join-Path $InstallDir "目前版本"
-$DesktopExe = Join-Path $Desktop "FLASH.exe"
+$InstallDir = $ScriptDir
+$DownloadDir = Join-Path $InstallDir "下載暫存"
+$ReleaseDir = $InstallDir
+$ExePath = Join-Path $ReleaseDir "FLASH.exe"
+$DesktopExe = $ExePath
 $DesktopShortcut = Join-Path $Desktop "輔.lnk"
 $LogPath = Join-Path $InstallDir "更新紀錄.txt"
 
@@ -27,7 +29,7 @@ function Require-File([string]$Path) {
     }
 }
 
-New-Item -ItemType Directory -Force -Path $InstallDir, $DownloadDir, $ReleaseDir | Out-Null
+New-Item -ItemType Directory -Force -Path $InstallDir, $DownloadDir | Out-Null
 if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
     New-Item -ItemType File -Force -Path $LogPath | Out-Null
 }
@@ -39,22 +41,22 @@ try {
     $files = @("FLASH.exe", "SHA256SUMS.txt", "BUILD_INFO.txt", "verify_windows_release.ps1")
     $cacheBreaker = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
-    if (Test-Path -LiteralPath $ReleaseDir) {
-        Get-ChildItem -LiteralPath $ReleaseDir -Force | Remove-Item -Recurse -Force
+    if (Test-Path -LiteralPath $DownloadDir) {
+        Get-ChildItem -LiteralPath $DownloadDir -Force | Remove-Item -Recurse -Force
     }
 
     foreach ($file in $files) {
         $source = "$baseUrl/$file`?t=$cacheBreaker"
-        $target = Join-Path $ReleaseDir $file
+        $target = Join-Path $DownloadDir $file
         Write-Step "下載：$file"
         Invoke-WebRequest -Uri $source -OutFile $target
     }
 
-    $exePath = Join-Path $ReleaseDir "FLASH.exe"
-    $hashPath = Join-Path $ReleaseDir "SHA256SUMS.txt"
-    $infoPath = Join-Path $ReleaseDir "BUILD_INFO.txt"
+    $downloadedExe = Join-Path $DownloadDir "FLASH.exe"
+    $hashPath = Join-Path $DownloadDir "SHA256SUMS.txt"
+    $infoPath = Join-Path $DownloadDir "BUILD_INFO.txt"
 
-    Require-File $exePath
+    Require-File $downloadedExe
     Require-File $hashPath
     Require-File $infoPath
 
@@ -65,24 +67,33 @@ try {
     }
 
     $expectedHash = $Matches[1].ToLowerInvariant()
-    $actualHash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualHash = (Get-FileHash -LiteralPath $downloadedExe -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actualHash -ne $expectedHash) {
         throw "FLASH.exe 核對失敗。"
     }
 
-    Write-Step "核對通過，放置 FLASH.exe 到桌面。"
-    Copy-Item -LiteralPath $exePath -Destination $DesktopExe -Force
+    Write-Step "核對通過，更新目前資料夾。"
+    foreach ($file in $files) {
+        Copy-Item -LiteralPath (Join-Path $DownloadDir $file) -Destination (Join-Path $ReleaseDir $file) -Force
+    }
 
     Write-Step "建立桌面捷徑：輔。"
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($DesktopShortcut)
-    $shortcut.TargetPath = $DesktopExe
-    $shortcut.WorkingDirectory = $Desktop
-    $shortcut.IconLocation = "$DesktopExe,0"
+    $shortcut.TargetPath = $ExePath
+    $shortcut.WorkingDirectory = $ReleaseDir
+    $shortcut.IconLocation = "$ExePath,0"
     $shortcut.Save()
 
-    Write-Step "更新完成。桌面位置：$DesktopExe"
+    $buildInfo = Get-Content -LiteralPath (Join-Path $ReleaseDir "BUILD_INFO.txt") -Raw
+    Write-Step "更新完成。目前資料夾：$ReleaseDir"
     Write-Step "捷徑位置：$DesktopShortcut"
+    Write-Step "最新建置資訊："
+    foreach ($line in ($buildInfo -split "`r?`n")) {
+        if ($line.Trim()) {
+            Write-Step $line
+        }
+    }
     Write-Host ""
     Write-Host "更新完成，可以直接打開桌面的「輔」。" -ForegroundColor Green
 }
