@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import sys
 import traceback
@@ -27,6 +28,8 @@ SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_WINDOW_KEY = "target_window_keywords"
 REGISTRY_FILENAME = "window_registry.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
+APP_ICON_ICO = Path("assets") / "flash_icon.ico"
+WINDOWS_APP_USER_MODEL_ID = "limaple0324.FLASH"
 
 
 def resource_path(relative_path: Path) -> Path:
@@ -37,16 +40,31 @@ def resource_path(relative_path: Path) -> Path:
     return Path(__file__).resolve().parent / relative_path
 
 
-def apply_window_icon(window: Tk) -> None:
-    icon_path = resource_path(APP_ICON_PNG)
-    if not icon_path.exists():
+def apply_windows_app_identity() -> None:
+    if sys.platform != "win32":
         return
     try:
-        icon = PhotoImage(file=str(icon_path))
-        window.iconphoto(True, icon)
-        window._flash_icon = icon
-    except TclError:
-        return
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_USER_MODEL_ID)
+    except (AttributeError, OSError):
+        pass
+
+
+def apply_window_icon(window: Tk) -> None:
+    png_path = resource_path(APP_ICON_PNG)
+    if png_path.exists():
+        try:
+            icon = PhotoImage(file=str(png_path))
+            window.iconphoto(True, icon)
+            window._flash_icon = icon
+        except TclError:
+            pass
+
+    ico_path = resource_path(APP_ICON_ICO)
+    if sys.platform == "win32" and ico_path.exists():
+        try:
+            window.iconbitmap(default=str(ico_path))
+        except TclError:
+            pass
 
 
 def _normalize_window_keywords(value: object) -> list[str]:
@@ -252,6 +270,7 @@ def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
     paths: PathManager | None = None
     logger: LoggerService | None = None
     try:
+        apply_windows_app_identity()
         paths, logger = build_services(root=root)
         status = Bootstrap(context=AppContext).start()
         status["window_registry"] = registry_status()

@@ -4,7 +4,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets/flash_icon.png', 'assets')],
+    datas=[('assets/flash_icon.png', 'assets'), ('assets/flash_icon.ico', 'assets')],
     hiddenimports=['tkinter'],
     hookspath=[],
     hooksconfig={},
