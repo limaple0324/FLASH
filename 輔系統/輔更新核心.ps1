@@ -1,5 +1,6 @@
 # 輔更新核心
-# 用途：由「更新輔.cmd」呼叫，下載最新成品並更新目前資料夾與桌面捷徑。
+# 用途：由「更新輔.cmd」呼叫，只更新目前資料夾內的最新成品。
+# 桌面捷徑由玩家自行保留；更新程序不得更改名稱或圖示。
 
 $ErrorActionPreference = "Stop"
 
@@ -9,12 +10,9 @@ $Repo = "limaple0324/FLASH"
 $ReleaseBranch = "release/latest"
 $SystemDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $InstallDir = Split-Path -Parent $SystemDir
-$Desktop = [Environment]::GetFolderPath("Desktop")
 $DownloadDir = Join-Path $SystemDir "下載暫存"
 $ReleaseDir = $InstallDir
 $ExePath = Join-Path $ReleaseDir "FLASH.exe"
-$DesktopExe = $ExePath
-$DesktopShortcut = Join-Path $Desktop "輔.lnk"
 $LogPath = Join-Path $InstallDir "更新紀錄.txt"
 
 function Write-Step([string]$Message) {
@@ -109,17 +107,9 @@ try {
             -Name $file.Name
     }
 
-    Write-Step "建立桌面捷徑：輔。"
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($DesktopShortcut)
-    $shortcut.TargetPath = $ExePath
-    $shortcut.WorkingDirectory = $ReleaseDir
-    $shortcut.IconLocation = "$ExePath,0"
-    $shortcut.Save()
-
     $buildInfo = Get-Content -LiteralPath (Join-Path $SystemDir "BUILD_INFO.txt") -Raw
     Write-Step "更新完成。目前資料夾：$ReleaseDir"
-    Write-Step "捷徑位置：$DesktopShortcut"
+    Write-Step "已保留原本桌面捷徑的名稱與圖示。"
     Write-Step "最新建置資訊："
     foreach ($line in ($buildInfo -split "`r?`n")) {
         if ($line.Trim()) {
@@ -136,7 +126,7 @@ try {
     }
 
     Write-Host ""
-    Write-Host "更新完成，可以直接打開桌面的「輔」。" -ForegroundColor Green
+    Write-Host "更新完成，可以直接打開原本桌面的「輔 V0.2」。" -ForegroundColor Green
 }
 catch {
     Write-Step "更新失敗：$($_.Exception.Message)"
