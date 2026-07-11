@@ -1,4 +1,4 @@
-﻿# Verify a downloaded FLASH Windows SP1 release bundle.
+# Verify a downloaded FLASH Windows SP1 release bundle.
 # Place this script inside 輔系統, beside SHA256SUMS.txt and BUILD_INFO.txt.
 
 $ErrorActionPreference = "Stop"
