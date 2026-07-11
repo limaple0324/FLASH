@@ -1,4 +1,4 @@
-# 檢查輔同步狀態
+﻿# 檢查輔同步狀態
 # 用途：檢查 Windows 工作排程裡是否還有舊的自動同步。
 
 $ErrorActionPreference = "Stop"
