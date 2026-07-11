@@ -1,13 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-# No custom icon is set here. This avoids silently replacing the user's
-# existing executable or shortcut icon.
-
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('assets/flash_icon.png', 'assets'), ('assets/flash_icon.ico', 'assets')],
     hiddenimports=['tkinter'],
     hookspath=[],
     hooksconfig={},
@@ -37,4 +34,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/flash_icon.ico',
 )

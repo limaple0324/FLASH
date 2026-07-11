@@ -1,0 +1,2 @@
+*.cmd -text whitespace=cr-at-eol
+*.bat -text whitespace=cr-at-eol

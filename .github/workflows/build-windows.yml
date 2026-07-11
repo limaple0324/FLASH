@@ -8,7 +8,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: windows-build-${{ github.ref }}
@@ -137,11 +137,20 @@ jobs:
           }
 
           New-Item -ItemType Directory -Force -Path release | Out-Null
+          New-Item -ItemType Directory -Force -Path 'release/輔系統' | Out-Null
+          @(
+            '*.cmd -text'
+            '*.bat -text'
+          ) | Set-Content 'release/.gitattributes' -Encoding ascii
           Copy-Item 'dist/FLASH.exe' 'release/FLASH.exe'
-          Copy-Item 'tools/verify_windows_release.ps1' 'release/verify_windows_release.ps1'
+          Copy-Item 'tools/更新輔.cmd' 'release/更新輔.cmd'
+          Copy-Item 'tools/verify_windows_release.ps1' 'release/輔系統/verify_windows_release.ps1'
+          Copy-Item 'tools/輔系統/輔更新核心.ps1' 'release/輔系統/輔更新核心.ps1'
+          Copy-Item 'tools/檢查輔同步狀態.cmd' 'release/輔系統/檢查輔同步狀態.cmd'
+          Copy-Item 'tools/檢查輔同步狀態.ps1' 'release/輔系統/檢查輔同步狀態.ps1'
 
           $hash = (Get-FileHash 'release/FLASH.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  FLASH.exe" | Set-Content 'release/SHA256SUMS.txt' -Encoding ascii
+          "$hash  FLASH.exe" | Set-Content 'release/輔系統/SHA256SUMS.txt' -Encoding ascii
 
           @(
             "product=FLASH"
@@ -152,24 +161,86 @@ jobs:
             "built_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
             "python=$(python --version 2>&1)"
             "sha256=$hash"
-          ) | Set-Content 'release/BUILD_INFO.txt' -Encoding utf8
+          ) | Set-Content 'release/輔系統/BUILD_INFO.txt' -Encoding utf8
 
           Get-Item 'release/FLASH.exe' | Format-List Name,Length,LastWriteTime
-          Get-Content 'release/BUILD_INFO.txt'
+          Get-Content 'release/輔系統/BUILD_INFO.txt'
 
       - name: Verify release bundle layout
         shell: pwsh
         run: |
           foreach ($required in @(
+            'release/.gitattributes',
             'release/FLASH.exe',
-            'release/SHA256SUMS.txt',
-            'release/BUILD_INFO.txt',
-            'release/verify_windows_release.ps1'
+            'release/更新輔.cmd',
+            'release/輔系統/SHA256SUMS.txt',
+            'release/輔系統/BUILD_INFO.txt',
+            'release/輔系統/verify_windows_release.ps1',
+            'release/輔系統/輔更新核心.ps1',
+            'release/輔系統/檢查輔同步狀態.cmd',
+            'release/輔系統/檢查輔同步狀態.ps1'
           )) {
             if (-not (Test-Path $required -PathType Leaf)) {
               throw "Release bundle is missing: $required"
             }
           }
+
+          foreach ($cmd in @(
+            'release/更新輔.cmd',
+            'release/輔系統/檢查輔同步狀態.cmd'
+          )) {
+            $content = [IO.File]::ReadAllText($cmd, [Text.Encoding]::UTF8)
+            if ($content -notmatch "`r`n" -or $content -match "(?<!`r)`n") {
+              throw "Windows command file does not use CRLF line endings: $cmd"
+            }
+          }
+
+      - name: Publish latest desktop updater files
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $publishRoot = Join-Path $env:RUNNER_TEMP 'flash-latest-release'
+          Remove-Item -Recurse -Force $publishRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $publishRoot | Out-Null
+
+          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" $publishRoot
+          Set-Location $publishRoot
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          $branchExists = $true
+          git fetch origin release/latest
+          if ($LASTEXITCODE -ne 0) {
+            $branchExists = $false
+          }
+
+          if ($branchExists) {
+            git checkout release/latest
+          }
+          else {
+            git checkout --orphan release/latest
+          }
+
+          Get-ChildItem -Force |
+            Where-Object { $_.Name -ne '.git' } |
+            Remove-Item -Recurse -Force
+
+          Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\.gitattributes" ".\.gitattributes"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\更新輔.cmd" ".\更新輔.cmd"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\輔系統" ".\輔系統" -Recurse -Force
+
+          @(
+            "branch=${{ github.head_ref || github.ref_name }}"
+            "commit=${{ github.sha }}"
+            "run_id=${{ github.run_id }}"
+            "updated_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+          ) | Set-Content ".\LATEST.txt" -Encoding utf8
+
+          # 同時登記刪除舊版發布分支殘留的原始碼與過期檔案。
+          git add -A
+          git commit -m "Update latest Windows FLASH build"
+          git push origin release/latest --force
 
       - name: Upload Windows release bundle
         uses: actions/upload-artifact@v4

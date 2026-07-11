@@ -1,12 +1,13 @@
 # Verify a downloaded FLASH Windows SP1 release bundle.
-# Place this script beside FLASH.exe, SHA256SUMS.txt, and BUILD_INFO.txt.
+# Place this script inside 輔系統, beside SHA256SUMS.txt and BUILD_INFO.txt.
 
 $ErrorActionPreference = "Stop"
 
-$ReleaseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$SystemDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ReleaseDir = Split-Path -Parent $SystemDir
 $ExePath = Join-Path $ReleaseDir "FLASH.exe"
-$HashPath = Join-Path $ReleaseDir "SHA256SUMS.txt"
-$InfoPath = Join-Path $ReleaseDir "BUILD_INFO.txt"
+$HashPath = Join-Path $SystemDir "SHA256SUMS.txt"
+$InfoPath = Join-Path $SystemDir "BUILD_INFO.txt"
 
 function Require-File([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {

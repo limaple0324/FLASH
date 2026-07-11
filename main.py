@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import sys
 import traceback
 from pathlib import Path
-from tkinter import BOTH, LEFT, X, Button, Frame, Label, Tk, messagebox
+from tkinter import PhotoImage, TclError, Tk, messagebox
 
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
@@ -20,11 +21,50 @@ from core.window_registry_store import WindowRegistryStore
 from services.app_context import AppContext
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
+from ui.home import HomeView
 
-APP_TITLE = "輔｜FLASH SP1"
+APP_TITLE = "輔"
 SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_WINDOW_KEY = "target_window_keywords"
 REGISTRY_FILENAME = "window_registry.json"
+APP_ICON_PNG = Path("assets") / "flash_icon.png"
+APP_ICON_ICO = Path("assets") / "flash_icon.ico"
+WINDOWS_APP_USER_MODEL_ID = "limaple0324.FLASH"
+
+
+def resource_path(relative_path: Path) -> Path:
+    """Resolve files both from source and from a PyInstaller bundle."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        return Path(bundle_root) / relative_path
+    return Path(__file__).resolve().parent / relative_path
+
+
+def apply_windows_app_identity() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_USER_MODEL_ID)
+    except (AttributeError, OSError):
+        pass
+
+
+def apply_window_icon(window: Tk) -> None:
+    png_path = resource_path(APP_ICON_PNG)
+    if png_path.exists():
+        try:
+            icon = PhotoImage(file=str(png_path))
+            window.iconphoto(True, icon)
+            window._flash_icon = icon
+        except TclError:
+            pass
+
+    ico_path = resource_path(APP_ICON_ICO)
+    if sys.platform == "win32" and ico_path.exists():
+        try:
+            window.iconbitmap(default=str(ico_path))
+        except TclError:
+            pass
 
 
 def _normalize_window_keywords(value: object) -> list[str]:
@@ -189,44 +229,34 @@ def format_background_status(status: dict[str, object]) -> str:
 def format_registry_status(status: dict[str, object]) -> str:
     item = status.get("window_registry", {})
     if not isinstance(item, dict) or not item.get("loaded"):
-        return "角色註冊表：未載入。"
+        return "角色資料：未載入。"
     count = int(item.get("count", 0))
     recovered = bool(item.get("recovered", False))
-    message = f"角色註冊表：已載入 {count} 個角色。"
+    message = f"角色資料：已載入 {count} 個角色。"
     if recovered:
         message += " 本次已從損壞狀態重建。"
-    return message + "\n舊 Handle 不會在重開後直接視為有效。"
+    return message + "\n舊視窗紀錄不會在重開後直接視為有效。"
 
 
 def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window = Tk()
     window.title(APP_TITLE)
+    apply_window_icon(window)
     window.geometry("760x760")
     window.minsize(660, 600)
-    body = Frame(window, padx=28, pady=24)
-    body.pack(fill=BOTH, expand=True)
 
-    headline, details = format_self_check(status)
-    passed = bool(status.get("self_check_passed", False))
-    Label(body, text="輔", font=("Microsoft JhengHei UI", 24, "bold"), anchor="w").pack(fill=X)
-    Label(body, text=f"FLASH SP1 已啟動｜{headline}", font=("Microsoft JhengHei UI", 15, "bold"), anchor="w", pady=8).pack(fill=X)
-    Label(body, text=f"版本：{status.get('version', 'unknown')}\n階段：{status.get('sprint', 'SP1')}\n整體狀態：{'核心檢查正常' if passed else '需要檢查下列失敗項目'}", font=("Microsoft JhengHei UI", 10), justify=LEFT, anchor="nw").pack(fill=X)
+    def show_start_status() -> None:
+        messagebox.showinfo(
+            "輔｜目前狀態",
+            (
+                "目前可以查看狀態與紀錄。\n\n"
+                "遊戲操作尚未啟用，輔不會自動點擊或控制遊戲。\n"
+                f"紀錄位置：{paths.logs_dir()}"
+            ),
+            parent=window,
+        )
 
-    for title, text in (
-        ("角色註冊表", format_registry_status(status)),
-        ("遊戲主視窗（只讀偵測）", format_window_status(status)),
-        ("背景能力（不送出輸入）", format_background_status(status)),
-    ):
-        Label(body, text=title, font=("Microsoft JhengHei UI", 11, "bold"), anchor="w").pack(fill=X, pady=(14, 4))
-        Label(body, text=text, font=("Microsoft JhengHei UI", 10), justify=LEFT, anchor="nw", wraplength=690).pack(fill=X)
-
-    Label(body, text="核心檢查明細", font=("Microsoft JhengHei UI", 11, "bold"), anchor="w").pack(fill=X, pady=(14, 4))
-    Label(body, text=details, font=("Consolas", 9), justify=LEFT, anchor="nw", wraplength=690).pack(fill=BOTH, expand=True)
-
-    footer = Frame(body)
-    footer.pack(side="bottom", fill=X, pady=(16, 0))
-    Button(footer, text="關閉", width=12, command=window.destroy).pack(side="right")
-    Label(footer, text=f"紀錄位置：{paths.logs_dir()}", font=("Microsoft JhengHei UI", 8), anchor="w").pack(side="left")
+    HomeView(window, status, on_start=show_start_status).build()
     return window
 
 
@@ -240,6 +270,7 @@ def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
     paths: PathManager | None = None
     logger: LoggerService | None = None
     try:
+        apply_windows_app_identity()
         paths, logger = build_services(root=root)
         status = Bootstrap(context=AppContext).start()
         status["window_registry"] = registry_status()
@@ -270,7 +301,7 @@ def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
         try:
             root_window = Tk()
             root_window.withdraw()
-            messagebox.showerror("輔｜啟動失敗", f"FLASH 無法啟動。錯誤已寫入紀錄檔。\n\n原因：{exc}", parent=root_window)
+            messagebox.showerror("輔｜啟動失敗", f"輔無法啟動。錯誤已寫入紀錄檔。\n\n原因：{exc}", parent=root_window)
             root_window.destroy()
         except Exception:
             print(details, file=sys.stderr)
