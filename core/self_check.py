@@ -11,7 +11,9 @@ from config.path_manager import PathManager
 from core.sp1_boundaries import ExternalAdapter, RecoveryBoundary, SmartReconnectBoundary
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+from domain.progress_store import ActivityProgressStore
 from services.app_context import AppContext
+from services.activity_progress_service import ActivityProgressService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 
@@ -43,6 +45,7 @@ class SelfCheck:
             self._run("logger_service", self._check_logger),
             self._run("event_bus", self._check_event_bus),
             self._run("window_registry", self._check_window_registry),
+            self._run("activity_progress", self._check_activity_progress),
             self._run("recovery_boundary", lambda: self._check_optional(RecoveryBoundary)),
             self._run("smart_reconnect_boundary", lambda: self._check_optional(SmartReconnectBoundary)),
             self._run("external_adapter", lambda: self._check_optional(ExternalAdapter)),
@@ -106,6 +109,20 @@ class SelfCheck:
             backup = store.corrupt_backup.name if store.corrupt_backup else "unknown"
             return f"Character registry recovered from corruption; backup saved as {backup}."
         return f"Character registry loaded with {len(registry.all())} character(s)."
+
+    def _check_activity_progress(self) -> str:
+        store = self.context.get(ActivityProgressStore)
+        service = self.context.get(ActivityProgressService)
+        if store is None:
+            raise RuntimeError("ActivityProgressStore is not registered.")
+        if service is None:
+            raise RuntimeError("ActivityProgressService is not registered.")
+        if store.path.parent != self.paths.data_dir():
+            raise RuntimeError("Activity progress path is outside the managed data directory.")
+        if store.recovered_from_corruption:
+            backup = store.corrupt_backup.name if store.corrupt_backup else "unknown"
+            return f"Activity progress recovered from corruption; backup saved as {backup}."
+        return f"Activity progress loaded with {len(service.all())} record(s)."
 
     def _check_optional(self, contract: type[object]) -> str:
         service = self.context.get(contract)
