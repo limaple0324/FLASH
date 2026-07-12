@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from cards.priority import CardPriorityReason, CardPriorityTier, priority_tier
 from domain.activity import ActivityDefinition
 from domain.group import CharacterGroup
 
@@ -33,6 +34,7 @@ class GroupCard:
     daily_summary: str | None = None
     requires_player_action: bool = False
     next_step: str | None = None
+    priority_reason: CardPriorityReason = CardPriorityReason.ACTIVITY
 
     def __post_init__(self) -> None:
         if not isinstance(self.group, CharacterGroup):
@@ -41,6 +43,8 @@ class GroupCard:
             raise TypeError("activity must be ActivityDefinition.")
         if not isinstance(self.requires_player_action, bool):
             raise TypeError("requires_player_action must be bool.")
+        if not isinstance(self.priority_reason, CardPriorityReason):
+            raise TypeError("priority_reason must be CardPriorityReason.")
 
         affected_ids = tuple(
             _required_text(item, "affected_character_ids item")
@@ -70,6 +74,10 @@ class GroupCard:
             _optional_text(self.next_step, "next_step"),
         )
 
+    @property
+    def priority_tier(self) -> CardPriorityTier:
+        return priority_tier(self.priority_reason)
+
     def to_dict(self) -> dict[str, object]:
         return {
             "card_id": self.card_id,
@@ -80,4 +88,6 @@ class GroupCard:
             "daily_summary": self.daily_summary,
             "requires_player_action": self.requires_player_action,
             "next_step": self.next_step,
+            "priority_reason": self.priority_reason.value,
+            "priority_tier": self.priority_tier.name,
         }
