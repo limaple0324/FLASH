@@ -6,6 +6,7 @@ Keeps engineering diagnostics separated from the player home experience.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from tkinter import BOTH, X, Button, Frame, Label
 
 from cards.view_state import CardViewState
@@ -94,11 +95,23 @@ class HomeView:
         status: dict[str, object],
         on_start=None,
         card_view_state: CardViewState | None = None,
+        card_view_state_provider: Callable[[], CardViewState] | None = None,
     ):
         self.parent = parent
         self.status = status
         self.on_start = on_start
         self.card_view_state = card_view_state
+        self.card_view_state_provider = card_view_state_provider
+        self._card_label = None
+
+    def refresh_cards(self) -> str:
+        """重新讀取唯讀快照，並更新既有的首頁提醒文字。"""
+        if self.card_view_state_provider is not None:
+            self.card_view_state = self.card_view_state_provider()
+        text = _card_text(self.status, self.card_view_state)
+        if self._card_label is not None:
+            self._card_label.configure(text=text)
+        return text
 
     def build(self):
         body = Frame(self.parent, padx=28, pady=24)
@@ -139,11 +152,12 @@ class HomeView:
             anchor="w",
         ).pack(fill=X, pady=12)
 
-        Label(
+        self._card_label = Label(
             body,
-            text=_card_text(self.status, self.card_view_state),
+            text=self.refresh_cards(),
             font=("Microsoft JhengHei UI", 11),
             anchor="w",
-        ).pack(fill=X, pady=12)
+        )
+        self._card_label.pack(fill=X, pady=12)
 
         return body

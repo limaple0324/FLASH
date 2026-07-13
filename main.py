@@ -298,17 +298,19 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
 
     card_view_state_service = AppContext.get(CardViewStateService)
-    card_view_state = (
-        card_view_state_service.snapshot()
-        if card_view_state_service is not None
-        else CardViewState()
-    )
-    HomeView(
+    home_view = HomeView(
         window,
         status,
         on_start=show_start_status,
-        card_view_state=card_view_state,
-    ).build()
+        card_view_state=CardViewState(),
+        card_view_state_provider=(
+            card_view_state_service.snapshot
+            if card_view_state_service is not None
+            else None
+        ),
+    )
+    home_view.build()
+    window._home_view = home_view
     return window
 
 
