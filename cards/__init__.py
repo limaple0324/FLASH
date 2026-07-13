@@ -1,6 +1,7 @@
 """SP2 組別級提醒卡資料模型。"""
 
 from cards.history import CardHistory, CardHistoryRecord, should_retain
+from cards.history_store import CardHistoryStore
 from cards.lifecycle import CardLifecycle, DEFAULT_CARD_LIFETIME
 from cards.models import GroupCard
 from cards.priority import CardPriorityReason, CardPriorityTier, priority_tier
@@ -12,6 +13,7 @@ __all__ = [
     "CardCapacityError",
     "CardHistory",
     "CardHistoryRecord",
+    "CardHistoryStore",
     "CardLifecycle",
     "CardService",
     "DEFAULT_CARD_LIFETIME",
