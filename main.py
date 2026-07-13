@@ -26,6 +26,7 @@ from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
 from services.card_history_service import CardHistoryService
 from services.card_coordinator import CardCoordinator
+from services.card_view_state_service import CardViewStateService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from ui.home import HomeView
@@ -100,6 +101,7 @@ def build_services(root: Path | None = None):
     card_history_service = CardHistoryService(card_history_store)
     card_service = CardService()
     card_coordinator = CardCoordinator(card_service, card_history_service)
+    card_view_state_service = CardViewStateService(card_service)
 
     AppContext.register(PathManager, paths)
     AppContext.register(LoggerService, logger)
@@ -113,6 +115,7 @@ def build_services(root: Path | None = None):
     AppContext.register(CardHistoryService, card_history_service)
     AppContext.register(CardService, card_service)
     AppContext.register(CardCoordinator, card_coordinator)
+    AppContext.register(CardViewStateService, card_view_state_service)
 
     if registry_store.recovered_from_corruption:
         logger.warning(
