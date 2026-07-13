@@ -12,6 +12,7 @@ from tkinter import PhotoImage, TclError, Tk, messagebox
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
 from adapters.windows_window import WindowsWindowAdapter
+from cards.history_store import CardHistoryStore
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.bootstrap import Bootstrap
@@ -22,6 +23,7 @@ from domain.progress_store import ActivityProgressStore
 from product.identity import PRODUCT_NAME
 from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
+from services.card_history_service import CardHistoryService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from ui.home import HomeView
@@ -31,6 +33,7 @@ SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_WINDOW_KEY = "target_window_keywords"
 REGISTRY_FILENAME = "window_registry.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
+CARD_HISTORY_FILENAME = "card_history.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 WINDOWS_APP_USER_MODEL_ID = "limaple0324.FLASH"
@@ -91,6 +94,8 @@ def build_services(root: Path | None = None):
     registry = registry_store.load()
     progress_store = ActivityProgressStore(paths.data_dir() / ACTIVITY_PROGRESS_FILENAME)
     progress_service = ActivityProgressService(progress_store)
+    card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
+    card_history_service = CardHistoryService(card_history_store)
 
     AppContext.register(PathManager, paths)
     AppContext.register(LoggerService, logger)
@@ -100,6 +105,8 @@ def build_services(root: Path | None = None):
     AppContext.register(WindowRegistry, registry)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
+    AppContext.register(CardHistoryStore, card_history_store)
+    AppContext.register(CardHistoryService, card_history_service)
 
     if registry_store.recovered_from_corruption:
         logger.warning(
@@ -116,6 +123,14 @@ def build_services(root: Path | None = None):
         )
     else:
         logger.info(f"Activity progress loaded: {len(progress_service.all())} record(s).")
+
+    if card_history_store.recovered_from_corruption:
+        logger.warning(
+            "Card history was corrupt and has been rebuilt; "
+            f"backup={card_history_store.corrupt_backup}"
+        )
+    else:
+        logger.info(f"Card history loaded: {len(card_history_service.all())} record(s).")
 
     keywords = _normalize_window_keywords(config.get(TARGET_WINDOW_KEY, []))
     if keywords:

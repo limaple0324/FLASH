@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from cards.lifecycle import _require_aware
 from cards.models import GroupCard
@@ -145,8 +145,11 @@ class CardHistoryRecord:
 
 
 class CardHistory:
-    def __init__(self) -> None:
-        self._records: list[CardHistoryRecord] = []
+    def __init__(self, records: Iterable[CardHistoryRecord] = ()) -> None:
+        items = tuple(records)
+        if any(not isinstance(item, CardHistoryRecord) for item in items):
+            raise TypeError("records must contain only CardHistoryRecord values.")
+        self._records = list(items)
 
     @property
     def records(self) -> tuple[CardHistoryRecord, ...]:
