@@ -19,6 +19,7 @@ def test_self_check_reports_all_required_checks_once(tmp_path):
         "event_bus",
         "window_registry",
         "activity_progress",
+        "card_history",
         "recovery_boundary",
         "smart_reconnect_boundary",
         "external_adapter",

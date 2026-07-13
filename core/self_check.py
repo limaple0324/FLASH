@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
+from cards.history_store import CardHistoryStore
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.sp1_boundaries import ExternalAdapter, RecoveryBoundary, SmartReconnectBoundary
@@ -15,6 +16,7 @@ from domain.progress_store import ActivityProgressStore
 from services.app_context import AppContext
 from services.activity_progress_service import ActivityProgressService
 from services.event_bus import EventBus
+from services.card_history_service import CardHistoryService
 from services.logger_service import LoggerService
 
 
@@ -46,6 +48,7 @@ class SelfCheck:
             self._run("event_bus", self._check_event_bus),
             self._run("window_registry", self._check_window_registry),
             self._run("activity_progress", self._check_activity_progress),
+            self._run("card_history", self._check_card_history),
             self._run("recovery_boundary", lambda: self._check_optional(RecoveryBoundary)),
             self._run("smart_reconnect_boundary", lambda: self._check_optional(SmartReconnectBoundary)),
             self._run("external_adapter", lambda: self._check_optional(ExternalAdapter)),
@@ -123,6 +126,22 @@ class SelfCheck:
             backup = store.corrupt_backup.name if store.corrupt_backup else "unknown"
             return f"Activity progress recovered from corruption; backup saved as {backup}."
         return f"Activity progress loaded with {len(service.all())} record(s)."
+
+    def _check_card_history(self) -> str:
+        store = self.context.get(CardHistoryStore)
+        service = self.context.get(CardHistoryService)
+        if store is None:
+            raise RuntimeError("CardHistoryStore is not registered.")
+        if service is None:
+            raise RuntimeError("CardHistoryService is not registered.")
+        if service.store is not store:
+            raise RuntimeError("Card history service does not use the registered store.")
+        if store.path.parent != self.paths.data_dir():
+            raise RuntimeError("Card history path is outside the managed data directory.")
+        if store.recovered_from_corruption:
+            backup = store.corrupt_backup.name if store.corrupt_backup else "unknown"
+            return f"Card history recovered from corruption; backup saved as {backup}."
+        return f"Card history loaded with {len(service.all())} record(s)."
 
     def _check_optional(self, contract: type[object]) -> str:
         service = self.context.get(contract)
