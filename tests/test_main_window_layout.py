@@ -5,7 +5,8 @@ def test_main_window_uses_home_view():
     source = Path("main.py").read_text(encoding="utf-8")
 
     assert "from ui.home import HomeView" in source
-    assert "HomeView(window, status, on_start=show_start_status).build()" in source
+    assert "card_view_state_service.snapshot()" in source
+    assert "card_view_state=card_view_state" in source
 
 
 def test_main_window_start_message_is_player_facing():

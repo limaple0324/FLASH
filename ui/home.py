@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from tkinter import BOTH, X, Button, Frame, Label
 
+from cards.view_state import CardViewState
+
 
 def _characters(status: dict[str, object]) -> list[dict[str, object]]:
     registry = status.get("window_registry", {})
@@ -57,7 +59,24 @@ def _workspace_text(status: dict[str, object]) -> str:
     return "工作區\n等待設定組別"
 
 
-def _card_text(status: dict[str, object]) -> str:
+def _card_text(
+    status: dict[str, object],
+    card_view_state: CardViewState | None = None,
+) -> str:
+    if card_view_state is not None:
+        count = len(card_view_state.cards)
+        if card_view_state.is_empty:
+            return "提醒卡（0）\n目前沒有提醒"
+
+        card = card_view_state.cards[0]
+        next_step = card.next_step or "尚未提供"
+        return (
+            f"提醒卡（{count}）\n"
+            f"{card.group_name}｜{card.activity_name}\n"
+            f"進度：{card.current_progress}\n"
+            f"下一步：{next_step}"
+        )
+
     if not bool(status.get("self_check_passed", False)):
         return "提醒卡\n自我檢查發現問題"
     target = status.get("target_window", {})
@@ -69,10 +88,17 @@ def _card_text(status: dict[str, object]) -> str:
 class HomeView:
     """First version of the player home screen."""
 
-    def __init__(self, parent, status: dict[str, object], on_start=None):
+    def __init__(
+        self,
+        parent,
+        status: dict[str, object],
+        on_start=None,
+        card_view_state: CardViewState | None = None,
+    ):
         self.parent = parent
         self.status = status
         self.on_start = on_start
+        self.card_view_state = card_view_state
 
     def build(self):
         body = Frame(self.parent, padx=28, pady=24)
@@ -115,7 +141,7 @@ class HomeView:
 
         Label(
             body,
-            text=_card_text(self.status),
+            text=_card_text(self.status, self.card_view_state),
             font=("Microsoft JhengHei UI", 11),
             anchor="w",
         ).pack(fill=X, pady=12)

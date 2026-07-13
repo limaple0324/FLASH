@@ -14,6 +14,7 @@ from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
 from adapters.windows_window import WindowsWindowAdapter
 from cards.history_store import CardHistoryStore
 from cards.service import CardService
+from cards.view_state import CardViewState
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.bootstrap import Bootstrap
@@ -296,7 +297,18 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             parent=window,
         )
 
-    HomeView(window, status, on_start=show_start_status).build()
+    card_view_state_service = AppContext.get(CardViewStateService)
+    card_view_state = (
+        card_view_state_service.snapshot()
+        if card_view_state_service is not None
+        else CardViewState()
+    )
+    HomeView(
+        window,
+        status,
+        on_start=show_start_status,
+        card_view_state=card_view_state,
+    ).build()
     return window
 
 
