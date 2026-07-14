@@ -27,6 +27,7 @@ from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
 from services.card_history_service import CardHistoryService
 from services.card_coordinator import CardCoordinator
+from services.card_expiry_monitor import CardExpiryMonitor
 from services.card_view_state_service import CardViewStateService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
@@ -314,6 +315,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     card_service = AppContext.get(CardService)
     if card_service is not None:
         card_service.subscribe(lambda: window.after_idle(home_view.refresh_cards))
+        card_expiry_monitor = CardExpiryMonitor(card_service, window.after)
+        card_expiry_monitor.start()
+        window._card_expiry_monitor = card_expiry_monitor
     return window
 
 
