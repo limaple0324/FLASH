@@ -311,6 +311,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     home_view.build()
     window._home_view = home_view
+    card_service = AppContext.get(CardService)
+    if card_service is not None:
+        card_service.subscribe(lambda: window.after_idle(home_view.refresh_cards))
     return window
 
 
