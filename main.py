@@ -8,6 +8,7 @@ import sys
 import traceback
 from pathlib import Path
 from tkinter import PhotoImage, TclError, Tk, messagebox
+from typing import Protocol
 
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
@@ -42,6 +43,14 @@ CARD_HISTORY_FILENAME = "card_history.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 WINDOWS_APP_USER_MODEL_ID = "limaple0324.FLASH"
+
+
+class CardOverlayRuntime(Protocol):
+    """Optional reminder overlay lifecycle managed by the main window."""
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
 
 
 def resource_path(relative_path: Path) -> Path:
@@ -280,7 +289,35 @@ def format_registry_status(status: dict[str, object]) -> str:
     return message + "\n舊視窗紀錄不會在重開後直接視為有效。"
 
 
-def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
+def _attach_card_overlay_runtime(window: Tk, runtime: CardOverlayRuntime | None) -> None:
+    if runtime is None:
+        return
+
+    closed = False
+
+    def close_window() -> None:
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        try:
+            runtime.stop()
+        except Exception as exc:
+            window._card_overlay_stop_error = exc
+        finally:
+            window.destroy()
+
+    window.protocol("WM_DELETE_WINDOW", close_window)
+    window._card_overlay_runtime = runtime
+    runtime.start()
+
+
+def create_main_window(
+    status: dict[str, object],
+    paths: PathManager,
+    *,
+    card_overlay_runtime: CardOverlayRuntime | None = None,
+) -> Tk:
     window = Tk()
     window.title(APP_TITLE)
     apply_window_icon(window)
@@ -318,6 +355,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         card_expiry_monitor = CardExpiryMonitor(card_service, window.after)
         card_expiry_monitor.start()
         window._card_expiry_monitor = card_expiry_monitor
+    _attach_card_overlay_runtime(window, card_overlay_runtime)
     return window
 
 
