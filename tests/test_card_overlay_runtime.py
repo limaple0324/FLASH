@@ -1,14 +1,21 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from cards.models import GroupCard
 from cards.service import CardService
-from cards.view_state import CardViewItem
+from cards.view_state import CardViewItem, CardViewState
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.group import CharacterGroup
 from services.card_overlay_layout_service import CardOverlayLayout, PositionedCard
-from services.card_overlay_runtime import build_windows_card_overlay_runtime
-from ui.card_overlay import CardPlacement
+from services.card_overlay_runtime import (
+    build_selected_card_overlay_runtime,
+    build_windows_card_overlay_runtime,
+)
+from services.card_preview_adapter import select_card_preview
+from ui.card_overlay import CardPlacement, CardSize, WorkArea
+from ui.card_preview_settings import CardPreviewCatalog, CardPreviewProfile
 from ui.tk_card_presenter import TkCardTextSettings
 
 
@@ -76,6 +83,19 @@ class MutableLayoutSource:
     def snapshot(self):
         self.calls += 1
         return self.layout
+
+
+class FixedCardState:
+    def __init__(self, state):
+        self.state = state
+
+    def snapshot(self):
+        return self.state
+
+
+class FixedWorkArea:
+    def read(self):
+        return WorkArea(0, 0, 1920, 1040)
 
 
 class FakeWindow:
@@ -218,3 +238,46 @@ def test_stop_closes_windows_and_unsubscribes_from_future_changes():
     assert service.running is False
     assert windows.windows[0].destroyed is True
     assert layout.calls == calls_before_stop
+
+
+def test_selected_profile_builds_complete_stopped_runtime():
+    profile = CardPreviewProfile(
+        profile_id="player-selected",
+        display_name="玩家選定預覽",
+        card_size=CardSize(360, 120),
+        right_margin=16,
+        bottom_margin=16,
+        gap=12,
+        text=_settings(),
+    )
+    selected = select_card_preview(
+        CardPreviewCatalog((profile,)),
+        "player-selected",
+        FixedCardState(CardViewState(cards=(_positioned_card().card,))),
+        FixedWorkArea(),
+    )
+    cards = CardService()
+    windows = RecordingWindowFactory()
+    widgets = RecordingWidgetFactory()
+
+    service = build_selected_card_overlay_runtime(
+        object(),
+        cards,
+        selected,
+        window_factory=windows,
+        widget_factory=widgets,
+    )
+
+    assert service.running is False
+    assert windows.windows == []
+    service.start()
+    assert windows.windows[0].operations[2] == (
+        "geometry",
+        "360x120+1544+904",
+    )
+    assert widgets.widgets[0].options["background"] == "caller-background"
+
+
+def test_selected_runtime_rejects_unselected_settings():
+    with pytest.raises(TypeError, match="SelectedCardPreview"):
+        build_selected_card_overlay_runtime(object(), CardService(), object())
