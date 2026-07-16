@@ -29,10 +29,13 @@ from services.app_context import AppContext
 from services.card_history_service import CardHistoryService
 from services.card_coordinator import CardCoordinator
 from services.card_expiry_monitor import CardExpiryMonitor
+from services.card_preview_selection_service import CardPreviewSelectionService
+from services.card_preview_selection_store import CardPreviewSelectionStore
 from services.card_view_state_service import CardViewStateService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from ui.home import HomeView
+from ui.card_preview_settings import CardPreviewCatalog
 
 APP_TITLE = PRODUCT_NAME
 SELF_CHECK_ARGUMENT = "--self-check"
@@ -40,6 +43,7 @@ TARGET_WINDOW_KEY = "target_window_keywords"
 REGISTRY_FILENAME = "window_registry.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
+CARD_PREVIEW_SELECTION_FILENAME = "card_preview_selection.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 WINDOWS_APP_USER_MODEL_ID = "limaple0324.FLASH"
@@ -96,7 +100,11 @@ def _normalize_window_keywords(value: object) -> list[str]:
     return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
-def build_services(root: Path | None = None):
+def build_services(
+    root: Path | None = None,
+    *,
+    card_preview_catalog: CardPreviewCatalog | None = None,
+):
     """Create, load, and register all SP1 services."""
     AppContext.clear()
     paths = PathManager(root=root)
@@ -127,6 +135,29 @@ def build_services(root: Path | None = None):
     AppContext.register(CardService, card_service)
     AppContext.register(CardCoordinator, card_coordinator)
     AppContext.register(CardViewStateService, card_view_state_service)
+
+    if card_preview_catalog is not None:
+        card_preview_selection_store = CardPreviewSelectionStore(
+            paths.data_dir() / CARD_PREVIEW_SELECTION_FILENAME
+        )
+        card_preview_selection_service = CardPreviewSelectionService(
+            card_preview_catalog,
+            card_preview_selection_store,
+        )
+        AppContext.register(CardPreviewSelectionStore, card_preview_selection_store)
+        AppContext.register(CardPreviewSelectionService, card_preview_selection_service)
+
+        if card_preview_selection_store.recovered_from_corruption:
+            logger.warning(
+                "Card preview selection was corrupt and has been disabled; "
+                f"backup={card_preview_selection_store.corrupt_backup}"
+            )
+        elif card_preview_selection_service.unavailable_stored_profile_id is not None:
+            logger.warning(
+                "Card preview selection references an unavailable profile and has been "
+                "disabled; "
+                f"profile={card_preview_selection_service.unavailable_stored_profile_id}"
+            )
 
     if registry_store.recovered_from_corruption:
         logger.warning(
