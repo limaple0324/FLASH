@@ -421,12 +421,20 @@ def write_self_check_report(status: dict[str, object], paths: PathManager) -> Pa
     return report_path
 
 
-def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
+def run(
+    *,
+    self_check_only: bool = False,
+    root: Path | None = None,
+    card_preview_catalog: CardPreviewCatalog | None = None,
+) -> int:
     paths: PathManager | None = None
     logger: LoggerService | None = None
     try:
         apply_windows_app_identity()
-        paths, logger = build_services(root=root)
+        paths, logger = build_services(
+            root=root,
+            card_preview_catalog=card_preview_catalog,
+        )
         status = Bootstrap(context=AppContext).start()
         status["window_registry"] = registry_status()
         status["target_window"] = detect_target_window()

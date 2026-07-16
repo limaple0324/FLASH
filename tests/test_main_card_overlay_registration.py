@@ -2,7 +2,10 @@ from main import (
     _build_registered_card_overlay_runtime,
     build_services,
     create_main_window,
+    run,
 )
+from services.app_context import AppContext
+from services.card_preview_selection_service import CardPreviewSelectionService
 from ui.card_overlay import CardSize
 from ui.card_preview_settings import CardPreviewCatalog, CardPreviewProfile
 from ui.tk_card_presenter import TkCardTextSettings
@@ -119,3 +122,16 @@ def test_main_window_builds_and_manages_registered_overlay(monkeypatch, tmp_path
     assert runtime.start_calls == 1
     window.protocols["WM_DELETE_WINDOW"]()
     assert runtime.stop_calls == 1
+
+
+def test_run_forwards_explicit_catalog_into_startup_services(tmp_path) -> None:
+    exit_code = run(
+        self_check_only=True,
+        root=tmp_path,
+        card_preview_catalog=_catalog(),
+    )
+
+    selection = AppContext.get(CardPreviewSelectionService)
+    assert exit_code == 0
+    assert selection is not None
+    assert selection.snapshot().overlay_enabled is False
