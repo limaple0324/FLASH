@@ -48,7 +48,13 @@ class CardOverlaySelectionCoordinator:
         if self._started:
             return False
         self._started = True
-        return self.sync_selection()
+        self._selection.subscribe(self.sync_selection)
+        try:
+            return self.sync_selection()
+        except Exception:
+            self._selection.unsubscribe(self.sync_selection)
+            self._started = False
+            raise
 
     def sync_selection(self) -> bool:
         if not self._started:
@@ -84,6 +90,7 @@ class CardOverlaySelectionCoordinator:
         if not self._started:
             return False
         self._started = False
+        self._selection.unsubscribe(self.sync_selection)
         runtime = self._runtime
         self._runtime = None
         self._active_profile_id = None

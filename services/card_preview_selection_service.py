@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -36,6 +37,7 @@ class CardPreviewSelectionService:
         self._catalog = catalog
         self._store = store
         self._state = CardPreviewSelectionState()
+        self._change_listeners: list[Callable[[], None]] = []
         self.unavailable_stored_profile_id: str | None = None
         if store is not None:
             stored_profile_id = store.load()
@@ -46,6 +48,20 @@ class CardPreviewSelectionService:
                     self.unavailable_stored_profile_id = stored_profile_id
                 else:
                     self._state = CardPreviewSelectionState(profile.profile_id)
+
+    def subscribe(self, listener: Callable[[], None]) -> None:
+        if not callable(listener):
+            raise TypeError("listener must be callable.")
+        if listener not in self._change_listeners:
+            self._change_listeners.append(listener)
+
+    def unsubscribe(self, listener: Callable[[], None]) -> None:
+        if listener in self._change_listeners:
+            self._change_listeners.remove(listener)
+
+    def _notify_changed(self) -> None:
+        for listener in tuple(self._change_listeners):
+            listener()
 
     def snapshot(self) -> CardPreviewSelectionState:
         return self._state
@@ -64,6 +80,7 @@ class CardPreviewSelectionService:
             selected_profile_id=profile.profile_id,
         )
         self.unavailable_stored_profile_id = None
+        self._notify_changed()
         return self._state
 
     def clear(self) -> CardPreviewSelectionState:
@@ -71,4 +88,5 @@ class CardPreviewSelectionService:
             self._store.save(None)
         self._state = CardPreviewSelectionState()
         self.unavailable_stored_profile_id = None
+        self._notify_changed()
         return self._state

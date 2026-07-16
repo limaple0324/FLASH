@@ -97,3 +97,50 @@ def test_selection_snapshot_is_immutable() -> None:
 def test_service_rejects_non_catalog_input() -> None:
     with pytest.raises(TypeError, match="catalog"):
         CardPreviewSelectionService(object())
+
+
+def test_successful_select_switch_and_clear_notify_current_state() -> None:
+    service = _service()
+    states = []
+    service.subscribe(lambda: states.append(service.snapshot()))
+
+    service.select("compact")
+    service.select("roomy")
+    service.clear()
+
+    assert [state.selected_profile_id for state in states] == [
+        "compact",
+        "roomy",
+        None,
+    ]
+
+
+def test_unknown_selection_does_not_notify_listener() -> None:
+    service = _service()
+    notifications = []
+    service.subscribe(lambda: notifications.append(True))
+
+    with pytest.raises(KeyError):
+        service.select("unknown")
+
+    assert notifications == []
+
+
+def test_unsubscribe_stops_future_selection_notifications() -> None:
+    service = _service()
+    notifications = []
+
+    def record_change() -> None:
+        notifications.append(service.snapshot().selected_profile_id)
+
+    service.subscribe(record_change)
+    service.select("compact")
+    service.unsubscribe(record_change)
+    service.select("roomy")
+
+    assert notifications == ["compact"]
+
+
+def test_selection_listener_must_be_callable() -> None:
+    with pytest.raises(TypeError, match="listener"):
+        _service().subscribe(object())

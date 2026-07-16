@@ -103,9 +103,7 @@ def test_switch_stops_old_overlay_and_starts_selected_replacement() -> None:
     previous = factory.created[0]
 
     selection.select("roomy")
-    changed = coordinator.sync_selection()
 
-    assert changed is True
     assert previous.stop_calls == 1
     assert factory.created[1].profile_id == "roomy"
     assert factory.created[1].start_calls == 1
@@ -134,9 +132,7 @@ def test_clear_selection_stops_overlay_without_creating_a_replacement() -> None:
     previous = factory.created[0]
 
     selection.clear()
-    changed = coordinator.sync_selection()
 
-    assert changed is True
     assert previous.stop_calls == 1
     assert len(factory.created) == 1
     assert coordinator.active_profile_id is None
@@ -150,10 +146,9 @@ def test_replacement_factory_failure_preserves_running_overlay() -> None:
     coordinator.start()
     previous = factory.created[0]
 
-    selection.select("roomy")
     factory.raise_profile_id = "roomy"
     with pytest.raises(RuntimeError, match="factory failed"):
-        coordinator.sync_selection()
+        selection.select("roomy")
 
     assert previous.stop_calls == 0
     assert coordinator.active_profile_id == "compact"
@@ -167,10 +162,9 @@ def test_failed_replacement_start_is_cleaned_and_leaves_overlay_disabled() -> No
     coordinator.start()
     previous = factory.created[0]
     factory.fail_profile_id = "roomy"
-    selection.select("roomy")
 
     with pytest.raises(RuntimeError, match="overlay start failed"):
-        coordinator.sync_selection()
+        selection.select("roomy")
 
     failed = factory.created[1]
     assert previous.stop_calls == 1
@@ -188,5 +182,16 @@ def test_stop_is_idempotent_and_prevents_future_sync_until_restarted() -> None:
     assert coordinator.stop() is True
     assert coordinator.stop() is False
     selection.select("roomy")
-    assert coordinator.sync_selection() is False
     assert len(factory.created) == 1
+
+
+def test_stopped_coordinator_unsubscribes_from_selection_changes() -> None:
+    selection = _selection()
+    factory = RecordingFactory()
+    coordinator = CardOverlaySelectionCoordinator(selection, factory)
+    coordinator.start()
+    coordinator.stop()
+
+    selection.select("compact")
+
+    assert factory.created == []
