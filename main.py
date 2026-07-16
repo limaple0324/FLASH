@@ -12,6 +12,7 @@ from typing import Protocol
 
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
+from adapters.windows_work_area import WindowsWorkAreaReader
 from adapters.windows_window import WindowsWindowAdapter
 from cards.history_store import CardHistoryStore
 from cards.service import CardService
@@ -29,6 +30,9 @@ from services.app_context import AppContext
 from services.card_history_service import CardHistoryService
 from services.card_coordinator import CardCoordinator
 from services.card_expiry_monitor import CardExpiryMonitor
+from services.card_overlay_selection_assembly import (
+    build_windows_card_overlay_selection_coordinator,
+)
 from services.card_preview_selection_service import CardPreviewSelectionService
 from services.card_preview_selection_store import CardPreviewSelectionStore
 from services.card_view_state_service import CardViewStateService
@@ -343,6 +347,25 @@ def _attach_card_overlay_runtime(window: Tk, runtime: CardOverlayRuntime | None)
     runtime.start()
 
 
+def _build_registered_card_overlay_runtime(
+    window: Tk,
+) -> CardOverlayRuntime | None:
+    """Build the overlay only when an explicit preview catalog was registered."""
+    selection = AppContext.get(CardPreviewSelectionService)
+    cards = AppContext.get(CardService)
+    card_state = AppContext.get(CardViewStateService)
+    if selection is None or cards is None or card_state is None:
+        return None
+
+    return build_windows_card_overlay_selection_coordinator(
+        window,
+        cards,
+        selection,
+        card_state,
+        WindowsWorkAreaReader(),
+    )
+
+
 def create_main_window(
     status: dict[str, object],
     paths: PathManager,
@@ -386,6 +409,8 @@ def create_main_window(
         card_expiry_monitor = CardExpiryMonitor(card_service, window.after)
         card_expiry_monitor.start()
         window._card_expiry_monitor = card_expiry_monitor
+    if card_overlay_runtime is None:
+        card_overlay_runtime = _build_registered_card_overlay_runtime(window)
     _attach_card_overlay_runtime(window, card_overlay_runtime)
     return window
 
