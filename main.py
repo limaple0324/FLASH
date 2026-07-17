@@ -276,6 +276,35 @@ def format_self_check(status: dict[str, object]) -> tuple[str, str]:
     return ("自我檢查通過" if passed else "自我檢查發現問題", "\n".join(lines))
 
 
+def format_card_overlay_status(status: dict[str, object]) -> str:
+    """Turn overlay self-check diagnostics into a concise player-facing summary."""
+    check = next(
+        (
+            item
+            for item in _self_check_items(status)
+            if item.get("name") == "card_preview_selection"
+        ),
+        None,
+    )
+    if check is None:
+        return "提醒卡浮層：未取得狀態，目前保持停用。"
+    if not bool(check.get("passed", False)):
+        return "提醒卡浮層：設定檢查未通過，目前保持停用。"
+
+    message = str(check.get("message", ""))
+    if "not configured" in message:
+        return "提醒卡浮層：尚未提供候選樣式，因此目前不顯示。"
+    if "has not selected" in message:
+        return "提醒卡浮層：候選樣式已準備好，尚未選擇。"
+    if "ready with selected preview profile" in message:
+        return "提醒卡浮層：已選擇樣式，可以顯示。"
+    if "selection was corrupt" in message:
+        return "提醒卡浮層：選擇資料損壞，已安全停用並保留備份。"
+    if "saved preview profile is unavailable" in message:
+        return "提醒卡浮層：原先選擇的樣式已不可用，目前保持停用。"
+    return "提醒卡浮層：狀態無法判斷，目前保持停用。"
+
+
 def format_window_status(status: dict[str, object]) -> str:
     item = status.get("target_window", {})
     if not isinstance(item, dict):
@@ -384,6 +413,7 @@ def create_main_window(
             (
                 "目前可以查看狀態與紀錄。\n\n"
                 "遊戲操作尚未啟用，輔不會自動點擊或控制遊戲。\n"
+                f"{format_card_overlay_status(status)}\n"
                 f"紀錄位置：{paths.logs_dir()}"
             ),
             parent=window,
