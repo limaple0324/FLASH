@@ -24,6 +24,15 @@ class CardPreviewSelectionState:
         return self.selected_profile_id is not None
 
 
+@dataclass(frozen=True, slots=True)
+class CardPreviewChoice:
+    """Read-only candidate metadata safe for player-facing selection views."""
+
+    profile_id: str
+    display_name: str
+    selected: bool
+
+
 class CardPreviewSelectionService:
     """Only an explicit catalog selection can enable the preview overlay."""
 
@@ -65,6 +74,17 @@ class CardPreviewSelectionService:
 
     def snapshot(self) -> CardPreviewSelectionState:
         return self._state
+
+    def available_choices(self) -> tuple[CardPreviewChoice, ...]:
+        selected_profile_id = self._state.selected_profile_id
+        return tuple(
+            CardPreviewChoice(
+                profile_id=profile.profile_id,
+                display_name=profile.display_name,
+                selected=profile.profile_id == selected_profile_id,
+            )
+            for profile in self._catalog.profiles
+        )
 
     def selected_profile(self) -> CardPreviewProfile | None:
         profile_id = self._state.selected_profile_id

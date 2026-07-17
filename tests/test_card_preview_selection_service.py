@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from services.card_preview_selection_service import (
+    CardPreviewChoice,
     CardPreviewSelectionService,
     CardPreviewSelectionState,
 )
@@ -43,6 +44,35 @@ def test_initial_state_has_no_selection_and_keeps_overlay_disabled() -> None:
     assert service.snapshot() == CardPreviewSelectionState()
     assert service.snapshot().overlay_enabled is False
     assert service.selected_profile() is None
+
+
+def test_available_choices_expose_only_ordered_player_facing_metadata() -> None:
+    choices = _service().available_choices()
+
+    assert choices == (
+        CardPreviewChoice("compact", "compact 預覽", False),
+        CardPreviewChoice("roomy", "roomy 預覽", False),
+    )
+    assert not hasattr(choices[0], "card_size")
+    assert not hasattr(choices[0], "text")
+
+
+def test_available_choices_mark_only_the_current_selection() -> None:
+    service = _service()
+    before = service.available_choices()
+
+    service.select("roomy")
+    after = service.available_choices()
+
+    assert [choice.selected for choice in before] == [False, False]
+    assert [choice.selected for choice in after] == [False, True]
+
+
+def test_available_choice_items_are_immutable() -> None:
+    choice = _service().available_choices()[0]
+
+    with pytest.raises(FrozenInstanceError):
+        choice.display_name = "已被修改"
 
 
 def test_explicit_catalog_selection_enables_overlay() -> None:
