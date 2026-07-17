@@ -75,8 +75,8 @@ class FakeWindow:
 
 
 class FakeHomeView:
-    def __init__(self, *_args, **_kwargs) -> None:
-        pass
+    def __init__(self, *_args, **kwargs) -> None:
+        self.kwargs = kwargs
 
     def build(self) -> None:
         pass
@@ -119,6 +119,10 @@ def test_main_window_builds_and_manages_registered_overlay(monkeypatch, tmp_path
     created = create_main_window({}, main.AppContext.get(main.PathManager))
 
     assert created is window
+    choices = created._home_view.kwargs["card_preview_choices_provider"]()
+    assert [choice.display_name for choice in choices] == ["玩家選定方案"]
+    created._home_view.kwargs["on_card_preview_select"]("player-selected")
+    assert AppContext.get(CardPreviewSelectionService).snapshot().overlay_enabled is True
     assert runtime.start_calls == 1
     window.protocols["WM_DELETE_WINDOW"]()
     assert runtime.stop_calls == 1

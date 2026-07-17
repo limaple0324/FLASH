@@ -1,0 +1,66 @@
+from services.card_preview_selection_service import CardPreviewChoice
+from ui import home
+
+
+class _FakeWidget:
+    created: list["_FakeWidget"] = []
+
+    def __init__(self, parent=None, **kwargs) -> None:
+        self.parent = parent
+        self.options = dict(kwargs)
+        self.created.append(self)
+
+    def pack(self, **_kwargs) -> None:
+        pass
+
+    def configure(self, **kwargs) -> None:
+        self.options.update(kwargs)
+
+
+def _install_fake_widgets(monkeypatch) -> None:
+    _FakeWidget.created = []
+    monkeypatch.setattr(home, "Frame", _FakeWidget)
+    monkeypatch.setattr(home, "Label", _FakeWidget)
+    monkeypatch.setattr(home, "Button", _FakeWidget)
+
+
+def test_home_omits_preview_entry_without_explicit_candidates(monkeypatch) -> None:
+    _install_fake_widgets(monkeypatch)
+
+    home.HomeView(None, {}).build()
+
+    assert "提醒卡樣式" not in {
+        widget.options.get("text") for widget in _FakeWidget.created
+    }
+
+
+def test_home_selects_candidate_and_refreshes_selected_marker(monkeypatch) -> None:
+    _install_fake_widgets(monkeypatch)
+    selected_profile_id = None
+
+    def choices() -> tuple[CardPreviewChoice, ...]:
+        return (
+            CardPreviewChoice("compact", "精簡方案", selected_profile_id == "compact"),
+            CardPreviewChoice("roomy", "寬鬆方案", selected_profile_id == "roomy"),
+        )
+
+    def select(profile_id: str) -> None:
+        nonlocal selected_profile_id
+        selected_profile_id = profile_id
+
+    view = home.HomeView(
+        None,
+        {},
+        card_preview_choices_provider=choices,
+        on_card_preview_select=select,
+    )
+    view.build()
+
+    assert "提醒卡樣式" in {
+        widget.options.get("text") for widget in _FakeWidget.created
+    }
+    view._card_preview_buttons["roomy"].options["command"]()
+
+    assert selected_profile_id == "roomy"
+    assert view._card_preview_buttons["compact"].options["text"] == "精簡方案"
+    assert view._card_preview_buttons["roomy"].options["text"] == "✓ 寬鬆方案"

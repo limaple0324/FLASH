@@ -420,6 +420,7 @@ def create_main_window(
         )
 
     card_view_state_service = AppContext.get(CardViewStateService)
+    card_preview_selection_service = AppContext.get(CardPreviewSelectionService)
     home_view = HomeView(
         window,
         status,
@@ -428,6 +429,16 @@ def create_main_window(
         card_view_state_provider=(
             card_view_state_service.snapshot
             if card_view_state_service is not None
+            else None
+        ),
+        card_preview_choices_provider=(
+            card_preview_selection_service.available_choices
+            if card_preview_selection_service is not None
+            else None
+        ),
+        on_card_preview_select=(
+            card_preview_selection_service.select
+            if card_preview_selection_service is not None
             else None
         ),
     )

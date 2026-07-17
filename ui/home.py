@@ -10,6 +10,7 @@ from collections.abc import Callable
 from tkinter import BOTH, X, Button, Frame, Label
 
 from cards.view_state import CardViewState
+from services.card_preview_selection_service import CardPreviewChoice
 
 
 def _characters(status: dict[str, object]) -> list[dict[str, object]]:
@@ -96,13 +97,18 @@ class HomeView:
         on_start=None,
         card_view_state: CardViewState | None = None,
         card_view_state_provider: Callable[[], CardViewState] | None = None,
+        card_preview_choices_provider: Callable[[], tuple[CardPreviewChoice, ...]] | None = None,
+        on_card_preview_select: Callable[[str], object] | None = None,
     ):
         self.parent = parent
         self.status = status
         self.on_start = on_start
         self.card_view_state = card_view_state
         self.card_view_state_provider = card_view_state_provider
+        self.card_preview_choices_provider = card_preview_choices_provider
+        self.on_card_preview_select = on_card_preview_select
         self._card_label = None
+        self._card_preview_buttons: dict[str, Button] = {}
 
     def refresh_cards(self) -> str:
         """重新讀取唯讀快照，並更新既有的首頁提醒文字。"""
@@ -112,6 +118,24 @@ class HomeView:
         if self._card_label is not None:
             self._card_label.configure(text=text)
         return text
+
+    def refresh_card_preview_choices(self) -> tuple[CardPreviewChoice, ...]:
+        """Refresh the read-only candidate labels after an explicit selection."""
+        if self.card_preview_choices_provider is None:
+            return ()
+        choices = self.card_preview_choices_provider()
+        for choice in choices:
+            button = self._card_preview_buttons.get(choice.profile_id)
+            if button is not None:
+                marker = "✓ " if choice.selected else ""
+                button.configure(text=f"{marker}{choice.display_name}")
+        return choices
+
+    def select_card_preview(self, profile_id: str) -> None:
+        if self.on_card_preview_select is None:
+            return
+        self.on_card_preview_select(profile_id)
+        self.refresh_card_preview_choices()
 
     def build(self):
         body = Frame(self.parent, padx=28, pady=24)
@@ -159,5 +183,25 @@ class HomeView:
             anchor="w",
         )
         self._card_label.pack(fill=X, pady=12)
+
+        choices = self.refresh_card_preview_choices()
+        if choices and self.on_card_preview_select is not None:
+            Label(
+                body,
+                text="提醒卡樣式",
+                font=("Microsoft JhengHei UI", 11),
+                anchor="w",
+            ).pack(fill=X, pady=(12, 4))
+            for choice in choices:
+                marker = "✓ " if choice.selected else ""
+                button = Button(
+                    body,
+                    text=f"{marker}{choice.display_name}",
+                    command=lambda profile_id=choice.profile_id: self.select_card_preview(
+                        profile_id
+                    ),
+                )
+                button.pack(fill=X, pady=2)
+                self._card_preview_buttons[choice.profile_id] = button
 
         return body
