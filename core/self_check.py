@@ -17,6 +17,8 @@ from services.app_context import AppContext
 from services.activity_progress_service import ActivityProgressService
 from services.event_bus import EventBus
 from services.card_history_service import CardHistoryService
+from services.card_preview_selection_service import CardPreviewSelectionService
+from services.card_preview_selection_store import CardPreviewSelectionStore
 from services.logger_service import LoggerService
 
 
@@ -49,6 +51,7 @@ class SelfCheck:
             self._run("window_registry", self._check_window_registry),
             self._run("activity_progress", self._check_activity_progress),
             self._run("card_history", self._check_card_history),
+            self._run("card_preview_selection", self._check_card_preview_selection),
             self._run("recovery_boundary", lambda: self._check_optional(RecoveryBoundary)),
             self._run("smart_reconnect_boundary", lambda: self._check_optional(SmartReconnectBoundary)),
             self._run("external_adapter", lambda: self._check_optional(ExternalAdapter)),
@@ -142,6 +145,41 @@ class SelfCheck:
             backup = store.corrupt_backup.name if store.corrupt_backup else "unknown"
             return f"Card history recovered from corruption; backup saved as {backup}."
         return f"Card history loaded with {len(service.all())} record(s)."
+
+    def _check_card_preview_selection(self) -> str:
+        service = self.context.get(CardPreviewSelectionService)
+        store = self.context.get(CardPreviewSelectionStore)
+        if service is None:
+            if store is not None:
+                raise RuntimeError(
+                    "Card preview selection store is registered without its service."
+                )
+            return "Card overlay is not configured; no preview catalog is registered."
+        if store is None:
+            raise RuntimeError("CardPreviewSelectionStore is not registered.")
+        if store.path.parent != self.paths.data_dir():
+            raise RuntimeError(
+                "Card preview selection path is outside the managed data directory."
+            )
+        if store.recovered_from_corruption:
+            backup = store.corrupt_backup.name if store.corrupt_backup else "unknown"
+            return (
+                "Card overlay is disabled because its selection was corrupt; "
+                f"backup saved as {backup}."
+            )
+        unavailable = service.unavailable_stored_profile_id
+        if unavailable is not None:
+            return (
+                "Card overlay is disabled because the saved preview profile is "
+                f"unavailable: {unavailable}."
+            )
+        state = service.snapshot()
+        if not state.overlay_enabled:
+            return "Card overlay is configured; the player has not selected a preview profile."
+        return (
+            "Card overlay is ready with selected preview profile "
+            f"{state.selected_profile_id}."
+        )
 
     def _check_optional(self, contract: type[object]) -> str:
         service = self.context.get(contract)
