@@ -15,11 +15,11 @@
 - `main`：`538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`，仍是 SP1 0.1.2 工程驗證版。
 - `integration/sp2-sp3-sp35` 本次功能核對基準：
   `85f6e30057ed994ff8980b0d7d27ff7550b7e0b9`。
-- `integration/sp2-sp3-sp35` 本次乾淨來源驗證基準：
-  `d03899dff8a64993b8f1e174c954b58ad48ee3ac`。
+- `integration/sp2-sp3-sp35` 本次 Windows 快照來源基準：
+  `a2bf410298358d6962b76592a08a458e94b88d03`。
 - `release/latest`：`341ce3cdfd715531ae64c4b75f08fc3af4e8ad15`。
 - 開放中的合併請求：無。
-- 在上述功能基準，整合分支相對 `main`：多 79 筆、少 31 筆提交。
+- 在快照來源 `a2bf410`，整合分支相對 `main`：多 84 筆、少 31 筆提交。
 - 模擬合併會衝突：`PROJECT_CONTEXT.md`、`README.md`、`main.py`、
   `tests/test_home_view_text.py`、`tests/test_main_window_layout.py`、`ui/home.py`。
 - 不可硬合併、強推或以任一方整檔覆蓋衝突。
@@ -38,6 +38,9 @@
   失敗時保留原資料、顯示中文訊息並寫入紀錄。
 - Windows 執行相依已明列 `tzdata`；全新虛擬環境只安裝
   `requirements.txt` 後，可正確載入 `Asia/Taipei` 並通過完整來源驗證。
+- Windows 工作流程已分離 SP1 引擎中繼資料與 SP1＋SP2＋SP3 交付身分；
+  只有 `main` 的正式 push 能更新 `release/latest`，手動建置只產生快照。
+- 整合快照刻意不包含「更新輔」與更新核心，避免工程快照切回舊正式通道。
 
 ## SP1／SP2／SP3 獨立交付檔
 
@@ -53,28 +56,41 @@
 - `WorkspaceService` 已有模型與測試，但尚未成為正常主程式工作區資訊來源。
 - 正常 `main()` 尚未提供正式預設提醒卡方案，真正遊戲事件也尚未產生提醒卡。
 - 真正斷線偵測、重新登入、背景／最小化能力與遊戲輸入尚未完成實機驗證。
-- 最新整合分支尚未建立 Windows 執行檔，也未完成 Windows 11 或桌面「更新輔」驗證。
-- `tzdata` 的乾淨來源驗證已通過，但 PyInstaller 封裝是否完整收錄時區資料仍須
-  由最新整合版 Windows 成品驗證。
+- 本機整合快照已建立並通過 Windows 11 啟動煙霧測試，但尚未完成乾淨使用者帳號、
+  真正遊戲、多視窗、背景／最小化、長時間效能與桌面「更新輔」完整驗收。
+- 尚未由 GitHub Actions 產生並下載核對本次整合快照 artifact；`release/latest`
+  仍維持舊 `main` 工程驗證版，沒有被本機快照覆蓋。
 
 ## 目前驗證快照
 
-在 `integration/sp2-sp3-sp35@d03899d` 的全新虛擬環境中，只安裝
-`requirements.txt` 後重新執行：
+在 Windows 11 Enterprise 10.0.26200 的乾淨虛擬環境，針對
+`integration/sp2-sp3-sp35@a2bf410` 重新執行：
 
-- 473 項測試全部通過。
+- 484 項測試全部通過。
 - 全部 Python 原始碼編譯通過。
 - 完整來源程式自我檢查通過。
 - `ZoneInfo("Asia/Taipei")` 可正常載入。
 - 設定、紀錄、自我檢查報告與視窗註冊檔均成功建立。
+- PyInstaller 6.21.0 已建立 `FLASH.exe`，並明確套用 `zoneinfo` 與 `tzdata` hook。
+- 封裝後 `FLASH.exe --self-check`、解壓後重驗、SHA-256 與建置身分全部通過。
+- Windows 11 GUI 已實際開啟標題為「輔」的主視窗，並可正常關閉。
 
-以上是本機原始碼驗證，不等於 GitHub Actions、Windows 執行檔或 Windows 11 實機驗證。
+本機獨立快照：
+`C:\Users\USER\Documents\輔\成品\輔-整合工程驗證版-SP1-SP2-SP3-0.1.2-a2bf410-windows-x64.zip`
+
+- `FLASH.exe` SHA-256：
+  `56580bfe6fe3b124ef924faa795cdab9f7fe16979004d325475d1a242c1e3c3a`
+- ZIP SHA-256：
+  `216cf43415ab730b8915bfb3941368d2ee314fa09818b030af4c991ba765cbec`
+
+以上證明本機 Windows 11 建置、封裝自我檢查與基本 GUI 啟動通過；不等於
+GitHub Actions artifact、完整玩家情境、真正遊戲或正式發布驗收。
 
 ## 下一個小型接續區塊
 
-修正 Windows 工作流程的發布保護，確保手動或整合分支建置不會覆蓋
-`release/latest`；接著補上不冒充 `main` 正式版的整合版中繼資料，再建立
-整合分支 Windows 快照成品。
+由 GitHub Actions 手動建置 `integration/sp2-sp3-sp35`，下載並重驗遠端
+artifact；保持 `release/latest` 不變。通過後接續 `WorkspaceService` 正常主流程
+接線，仍以一個可獨立驗證的小區塊為單位。
 
 ## 固定接續提醒
 

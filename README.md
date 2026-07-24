@@ -21,9 +21,11 @@ FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式
 
 整合分支已包含產品與領域資料骨架、工作區與組別級提醒卡、提醒卡生命週期、
 歷史紀錄、玩家顯示時間設定、浮層骨架、組別角色清單、角色詳細資料，以及
-靈魂石正常編輯與安全保存流程。最新乾淨原始碼快照已通過 473 項自動測試；
-整合版 Windows 執行檔與 Windows 11 實機驗收尚未完成。實際進度以
-[`docs/INTEGRATION_BOARD.md`](docs/INTEGRATION_BOARD.md) 為準。
+靈魂石正常編輯與安全保存流程。最新乾淨快照已通過 484 項自動測試；
+本機 SP1＋SP2＋SP3 Windows 整合工程快照已完成封裝自我檢查與 Windows 11
+基本 GUI 啟動煙霧測試，但 GitHub Actions artifact、真正遊戲與完整實機驗收
+尚未完成。實際進度以 [`docs/INTEGRATION_BOARD.md`](docs/INTEGRATION_BOARD.md)
+為準。
 
 SP1 目前已包含：
 

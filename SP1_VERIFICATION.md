@@ -3,8 +3,9 @@
 This document is the delivery gate for FLASH SP1. A feature is not considered complete merely because code or a workflow file exists.
 
 Scope note (2026-07-25): this checklist governs the SP1 engineering build on `main`
-and the current `release/latest`. It does not prove that the newer
-`integration/sp2-sp3-sp35` source has a Windows executable or Windows 11 acceptance.
+and the current `release/latest`. The newer `integration/sp2-sp3-sp35@a2bf410`
+has a locally built and verified Windows integration snapshot, but that is not evidence
+of a GitHub Actions artifact, an updated `release/latest`, or complete Windows 11 acceptance.
 
 ## A. Repository and delivery update
 
