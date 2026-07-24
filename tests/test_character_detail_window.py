@@ -15,6 +15,7 @@ def _detail() -> PlayerCharacterDetail:
         importance="主號",
         role="古",
         note="守紀優先",
+        soul_stone="本週先保留稀有靈魂石",
     )
 
 
@@ -159,7 +160,8 @@ def test_default_content_is_chinese_and_keeps_visual_factories_replaceable() -> 
         "等級：120\n"
         "分類：主號\n"
         "定位：古\n"
-        "備註：守紀優先"
+        "備註：守紀優先\n"
+        "靈魂石：本週先保留稀有靈魂石"
     )
     assert button.options["text"] == "關閉"
     button.options["command"]()

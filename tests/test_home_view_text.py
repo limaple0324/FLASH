@@ -164,6 +164,7 @@ def test_player_character_detail_text_uses_confirmed_chinese_fields():
             importance="主號",
             role="古",
             note="守紀優先",
+            soul_stone="本週先保留稀有靈魂石",
         )
     )
 
@@ -173,7 +174,8 @@ def test_player_character_detail_text_uses_confirmed_chinese_fields():
         "等級：120\n"
         "分類：主號\n"
         "定位：古\n"
-        "備註：守紀優先"
+        "備註：守紀優先\n"
+        "靈魂石：本週先保留稀有靈魂石"
     )
 
 
@@ -195,9 +197,9 @@ def test_player_character_detail_text_marks_missing_values_without_guessing():
         "等級：尚未設定\n"
         "分類：尚未設定\n"
         "定位：尚未設定\n"
-        "備註：尚未設定"
+        "備註：尚未設定\n"
+        "靈魂石：尚未設定"
     )
-    assert "靈魂石" not in text
     assert "命魂" not in text
     assert "魂器" not in text
     assert "背包" not in text

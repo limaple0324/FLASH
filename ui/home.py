@@ -132,6 +132,7 @@ def format_player_character_detail(detail: PlayerCharacterDetail) -> str:
             f"分類：{value_or_unset(detail.importance)}",
             f"定位：{value_or_unset(detail.role)}",
             f"備註：{value_or_unset(detail.note)}",
+            f"靈魂石：{value_or_unset(detail.soul_stone)}",
         )
     )
 
