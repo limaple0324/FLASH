@@ -17,6 +17,7 @@ from adapters.windows_window import WindowsWindowAdapter
 from cards.history_store import CardHistoryStore
 from cards.service import CardService
 from cards.settings import (
+    DEFAULT_CARD_LIFETIME_SECONDS,
     CardDisplaySettings,
     CardDisplaySettingsResolution,
     resolve_card_display_settings,
@@ -321,6 +322,35 @@ def format_card_overlay_status(status: dict[str, object]) -> str:
     return "提醒卡浮層：狀態無法判斷，目前保持停用。"
 
 
+def format_card_display_settings_status(status: dict[str, object]) -> str:
+    """Turn card lifetime diagnostics into a concise player-facing summary."""
+    check = next(
+        (
+            item
+            for item in _self_check_items(status)
+            if item.get("name") == "card_display_settings"
+        ),
+        None,
+    )
+    if check is None:
+        return "提醒卡顯示時間：未取得設定狀態。"
+    if not bool(check.get("passed", False)):
+        return "提醒卡顯示時間：設定檢查未通過，目前使用安全預設值。"
+
+    message = str(check.get("message", ""))
+    seconds = next(
+        (part for part in message.split() if part.isdecimal()),
+        str(DEFAULT_CARD_LIFETIME_SECONDS),
+    )
+    if "setting was invalid" in message:
+        return f"提醒卡顯示時間：原設定無效，已安全改用 {seconds} 秒。"
+    if "uses default" in message:
+        return f"提醒卡顯示時間：目前使用預設 {seconds} 秒。"
+    if "is configured" in message:
+        return f"提醒卡顯示時間：目前設定為 {seconds} 秒。"
+    return "提醒卡顯示時間：狀態無法判斷，目前使用安全預設值。"
+
+
 def format_window_status(status: dict[str, object]) -> str:
     item = status.get("target_window", {})
     if not isinstance(item, dict):
@@ -430,6 +460,7 @@ def create_main_window(
                 "目前可以查看狀態與紀錄。\n\n"
                 "遊戲操作尚未啟用，輔不會自動點擊或控制遊戲。\n"
                 f"{format_card_overlay_status(status)}\n"
+                f"{format_card_display_settings_status(status)}\n"
                 f"紀錄位置：{paths.logs_dir()}"
             ),
             parent=window,

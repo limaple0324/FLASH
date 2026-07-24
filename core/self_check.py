@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from cards.history_store import CardHistoryStore
+from cards.settings import CardDisplaySettings, CardDisplaySettingsResolution
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.sp1_boundaries import ExternalAdapter, RecoveryBoundary, SmartReconnectBoundary
@@ -51,6 +52,7 @@ class SelfCheck:
             self._run("window_registry", self._check_window_registry),
             self._run("activity_progress", self._check_activity_progress),
             self._run("card_history", self._check_card_history),
+            self._run("card_display_settings", self._check_card_display_settings),
             self._run("card_preview_selection", self._check_card_preview_selection),
             self._run("recovery_boundary", lambda: self._check_optional(RecoveryBoundary)),
             self._run("smart_reconnect_boundary", lambda: self._check_optional(SmartReconnectBoundary)),
@@ -145,6 +147,28 @@ class SelfCheck:
             backup = store.corrupt_backup.name if store.corrupt_backup else "unknown"
             return f"Card history recovered from corruption; backup saved as {backup}."
         return f"Card history loaded with {len(service.all())} record(s)."
+
+    def _check_card_display_settings(self) -> str:
+        settings = self.context.get(CardDisplaySettings)
+        resolution = self.context.get(CardDisplaySettingsResolution)
+        if settings is None:
+            raise RuntimeError("CardDisplaySettings is not registered.")
+        if resolution is None:
+            raise RuntimeError("CardDisplaySettingsResolution is not registered.")
+        if resolution.settings is not settings:
+            raise RuntimeError(
+                "Card display settings resolution does not use the registered settings."
+            )
+
+        seconds = settings.lifetime_seconds
+        if resolution.recovered_from_invalid:
+            return (
+                "Card lifetime setting was invalid; "
+                f"using safe default of {seconds} seconds."
+            )
+        if not resolution.configured:
+            return f"Card lifetime uses default of {seconds} seconds."
+        return f"Card lifetime is configured to {seconds} seconds."
 
     def _check_card_preview_selection(self) -> str:
         service = self.context.get(CardPreviewSelectionService)

@@ -20,6 +20,7 @@ def test_self_check_reports_all_required_checks_once(tmp_path):
         "window_registry",
         "activity_progress",
         "card_history",
+        "card_display_settings",
         "card_preview_selection",
         "recovery_boundary",
         "smart_reconnect_boundary",
