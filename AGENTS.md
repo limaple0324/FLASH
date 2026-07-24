@@ -5,10 +5,13 @@
 1. `PROJECT_CONTEXT.md`
 2. `docs/USER_REQUIREMENTS_2026-07-24.md`
 3. `docs/00_輔_專案完整總整理與未來路線圖.md`
-4. `docs/INTEGRATION_BOARD.md`
-5. `docs/INTEGRATION_ARCHITECTURE_BASELINE.md`
-6. `docs/INTEGRATION_BLUEPRINT_MAP.md`
-7. `SP1_VERIFICATION.md`
+4. `docs/01_輔_SP1_基礎系統_狀態與驗收.md`
+5. `docs/02_輔_SP2_智慧邏輯_狀態與驗收.md`
+6. `docs/03_輔_SP3_產品呈現_狀態與驗收.md`
+7. `docs/INTEGRATION_BOARD.md`
+8. `docs/INTEGRATION_ARCHITECTURE_BASELINE.md`
+9. `docs/INTEGRATION_BLUEPRINT_MAP.md`
+10. `SP1_VERIFICATION.md`
 
 產品決策以正式文件為準；程式是否完成，必須共同核對目前分支的原始碼、測試、
 提交紀錄與自我檢查，不可只看文件勾選框。

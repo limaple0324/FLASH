@@ -7,8 +7,12 @@ FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式
 完整產品核心、SP1／SP2／SP3 決策、玩家流程、提醒卡規格、實作現況、待驗證項目及未來討論順序，統一以以下文件為基準：
 
 - [「輔」專案完整總整理與未來路線圖](docs/00_輔_專案完整總整理與未來路線圖.md)
+- [SP1 基礎系統｜狀態與驗收](docs/01_輔_SP1_基礎系統_狀態與驗收.md)
+- [SP2 智慧邏輯｜狀態與驗收](docs/02_輔_SP2_智慧邏輯_狀態與驗收.md)
+- [SP3 產品呈現｜狀態與驗收](docs/03_輔_SP3_產品呈現_狀態與驗收.md)
 
-後續進度必須分開標示：**已討論完成、已寫入倉庫、已完成程式實作、已通過雲端測試、已通過 Windows 實機驗證**。
+後續進度必須分開標示：**已討論完成、已寫入倉庫、已完成程式實作、
+已通過自動測試、已建立 Windows 成品、已通過 Windows 11 實機驗證、已正式發布**。
 
 ## 目前里程碑
 
@@ -16,7 +20,9 @@ FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式
 - `integration/sp2-sp3-sp35`：持續整合 SP2／SP3／SP3.5
 
 整合分支已包含產品與領域資料骨架、工作區與組別級提醒卡、提醒卡生命週期、
-歷史紀錄、玩家顯示時間設定及浮層骨架。實際進度以
+歷史紀錄、玩家顯示時間設定、浮層骨架、組別角色清單、角色詳細資料，以及
+靈魂石正常編輯與安全保存流程。最新原始碼快照已通過 471 項自動測試；
+整合版 Windows 執行檔與 Windows 11 實機驗收尚未完成。實際進度以
 [`docs/INTEGRATION_BOARD.md`](docs/INTEGRATION_BOARD.md) 為準。
 
 SP1 目前已包含：
@@ -29,7 +35,7 @@ SP1 目前已包含：
 - Recovery / Smart Reconnect / External Adapter contracts
 - structured self-check system
 - Windows desktop verification window
-- Windows desktop auto-sync scripts
+- single player-facing Windows update flow
 - PyInstaller build specification
 - GitHub Actions test-and-build workflow
 - release bundle metadata and SHA-256 verification

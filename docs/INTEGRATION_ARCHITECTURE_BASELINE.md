@@ -2,6 +2,9 @@
 
 本文件記錄 SP2、SP3、SP3.5 整合前的現有程式基準與固定接入邊界。
 
+> 本文件是 Sprint 0 的歷史架構基準，不是目前功能完成表。部分接入點已落地；
+> 最新實作狀態請看 `PROJECT_CONTEXT.md` 與 `docs/INTEGRATION_BOARD.md`。
+
 ## 一、現有結構
 
 ### 1. 啟動入口

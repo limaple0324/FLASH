@@ -2,9 +2,12 @@
 
 本文件將既有 Blueprint 對應至目前程式層次，不重新命名、不重新設計。
 
+> 下表記錄已定案的 Blueprint 與目標責任，不代表每個預定模組都已建立。
+> 最新程式完成度請看 `PROJECT_CONTEXT.md` 與 `docs/INTEGRATION_BOARD.md`。
+
 ## SP2｜Brain（決策層）
 
-| 已完成 Blueprint | 程式責任 | 預定模組 |
+| 已定案 Blueprint | 程式責任 | 預定模組 |
 |---|---|---|
 | 產品哲學 | 固定產品原則與不可違反規則 | `product/principles.py` |
 | 工作區系統 | 工作區狀態、目前組別、目前活動 | `workspace/models.py`、`workspace/service.py` |
@@ -20,7 +23,7 @@
 
 ## SP3｜Presentation（呈現層）
 
-| 已完成 Blueprint | 程式責任 | 預定模組 |
+| 已定案 Blueprint | 程式責任 | 預定模組 |
 |---|---|---|
 | 產品呈現 | 主畫面資訊結構 | `ui/main_view.py` |
 | 陪伴體驗 | 少操作、不打擾、當下相關 | `presentation/view_state.py` |
@@ -31,7 +34,7 @@
 
 ## SP3.5｜Companion（陪伴層）
 
-| 已完成 Blueprint | 程式責任 | 預定模組 |
+| 已定案 Blueprint | 程式責任 | 預定模組 |
 |---|---|---|
 | 陪伴個性 | 安心、可靠、值得託付背後 | `companion/personality.py` |
 | 主動程度 | 何時提醒、建議、保持安靜 | `companion/policy.py` |
