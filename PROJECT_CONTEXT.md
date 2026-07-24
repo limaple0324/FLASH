@@ -15,6 +15,8 @@
 - `main`：`538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`，仍是 SP1 0.1.2 工程驗證版。
 - `integration/sp2-sp3-sp35` 本次功能核對基準：
   `85f6e30057ed994ff8980b0d7d27ff7550b7e0b9`。
+- `integration/sp2-sp3-sp35` 本次乾淨來源驗證基準：
+  `d03899dff8a64993b8f1e174c954b58ad48ee3ac`。
 - `release/latest`：`341ce3cdfd715531ae64c4b75f08fc3af4e8ad15`。
 - 開放中的合併請求：無。
 - 在上述功能基準，整合分支相對 `main`：多 79 筆、少 31 筆提交。
@@ -34,6 +36,8 @@
 - 每角色靈魂石模型、保存、顯示、修改／清除服務、獨立編輯視窗與安全角色配對。
 - 角色詳細頁已正式接上靈魂石編輯；保存／清除後會重抓正確角色並刷新，
   失敗時保留原資料、顯示中文訊息並寫入紀錄。
+- Windows 執行相依已明列 `tzdata`；全新虛擬環境只安裝
+  `requirements.txt` 後，可正確載入 `Asia/Taipei` 並通過完整來源驗證。
 
 ## SP1／SP2／SP3 獨立交付檔
 
@@ -50,25 +54,27 @@
 - 正常 `main()` 尚未提供正式預設提醒卡方案，真正遊戲事件也尚未產生提醒卡。
 - 真正斷線偵測、重新登入、背景／最小化能力與遊戲輸入尚未完成實機驗證。
 - 最新整合分支尚未建立 Windows 執行檔，也未完成 Windows 11 或桌面「更新輔」驗證。
-- 乾淨 Windows Python 環境需要 `tzdata` 才能載入 `Asia/Taipei`；目前相依清單
-  尚未明列，建立乾淨成品前必須修正並重新驗證。
+- `tzdata` 的乾淨來源驗證已通過，但 PyInstaller 封裝是否完整收錄時區資料仍須
+  由最新整合版 Windows 成品驗證。
 
 ## 目前驗證快照
 
-在 `integration/sp2-sp3-sp35@85f6e30` 上重新執行：
+在 `integration/sp2-sp3-sp35@d03899d` 的全新虛擬環境中，只安裝
+`requirements.txt` 後重新執行：
 
-- 471 項測試全部通過。
+- 473 項測試全部通過。
 - 全部 Python 原始碼編譯通過。
 - 完整來源程式自我檢查通過。
+- `ZoneInfo("Asia/Taipei")` 可正常載入。
 - 設定、紀錄、自我檢查報告與視窗註冊檔均成功建立。
 
 以上是本機原始碼驗證，不等於 GitHub Actions、Windows 執行檔或 Windows 11 實機驗證。
 
 ## 下一個小型接續區塊
 
-先補齊乾淨 Windows 環境的 `tzdata` 相依並驗證；下一個小區塊再修正
-Windows 工作流程的發布保護與整合版中繼資料，確保手動建置不會覆蓋
-`release/latest`，之後才建立整合分支快照成品。
+修正 Windows 工作流程的發布保護，確保手動或整合分支建置不會覆蓋
+`release/latest`；接著補上不冒充 `main` 正式版的整合版中繼資料，再建立
+整合分支 Windows 快照成品。
 
 ## 固定接續提醒
 
