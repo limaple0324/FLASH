@@ -38,22 +38,34 @@ class CharacterViewService:
                 )
             self._characters[character.character_id] = character
 
-    def all(self) -> tuple[PlayerCharacterView, ...]:
-        snapshots: list[PlayerCharacterView] = []
+    def all_with_identities(
+        self,
+    ) -> tuple[tuple[str, PlayerCharacterView], ...]:
+        """提供內部服務安全配對；角色識別不得傳給顯示層。"""
+        snapshots: list[tuple[str, PlayerCharacterView]] = []
         for record in self._registry.all():
             character = self._characters.get(record.character_id)
             snapshots.append(
-                PlayerCharacterView(
-                    display_name=record.display_name,
-                    group=record.group,
-                    level=character.level if character is not None else None,
-                    importance=(
-                        character.importance.value
-                        if character is not None
-                        else None
+                (
+                    record.character_id,
+                    PlayerCharacterView(
+                        display_name=record.display_name,
+                        group=record.group,
+                        level=character.level if character is not None else None,
+                        importance=(
+                            character.importance.value
+                            if character is not None
+                            else None
+                        ),
+                        role=record.role,
+                        note=record.note,
                     ),
-                    role=record.role,
-                    note=record.note,
                 )
             )
         return tuple(snapshots)
+
+    def all(self) -> tuple[PlayerCharacterView, ...]:
+        return tuple(
+            snapshot
+            for _character_id, snapshot in self.all_with_identities()
+        )

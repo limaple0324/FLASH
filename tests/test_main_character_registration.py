@@ -2,6 +2,8 @@ from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from domain.character import Character, CharacterImportance
 from domain.character_store import CharacterStore
+from domain.soul_stone import SoulStoneRecord
+from domain.soul_stone_store import SoulStoneStore
 from main import build_services
 from services.app_context import AppContext
 from services.character_detail_view_service import (
@@ -33,6 +35,9 @@ def test_build_services_loads_character_profiles_into_read_only_view(tmp_path) -
             ),
         )
     )
+    SoulStoneStore(tmp_path / "data" / "soul_stones.json").save(
+        (SoulStoneRecord("same-character", "本週先保留稀有靈魂石"),)
+    )
 
     build_services(root=tmp_path)
 
@@ -55,6 +60,7 @@ def test_build_services_loads_character_profiles_into_read_only_view(tmp_path) -
             importance="主號",
             role="古",
             note="守紀優先",
+            soul_stone="本週先保留稀有靈魂石",
         ),
     )
 

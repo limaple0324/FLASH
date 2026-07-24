@@ -138,9 +138,12 @@ def build_services(
     character_store = CharacterStore(paths.data_dir() / CHARACTER_FILENAME)
     characters = character_store.load()
     character_view_service = CharacterViewService(registry, characters)
-    character_detail_view_service = CharacterDetailViewService(character_view_service)
     soul_stone_store = SoulStoneStore(paths.data_dir() / SOUL_STONE_FILENAME)
     soul_stone_service = SoulStoneService(soul_stone_store)
+    character_detail_view_service = CharacterDetailViewService(
+        character_view_service,
+        soul_stone_service,
+    )
     progress_store = ActivityProgressStore(paths.data_dir() / ACTIVITY_PROGRESS_FILENAME)
     progress_service = ActivityProgressService(progress_store)
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
