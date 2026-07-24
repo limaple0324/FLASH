@@ -116,6 +116,35 @@ def test_window_rejects_duplicate_open_and_untrusted_detail() -> None:
         view.open(_detail())
 
 
+def test_window_rejects_untrusted_optional_edit_callback() -> None:
+    with pytest.raises(TypeError, match="on_edit_soul_stone"):
+        CharacterDetailWindow(object(), on_edit_soul_stone=object())
+
+
+def test_default_renderer_receives_optional_edit_callback(monkeypatch) -> None:
+    factory = RecordingWindowFactory()
+    edit = lambda: None
+    rendered = []
+
+    def record_render(window, detail, close, **options):
+        rendered.append((window, detail, close, options))
+
+    monkeypatch.setattr(
+        "ui.character_detail_window.render_character_detail",
+        record_render,
+    )
+    view = CharacterDetailWindow(
+        object(),
+        on_edit_soul_stone=edit,
+        window_factory=factory,
+    )
+
+    view.open(_detail())
+
+    assert rendered[0][0:2] == (factory.windows[0], _detail())
+    assert rendered[0][3] == {"on_edit_soul_stone": edit}
+
+
 def test_renderer_failure_cleans_up_partial_window() -> None:
     factory = RecordingWindowFactory()
 
@@ -166,3 +195,30 @@ def test_default_content_is_chinese_and_keeps_visual_factories_replaceable() -> 
     assert button.options["text"] == "關閉"
     button.options["command"]()
     assert close_calls == ["close"]
+
+
+def test_optional_soul_stone_edit_entry_is_hidden_until_injected() -> None:
+    frame_factory = RecordingWidgetFactory()
+    label_factory = RecordingWidgetFactory()
+    button_factory = RecordingWidgetFactory()
+    calls = []
+
+    render_character_detail(
+        FakeWindow(),
+        _detail(),
+        lambda: calls.append("close"),
+        on_edit_soul_stone=lambda: calls.append("edit"),
+        frame_factory=frame_factory,
+        label_factory=label_factory,
+        button_factory=button_factory,
+    )
+
+    assert [button.options["text"] for button in button_factory.widgets] == [
+        "編輯靈魂石",
+        "關閉",
+    ]
+    assert button_factory.widgets[0].pack_options["pady"] == (20, 0)
+    assert button_factory.widgets[1].pack_options["pady"] == (8, 0)
+    button_factory.widgets[0].options["command"]()
+    button_factory.widgets[1].options["command"]()
+    assert calls == ["edit", "close"]

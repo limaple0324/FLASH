@@ -37,6 +37,7 @@ def render_character_detail(
     detail: PlayerCharacterDetail,
     on_close: Callable[[], None],
     *,
+    on_edit_soul_stone: Callable[[], None] | None = None,
     frame_factory: WidgetFactory | None = None,
     label_factory: WidgetFactory | None = None,
     button_factory: WidgetFactory | None = None,
@@ -57,12 +58,19 @@ def render_character_detail(
         justify="left",
         anchor="w",
     ).pack(fill=tk.X)
+    if on_edit_soul_stone is not None:
+        button_factory(
+            body,
+            text="編輯靈魂石",
+            width=12,
+            command=on_edit_soul_stone,
+        ).pack(pady=(20, 0))
     button_factory(
         body,
         text="關閉",
         width=12,
         command=on_close,
-    ).pack(pady=(20, 0))
+    ).pack(pady=(8 if on_edit_soul_stone is not None else 20, 0))
 
 
 class CharacterDetailWindow:
@@ -72,16 +80,20 @@ class CharacterDetailWindow:
         self,
         master: Any,
         *,
+        on_edit_soul_stone: Callable[[], None] | None = None,
         window_factory: WindowFactory | None = None,
         renderer: DetailRenderer | None = None,
     ) -> None:
+        if on_edit_soul_stone is not None and not callable(on_edit_soul_stone):
+            raise TypeError("on_edit_soul_stone must be callable.")
         if window_factory is not None and not callable(window_factory):
             raise TypeError("window_factory must be callable.")
         if renderer is not None and not callable(renderer):
             raise TypeError("renderer must be callable.")
         self._master = master
+        self._on_edit_soul_stone = on_edit_soul_stone
         self._window_factory = window_factory or _default_window_factory
-        self._renderer = renderer or render_character_detail
+        self._renderer = renderer
         self._window: DetailWindow | None = None
 
     @property
@@ -100,7 +112,15 @@ class CharacterDetailWindow:
             window.title("輔｜角色詳細資料")
             window.transient(self._master)
             window.protocol("WM_DELETE_WINDOW", self.close)
-            self._renderer(window, detail, self.close)
+            if self._renderer is None:
+                render_character_detail(
+                    window,
+                    detail,
+                    self.close,
+                    on_edit_soul_stone=self._on_edit_soul_stone,
+                )
+            else:
+                self._renderer(window, detail, self.close)
         except Exception:
             self._window = None
             window.destroy()
