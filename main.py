@@ -47,7 +47,7 @@ from services.card_view_state_service import CardViewStateService
 from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
-from ui.home import HomeView, format_group_characters
+from ui.home import HomeView, format_player_characters
 from ui.card_preview_settings import CardPreviewCatalog
 
 APP_TITLE = PRODUCT_NAME
@@ -519,9 +519,15 @@ def create_main_window(
         )
 
     def show_group_characters() -> None:
+        character_view_service = AppContext.get(CharacterViewService)
+        characters = (
+            character_view_service.all()
+            if character_view_service is not None
+            else ()
+        )
         messagebox.showinfo(
             "輔｜組別角色",
-            format_group_characters({"window_registry": registry_status()}),
+            format_player_characters(characters),
             parent=window,
         )
 

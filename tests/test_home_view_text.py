@@ -1,11 +1,13 @@
 from pathlib import Path
 
+from services.character_view_service import PlayerCharacterView
 from ui.home import (
     _card_text,
     _group_text,
     _status_text,
     _workspace_text,
     format_group_characters,
+    format_player_characters,
 )
 
 
@@ -104,5 +106,46 @@ def test_group_character_text_lists_every_character_by_group_without_internals()
 def test_group_character_text_has_player_facing_empty_state():
     assert (
         format_group_characters({"window_registry": {"characters": []}})
+        == "目前沒有可顯示的組別與角色資料。"
+    )
+
+
+def test_player_character_text_includes_level_importance_role_and_note():
+    text = format_player_characters(
+        (
+            PlayerCharacterView(
+                display_name="小古",
+                group="14支",
+                level=120,
+                importance="主號",
+                role="古",
+                note="守紀優先",
+            ),
+            PlayerCharacterView(
+                display_name="待補資料",
+                group=None,
+                level=None,
+                importance=None,
+                role=None,
+                note=None,
+            ),
+        )
+    )
+
+    assert text == (
+        "【14支】\n"
+        "• 小古\n"
+        "  等級：120\n"
+        "  分類：主號\n"
+        "  定位：古\n"
+        "  備註：守紀優先\n\n"
+        "【未分組】\n"
+        "• 待補資料"
+    )
+
+
+def test_player_character_text_has_player_facing_empty_state():
+    assert (
+        format_player_characters(())
         == "目前沒有可顯示的組別與角色資料。"
     )

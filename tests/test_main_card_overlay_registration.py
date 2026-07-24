@@ -188,16 +188,30 @@ def test_main_window_shows_current_group_characters_without_internal_details(
     tmp_path,
 ) -> None:
     import main
+    from domain.character import Character, CharacterImportance
+    from domain.character_store import CharacterStore
+    from core.window_registry_store import WindowRegistryStore
 
-    build_services(root=tmp_path)
-    registry = AppContext.get(WindowRegistry)
+    registry = WindowRegistry()
     registry.register_character(
         "private-character-id",
         "小古",
         group="14支",
-        role="主號",
+        role="古",
         note="守紀優先",
     )
+    WindowRegistryStore(tmp_path / "data" / "window_registry.json").save(registry)
+    CharacterStore(tmp_path / "data" / "characters.json").save(
+        (
+            Character(
+                "private-character-id",
+                "舊名稱",
+                120,
+                CharacterImportance.PRIMARY,
+            ),
+        )
+    )
+    build_services(root=tmp_path)
     window = FakeWindow()
     shown = []
     monkeypatch.setattr(main, "Tk", lambda: window)
@@ -216,7 +230,14 @@ def test_main_window_shows_current_group_characters_without_internal_details(
     assert shown == [
         (
             "輔｜組別角色",
-            "【14支】\n• 小古\n  定位：主號\n  備註：守紀優先",
+            (
+                "【14支】\n"
+                "• 小古\n"
+                "  等級：120\n"
+                "  分類：主號\n"
+                "  定位：古\n"
+                "  備註：守紀優先"
+            ),
             window,
         )
     ]

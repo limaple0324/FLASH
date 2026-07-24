@@ -6,11 +6,12 @@ Keeps engineering diagnostics separated from the player home experience.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from tkinter import BOTH, X, Button, Entry, Frame, Label
 
 from cards.view_state import CardViewState
 from services.card_preview_selection_service import CardPreviewChoice
+from services.character_view_service import PlayerCharacterView
 
 
 def _characters(status: dict[str, object]) -> list[dict[str, object]]:
@@ -76,6 +77,35 @@ def format_group_characters(status: dict[str, object]) -> str:
             note = item.get("note")
             if isinstance(note, str) and note.strip():
                 lines.append(f"  備註：{note.strip()}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def format_player_characters(
+    characters: Iterable[PlayerCharacterView],
+) -> str:
+    """顯示已合併的角色資料，不外露固定識別或視窗技術資訊。"""
+    grouped: dict[str, list[PlayerCharacterView]] = {}
+    for item in characters:
+        group_name = item.group.strip() if item.group and item.group.strip() else "未分組"
+        grouped.setdefault(group_name, []).append(item)
+
+    if not grouped:
+        return "目前沒有可顯示的組別與角色資料。"
+
+    lines: list[str] = []
+    for group_name in sorted(grouped, key=lambda value: (value == "未分組", value)):
+        lines.append(f"【{group_name}】")
+        for item in grouped[group_name]:
+            lines.append(f"• {item.display_name}")
+            if item.level is not None:
+                lines.append(f"  等級：{item.level}")
+            if item.importance:
+                lines.append(f"  分類：{item.importance}")
+            if item.role:
+                lines.append(f"  定位：{item.role}")
+            if item.note:
+                lines.append(f"  備註：{item.note}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
