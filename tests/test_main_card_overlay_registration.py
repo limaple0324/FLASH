@@ -130,6 +130,40 @@ def test_main_window_builds_and_manages_registered_overlay(monkeypatch, tmp_path
     assert runtime.stop_calls == 1
 
 
+def test_main_window_reports_card_preview_failure_without_internal_details(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import main
+
+    build_services(root=tmp_path, card_preview_catalog=_catalog())
+    window = FakeWindow()
+    shown = []
+    monkeypatch.setattr(main, "Tk", lambda: window)
+    monkeypatch.setattr(main, "HomeView", FakeHomeView)
+    monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
+    monkeypatch.setattr(main, "_build_registered_card_overlay_runtime", lambda _window: None)
+    monkeypatch.setattr(
+        main.messagebox,
+        "showerror",
+        lambda title, message, parent: shown.append((title, message, parent)),
+    )
+
+    created = create_main_window({}, main.AppContext.get(main.PathManager))
+    created._home_view.kwargs["on_card_preview_error"](
+        "select",
+        OSError("private disk path"),
+    )
+
+    assert shown == [
+        (
+            "輔｜提醒卡樣式",
+            "無法套用提醒卡樣式，原本設定已保留。\n\n請稍後再試；錯誤已寫入紀錄。",
+            window,
+        )
+    ]
+
+
 def test_run_forwards_explicit_catalog_into_startup_services(tmp_path) -> None:
     exit_code = run(
         self_check_only=True,

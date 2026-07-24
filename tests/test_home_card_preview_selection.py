@@ -82,3 +82,45 @@ def test_home_selects_candidate_and_refreshes_selected_marker(monkeypatch) -> No
     assert selected_profile_id is None
     assert view._card_preview_buttons["roomy"].options["text"] == "寬鬆方案"
     assert view._card_preview_clear_button.packed is False
+
+
+def test_home_reports_preview_errors_without_changing_visible_selection(
+    monkeypatch,
+) -> None:
+    _install_fake_widgets(monkeypatch)
+    errors: list[tuple[str, str]] = []
+
+    def choices() -> tuple[CardPreviewChoice, ...]:
+        return (
+            CardPreviewChoice("compact", "精簡方案", True),
+            CardPreviewChoice("roomy", "寬鬆方案", False),
+        )
+
+    def fail_select(_profile_id: str) -> None:
+        raise OSError("selection write failed")
+
+    def fail_clear() -> None:
+        raise OSError("selection delete failed")
+
+    view = home.HomeView(
+        None,
+        {},
+        card_preview_choices_provider=choices,
+        on_card_preview_select=fail_select,
+        on_card_preview_clear=fail_clear,
+        on_card_preview_error=lambda action, error: errors.append(
+            (action, str(error))
+        ),
+    )
+    view.build()
+
+    view._card_preview_buttons["roomy"].options["command"]()
+    view._card_preview_clear_button.options["command"]()
+
+    assert errors == [
+        ("select", "selection write failed"),
+        ("clear", "selection delete failed"),
+    ]
+    assert view._card_preview_buttons["compact"].options["text"] == "✓ 精簡方案"
+    assert view._card_preview_buttons["roomy"].options["text"] == "寬鬆方案"
+    assert view._card_preview_clear_button.packed is True

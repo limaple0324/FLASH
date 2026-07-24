@@ -419,6 +419,20 @@ def create_main_window(
             parent=window,
         )
 
+    def show_card_preview_error(action: str, error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            logger.error(f"Card preview {action} failed: {error}")
+        action_text = {
+            "select": "無法套用提醒卡樣式",
+            "clear": "無法關閉提醒卡預覽",
+        }.get(action, "無法更新提醒卡樣式")
+        messagebox.showerror(
+            "輔｜提醒卡樣式",
+            f"{action_text}，原本設定已保留。\n\n請稍後再試；錯誤已寫入紀錄。",
+            parent=window,
+        )
+
     card_view_state_service = AppContext.get(CardViewStateService)
     card_preview_selection_service = AppContext.get(CardPreviewSelectionService)
     home_view = HomeView(
@@ -446,6 +460,7 @@ def create_main_window(
             if card_preview_selection_service is not None
             else None
         ),
+        on_card_preview_error=show_card_preview_error,
     )
     home_view.build()
     window._home_view = home_view

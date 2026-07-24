@@ -100,6 +100,7 @@ class HomeView:
         card_preview_choices_provider: Callable[[], tuple[CardPreviewChoice, ...]] | None = None,
         on_card_preview_select: Callable[[str], object] | None = None,
         on_card_preview_clear: Callable[[], object] | None = None,
+        on_card_preview_error: Callable[[str, Exception], object] | None = None,
     ):
         self.parent = parent
         self.status = status
@@ -109,6 +110,7 @@ class HomeView:
         self.card_preview_choices_provider = card_preview_choices_provider
         self.on_card_preview_select = on_card_preview_select
         self.on_card_preview_clear = on_card_preview_clear
+        self.on_card_preview_error = on_card_preview_error
         self._card_label = None
         self._card_preview_buttons: dict[str, Button] = {}
         self._card_preview_clear_button: Button | None = None
@@ -139,14 +141,27 @@ class HomeView:
     def select_card_preview(self, profile_id: str) -> None:
         if self.on_card_preview_select is None:
             return
-        self.on_card_preview_select(profile_id)
+        try:
+            self.on_card_preview_select(profile_id)
+        except Exception as exc:
+            self._report_card_preview_error("select", exc)
+            return
         self.refresh_card_preview_choices()
 
     def clear_card_preview(self) -> None:
         if self.on_card_preview_clear is None:
             return
-        self.on_card_preview_clear()
+        try:
+            self.on_card_preview_clear()
+        except Exception as exc:
+            self._report_card_preview_error("clear", exc)
+            return
         self.refresh_card_preview_choices()
+
+    def _report_card_preview_error(self, action: str, error: Exception) -> None:
+        if self.on_card_preview_error is None:
+            raise error
+        self.on_card_preview_error(action, error)
 
     def _set_card_preview_clear_visible(self, visible: bool) -> None:
         button = self._card_preview_clear_button
