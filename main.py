@@ -29,6 +29,7 @@ from core.bootstrap import Bootstrap
 from core.sp1_boundaries import ExternalAdapter
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+from domain.character_store import CharacterStore
 from domain.progress_store import ActivityProgressStore
 from product.identity import PRODUCT_NAME
 from services.activity_progress_service import ActivityProgressService
@@ -43,6 +44,7 @@ from services.card_overlay_selection_assembly import (
 from services.card_preview_selection_service import CardPreviewSelectionService
 from services.card_preview_selection_store import CardPreviewSelectionStore
 from services.card_view_state_service import CardViewStateService
+from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from ui.home import HomeView, format_group_characters
@@ -52,6 +54,7 @@ APP_TITLE = PRODUCT_NAME
 SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_WINDOW_KEY = "target_window_keywords"
 REGISTRY_FILENAME = "window_registry.json"
+CHARACTER_FILENAME = "characters.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
 CARD_PREVIEW_SELECTION_FILENAME = "card_preview_selection.json"
@@ -126,6 +129,9 @@ def build_services(
 
     registry_store = WindowRegistryStore(paths.data_dir() / REGISTRY_FILENAME)
     registry = registry_store.load()
+    character_store = CharacterStore(paths.data_dir() / CHARACTER_FILENAME)
+    characters = character_store.load()
+    character_view_service = CharacterViewService(registry, characters)
     progress_store = ActivityProgressStore(paths.data_dir() / ACTIVITY_PROGRESS_FILENAME)
     progress_service = ActivityProgressService(progress_store)
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
@@ -157,6 +163,8 @@ def build_services(
     AppContext.register(EventBus, event_bus)
     AppContext.register(WindowRegistryStore, registry_store)
     AppContext.register(WindowRegistry, registry)
+    AppContext.register(CharacterStore, character_store)
+    AppContext.register(CharacterViewService, character_view_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(CardHistoryStore, card_history_store)
@@ -201,6 +209,19 @@ def build_services(
         )
     else:
         logger.info(f"Character window registry loaded: {len(registry.all())} character(s).")
+
+    if character_store.recovered_from_corruption:
+        recovery = (
+            "recovered from backup"
+            if character_store.recovered_from_backup
+            else "kept empty"
+        )
+        logger.warning(
+            "Character profiles were corrupt; "
+            f"{recovery}; backup={character_store.corrupt_backup}"
+        )
+    else:
+        logger.info(f"Character profiles loaded: {len(characters)} character(s).")
 
     if progress_store.recovered_from_corruption:
         logger.warning(
