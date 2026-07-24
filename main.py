@@ -35,6 +35,7 @@ from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
 from services.card_history_service import CardHistoryService
 from services.card_coordinator import CardCoordinator
+from services.card_display_settings_service import CardDisplaySettingsService
 from services.card_expiry_monitor import CardExpiryMonitor
 from services.card_overlay_selection_assembly import (
     build_windows_card_overlay_selection_coordinator,
@@ -130,6 +131,18 @@ def build_services(
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
     card_history_service = CardHistoryService(card_history_store)
     card_service = CardService(card_display_settings_resolution.settings)
+    def register_card_display_settings(
+        resolution: CardDisplaySettingsResolution,
+    ) -> None:
+        AppContext.register(CardDisplaySettings, resolution.settings)
+        AppContext.register(CardDisplaySettingsResolution, resolution)
+
+    card_display_settings_service = CardDisplaySettingsService(
+        config,
+        card_service,
+        card_display_settings_resolution,
+        on_changed=register_card_display_settings,
+    )
     card_coordinator = CardCoordinator(card_service, card_history_service)
     card_view_state_service = CardViewStateService(card_service)
 
@@ -149,6 +162,7 @@ def build_services(
     AppContext.register(CardHistoryStore, card_history_store)
     AppContext.register(CardHistoryService, card_history_service)
     AppContext.register(CardService, card_service)
+    AppContext.register(CardDisplaySettingsService, card_display_settings_service)
     AppContext.register(CardCoordinator, card_coordinator)
     AppContext.register(CardViewStateService, card_view_state_service)
 
