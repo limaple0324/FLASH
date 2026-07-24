@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+from services.character_detail_view_service import PlayerCharacterDetail
 from services.character_view_service import PlayerCharacterView
 from ui.home import (
     _card_text,
@@ -7,6 +10,7 @@ from ui.home import (
     _status_text,
     _workspace_text,
     format_group_characters,
+    format_player_character_detail,
     format_player_characters,
 )
 
@@ -149,3 +153,56 @@ def test_player_character_text_has_player_facing_empty_state():
         format_player_characters(())
         == "目前沒有可顯示的組別與角色資料。"
     )
+
+
+def test_player_character_detail_text_uses_confirmed_chinese_fields():
+    text = format_player_character_detail(
+        PlayerCharacterDetail(
+            display_name="小古",
+            group="14支",
+            level=120,
+            importance="主號",
+            role="古",
+            note="守紀優先",
+        )
+    )
+
+    assert text == (
+        "【小古】\n"
+        "組別：14支\n"
+        "等級：120\n"
+        "分類：主號\n"
+        "定位：古\n"
+        "備註：守紀優先"
+    )
+
+
+def test_player_character_detail_text_marks_missing_values_without_guessing():
+    text = format_player_character_detail(
+        PlayerCharacterDetail(
+            display_name="待補資料",
+            group=None,
+            level=None,
+            importance=None,
+            role=None,
+            note=None,
+        )
+    )
+
+    assert text == (
+        "【待補資料】\n"
+        "組別：尚未設定\n"
+        "等級：尚未設定\n"
+        "分類：尚未設定\n"
+        "定位：尚未設定\n"
+        "備註：尚未設定"
+    )
+    assert "靈魂石" not in text
+    assert "命魂" not in text
+    assert "魂器" not in text
+    assert "背包" not in text
+
+
+def test_player_character_detail_text_rejects_untrusted_values():
+    with pytest.raises(TypeError, match="PlayerCharacterDetail"):
+        format_player_character_detail(object())

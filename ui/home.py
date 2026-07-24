@@ -11,6 +11,7 @@ from tkinter import BOTH, X, Button, Entry, Frame, Label
 
 from cards.view_state import CardViewState
 from services.card_preview_selection_service import CardPreviewChoice
+from services.character_detail_view_service import PlayerCharacterDetail
 from services.character_view_service import PlayerCharacterView
 
 
@@ -108,6 +109,31 @@ def format_player_characters(
                 lines.append(f"  備註：{item.note}")
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+def format_player_character_detail(detail: PlayerCharacterDetail) -> str:
+    """將單一角色詳細快照轉成簡潔中文，不補造缺少的資料。"""
+    if not isinstance(detail, PlayerCharacterDetail):
+        raise TypeError("detail must be PlayerCharacterDetail.")
+
+    def value_or_unset(value: str | None) -> str:
+        return value.strip() if value and value.strip() else "尚未設定"
+
+    level = (
+        str(detail.level)
+        if isinstance(detail.level, int) and not isinstance(detail.level, bool)
+        else "尚未設定"
+    )
+    return "\n".join(
+        (
+            f"【{detail.display_name}】",
+            f"組別：{value_or_unset(detail.group)}",
+            f"等級：{level}",
+            f"分類：{value_or_unset(detail.importance)}",
+            f"定位：{value_or_unset(detail.role)}",
+            f"備註：{value_or_unset(detail.note)}",
+        )
+    )
 
 
 def _status_text(status: dict[str, object]) -> str:
