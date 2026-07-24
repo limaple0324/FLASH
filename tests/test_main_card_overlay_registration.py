@@ -234,8 +234,9 @@ def test_main_window_opens_selected_character_in_single_read_only_detail_window(
             self.close_calls += 1
 
     class FakeCharacterDetailWindow:
-        def __init__(self, master):
+        def __init__(self, master, *, on_edit_soul_stone=None):
             self.master = master
+            self.on_edit_soul_stone = on_edit_soul_stone
             self.open_calls = []
             self.close_calls = 0
             detail_windows.append(self)
@@ -257,6 +258,7 @@ def test_main_window_opens_selected_character_in_single_read_only_detail_window(
     created._home_view.kwargs["on_show_group_characters"]()
 
     details = list_windows[0].open_calls[0]
+    assert callable(detail_windows[0].on_edit_soul_stone)
     assert len(details) == 1
     assert details[0].display_name == "小古"
     assert details[0].group == "14支"

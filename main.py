@@ -54,6 +54,7 @@ from ui.home import HomeView
 from ui.card_preview_settings import CardPreviewCatalog
 from ui.character_detail_window import CharacterDetailWindow
 from ui.character_list_window import CharacterListWindow
+from ui.soul_stone_editor_window import SoulStoneEditorWindow
 
 APP_TITLE = PRODUCT_NAME
 SELF_CHECK_ARGUMENT = "--self-check"
@@ -513,11 +514,210 @@ def create_main_window(
     window.geometry("760x760")
     window.minsize(660, 600)
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
-    character_detail_window = CharacterDetailWindow(window)
+    detail_identities: dict[int, tuple[object, str]] = {}
+    current_detail_character_id: str | None = None
+    soul_stone_editor_window: SoulStoneEditorWindow | None = None
+
+    def load_character_details(
+        *,
+        allow_missing_service: bool = False,
+    ) -> tuple[tuple[str, object], ...]:
+        character_details = AppContext.get(CharacterDetailViewService)
+        if character_details is None:
+            if allow_missing_service:
+                return ()
+            raise RuntimeError("Character detail view service is unavailable.")
+        return character_details.all_with_identities()
+
+    def trusted_character_id_for(detail: object) -> str:
+        identity = detail_identities.get(id(detail))
+        if identity is None or identity[0] is not detail:
+            raise LookupError("Character detail has no trusted identity pairing.")
+        return identity[1]
+
+    def detail_for_character(character_id: str):
+        for paired_character_id, detail in load_character_details():
+            if paired_character_id == character_id:
+                return detail
+        raise LookupError("Character detail is no longer available.")
+
+    def show_character_detail_error(error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            try:
+                logger.error(f"Character detail open failed: {error}")
+            except Exception:
+                pass
+        messagebox.showerror(
+            "輔｜角色詳細資料",
+            (
+                "無法開啟角色詳細資料。\n\n"
+                "請重新開啟角色清單後再試；錯誤已寫入紀錄。"
+            ),
+            parent=window,
+        )
+
+    def show_soul_stone_editor_error(error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            try:
+                logger.error(f"Soul stone editor open failed: {error}")
+            except Exception:
+                pass
+        messagebox.showerror(
+            "輔｜靈魂石紀錄",
+            (
+                "無法開啟靈魂石編輯視窗。\n\n"
+                "請稍後再試；錯誤已寫入紀錄。"
+            ),
+            parent=window,
+        )
+
+    def report_soul_stone_editor_error(title: str, message: str) -> None:
+        messagebox.showerror(
+            "輔｜靈魂石紀錄",
+            f"{title}。\n\n{message}\n錯誤已寫入紀錄。",
+            parent=window,
+        )
+
+    def soul_stone_editor_is_open() -> bool:
+        return (
+            soul_stone_editor_window is not None
+            and soul_stone_editor_window.is_open
+        )
+
+    def show_soul_stone_editor_busy() -> None:
+        messagebox.showinfo(
+            "輔｜靈魂石紀錄",
+            (
+                "目前已有靈魂石編輯視窗。\n\n"
+                "請先保存、清除或取消目前編輯，再開啟其他角色。"
+            ),
+            parent=window,
+        )
+
+    def show_soul_stone_refresh_error(error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            try:
+                logger.error(
+                    "Soul stone persisted but character detail refresh failed: "
+                    f"{error}"
+                )
+            except Exception:
+                pass
+        try:
+            messagebox.showwarning(
+                "輔｜靈魂石紀錄",
+                (
+                    "靈魂石紀錄的變更已保存，但角色詳細資料暫時無法更新。\n\n"
+                    "請關閉後重新開啟角色詳細資料；錯誤已寫入紀錄。"
+                ),
+                parent=window,
+            )
+        except Exception:
+            pass
+
+    def refresh_current_character_detail(character_id: str) -> None:
+        if (
+            current_detail_character_id != character_id
+            or not character_detail_window.is_open
+        ):
+            return
+        try:
+            refreshed_detail = detail_for_character(character_id)
+            character_detail_window.close()
+            character_detail_window.open(refreshed_detail)
+        except Exception as error:
+            show_soul_stone_refresh_error(error)
+
+    def show_soul_stone_editor() -> None:
+        nonlocal soul_stone_editor_window
+        if soul_stone_editor_is_open():
+            show_soul_stone_editor_busy()
+            return
+
+        character_id = current_detail_character_id
+        soul_stones = AppContext.get(SoulStoneService)
+        if character_id is None or soul_stones is None:
+            show_soul_stone_editor_error(
+                RuntimeError("Soul stone editor context is unavailable.")
+            )
+            return
+        try:
+            current_detail = detail_for_character(character_id)
+        except Exception as error:
+            soul_stone_editor_window = None
+            window._soul_stone_editor_window = None
+            show_soul_stone_editor_error(error)
+            return
+
+        def save_soul_stone(
+            note: str,
+            fixed_character_id: str = character_id,
+        ) -> None:
+            try:
+                soul_stones.set_for_character(fixed_character_id, note)
+            except Exception as error:
+                logger = AppContext.get(LoggerService)
+                if logger is not None:
+                    try:
+                        logger.error(f"Soul stone save failed: {error}")
+                    except Exception:
+                        pass
+                raise
+            refresh_current_character_detail(fixed_character_id)
+
+        def clear_soul_stone(
+            fixed_character_id: str = character_id,
+        ) -> None:
+            try:
+                soul_stones.clear_for_character(fixed_character_id)
+            except Exception as error:
+                logger = AppContext.get(LoggerService)
+                if logger is not None:
+                    try:
+                        logger.error(f"Soul stone clear failed: {error}")
+                    except Exception:
+                        pass
+                raise
+            refresh_current_character_detail(fixed_character_id)
+
+        try:
+            editor = SoulStoneEditorWindow(
+                window,
+                save_soul_stone,
+                clear_soul_stone,
+                error_reporter=report_soul_stone_editor_error,
+            )
+            soul_stone_editor_window = editor
+            window._soul_stone_editor_window = editor
+            editor.open(
+                current_detail.display_name,
+                current_detail.soul_stone,
+            )
+        except Exception as error:
+            show_soul_stone_editor_error(error)
+
+    character_detail_window = CharacterDetailWindow(
+        window,
+        on_edit_soul_stone=show_soul_stone_editor,
+    )
 
     def show_character_detail(detail) -> None:
-        character_detail_window.close()
-        character_detail_window.open(detail)
+        nonlocal current_detail_character_id
+        if soul_stone_editor_is_open():
+            show_soul_stone_editor_busy()
+            return
+        try:
+            character_id = trusted_character_id_for(detail)
+            current_detail = detail_for_character(character_id)
+            character_detail_window.close()
+            character_detail_window.open(current_detail)
+        except Exception as error:
+            show_character_detail_error(error)
+            return
+        current_detail_character_id = character_id
 
     character_list_window = CharacterListWindow(
         window,
@@ -554,11 +754,18 @@ def create_main_window(
         )
 
     def show_group_characters() -> None:
-        character_detail_view_service = AppContext.get(CharacterDetailViewService)
-        details = (
-            character_detail_view_service.all()
-            if character_detail_view_service is not None
-            else ()
+        paired_details = load_character_details(allow_missing_service=True)
+        detail_identities.clear()
+        detail_identities.update(
+            (
+                id(detail),
+                (detail, character_id),
+            )
+            for character_id, detail in paired_details
+        )
+        details = tuple(
+            detail
+            for _character_id, detail in paired_details
         )
         if character_list_window.is_open:
             character_list_window.close()
@@ -636,6 +843,7 @@ def create_main_window(
     window._home_view = home_view
     window._character_list_window = character_list_window
     window._character_detail_window = character_detail_window
+    window._soul_stone_editor_window = soul_stone_editor_window
     card_service = AppContext.get(CardService)
     if card_service is not None:
         card_service.subscribe(lambda: window.after_idle(home_view.refresh_cards))
