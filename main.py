@@ -441,6 +441,11 @@ def create_main_window(
             if card_preview_selection_service is not None
             else None
         ),
+        on_card_preview_clear=(
+            card_preview_selection_service.clear
+            if card_preview_selection_service is not None
+            else None
+        ),
     )
     home_view.build()
     window._home_view = home_view

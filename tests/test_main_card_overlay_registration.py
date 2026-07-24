@@ -124,6 +124,8 @@ def test_main_window_builds_and_manages_registered_overlay(monkeypatch, tmp_path
     created._home_view.kwargs["on_card_preview_select"]("player-selected")
     assert AppContext.get(CardPreviewSelectionService).snapshot().overlay_enabled is True
     assert runtime.start_calls == 1
+    created._home_view.kwargs["on_card_preview_clear"]()
+    assert AppContext.get(CardPreviewSelectionService).snapshot().overlay_enabled is False
     window.protocols["WM_DELETE_WINDOW"]()
     assert runtime.stop_calls == 1
 

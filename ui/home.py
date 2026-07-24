@@ -99,6 +99,7 @@ class HomeView:
         card_view_state_provider: Callable[[], CardViewState] | None = None,
         card_preview_choices_provider: Callable[[], tuple[CardPreviewChoice, ...]] | None = None,
         on_card_preview_select: Callable[[str], object] | None = None,
+        on_card_preview_clear: Callable[[], object] | None = None,
     ):
         self.parent = parent
         self.status = status
@@ -107,8 +108,11 @@ class HomeView:
         self.card_view_state_provider = card_view_state_provider
         self.card_preview_choices_provider = card_preview_choices_provider
         self.on_card_preview_select = on_card_preview_select
+        self.on_card_preview_clear = on_card_preview_clear
         self._card_label = None
         self._card_preview_buttons: dict[str, Button] = {}
+        self._card_preview_clear_button: Button | None = None
+        self._card_preview_clear_visible = False
 
     def refresh_cards(self) -> str:
         """重新讀取唯讀快照，並更新既有的首頁提醒文字。"""
@@ -129,6 +133,7 @@ class HomeView:
             if button is not None:
                 marker = "✓ " if choice.selected else ""
                 button.configure(text=f"{marker}{choice.display_name}")
+        self._set_card_preview_clear_visible(any(choice.selected for choice in choices))
         return choices
 
     def select_card_preview(self, profile_id: str) -> None:
@@ -136,6 +141,22 @@ class HomeView:
             return
         self.on_card_preview_select(profile_id)
         self.refresh_card_preview_choices()
+
+    def clear_card_preview(self) -> None:
+        if self.on_card_preview_clear is None:
+            return
+        self.on_card_preview_clear()
+        self.refresh_card_preview_choices()
+
+    def _set_card_preview_clear_visible(self, visible: bool) -> None:
+        button = self._card_preview_clear_button
+        if button is None or visible == self._card_preview_clear_visible:
+            return
+        if visible:
+            button.pack(fill=X, pady=(8, 2))
+        else:
+            button.pack_forget()
+        self._card_preview_clear_visible = visible
 
     def build(self):
         body = Frame(self.parent, padx=28, pady=24)
@@ -203,5 +224,14 @@ class HomeView:
                 )
                 button.pack(fill=X, pady=2)
                 self._card_preview_buttons[choice.profile_id] = button
+            if self.on_card_preview_clear is not None:
+                self._card_preview_clear_button = Button(
+                    body,
+                    text="關閉提醒卡預覽",
+                    command=self.clear_card_preview,
+                )
+                self._set_card_preview_clear_visible(
+                    any(choice.selected for choice in choices)
+                )
 
         return body

@@ -8,10 +8,14 @@ class _FakeWidget:
     def __init__(self, parent=None, **kwargs) -> None:
         self.parent = parent
         self.options = dict(kwargs)
+        self.packed = False
         self.created.append(self)
 
     def pack(self, **_kwargs) -> None:
-        pass
+        self.packed = True
+
+    def pack_forget(self) -> None:
+        self.packed = False
 
     def configure(self, **kwargs) -> None:
         self.options.update(kwargs)
@@ -48,19 +52,33 @@ def test_home_selects_candidate_and_refreshes_selected_marker(monkeypatch) -> No
         nonlocal selected_profile_id
         selected_profile_id = profile_id
 
+    def clear() -> None:
+        nonlocal selected_profile_id
+        selected_profile_id = None
+
     view = home.HomeView(
         None,
         {},
         card_preview_choices_provider=choices,
         on_card_preview_select=select,
+        on_card_preview_clear=clear,
     )
     view.build()
 
     assert "提醒卡樣式" in {
         widget.options.get("text") for widget in _FakeWidget.created
     }
+    assert view._card_preview_clear_button is not None
+    assert view._card_preview_clear_button.packed is False
     view._card_preview_buttons["roomy"].options["command"]()
 
     assert selected_profile_id == "roomy"
     assert view._card_preview_buttons["compact"].options["text"] == "精簡方案"
     assert view._card_preview_buttons["roomy"].options["text"] == "✓ 寬鬆方案"
+    assert view._card_preview_clear_button.packed is True
+
+    view._card_preview_clear_button.options["command"]()
+
+    assert selected_profile_id is None
+    assert view._card_preview_buttons["roomy"].options["text"] == "寬鬆方案"
+    assert view._card_preview_clear_button.packed is False
