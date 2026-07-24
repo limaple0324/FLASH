@@ -62,6 +62,8 @@ def test_group_character_text_lists_every_character_by_group_without_internals()
                     "character_id": "private-id-a",
                     "display_name": "小古",
                     "group": "14支",
+                    "role": "主號",
+                    "note": "優先追蹤",
                     "handle": 123,
                     "health": "ready",
                 },
@@ -86,6 +88,8 @@ def test_group_character_text_lists_every_character_by_group_without_internals()
     assert text == (
         "【14支】\n"
         "• 小古\n"
+        "  定位：主號\n"
+        "  備註：優先追蹤\n"
         "• 小法\n\n"
         "【魔心次元組】\n"
         "• 次元主號\n\n"

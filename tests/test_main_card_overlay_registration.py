@@ -195,6 +195,8 @@ def test_main_window_shows_current_group_characters_without_internal_details(
         "private-character-id",
         "小古",
         group="14支",
+        role="主號",
+        note="守紀優先",
     )
     window = FakeWindow()
     shown = []
@@ -211,7 +213,13 @@ def test_main_window_shows_current_group_characters_without_internal_details(
     created = create_main_window({}, main.AppContext.get(main.PathManager))
     created._home_view.kwargs["on_show_group_characters"]()
 
-    assert shown == [("輔｜組別角色", "【14支】\n• 小古", window)]
+    assert shown == [
+        (
+            "輔｜組別角色",
+            "【14支】\n• 小古\n  定位：主號\n  備註：守紀優先",
+            window,
+        )
+    ]
     assert "private-character-id" not in shown[0][1]
 
 

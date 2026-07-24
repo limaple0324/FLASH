@@ -46,9 +46,9 @@ def _group_text(status: dict[str, object]) -> str:
 
 
 def format_group_characters(status: dict[str, object]) -> str:
-    """Format every registered character without exposing window internals."""
+    """顯示所有已登記角色，但不外露視窗與識別資訊。"""
     characters = _characters(status)
-    grouped: dict[str, list[str]] = {}
+    grouped: dict[str, list[dict[str, object]]] = {}
     for item in characters:
         name = item.get("display_name")
         if not isinstance(name, str) or not name.strip():
@@ -59,7 +59,7 @@ def format_group_characters(status: dict[str, object]) -> str:
             if isinstance(group, str) and group.strip()
             else "未分組"
         )
-        grouped.setdefault(group_name, []).append(name.strip())
+        grouped.setdefault(group_name, []).append(item)
 
     if not grouped:
         return "目前沒有可顯示的組別與角色資料。"
@@ -67,7 +67,15 @@ def format_group_characters(status: dict[str, object]) -> str:
     lines: list[str] = []
     for group_name in sorted(grouped, key=lambda value: (value == "未分組", value)):
         lines.append(f"【{group_name}】")
-        lines.extend(f"• {name}" for name in grouped[group_name])
+        for item in grouped[group_name]:
+            name = str(item["display_name"]).strip()
+            lines.append(f"• {name}")
+            role = item.get("role")
+            if isinstance(role, str) and role.strip():
+                lines.append(f"  定位：{role.strip()}")
+            note = item.get("note")
+            if isinstance(note, str) and note.strip():
+                lines.append(f"  備註：{note.strip()}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
