@@ -4,6 +4,10 @@ from domain.character import Character, CharacterImportance
 from domain.character_store import CharacterStore
 from main import build_services
 from services.app_context import AppContext
+from services.character_detail_view_service import (
+    CharacterDetailViewService,
+    PlayerCharacterDetail,
+)
 from services.character_view_service import CharacterViewService, PlayerCharacterView
 
 
@@ -35,6 +39,16 @@ def test_build_services_loads_character_profiles_into_read_only_view(tmp_path) -
     assert AppContext.get(CharacterStore) is not None
     assert AppContext.get(CharacterViewService).all() == (
         PlayerCharacterView(
+            display_name="目前名稱",
+            group="14支",
+            level=120,
+            importance="主號",
+            role="古",
+            note="守紀優先",
+        ),
+    )
+    assert AppContext.get(CharacterDetailViewService).all() == (
+        PlayerCharacterDetail(
             display_name="目前名稱",
             group="14支",
             level=120,

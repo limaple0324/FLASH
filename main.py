@@ -44,6 +44,7 @@ from services.card_overlay_selection_assembly import (
 from services.card_preview_selection_service import CardPreviewSelectionService
 from services.card_preview_selection_store import CardPreviewSelectionStore
 from services.card_view_state_service import CardViewStateService
+from services.character_detail_view_service import CharacterDetailViewService
 from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
@@ -132,6 +133,7 @@ def build_services(
     character_store = CharacterStore(paths.data_dir() / CHARACTER_FILENAME)
     characters = character_store.load()
     character_view_service = CharacterViewService(registry, characters)
+    character_detail_view_service = CharacterDetailViewService(character_view_service)
     progress_store = ActivityProgressStore(paths.data_dir() / ACTIVITY_PROGRESS_FILENAME)
     progress_service = ActivityProgressService(progress_store)
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
@@ -165,6 +167,7 @@ def build_services(
     AppContext.register(WindowRegistry, registry)
     AppContext.register(CharacterStore, character_store)
     AppContext.register(CharacterViewService, character_view_service)
+    AppContext.register(CharacterDetailViewService, character_detail_view_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(CardHistoryStore, card_history_store)
