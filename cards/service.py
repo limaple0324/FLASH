@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from cards.lifecycle import CardLifecycle, _require_aware
 from cards.models import GroupCard
+from cards.settings import CardDisplaySettings
 
 
 MAX_VISIBLE_CARDS = 3
@@ -15,7 +16,10 @@ class CardCapacityError(RuntimeError):
 
 
 class CardService:
-    def __init__(self) -> None:
+    def __init__(self, settings: CardDisplaySettings | None = None) -> None:
+        if settings is not None and not isinstance(settings, CardDisplaySettings):
+            raise TypeError("settings must be CardDisplaySettings.")
+        self.settings = settings or CardDisplaySettings()
         self._entries: list[CardLifecycle] = []
         self._change_listeners: list[Callable[[], None]] = []
 
@@ -51,14 +55,24 @@ class CardService:
 
         for index, current in enumerate(self._entries):
             if current.card.card_id == card.card_id:
-                self._entries[index] = CardLifecycle(card, current.shown_at)
+                self._entries[index] = CardLifecycle(
+                    card,
+                    current.shown_at,
+                    current.lifetime,
+                )
                 self._notify_changed()
                 return card
 
         if len(self._entries) >= MAX_VISIBLE_CARDS:
             raise CardCapacityError("At most three cards can be visible.")
         shown_at = shown_at or datetime.now(timezone.utc)
-        self._entries.append(CardLifecycle(card, shown_at))
+        self._entries.append(
+            CardLifecycle(
+                card,
+                shown_at,
+                self.settings.lifetime,
+            )
+        )
         self._notify_changed()
         return card
 

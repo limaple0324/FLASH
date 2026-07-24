@@ -5,6 +5,7 @@ import pytest
 from cards.lifecycle import CardLifecycle, DEFAULT_CARD_LIFETIME
 from cards.models import GroupCard
 from cards.service import CardService
+from cards.settings import CardDisplaySettings
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.group import CharacterGroup
 
@@ -31,6 +32,30 @@ def test_lifecycle_expires_at_exactly_thirty_seconds():
     assert lifecycle.expires_at == shown_at + timedelta(seconds=30)
     assert lifecycle.is_expired(shown_at + timedelta(seconds=29)) is False
     assert lifecycle.is_expired(shown_at + timedelta(seconds=30)) is True
+
+
+def test_custom_display_settings_control_new_card_lifetime():
+    shown_at = datetime(2026, 7, 13, 7, 0, tzinfo=timezone.utc)
+    service = CardService(CardDisplaySettings(lifetime_seconds=75))
+    card = _card()
+
+    service.upsert(card, shown_at=shown_at)
+
+    assert service.entries[0].expires_at == shown_at + timedelta(seconds=75)
+    assert service.remove_expired(shown_at + timedelta(seconds=74)) == ()
+    assert service.remove_expired(shown_at + timedelta(seconds=75)) == (card,)
+
+
+@pytest.mark.parametrize("value", [0, -1, 10**20])
+def test_display_settings_reject_invalid_lifetime(value):
+    with pytest.raises(ValueError):
+        CardDisplaySettings(lifetime_seconds=value)
+
+
+@pytest.mark.parametrize("value", [True, 1.5, "30"])
+def test_display_settings_reject_non_integer_lifetime(value):
+    with pytest.raises(TypeError):
+        CardDisplaySettings(lifetime_seconds=value)
 
 
 def test_service_removes_only_expired_cards():

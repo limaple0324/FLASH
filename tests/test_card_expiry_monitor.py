@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from cards.models import GroupCard
 from cards.service import CardService
+from cards.settings import CardDisplaySettings
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.group import CharacterGroup
 from services.card_expiry_monitor import CARD_EXPIRY_CHECK_MS, CardExpiryMonitor
@@ -71,6 +72,28 @@ def test_monitor_keeps_card_before_expiry_and_schedules_next_check():
 
     assert cards.cards == (card,)
     assert len(schedule.calls) == 1
+
+
+def test_monitor_uses_configured_card_lifetime():
+    shown_at = datetime(2026, 7, 14, 13, 0, tzinfo=timezone.utc)
+    cards = CardService(CardDisplaySettings(lifetime_seconds=45))
+    card = _card()
+    cards.upsert(card, shown_at=shown_at)
+    schedule = _Schedule()
+    current_time = shown_at + timedelta(seconds=44)
+    monitor = CardExpiryMonitor(
+        cards,
+        schedule,
+        now=lambda: current_time,
+    )
+
+    monitor.start()
+    schedule.run_next()
+    assert cards.cards == (card,)
+
+    current_time = shown_at + timedelta(seconds=45)
+    schedule.run_next()
+    assert cards.cards == ()
 
 
 def test_start_is_idempotent_and_stop_prevents_pending_check():
