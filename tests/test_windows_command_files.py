@@ -30,10 +30,25 @@ def test_updater_preserves_the_existing_desktop_shortcut():
     assert "已保留原本桌面捷徑的名稱與圖示" in updater
 
 
-def test_pull_request_build_does_not_publish_over_the_live_release():
+def test_only_main_push_can_publish_over_the_live_release():
     workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
 
     publish_step = workflow.split("- name: Publish latest desktop updater files", 1)[1]
     publish_step = publish_step.split("- name: Upload Windows release bundle", 1)[0]
-    assert "if: github.event_name != 'pull_request'" in publish_step
+    condition = next(
+        line.strip()
+        for line in publish_step.splitlines()
+        if line.strip().startswith("if:")
+    )
+
+    assert condition == (
+        "if: github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    )
     assert "git add -A" in publish_step
+
+
+def test_windows_workflow_keeps_manual_artifact_build():
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+
+    assert "workflow_dispatch: {}" in workflow
+    assert "- name: Upload Windows release bundle" in workflow

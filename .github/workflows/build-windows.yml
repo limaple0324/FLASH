@@ -196,7 +196,7 @@ jobs:
           }
 
       - name: Publish latest desktop updater files
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         run: |
           $publishRoot = Join-Path $env:RUNNER_TEMP 'flash-latest-release'
