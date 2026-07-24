@@ -7,7 +7,7 @@ Keeps engineering diagnostics separated from the player home experience.
 from __future__ import annotations
 
 from collections.abc import Callable
-from tkinter import BOTH, X, Button, Frame, Label
+from tkinter import BOTH, X, Button, Entry, Frame, Label
 
 from cards.view_state import CardViewState
 from services.card_preview_selection_service import CardPreviewChoice
@@ -101,6 +101,9 @@ class HomeView:
         on_card_preview_select: Callable[[str], object] | None = None,
         on_card_preview_clear: Callable[[], object] | None = None,
         on_card_preview_error: Callable[[str, Exception], object] | None = None,
+        card_display_seconds_provider: Callable[[], int] | None = None,
+        on_card_display_seconds_update: Callable[[int], object] | None = None,
+        on_card_display_seconds_error: Callable[[Exception], object] | None = None,
     ):
         self.parent = parent
         self.status = status
@@ -111,10 +114,14 @@ class HomeView:
         self.on_card_preview_select = on_card_preview_select
         self.on_card_preview_clear = on_card_preview_clear
         self.on_card_preview_error = on_card_preview_error
+        self.card_display_seconds_provider = card_display_seconds_provider
+        self.on_card_display_seconds_update = on_card_display_seconds_update
+        self.on_card_display_seconds_error = on_card_display_seconds_error
         self._card_label = None
         self._card_preview_buttons: dict[str, Button] = {}
         self._card_preview_clear_button: Button | None = None
         self._card_preview_clear_visible = False
+        self._card_display_seconds_entry: Entry | None = None
 
     def refresh_cards(self) -> str:
         """重新讀取唯讀快照，並更新既有的首頁提醒文字。"""
@@ -172,6 +179,36 @@ class HomeView:
         else:
             button.pack_forget()
         self._card_preview_clear_visible = visible
+
+    def refresh_card_display_seconds(self) -> int | None:
+        if self.card_display_seconds_provider is None:
+            return None
+        seconds = self.card_display_seconds_provider()
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 1:
+            raise ValueError("card display seconds must be a positive integer.")
+        if self._card_display_seconds_entry is not None:
+            self._card_display_seconds_entry.delete(0, "end")
+            self._card_display_seconds_entry.insert(0, str(seconds))
+        return seconds
+
+    def update_card_display_seconds(self) -> None:
+        entry = self._card_display_seconds_entry
+        if entry is None or self.on_card_display_seconds_update is None:
+            return
+        try:
+            seconds = int(entry.get().strip())
+            if seconds < 1:
+                raise ValueError("card display seconds must be positive.")
+            self.on_card_display_seconds_update(seconds)
+        except Exception as exc:
+            self._report_card_display_seconds_error(exc)
+        finally:
+            self.refresh_card_display_seconds()
+
+    def _report_card_display_seconds_error(self, error: Exception) -> None:
+        if self.on_card_display_seconds_error is None:
+            raise error
+        self.on_card_display_seconds_error(error)
 
     def build(self):
         body = Frame(self.parent, padx=28, pady=24)
@@ -248,5 +285,24 @@ class HomeView:
                 self._set_card_preview_clear_visible(
                     any(choice.selected for choice in choices)
                 )
+
+        if (
+            self.card_display_seconds_provider is not None
+            and self.on_card_display_seconds_update is not None
+        ):
+            Label(
+                body,
+                text="提醒卡顯示時間（秒）",
+                font=("Microsoft JhengHei UI", 11),
+                anchor="w",
+            ).pack(fill=X, pady=(12, 4))
+            self._card_display_seconds_entry = Entry(body)
+            self._card_display_seconds_entry.pack(fill=X, pady=2)
+            self.refresh_card_display_seconds()
+            Button(
+                body,
+                text="儲存顯示時間",
+                command=self.update_card_display_seconds,
+            ).pack(fill=X, pady=(2, 8))
 
         return body

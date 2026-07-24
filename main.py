@@ -466,6 +466,23 @@ def create_main_window(
     apply_window_icon(window)
     window.geometry("760x760")
     window.minsize(660, 600)
+    card_display_settings_service = AppContext.get(CardDisplaySettingsService)
+
+    def current_card_display_settings_status() -> str:
+        if card_display_settings_service is None:
+            return format_card_display_settings_status(status)
+        resolution = card_display_settings_service.snapshot()
+        seconds = resolution.settings.lifetime_seconds
+        if resolution.recovered_from_invalid:
+            return f"提醒卡顯示時間：原設定無效，已安全改用 {seconds} 秒。"
+        if resolution.configured:
+            return f"提醒卡顯示時間：目前設定為 {seconds} 秒。"
+        return f"提醒卡顯示時間：目前使用預設 {seconds} 秒。"
+
+    def current_card_display_seconds() -> int:
+        if card_display_settings_service is None:
+            raise RuntimeError("Card display settings service is unavailable.")
+        return card_display_settings_service.snapshot().settings.lifetime_seconds
 
     def show_start_status() -> None:
         messagebox.showinfo(
@@ -474,7 +491,7 @@ def create_main_window(
                 "目前可以查看狀態與紀錄。\n\n"
                 "遊戲操作尚未啟用，輔不會自動點擊或控制遊戲。\n"
                 f"{format_card_overlay_status(status)}\n"
-                f"{format_card_display_settings_status(status)}\n"
+                f"{current_card_display_settings_status()}\n"
                 f"紀錄位置：{paths.logs_dir()}"
             ),
             parent=window,
@@ -491,6 +508,19 @@ def create_main_window(
         messagebox.showerror(
             "輔｜提醒卡樣式",
             f"{action_text}，原本設定已保留。\n\n請稍後再試；錯誤已寫入紀錄。",
+            parent=window,
+        )
+
+    def show_card_display_seconds_error(error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            logger.error(f"Card display time update failed: {error}")
+        messagebox.showerror(
+            "輔｜提醒卡顯示時間",
+            (
+                "無法儲存提醒卡顯示時間，原本設定已保留。\n\n"
+                "請輸入大於 0 的完整秒數後再試；錯誤已寫入紀錄。"
+            ),
             parent=window,
         )
 
@@ -522,6 +552,17 @@ def create_main_window(
             else None
         ),
         on_card_preview_error=show_card_preview_error,
+        card_display_seconds_provider=(
+            current_card_display_seconds
+            if card_display_settings_service is not None
+            else None
+        ),
+        on_card_display_seconds_update=(
+            card_display_settings_service.update_lifetime_seconds
+            if card_display_settings_service is not None
+            else None
+        ),
+        on_card_display_seconds_error=show_card_display_seconds_error,
     )
     home_view.build()
     window._home_view = home_view

@@ -5,6 +5,7 @@ from main import (
     run,
 )
 from services.app_context import AppContext
+from services.card_display_settings_service import CardDisplaySettingsService
 from services.card_preview_selection_service import CardPreviewSelectionService
 from ui.card_overlay import CardSize
 from ui.card_preview_settings import CardPreviewCatalog, CardPreviewProfile
@@ -110,6 +111,12 @@ def test_main_window_builds_and_manages_registered_overlay(monkeypatch, tmp_path
     monkeypatch.setattr(main, "Tk", lambda: window)
     monkeypatch.setattr(main, "HomeView", FakeHomeView)
     monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
+    shown_info = []
+    monkeypatch.setattr(
+        main.messagebox,
+        "showinfo",
+        lambda title, message, parent: shown_info.append((title, message, parent)),
+    )
     monkeypatch.setattr(
         main,
         "_build_registered_card_overlay_runtime",
@@ -126,6 +133,17 @@ def test_main_window_builds_and_manages_registered_overlay(monkeypatch, tmp_path
     assert runtime.start_calls == 1
     created._home_view.kwargs["on_card_preview_clear"]()
     assert AppContext.get(CardPreviewSelectionService).snapshot().overlay_enabled is False
+    assert created._home_view.kwargs["card_display_seconds_provider"]() == 30
+    created._home_view.kwargs["on_card_display_seconds_update"](75)
+    assert created._home_view.kwargs["card_display_seconds_provider"]() == 75
+    assert (
+        AppContext.get(CardDisplaySettingsService)
+        .snapshot()
+        .settings.lifetime_seconds
+        == 75
+    )
+    created._home_view.kwargs["on_start"]()
+    assert "提醒卡顯示時間：目前設定為 75 秒。" in shown_info[0][1]
     window.protocols["WM_DELETE_WINDOW"]()
     assert runtime.stop_calls == 1
 
@@ -159,6 +177,42 @@ def test_main_window_reports_card_preview_failure_without_internal_details(
         (
             "輔｜提醒卡樣式",
             "無法套用提醒卡樣式，原本設定已保留。\n\n請稍後再試；錯誤已寫入紀錄。",
+            window,
+        )
+    ]
+
+
+def test_main_window_reports_card_display_time_failure_without_internal_details(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import main
+
+    build_services(root=tmp_path)
+    window = FakeWindow()
+    shown = []
+    monkeypatch.setattr(main, "Tk", lambda: window)
+    monkeypatch.setattr(main, "HomeView", FakeHomeView)
+    monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
+    monkeypatch.setattr(main, "_build_registered_card_overlay_runtime", lambda _window: None)
+    monkeypatch.setattr(
+        main.messagebox,
+        "showerror",
+        lambda title, message, parent: shown.append((title, message, parent)),
+    )
+
+    created = create_main_window({}, main.AppContext.get(main.PathManager))
+    created._home_view.kwargs["on_card_display_seconds_error"](
+        OSError("private disk path"),
+    )
+
+    assert shown == [
+        (
+            "輔｜提醒卡顯示時間",
+            (
+                "無法儲存提醒卡顯示時間，原本設定已保留。\n\n"
+                "請輸入大於 0 的完整秒數後再試；錯誤已寫入紀錄。"
+            ),
             window,
         )
     ]
