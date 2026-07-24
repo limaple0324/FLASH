@@ -183,7 +183,7 @@ def test_main_window_reports_card_preview_failure_without_internal_details(
     ]
 
 
-def test_main_window_shows_current_group_characters_without_internal_details(
+def test_main_window_opens_selected_character_in_single_read_only_detail_window(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -213,35 +213,64 @@ def test_main_window_shows_current_group_characters_without_internal_details(
     )
     build_services(root=tmp_path)
     window = FakeWindow()
-    shown = []
+    list_windows = []
+    detail_windows = []
+
+    class FakeCharacterListWindow:
+        def __init__(self, master, on_select):
+            self.master = master
+            self.on_select = on_select
+            self.is_open = False
+            self.open_calls = []
+            self.close_calls = 0
+            list_windows.append(self)
+
+        def open(self, details):
+            self.is_open = True
+            self.open_calls.append(tuple(details))
+
+        def close(self):
+            self.is_open = False
+            self.close_calls += 1
+
+    class FakeCharacterDetailWindow:
+        def __init__(self, master):
+            self.master = master
+            self.open_calls = []
+            self.close_calls = 0
+            detail_windows.append(self)
+
+        def open(self, detail):
+            self.open_calls.append(detail)
+
+        def close(self):
+            self.close_calls += 1
+
     monkeypatch.setattr(main, "Tk", lambda: window)
     monkeypatch.setattr(main, "HomeView", FakeHomeView)
+    monkeypatch.setattr(main, "CharacterListWindow", FakeCharacterListWindow)
+    monkeypatch.setattr(main, "CharacterDetailWindow", FakeCharacterDetailWindow)
     monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
     monkeypatch.setattr(main, "_build_registered_card_overlay_runtime", lambda _window: None)
-    monkeypatch.setattr(
-        main.messagebox,
-        "showinfo",
-        lambda title, message, parent: shown.append((title, message, parent)),
-    )
 
     created = create_main_window({}, main.AppContext.get(main.PathManager))
     created._home_view.kwargs["on_show_group_characters"]()
 
-    assert shown == [
-        (
-            "輔｜組別角色",
-            (
-                "【14支】\n"
-                "• 小古\n"
-                "  等級：120\n"
-                "  分類：主號\n"
-                "  定位：古\n"
-                "  備註：守紀優先"
-            ),
-            window,
-        )
-    ]
-    assert "private-character-id" not in shown[0][1]
+    details = list_windows[0].open_calls[0]
+    assert len(details) == 1
+    assert details[0].display_name == "小古"
+    assert details[0].group == "14支"
+    assert details[0].level == 120
+    assert details[0].importance == "主號"
+    assert details[0].role == "古"
+    assert details[0].note == "守紀優先"
+    assert "private-character-id" not in repr(details[0])
+
+    list_windows[0].on_select(details[0])
+    assert detail_windows[0].close_calls == 1
+    assert detail_windows[0].open_calls == [details[0]]
+    assert created._character_list_window is list_windows[0]
+    assert created._character_detail_window is detail_windows[0]
 
 
 def test_main_window_reports_card_display_time_failure_without_internal_details(

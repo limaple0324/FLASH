@@ -48,8 +48,10 @@ from services.character_detail_view_service import CharacterDetailViewService
 from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
-from ui.home import HomeView, format_player_characters
+from ui.home import HomeView
 from ui.card_preview_settings import CardPreviewCatalog
+from ui.character_detail_window import CharacterDetailWindow
+from ui.character_list_window import CharacterListWindow
 
 APP_TITLE = PRODUCT_NAME
 SELF_CHECK_ARGUMENT = "--self-check"
@@ -491,6 +493,16 @@ def create_main_window(
     window.geometry("760x760")
     window.minsize(660, 600)
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
+    character_detail_window = CharacterDetailWindow(window)
+
+    def show_character_detail(detail) -> None:
+        character_detail_window.close()
+        character_detail_window.open(detail)
+
+    character_list_window = CharacterListWindow(
+        window,
+        show_character_detail,
+    )
 
     def current_card_display_settings_status() -> str:
         if card_display_settings_service is None:
@@ -522,17 +534,15 @@ def create_main_window(
         )
 
     def show_group_characters() -> None:
-        character_view_service = AppContext.get(CharacterViewService)
-        characters = (
-            character_view_service.all()
-            if character_view_service is not None
+        character_detail_view_service = AppContext.get(CharacterDetailViewService)
+        details = (
+            character_detail_view_service.all()
+            if character_detail_view_service is not None
             else ()
         )
-        messagebox.showinfo(
-            "輔｜組別角色",
-            format_player_characters(characters),
-            parent=window,
-        )
+        if character_list_window.is_open:
+            character_list_window.close()
+        character_list_window.open(details)
 
     def show_card_preview_error(action: str, error: Exception) -> None:
         logger = AppContext.get(LoggerService)
@@ -604,6 +614,8 @@ def create_main_window(
     )
     home_view.build()
     window._home_view = home_view
+    window._character_list_window = character_list_window
+    window._character_detail_window = character_detail_window
     card_service = AppContext.get(CardService)
     if card_service is not None:
         card_service.subscribe(lambda: window.after_idle(home_view.refresh_cards))
