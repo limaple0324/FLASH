@@ -50,14 +50,26 @@ def test_manual_build_is_named_as_an_integration_engineering_snapshot():
     assert "$buildKind = 'integration_snapshot'" in metadata_step
     assert "$buildKind = 'main_snapshot'" in metadata_step
     assert "$publishTarget = 'none'" in metadata_step
-    assert "$artifactKind = $parts[3]" in metadata_step
-    assert "$scopeForName = $parts[2].Replace('+', '-')" in metadata_step
+    assert "$artifactKind = $metadata.delivery_label" in metadata_step
+    assert "$scopeForName = $metadata.delivery_scope.Replace('+', '-')" in metadata_step
     assert (
         '$artifactName = "輔-$artifactKind-$scopeForName-'
-        '$($parts[0])-$shortCommit-windows-x64"'
+        '$($metadata.version)-$shortCommit-windows-x64"'
     ) in metadata_step
     assert "name: ${{ env.FLASH_ARTIFACT_NAME }}" in workflow
     assert "name: FLASH-Windows-${{ env.FLASH_MILESTONE }}" not in workflow
+
+
+def test_delivery_metadata_uses_ascii_safe_json_across_windows_code_pages():
+    metadata_step = _step(
+        _workflow(),
+        "Read application and delivery metadata",
+        "Build windowed executable",
+    )
+
+    assert "json.dumps(" in metadata_step
+    assert "$metadataJson | ConvertFrom-Json" in metadata_step
+    assert "print('|'.join(" not in metadata_step
 
 
 def test_integration_snapshot_does_not_include_the_live_updater():
