@@ -16,6 +16,11 @@ from adapters.windows_work_area import WindowsWorkAreaReader
 from adapters.windows_window import WindowsWindowAdapter
 from cards.history_store import CardHistoryStore
 from cards.service import CardService
+from cards.settings import (
+    CardDisplaySettings,
+    CardDisplaySettingsResolution,
+    resolve_card_display_settings,
+)
 from cards.view_state import CardViewState
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
@@ -115,6 +120,7 @@ def build_services(
     logger = LoggerService(paths.log_file("flash.log"))
     config = ConfigManager(paths.config_file("settings.json"))
     event_bus = EventBus(logger=logger)
+    card_display_settings_resolution = resolve_card_display_settings(config.data)
 
     registry_store = WindowRegistryStore(paths.data_dir() / REGISTRY_FILENAME)
     registry = registry_store.load()
@@ -122,13 +128,18 @@ def build_services(
     progress_service = ActivityProgressService(progress_store)
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
     card_history_service = CardHistoryService(card_history_store)
-    card_service = CardService()
+    card_service = CardService(card_display_settings_resolution.settings)
     card_coordinator = CardCoordinator(card_service, card_history_service)
     card_view_state_service = CardViewStateService(card_service)
 
     AppContext.register(PathManager, paths)
     AppContext.register(LoggerService, logger)
     AppContext.register(ConfigManager, config)
+    AppContext.register(CardDisplaySettings, card_display_settings_resolution.settings)
+    AppContext.register(
+        CardDisplaySettingsResolution,
+        card_display_settings_resolution,
+    )
     AppContext.register(EventBus, event_bus)
     AppContext.register(WindowRegistryStore, registry_store)
     AppContext.register(WindowRegistry, registry)
@@ -139,6 +150,11 @@ def build_services(
     AppContext.register(CardService, card_service)
     AppContext.register(CardCoordinator, card_coordinator)
     AppContext.register(CardViewStateService, card_view_state_service)
+
+    if card_display_settings_resolution.recovered_from_invalid:
+        logger.warning(
+            "Card lifetime setting is invalid; using the safe 30-second default."
+        )
 
     if card_preview_catalog is not None:
         card_preview_selection_store = CardPreviewSelectionStore(
