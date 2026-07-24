@@ -1,4 +1,4 @@
-# FLASH
+# 輔（FLASH）
 
 FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式。
 
@@ -10,9 +10,14 @@ FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式
 
 後續進度必須分開標示：**已討論完成、已寫入倉庫、已完成程式實作、已通過雲端測試、已通過 Windows 實機驗證**。
 
-## Current milestone
+## 目前里程碑
 
-目前版本：**SP1 0.1.2 engineering verification build**
+- `main`／正式成品：**SP1 0.1.2 工程驗證版**
+- `integration/sp2-sp3-sp35`：持續整合 SP2／SP3／SP3.5
+
+整合分支已包含產品與領域資料骨架、工作區與組別級提醒卡、提醒卡生命週期、
+歷史紀錄、玩家顯示時間設定及浮層骨架。實際進度以
+[`docs/INTEGRATION_BOARD.md`](docs/INTEGRATION_BOARD.md) 為準。
 
 SP1 目前已包含：
 
@@ -53,32 +58,31 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows_setup_sp1.ps1
 
 此腳本會檢查 Python、安裝必要套件、執行測試與無視窗自我檢查，最後啟動 FLASH。
 
-## Desktop synchronization
+## 玩家更新
 
-手動同步：
+正式成品只保留一個玩家需要操作的更新入口：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\sync_desktop_from_github.ps1
+```text
+更新輔.cmd
 ```
 
-註冊每 15 分鐘自動同步：
+它會取得 `release/latest` 的最新成品、核對 `FLASH.exe` 雜湊、更新目前安裝
+資料夾，並保留既有桌面「輔 V0.2」捷徑名稱與圖示。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\register_flash_auto_sync_task.ps1
-```
-
-同步腳本追蹤 `origin/main`，若本機存在未提交修改會停止，避免覆蓋桌面內容。
+舊版每 15 分鐘 Git 同步排程已停用，不再提供建立該排程的腳本。若舊電腦曾
+安裝過，可執行成品內 `輔系統\檢查輔同步狀態.cmd` 取得可判斷的中文報告。
 
 ## Verify a downloaded Windows build
 
 下載並解壓 GitHub Actions Artifact 後執行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\verify_windows_release.ps1
+powershell -ExecutionPolicy Bypass -File .\輔系統\verify_windows_release.ps1
 ```
 
 驗收腳本會核對 `FLASH.exe`、SHA-256 與建置資訊，通過後啟動程式。
 
 ## Delivery status
 
-正式交付標準請見 `SP1_VERIFICATION.md`。只有 GitHub Actions 建置、Windows 成品驗證、桌面同步與目標電腦實機驗收全部通過，才視為 SP1 完成。
+正式交付標準請見 `SP1_VERIFICATION.md`。只有 GitHub Actions 建置、Windows
+成品驗證、單一更新流程與目標電腦實機驗收全部通過，才視為 SP1 完成。

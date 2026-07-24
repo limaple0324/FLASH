@@ -2,14 +2,16 @@
 
 This document is the delivery gate for FLASH SP1. A feature is not considered complete merely because code or a workflow file exists.
 
-## A. Repository and synchronization
+## A. Repository and delivery update
 
 - [x] GitHub default branch is `main`.
-- [x] Desktop synchronization script tracks `origin/main`.
-- [x] Synchronization refuses to overwrite uncommitted local changes.
-- [x] Scheduled task starts shortly after registration and repeats every 15 minutes.
-- [ ] Verify the scheduled task exists on the target Windows computer.
-- [ ] Verify `Desktop\FLASH` HEAD matches `origin/main`.
+- [x] Successful non-PR `main` builds publish the verified bundle to `release/latest`.
+- [x] The only player-facing update entry is `更新輔.cmd`.
+- [x] The updater verifies `FLASH.exe` before replacing the installed build.
+- [x] The updater preserves the existing desktop `輔 V0.2` shortcut name and icon.
+- [x] A diagnostic tool can identify the obsolete scheduled Git sync task.
+- [ ] Confirm the obsolete scheduled Git sync task is absent or disabled on the target computer.
+- [ ] Run `更新輔.cmd` on the target computer and confirm the installed build matches `release/latest`.
 
 ## B. Core startup
 
@@ -86,6 +88,7 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - [ ] Confirm config and log persistence after closing and reopening.
 - [ ] Confirm no console window appears.
 - [ ] Complete user acceptance test on the target desktop.
+- [ ] Confirm the desktop `輔 V0.2` shortcut name and icon remain unchanged after updating.
 
 ## Delivery states
 
