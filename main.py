@@ -45,7 +45,7 @@ from services.card_preview_selection_store import CardPreviewSelectionStore
 from services.card_view_state_service import CardViewStateService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
-from ui.home import HomeView
+from ui.home import HomeView, format_group_characters
 from ui.card_preview_settings import CardPreviewCatalog
 
 APP_TITLE = PRODUCT_NAME
@@ -497,6 +497,13 @@ def create_main_window(
             parent=window,
         )
 
+    def show_group_characters() -> None:
+        messagebox.showinfo(
+            "輔｜組別角色",
+            format_group_characters({"window_registry": registry_status()}),
+            parent=window,
+        )
+
     def show_card_preview_error(action: str, error: Exception) -> None:
         logger = AppContext.get(LoggerService)
         if logger is not None:
@@ -563,6 +570,7 @@ def create_main_window(
             else None
         ),
         on_card_display_seconds_error=show_card_display_seconds_error,
+        on_show_group_characters=show_group_characters,
     )
     home_view.build()
     window._home_view = home_view

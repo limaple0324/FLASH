@@ -38,6 +38,26 @@ def test_home_omits_preview_entry_without_explicit_candidates(monkeypatch) -> No
     }
 
 
+def test_home_shows_read_only_group_character_entry_when_provided(monkeypatch) -> None:
+    _install_fake_widgets(monkeypatch)
+    calls = []
+
+    home.HomeView(
+        None,
+        {},
+        on_show_group_characters=lambda: calls.append("show"),
+    ).build()
+
+    button = next(
+        widget
+        for widget in _FakeWidget.created
+        if widget.options.get("text") == "查看組別角色"
+    )
+    button.options["command"]()
+
+    assert calls == ["show"]
+
+
 def test_home_selects_candidate_and_refreshes_selected_marker(monkeypatch) -> None:
     _install_fake_widgets(monkeypatch)
     selected_profile_id = None

@@ -45,6 +45,33 @@ def _group_text(status: dict[str, object]) -> str:
     return f"目前組別\n{title}\n{preview}"
 
 
+def format_group_characters(status: dict[str, object]) -> str:
+    """Format every registered character without exposing window internals."""
+    characters = _characters(status)
+    grouped: dict[str, list[str]] = {}
+    for item in characters:
+        name = item.get("display_name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        group = item.get("group")
+        group_name = (
+            group.strip()
+            if isinstance(group, str) and group.strip()
+            else "未分組"
+        )
+        grouped.setdefault(group_name, []).append(name.strip())
+
+    if not grouped:
+        return "目前沒有可顯示的組別與角色資料。"
+
+    lines: list[str] = []
+    for group_name in sorted(grouped, key=lambda value: (value == "未分組", value)):
+        lines.append(f"【{group_name}】")
+        lines.extend(f"• {name}" for name in grouped[group_name])
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def _status_text(status: dict[str, object]) -> str:
     if not bool(status.get("self_check_passed", False)):
         return "目前狀態\n● 需要檢查"
@@ -104,6 +131,7 @@ class HomeView:
         card_display_seconds_provider: Callable[[], int] | None = None,
         on_card_display_seconds_update: Callable[[int], object] | None = None,
         on_card_display_seconds_error: Callable[[Exception], object] | None = None,
+        on_show_group_characters: Callable[[], object] | None = None,
     ):
         self.parent = parent
         self.status = status
@@ -117,6 +145,7 @@ class HomeView:
         self.card_display_seconds_provider = card_display_seconds_provider
         self.on_card_display_seconds_update = on_card_display_seconds_update
         self.on_card_display_seconds_error = on_card_display_seconds_error
+        self.on_show_group_characters = on_show_group_characters
         self._card_label = None
         self._card_preview_buttons: dict[str, Button] = {}
         self._card_preview_clear_button: Button | None = None
@@ -227,6 +256,14 @@ class HomeView:
             font=("Microsoft JhengHei UI", 12),
             anchor="w",
         ).pack(fill=X, pady=12)
+
+        if self.on_show_group_characters is not None:
+            Button(
+                body,
+                text="查看組別角色",
+                width=18,
+                command=self.on_show_group_characters,
+            ).pack(pady=(0, 8))
 
         Button(
             body,

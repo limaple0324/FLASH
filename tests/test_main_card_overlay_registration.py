@@ -4,6 +4,7 @@ from main import (
     create_main_window,
     run,
 )
+from core.window_registry import WindowRegistry
 from services.app_context import AppContext
 from services.card_display_settings_service import CardDisplaySettingsService
 from services.card_preview_selection_service import CardPreviewSelectionService
@@ -180,6 +181,38 @@ def test_main_window_reports_card_preview_failure_without_internal_details(
             window,
         )
     ]
+
+
+def test_main_window_shows_current_group_characters_without_internal_details(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import main
+
+    build_services(root=tmp_path)
+    registry = AppContext.get(WindowRegistry)
+    registry.register_character(
+        "private-character-id",
+        "小古",
+        group="14支",
+    )
+    window = FakeWindow()
+    shown = []
+    monkeypatch.setattr(main, "Tk", lambda: window)
+    monkeypatch.setattr(main, "HomeView", FakeHomeView)
+    monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
+    monkeypatch.setattr(main, "_build_registered_card_overlay_runtime", lambda _window: None)
+    monkeypatch.setattr(
+        main.messagebox,
+        "showinfo",
+        lambda title, message, parent: shown.append((title, message, parent)),
+    )
+
+    created = create_main_window({}, main.AppContext.get(main.PathManager))
+    created._home_view.kwargs["on_show_group_characters"]()
+
+    assert shown == [("輔｜組別角色", "【14支】\n• 小古", window)]
+    assert "private-character-id" not in shown[0][1]
 
 
 def test_main_window_reports_card_display_time_failure_without_internal_details(
