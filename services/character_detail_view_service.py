@@ -56,14 +56,29 @@ class CharacterDetailViewService:
         self._characters = characters
         self._soul_stones = soul_stones
 
-    def all(self) -> tuple[PlayerCharacterDetail, ...]:
-        details: list[PlayerCharacterDetail] = []
+    def all_with_identities(
+        self,
+    ) -> tuple[tuple[str, PlayerCharacterDetail], ...]:
+        """供控制層安全綁定操作；角色識別不得傳給顯示內容。"""
+
+        details: list[tuple[str, PlayerCharacterDetail]] = []
         for character_id, summary in self._characters.all_with_identities():
             soul_stone = self._soul_stones.for_character(character_id)
             details.append(
-                PlayerCharacterDetail.from_summary(
-                    summary,
-                    soul_stone=soul_stone.note if soul_stone is not None else None,
+                (
+                    character_id,
+                    PlayerCharacterDetail.from_summary(
+                        summary,
+                        soul_stone=(
+                            soul_stone.note if soul_stone is not None else None
+                        ),
+                    ),
                 )
             )
         return tuple(details)
+
+    def all(self) -> tuple[PlayerCharacterDetail, ...]:
+        return tuple(
+            detail
+            for _character_id, detail in self.all_with_identities()
+        )
