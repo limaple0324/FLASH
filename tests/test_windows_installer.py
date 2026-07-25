@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -79,8 +80,11 @@ def test_complete_installer_verifies_copies_and_creates_one_shortcut(tmp_path: P
 
     shortcut_path = desktop_root / "輔.lnk"
     assert shortcut_path.is_file()
+    assert tuple(desktop_root.glob("*.lnk")) == (shortcut_path,)
+    inspected_shortcut = desktop_root / "shortcut-under-test.lnk"
+    shutil.copy2(shortcut_path, inspected_shortcut)
     env = os.environ.copy()
-    env["FLASH_TEST_SHORTCUT"] = str(shortcut_path)
+    env["FLASH_TEST_SHORTCUT"] = str(inspected_shortcut)
     inspected = subprocess.run(
         [
             str(POWERSHELL),
@@ -106,7 +110,6 @@ def test_complete_installer_verifies_copies_and_creates_one_shortcut(tmp_path: P
     assert str(install_root / "FLASH.exe") in inspected_lines
     assert str(install_root) in inspected_lines
     assert f"{install_root / 'FLASH.exe'},0" in inspected_lines
-    assert tuple(desktop_root.glob("*.lnk")) == (shortcut_path,)
 
 
 def test_install_failure_restores_existing_install_and_shortcut(tmp_path: Path):
