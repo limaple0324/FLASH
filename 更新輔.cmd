@@ -18,7 +18,7 @@ if errorlevel 1 (
   pause >nul
   exit /b 1
 )
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TEMPUPDATER%" -InstallDirectory "%~dp0"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TEMPUPDATER%" -InstallDirectory "%~dp0."
 set "EXITCODE=%ERRORLEVEL%"
 del /f /q "%TEMPUPDATER%" >nul 2>nul
 if not "%EXITCODE%"=="0" (
