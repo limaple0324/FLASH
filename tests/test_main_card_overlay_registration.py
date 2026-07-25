@@ -203,6 +203,46 @@ def test_main_window_reports_card_preview_failure_without_internal_details(
     ]
 
 
+def test_main_window_reports_card_refresh_failure_without_internal_details(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import main
+
+    build_services(root=tmp_path)
+    window = FakeWindow()
+    shown = []
+    monkeypatch.setattr(main, "Tk", lambda: window)
+    monkeypatch.setattr(main, "HomeView", FakeHomeView)
+    monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
+    monkeypatch.setattr(main, "_build_registered_card_overlay_runtime", lambda _window: None)
+    monkeypatch.setattr(
+        main.messagebox,
+        "showerror",
+        lambda title, message, parent: shown.append((title, message, parent)),
+    )
+
+    created = create_main_window({}, main.AppContext.get(main.PathManager))
+    created._home_view.kwargs["on_card_refresh_error"](
+        OSError(r"C:\private\cards.json")
+    )
+
+    assert shown == [
+        (
+            "輔｜提醒卡",
+            (
+                "無法更新提醒卡畫面，已保留上次顯示的內容。\n\n"
+                "請稍後再試；錯誤已寫入紀錄。"
+            ),
+            window,
+        )
+    ]
+    assert r"C:\private\cards.json" not in shown[0][1]
+    assert r"C:\private\cards.json" in (
+        tmp_path / "logs" / "flash.log"
+    ).read_text(encoding="utf-8")
+
+
 def test_main_window_opens_selected_character_in_single_read_only_detail_window(
     monkeypatch,
     tmp_path,
@@ -301,6 +341,75 @@ def test_main_window_opens_selected_character_in_single_read_only_detail_window(
     assert detail_windows[0].open_calls == [details[0]]
     assert created._character_list_window is list_windows[0]
     assert created._character_detail_window is detail_windows[0]
+
+
+def test_main_window_character_list_failure_is_isolated_and_hides_internal_details(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import main
+    from services.character_detail_view_service import CharacterDetailViewService
+
+    build_services(root=tmp_path)
+    service = AppContext.get(CharacterDetailViewService)
+    window = FakeWindow()
+    shown = []
+    list_windows = []
+
+    class FakeCharacterListWindow:
+        def __init__(self, master):
+            self.master = master
+            self.is_open = True
+            self.close_calls = 0
+            self.open_calls = []
+            list_windows.append(self)
+
+        def open_choices(self, choices):
+            self.open_calls.append(tuple(choices))
+
+        def close(self):
+            self.close_calls += 1
+            self.is_open = False
+
+    def fail_to_load():
+        raise OSError(
+            r"C:\private\characters.json private-character-id"
+        )
+
+    monkeypatch.setattr(service, "all_with_identities", fail_to_load)
+    monkeypatch.setattr(main, "Tk", lambda: window)
+    monkeypatch.setattr(main, "HomeView", FakeHomeView)
+    monkeypatch.setattr(main, "CharacterListWindow", FakeCharacterListWindow)
+    monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
+    monkeypatch.setattr(main, "_build_registered_card_overlay_runtime", lambda _window: None)
+    monkeypatch.setattr(
+        main.messagebox,
+        "showerror",
+        lambda title, message, parent: shown.append((title, message, parent)),
+    )
+
+    created = create_main_window({}, main.AppContext.get(main.PathManager))
+    created._home_view.kwargs["on_show_group_characters"]()
+
+    assert list_windows[0].close_calls == 0
+    assert list_windows[0].open_calls == []
+    assert shown == [
+        (
+            "輔｜組別角色",
+            (
+                "無法開啟角色清單。\n\n"
+                "請稍後再試；錯誤已寫入紀錄。"
+            ),
+            window,
+        )
+    ]
+    assert "private-character-id" not in shown[0][1]
+    assert r"C:\private\characters.json" not in shown[0][1]
+    log_text = (tmp_path / "logs" / "flash.log").read_text(
+        encoding="utf-8"
+    )
+    assert "private-character-id" in log_text
+    assert r"C:\private\characters.json" in log_text
 
 
 def test_main_window_reports_card_display_time_failure_without_internal_details(

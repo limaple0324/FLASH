@@ -1043,18 +1043,37 @@ def create_main_window(
         )
 
     def show_group_characters() -> None:
-        character_details = AppContext.get(CharacterDetailViewService)
-        choices = (
-            CharacterDetailChoiceService(
-                character_details,
-                show_character_detail,
-            ).all()
-            if character_details is not None
-            else ()
+        try:
+            character_details = AppContext.get(CharacterDetailViewService)
+            choices = (
+                CharacterDetailChoiceService(
+                    character_details,
+                    show_character_detail,
+                ).all()
+                if character_details is not None
+                else ()
+            )
+            if character_list_window.is_open:
+                character_list_window.close()
+            character_list_window.open_choices(choices)
+        except Exception as error:
+            show_character_list_error(error)
+
+    def show_character_list_error(error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            try:
+                logger.error(f"Character list open failed: {error}")
+            except Exception:
+                pass
+        messagebox.showerror(
+            "輔｜組別角色",
+            (
+                "無法開啟角色清單。\n\n"
+                "請稍後再試；錯誤已寫入紀錄。"
+            ),
+            parent=window,
         )
-        if character_list_window.is_open:
-            character_list_window.close()
-        character_list_window.open_choices(choices)
 
     def show_card_preview_error(action: str, error: Exception) -> None:
         logger = AppContext.get(LoggerService)
@@ -1079,6 +1098,22 @@ def create_main_window(
             (
                 "無法儲存提醒卡顯示時間，原本設定已保留。\n\n"
                 "請輸入大於 0 的完整秒數後再試；錯誤已寫入紀錄。"
+            ),
+            parent=window,
+        )
+
+    def show_card_refresh_error(error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            try:
+                logger.error(f"Card display refresh failed: {error}")
+            except Exception:
+                pass
+        messagebox.showerror(
+            "輔｜提醒卡",
+            (
+                "無法更新提醒卡畫面，已保留上次顯示的內容。\n\n"
+                "請稍後再試；錯誤已寫入紀錄。"
             ),
             parent=window,
         )
@@ -1133,6 +1168,7 @@ def create_main_window(
             if card_view_state_service is not None
             else None
         ),
+        on_card_refresh_error=show_card_refresh_error,
         card_preview_choices_provider=(
             card_preview_selection_service.available_choices
             if card_preview_selection_service is not None

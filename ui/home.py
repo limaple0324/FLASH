@@ -222,6 +222,7 @@ class HomeView:
         on_start=None,
         card_view_state: CardViewState | None = None,
         card_view_state_provider: Callable[[], CardViewState] | None = None,
+        on_card_refresh_error: Callable[[Exception], object] | None = None,
         card_preview_choices_provider: Callable[[], tuple[CardPreviewChoice, ...]] | None = None,
         on_card_preview_select: Callable[[str], object] | None = None,
         on_card_preview_clear: Callable[[], object] | None = None,
@@ -239,6 +240,11 @@ class HomeView:
         ) = None,
         on_target_window_error: Callable[[Exception], object] | None = None,
     ):
+        if card_view_state is not None and not isinstance(
+            card_view_state,
+            CardViewState,
+        ):
+            raise TypeError("card_view_state must be CardViewState or None.")
         if workspace_state is not None and not isinstance(
             workspace_state,
             WorkspaceState,
@@ -256,6 +262,7 @@ class HomeView:
         self.on_start = on_start
         self.card_view_state = card_view_state
         self.card_view_state_provider = card_view_state_provider
+        self.on_card_refresh_error = on_card_refresh_error
         self.card_preview_choices_provider = card_preview_choices_provider
         self.on_card_preview_select = on_card_preview_select
         self.on_card_preview_clear = on_card_preview_clear
@@ -280,11 +287,29 @@ class HomeView:
 
     def refresh_cards(self) -> str:
         """重新讀取唯讀快照，並更新既有的首頁提醒文字。"""
-        if self.card_view_state_provider is not None:
-            self.card_view_state = self.card_view_state_provider()
-        text = _card_text(self.status, self.card_view_state)
-        if self._card_label is not None:
-            self._card_label.configure(text=text)
+        previous_state = self.card_view_state
+        try:
+            if self.card_view_state_provider is not None:
+                state = self.card_view_state_provider()
+            else:
+                state = previous_state
+            if self.card_view_state_provider is not None and not isinstance(
+                state,
+                CardViewState,
+            ):
+                raise TypeError(
+                    "card view provider must return CardViewState."
+                )
+            text = _card_text(self.status, state)
+            if self._card_label is not None:
+                self._card_label.configure(text=text)
+        except Exception as error:
+            if self.on_card_refresh_error is None:
+                raise
+            self.on_card_refresh_error(error)
+            return _card_text(self.status, previous_state)
+
+        self.card_view_state = state
         return text
 
     def refresh_workspace(self) -> str:

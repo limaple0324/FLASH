@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from cards.view_state import CardViewItem, CardViewState
 from ui.home import HomeView, _card_text
 
@@ -85,3 +87,98 @@ def test_home_card_refresh_keeps_static_state_when_provider_is_unavailable():
     view = HomeView(None, {}, card_view_state=state)
 
     assert view.refresh_cards().startswith("提醒卡（1）\n14支｜守紀")
+
+
+def test_home_card_refresh_failure_keeps_last_good_state_and_reports_error():
+    state = CardViewState(cards=(_item("guard"),))
+    errors: list[Exception] = []
+    calls = 0
+
+    def provider() -> CardViewState:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return state
+        raise OSError(r"C:\private\cards.json")
+
+    view = HomeView(
+        None,
+        {},
+        card_view_state_provider=provider,
+        on_card_refresh_error=errors.append,
+    )
+    label = _FakeLabel()
+    view._card_label = label
+
+    previous = view.refresh_cards()
+    failed = view.refresh_cards()
+
+    assert failed == previous
+    assert label.text == previous
+    assert view.card_view_state is state
+    assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+
+
+@pytest.mark.parametrize("invalid_state", (None, object()))
+def test_home_card_refresh_rejects_invalid_provider_without_replacing_state(
+    invalid_state,
+):
+    previous = CardViewState(cards=(_item("guard"),))
+    errors: list[Exception] = []
+    view = HomeView(
+        None,
+        {},
+        card_view_state=previous,
+        card_view_state_provider=lambda: invalid_state,
+        on_card_refresh_error=errors.append,
+    )
+
+    text = view.refresh_cards()
+
+    assert view.card_view_state is previous
+    assert text.startswith("提醒卡（1）\n14支｜守紀")
+    assert len(errors) == 1
+    assert isinstance(errors[0], TypeError)
+
+
+def test_home_card_refresh_raises_without_an_error_boundary():
+    view = HomeView(
+        None,
+        {},
+        card_view_state_provider=lambda: object(),
+    )
+
+    with pytest.raises(TypeError, match="CardViewState"):
+        view.refresh_cards()
+
+
+def test_home_card_label_failure_keeps_previous_state_and_reports_error():
+    previous = CardViewState(cards=(_item("guard"),))
+    replacement = CardViewState(
+        cards=(
+            _item("guard"),
+            _item("second", next_step="稍後再處理"),
+        )
+    )
+    errors: list[Exception] = []
+
+    class _FailingLabel:
+        def configure(self, *, text: str) -> None:
+            raise RuntimeError(f"label unavailable: {text}")
+
+    view = HomeView(
+        None,
+        {},
+        card_view_state=previous,
+        card_view_state_provider=lambda: replacement,
+        on_card_refresh_error=errors.append,
+    )
+    view._card_label = _FailingLabel()
+
+    text = view.refresh_cards()
+
+    assert view.card_view_state is previous
+    assert text.startswith("提醒卡（1）\n14支｜守紀")
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
