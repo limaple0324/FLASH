@@ -5,7 +5,7 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 Scope note (2026-07-25): new work is restricted to SP1 on
 `sp1/completion-2026-07-25`, based on `main@538bdbc`. The latest verified source
 commit is
-`ac1223a45ccfd12ec3096ccd8fd7933cdbb2bfe3`. The `5db5b5f` local baseline
+`960bacb7260ea33f59c0724b219472fcbc36924e`. The `5db5b5f` local baseline
 passed 171 tests, Python compilation, 8/8 source self-checks, and
 `git diff --check`; the subsequent hash-compatibility fix passed the 24 affected
 updater/release-verifier tests and one focused regression test.
@@ -55,6 +55,18 @@ On the real Windows 11 desktop, the transactionally installed package preserved
 the existing `輔` project junction, created only `啟動輔.lnk`, passed target,
 working-directory, icon, EXE-hash, GUI launch, and normal-close checks, and left
 no FLASH process behind.
+
+GitHub Actions run #127 for `960bacb` passed all 188 tests, source and packaged
+8/8 self-checks, Windows EXE creation, bundle verification, artifact upload,
+and SP1-only publication. The permanent ZIP SHA-256 matches artifact
+`8616874795`:
+`14a6adba241defb0415d92ca66a48d3e1980c05204e5c7f3f4cfadeda13abe7d`.
+Read-only target-desktop probing covered all 14 matching Flash windows without
+persisting images or sending input: 13 were non-foreground, four partially
+covered, one fully covered, and five minimized. All returned non-blank frames;
+the minimized capture fix used the saved normal window bounds and returned
+911/916 by 629 frames instead of the misleading 353 by 39 minimized shell.
+The installed SP1 release was transactionally updated to the same source commit.
 
 Every new item must be confirmed as discussed before implementation. The
 player-viewable window-registry area and the five frozen resource areas remain
@@ -120,9 +132,9 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] Confirm the result is shown correctly in the packaged SP1 window on the
   target Windows 11 desktop.
 - [ ] Configure the real Adobe Flash Player 11 window identity.
-- [ ] Verify background capture while the game is partially covered.
-- [ ] Verify background capture while the game is not foreground.
-- [ ] Verify background capture while the game is minimized.
+- [x] Verify background capture while the game is partially covered.
+- [x] Verify background capture while the game is not foreground.
+- [x] Verify background capture while the game is minimized.
 - [ ] Add a user-approved harmless background-input probe.
 - [ ] Verify non-foreground background input on the target desktop.
 - [ ] Verify minimized background input on the target desktop.
@@ -156,6 +168,9 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] GitHub Actions run #125 for `ac1223a` passes all 186 tests, publishes only
   to `release/sp1`, and its collision-safe shortcut passes real-desktop
   installation and launch acceptance.
+- [x] GitHub Actions run #127 for `960bacb` passes all 188 tests, publishes only
+  to `release/sp1`, and its read-only capture passes covered, non-foreground,
+  and minimized real-Flash acceptance.
 - [ ] Add target-desktop integration tests for capture, overlap, and reconnect behavior.
 
 ## F. Build and delivery
@@ -177,6 +192,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   release and its isolated Windows 11 first-install/shortcut flow.
 - [x] Verify and permanently save the `ac1223a` real-desktop-entry release and
   its junction-preserving first-install/shortcut flow.
+- [x] Verify and permanently save the `960bacb` real-background-capture release,
+  including its target-desktop updater and minimized normal-bounds fix.
 - [ ] Confirm a successful GitHub Actions run for current `main`.
 - [x] Download and launch the current artifact on Windows 11 build 26200 with an
   isolated data profile.
@@ -236,6 +253,14 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   `3854f49733dcd5d23f9a8452d0390f5aca31c7aaed1c89bc505f45240d38ff63`.
 - Latest real-desktop-entry evidence:
   `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-ac1223a-sp1-release.md`.
+- Latest real-background-capture release:
+  `FLASH-SP1-Windows-0.1.2-960bacb-sp1-release.zip`, source
+  `960bacb7260ea33f59c0724b219472fcbc36924e`, GitHub Actions run
+  `30148568086`, artifact `8616874795`, publication commit
+  `43c068d360dc63f04130660382b38614cc8709de`, SHA-256
+  `14a6adba241defb0415d92ca66a48d3e1980c05204e5c7f3f4cfadeda13abe7d`.
+- Latest real-background-capture evidence:
+  `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-960bacb-sp1-release.md`.
 - The latest SP1 artifact record must include branch, full commit, version,
   tests, self-checks, SHA-256, build source, Windows evidence, and publication
   state.

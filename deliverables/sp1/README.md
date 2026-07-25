@@ -8,7 +8,7 @@
 - GitHub：`https://github.com/limaple0324/FLASH.git`
 - 分支：`sp1/completion-2026-07-25`
 - 基準：`main@538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`
-- 最新來源提交：`ac1223a45ccfd12ec3096ccd8fd7933cdbb2bfe3`
+- 最新來源提交：`960bacb7260ea33f59c0724b219472fcbc36924e`
 - 版本：SP1 0.1.2 工程驗證階段
 
 ## 目前來源驗證
@@ -63,6 +63,14 @@ Windows 11 已在隔離位置完成來源、暫存、安裝後三次成品驗證
 `3854f49733dcd5d23f9a8452d0390f5aca31c7aaed1c89bc505f45240d38ff63`。
 Windows 11 真實桌面安裝保留原有 `輔` 專案 junction，只建立
 `啟動輔.lnk`，並通過捷徑屬性、EXE 雜湊、圖形啟動及正常關閉驗收。
+
+最新真實背景擷取版為
+`FLASH-SP1-Windows-0.1.2-960bacb-sp1-release.zip`。GitHub Actions run #127
+的 188 項完整測試、來源／封裝 8/8 自我檢查與全部 Windows 建置／發布步驟
+通過；ZIP SHA-256 與 artifact `8616874795` digest 均為
+`14a6adba241defb0415d92ca66a48d3e1980c05204e5c7f3f4cfadeda13abe7d`。
+14 個真實 Flash 視窗已通過部分／完全遮擋、非前景與最小化唯讀畫面擷取；
+正式安裝亦已由 `更新輔.cmd` 交易式更新到同一提交。
 
 ## 後續成品紀錄
 

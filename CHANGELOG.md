@@ -2,7 +2,24 @@
 
 ## SP1 0.1.2 — 2026-07-25
 
-### Latest verified real-desktop-entry release
+### Latest verified real-background-capture release
+
+- Source: `960bacb7260ea33f59c0724b219472fcbc36924e`
+- GitHub Actions: run #127
+- Tests: 188 passed
+- Source and packaged self-checks: 8/8 passed
+- Captured valid non-blank frames from 14 real Flash windows, including
+  non-foreground, partially/fully covered, and minimized states.
+- Used saved normal bounds for minimized capture instead of accepting the
+  353 by 39 minimized shell as game content.
+- Removed the stale `輔 V0.2` shortcut name from updater completion text.
+- Published only to `release/sp1`; `release/latest` remained unchanged.
+- Permanent artifact:
+  `FLASH-SP1-Windows-0.1.2-960bacb-sp1-release.zip`
+- ZIP SHA-256:
+  `14a6adba241defb0415d92ca66a48d3e1980c05204e5c7f3f4cfadeda13abe7d`
+
+### Earlier verified real-desktop-entry release
 
 - Source: `ac1223a45ccfd12ec3096ccd8fd7933cdbb2bfe3`
 - GitHub Actions: run #125
