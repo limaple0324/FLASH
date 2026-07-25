@@ -21,6 +21,12 @@ FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式
 
 目前版本：**SP1 0.1.2 engineering verification build**
 
+目前最新已驗證來源為
+`03db0624fb64e7b5997502558914a0f706da7b79`。GitHub Actions run #124
+已通過 184 項測試、來源／封裝 8/8 自我檢查、Windows EXE、bundle、
+artifact 上傳及 `release/sp1` 發布；永久成品與證據保存在
+`C:\Users\USER\Documents\輔\SP1成品`。
+
 SP1 目前已包含：
 
 - application bootstrap
@@ -35,6 +41,8 @@ SP1 目前已包含：
 - PyInstaller build specification
 - GitHub Actions test-and-build workflow
 - release bundle metadata and SHA-256 verification
+- 完整首次安裝、單一捷徑及交易式 SP1 專用更新
+- Windows 11 包裝視窗的完整唯讀自我檢查與安全狀態顯示
 
 > 注意：目前是工程驗證版本。Recovery、Smart Reconnect 與遊戲視窗操作的介面已固定，但真正的遊戲／視窗適配器仍需接入並完成 Windows 實機驗收。
 
