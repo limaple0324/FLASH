@@ -112,6 +112,62 @@ def test_complete_installer_verifies_copies_and_creates_one_shortcut(tmp_path: P
     assert f"{install_root / 'FLASH.exe'},0" in inspected_lines
 
 
+def test_first_install_uses_distinct_shortcut_name_when_desktop_has_fu_directory(
+    tmp_path: Path,
+):
+    release_root = _create_release(
+        tmp_path,
+        build_kind="sp1_release",
+        event_name="push",
+        source_ref="refs/heads/sp1/completion-2026-07-25",
+        source_branch="sp1/completion-2026-07-25",
+        publish_target="release/sp1",
+    )
+    install_root = tmp_path / "installed" / "SP1"
+    desktop_root = tmp_path / "desktop"
+    visible_name_conflict = desktop_root / "輔"
+    visible_name_conflict.mkdir(parents=True)
+    sentinel = visible_name_conflict / "preserve-project-entry.txt"
+    sentinel.write_bytes(b"preserve desktop directory")
+
+    result = _run_installer(release_root, install_root, desktop_root)
+
+    assert result.returncode == 0, _output(result)
+    shortcut_path = desktop_root / "啟動輔.lnk"
+    assert shortcut_path.is_file()
+    assert not (desktop_root / "輔.lnk").exists()
+    assert tuple(desktop_root.glob("*.lnk")) == (shortcut_path,)
+    assert sentinel.read_bytes() == b"preserve desktop directory"
+    install_record = (install_root / "安裝紀錄.txt").read_text(encoding="utf-8-sig")
+    assert f"shortcut_path={shortcut_path}" in install_record
+
+
+def test_reinstall_preserves_existing_shortcut_name_despite_visible_name_conflict(
+    tmp_path: Path,
+):
+    release_root = _create_release(
+        tmp_path,
+        build_kind="sp1_release",
+        event_name="push",
+        source_ref="refs/heads/sp1/completion-2026-07-25",
+        source_branch="sp1/completion-2026-07-25",
+        publish_target="release/sp1",
+    )
+    install_root = tmp_path / "installed" / "SP1"
+    desktop_root = tmp_path / "desktop"
+    (desktop_root / "輔").mkdir(parents=True)
+    existing_shortcut = desktop_root / "輔.lnk"
+    existing_shortcut.write_bytes(b"replace this prior shortcut")
+
+    result = _run_installer(release_root, install_root, desktop_root)
+
+    assert result.returncode == 0, _output(result)
+    assert existing_shortcut.is_file()
+    assert existing_shortcut.read_bytes() != b"replace this prior shortcut"
+    assert not (desktop_root / "啟動輔.lnk").exists()
+    assert tuple(desktop_root.glob("*.lnk")) == (existing_shortcut,)
+
+
 def test_install_failure_restores_existing_install_and_shortcut(tmp_path: Path):
     release_root = _create_release(
         tmp_path,

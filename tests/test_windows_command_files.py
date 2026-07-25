@@ -48,7 +48,9 @@ def test_installer_uses_a_safe_source_path_and_one_confirmed_shortcut():
 
     assert '-SourceDirectory "%~dp0."' in launcher
     assert 'Join-Path $env:LOCALAPPDATA "Programs\\輔\\SP1"' in installer
-    assert 'Join-Path $DesktopDir "輔.lnk"' in installer
+    assert 'Join-Path $DesktopDirectory "輔.lnk"' in installer
+    assert 'Join-Path $DesktopDirectory "啟動輔.lnk"' in installer
+    assert 'Join-Path $DesktopDirectory "輔"' in installer
     assert '$shortcut.TargetPath = $ExecutablePath' in installer
     assert '$shortcut.IconLocation = "$ExecutablePath,0"' in installer
 
