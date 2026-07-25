@@ -2,14 +2,26 @@
 
 This document is the delivery gate for FLASH SP1. A feature is not considered complete merely because code or a workflow file exists.
 
-## A. Repository and synchronization
+Scope note (2026-07-25): new work is restricted to SP1 on
+`sp1/completion-2026-07-25`, based on `main@538bdbc`. Baseline source evidence is
+110 passing tests, compilation, and 8 source self-checks. No new Windows artifact
+has been built from this branch.
+
+Every new item must be confirmed as discussed before implementation. The
+player-viewable window-registry area and the five frozen resource areas remain
+paused. SP2 and SP3 work does not resume until the prior delivery stage is complete.
+
+## A. Repository and delivery update
 
 - [x] GitHub default branch is `main`.
-- [x] Desktop synchronization script tracks `origin/main`.
-- [x] Synchronization refuses to overwrite uncommitted local changes.
-- [x] Scheduled task starts shortly after registration and repeats every 15 minutes.
-- [ ] Verify the scheduled task exists on the target Windows computer.
-- [ ] Verify `Desktop\FLASH` HEAD matches `origin/main`.
+- [x] SP1 completion uses a dedicated branch based on `main`.
+- [x] SP1 has an independent delivery area and status file.
+- [x] The player-facing update entry is the single `更新輔.cmd`.
+- [ ] Restrict `release/latest` publication to an approved `main` push.
+- [ ] Give the independent SP1 build an update source that cannot advance to
+  SP2, SP3, or the complete integrated delivery.
+- [ ] Confirm the obsolete scheduled Git sync task is absent or disabled.
+- [ ] Run `更新輔.cmd` on the target computer and verify the installed build.
 
 ## B. Core startup
 
@@ -93,3 +105,11 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 - **Engineering verification build:** executable starts and self-check passes, but real game adapters may still be absent.
 - **Player test build:** concrete target-window, recovery, and reconnect behavior is integrated and tested.
 - **SP1 complete:** all required checklist items are checked and the target Windows desktop acceptance test passes.
+
+## Independent delivery records
+
+- SP1 delivery area: `deliverables/sp1/`
+- SP1 status file: `docs/01_輔_SP1_基礎系統_狀態與驗收.md`
+- Overall project file: `docs/00_輔_專案完整總整理與未來路線圖.md`
+- A future SP1 artifact record must include branch, full commit, version, tests,
+  self-checks, SHA-256, build source, Windows evidence, and publication state.
