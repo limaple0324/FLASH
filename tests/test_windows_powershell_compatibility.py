@@ -9,6 +9,7 @@ import pytest
 PLAYER_POWERSHELL_SCRIPTS = (
     Path("tools/verify_windows_release.ps1"),
     Path("tools/檢查輔同步狀態.ps1"),
+    Path("tools/輔系統/安裝輔.ps1"),
     Path("tools/輔系統/輔更新核心.ps1"),
 )
 WINDOWS_POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")

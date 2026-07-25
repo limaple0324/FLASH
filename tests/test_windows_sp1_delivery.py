@@ -101,6 +101,8 @@ def test_main_release_keeps_the_single_live_updater():
     )[1].split("elseif ($env:FLASH_BUILD_KIND -eq 'sp1_snapshot')", 1)[0]
 
     assert "Copy-Item 'tools/更新輔.cmd' 'release/更新輔.cmd'" in live_release_block
+    assert "Copy-Item 'tools/安裝輔.cmd' 'release/安裝輔.cmd'" in live_release_block
+    assert "Copy-Item 'tools/輔系統/安裝輔.ps1'" in live_release_block
     assert "Copy-Item 'tools/輔系統/輔更新核心.ps1'" in live_release_block
     assert "release/輔系統/UPDATE_CHANNEL.txt" in live_release_block
 
@@ -139,9 +141,11 @@ def test_main_release_builds_latest_then_a_complete_payload_manifest():
     for relative_path in (
         "FLASH.exe",
         "LATEST.txt",
+        "安裝輔.cmd",
         "更新輔.cmd",
         "輔系統/BUILD_INFO.txt",
         "輔系統/verify_windows_release.ps1",
+        "輔系統/安裝輔.ps1",
         "輔系統/輔更新核心.ps1",
         "輔系統/UPDATE_CHANNEL.txt",
         "輔系統/檢查輔同步狀態.cmd",
@@ -203,6 +207,7 @@ def test_release_payload_bytes_survive_git_round_trip_with_autocrlf(tmp_path: Pa
         b"* -text\n*.cmd -text\n*.bat -text\n*.ps1 -text\n*.txt -text\n"
     )
     payloads = {
+        "安裝輔.cmd": b"@echo off\r\necho installer\r\n",
         "更新輔.cmd": b"@echo off\r\necho updater\r\n",
         "LATEST.txt": b"\xef\xbb\xbfbranch=main\r\ncommit=abc\r\n",
         "輔系統/BUILD_INFO.txt": b"\xef\xbb\xbfproduct=FLASH\r\nmilestone=SP1\r\n",
@@ -210,6 +215,7 @@ def test_release_payload_bytes_survive_git_round_trip_with_autocrlf(tmp_path: Pa
         "輔系統/verify_windows_release.ps1": (
             b"\xef\xbb\xbfWrite-Host 'verify'\r\n"
         ),
+        "輔系統/安裝輔.ps1": b"\xef\xbb\xbfWrite-Host 'install'\r\n",
         "輔系統/輔更新核心.ps1": b"\xef\xbb\xbfWrite-Host 'update'\r\n",
         "FLASH.exe": b"MZ\x00\r\n\x1a\nbinary\xff",
     }

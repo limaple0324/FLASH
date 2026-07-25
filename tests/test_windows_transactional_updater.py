@@ -10,7 +10,9 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UPDATER_SOURCE = PROJECT_ROOT / "tools" / "輔系統" / "輔更新核心.ps1"
 VERIFIER_SOURCE = PROJECT_ROOT / "tools" / "verify_windows_release.ps1"
+INSTALLER_LAUNCHER_SOURCE = PROJECT_ROOT / "tools" / "安裝輔.cmd"
 LAUNCHER_SOURCE = PROJECT_ROOT / "tools" / "更新輔.cmd"
+INSTALLER_SOURCE = PROJECT_ROOT / "tools" / "輔系統" / "安裝輔.ps1"
 STATUS_CMD_SOURCE = PROJECT_ROOT / "tools" / "檢查輔同步狀態.cmd"
 STATUS_PS1_SOURCE = PROJECT_ROOT / "tools" / "檢查輔同步狀態.ps1"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")
@@ -20,9 +22,11 @@ MANIFEST_PATH = "輔系統/SHA256SUMS.txt"
 PAYLOAD_PATHS = (
     "FLASH.exe",
     "LATEST.txt",
+    "安裝輔.cmd",
     "更新輔.cmd",
     "輔系統/BUILD_INFO.txt",
     "輔系統/verify_windows_release.ps1",
+    "輔系統/安裝輔.ps1",
     "輔系統/輔更新核心.ps1",
     "輔系統/UPDATE_CHANNEL.txt",
     "輔系統/檢查輔同步狀態.cmd",
@@ -44,7 +48,12 @@ def _path(root: Path, relative_path: str) -> Path:
 
 
 def _copy_payload_sources(release_root: Path) -> None:
+    shutil.copy2(INSTALLER_LAUNCHER_SOURCE, _path(release_root, "安裝輔.cmd"))
     shutil.copy2(LAUNCHER_SOURCE, _path(release_root, "更新輔.cmd"))
+    shutil.copy2(
+        INSTALLER_SOURCE,
+        _path(release_root, "輔系統/安裝輔.ps1"),
+    )
     shutil.copy2(
         VERIFIER_SOURCE,
         _path(release_root, "輔系統/verify_windows_release.ps1"),

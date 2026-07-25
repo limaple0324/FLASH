@@ -214,7 +214,9 @@ jobs:
               '*.ps1 -text'
               '*.txt -text'
             ) | Set-Content 'release/.gitattributes' -Encoding ascii
+            Copy-Item 'tools/安裝輔.cmd' 'release/安裝輔.cmd'
             Copy-Item 'tools/更新輔.cmd' 'release/更新輔.cmd'
+            Copy-Item 'tools/輔系統/安裝輔.ps1' 'release/輔系統/安裝輔.ps1'
             Copy-Item 'tools/輔系統/輔更新核心.ps1' 'release/輔系統/輔更新核心.ps1'
             Copy-Item 'tools/檢查輔同步狀態.cmd' 'release/輔系統/檢查輔同步狀態.cmd'
             Copy-Item 'tools/檢查輔同步狀態.ps1' 'release/輔系統/檢查輔同步狀態.ps1'
@@ -293,9 +295,11 @@ jobs:
             $manifestPaths = @(
               'FLASH.exe'
               'LATEST.txt'
+              '安裝輔.cmd'
               '更新輔.cmd'
               '輔系統/BUILD_INFO.txt'
               '輔系統/verify_windows_release.ps1'
+              '輔系統/安裝輔.ps1'
               '輔系統/輔更新核心.ps1'
               '輔系統/UPDATE_CHANNEL.txt'
               '輔系統/檢查輔同步狀態.cmd'
@@ -339,7 +343,9 @@ jobs:
             foreach ($required in @(
               'release/.gitattributes',
               'release/LATEST.txt',
+              'release/安裝輔.cmd',
               'release/更新輔.cmd',
+              'release/輔系統/安裝輔.ps1',
               'release/輔系統/輔更新核心.ps1',
               'release/輔系統/UPDATE_CHANNEL.txt',
               'release/輔系統/檢查輔同步狀態.cmd',
@@ -351,6 +357,7 @@ jobs:
             }
 
             foreach ($cmd in @(
+              'release/安裝輔.cmd',
               'release/更新輔.cmd',
               'release/輔系統/檢查輔同步狀態.cmd'
             )) {
@@ -362,7 +369,9 @@ jobs:
           }
           else {
             foreach ($forbidden in @(
+              'release/安裝輔.cmd',
               'release/更新輔.cmd',
+              'release/輔系統/安裝輔.ps1',
               'release/輔系統/輔更新核心.ps1',
               'release/輔系統/UPDATE_CHANNEL.txt'
             )) {
@@ -433,6 +442,7 @@ jobs:
           Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
           Copy-Item "$env:GITHUB_WORKSPACE\release\.gitattributes" ".\.gitattributes"
           Copy-Item "$env:GITHUB_WORKSPACE\release\LATEST.txt" ".\LATEST.txt"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\安裝輔.cmd" ".\安裝輔.cmd"
           Copy-Item "$env:GITHUB_WORKSPACE\release\更新輔.cmd" ".\更新輔.cmd"
           Copy-Item "$env:GITHUB_WORKSPACE\release\輔系統" ".\輔系統" -Recurse -Force
 
@@ -474,6 +484,7 @@ jobs:
           Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
           Copy-Item "$env:GITHUB_WORKSPACE\release\.gitattributes" ".\.gitattributes"
           Copy-Item "$env:GITHUB_WORKSPACE\release\LATEST.txt" ".\LATEST.txt"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\安裝輔.cmd" ".\安裝輔.cmd"
           Copy-Item "$env:GITHUB_WORKSPACE\release\更新輔.cmd" ".\更新輔.cmd"
           Copy-Item "$env:GITHUB_WORKSPACE\release\輔系統" ".\輔系統" -Recurse -Force
 

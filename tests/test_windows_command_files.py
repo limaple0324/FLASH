@@ -2,6 +2,7 @@ from pathlib import Path
 
 
 WINDOWS_COMMAND_FILES = (
+    Path("tools/安裝輔.cmd"),
     Path("tools/更新輔.cmd"),
     Path("tools/檢查輔同步狀態.cmd"),
 )
@@ -39,6 +40,17 @@ def test_updater_runs_a_temporary_core_with_one_fixed_cmd_bootstrap():
     assert 'del /f /q "%TEMPUPDATER%"' in launcher
     assert "ReadKey(" not in updater
     assert updater.count("更新成功；全部檔案已套用並通過再次驗證") == 1
+
+
+def test_installer_uses_a_safe_source_path_and_one_confirmed_shortcut():
+    launcher = Path("tools/安裝輔.cmd").read_text(encoding="utf-8")
+    installer = Path("tools/輔系統/安裝輔.ps1").read_text(encoding="utf-8")
+
+    assert '-SourceDirectory "%~dp0."' in launcher
+    assert 'Join-Path $env:LOCALAPPDATA "Programs\\輔\\SP1"' in installer
+    assert 'Join-Path $DesktopDir "輔.lnk"' in installer
+    assert '$shortcut.TargetPath = $ExecutablePath' in installer
+    assert '$shortcut.IconLocation = "$ExecutablePath,0"' in installer
 
 
 def test_windows_powershell_download_does_not_require_the_ie_engine():

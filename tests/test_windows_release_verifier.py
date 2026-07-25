@@ -68,7 +68,12 @@ def _create_bundle(
     if include_live_updater is None:
         include_live_updater = build_kind in {"main_release", "sp1_release"}
     if include_live_updater:
+        (release_dir / "安裝輔.cmd").write_bytes(b"@echo off\r\n")
         (release_dir / "更新輔.cmd").write_bytes(b"@echo off\r\n")
+        (system_dir / "安裝輔.ps1").write_text(
+            "# installer fixture\n",
+            encoding="utf-8",
+        )
         (system_dir / "輔更新核心.ps1").write_text(
             "# updater fixture\n",
             encoding="utf-8",
@@ -123,9 +128,11 @@ def _create_bundle(
         manifest_paths = [
             "FLASH.exe",
             "LATEST.txt",
+            "安裝輔.cmd",
             "更新輔.cmd",
             "輔系統/BUILD_INFO.txt",
             "輔系統/verify_windows_release.ps1",
+            "輔系統/安裝輔.ps1",
             "輔系統/輔更新核心.ps1",
             "輔系統/UPDATE_CHANNEL.txt",
             "輔系統/檢查輔同步狀態.cmd",
