@@ -8,7 +8,7 @@
 - GitHub：`https://github.com/limaple0324/FLASH.git`
 - 分支：`sp1/completion-2026-07-25`
 - 基準：`main@538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`
-- 最新來源提交：`689a186e5cd3e93e72e98c25e2840deb49e0a637`
+- 最新來源提交：`f419e07ebdef5e4836e6229df082c6222b2ef551`
 - 版本：SP1 0.1.2 工程驗證階段
 
 ## 目前來源驗證
@@ -30,6 +30,15 @@ artifact digest 均為
 以隔離資料目錄完成兩次啟動、正常關閉、重開、持久化、8/8 包裝自我檢查及
 無主控台視窗驗收。這不代表乾淨的新 Windows 帳號、真正遊戲視窗、
 背景／最小化、斷線重連、安全輸入、目標電腦更新或正式發布驗收已通過。
+
+最新 SP1 獨立正式更新版為
+`FLASH-SP1-Windows-0.1.2-f419e07-sp1-release.zip`。GitHub Actions run #120
+已通過完整流程並發布到專用 `release/sp1`；本機 ZIP SHA-256 與 artifact
+`8616031855` digest 均為
+`746fc2c630b77e7d7e3d2db87089716cfe5ebf0fda37e5cf9010d264d5fd6b66`。
+Windows 11 build `26200` 已實際由包內 `更新輔.cmd` 連線此通道，完成下載、
+安裝前驗證、交易式套用與安裝後驗證。它不追蹤 `release/latest`，不會更新
+成 SP2、SP3 或完整整合版。
 
 ## 後續成品紀錄
 

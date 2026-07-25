@@ -5,7 +5,7 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 Scope note (2026-07-25): new work is restricted to SP1 on
 `sp1/completion-2026-07-25`, based on `main@538bdbc`. The latest verified source
 commit is
-`689a186e5cd3e93e72e98c25e2840deb49e0a637`. The `5db5b5f` local baseline
+`f419e07ebdef5e4836e6229df082c6222b2ef551`. The `5db5b5f` local baseline
 passed 171 tests, Python compilation, 8/8 source self-checks, and
 `git diff --check`; the subsequent hash-compatibility fix passed the 24 affected
 updater/release-verifier tests and one focused regression test.
@@ -21,6 +21,14 @@ self-check results, and no-console verification. This used the current Windows
 account with isolated `APPDATA`/`LOCALAPPDATA`, not a clean new user account, and
 did not exercise a real game flow. SP1 is therefore still not formally complete.
 
+GitHub Actions run #120 for `f419e07` passed the complete workflow and published
+the SP1-only release to `release/sp1`. The permanent ZIP SHA-256 matches artifact
+`8616031855`:
+`746fc2c630b77e7d7e3d2db87089716cfe5ebf0fda37e5cf9010d264d5fd6b66`.
+On the target Windows 11 computer, its real `更新輔.cmd` successfully resolved
+`release/sp1`, downloaded one fixed release commit, passed pre-install
+verification, applied the transaction, and passed post-install verification.
+
 Every new item must be confirmed as discussed before implementation. The
 player-viewable window-registry area and the five frozen resource areas remain
 paused. SP2 and SP3 work does not resume until the prior delivery stage is complete.
@@ -32,12 +40,12 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] SP1 has an independent delivery area and status file.
 - [x] The player-facing update entry is the single `更新輔.cmd`.
 - [x] Restrict `release/latest` publication to an approved `main` push.
-- [ ] Give the independent SP1 build an update source that cannot advance to
+- [x] Give the independent SP1 build an update source that cannot advance to
   SP2, SP3, or the complete integrated delivery.
 - [x] Confirm the obsolete scheduled Git sync task is absent or disabled.
 - [x] Implement same-commit, full-payload verification and transactional update
   with rollback and failure-injection coverage.
-- [ ] Run `更新輔.cmd` on the target computer and verify the installed build.
+- [x] Run `更新輔.cmd` on the target computer and verify the installed build.
 
 ## B. Core startup
 
@@ -107,6 +115,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] Win32 adapter and transactional updater received independent focused
   reviews with no remaining blocker.
 - [x] GitHub Actions run #118 for `689a186` passes the complete workflow.
+- [x] GitHub Actions run #120 for `f419e07` passes the complete workflow and
+  publishes only to `release/sp1`.
 - [ ] Add target-desktop integration tests for capture, overlap, and reconnect behavior.
 
 ## F. Build and delivery
@@ -122,6 +132,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   and packaged `--self-check`.
 - [x] Verify the `689a186` bundle, metadata, manifest, hashes, artifact digest,
   bundled Windows PowerShell 5.1 verifier, and cloud packaged `--self-check`.
+- [x] Verify and permanently save the `f419e07` SP1-only release, its artifact
+  digest, `release/sp1` identity, and real target-computer updater flow.
 - [ ] Confirm a successful GitHub Actions run for current `main`.
 - [x] Download and launch the current artifact on Windows 11 build 26200 with an
   isolated data profile.
@@ -149,6 +161,14 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   `30aca05eb2e8c84f10c58a86cc34af89cda8559b31989b8b6cb266e007b231fa`.
 - Permanent evidence:
   `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-689a186-snapshot.md`.
+- Latest SP1-only release:
+  `FLASH-SP1-Windows-0.1.2-f419e07-sp1-release.zip`, source
+  `f419e07ebdef5e4836e6229df082c6222b2ef551`, GitHub Actions run
+  `30146010560`, artifact `8616031855`, publication commit
+  `56c815680c9f8cc281f1674f757a3c11f79beba0`, SHA-256
+  `746fc2c630b77e7d7e3d2db87089716cfe5ebf0fda37e5cf9010d264d5fd6b66`.
+- Latest release evidence:
+  `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-f419e07-sp1-release.md`.
 - The latest SP1 artifact record must include branch, full commit, version,
   tests, self-checks, SHA-256, build source, Windows evidence, and publication
   state.
