@@ -30,6 +30,25 @@ def test_updater_preserves_the_existing_desktop_shortcut():
     assert "已保留原本桌面捷徑的名稱與圖示" in updater
 
 
+def test_updater_runs_a_temporary_core_with_one_fixed_cmd_bootstrap():
+    launcher = Path("tools/更新輔.cmd").read_text(encoding="utf-8")
+    updater = Path("tools/輔系統/輔更新核心.ps1").read_text(encoding="utf-8")
+
+    assert 'copy /y "%SCRIPT%" "%TEMPUPDATER%"' in launcher
+    assert '-File "%TEMPUPDATER%" -InstallDirectory "%~dp0"' in launcher
+    assert 'del /f /q "%TEMPUPDATER%"' in launcher
+    assert "ReadKey(" not in updater
+    assert updater.count("更新成功；全部檔案已套用並通過再次驗證") == 1
+
+
+def test_windows_powershell_download_does_not_require_the_ie_engine():
+    updater = Path("tools/輔系統/輔更新核心.ps1").read_text(encoding="utf-8")
+
+    assert "Invoke-WebRequest -Uri $url -OutFile $TargetPath -UseBasicParsing" in updater
+    assert "Invoke-RestMethod `" in updater
+    assert updater.count("-UseBasicParsing") == 2
+
+
 def test_only_main_push_can_publish_over_the_live_release():
     workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
 

@@ -184,8 +184,11 @@ jobs:
 
           if ($env:FLASH_BUILD_KIND -eq 'main_release') {
             @(
+              '* -text'
               '*.cmd -text'
               '*.bat -text'
+              '*.ps1 -text'
+              '*.txt -text'
             ) | Set-Content 'release/.gitattributes' -Encoding ascii
             Copy-Item 'tools/更新輔.cmd' 'release/更新輔.cmd'
             Copy-Item 'tools/輔系統/輔更新核心.ps1' 'release/輔系統/輔更新核心.ps1'
@@ -210,7 +213,6 @@ jobs:
           }
 
           $hash = (Get-FileHash 'release/FLASH.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  FLASH.exe" | Set-Content 'release/輔系統/SHA256SUMS.txt' -Encoding ascii
 
           @(
             "product=FLASH"
@@ -228,8 +230,50 @@ jobs:
             "sha256=$hash"
           ) | Set-Content 'release/輔系統/BUILD_INFO.txt' -Encoding utf8
 
+          if ($env:FLASH_BUILD_KIND -eq 'main_release') {
+            @(
+              "branch=main"
+              "commit=$env:GITHUB_SHA"
+              "run_id=$env:GITHUB_RUN_ID"
+              "updated_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+            ) | Set-Content 'release/LATEST.txt' -Encoding utf8
+          }
+
+          $manifestPaths = @(
+            'FLASH.exe'
+            '輔系統/BUILD_INFO.txt'
+            '輔系統/verify_windows_release.ps1'
+          )
+          if ($env:FLASH_BUILD_KIND -eq 'main_release') {
+            $manifestPaths = @(
+              'FLASH.exe'
+              'LATEST.txt'
+              '更新輔.cmd'
+              '輔系統/BUILD_INFO.txt'
+              '輔系統/verify_windows_release.ps1'
+              '輔系統/輔更新核心.ps1'
+              '輔系統/檢查輔同步狀態.cmd'
+              '輔系統/檢查輔同步狀態.ps1'
+            )
+          }
+          elseif ($env:FLASH_BUILD_KIND -eq 'sp1_snapshot') {
+            $manifestPaths += 'SP1快照說明.txt'
+          }
+          else {
+            $manifestPaths += '分支驗證說明.txt'
+          }
+          @(
+            foreach ($relativePath in $manifestPaths) {
+              $fileHash = (
+                Get-FileHash (Join-Path 'release' $relativePath) -Algorithm SHA256
+              ).Hash.ToLowerInvariant()
+              "$fileHash  $relativePath"
+            }
+          ) | Set-Content 'release/輔系統/SHA256SUMS.txt' -Encoding utf8
+
           Get-Item 'release/FLASH.exe' | Format-List Name,Length,LastWriteTime
           Get-Content 'release/輔系統/BUILD_INFO.txt'
+          Get-Content 'release/輔系統/SHA256SUMS.txt'
 
       - name: Verify release bundle layout
         shell: pwsh
@@ -248,6 +292,7 @@ jobs:
           if ($env:FLASH_BUILD_KIND -eq 'main_release') {
             foreach ($required in @(
               'release/.gitattributes',
+              'release/LATEST.txt',
               'release/更新輔.cmd',
               'release/輔系統/輔更新核心.ps1',
               'release/輔系統/檢查輔同步狀態.cmd',
@@ -339,15 +384,9 @@ jobs:
 
           Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
           Copy-Item "$env:GITHUB_WORKSPACE\release\.gitattributes" ".\.gitattributes"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\LATEST.txt" ".\LATEST.txt"
           Copy-Item "$env:GITHUB_WORKSPACE\release\更新輔.cmd" ".\更新輔.cmd"
           Copy-Item "$env:GITHUB_WORKSPACE\release\輔系統" ".\輔系統" -Recurse -Force
-
-          @(
-            "branch=${{ github.head_ref || github.ref_name }}"
-            "commit=${{ github.sha }}"
-            "run_id=${{ github.run_id }}"
-            "updated_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
-          ) | Set-Content ".\LATEST.txt" -Encoding utf8
 
           # 同時登記刪除舊版發布分支殘留的原始碼與過期檔案。
           git add -A

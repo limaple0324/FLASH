@@ -37,10 +37,6 @@ def _create_bundle(
     executable_path.write_bytes(b"FLASH SP1 Windows verifier fixture")
     digest = hashlib.sha256(executable_path.read_bytes()).hexdigest()
 
-    (system_dir / "SHA256SUMS.txt").write_text(
-        f"{digest}  FLASH.exe\n",
-        encoding="ascii",
-    )
     if event_name is None:
         event_name = "push" if build_kind == "main_release" else "workflow_dispatch"
     if source_ref is None:
@@ -77,6 +73,69 @@ def _create_bundle(
             "# updater fixture\n",
             encoding="utf-8",
         )
+        (system_dir / "檢查輔同步狀態.cmd").write_bytes(b"@echo off\r\n")
+        (system_dir / "檢查輔同步狀態.ps1").write_text(
+            "# status fixture\n",
+            encoding="utf-8",
+        )
+    if build_kind == "sp1_snapshot":
+        (release_dir / "SP1快照說明.txt").write_text(
+            "SP1 snapshot fixture\n",
+            encoding="utf-8",
+        )
+    elif build_kind == "validation_build":
+        (release_dir / "分支驗證說明.txt").write_text(
+            "validation fixture\n",
+            encoding="utf-8",
+        )
+    if build_kind == "main_release":
+        (release_dir / "LATEST.txt").write_text(
+            "\n".join(
+                (
+                    "branch=main",
+                    f"commit={build_info['commit']}",
+                    f"run_id={build_info['run_id']}",
+                    "updated_utc=2026-07-25T00:00:00Z",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+    manifest_paths = [
+        "FLASH.exe",
+        "輔系統/BUILD_INFO.txt",
+        "輔系統/verify_windows_release.ps1",
+    ]
+    if build_kind == "main_release":
+        manifest_paths = [
+            "FLASH.exe",
+            "LATEST.txt",
+            "更新輔.cmd",
+            "輔系統/BUILD_INFO.txt",
+            "輔系統/verify_windows_release.ps1",
+            "輔系統/輔更新核心.ps1",
+            "輔系統/檢查輔同步狀態.cmd",
+            "輔系統/檢查輔同步狀態.ps1",
+        ]
+    elif build_kind == "sp1_snapshot":
+        manifest_paths.append("SP1快照說明.txt")
+    else:
+        manifest_paths.append("分支驗證說明.txt")
+
+    manifest_lines = []
+    for relative_path in manifest_paths:
+        payload_path = release_dir.joinpath(*relative_path.split("/"))
+        payload_digest = (
+            hashlib.sha256(payload_path.read_bytes()).hexdigest()
+            if payload_path.is_file()
+            else "0" * 64
+        )
+        manifest_lines.append(f"{payload_digest}  {relative_path}")
+    (system_dir / "SHA256SUMS.txt").write_text(
+        "\n".join((*manifest_lines, "")),
+        encoding="utf-8",
+    )
     return verifier_path
 
 
@@ -142,6 +201,33 @@ def test_no_launch_accepts_a_non_release_validation_build(tmp_path: Path):
     result = _run_verifier(verifier_path)
 
     assert result.returncode == 0, _output(result)
+
+
+def test_snapshot_manifest_rejects_a_tampered_notice(tmp_path: Path):
+    verifier_path = _create_bundle(tmp_path)
+    with (verifier_path.parents[1] / "SP1快照說明.txt").open("ab") as stream:
+        stream.write(b"\ntampered\n")
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode != 0
+    assert "Release file hash mismatch" in _output(result)
+
+
+def test_main_manifest_rejects_a_tampered_updater_core(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="main_release",
+        source_branch="main",
+        publish_target="release/latest",
+    )
+    with (verifier_path.parent / "輔更新核心.ps1").open("ab") as stream:
+        stream.write(b"\ntampered\n")
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode != 0
+    assert "Release file hash mismatch" in _output(result)
 
 
 def test_sp1_snapshot_rejects_a_live_publish_target(tmp_path: Path):
