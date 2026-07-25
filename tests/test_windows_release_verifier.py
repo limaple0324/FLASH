@@ -107,6 +107,17 @@ def test_no_launch_accepts_an_independent_sp1_snapshot(tmp_path: Path):
     assert "NoLaunch was specified" in _output(result)
 
 
+def test_no_launch_accepts_an_sp1_branch_push_snapshot(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        event_name="push",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode == 0, _output(result)
+
+
 def test_no_launch_accepts_a_main_release(tmp_path: Path):
     verifier_path = _create_bundle(
         tmp_path,

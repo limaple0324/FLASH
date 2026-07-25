@@ -2,7 +2,9 @@ name: Build Windows FLASH
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - sp1/completion-2026-07-25
   pull_request:
     branches: [main]
   workflow_dispatch: {}
@@ -98,7 +100,7 @@ jobs:
           $sp1DeliveryBranch = 'sp1/completion-2026-07-25'
           $sp1DeliveryRef = "refs/heads/$sp1DeliveryBranch"
           $isSp1Snapshot = (
-            $env:BUILD_EVENT_NAME -eq 'workflow_dispatch' -and
+            $env:BUILD_EVENT_NAME -in @('push', 'workflow_dispatch') -and
             $env:BUILD_REF -eq $sp1DeliveryRef -and
             $env:BUILD_SOURCE_BRANCH -eq $sp1DeliveryBranch
           )

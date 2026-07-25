@@ -106,7 +106,7 @@ if ($buildKind -in @('sp1_snapshot', 'validation_build')) {
 if (
     $buildKind -eq 'sp1_snapshot' -and
     (
-        $buildInfo['event_name'] -ne 'workflow_dispatch' -or
+        $buildInfo['event_name'] -notin @('push', 'workflow_dispatch') -or
         $buildInfo['source_ref'] -ne 'refs/heads/sp1/completion-2026-07-25' -or
         $buildInfo['source_branch'] -ne 'sp1/completion-2026-07-25'
     )

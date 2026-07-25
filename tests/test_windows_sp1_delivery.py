@@ -45,7 +45,7 @@ def test_manual_build_is_an_independent_sp1_snapshot():
     assert "$buildKind = 'sp1_snapshot'" in metadata_step
     assert "$buildKind = 'validation_build'" in metadata_step
     assert "$sp1DeliveryBranch = 'sp1/completion-2026-07-25'" in metadata_step
-    assert "$env:BUILD_EVENT_NAME -eq 'workflow_dispatch'" in metadata_step
+    assert "$env:BUILD_EVENT_NAME -in @('push', 'workflow_dispatch')" in metadata_step
     assert "$env:BUILD_REF -eq $sp1DeliveryRef" in metadata_step
     assert "$env:BUILD_SOURCE_BRANCH -eq $sp1DeliveryBranch" in metadata_step
     assert "elseif ($isSp1Snapshot)" in metadata_step
@@ -55,6 +55,7 @@ def test_manual_build_is_an_independent_sp1_snapshot():
         '$shortCommit-$artifactKind"'
     ) in metadata_step
     assert "name: ${{ env.FLASH_ARTIFACT_NAME }}" in workflow
+    assert "      - sp1/completion-2026-07-25" in workflow
 
 
 def test_sp1_snapshot_does_not_include_the_live_updater():
