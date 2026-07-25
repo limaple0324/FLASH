@@ -8,7 +8,7 @@
 - 工作區：`C:\Users\USER\Documents\輔\SP1`
 - 目前分支：`sp1/completion-2026-07-25`
 - 基準：`origin/main@538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`
-- 最新提交：`cee31ac2124ba3584f3d278d5dd67330d8cb312a`
+- 最新提交：`03db0624fb64e7b5997502558914a0f706da7b79`
 - 既有整合分支只保留 SP2／SP3 累積成果；目前不新增上層功能。
 
 ## 目前來源證據
@@ -38,6 +38,12 @@
   `40af7b7c6a8e8ab8c768cdf6aa5961cb82f1a28f6c7075204b316adbec52053a`。
 - Windows 11 隔離位置已完成真正成品首次安裝、三次成品驗證及單一捷徑
   TargetPath／WorkingDirectory／IconLocation 驗收。
+- `03db062` 的 GitHub Actions run #124 已通過 184 項完整測試、來源／封裝
+  8/8 自我檢查、Windows EXE 與 bundle 驗證，並發布到 `release/sp1`。
+- Windows 11 已以同提交的視窗成品實際確認完整自我檢查、保守主視窗狀態、
+  三項背景能力、角色資料、安全停用與紀錄位置均正確顯示；永久 ZIP 與
+  artifact digest 均為
+  `e470f5c71b5c81a182d8d0532c1cfb2f00385233868735cdc797284fe99f097b`。
 - 尚未完成乾淨新帳號、真實桌面最終入口、真正遊戲輸入、斷線重連及視窗
   標題／身分驗收，因此 SP1 尚未正式完成。
 
@@ -51,7 +57,7 @@
 
 ## 下一個小型區塊
 
-使用已驗證的 `cee31ac` SP1 完整安裝／更新包繼續乾淨 Windows 11 新帳號與
+使用已驗證的 `03db062` SP1 完整安全狀態包繼續乾淨 Windows 11 新帳號與
 真實桌面入口驗收；現有 `C:\Users\USER\Desktop\輔` 是指向專案工作區的
 junction，不擅自覆寫。真正遊戲輸入、斷線重連及 Flash 視窗身分只依已確認
 規格執行，不自行猜測。SP1 必要門檻未全部通過前，不開始 SP2。

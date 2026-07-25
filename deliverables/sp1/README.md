@@ -8,7 +8,7 @@
 - GitHub：`https://github.com/limaple0324/FLASH.git`
 - 分支：`sp1/completion-2026-07-25`
 - 基準：`main@538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`
-- 最新來源提交：`cee31ac2124ba3584f3d278d5dd67330d8cb312a`
+- 最新來源提交：`03db0624fb64e7b5997502558914a0f706da7b79`
 - 版本：SP1 0.1.2 工程驗證階段
 
 ## 目前來源驗證
@@ -47,6 +47,14 @@ Windows 11 build `26200` 已實際由包內 `更新輔.cmd` 連線此通道，�
 `40af7b7c6a8e8ab8c768cdf6aa5961cb82f1a28f6c7075204b316adbec52053a`。
 Windows 11 已在隔離位置完成來源、暫存、安裝後三次成品驗證，並確認只建立
 一個 `輔.lnk`，其目標、工作目錄與圖示均指向安裝後 `FLASH.exe`。
+
+最新完整安全狀態版為
+`FLASH-SP1-Windows-0.1.2-03db062-sp1-release.zip`。GitHub Actions run #124
+的 184 項完整測試、來源／封裝 8/8 自我檢查與所有 Windows 建置／發布步驟
+通過；ZIP SHA-256 與 artifact `8616418914` digest 均為
+`e470f5c71b5c81a182d8d0532c1cfb2f00385233868735cdc797284fe99f097b`。
+同提交的 Windows 11 包裝視窗已實際顯示完整自我檢查、保守主視窗狀態、
+三項背景能力、角色資料、安全停用與紀錄位置。
 
 ## 後續成品紀錄
 

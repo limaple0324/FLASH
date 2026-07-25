@@ -5,7 +5,7 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 Scope note (2026-07-25): new work is restricted to SP1 on
 `sp1/completion-2026-07-25`, based on `main@538bdbc`. The latest verified source
 commit is
-`cee31ac2124ba3584f3d278d5dd67330d8cb312a`. The `5db5b5f` local baseline
+`03db0624fb64e7b5997502558914a0f706da7b79`. The `5db5b5f` local baseline
 passed 171 tests, Python compilation, 8/8 source self-checks, and
 `git diff --check`; the subsequent hash-compatibility fix passed the 24 affected
 updater/release-verifier tests and one focused regression test.
@@ -36,6 +36,15 @@ complete installer/updater bundle. Its permanent ZIP SHA-256 matches artifact
 The real installer then passed source, staged, and installed bundle verification
 on Windows 11 and created exactly one isolated `輔.lnk` with the expected target,
 working directory, and executable icon.
+
+GitHub Actions run #124 for `03db062` passed 184 tests, source and packaged
+8/8 self-checks, Windows EXE creation, bundle verification, artifact upload,
+and SP1-only publication. The permanent ZIP SHA-256 matches artifact
+`8616418914`:
+`e470f5c71b5c81a182d8d0532c1cfb2f00385233868735cdc797284fe99f097b`.
+On Windows 11 build 26200, the same-source packaged window displayed the full
+self-check details, conservative target-window state, all three background
+capability states, registry state, disabled-input notice, and isolated log path.
 
 Every new item must be confirmed as discussed before implementation. The
 player-viewable window-registry area and the five frozen resource areas remain
@@ -78,7 +87,7 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] External adapter boundary check.
 - [x] Detailed self-check result formatting is covered by source tests.
 - [x] Corrupt configuration is preserved and rebuilt automatically.
-- [ ] Confirm detailed results display correctly in the packaged application on
+- [x] Confirm detailed results display correctly in the packaged application on
   the target Windows 11 desktop.
 - [x] Confirm all checks pass in the packaged executable on the target desktop.
 
@@ -96,7 +105,7 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] Blank or failed background captures are rejected conservatively.
 - [x] Background capture result model and JSON report output are covered by
   source tests.
-- [ ] Confirm the result is shown correctly in the packaged SP1 window on the
+- [x] Confirm the result is shown correctly in the packaged SP1 window on the
   target Windows 11 desktop.
 - [ ] Configure the real Adobe Flash Player 11 window identity.
 - [ ] Verify background capture while the game is partially covered.
@@ -129,6 +138,9 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   publishes only to `release/sp1`.
 - [x] GitHub Actions run #123 for `cee31ac` passes all 183 tests and publishes
   the complete installer/updater bundle only to `release/sp1`.
+- [x] GitHub Actions run #124 for `03db062` passes all 184 tests, publishes only
+  to `release/sp1`, and its packaged status window passes Windows 11 display
+  acceptance.
 - [ ] Add target-desktop integration tests for capture, overlap, and reconnect behavior.
 
 ## F. Build and delivery
@@ -191,6 +203,14 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   `40af7b7c6a8e8ab8c768cdf6aa5961cb82f1a28f6c7075204b316adbec52053a`.
 - Latest complete release evidence:
   `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-cee31ac-sp1-release.md`.
+- Latest complete safe-status release:
+  `FLASH-SP1-Windows-0.1.2-03db062-sp1-release.zip`, source
+  `03db0624fb64e7b5997502558914a0f706da7b79`, GitHub Actions run
+  `30147184671`, artifact `8616418914`, publication commit
+  `8c0c61bae3a1c3f97b8794162c7ba88a415a2e94`, SHA-256
+  `e470f5c71b5c81a182d8d0532c1cfb2f00385233868735cdc797284fe99f097b`.
+- Latest safe-status release evidence:
+  `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-03db062-sp1-release.md`.
 - The latest SP1 artifact record must include branch, full commit, version,
   tests, self-checks, SHA-256, build source, Windows evidence, and publication
   state.
