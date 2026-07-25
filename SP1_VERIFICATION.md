@@ -3,9 +3,11 @@
 This document is the delivery gate for FLASH SP1. A feature is not considered complete merely because code or a workflow file exists.
 
 Scope note (2026-07-25): this checklist governs the SP1 engineering build on `main`
-and the current `release/latest`. The newer `integration/sp2-sp3-sp35@a2bf410`
-has a locally built and verified Windows integration snapshot, but that is not evidence
-of a GitHub Actions artifact, an updated `release/latest`, or complete Windows 11 acceptance.
+and the current `release/latest`. The latest integration source
+`integration/sp2-sp3-sp35@2d9f878` has 593 passing tests, compilation, 14 source
+self-checks and a target-window read-only event chain. The latest downloaded Windows
+integration artifact still comes from older source `893f65e`; neither source evidence
+nor that artifact proves an updated `release/latest` or complete Windows 11 acceptance.
 
 ## A. Repository and delivery update
 
@@ -34,6 +36,7 @@ of a GitHub Actions artifact, an updated `release/latest`, or complete Windows 1
 - [x] Configuration check.
 - [x] Logger write check.
 - [x] Event bus delivery check.
+- [x] Target-window observation service wiring check.
 - [x] Recovery boundary check.
 - [x] Smart Reconnect boundary check.
 - [x] External adapter boundary check.
