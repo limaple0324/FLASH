@@ -105,7 +105,7 @@ def test_ready_window_is_reported_but_input_is_not_enabled():
     assert status["safe"] is True
     assert status["code"] == "window.ready"
     assert status["details"]["handle"] == 100
-    assert "仍未啟用輸入" in text
+    assert "同步輸入仍需玩家手動執行" in text
 
 
 def test_ambiguous_window_keeps_operation_disabled():

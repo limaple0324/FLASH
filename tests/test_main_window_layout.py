@@ -5,7 +5,8 @@ def test_main_window_uses_home_view():
     source = Path("main.py").read_text(encoding="utf-8")
 
     assert "from ui.home import HomeView" in source
-    assert "HomeView(window, status, on_start=show_start_status).build()" in source
+    assert "on_input_policy_change=change_input_policy" in source
+    assert "on_test_key=test_approved_key" in source
 
 
 def test_main_window_start_message_is_player_facing():
@@ -13,7 +14,9 @@ def test_main_window_start_message_is_player_facing():
 
     assert "輔｜目前狀態" in source
     assert "format_start_status(status, paths)" in source
-    assert "遊戲操作尚未啟用" in source
+    assert "同步按鍵不會自行送出" in source
+    assert "目前只允許玩家明確執行 B／C 同步測試" in source
+    assert "未知畫面不會點擊" in source
     assert "啟動入口已接入首頁" not in source
     assert "RC-01" not in source
 

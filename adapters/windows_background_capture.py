@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import time
 from dataclasses import dataclass
 from ctypes import wintypes
 from typing import Protocol
@@ -61,6 +62,14 @@ def _configure_win32_capture_api(user32, gdi32) -> None:
     user32.GetWindowDC.restype = wintypes.HDC
     user32.PrintWindow.argtypes = (wintypes.HWND, wintypes.HDC, wintypes.UINT)
     user32.PrintWindow.restype = wintypes.BOOL
+    if hasattr(user32, "RedrawWindow"):
+        user32.RedrawWindow.argtypes = (
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.RECT),
+            wintypes.HRGN,
+            wintypes.UINT,
+        )
+        user32.RedrawWindow.restype = wintypes.BOOL
     user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
     user32.ReleaseDC.restype = ctypes.c_int
 
@@ -101,6 +110,10 @@ class WindowCaptureProvider(Protocol):
 
 class Win32PrintWindowProvider:
     """ctypes implementation of an off-screen PrintWindow capture."""
+
+    RDW_INVALIDATE = 0x0001
+    RDW_UPDATENOW = 0x0100
+    RDW_ALLCHILDREN = 0x0080
 
     @staticmethod
     def _libraries():
@@ -154,8 +167,24 @@ class Win32PrintWindowProvider:
                 return None
             bitmap_selected = True
 
-            # PW_RENDERFULLCONTENT improves capture for some modern and legacy windows.
-            api_succeeded = bool(user32.PrintWindow(hwnd, memory_dc, 0x00000002))
+            # Legacy Flash projectors can leave an off-screen frame stale after
+            # a modal appears. Ask the target to process a paint cycle without
+            # activating it or moving the user's pointer.
+            redraw_window = getattr(user32, "RedrawWindow", None)
+            if redraw_window is not None:
+                redraw_window(
+                    hwnd,
+                    None,
+                    None,
+                    self.RDW_INVALIDATE
+                    | self.RDW_UPDATENOW
+                    | self.RDW_ALLCHILDREN,
+                )
+
+            # Legacy Flash projectors render more reliably with the documented
+            # whole-window mode (flags=0); PW_RENDERFULLCONTENT can return a
+            # stale pre-modal frame for background instances.
+            api_succeeded = bool(user32.PrintWindow(hwnd, memory_dc, 0))
             restored_object = gdi32.SelectObject(memory_dc, old_object)
             if not restored_object:
                 return None
@@ -207,6 +236,49 @@ class Win32PrintWindowProvider:
                 if memory_dc:
                     gdi32.DeleteDC(memory_dc)
             user32.ReleaseDC(hwnd, window_dc)
+
+
+class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
+    """Refresh minimized Flash windows without taking foreground focus.
+
+    A minimized legacy projector can keep returning its pre-modal PrintWindow
+    frame. This provider briefly restores it without activation, captures the
+    fresh frame, and returns it to the minimized state in ``finally``.
+    """
+
+    SW_SHOWNOACTIVATE = 4
+    SW_SHOWMINNOACTIVE = 7
+
+    def __init__(
+        self,
+        *,
+        paint_settle_seconds: float = 0.75,
+    ) -> None:
+        self._paint_settle_seconds = max(0.0, float(paint_settle_seconds))
+
+    def capture(self, window_handle: int) -> CaptureSample | None:
+        if os.name != "nt" or not window_handle:
+            return None
+
+        user32, _gdi32 = self._libraries()
+        hwnd = wintypes.HWND(window_handle)
+        user32.IsIconic.argtypes = (wintypes.HWND,)
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.ShowWindow.restype = wintypes.BOOL
+
+        was_minimized = bool(user32.IsIconic(hwnd))
+        temporarily_restored = False
+        try:
+            if was_minimized:
+                user32.ShowWindow(hwnd, self.SW_SHOWNOACTIVATE)
+                temporarily_restored = not bool(user32.IsIconic(hwnd))
+                if temporarily_restored and self._paint_settle_seconds:
+                    time.sleep(self._paint_settle_seconds)
+            return super().capture(window_handle)
+        finally:
+            if temporarily_restored and not user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, self.SW_SHOWMINNOACTIVE)
 
 
 class WindowsBackgroundCaptureBackend:

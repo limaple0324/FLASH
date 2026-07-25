@@ -1,0 +1,118 @@
+"""Background monitor for the registered SP1 smart reconnect boundary."""
+
+from __future__ import annotations
+
+import threading
+
+from core.sp1_boundaries import OperationResult, SmartReconnectBoundary
+from services.logger_service import LoggerService
+
+
+class SmartReconnectMonitor:
+    """Run safe reconnect scans until explicitly stopped with the application."""
+
+    def __init__(
+        self,
+        boundary: SmartReconnectBoundary,
+        *,
+        logger: LoggerService | None = None,
+        fallback_delay_seconds: int = 60,
+    ):
+        if fallback_delay_seconds <= 0:
+            raise ValueError("fallback_delay_seconds must be positive")
+        self._boundary = boundary
+        self._logger = logger
+        self._fallback_delay_seconds = fallback_delay_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._last_signature: tuple[object, ...] | None = None
+
+    @property
+    def running(self) -> bool:
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
+
+    @staticmethod
+    def _safe_delay(result: OperationResult, fallback: int) -> int:
+        details = result.details
+        value = details.get("next_check_seconds") if details is not None else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return fallback
+        return max(1, int(value))
+
+    @staticmethod
+    def _signature(result: OperationResult) -> tuple[object, ...]:
+        details = result.details or {}
+        state_counts = details.get("state_counts", {})
+        failure_codes = details.get("failure_codes", [])
+        return (
+            result.code,
+            tuple(sorted(state_counts.items()))
+            if isinstance(state_counts, dict)
+            else (),
+            tuple(failure_codes) if isinstance(failure_codes, list) else (),
+            details.get("clicked_windows"),
+        )
+
+    def run_once(self) -> tuple[OperationResult, int]:
+        result = self._boundary.reconnect()
+        delay = self._safe_delay(result, self._fallback_delay_seconds)
+        signature = self._signature(result)
+        if self._logger is not None and signature != self._last_signature:
+            details = result.details or {}
+            self._logger.info(
+                "Smart reconnect state changed; "
+                f"code={result.code}; "
+                f"connected={details.get('connected_windows', 0)}; "
+                f"actionable={details.get('actionable_windows', 0)}; "
+                f"clicked={details.get('clicked_windows', 0)}; "
+                f"unknown={details.get('unknown_windows', 0)}; "
+                f"next_check_seconds={delay}"
+            )
+        self._last_signature = signature
+        return result, delay
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                _result, delay = self.run_once()
+            except Exception as exc:
+                delay = self._fallback_delay_seconds
+                if self._logger is not None:
+                    self._logger.error(
+                        "Smart reconnect monitor cycle failed safely; "
+                        f"error_type={type(exc).__name__}; "
+                        f"next_check_seconds={delay}"
+                    )
+            if self._stop_event.wait(delay):
+                break
+
+    def start(self) -> bool:
+        with self._lock:
+            if self.running:
+                return False
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="FLASH-SmartReconnect",
+                daemon=True,
+            )
+            self._thread.start()
+            return True
+
+    def stop(self, timeout_seconds: float = 5.0) -> bool:
+        with self._lock:
+            thread = self._thread
+            if thread is None:
+                return True
+            self._stop_event.set()
+        if thread is not threading.current_thread():
+            thread.join(max(0.0, timeout_seconds))
+        stopped = not thread.is_alive()
+        if stopped:
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+        return stopped
+

@@ -4,7 +4,11 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets/flash_icon.png', 'assets'), ('assets/flash_icon.ico', 'assets')],
+    datas=[
+        ('assets/flash_icon.png', 'assets'),
+        ('assets/flash_icon.ico', 'assets'),
+        ('assets/reconnect_reference', 'assets/reconnect_reference'),
+    ],
     hiddenimports=['tkinter'],
     hookspath=[],
     hooksconfig={},

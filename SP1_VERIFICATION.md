@@ -24,6 +24,14 @@ self-check results, and no-console verification. This used the current Windows
 account with isolated `APPDATA`/`LOCALAPPDATA`, not a clean new user account, and
 did not exercise a real game flow. SP1 is therefore still not formally complete.
 
+Current SP1 completion work has added target-directed B/C input, dynamic
+recent-route selection, anonymous-fingerprint reconnect persistence, and live
+multi-window evidence. All 278 tests, Python compilation, source self-check,
+all three input policies, and final 14/14 reconnect acceptance now pass. The
+current Windows package and final player acceptance have not yet run; this note
+is not a completion claim. The user deferred clean-account/another-PC testing
+on 2026-07-26, so it is not a local packaging blocker and is not claimed passed.
+
 GitHub Actions run #120 for `f419e07` passed the complete workflow and published
 the SP1-only release to `release/sp1`. The permanent ZIP SHA-256 matches artifact
 `8616031855`:
@@ -112,7 +120,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] Startup exceptions are logged and shown to the user.
 - [x] Packaged executable supports non-GUI `--self-check` verification.
 - [x] CI verifies packaged config, log, and self-check report creation.
-- [ ] Run the packaged executable on a clean Windows user account.
+- [x] Record the user's decision to defer clean-account/another-PC verification;
+  do not claim that external gate passed.
 
 ## C. SP1 self-check
 
@@ -154,10 +163,25 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] Verify background capture while the game is partially covered.
 - [x] Verify background capture while the game is not foreground.
 - [x] Verify background capture while the game is minimized.
-- [ ] Add a user-approved harmless background-input probe.
-- [ ] Verify non-foreground background input on the target desktop.
+- [x] Add a user-approved harmless background-input probe (`B` and `C` only).
+- [x] Verify non-foreground background `B` and `C` input on all 14 target
+  windows, including individual visual confirmation.
+- [x] Implement three explicit input policies: foreground only, foreground plus
+  non-minimized background, and all validated windows including minimized.
+- [x] Verify foreground-only B delivery sends to exactly one live target and
+  visually opens that target's backpack while 13 targets are skipped.
+- [x] Finish live acceptance of all three input policies and restore every game
+  window to its normal view afterward.
 - [ ] Verify minimized background input on the target desktop.
-- [ ] Implement and test a real reconnect sequence.
+- [x] Implement and test one real reconnect sequence: 13 connected plus 1
+  disconnected, then confirm, forced login, character entry, popup close, and
+  final 14/14 connected with zero unknown or failed windows.
+- [x] Select the route shown in recent-login information instead of always
+  selecting the top route; line 7 is live-proven with shifted character names.
+- [x] Persist pending reconnect, controller-started popup context, and 60-second
+  retry deadlines by anonymous fingerprint across controller restarts.
+- [x] Finish a stable multi-window reconnect run at final 14/14 connected after
+  the currently observed repeated server disconnects.
 - [ ] Verify the player remains in control outside explicitly automated modes.
 
 ## E. Tests
@@ -195,7 +219,45 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] GitHub Actions run #128 for `49ee668` passes all 200 tests, packages and
   publishes only to `release/sp1`, and passes installed identity/GUI acceptance.
 - [x] Add repeatable target-desktop identity and capture integration verification.
-- [ ] Add reconnect integration only after its screen and retry semantics are confirmed.
+- [x] Add reconnect integration after confirming 10 full reference screens
+  plus 2 route-digit templates, forced
+  login after disconnect, an approximately 10-second wait, 60-second unlimited
+  failed retries, known popup close actions, and fail-closed unknown screens.
+
+### 2026-07-25 live game evidence
+
+- Background `B` opened the backpack on 14/14 exact target windows; each capture
+  was checked individually, and the windows were restored.
+- Background `C` opened character information on 14/14 exact target windows;
+  each capture was checked individually, and the windows were restored.
+- A read-only scan identified 13 connected windows and exactly 1 disconnected
+  window. Only that disconnected window received reconnect clicks.
+- The source controller completed confirm, forced login, approximately
+  10 seconds of waiting, character entry, and known post-login popup close.
+  The final scan reported 14 connected, 0 unknown, 0 failed, and 0 further
+  actions.
+- A later live session displayed up to 9 line-selection windows at once. The
+  fixed digit crop safely withheld 2 shifted line-7 screens; prefix-relative
+  recognition corrected them, and background route-7 clicks advanced multiple
+  clients without requiring the Flash window to be foreground.
+- The persistent version-1 runtime state survived verifier restarts, retained
+  one-minute suppression and popup-close context, and contained no handles,
+  process IDs, raw arguments, character names, or captured pixels.
+- Foreground-only B passed exact 14-window preflight, sent to 1, skipped 13, and
+  visibly opened the selected window's backpack.
+- Foreground/background B temporarily minimized 2 exact windows, sent to the
+  remaining 12/12, skipped 2, and visually confirmed the expected open/closed
+  backpack split before restoring all windows and closing the 12 backpacks.
+- All-including-minimized C held all 14 windows minimized for 2 seconds, sent
+  to 14/14 with zero skips or failures, visibly opened character information,
+  and repeated the same test to close it and restore normal gameplay.
+- A later server-wide run began with all 14 disconnected, including 7 minimized
+  windows. It preserved foreground/minimized state while advancing all clients,
+  handled stacked Activity and Auto Dungeon windows independently, and ended at
+  14 connected, 0 unknown, 0 failed, and 0 actionable.
+- Still open: current packaged-build verification and final player acceptance.
+  Clean-account/another-PC verification was explicitly deferred by the user on
+  2026-07-26; it is not a local packaging blocker and is not claimed as passed.
 
 ## F. Build and delivery
 

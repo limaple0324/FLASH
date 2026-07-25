@@ -41,6 +41,8 @@ class PowerShellLaunchFingerprintResolver:
 
     _SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
 try {
     $requested = @(
         ([string]$env:FLASH_WINDOW_PIDS).Split(
@@ -180,7 +182,7 @@ try {
                     self._encoded_script(),
                 ],
                 capture_output=True,
-                text=True,
+                text=False,
                 timeout=self._timeout_seconds,
                 env=environment,
                 creationflags=creation_flags,
@@ -193,8 +195,11 @@ try {
             return {}
 
         try:
-            raw = json.loads(completed.stdout.strip() or "{}")
-        except (AttributeError, json.JSONDecodeError):
+            output = completed.stdout
+            if isinstance(output, bytes):
+                output = output.decode("utf-8-sig")
+            raw = json.loads(output.strip() or "{}")
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
             return {}
         if not isinstance(raw, dict):
             return {}

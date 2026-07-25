@@ -32,7 +32,7 @@ Remaining SP1 verification work:
 - [x] Confirm configuration, log, self-check, and registry persistence
 - [x] Confirm the obsolete desktop scheduled sync is absent or disabled
 - [x] Confirm installer, updater, shortcut, and full safe-status display
-- [ ] Run the packaged executable under a clean Windows user account
+- [x] Record clean-account/another-PC verification as user-deferred, not passed
 - [x] Resolve the final real-desktop entry without overwriting the existing junction
 - [x] Verify read-only capture while partially covered, non-foreground, and minimized
 - [x] Configure the user-confirmed fail-closed anonymous Flash window identity
@@ -40,19 +40,32 @@ Remaining SP1 verification work:
 - [x] Add a repeatable, read-only 14-window identity/capture verifier
 - [x] Build and verify the packaged `--verify-target-desktop` mode
 - [ ] Complete safe-input, reconnect, and player-control acceptance
+  - [x] User-approved `B` and `C` background input pass 14/14 live windows
+  - [x] One real disconnected window completes forced-login recovery and returns
+    the desktop to 14/14 connected windows
+  - [x] Select the recent-login route dynamically; line 7 passes shifted-name
+    multi-window recognition and background click progression
+  - [x] Preserve reconnect context and one-minute retry timing across restarts
+  - [x] Verify foreground-only B sends to 1, skips 13, and visibly opens backpack
+  - [x] Verify foreground/background and minimized-input modes
+  - [x] Finish a stable multi-window reconnect run at 14/14 connected
+  - [ ] Verify the current packaged build and player control outside automation
 - [ ] Merge only after approval, then verify current `main` and `release/latest`
 - [ ] Complete final target-desktop user acceptance
 - [ ] Complete final SP1 verification checklist
 
 Important scope note:
 
-The current executable is an SP1 engineering verification application. It
-verifies startup, persistence, service registration, event flow, and stable
-extension boundaries. Concrete game-specific recovery and reconnect adapters
-must be integrated and validated before those behaviors can be called complete.
-Window identity now uses the user-confirmed anonymous launcher fingerprint.
-Harmless input, login, disconnect, reconnect, failure conditions, and
-player-visible role mapping remain paused until separately confirmed.
+The latest released executable remains an SP1 engineering verification
+application. Current unreleased source now includes the confirmed `B`/`C`
+safe-input controller and forced-login reconnect flow. All three input policies,
+line 7 dynamic selection, cross-restart retry context, stacked post-login
+popups, minimized-window reconnect, and a final 14/14 connected state are
+live-proven. The current packaged build, additional failure variants, and
+player control outside automation remain open. Clean-account/another-PC
+acceptance was explicitly deferred by the user on 2026-07-26 and is not
+claimed as passed.
+Player-visible role mapping remains paused.
 
 ## SP2 — Product Design
 

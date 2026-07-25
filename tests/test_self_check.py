@@ -22,7 +22,10 @@ def test_self_check_passes_for_bootstrapped_core(tmp_path):
     assert checks["window_registry"]["passed"] is True
     assert "Character registry loaded" in checks["window_registry"]["message"]
     assert "not registered yet" in checks["recovery_boundary"]["message"]
-    assert "not registered yet" in checks["smart_reconnect_boundary"]["message"]
+    assert (
+        checks["smart_reconnect_boundary"]["message"]
+        == "Registered SmartReconnectBoundary implementation is valid."
+    )
     assert "not registered yet" in checks["external_adapter"]["message"]
 
 

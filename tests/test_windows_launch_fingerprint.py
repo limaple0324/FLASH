@@ -42,6 +42,7 @@ def test_resolver_returns_only_requested_valid_fingerprints(monkeypatch):
     assert result == {42: "a" * 64}
     assert observed["kwargs"]["env"]["FLASH_WINDOW_PIDS"] == "42,43"
     assert observed["kwargs"]["capture_output"] is True
+    assert observed["kwargs"]["text"] is False
     assert observed["kwargs"]["check"] is False
     assert "-NonInteractive" in observed["command"]
     assert "-EncodedCommand" in observed["command"]
@@ -69,3 +70,17 @@ def test_resolver_rejects_non_json_output_without_exposing_it():
     resolver = PowerShellLaunchFingerprintResolver(runner=runner)
 
     assert resolver.resolve([42]) == {}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Resolver intentionally runs only on Windows")
+def test_resolver_decodes_utf8_bytes_without_decoding_stderr():
+    def runner(_command, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"42": "a" * 64}).encode("utf-8"),
+            stderr=b"\xa5\xff",
+        )
+
+    resolver = PowerShellLaunchFingerprintResolver(runner=runner)
+
+    assert resolver.resolve([42]) == {42: "a" * 64}

@@ -1,5 +1,43 @@
 # Changelog
 
+## SP1 0.1.3 completion candidate — 2026-07-26
+
+- Added `B`/`C`-only Windows input synchronization with foreground-only,
+  foreground/background, and all-including-minimized policies.
+- Added exact 14-window identity preflight and fail-closed per-window isolation.
+- Added 10 full reconnect reference images plus 2 route-digit templates,
+  fail-closed screen recognition, automatic forced-login recovery,
+  approximately 10-second force-login waiting, and unlimited failed retries at
+  60-second intervals.
+- Added the user-confirmed post-login Auto Dungeon window as a third independent
+  popup with its own title guard and close point.
+- Suppressed duplicate clicks on an unchanged actionable screen for 60 seconds;
+  a recognized screen transition still advances immediately.
+- Restricted post-login popup closing to a controller-started login/reconnect
+  session; matching popups opened manually during normal play are observe-only.
+- Added recent-login route selection instead of a fixed top-line click. Route
+  text is located by its stable prefix so character-name length and window size
+  do not shift the digit out of the detector.
+- Persisted pending reconnect context, controller-started popup eligibility, and
+  retry deadlines by anonymous launch fingerprint across process restarts.
+- Live background `B` and `C` tests each passed 14/14 windows with individual
+  visual confirmation.
+- One real disconnected window recovered through confirm, forced login,
+  character entry, and post-login popup close; the final scan was 14/14
+  connected with zero unknown or failed windows.
+- Foreground/background B sent to 12/12 non-minimized windows and skipped the
+  2 test-minimized windows; all-including-minimized C sent to 14/14 while every
+  game window remained minimized for the two-second evidence hold.
+- A later run recovered all 14 simultaneously disconnected windows, including
+  7 minimized instances, handled stacked Activity and Auto Dungeon windows, and
+  ended at 14 connected with zero unknown, failed, or actionable windows.
+- Tightened popup/progress thresholds and changed recognition to choose the best
+  per-template-valid match, preventing stale popup and progress imagery from
+  masking a valid connected-game match.
+- Packaged-build and final player acceptance remain open. Clean-account testing
+  was explicitly deferred to another PC by the user and is not claimed passed.
+  This work is not yet a release.
+
 ## SP1 0.1.2 — 2026-07-25
 
 ### Latest verified repeatable target-desktop release
@@ -93,6 +131,6 @@
 - `f419e07`: dedicated SP1 transactional update channel; run #120.
 - `689a186`: Windows engineering snapshot and hash compatibility; run #118.
 
-SP1 remains an engineering verification stage until the clean-account,
-confirmed real-game, current-`main`, and final user-acceptance
-gates are complete.
+This historical 0.1.2 line remained an engineering verification stage. For the
+0.1.3 completion candidate, clean-account testing is deferred to another PC and
+is not claimed passed.

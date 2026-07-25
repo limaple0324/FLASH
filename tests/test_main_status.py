@@ -89,7 +89,9 @@ def test_start_status_includes_all_read_only_sections(tmp_path):
     assert "被遮擋時讀取畫面：尚未測試" in text
     assert "非前景背景操作：尚未測試" in text
     assert "最小化背景操作：尚未測試" in text
-    assert "背景輸入目前仍為停用。" in text
+    assert "同步輸入：只在玩家明確執行已批准測試時啟用" in text
+    assert "目前權限為「全部允許（含最小化）」" in text
     assert "角色資料：已載入 0 個角色。" in text
-    assert "遊戲操作尚未啟用" in text
+    assert "目前只允許玩家明確執行 B／C 同步測試" in text
+    assert "智慧重連只依已確認畫面自動監看" in text
     assert f"紀錄位置：{paths.logs_dir()}" in text

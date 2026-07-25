@@ -1,5 +1,7 @@
 from adapters.windows_background_capture import (
     CaptureSample,
+    Win32PrintWindowProvider,
+    Win32RecoveringPrintWindowProvider,
     WindowsBackgroundCaptureBackend,
 )
 
@@ -68,3 +70,63 @@ def test_input_capabilities_remain_unknown_without_user_approved_probe():
 
     assert backend.probe_background_input(1) is None
     assert backend.probe_minimized_input(1) is None
+
+
+class FakeWindowStateApi:
+    def __init__(self, *, minimized):
+        self.minimized = minimized
+        self.show_commands = []
+        self.IsIconic = FakeCallable(lambda _handle: self.minimized)
+        self.ShowWindow = FakeCallable(self._show_window)
+
+    def _show_window(self, _handle, command):
+        self.show_commands.append(command)
+        if command == Win32RecoveringPrintWindowProvider.SW_SHOWNOACTIVATE:
+            self.minimized = False
+        elif command == Win32RecoveringPrintWindowProvider.SW_SHOWMINNOACTIVE:
+            self.minimized = True
+        return True
+
+
+class FakeCallable:
+    def __init__(self, callback):
+        self.callback = callback
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *args):
+        return self.callback(*args)
+
+
+def test_recovering_provider_refreshes_and_restores_minimized_window(monkeypatch):
+    expected = sample([0, 20, 80, 255] * 4)
+    user32 = FakeWindowStateApi(minimized=True)
+    provider = Win32RecoveringPrintWindowProvider(paint_settle_seconds=0)
+    monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
+    monkeypatch.setattr(
+        Win32PrintWindowProvider,
+        "capture",
+        lambda _self, _handle: expected,
+    )
+
+    assert provider.capture(123) is expected
+    assert user32.minimized is True
+    assert user32.show_commands == [
+        provider.SW_SHOWNOACTIVATE,
+        provider.SW_SHOWMINNOACTIVE,
+    ]
+
+
+def test_recovering_provider_does_not_touch_normal_window(monkeypatch):
+    expected = sample([0, 20, 80, 255] * 4)
+    user32 = FakeWindowStateApi(minimized=False)
+    provider = Win32RecoveringPrintWindowProvider(paint_settle_seconds=0)
+    monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
+    monkeypatch.setattr(
+        Win32PrintWindowProvider,
+        "capture",
+        lambda _self, _handle: expected,
+    )
+
+    assert provider.capture(123) is expected
+    assert user32.show_commands == []

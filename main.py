@@ -11,18 +11,25 @@ from tkinter import PhotoImage, TclError, Tk, messagebox
 
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
+from adapters.windows_input_sync import (
+    WindowInputPolicy,
+    WindowsInputSyncController,
+    normalize_input_policy,
+)
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
+from adapters.windows_smart_reconnect import WindowsSmartReconnectController
 from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
 from adapters.windows_window import WindowsWindowAdapter
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.bootstrap import Bootstrap
-from core.sp1_boundaries import ExternalAdapter
+from core.sp1_boundaries import ExternalAdapter, SmartReconnectBoundary
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from services.app_context import AppContext
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
+from services.smart_reconnect_monitor import SmartReconnectMonitor
 from ui.home import HomeView
 
 APP_TITLE = "輔"
@@ -30,10 +37,14 @@ SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_DESKTOP_VERIFY_ARGUMENT = "--verify-target-desktop"
 TARGET_WINDOW_KEY = "target_window_keywords"
 TARGET_WINDOW_FINGERPRINT_KEY = "target_window_fingerprint"
+INPUT_POLICY_KEY = "input_policy"
+SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
 REGISTRY_FILENAME = "window_registry.json"
+RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
+RECONNECT_REFERENCE_DIR = Path("assets") / "reconnect_reference"
 WINDOWS_APP_USER_MODEL_ID = "limaple0324.FLASH"
 
 
@@ -90,6 +101,12 @@ def build_services(root: Path | None = None):
     paths = PathManager(root=root)
     logger = LoggerService(paths.log_file("flash.log"))
     config = ConfigManager(paths.config_file("settings.json"))
+    config.ensure_defaults(
+        {
+            INPUT_POLICY_KEY: WindowInputPolicy.ALL.value,
+            SMART_RECONNECT_ENABLED_KEY: True,
+        }
+    )
     event_bus = EventBus(logger=logger)
 
     registry_store = WindowRegistryStore(paths.data_dir() / REGISTRY_FILENAME)
@@ -101,6 +118,23 @@ def build_services(root: Path | None = None):
     AppContext.register(EventBus, event_bus)
     AppContext.register(WindowRegistryStore, registry_store)
     AppContext.register(WindowRegistry, registry)
+    AppContext.register(
+        WindowsInputSyncController,
+        WindowsInputSyncController.for_real_windows(),
+    )
+    reconnect_controller = WindowsSmartReconnectController.for_real_windows(
+        reference_dir=resource_path(RECONNECT_REFERENCE_DIR),
+        state_path=paths.data_dir() / RECONNECT_STATE_FILENAME,
+    )
+    AppContext.register(
+        WindowsSmartReconnectController,
+        reconnect_controller,
+    )
+    AppContext.register(SmartReconnectBoundary, reconnect_controller)
+    AppContext.register(
+        SmartReconnectMonitor,
+        SmartReconnectMonitor(reconnect_controller, logger=logger),
+    )
 
     if registry_store.recovered_from_corruption:
         logger.warning(
@@ -150,6 +184,25 @@ def shutdown_external_adapter(logger: LoggerService | None = None) -> None:
         if logger is not None:
             try:
                 logger.error(f"External adapter shutdown failed:\n{traceback.format_exc()}")
+            except Exception:
+                pass
+
+
+def shutdown_smart_reconnect_monitor(
+    logger: LoggerService | None = None,
+) -> None:
+    """Stop the daemon monitor before services and logs are released."""
+    try:
+        monitor = AppContext.get(SmartReconnectMonitor)
+        if monitor is not None and not monitor.stop():
+            raise RuntimeError("Smart reconnect monitor did not stop in time.")
+    except Exception:
+        if logger is not None:
+            try:
+                logger.error(
+                    "Smart reconnect monitor shutdown failed:\n"
+                    f"{traceback.format_exc()}"
+                )
             except Exception:
                 pass
 
@@ -226,7 +279,7 @@ def format_window_status(status: dict[str, object]) -> str:
     safe = bool(item.get("safe", False))
     return (
         f"{'✓' if safe else '—'} 主視窗："
-        f"{'可安全辨識（仍未啟用輸入）' if safe else '不可操作'}\n"
+        f"{'可安全辨識（同步輸入仍需玩家手動執行）' if safe else '不可操作'}\n"
         f"代碼：{item.get('code', 'window.unknown')}\n"
         f"說明：{item.get('message', '')}"
     )
@@ -251,7 +304,16 @@ def format_background_status(status: dict[str, object]) -> str:
         item = capabilities.get(key, {})
         state = str(item.get("state", "unknown")) if isinstance(item, dict) else "unknown"
         lines.append(f"{label}：{states.get(state, state)}")
-    lines.append("背景輸入目前仍為停用。")
+    policy_labels = {
+        WindowInputPolicy.FOREGROUND_ONLY.value: "僅允許前台",
+        WindowInputPolicy.FOREGROUND_BACKGROUND.value: "允許前台與背景",
+        WindowInputPolicy.ALL.value: "全部允許（含最小化）",
+    }
+    policy = str(status.get("input_policy", WindowInputPolicy.ALL.value))
+    lines.append(
+        "同步輸入：只在玩家明確執行已批准測試時啟用；"
+        f"目前權限為「{policy_labels.get(policy, '設定無效')}」。"
+    )
     return "\n".join(lines)
 
 
@@ -277,7 +339,8 @@ def format_start_status(status: dict[str, object], paths: PathManager) -> str:
         "背景能力\n"
         f"{format_background_status(status)}\n\n"
         f"{format_registry_status(status)}\n\n"
-        "遊戲操作尚未啟用，輔不會自動點擊或控制遊戲。\n"
+        "同步按鍵不會自行送出；目前只允許玩家明確執行 B／C 同步測試。\n"
+        "智慧重連只依已確認畫面自動監看，未知畫面不會點擊。\n"
         f"紀錄位置：{paths.logs_dir()}"
     )
 
@@ -296,7 +359,76 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             parent=window,
         )
 
-    HomeView(window, status, on_start=show_start_status).build()
+    config = AppContext.get(ConfigManager)
+    input_controller = AppContext.get(WindowsInputSyncController)
+    logger = AppContext.get(LoggerService)
+    configured_policy = (
+        normalize_input_policy(config.get(INPUT_POLICY_KEY))
+        if config is not None
+        else WindowInputPolicy.ALL
+    ) or WindowInputPolicy.ALL
+
+    def change_input_policy(value: str) -> None:
+        policy = normalize_input_policy(value)
+        if policy is None or config is None:
+            messagebox.showerror(
+                "輔｜同步輸入設定",
+                "同步輸入權限設定無效，未變更任何操作。",
+                parent=window,
+            )
+            return
+        config.set(INPUT_POLICY_KEY, policy.value)
+        status["input_policy"] = policy.value
+
+    def test_approved_key(key: str) -> None:
+        policy = (
+            normalize_input_policy(config.get(INPUT_POLICY_KEY))
+            if config is not None
+            else None
+        )
+        if input_controller is None or policy is None:
+            messagebox.showerror(
+                "輔｜同步輸入測試",
+                "同步輸入尚未正確設定，沒有送出任何按鍵。",
+                parent=window,
+            )
+            return
+        result = input_controller.send_approved_key(
+            key,
+            policy=policy,
+            execute=True,
+        )
+        if logger is not None:
+            logger.info(
+                "Approved input test completed; "
+                f"key={result.approved_key}; policy={result.policy}; "
+                f"eligible={result.eligible_windows}; sent={result.sent_windows}; "
+                f"failures={','.join(result.failure_codes) or 'none'}"
+            )
+        if result.passed:
+            messagebox.showinfo(
+                "輔｜同步輸入測試",
+                f"{key} 已送達 {result.sent_windows} 個已驗證遊戲視窗。",
+                parent=window,
+            )
+        else:
+            messagebox.showerror(
+                "輔｜同步輸入測試",
+                "同步輸入未完整送達；已停止後續操作。\n"
+                f"符合權限：{result.eligible_windows}\n"
+                f"成功送達：{result.sent_windows}\n"
+                f"錯誤代碼：{', '.join(result.failure_codes) or 'unknown'}",
+                parent=window,
+            )
+
+    HomeView(
+        window,
+        status,
+        on_start=show_start_status,
+        input_policy=configured_policy.value,
+        on_input_policy_change=change_input_policy,
+        on_test_key=test_approved_key,
+    ).build()
     return window
 
 
@@ -354,10 +486,29 @@ def run(
         status["window_registry"] = registry_status()
         status["target_window"] = detect_target_window()
         status["background_capabilities"] = detect_background_capabilities()
+        config = AppContext.get(ConfigManager)
+        status["input_policy"] = (
+            normalize_input_policy(config.get(INPUT_POLICY_KEY)).value
+            if config is not None
+            and normalize_input_policy(config.get(INPUT_POLICY_KEY)) is not None
+            else WindowInputPolicy.ALL.value
+        )
+        status["smart_reconnect_enabled"] = bool(
+            config.get(SMART_RECONNECT_ENABLED_KEY, True)
+            if config is not None
+            else True
+        )
         write_self_check_report(status, paths)
 
         if self_check_only:
             return 0 if bool(status.get("self_check_passed", False)) else 2
+
+        monitor = AppContext.get(SmartReconnectMonitor)
+        if status["smart_reconnect_enabled"] and monitor is not None:
+            monitor.start()
+            logger.info(
+                "Smart reconnect monitor enabled with confirmed screen templates."
+            )
 
         window = create_main_window(status, paths)
         window.mainloop()
@@ -386,12 +537,23 @@ def run(
         return 1
     finally:
         try:
-            save_registry(logger)
+            shutdown_smart_reconnect_monitor(logger)
         except Exception:
             if logger is not None:
-                logger.error(f"Registry final save failed:\n{traceback.format_exc()}")
+                logger.error(
+                    "Smart reconnect final shutdown failed:\n"
+                    f"{traceback.format_exc()}"
+                )
         finally:
-            shutdown_external_adapter(logger)
+            try:
+                save_registry(logger)
+            except Exception:
+                if logger is not None:
+                    logger.error(
+                        f"Registry final save failed:\n{traceback.format_exc()}"
+                    )
+            finally:
+                shutdown_external_adapter(logger)
 
 
 def main() -> None:
