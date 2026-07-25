@@ -3,6 +3,8 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from core.window_registry import WindowRegistry
+from domain.life_soul import LifeSoulRecord
+from domain.life_soul_store import LifeSoulStore
 from domain.soul_stone import SoulStoneRecord
 from domain.soul_stone_store import SoulStoneStore
 from services.character_detail_choice_service import (
@@ -14,6 +16,7 @@ from services.character_detail_view_service import (
     PlayerCharacterDetail,
 )
 from services.character_view_service import CharacterViewService
+from services.life_soul_service import LifeSoulService
 from services.soul_stone_service import SoulStoneService
 
 
@@ -28,9 +31,17 @@ def _detail_service(tmp_path) -> CharacterDetailViewService:
             SoulStoneRecord("char-b", "乙的紀錄"),
         )
     )
+    life_soul_store = LifeSoulStore(tmp_path / "life_souls.json")
+    life_soul_store.save(
+        (
+            LifeSoulRecord("char-a", "甲的命魂"),
+            LifeSoulRecord("char-b", "乙的命魂"),
+        )
+    )
     return CharacterDetailViewService(
         CharacterViewService(registry, ()),
         SoulStoneService(store),
+        LifeSoulService(life_soul_store),
     )
 
 
@@ -45,6 +56,10 @@ def test_choices_bind_duplicate_names_to_exact_stable_identities(tmp_path) -> No
     assert tuple(choice.detail.soul_stone for choice in choices) == (
         "甲的紀錄",
         "乙的紀錄",
+    )
+    assert tuple(choice.detail.life_soul for choice in choices) == (
+        "甲的命魂",
+        "乙的命魂",
     )
 
     choices[1].select()

@@ -30,6 +30,7 @@ from core.sp1_boundaries import ExternalAdapter
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from domain.character_store import CharacterStore
+from domain.life_soul_store import LifeSoulStore
 from domain.progress_store import ActivityProgressStore
 from domain.soul_stone_store import SoulStoneStore
 from product.identity import PRODUCT_NAME
@@ -50,12 +51,14 @@ from services.character_detail_view_service import CharacterDetailViewService
 from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
+from services.life_soul_service import LifeSoulService
 from services.soul_stone_service import SoulStoneService
 from ui.builtin_card_preview_catalog import build_builtin_card_preview_catalog
 from ui.home import HomeView
 from ui.card_preview_settings import CardPreviewCatalog
 from ui.character_detail_window import CharacterDetailWindow
 from ui.character_list_window import CharacterListWindow
+from ui.life_soul_editor_window import LifeSoulEditorWindow
 from ui.soul_stone_editor_window import SoulStoneEditorWindow
 from workspace.service import WorkspaceService
 
@@ -65,6 +68,7 @@ TARGET_WINDOW_KEY = "target_window_keywords"
 REGISTRY_FILENAME = "window_registry.json"
 CHARACTER_FILENAME = "characters.json"
 SOUL_STONE_FILENAME = "soul_stones.json"
+LIFE_SOUL_FILENAME = "life_souls.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
 CARD_PREVIEW_SELECTION_FILENAME = "card_preview_selection.json"
@@ -151,9 +155,12 @@ def build_services(
     character_view_service = CharacterViewService(registry, characters)
     soul_stone_store = SoulStoneStore(paths.data_dir() / SOUL_STONE_FILENAME)
     soul_stone_service = SoulStoneService(soul_stone_store)
+    life_soul_store = LifeSoulStore(paths.data_dir() / LIFE_SOUL_FILENAME)
+    life_soul_service = LifeSoulService(life_soul_store)
     character_detail_view_service = CharacterDetailViewService(
         character_view_service,
         soul_stone_service,
+        life_soul_service,
     )
     progress_store = ActivityProgressStore(paths.data_dir() / ACTIVITY_PROGRESS_FILENAME)
     progress_service = ActivityProgressService(progress_store)
@@ -192,6 +199,8 @@ def build_services(
     AppContext.register(CharacterDetailViewService, character_detail_view_service)
     AppContext.register(SoulStoneStore, soul_stone_store)
     AppContext.register(SoulStoneService, soul_stone_service)
+    AppContext.register(LifeSoulStore, life_soul_store)
+    AppContext.register(LifeSoulService, life_soul_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(WorkspaceService, workspace_service)
@@ -259,6 +268,16 @@ def build_services(
     else:
         logger.info(
             f"Soul stone records loaded: {len(soul_stone_service.all())} record(s)."
+        )
+
+    if life_soul_store.recovered_from_corruption:
+        logger.warning(
+            "Life soul records were corrupt and have been kept empty; "
+            f"backup={life_soul_store.corrupt_backup}"
+        )
+    else:
+        logger.info(
+            f"Life soul records loaded: {len(life_soul_service.all())} record(s)."
         )
 
     if progress_store.recovered_from_corruption:
@@ -580,6 +599,7 @@ def create_main_window(
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
     current_detail_character_id: str | None = None
     soul_stone_editor_window: SoulStoneEditorWindow | None = None
+    life_soul_editor_window: LifeSoulEditorWindow | None = None
 
     def load_character_details() -> tuple[tuple[str, object], ...]:
         character_details = AppContext.get(CharacterDetailViewService)
@@ -632,17 +652,50 @@ def create_main_window(
             parent=window,
         )
 
+    def show_life_soul_editor_error(error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            try:
+                logger.error(f"Life soul editor open failed: {error}")
+            except Exception:
+                pass
+        messagebox.showerror(
+            "輔｜命魂紀錄",
+            (
+                "無法開啟命魂編輯視窗。\n\n"
+                "請稍後再試；錯誤已寫入紀錄。"
+            ),
+            parent=window,
+        )
+
+    def report_life_soul_editor_error(title: str, message: str) -> None:
+        messagebox.showerror(
+            "輔｜命魂紀錄",
+            f"{title}。\n\n{message}\n錯誤已寫入紀錄。",
+            parent=window,
+        )
+
     def soul_stone_editor_is_open() -> bool:
         return (
             soul_stone_editor_window is not None
             and soul_stone_editor_window.is_open
         )
 
-    def show_soul_stone_editor_busy() -> None:
+    def life_soul_editor_is_open() -> bool:
+        return (
+            life_soul_editor_window is not None
+            and life_soul_editor_window.is_open
+        )
+
+    def character_resource_editor_is_open() -> bool:
+        return soul_stone_editor_is_open() or life_soul_editor_is_open()
+
+    def show_character_resource_editor_busy() -> None:
+        resource_name = "靈魂石" if soul_stone_editor_is_open() else "命魂"
         messagebox.showinfo(
-            "輔｜靈魂石紀錄",
+            f"輔｜{resource_name}紀錄",
             (
-                "目前已有靈魂石編輯視窗。\n\n"
+                f"目前已有{resource_name}編輯視窗。\n\n"
                 "請先保存、清除或取消目前編輯，再開啟其他角色。"
             ),
             parent=window,
@@ -670,7 +723,33 @@ def create_main_window(
         except Exception:
             pass
 
-    def refresh_current_character_detail(character_id: str) -> None:
+    def show_life_soul_refresh_error(error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            try:
+                logger.error(
+                    "Life soul persisted but character detail refresh failed: "
+                    f"{error}"
+                )
+            except Exception:
+                pass
+        try:
+            messagebox.showwarning(
+                "輔｜命魂紀錄",
+                (
+                    "命魂紀錄的變更已保存，但角色詳細資料暫時無法更新。\n\n"
+                    "請關閉後重新開啟角色詳細資料；錯誤已寫入紀錄。"
+                ),
+                parent=window,
+            )
+        except Exception:
+            pass
+
+    def refresh_current_character_detail(
+        character_id: str,
+        *,
+        on_error,
+    ) -> None:
         if (
             current_detail_character_id != character_id
             or not character_detail_window.is_open
@@ -681,12 +760,12 @@ def create_main_window(
             character_detail_window.close()
             character_detail_window.open(refreshed_detail)
         except Exception as error:
-            show_soul_stone_refresh_error(error)
+            on_error(error)
 
     def show_soul_stone_editor() -> None:
         nonlocal soul_stone_editor_window
-        if soul_stone_editor_is_open():
-            show_soul_stone_editor_busy()
+        if character_resource_editor_is_open():
+            show_character_resource_editor_busy()
             return
 
         character_id = current_detail_character_id
@@ -718,7 +797,10 @@ def create_main_window(
                     except Exception:
                         pass
                 raise
-            refresh_current_character_detail(fixed_character_id)
+            refresh_current_character_detail(
+                fixed_character_id,
+                on_error=show_soul_stone_refresh_error,
+            )
 
         def clear_soul_stone(
             fixed_character_id: str = character_id,
@@ -733,7 +815,10 @@ def create_main_window(
                     except Exception:
                         pass
                 raise
-            refresh_current_character_detail(fixed_character_id)
+            refresh_current_character_detail(
+                fixed_character_id,
+                on_error=show_soul_stone_refresh_error,
+            )
 
         try:
             editor = SoulStoneEditorWindow(
@@ -751,15 +836,90 @@ def create_main_window(
         except Exception as error:
             show_soul_stone_editor_error(error)
 
+    def show_life_soul_editor() -> None:
+        nonlocal life_soul_editor_window
+        if character_resource_editor_is_open():
+            show_character_resource_editor_busy()
+            return
+
+        character_id = current_detail_character_id
+        life_souls = AppContext.get(LifeSoulService)
+        if character_id is None or life_souls is None:
+            show_life_soul_editor_error(
+                RuntimeError("Life soul editor context is unavailable.")
+            )
+            return
+        try:
+            current_detail = detail_for_character(character_id)
+        except Exception as error:
+            life_soul_editor_window = None
+            window._life_soul_editor_window = None
+            show_life_soul_editor_error(error)
+            return
+
+        def save_life_soul(
+            note: str,
+            fixed_character_id: str = character_id,
+        ) -> None:
+            try:
+                life_souls.set_for_character(fixed_character_id, note)
+            except Exception as error:
+                logger = AppContext.get(LoggerService)
+                if logger is not None:
+                    try:
+                        logger.error(f"Life soul save failed: {error}")
+                    except Exception:
+                        pass
+                raise
+            refresh_current_character_detail(
+                fixed_character_id,
+                on_error=show_life_soul_refresh_error,
+            )
+
+        def clear_life_soul(
+            fixed_character_id: str = character_id,
+        ) -> None:
+            try:
+                life_souls.clear_for_character(fixed_character_id)
+            except Exception as error:
+                logger = AppContext.get(LoggerService)
+                if logger is not None:
+                    try:
+                        logger.error(f"Life soul clear failed: {error}")
+                    except Exception:
+                        pass
+                raise
+            refresh_current_character_detail(
+                fixed_character_id,
+                on_error=show_life_soul_refresh_error,
+            )
+
+        try:
+            editor = LifeSoulEditorWindow(
+                window,
+                save_life_soul,
+                clear_life_soul,
+                error_reporter=report_life_soul_editor_error,
+            )
+            life_soul_editor_window = editor
+            window._life_soul_editor_window = editor
+            editor.open(
+                current_detail.display_name,
+                current_detail.life_soul,
+            )
+        except Exception as error:
+            show_life_soul_editor_error(error)
+
     character_detail_window = CharacterDetailWindow(
         window,
         on_edit_soul_stone=show_soul_stone_editor,
+        on_edit_life_soul=show_life_soul_editor,
     )
 
     def show_character_detail(character_id: str, _listed_detail: object) -> None:
         nonlocal current_detail_character_id
-        if soul_stone_editor_is_open():
-            show_soul_stone_editor_busy()
+        if character_resource_editor_is_open():
+            show_character_resource_editor_busy()
             return
         try:
             current_detail = detail_for_character(character_id)
@@ -909,6 +1069,7 @@ def create_main_window(
     window._character_list_window = character_list_window
     window._character_detail_window = character_detail_window
     window._soul_stone_editor_window = soul_stone_editor_window
+    window._life_soul_editor_window = life_soul_editor_window
     workspace_change_listener = lambda: window.after_idle(
         home_view.refresh_workspace
     )

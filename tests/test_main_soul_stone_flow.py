@@ -6,12 +6,16 @@ from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from domain.character import Character, CharacterImportance
 from domain.character_store import CharacterStore
+from domain.life_soul import LifeSoulRecord
+from domain.life_soul_store import LifeSoulStore
 from domain.soul_stone import SoulStoneRecord
 from domain.soul_stone_store import SoulStoneStore
 from main import build_services, create_main_window
 from services.app_context import AppContext
 from services.character_detail_view_service import CharacterDetailViewService
+from services.life_soul_service import LifeSoulService
 from services.soul_stone_service import SoulStoneService
+from ui.life_soul_editor_window import LifeSoulEditorWindow
 from ui.soul_stone_editor_window import SoulStoneEditorWindow
 
 
@@ -80,6 +84,8 @@ class FlowHarness:
     detail_windows: list = field(default_factory=list)
     editors: list = field(default_factory=list)
     editor_renders: list = field(default_factory=list)
+    life_soul_editors: list = field(default_factory=list)
+    life_soul_editor_renders: list = field(default_factory=list)
     editor_errors: list[tuple[str, str]] = field(default_factory=list)
     messagebox_errors: list[tuple[str, str]] = field(default_factory=list)
     messagebox_error_parents: list = field(default_factory=list)
@@ -92,6 +98,7 @@ def _seed_characters(
     character_ids: tuple[str, ...],
     *,
     soul_stone_note: str | None,
+    life_soul_note: str | None = None,
 ) -> None:
     registry = WindowRegistry()
     for character_id in character_ids:
@@ -120,6 +127,13 @@ def _seed_characters(
         SoulStoneStore(tmp_path / "data" / "soul_stones.json").save(
             tuple(
                 SoulStoneRecord(character_id, soul_stone_note)
+                for character_id in character_ids
+            )
+        )
+    if life_soul_note is not None:
+        LifeSoulStore(tmp_path / "data" / "life_souls.json").save(
+            tuple(
+                LifeSoulRecord(character_id, life_soul_note)
                 for character_id in character_ids
             )
         )
@@ -152,9 +166,11 @@ def _install_flow_fakes(monkeypatch) -> FlowHarness:
             master,
             *,
             on_edit_soul_stone=None,
+            on_edit_life_soul=None,
         ):
             self.master = master
             self.on_edit_soul_stone = on_edit_soul_stone
+            self.on_edit_life_soul = on_edit_life_soul
             self.open_calls = []
             self.close_calls = 0
             self.is_open = False
@@ -171,6 +187,10 @@ def _install_flow_fakes(monkeypatch) -> FlowHarness:
         def edit_soul_stone(self) -> None:
             assert callable(self.on_edit_soul_stone)
             self.on_edit_soul_stone()
+
+        def edit_life_soul(self) -> None:
+            assert callable(self.on_edit_life_soul)
+            self.on_edit_life_soul()
 
     def record_editor_render(
         _window,
@@ -207,6 +227,41 @@ def _install_flow_fakes(monkeypatch) -> FlowHarness:
         harness.editors.append(editor)
         return editor
 
+    def record_life_soul_editor_render(
+        _window,
+        display_name,
+        initial_note,
+        on_save,
+        on_clear,
+        on_close,
+    ) -> None:
+        harness.life_soul_editor_renders.append(
+            SimpleNamespace(
+                display_name=display_name,
+                initial_note=initial_note,
+                on_save=on_save,
+                on_clear=on_clear,
+                on_close=on_close,
+            )
+        )
+
+    def build_life_soul_editor(master, on_save, on_clear, **options):
+        editor = LifeSoulEditorWindow(
+            master,
+            on_save,
+            on_clear,
+            window_factory=lambda _master: FakeDialogWindow(),
+            renderer=record_life_soul_editor_render,
+            error_reporter=options.get(
+                "error_reporter",
+                lambda title, message: harness.editor_errors.append(
+                    (title, message)
+                ),
+            ),
+        )
+        harness.life_soul_editors.append(editor)
+        return editor
+
     def record_messagebox_error(title, message, **options) -> None:
         harness.messagebox_errors.append((title, message))
         harness.messagebox_error_parents.append(options.get("parent"))
@@ -220,6 +275,12 @@ def _install_flow_fakes(monkeypatch) -> FlowHarness:
     monkeypatch.setattr(main, "CharacterListWindow", FakeCharacterListWindow)
     monkeypatch.setattr(main, "CharacterDetailWindow", FakeCharacterDetailWindow)
     monkeypatch.setattr(main, "SoulStoneEditorWindow", build_editor, raising=False)
+    monkeypatch.setattr(
+        main,
+        "LifeSoulEditorWindow",
+        build_life_soul_editor,
+        raising=False,
+    )
     monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
     monkeypatch.setattr(
         main,
@@ -259,6 +320,10 @@ def _select_listed_character(harness: FlowHarness, index: int):
 
 def _open_editor(harness: FlowHarness) -> None:
     harness.detail_windows[0].edit_soul_stone()
+
+
+def _open_life_soul_editor(harness: FlowHarness) -> None:
+    harness.detail_windows[0].edit_life_soul()
 
 
 def test_duplicate_visible_details_update_only_selected_stable_identity_and_refresh(
@@ -448,4 +513,229 @@ def test_clicking_old_list_snapshot_fetches_latest_detail_by_identity(
 
     opened = harness.detail_windows[0].open_calls[-1]
     assert opened.soul_stone == "點擊前已更新的紀錄"
+    assert opened is not listed
+
+
+def test_life_soul_updates_only_selected_stable_identity_and_refreshes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _seed_characters(
+        tmp_path,
+        ("character-a", "character-b"),
+        soul_stone_note=None,
+        life_soul_note="共同命魂舊紀錄",
+    )
+    build_services(root=tmp_path)
+    _created, harness = _create_flow(monkeypatch, tmp_path)
+
+    listed = _select_listed_character(harness, 1)
+    assert listed[0] == listed[1]
+    assert listed[0] is not listed[1]
+    _open_life_soul_editor(harness)
+    assert (
+        harness.life_soul_editor_renders[-1].initial_note
+        == "共同命魂舊紀錄"
+    )
+
+    harness.life_soul_editor_renders[-1].on_save("只修改第二個角色的命魂")
+
+    life_souls = AppContext.get(LifeSoulService)
+    assert life_souls.for_character("character-a").note == "共同命魂舊紀錄"
+    assert life_souls.for_character("character-b").note == "只修改第二個角色的命魂"
+    refreshed = harness.detail_windows[0].open_calls[-1]
+    assert refreshed.life_soul == "只修改第二個角色的命魂"
+    assert not hasattr(refreshed, "character_id")
+
+
+def test_life_soul_clear_refreshes_selected_detail_to_none(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _seed_characters(
+        tmp_path,
+        ("character-a",),
+        soul_stone_note=None,
+        life_soul_note="準備清除的命魂",
+    )
+    build_services(root=tmp_path)
+    _created, harness = _create_flow(monkeypatch, tmp_path)
+    _select_listed_character(harness, 0)
+    _open_life_soul_editor(harness)
+
+    harness.life_soul_editor_renders[-1].on_clear()
+
+    assert AppContext.get(LifeSoulService).for_character("character-a") is None
+    assert len(harness.detail_windows[0].open_calls) == 2
+    assert harness.detail_windows[0].open_calls[-1].life_soul is None
+
+
+def test_life_soul_editor_blocks_switching_and_other_resource_editor(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _seed_characters(
+        tmp_path,
+        ("character-a", "character-b"),
+        soul_stone_note="靈魂石原紀錄",
+        life_soul_note="命魂原紀錄",
+    )
+    build_services(root=tmp_path)
+    _created, harness = _create_flow(monkeypatch, tmp_path)
+    listed = _select_listed_character(harness, 0)
+    _open_life_soul_editor(harness)
+    active_editor = harness.life_soul_editors[-1]
+    active_render = harness.life_soul_editor_renders[-1]
+    active_render.pending_note = "尚未保存的命魂"
+    shown_for_first_character = harness.detail_windows[0].open_calls[-1]
+
+    harness.detail_windows[0].edit_soul_stone()
+    harness.list_windows[0].open_calls[-1][1].select()
+
+    assert harness.editors == []
+    assert harness.life_soul_editors == [active_editor]
+    assert active_editor.is_open is True
+    assert active_render.pending_note == "尚未保存的命魂"
+    assert harness.detail_windows[0].open_calls == [shown_for_first_character]
+    assert len(harness.messagebox_infos) == 2
+    for title, message in harness.messagebox_infos:
+        assert "命魂" in title + message
+        assert "保存" in message
+        assert "character-a" not in title + message
+        assert "character-b" not in title + message
+    assert harness.messagebox_info_parents == [harness.root, harness.root]
+
+
+def test_soul_stone_editor_blocks_life_soul_editor(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _seed_characters(
+        tmp_path,
+        ("character-a",),
+        soul_stone_note="靈魂石原紀錄",
+        life_soul_note="命魂原紀錄",
+    )
+    build_services(root=tmp_path)
+    _created, harness = _create_flow(monkeypatch, tmp_path)
+    _select_listed_character(harness, 0)
+    _open_editor(harness)
+
+    harness.detail_windows[0].edit_life_soul()
+
+    assert len(harness.editors) == 1
+    assert harness.editors[0].is_open is True
+    assert harness.life_soul_editors == []
+    title, message = harness.messagebox_infos[-1]
+    assert "靈魂石" in title + message
+    assert "保存" in message
+
+
+def test_life_soul_save_failure_keeps_old_record_and_chinese_error(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _seed_characters(
+        tmp_path,
+        ("character-a",),
+        soul_stone_note=None,
+        life_soul_note="原本命魂紀錄",
+    )
+    build_services(root=tmp_path)
+    _created, harness = _create_flow(monkeypatch, tmp_path)
+    _select_listed_character(harness, 0)
+    _open_life_soul_editor(harness)
+    life_souls = AppContext.get(LifeSoulService)
+
+    def fail_save(_records) -> None:
+        raise OSError(r"C:\private\life-soul.json")
+
+    monkeypatch.setattr(life_souls.store, "save", fail_save)
+    harness.life_soul_editor_renders[-1].on_save("不應套用")
+
+    assert life_souls.for_character("character-a").note == "原本命魂紀錄"
+    assert (
+        harness.detail_windows[0].open_calls[-1].life_soul
+        == "原本命魂紀錄"
+    )
+    assert len(harness.detail_windows[0].open_calls) == 1
+    assert harness.life_soul_editors[-1].is_open is True
+    player_errors = [*harness.editor_errors, *harness.messagebox_errors]
+    assert player_errors
+    title, message = player_errors[-1]
+    assert title == "輔｜命魂紀錄"
+    assert "無法保存" in message
+    assert "原本紀錄已保留" in message
+    assert r"C:\private\life-soul.json" not in title + message
+    assert harness.messagebox_error_parents[-1] is harness.root
+
+
+def test_saved_life_soul_refresh_failure_reports_saved_state(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _seed_characters(
+        tmp_path,
+        ("character-a",),
+        soul_stone_note=None,
+        life_soul_note="原本命魂紀錄",
+    )
+    build_services(root=tmp_path)
+    _created, harness = _create_flow(monkeypatch, tmp_path)
+    _select_listed_character(harness, 0)
+    _open_life_soul_editor(harness)
+    details = AppContext.get(CharacterDetailViewService)
+
+    def fail_refresh():
+        raise RuntimeError("private life soul refresh failure")
+
+    monkeypatch.setattr(details, "all_with_identities", fail_refresh)
+    harness.life_soul_editor_renders[-1].on_save("已保存的新命魂紀錄")
+
+    life_souls = AppContext.get(LifeSoulService)
+    assert life_souls.for_character("character-a").note == "已保存的新命魂紀錄"
+    assert LifeSoulStore(
+        tmp_path / "data" / "life_souls.json"
+    ).load() == (
+        LifeSoulRecord("character-a", "已保存的新命魂紀錄"),
+    )
+    player_errors = [*harness.editor_errors, *harness.messagebox_errors]
+    assert any(
+        "命魂" in title + message and "已保存" in title + message
+        for title, message in player_errors
+    )
+    assert all(
+        "原本紀錄已保留" not in title + message
+        for title, message in player_errors
+    )
+    assert all(
+        "private life soul refresh failure" not in title + message
+        for title, message in player_errors
+    )
+
+
+def test_old_list_snapshot_fetches_latest_life_soul_by_identity(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _seed_characters(
+        tmp_path,
+        ("character-a",),
+        soul_stone_note=None,
+        life_soul_note="清單建立時的命魂紀錄",
+    )
+    build_services(root=tmp_path)
+    _created, harness = _create_flow(monkeypatch, tmp_path)
+    choices = harness.list_windows[0].open_calls[-1]
+    listed = choices[0].detail
+    assert listed.life_soul == "清單建立時的命魂紀錄"
+
+    AppContext.get(LifeSoulService).set_for_character(
+        "character-a",
+        "點擊前已更新的命魂紀錄",
+    )
+    choices[0].select()
+
+    opened = harness.detail_windows[0].open_calls[-1]
+    assert opened.life_soul == "點擊前已更新的命魂紀錄"
     assert opened is not listed

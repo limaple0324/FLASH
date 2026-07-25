@@ -6,6 +6,7 @@ from services.character_view_service import (
     CharacterViewService,
     PlayerCharacterView,
 )
+from services.life_soul_service import LifeSoulService
 from services.soul_stone_service import SoulStoneService
 
 
@@ -20,6 +21,7 @@ class PlayerCharacterDetail:
     role: str | None
     note: str | None
     soul_stone: str | None = None
+    life_soul: str | None = None
 
     @classmethod
     def from_summary(
@@ -27,6 +29,7 @@ class PlayerCharacterDetail:
         summary: PlayerCharacterView,
         *,
         soul_stone: str | None = None,
+        life_soul: str | None = None,
     ) -> "PlayerCharacterDetail":
         if not isinstance(summary, PlayerCharacterView):
             raise TypeError("summary must be PlayerCharacterView.")
@@ -38,6 +41,7 @@ class PlayerCharacterDetail:
             role=summary.role,
             note=summary.note,
             soul_stone=soul_stone,
+            life_soul=life_soul,
         )
 
 
@@ -48,13 +52,17 @@ class CharacterDetailViewService:
         self,
         characters: CharacterViewService,
         soul_stones: SoulStoneService,
+        life_souls: LifeSoulService,
     ) -> None:
         if not isinstance(characters, CharacterViewService):
             raise TypeError("characters must be CharacterViewService.")
         if not isinstance(soul_stones, SoulStoneService):
             raise TypeError("soul_stones must be SoulStoneService.")
+        if not isinstance(life_souls, LifeSoulService):
+            raise TypeError("life_souls must be LifeSoulService.")
         self._characters = characters
         self._soul_stones = soul_stones
+        self._life_souls = life_souls
 
     def all_with_identities(
         self,
@@ -64,6 +72,7 @@ class CharacterDetailViewService:
         details: list[tuple[str, PlayerCharacterDetail]] = []
         for character_id, summary in self._characters.all_with_identities():
             soul_stone = self._soul_stones.for_character(character_id)
+            life_soul = self._life_souls.for_character(character_id)
             details.append(
                 (
                     character_id,
@@ -71,6 +80,9 @@ class CharacterDetailViewService:
                         summary,
                         soul_stone=(
                             soul_stone.note if soul_stone is not None else None
+                        ),
+                        life_soul=(
+                            life_soul.note if life_soul is not None else None
                         ),
                     ),
                 )

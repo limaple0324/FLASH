@@ -134,6 +134,7 @@ def format_player_character_detail(detail: PlayerCharacterDetail) -> str:
             f"定位：{value_or_unset(detail.role)}",
             f"備註：{value_or_unset(detail.note)}",
             f"靈魂石：{value_or_unset(detail.soul_stone)}",
+            f"命魂：{value_or_unset(detail.life_soul)}",
         )
     )
 

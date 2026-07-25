@@ -38,6 +38,7 @@ def render_character_detail(
     on_close: Callable[[], None],
     *,
     on_edit_soul_stone: Callable[[], None] | None = None,
+    on_edit_life_soul: Callable[[], None] | None = None,
     frame_factory: WidgetFactory | None = None,
     label_factory: WidgetFactory | None = None,
     button_factory: WidgetFactory | None = None,
@@ -65,12 +66,22 @@ def render_character_detail(
             width=12,
             command=on_edit_soul_stone,
         ).pack(pady=(20, 0))
+    if on_edit_life_soul is not None:
+        button_factory(
+            body,
+            text="編輯命魂",
+            width=12,
+            command=on_edit_life_soul,
+        ).pack(pady=(8 if on_edit_soul_stone is not None else 20, 0))
+    has_edit_entry = (
+        on_edit_soul_stone is not None or on_edit_life_soul is not None
+    )
     button_factory(
         body,
         text="關閉",
         width=12,
         command=on_close,
-    ).pack(pady=(8 if on_edit_soul_stone is not None else 20, 0))
+    ).pack(pady=(8 if has_edit_entry else 20, 0))
 
 
 class CharacterDetailWindow:
@@ -81,17 +92,21 @@ class CharacterDetailWindow:
         master: Any,
         *,
         on_edit_soul_stone: Callable[[], None] | None = None,
+        on_edit_life_soul: Callable[[], None] | None = None,
         window_factory: WindowFactory | None = None,
         renderer: DetailRenderer | None = None,
     ) -> None:
         if on_edit_soul_stone is not None and not callable(on_edit_soul_stone):
             raise TypeError("on_edit_soul_stone must be callable.")
+        if on_edit_life_soul is not None and not callable(on_edit_life_soul):
+            raise TypeError("on_edit_life_soul must be callable.")
         if window_factory is not None and not callable(window_factory):
             raise TypeError("window_factory must be callable.")
         if renderer is not None and not callable(renderer):
             raise TypeError("renderer must be callable.")
         self._master = master
         self._on_edit_soul_stone = on_edit_soul_stone
+        self._on_edit_life_soul = on_edit_life_soul
         self._window_factory = window_factory or _default_window_factory
         self._renderer = renderer
         self._window: DetailWindow | None = None
@@ -113,11 +128,20 @@ class CharacterDetailWindow:
             window.transient(self._master)
             window.protocol("WM_DELETE_WINDOW", self.close)
             if self._renderer is None:
+                edit_options: dict[str, Callable[[], None]] = {}
+                if self._on_edit_soul_stone is not None:
+                    edit_options["on_edit_soul_stone"] = (
+                        self._on_edit_soul_stone
+                    )
+                if self._on_edit_life_soul is not None:
+                    edit_options["on_edit_life_soul"] = (
+                        self._on_edit_life_soul
+                    )
                 render_character_detail(
                     window,
                     detail,
                     self.close,
-                    on_edit_soul_stone=self._on_edit_soul_stone,
+                    **edit_options,
                 )
             else:
                 self._renderer(window, detail, self.close)

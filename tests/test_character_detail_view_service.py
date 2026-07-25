@@ -4,6 +4,8 @@ import pytest
 
 from core.window_registry import WindowRegistry
 from domain.character import Character, CharacterImportance
+from domain.life_soul import LifeSoulRecord
+from domain.life_soul_store import LifeSoulStore
 from domain.soul_stone import SoulStoneRecord
 from domain.soul_stone_store import SoulStoneStore
 from services.character_detail_view_service import (
@@ -11,6 +13,7 @@ from services.character_detail_view_service import (
     PlayerCharacterDetail,
 )
 from services.character_view_service import CharacterViewService
+from services.life_soul_service import LifeSoulService
 from services.soul_stone_service import SoulStoneService
 
 
@@ -35,9 +38,14 @@ def _service(tmp_path) -> CharacterDetailViewService:
     soul_stone_store.save(
         (SoulStoneRecord("stable-character", "本週先保留稀有靈魂石"),)
     )
+    life_soul_store = LifeSoulStore(tmp_path / "life_souls.json")
+    life_soul_store.save(
+        (LifeSoulRecord("stable-character", "命魂先升到第三階"),)
+    )
     return CharacterDetailViewService(
         CharacterViewService(registry, profiles),
         SoulStoneService(soul_stone_store),
+        LifeSoulService(life_soul_store),
     )
 
 
@@ -51,6 +59,7 @@ def test_detail_snapshot_contains_only_confirmed_player_fields(tmp_path) -> None
             role="古",
             note="守紀優先",
             soul_stone="本週先保留稀有靈魂石",
+            life_soul="命魂先升到第三階",
         ),
     )
 
@@ -78,9 +87,17 @@ def test_control_pairing_does_not_guess_from_duplicate_display_names(
             SoulStoneRecord("char-b", "乙的紀錄"),
         )
     )
+    life_soul_store = LifeSoulStore(tmp_path / "life_souls.json")
+    life_soul_store.save(
+        (
+            LifeSoulRecord("char-a", "甲的命魂"),
+            LifeSoulRecord("char-b", "乙的命魂"),
+        )
+    )
     service = CharacterDetailViewService(
         CharacterViewService(registry, ()),
         SoulStoneService(soul_stone_store),
+        LifeSoulService(life_soul_store),
     )
 
     paired = service.all_with_identities()
@@ -93,6 +110,10 @@ def test_control_pairing_does_not_guess_from_duplicate_display_names(
         "甲的紀錄",
         "乙的紀錄",
     )
+    assert tuple(detail.life_soul for _character_id, detail in paired) == (
+        "甲的命魂",
+        "乙的命魂",
+    )
     assert all(not hasattr(detail, "character_id") for _, detail in paired)
 
 
@@ -103,7 +124,6 @@ def test_detail_snapshot_does_not_guess_future_record_fields(tmp_path) -> None:
         "character_id",
         "window_handle",
         "pet",
-        "life_soul",
         "artifact",
         "inventory",
     ):
@@ -121,10 +141,20 @@ def test_detail_service_requires_existing_read_only_services(tmp_path) -> None:
     soul_stones = SoulStoneService(
         SoulStoneStore(tmp_path / "soul_stones.json")
     )
+    life_souls = LifeSoulService(
+        LifeSoulStore(tmp_path / "life_souls.json")
+    )
     with pytest.raises(TypeError, match="CharacterViewService"):
-        CharacterDetailViewService(object(), soul_stones)
+        CharacterDetailViewService(object(), soul_stones, life_souls)
     with pytest.raises(TypeError, match="SoulStoneService"):
         CharacterDetailViewService(
             CharacterViewService(WindowRegistry(), ()),
+            object(),
+            life_souls,
+        )
+    with pytest.raises(TypeError, match="LifeSoulService"):
+        CharacterDetailViewService(
+            CharacterViewService(WindowRegistry(), ()),
+            soul_stones,
             object(),
         )
