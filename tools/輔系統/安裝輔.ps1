@@ -112,8 +112,8 @@ $stageDir = Join-Path $installParent ".輔-SP1-stage-$transactionId"
 $backupDir = Join-Path $installParent ".輔-SP1-backup-$transactionId"
 $failedDir = Join-Path $installParent ".輔-SP1-failed-$transactionId"
 $shortcutPath = Join-Path $DesktopDir "輔.lnk"
-$shortcutTemp = Join-Path $DesktopDir ".輔-SP1-$transactionId.lnk"
-$shortcutBackup = Join-Path $installParent ".輔-SP1-shortcut-$transactionId.lnk"
+$shortcutTemp = Join-Path $DesktopDir ".FLASH-SP1-$transactionId.lnk"
+$shortcutBackup = Join-Path $installParent ".FLASH-SP1-shortcut-$transactionId.lnk"
 
 $installSwapped = $false
 $installBackedUp = $false
