@@ -29,6 +29,8 @@ def test_updater_preserves_the_existing_desktop_shortcut():
     assert "IconLocation" not in updater
     assert 'Join-Path $Desktop "輔.lnk"' not in updater
     assert "已保留原本桌面捷徑的名稱與圖示" in updater
+    assert "可以直接使用原本桌面的輔啟動捷徑" in updater
+    assert "輔 V0.2" not in updater
 
 
 def test_updater_runs_a_temporary_core_with_one_fixed_cmd_bootstrap():
