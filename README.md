@@ -36,6 +36,10 @@ Actions run `30134982561` 已成功建立、下載並獨立重驗
 整合快照不含更新器，工作流程的發布步驟已跳過，`release/latest` 仍是
 `341ce3cdfd715531ae64c4b75f08fc3af4e8ad15`。
 
+其後來源提交 `f03a9cc` 已把 `WorkspaceService` 正式接成首頁唯一唯讀工作區
+來源；目前全套 497 項測試、原始碼編譯與完整來源自我檢查通過。這項來源進度
+尚未重建 Windows artifact，也不代表真實選組、活動事件或下一步決策已完成。
+
 SP1 目前已包含：
 
 - application bootstrap
