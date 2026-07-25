@@ -13,6 +13,7 @@ from cards.view_state import CardViewState
 from services.card_preview_selection_service import CardPreviewChoice
 from services.character_detail_view_service import PlayerCharacterDetail
 from services.character_view_service import PlayerCharacterView
+from workspace.models import WorkspaceState
 
 
 def _characters(status: dict[str, object]) -> list[dict[str, object]]:
@@ -28,7 +29,7 @@ def _characters(status: dict[str, object]) -> list[dict[str, object]]:
 def _group_text(status: dict[str, object]) -> str:
     characters = _characters(status)
     if not characters:
-        return "目前組別\n尚未設定"
+        return "已登記組別\n尚無角色資料"
 
     groups = sorted({
         str(item.get("group")).strip()
@@ -44,7 +45,7 @@ def _group_text(status: dict[str, object]) -> str:
     preview = "、".join(names[:3])
     if len(names) > 3:
         preview += f" 等 {len(names)} 個角色"
-    return f"目前組別\n{title}\n{preview}"
+    return f"已登記組別\n{title}\n{preview}"
 
 
 def format_group_characters(status: dict[str, object]) -> str:
@@ -146,11 +147,28 @@ def _status_text(status: dict[str, object]) -> str:
     return "目前狀態\n● 已準備完成"
 
 
-def _workspace_text(status: dict[str, object]) -> str:
-    characters = _characters(status)
-    if characters:
-        return f"工作區\n已載入 {len(characters)} 個角色"
-    return "工作區\n等待設定組別"
+def _workspace_text(state: WorkspaceState) -> str:
+    """Render only confirmed workspace state without exposing stable IDs."""
+    if not isinstance(state, WorkspaceState):
+        raise TypeError("state must be WorkspaceState.")
+
+    group_line = (
+        f"目前組別：{state.current_group.name}"
+        if state.current_group is not None
+        else "等待設定組別"
+    )
+    activity_name = (
+        state.current_activity.name
+        if state.current_activity is not None
+        else "尚未設定"
+    )
+    next_step = state.next_step or "尚未提供"
+    return (
+        "工作區\n"
+        f"{group_line}\n"
+        f"目前活動：{activity_name}\n"
+        f"下一步：{next_step}"
+    )
 
 
 def _card_text(
@@ -197,7 +215,15 @@ class HomeView:
         on_card_display_seconds_update: Callable[[int], object] | None = None,
         on_card_display_seconds_error: Callable[[Exception], object] | None = None,
         on_show_group_characters: Callable[[], object] | None = None,
+        workspace_state: WorkspaceState | None = None,
+        workspace_state_provider: Callable[[], WorkspaceState] | None = None,
+        on_workspace_error: Callable[[Exception], object] | None = None,
     ):
+        if workspace_state is not None and not isinstance(
+            workspace_state,
+            WorkspaceState,
+        ):
+            raise TypeError("workspace_state must be WorkspaceState or None.")
         self.parent = parent
         self.status = status
         self.on_start = on_start
@@ -211,7 +237,11 @@ class HomeView:
         self.on_card_display_seconds_update = on_card_display_seconds_update
         self.on_card_display_seconds_error = on_card_display_seconds_error
         self.on_show_group_characters = on_show_group_characters
+        self.workspace_state = workspace_state or WorkspaceState()
+        self.workspace_state_provider = workspace_state_provider
+        self.on_workspace_error = on_workspace_error
         self._card_label = None
+        self._workspace_label = None
         self._card_preview_buttons: dict[str, Button] = {}
         self._card_preview_clear_button: Button | None = None
         self._card_preview_clear_visible = False
@@ -224,6 +254,27 @@ class HomeView:
         text = _card_text(self.status, self.card_view_state)
         if self._card_label is not None:
             self._card_label.configure(text=text)
+        return text
+
+    def refresh_workspace(self) -> str:
+        """Refresh the workspace from its read-only source without guessing."""
+        previous_state = self.workspace_state
+        try:
+            state = (
+                self.workspace_state_provider()
+                if self.workspace_state_provider is not None
+                else previous_state
+            )
+            text = _workspace_text(state)
+        except Exception as error:
+            if self.on_workspace_error is None:
+                raise
+            self.on_workspace_error(error)
+            return _workspace_text(previous_state)
+
+        self.workspace_state = state
+        if self._workspace_label is not None:
+            self._workspace_label.configure(text=text)
         return text
 
     def refresh_card_preview_choices(self) -> tuple[CardPreviewChoice, ...]:
@@ -344,12 +395,13 @@ class HomeView:
             anchor="w",
         ).pack(fill=X, pady=12)
 
-        Label(
+        self._workspace_label = Label(
             body,
-            text=_workspace_text(self.status),
+            text=self.refresh_workspace(),
             font=("Microsoft JhengHei UI", 11),
             anchor="w",
-        ).pack(fill=X, pady=12)
+        )
+        self._workspace_label.pack(fill=X, pady=12)
 
         self._card_label = Label(
             body,

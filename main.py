@@ -55,6 +55,7 @@ from ui.card_preview_settings import CardPreviewCatalog
 from ui.character_detail_window import CharacterDetailWindow
 from ui.character_list_window import CharacterListWindow
 from ui.soul_stone_editor_window import SoulStoneEditorWindow
+from workspace.service import WorkspaceService
 
 APP_TITLE = PRODUCT_NAME
 SELF_CHECK_ARGUMENT = "--self-check"
@@ -147,6 +148,7 @@ def build_services(
     )
     progress_store = ActivityProgressStore(paths.data_dir() / ACTIVITY_PROGRESS_FILENAME)
     progress_service = ActivityProgressService(progress_store)
+    workspace_service = WorkspaceService()
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
     card_history_service = CardHistoryService(card_history_store)
     card_service = CardService(card_display_settings_resolution.settings)
@@ -183,6 +185,7 @@ def build_services(
     AppContext.register(SoulStoneService, soul_stone_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
+    AppContext.register(WorkspaceService, workspace_service)
     AppContext.register(CardHistoryStore, card_history_store)
     AppContext.register(CardHistoryService, card_history_service)
     AppContext.register(CardService, card_service)
@@ -798,8 +801,27 @@ def create_main_window(
             parent=window,
         )
 
+    def show_workspace_error(error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            try:
+                logger.error(f"Workspace display refresh failed: {error}")
+            except Exception:
+                pass
+        messagebox.showerror(
+            "輔｜工作區",
+            (
+                "無法更新工作區畫面，已保留上次顯示的內容。\n\n"
+                "請稍後再試；錯誤已寫入紀錄。"
+            ),
+            parent=window,
+        )
+
     card_view_state_service = AppContext.get(CardViewStateService)
     card_preview_selection_service = AppContext.get(CardPreviewSelectionService)
+    workspace_service = AppContext.get(WorkspaceService)
+    if workspace_service is None:
+        raise RuntimeError("Workspace service is unavailable.")
     home_view = HomeView(
         window,
         status,
@@ -838,12 +860,19 @@ def create_main_window(
         ),
         on_card_display_seconds_error=show_card_display_seconds_error,
         on_show_group_characters=show_group_characters,
+        workspace_state_provider=workspace_service.snapshot,
+        on_workspace_error=show_workspace_error,
     )
     home_view.build()
     window._home_view = home_view
     window._character_list_window = character_list_window
     window._character_detail_window = character_detail_window
     window._soul_stone_editor_window = soul_stone_editor_window
+    workspace_change_listener = lambda: window.after_idle(
+        home_view.refresh_workspace
+    )
+    workspace_service.subscribe(workspace_change_listener)
+    window._workspace_change_listener = workspace_change_listener
     card_service = AppContext.get(CardService)
     if card_service is not None:
         card_service.subscribe(lambda: window.after_idle(home_view.refresh_cards))

@@ -69,6 +69,9 @@ class FakeHomeView:
     def refresh_cards(self) -> None:
         pass
 
+    def refresh_workspace(self) -> None:
+        pass
+
 
 @dataclass
 class FlowHarness:

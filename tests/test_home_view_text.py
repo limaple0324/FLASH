@@ -2,6 +2,8 @@ from pathlib import Path
 
 import pytest
 
+from domain.activity import ActivityDefinition, ActivityType, ResetRule
+from domain.group import CharacterGroup
 from services.character_detail_view_service import PlayerCharacterDetail
 from services.character_view_service import PlayerCharacterView
 from ui.home import (
@@ -13,6 +15,18 @@ from ui.home import (
     format_player_character_detail,
     format_player_characters,
 )
+from workspace.models import WorkspaceState
+
+
+def _activity() -> ActivityDefinition:
+    return ActivityDefinition(
+        activity_id="SECRET-ACTIVITY-ID",
+        name="守紀",
+        activity_type=ActivityType.DAILY,
+        reset_rule=ResetRule.DAILY_MIDNIGHT,
+        max_completions=16,
+        applicable_character_ids=("SECRET-CHARACTER-ID",),
+    )
 
 
 def test_home_action_button_is_status_oriented():
@@ -29,9 +43,14 @@ def test_home_text_uses_empty_player_state():
         "target_window": {"configured": False, "safe": False},
     }
 
-    assert _group_text(status) == "目前組別\n尚未設定"
+    assert _group_text(status) == "已登記組別\n尚無角色資料"
     assert _status_text(status) == "目前狀態\n● 已準備完成"
-    assert _workspace_text(status) == "工作區\n等待設定組別"
+    assert _workspace_text(WorkspaceState()) == (
+        "工作區\n"
+        "等待設定組別\n"
+        "目前活動：尚未設定\n"
+        "下一步：尚未提供"
+    )
     assert _card_text(status) == "提醒卡\n尚未設定遊戲主視窗"
 
 
@@ -47,10 +66,52 @@ def test_home_text_summarizes_registered_group():
         "target_window": {"configured": True, "safe": True},
     }
 
-    assert _group_text(status) == "目前組別\n120、160\n160古、120古"
+    assert _group_text(status) == "已登記組別\n120、160\n160古、120古"
     assert _status_text(status) == "目前狀態\n● 已找到遊戲視窗"
-    assert _workspace_text(status) == "工作區\n已載入 2 個角色"
+    assert "已載入 2 個角色" not in _workspace_text(WorkspaceState())
     assert _card_text(status) == "提醒卡\n系統正常"
+
+
+def test_workspace_text_uses_only_confirmed_names_and_next_step():
+    state = WorkspaceState(
+        current_group=CharacterGroup(
+            group_id="SECRET-GROUP-ID",
+            name="十四支",
+        ),
+        current_activity=_activity(),
+        next_step="完成下一個角色",
+    )
+
+    text = _workspace_text(state)
+
+    assert text == (
+        "工作區\n"
+        "目前組別：十四支\n"
+        "目前活動：守紀\n"
+        "下一步：完成下一個角色"
+    )
+    assert "SECRET-GROUP-ID" not in text
+    assert "SECRET-ACTIVITY-ID" not in text
+    assert "SECRET-CHARACTER-ID" not in text
+
+
+def test_workspace_text_marks_each_missing_field_without_guessing():
+    state = WorkspaceState(
+        current_group=CharacterGroup(group_id="known-group", name="魔心次元組"),
+    )
+
+    text = _workspace_text(state)
+
+    assert "目前組別：魔心次元組" in text
+    assert "目前活動：尚未設定" in text
+    assert "下一步：尚未提供" in text
+    assert "農場" not in text
+    assert "守紀" not in text
+
+
+def test_workspace_text_rejects_untrusted_values():
+    with pytest.raises(TypeError, match="WorkspaceState"):
+        _workspace_text(object())
 
 
 def test_home_text_reports_self_check_problem():

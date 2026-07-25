@@ -22,7 +22,9 @@ def test_service_starts_empty_and_can_use_a_known_initial_state():
     restored = WorkspaceService(initial)
 
     assert empty.state == WorkspaceState()
+    assert empty.snapshot() is empty.state
     assert restored.state is initial
+    assert restored.snapshot() is initial
 
 
 def test_service_updates_only_the_requested_workspace_field():
@@ -74,3 +76,37 @@ def test_service_keeps_the_previous_state_when_an_update_is_invalid():
 def test_service_rejects_an_invalid_initial_state():
     with pytest.raises(TypeError):
         WorkspaceService(object())
+
+
+def test_service_notifies_subscribers_only_after_a_real_valid_change():
+    service = WorkspaceService()
+    notifications = []
+
+    def listener() -> None:
+        notifications.append(service.snapshot())
+
+    service.subscribe(listener)
+    service.subscribe(listener)
+
+    service.set_next_step("選擇組別")
+    service.set_next_step("選擇組別")
+    with pytest.raises(ValueError):
+        service.set_next_step("   ")
+    service.clear()
+
+    assert notifications == [
+        WorkspaceState(next_step="選擇組別"),
+        WorkspaceState(),
+    ]
+
+    service.unsubscribe(listener)
+    service.set_next_step("稍後再選")
+
+    assert len(notifications) == 2
+
+
+def test_service_rejects_a_non_callable_listener():
+    service = WorkspaceService()
+
+    with pytest.raises(TypeError, match="listener"):
+        service.subscribe(object())

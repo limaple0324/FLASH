@@ -21,6 +21,8 @@ from services.card_history_service import CardHistoryService
 from services.card_preview_selection_service import CardPreviewSelectionService
 from services.card_preview_selection_store import CardPreviewSelectionStore
 from services.logger_service import LoggerService
+from workspace.models import WorkspaceState
+from workspace.service import WorkspaceService
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +53,7 @@ class SelfCheck:
             self._run("event_bus", self._check_event_bus),
             self._run("window_registry", self._check_window_registry),
             self._run("activity_progress", self._check_activity_progress),
+            self._run("workspace_service", self._check_workspace_service),
             self._run("card_history", self._check_card_history),
             self._run("card_display_settings", self._check_card_display_settings),
             self._run("card_preview_selection", self._check_card_preview_selection),
@@ -131,6 +134,15 @@ class SelfCheck:
             backup = store.corrupt_backup.name if store.corrupt_backup else "unknown"
             return f"Activity progress recovered from corruption; backup saved as {backup}."
         return f"Activity progress loaded with {len(service.all())} record(s)."
+
+    def _check_workspace_service(self) -> str:
+        service = self.context.get(WorkspaceService)
+        if service is None:
+            raise RuntimeError("WorkspaceService is not registered.")
+        state = service.snapshot()
+        if not isinstance(state, WorkspaceState):
+            raise RuntimeError("WorkspaceService did not return a WorkspaceState.")
+        return "Workspace service provides a valid read-only state."
 
     def _check_card_history(self) -> str:
         store = self.context.get(CardHistoryStore)

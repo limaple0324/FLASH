@@ -8,6 +8,10 @@ def test_main_window_uses_home_view():
     assert "card_view_state_service.snapshot" in source
     assert "card_view_state_provider=" in source
     assert "window._home_view = home_view" in source
+    assert "workspace_state_provider=workspace_service.snapshot" in source
+    assert "workspace_service.subscribe" in source
+    assert "window.after_idle(" in source
+    assert "home_view.refresh_workspace" in source
     assert "card_service.subscribe" in source
     assert "window.after_idle(home_view.refresh_cards)" in source
     assert "CardExpiryMonitor(card_service, window.after)" in source

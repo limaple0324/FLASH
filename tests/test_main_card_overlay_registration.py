@@ -86,6 +86,9 @@ class FakeHomeView:
     def refresh_cards(self) -> None:
         pass
 
+    def refresh_workspace(self) -> None:
+        pass
+
 
 def test_missing_catalog_keeps_registered_overlay_disabled(tmp_path) -> None:
     build_services(root=tmp_path)
