@@ -35,10 +35,28 @@ class _BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
 
 
+class _WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("showCmd", wintypes.UINT),
+        ("ptMinPosition", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("rcNormalPosition", wintypes.RECT),
+    ]
+
+
 def _configure_win32_capture_api(user32, gdi32) -> None:
     """Apply pointer-safe ctypes signatures to every Win32 capture call."""
     user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
     user32.GetWindowRect.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = (wintypes.HWND,)
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetWindowPlacement.argtypes = (
+        wintypes.HWND,
+        ctypes.POINTER(_WINDOWPLACEMENT),
+    )
+    user32.GetWindowPlacement.restype = wintypes.BOOL
     user32.GetWindowDC.argtypes = (wintypes.HWND,)
     user32.GetWindowDC.restype = wintypes.HDC
     user32.PrintWindow.argtypes = (wintypes.HWND, wintypes.HDC, wintypes.UINT)
@@ -88,6 +106,20 @@ class Win32PrintWindowProvider:
     def _libraries():
         return ctypes.windll.user32, ctypes.windll.gdi32
 
+    @staticmethod
+    def _capture_rect(user32, hwnd) -> wintypes.RECT | None:
+        if user32.IsIconic(hwnd):
+            placement = _WINDOWPLACEMENT()
+            placement.length = ctypes.sizeof(_WINDOWPLACEMENT)
+            if not user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
+                return None
+            return placement.rcNormalPosition
+
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return rect
+
     def capture(self, window_handle: int) -> CaptureSample | None:
         if os.name != "nt" or not window_handle:
             return None
@@ -96,8 +128,8 @@ class Win32PrintWindowProvider:
         _configure_win32_capture_api(user32, gdi32)
         hwnd = wintypes.HWND(window_handle)
 
-        rect = wintypes.RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        rect = self._capture_rect(user32, hwnd)
+        if rect is None:
             return None
 
         width = int(rect.right - rect.left)

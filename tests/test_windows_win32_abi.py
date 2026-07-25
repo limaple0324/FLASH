@@ -8,6 +8,7 @@ import pytest
 from adapters.windows_background_capture import (
     Win32PrintWindowProvider,
     _BITMAPINFO,
+    _WINDOWPLACEMENT,
     _configure_win32_capture_api,
 )
 from adapters.windows_window import (
@@ -251,6 +252,8 @@ def _fake_capture_libraries(handles):
 
     user32 = SimpleNamespace(
         GetWindowRect=FakeWinFunction(set_window_rect),
+        IsIconic=FakeWinFunction(result=0),
+        GetWindowPlacement=FakeWinFunction(result=0),
         GetWindowDC=FakeWinFunction(result=handles["window_dc"]),
         PrintWindow=FakeWinFunction(result=1),
         ReleaseDC=FakeWinFunction(result=1),
@@ -279,6 +282,13 @@ def test_capture_api_declares_every_used_win32_signature():
 
     assert user32.GetWindowRect.argtypes == (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
     assert user32.GetWindowRect.restype is wintypes.BOOL
+    assert user32.IsIconic.argtypes == (wintypes.HWND,)
+    assert user32.IsIconic.restype is wintypes.BOOL
+    assert user32.GetWindowPlacement.argtypes == (
+        wintypes.HWND,
+        ctypes.POINTER(_WINDOWPLACEMENT),
+    )
+    assert user32.GetWindowPlacement.restype is wintypes.BOOL
     assert user32.GetWindowDC.argtypes == (wintypes.HWND,)
     assert user32.GetWindowDC.restype is wintypes.HDC
     assert user32.PrintWindow.argtypes == (wintypes.HWND, wintypes.HDC, wintypes.UINT)
@@ -341,6 +351,58 @@ def test_capture_provider_preserves_high_bit_gdi_handles_during_use_and_cleanup(
     assert gdi32.DeleteDC.calls == [(handles["memory_dc"],)]
     assert _value(user32.ReleaseDC.calls[0][0]) == hwnd
     assert user32.ReleaseDC.calls[0][1] == handles["window_dc"]
+
+
+def test_capture_provider_uses_normal_window_size_while_minimized():
+    handles = {
+        "window_dc": 11,
+        "memory_dc": 22,
+        "bitmap": 33,
+        "old_object": 44,
+    }
+    observed_lengths = []
+    user32, gdi32 = _fake_capture_libraries(handles)
+    user32.IsIconic = FakeWinFunction(result=1)
+
+    def set_normal_placement(_hwnd, placement_pointer):
+        placement = placement_pointer._obj
+        observed_lengths.append(placement.length)
+        placement.rcNormalPosition.left = 10
+        placement.rcNormalPosition.top = 20
+        placement.rcNormalPosition.right = 18
+        placement.rcNormalPosition.bottom = 26
+        return 1
+
+    user32.GetWindowPlacement = FakeWinFunction(set_normal_placement)
+    provider = Win32PrintWindowProvider()
+    provider._libraries = lambda: (user32, gdi32)
+
+    captured = provider.capture(123)
+
+    assert captured is not None
+    assert (captured.width, captured.height) == (8, 6)
+    assert observed_lengths == [ctypes.sizeof(_WINDOWPLACEMENT)]
+    assert user32.GetWindowRect.calls == []
+    assert gdi32.CreateCompatibleBitmap.calls[0] == (handles["window_dc"], 8, 6)
+
+
+def test_capture_provider_rejects_minimized_window_without_normal_placement():
+    handles = {
+        "window_dc": 11,
+        "memory_dc": 22,
+        "bitmap": 33,
+        "old_object": 44,
+    }
+    user32, gdi32 = _fake_capture_libraries(handles)
+    user32.IsIconic = FakeWinFunction(result=1)
+    user32.GetWindowPlacement = FakeWinFunction(result=0)
+    provider = Win32PrintWindowProvider()
+    provider._libraries = lambda: (user32, gdi32)
+
+    assert provider.capture(123) is None
+    assert user32.GetWindowRect.calls == []
+    assert user32.GetWindowDC.calls == []
+    assert gdi32.CreateCompatibleBitmap.calls == []
 
 
 def test_capture_provider_rejects_selectobject_failure_before_capture():
