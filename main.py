@@ -125,6 +125,20 @@ def save_registry(logger: LoggerService | None = None) -> None:
             raise
 
 
+def shutdown_external_adapter(logger: LoggerService | None = None) -> None:
+    """Release the registered adapter without changing the caller's exit path."""
+    try:
+        adapter = AppContext.get(ExternalAdapter)
+        if adapter is not None:
+            adapter.shutdown()
+    except Exception:
+        if logger is not None:
+            try:
+                logger.error(f"External adapter shutdown failed:\n{traceback.format_exc()}")
+            except Exception:
+                pass
+
+
 def registry_status() -> dict[str, object]:
     registry = AppContext.get(WindowRegistry)
     store = AppContext.get(WindowRegistryStore)
@@ -312,6 +326,8 @@ def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
         except Exception:
             if logger is not None:
                 logger.error(f"Registry final save failed:\n{traceback.format_exc()}")
+        finally:
+            shutdown_external_adapter(logger)
 
 
 def main() -> None:
