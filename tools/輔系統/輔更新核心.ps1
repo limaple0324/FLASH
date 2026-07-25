@@ -84,6 +84,25 @@ function Require-File([string]$Path) {
     }
 }
 
+function Get-Sha256Hex([string]$Path) {
+    Require-File $Path
+    $stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha256.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($hashBytes)).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Get-PayloadPath([string]$Root, [string]$RelativePath) {
     $result = $Root
     foreach ($segment in ($RelativePath -split "/")) {
@@ -158,7 +177,7 @@ function Read-AndVerifyManifest([string]$Root) {
         }
         $filePath = Get-PayloadPath -Root $Root -RelativePath $relativePath
         Require-File $filePath
-        $actualHash = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actualHash = Get-Sha256Hex -Path $filePath
         if ($actualHash -ne $manifest[$relativePath]) {
             throw "檔案雜湊核對失敗：$relativePath"
         }
@@ -413,12 +432,8 @@ try {
     $installedBootstrap = Get-PayloadPath -Root $InstallDir -RelativePath $FixedBootstrapPath
     $stagedBootstrap = Get-PayloadPath -Root $StageRoot -RelativePath $FixedBootstrapPath
     Require-File $installedBootstrap
-    $installedBootstrapHash = (
-        Get-FileHash -LiteralPath $installedBootstrap -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
-    $stagedBootstrapHash = (
-        Get-FileHash -LiteralPath $stagedBootstrap -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
+    $installedBootstrapHash = Get-Sha256Hex -Path $installedBootstrap
+    $stagedBootstrapHash = Get-Sha256Hex -Path $stagedBootstrap
     if ($installedBootstrapHash -ne $stagedBootstrapHash) {
         throw "固定更新啟動器版本不相容；未修改任何檔案，請改用完整安裝包更新。"
     }

@@ -49,6 +49,18 @@ def test_windows_powershell_download_does_not_require_the_ie_engine():
     assert updater.count("-UseBasicParsing") == 2
 
 
+def test_hash_verification_does_not_require_powershell_module_autoload():
+    scripts = (
+        Path("tools/輔系統/輔更新核心.ps1").read_text(encoding="utf-8"),
+        Path("tools/verify_windows_release.ps1").read_text(encoding="utf-8"),
+    )
+
+    for script in scripts:
+        assert "Get-FileHash" not in script
+        assert "[System.Security.Cryptography.SHA256]::Create()" in script
+        assert "$sha256.ComputeHash($stream)" in script
+
+
 def test_only_main_push_can_publish_over_the_live_release():
     workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
 

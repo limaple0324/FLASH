@@ -35,6 +35,25 @@ function Require-File([string]$Path) {
     }
 }
 
+function Get-Sha256Hex([string]$Path) {
+    Require-File $Path
+    $stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha256.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($hashBytes)).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Get-ReleasePath([string]$RelativePath) {
     $result = $ReleaseDir
     foreach ($segment in ($RelativePath -split "/")) {
@@ -93,7 +112,7 @@ function Read-AndVerifyManifest([string[]]$ExpectedPaths) {
         }
         $filePath = Get-ReleasePath -RelativePath $relativePath
         Require-File $filePath
-        $actualHash = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actualHash = Get-Sha256Hex -Path $filePath
         if ($actualHash -ne $manifest[$relativePath]) {
             throw "Release file hash mismatch: $relativePath"
         }
