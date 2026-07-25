@@ -8,22 +8,31 @@
 - GitHub：`https://github.com/limaple0324/FLASH.git`
 - 分支：`sp1/completion-2026-07-25`
 - 基準：`main@538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`
+- 最新來源提交：`689a186e5cd3e93e72e98c25e2840deb49e0a637`
 - 版本：SP1 0.1.2 工程驗證階段
 
 ## 目前來源驗證
 
-- 自動測試：110 項通過
-- 原始碼編譯：通過
-- 完整來源自我檢查：8 項通過
+- `5db5b5f` 本機完整基準：171 項測試、原始碼編譯、8 項來源自我檢查通過
+- `689a186` 相容性修正：24 項受影響測試及 1 項防回歸測試通過
+- GitHub Actions run #118：完整測試、來源自檢、EXE 建置、封裝 EXE 自檢、
+  bundle 與雜湊驗證全部通過
+- `git diff --check`：通過
+- Win32 適配器與交易式更新器獨立重點覆核：沒有剩餘阻擋項目
 - 驗證日期：2026-07-25（台灣時間）
 
-以上只證明目前來源基準可測試；尚未建立本分支的 Windows 成品，也未完成
-乾淨帳號、真正遊戲視窗、背景／最小化、斷線重連、安全輸入、更新及正式發布
-驗收。
+最新 `689a186` Windows 工程快照已通過雲端完整工作與本機 Windows
+PowerShell 5.1 包內驗證器，永久檔名為
+`FLASH-SP1-Windows-0.1.2-689a186-snapshot.zip`，ZIP SHA-256 與 GitHub
+artifact digest 均為
+`30aca05eb2e8c84f10c58a86cc34af89cda8559b31989b8b6cb266e007b231fa`。
+此快照沒有發布 `release/latest`。上述工程證據不代表
+乾淨 Windows 11 帳號、真正遊戲視窗、背景／最小化、斷線重連、安全輸入、
+目標電腦更新或正式發布驗收已通過。
 
 ## 後續成品紀錄
 
-建立 Windows 工程快照後，必須在本目錄留下可追溯的交付紀錄，至少包含：
+每個 Windows 工程快照必須留下可追溯的交付紀錄，至少包含：
 
 - 來源 branch 與完整 commit
 - 產品版本與 SP1 里程碑

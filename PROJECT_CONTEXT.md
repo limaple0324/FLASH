@@ -8,16 +8,25 @@
 - 工作區：`C:\Users\USER\Documents\輔\SP1`
 - 目前分支：`sp1/completion-2026-07-25`
 - 基準：`origin/main@538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`
+- 最新提交：`689a186e5cd3e93e72e98c25e2840deb49e0a637`
 - 既有整合分支只保留 SP2／SP3 累積成果；目前不新增上層功能。
 
 ## 目前來源證據
 
-- 110 項測試通過。
-- 原始碼編譯通過。
-- 8 項完整來源自我檢查通過。
-- 自我檢查根目錄：
-  `C:\Users\USER\Documents\輔\self-check-sp1-main-d415852405be43e480ba42bb80b838e0`
-- 目前工作樹建立後尚未產生新的 Windows artifact。
+- `5db5b5f` 本機完整基準：171 項測試、原始碼編譯、8 項完整來源自我檢查
+  及 `git diff --check` 通過。
+- `689a186` 雜湊相容性修正：受影響的 24 項更新器／發行驗證測試及 1 項
+  防回歸測試通過。
+- GitHub Actions run #118：原始碼編譯、完整測試、來源自我檢查、Windows
+  EXE 建置、封裝 EXE 自我檢查、bundle 版型與雜湊驗證全部通過。
+- Win32 適配器強化與交易式更新器均已完成獨立重點覆核，沒有剩餘阻擋項目。
+- 最新 `689a186` Windows 工程快照已永久保存；ZIP SHA-256 與 GitHub
+  artifact digest 均為
+  `30aca05eb2e8c84f10c58a86cc34af89cda8559b31989b8b6cb266e007b231fa`。
+- 本機 Windows PowerShell 5.1 包內驗證器通過；正式 `release/latest`
+  發布步驟正確略過。
+- 尚未完成乾淨 Windows 11、真正遊戲輸入、斷線重連及視窗標題／身分驗收，
+  因此 SP1 尚未正式完成。
 
 ## 固定範圍
 
@@ -29,7 +38,6 @@
 
 ## 下一個小型區塊
 
-先建立 SP1 獨立交付與文件基準；接著修正 Windows 工作流程，使分支／手動
-建置只能產生不發布的 SP1 artifact，只有核准的 `main` push 才能更新
-`release/latest`；同時固定 SP1 獨立更新來源，使它不會自動前進到
-SP2／SP3。之後建立本分支工程快照並進行 Windows 11 驗證。
+使用已驗證的 `689a186` 工程快照進行 Windows 11 乾淨帳號、視窗呈現、
+持久化與目標電腦安裝／更新驗收；真正遊戲輸入、斷線重連及 Flash 視窗身分
+只依已確認規格執行，不自行猜測。SP1 必要門檻未全部通過前，不開始 SP2。
