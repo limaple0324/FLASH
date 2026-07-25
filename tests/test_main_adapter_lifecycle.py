@@ -85,6 +85,98 @@ def test_run_shuts_down_adapter_after_self_check_exit(monkeypatch, tmp_path):
     assert adapter.shutdown_calls == 1
 
 
+def test_target_desktop_verification_writes_safe_report_and_shuts_down(
+    monkeypatch, tmp_path
+):
+    adapter = RecordingAdapter()
+    prepare_run(monkeypatch, tmp_path, adapter)
+    payload = {
+        "passed": True,
+        "discovered_windows": 14,
+        "unique_fingerprints": 14,
+        "input_sent": False,
+    }
+    verification = SimpleNamespace(passed=True, to_dict=lambda: payload)
+    monkeypatch.setattr(
+        main_module.TargetDesktopVerifier,
+        "for_real_windows",
+        lambda: SimpleNamespace(verify=lambda: verification),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "create_main_window",
+        lambda *_args: pytest.fail("Headless verification must not create a window."),
+    )
+
+    exit_code = main_module.run(
+        target_desktop_verify_only=True,
+        root=tmp_path,
+    )
+
+    assert exit_code == 0
+    assert adapter.shutdown_calls == 1
+    report_path = tmp_path / "data" / main_module.TARGET_DESKTOP_REPORT_FILENAME
+    assert report_path.exists()
+    assert '"input_sent": false' in report_path.read_text(encoding="utf-8")
+
+
+def test_target_desktop_verification_uses_distinct_failure_exit_code(
+    monkeypatch, tmp_path
+):
+    adapter = RecordingAdapter()
+    prepare_run(monkeypatch, tmp_path, adapter)
+    verification = SimpleNamespace(
+        passed=False,
+        to_dict=lambda: {
+            "passed": False,
+            "failure_codes": ["window_count_mismatch"],
+            "input_sent": False,
+        },
+    )
+    monkeypatch.setattr(
+        main_module.TargetDesktopVerifier,
+        "for_real_windows",
+        lambda: SimpleNamespace(verify=lambda: verification),
+    )
+
+    assert (
+        main_module.run(
+            target_desktop_verify_only=True,
+            root=tmp_path,
+        )
+        == 3
+    )
+    assert adapter.shutdown_calls == 1
+
+
+def test_target_desktop_verification_sanitizes_unexpected_failure(
+    monkeypatch, tmp_path
+):
+    adapter = RecordingAdapter()
+    prepare_run(monkeypatch, tmp_path, adapter)
+    monkeypatch.setattr(
+        main_module.TargetDesktopVerifier,
+        "for_real_windows",
+        lambda: SimpleNamespace(
+            verify=lambda: (_ for _ in ()).throw(
+                RuntimeError("raw launcher arguments must not escape")
+            )
+        ),
+    )
+
+    exit_code = main_module.run(
+        target_desktop_verify_only=True,
+        root=tmp_path,
+    )
+
+    report_path = tmp_path / "data" / main_module.TARGET_DESKTOP_REPORT_FILENAME
+    report = report_path.read_text(encoding="utf-8")
+    assert exit_code == 4
+    assert "verifier_execution_failed" in report
+    assert "raw launcher arguments" not in report
+    assert adapter.shutdown_calls == 1
+
+
 def test_run_shuts_down_adapter_after_normal_window_close(monkeypatch, tmp_path):
     adapter = RecordingAdapter()
     prepare_run(monkeypatch, tmp_path, adapter)

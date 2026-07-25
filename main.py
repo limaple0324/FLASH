@@ -12,6 +12,7 @@ from tkinter import PhotoImage, TclError, Tk, messagebox
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
+from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
 from adapters.windows_window import WindowsWindowAdapter
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
@@ -26,9 +27,11 @@ from ui.home import HomeView
 
 APP_TITLE = "輔"
 SELF_CHECK_ARGUMENT = "--self-check"
+TARGET_DESKTOP_VERIFY_ARGUMENT = "--verify-target-desktop"
 TARGET_WINDOW_KEY = "target_window_keywords"
 TARGET_WINDOW_FINGERPRINT_KEY = "target_window_fingerprint"
 REGISTRY_FILENAME = "window_registry.json"
+TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 WINDOWS_APP_USER_MODEL_ID = "limaple0324.FLASH"
@@ -303,12 +306,50 @@ def write_self_check_report(status: dict[str, object], paths: PathManager) -> Pa
     return report_path
 
 
-def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
+def write_target_desktop_report(
+    payload: dict[str, object], paths: PathManager
+) -> Path:
+    report_path = paths.data_dir() / TARGET_DESKTOP_REPORT_FILENAME
+    report_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return report_path
+
+
+def run(
+    *,
+    self_check_only: bool = False,
+    target_desktop_verify_only: bool = False,
+    root: Path | None = None,
+) -> int:
     paths: PathManager | None = None
     logger: LoggerService | None = None
     try:
         apply_windows_app_identity()
         paths, logger = build_services(root=root)
+        if target_desktop_verify_only:
+            try:
+                verification = TargetDesktopVerifier.for_real_windows().verify()
+                payload = verification.to_dict()
+                exit_code = 0 if verification.passed else 3
+            except Exception:
+                payload = {
+                    "passed": False,
+                    "failure_codes": ["verifier_execution_failed"],
+                    "raw_arguments_emitted": False,
+                    "captured_pixels_persisted": False,
+                    "input_sent": False,
+                }
+                exit_code = 4
+            report_path = write_target_desktop_report(payload, paths)
+            logger.info(
+                "Read-only target-desktop verification "
+                f"{'passed' if payload['passed'] else 'failed'}; "
+                f"report={report_path}"
+            )
+            return exit_code
+
         status = Bootstrap(context=AppContext).start()
         status["window_registry"] = registry_status()
         status["target_window"] = detect_target_window()
@@ -333,7 +374,7 @@ def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
             except OSError:
                 pass
 
-        if self_check_only:
+        if self_check_only or target_desktop_verify_only:
             return 1
         try:
             root_window = Tk()
@@ -354,7 +395,17 @@ def run(*, self_check_only: bool = False, root: Path | None = None) -> int:
 
 
 def main() -> None:
-    raise SystemExit(run(self_check_only=SELF_CHECK_ARGUMENT in sys.argv[1:]))
+    arguments = set(sys.argv[1:])
+    target_desktop_verify_only = TARGET_DESKTOP_VERIFY_ARGUMENT in arguments
+    raise SystemExit(
+        run(
+            self_check_only=(
+                SELF_CHECK_ARGUMENT in arguments
+                and not target_desktop_verify_only
+            ),
+            target_desktop_verify_only=target_desktop_verify_only,
+        )
+    )
 
 
 if __name__ == "__main__":
