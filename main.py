@@ -1018,6 +1018,11 @@ def create_main_window(
         return card_display_settings_service.snapshot().settings.lifetime_seconds
 
     def show_start_status() -> None:
+        try:
+            publish_target_window_observation(detect_target_window())
+        except Exception as error:
+            show_target_window_status_error(error)
+            return
         target_window_state = AppContext.get(TargetWindowStateService)
         target_window_message = (
             target_window_player_message(target_window_state.snapshot())
