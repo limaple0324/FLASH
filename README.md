@@ -45,6 +45,7 @@ SP1 目前已包含：
 - 完整首次安裝、單一捷徑及交易式 SP1 專用更新
 - Windows 11 包裝視窗的完整唯讀自我檢查與安全狀態顯示
 - 同名 Flash 視窗的不可逆匿名啟動指紋與失敗關閉式一對一篩選
+- 來源腳本與封裝 EXE 的 14 視窗唯讀整合驗證及安全彙總 JSON 報告
 
 > 注意：目前是工程驗證版本。Flash 同名視窗身分已接入，但角色對應、真正
 > 遊戲輸入、Recovery 與 Smart Reconnect 仍需依已確認規格完成實機驗收。
@@ -56,6 +57,16 @@ python main.py
 ```
 
 啟動後會顯示 SP1 自我檢查結果與紀錄檔位置。
+
+目標桌面唯讀整合驗證：
+
+```powershell
+python scripts/verify_target_desktop_sp1.py --expected-count 14
+```
+
+封裝 EXE 可使用 `FLASH.exe --verify-target-desktop`，結果寫入應用程式資料
+目錄的 `data\target_desktop_verification.json`。這個模式不送出輸入、不保存
+畫面，也不輸出視窗、程序、匿名指紋或啟動參數。
 
 ## Test
 

@@ -5,11 +5,12 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 Scope note (2026-07-25): new work is restricted to SP1 on
 `sp1/completion-2026-07-25`, based on `main@538bdbc`. The latest verified source
 feature commit is
-`2fae8bfba8b13a3fe05ba67f6af05d37cfc4a9ee`. It passed 200 local tests,
-Python compilation, 8/8 source self-checks, and a read-only one-to-one probe
-of 14 real Flash windows. The earlier `5db5b5f` local baseline passed 171 tests
-and
-`git diff --check`; the subsequent hash-compatibility fix passed the 24 affected
+`f47e132d1d3677af9fa2952ee6dcd99e0d073918`. It passed 209 local tests,
+Python compilation, 8/8 source self-checks, and a repeatable read-only probe
+with 14/14 individual identity selections and 14/14 non-blank captures. The
+earlier `5db5b5f` local baseline passed 171 tests, Python compilation, 8/8
+source self-checks, and `git diff --check`; the subsequent hash-compatibility
+fix passed the 24 affected
 updater/release-verifier tests and one focused regression test.
 
 GitHub Actions run #118 passed compilation, the complete test suite, source and
@@ -191,7 +192,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   self-checks, and 14-window one-to-one anonymous identity acceptance.
 - [x] GitHub Actions run #128 for `49ee668` passes all 200 tests, packages and
   publishes only to `release/sp1`, and passes installed identity/GUI acceptance.
-- [ ] Add target-desktop integration tests for capture, overlap, and reconnect behavior.
+- [x] Add repeatable target-desktop identity and capture integration verification.
+- [ ] Add reconnect integration only after its screen and retry semantics are confirmed.
 
 ## F. Build and delivery
 
@@ -216,6 +218,7 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   including its target-desktop updater and minimized normal-bounds fix.
 - [x] Verify and permanently save the `49ee668` anonymous-window-identity
   release, including one-to-one packaged selection and target-desktop update.
+- [ ] Build and verify the `f47e132` packaged target-desktop verification mode.
 - [ ] Confirm a successful GitHub Actions run for current `main`.
 - [x] Download and launch the current artifact on Windows 11 build 26200 with an
   isolated data profile.

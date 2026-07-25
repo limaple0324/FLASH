@@ -8,7 +8,7 @@
 - GitHub：`https://github.com/limaple0324/FLASH.git`
 - 分支：`sp1/completion-2026-07-25`
 - 基準：`main@538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`
-- 最新功能提交：`2fae8bfba8b13a3fe05ba67f6af05d37cfc4a9ee`
+- 最新功能提交：`f47e132d1d3677af9fa2952ee6dcd99e0d073918`
 - 版本：SP1 0.1.2 工程驗證階段
 
 ## 目前來源驗證
@@ -81,6 +81,10 @@ Windows 11 真實桌面安裝保留原有 `輔` 專案 junction，只建立
 與 ZIP SHA-256 均為
 `40838dfff48e858079a479242aa670743e8f08b5ec0c5f3e7d73a5f01bd3852d`。
 包裝指紋唯一選擇、正式交易式更新、圖形啟動與正常關閉均已通過。
+
+最新本機來源 `f47e132` 新增可重複的目標桌面唯讀驗證器與封裝 EXE 專用
+參數；209 項完整測試、編譯、8/8 來源自檢、真實 14/14 身分選擇及 14/14
+非空白擷取通過，選錯 0 次。此提交尚未建立新的 Windows 成品。
 
 ## 後續成品紀錄
 

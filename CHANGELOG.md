@@ -2,6 +2,19 @@
 
 ## SP1 0.1.2 — 2026-07-25
 
+### Latest locally verified repeatable target-desktop verifier
+
+- Source: `f47e132d1d3677af9fa2952ee6dcd99e0d073918`
+- Local tests: 209 passed
+- Source self-checks: 8/8 passed
+- Added `scripts/verify_target_desktop_sp1.py` and packaged
+  `FLASH.exe --verify-target-desktop` mode.
+- The real desktop passed 14/14 individual identity selections and 14/14
+  non-blank captures with zero wrong-window selections.
+- Reports contain aggregate counts only and persist no pixels, process IDs,
+  window handles, fingerprints, launcher arguments, or input.
+- Windows packaging and `release/sp1` verification for this source are pending.
+
 ### Latest verified anonymous-window-identity release
 
 - Source: `2fae8bfba8b13a3fe05ba67f6af05d37cfc4a9ee`
