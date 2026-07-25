@@ -13,6 +13,48 @@ from typing import Iterable, Protocol
 from core.sp1_boundaries import ExternalAdapter, OperationResult
 
 
+def _configure_user32_window_api(user32):
+    """Apply pointer-safe ctypes signatures to the user32 calls used here."""
+    import ctypes
+    from ctypes import wintypes
+
+    enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = (wintypes.HWND,)
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = (
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.EnumWindows.argtypes = (enum_proc_type, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetForegroundWindow.argtypes = ()
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.WindowFromPoint.argtypes = (wintypes.POINT,)
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+    user32.GetAncestor.restype = wintypes.HWND
+
+    return enum_proc_type
+
+
+def _handle_value(handle) -> int:
+    """Normalize an HWND returned by ctypes or a test double without narrowing it."""
+    value = getattr(handle, "value", handle)
+    return int(value) if value else 0
+
+
 @dataclass(frozen=True, slots=True)
 class WindowInfo:
     handle: int
@@ -20,6 +62,8 @@ class WindowInfo:
     visible: bool
     minimized: bool
     rect: tuple[int, int, int, int]
+    process_id: int | None = None
+    window_class: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +112,7 @@ class Win32WindowBackend:
         from ctypes import wintypes
 
         windows: list[WindowInfo] = []
-        enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        enum_proc_type = _configure_user32_window_api(user32)
 
         def callback(hwnd, _lparam):
             if not user32.IsWindowVisible(hwnd):
@@ -88,25 +132,54 @@ class Win32WindowBackend:
             if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 return True
 
+            process_id = None
+            try:
+                process_id_value = wintypes.DWORD()
+                thread_id = user32.GetWindowThreadProcessId(
+                    hwnd,
+                    ctypes.byref(process_id_value),
+                )
+                if thread_id and process_id_value.value:
+                    process_id = int(process_id_value.value)
+            except OSError:
+                pass
+
+            window_class = None
+            try:
+                class_buffer = ctypes.create_unicode_buffer(256)
+                class_length = user32.GetClassNameW(
+                    hwnd,
+                    class_buffer,
+                    len(class_buffer),
+                )
+                if class_length > 0:
+                    window_class = class_buffer.value.strip() or None
+            except OSError:
+                pass
+
             windows.append(
                 WindowInfo(
-                    handle=int(hwnd),
+                    handle=_handle_value(hwnd),
                     title=title,
                     visible=True,
                     minimized=bool(user32.IsIconic(hwnd)),
                     rect=(rect.left, rect.top, rect.right, rect.bottom),
+                    process_id=process_id,
+                    window_class=window_class,
                 )
             )
             return True
 
-        user32.EnumWindows(enum_proc_type(callback), 0)
+        if not user32.EnumWindows(enum_proc_type(callback), 0):
+            return []
         return windows
 
     def foreground_handle(self) -> int | None:
         user32 = self._user32()
         if user32 is None:
             return None
-        handle = int(user32.GetForegroundWindow())
+        _configure_user32_window_api(user32)
+        handle = _handle_value(user32.GetForegroundWindow())
         return handle or None
 
     def top_window_at(self, x: int, y: int) -> int | None:
@@ -114,17 +187,17 @@ class Win32WindowBackend:
         if user32 is None:
             return None
 
-        import ctypes
         from ctypes import wintypes
 
+        _configure_user32_window_api(user32)
         point = wintypes.POINT(x, y)
-        handle = int(user32.WindowFromPoint(point))
+        handle = _handle_value(user32.WindowFromPoint(point))
         if not handle:
             return None
 
         ga_root = 2
-        root = int(user32.GetAncestor(ctypes.c_void_p(handle), ga_root))
-        return root or handle
+        root = _handle_value(user32.GetAncestor(wintypes.HWND(handle), ga_root))
+        return root or None
 
 
 class WindowsWindowAdapter(ExternalAdapter):

@@ -8,9 +8,64 @@ real target-desktop test because some legacy renderers return blank frames.
 
 from __future__ import annotations
 
+import ctypes
 import os
 from dataclasses import dataclass
+from ctypes import wintypes
 from typing import Protocol
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class _BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
+
+def _configure_win32_capture_api(user32, gdi32) -> None:
+    """Apply pointer-safe ctypes signatures to every Win32 capture call."""
+    user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetWindowDC.argtypes = (wintypes.HWND,)
+    user32.GetWindowDC.restype = wintypes.HDC
+    user32.PrintWindow.argtypes = (wintypes.HWND, wintypes.HDC, wintypes.UINT)
+    user32.PrintWindow.restype = wintypes.BOOL
+    user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
+    user32.ReleaseDC.restype = ctypes.c_int
+
+    gdi32.CreateCompatibleDC.argtypes = (wintypes.HDC,)
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleBitmap.argtypes = (wintypes.HDC, ctypes.c_int, ctypes.c_int)
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.SelectObject.argtypes = (wintypes.HDC, wintypes.HGDIOBJ)
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    gdi32.GetDIBits.argtypes = (
+        wintypes.HDC,
+        wintypes.HBITMAP,
+        wintypes.UINT,
+        wintypes.UINT,
+        wintypes.LPVOID,
+        ctypes.POINTER(_BITMAPINFO),
+        wintypes.UINT,
+    )
+    gdi32.GetDIBits.restype = ctypes.c_int
+    gdi32.DeleteObject.argtypes = (wintypes.HGDIOBJ,)
+    gdi32.DeleteObject.restype = wintypes.BOOL
+    gdi32.DeleteDC.argtypes = (wintypes.HDC,)
+    gdi32.DeleteDC.restype = wintypes.BOOL
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,18 +84,20 @@ class WindowCaptureProvider(Protocol):
 class Win32PrintWindowProvider:
     """ctypes implementation of an off-screen PrintWindow capture."""
 
+    @staticmethod
+    def _libraries():
+        return ctypes.windll.user32, ctypes.windll.gdi32
+
     def capture(self, window_handle: int) -> CaptureSample | None:
         if os.name != "nt" or not window_handle:
             return None
 
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.windll.user32
-        gdi32 = ctypes.windll.gdi32
+        user32, gdi32 = self._libraries()
+        _configure_win32_capture_api(user32, gdi32)
+        hwnd = wintypes.HWND(window_handle)
 
         rect = wintypes.RECT()
-        if not user32.GetWindowRect(wintypes.HWND(window_handle), ctypes.byref(rect)):
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return None
 
         width = int(rect.right - rect.left)
@@ -48,41 +105,32 @@ class Win32PrintWindowProvider:
         if width <= 0 or height <= 0:
             return None
 
-        window_dc = user32.GetWindowDC(wintypes.HWND(window_handle))
+        window_dc = user32.GetWindowDC(hwnd)
         if not window_dc:
             return None
 
         memory_dc = gdi32.CreateCompatibleDC(window_dc)
         bitmap = gdi32.CreateCompatibleBitmap(window_dc, width, height)
         old_object = None
+        bitmap_selected = False
         try:
             if not memory_dc or not bitmap:
                 return None
 
             old_object = gdi32.SelectObject(memory_dc, bitmap)
+            if not old_object:
+                return None
+            bitmap_selected = True
+
             # PW_RENDERFULLCONTENT improves capture for some modern and legacy windows.
-            api_succeeded = bool(user32.PrintWindow(wintypes.HWND(window_handle), memory_dc, 0x00000002))
+            api_succeeded = bool(user32.PrintWindow(hwnd, memory_dc, 0x00000002))
+            restored_object = gdi32.SelectObject(memory_dc, old_object)
+            if not restored_object:
+                return None
+            bitmap_selected = False
 
-            class BITMAPINFOHEADER(ctypes.Structure):
-                _fields_ = [
-                    ("biSize", wintypes.DWORD),
-                    ("biWidth", wintypes.LONG),
-                    ("biHeight", wintypes.LONG),
-                    ("biPlanes", wintypes.WORD),
-                    ("biBitCount", wintypes.WORD),
-                    ("biCompression", wintypes.DWORD),
-                    ("biSizeImage", wintypes.DWORD),
-                    ("biXPelsPerMeter", wintypes.LONG),
-                    ("biYPelsPerMeter", wintypes.LONG),
-                    ("biClrUsed", wintypes.DWORD),
-                    ("biClrImportant", wintypes.DWORD),
-                ]
-
-            class BITMAPINFO(ctypes.Structure):
-                _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
-
-            info = BITMAPINFO()
-            info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            info = _BITMAPINFO()
+            info.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
             info.bmiHeader.biWidth = width
             info.bmiHeader.biHeight = -height  # top-down buffer
             info.bmiHeader.biPlanes = 1
@@ -110,13 +158,23 @@ class Win32PrintWindowProvider:
                 api_succeeded=api_succeeded,
             )
         finally:
-            if old_object and memory_dc:
-                gdi32.SelectObject(memory_dc, old_object)
-            if bitmap:
-                gdi32.DeleteObject(bitmap)
-            if memory_dc:
-                gdi32.DeleteDC(memory_dc)
-            user32.ReleaseDC(wintypes.HWND(window_handle), window_dc)
+            if bitmap_selected and old_object and memory_dc:
+                if gdi32.SelectObject(memory_dc, old_object):
+                    bitmap_selected = False
+            if bitmap_selected:
+                # A selected bitmap cannot be deleted. Releasing its memory DC
+                # first makes the bitmap deletable even when restoration failed.
+                if memory_dc:
+                    gdi32.DeleteDC(memory_dc)
+                    memory_dc = None
+                if bitmap:
+                    gdi32.DeleteObject(bitmap)
+            else:
+                if bitmap:
+                    gdi32.DeleteObject(bitmap)
+                if memory_dc:
+                    gdi32.DeleteDC(memory_dc)
+            user32.ReleaseDC(hwnd, window_dc)
 
 
 class WindowsBackgroundCaptureBackend:
