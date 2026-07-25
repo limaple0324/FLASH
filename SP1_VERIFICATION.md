@@ -149,6 +149,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] Reject invalid, missing, or duplicate identities without selecting a
   substitute window or exposing raw launcher data.
 - [x] Verify the fingerprint-enabled packaged application on Windows 11.
+- [x] Run a three-cycle installed read-only stability baseline with 14/14
+  identity selection, 14/14 capture, and zero wrong-window selections.
 - [x] Verify background capture while the game is partially covered.
 - [x] Verify background capture while the game is not foreground.
 - [x] Verify background capture while the game is minimized.
