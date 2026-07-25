@@ -21,11 +21,20 @@ FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式
 
 整合分支已包含產品與領域資料骨架、工作區與組別級提醒卡、提醒卡生命週期、
 歷史紀錄、玩家顯示時間設定、浮層骨架、組別角色清單、角色詳細資料，以及
-靈魂石正常編輯與安全保存流程。最新乾淨快照已通過 484 項自動測試；
-本機 SP1＋SP2＋SP3 Windows 整合工程快照已完成封裝自我檢查與 Windows 11
-基本 GUI 啟動煙霧測試，但 GitHub Actions artifact、真正遊戲與完整實機驗收
-尚未完成。實際進度以 [`docs/INTEGRATION_BOARD.md`](docs/INTEGRATION_BOARD.md)
-為準。
+靈魂石正常編輯與安全保存流程。`893f65e` 已通過 485 項自動測試；GitHub
+Actions run `30134982561` 已成功建立、下載並獨立重驗
+`輔-整合工程驗證版-SP1-SP2-SP3-0.1.2-893f65e-windows-x64`。包內驗證器、
+隔離 `--self-check` 與 Windows 11 標題「輔」主視窗啟閉均通過，且沒有殘留程序。
+這仍只是基本成品冒煙，不代表完整玩家、真正遊戲、DPI／多螢幕、乾淨帳號、
+背景能力、更新流程或正式發布驗收。實際進度以
+[`docs/INTEGRATION_BOARD.md`](docs/INTEGRATION_BOARD.md) 為準。
+
+快照 ZIP SHA-256：
+`E9E0E39E6E7ACC158B8D3A770180C31DE485554143A8CE2548B3A97CEF5BDA69`；
+`FLASH.exe` SHA-256：
+`36fa8642f552594b21b5e30b2622e7cf385acae090f56436e2f1c9420e9b7e0f`。
+整合快照不含更新器，工作流程的發布步驟已跳過，`release/latest` 仍是
+`341ce3cdfd715531ae64c4b75f08fc3af4e8ad15`。
 
 SP1 目前已包含：
 

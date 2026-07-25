@@ -9,10 +9,11 @@
 
 交接基準：`c65b740e9e134057eb04142648ee2635862cb03c`
 
-2026-07-25 Windows 快照來源 `a2bf410`：484 項測試、全原始碼編譯、
-完整來源與封裝自我檢查、`Asia/Taipei` 時區載入及基本 GUI 啟動通過。
+2026-07-25 最新遠端 Windows 快照來源 `893f65e`：485 項測試通過；
+GitHub Actions run `30134982561` 成功建置，artifact 已下載、獨立解壓並通過
+包內驗證器、隔離 `--self-check` 及 Windows 11 基本 GUI 啟閉煙霧測試。
 
-分支風險：在快照來源 `a2bf410`，整合分支相對 `main` 多 84 筆、
+分支風險：在快照來源 `893f65e`，整合分支相對 `main` 多 86 筆、
 少 31 筆提交，模擬合併有六個檔案衝突；正式整合前不得硬合併、強推或整檔覆蓋。
 
 狀態圖例：
@@ -83,7 +84,7 @@
 
 - 🟨 目前已實作範圍的單元測試通過；不代表整體 Sprint 全部完成
 - 🟨 目前已實作範圍的整合測試、原始碼編譯與來源自我檢查通過
-- 🟨 Windows 11 封裝與基本 GUI 煙霧測試通過；完整玩家／遊戲情境尚未驗收
+- 🟨 遠端 Windows 整合 artifact、封裝與基本 GUI 煙霧測試通過；完整玩家／遊戲情境尚未驗收
 - ⬜ 更新桌面成品與單一「更新輔」流程
 - ⬜ 建立整合完成報告
 
@@ -120,14 +121,24 @@
 
 ## 目前驗證與未完成界線
 
-- 目前來源快照：在乾淨虛擬環境中，484 項測試、全原始碼編譯、完整來源
+- 目前來源快照 `893f65e`：485 項測試、全原始碼編譯、完整來源
   自我檢查與 `Asia/Taipei` 時區載入全部通過。
-- 本機 Windows 快照：`a2bf410` 的獨立 ZIP、封裝後自我檢查、`tzdata`、
-  SHA-256、解壓重驗及 Windows 11「輔」主視窗啟動／正常關閉通過。
-- 以上不等於 GitHub Actions artifact、完整 Windows 11 玩家情境或桌面更新驗證。
+- 遠端 Windows 快照：GitHub Actions run `30134982561` 成功；artifact
+  `輔-整合工程驗證版-SP1-SP2-SP3-0.1.2-893f65e-windows-x64` 已下載並
+  獨立解壓，包內驗證器、隔離 `--self-check`、Windows 11「輔」主視窗啟閉
+  與無殘留程序檢查通過。
+- artifact ZIP SHA-256：
+  `E9E0E39E6E7ACC158B8D3A770180C31DE485554143A8CE2548B3A97CEF5BDA69`；
+  `FLASH.exe` SHA-256：
+  `36fa8642f552594b21b5e30b2622e7cf385acae090f56436e2f1c9420e9b7e0f`。
+- 整合 artifact 不含更新器，publish 已跳過；`release/latest` 仍是
+  `341ce3cdfd715531ae64c4b75f08fc3af4e8ad15`。
+- 以上仍不等於完整 Windows 11 玩家／真正遊戲、DPI／多螢幕、乾淨帳號、
+  背景能力、桌面更新流程或正式發布驗證。
+- `a2bf410` 本機快照只保留為歷史證據，不再稱為最新。
 - 真正遊戲事件、斷線重連、遊戲輸入與跨組同步衝突防止仍未完成。
 - SP1、SP2、SP3 各自狀態／驗收主文件與整體彙整入口已建立。
 - `tzdata` 已列入 Windows 執行相依並完成來源與封裝驗證。
 - 只有 `main` push 能發布 `release/latest`；整合快照身分與正式發布已分離。
-- 最新小型接續點：由 GitHub Actions 建置、下載並重驗整合 artifact，保持
-  `release/latest` 不變；之後接入 `WorkspaceService` 正常主流程。
+- 最新小型接續點：遠端整合 artifact 已完成建置、下載與重驗；接入
+  `WorkspaceService` 正常主流程。

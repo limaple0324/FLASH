@@ -15,11 +15,11 @@
 - `main`：`538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`，仍是 SP1 0.1.2 工程驗證版。
 - `integration/sp2-sp3-sp35` 本次功能核對基準：
   `85f6e30057ed994ff8980b0d7d27ff7550b7e0b9`。
-- `integration/sp2-sp3-sp35` 本次 Windows 快照來源基準：
-  `a2bf410298358d6962b76592a08a458e94b88d03`。
+- `integration/sp2-sp3-sp35` 最新遠端 Windows 整合快照來源：
+  `893f65ec03cb0df8dde627c5d79d8e90e243fc2b`。
 - `release/latest`：`341ce3cdfd715531ae64c4b75f08fc3af4e8ad15`。
 - 開放中的合併請求：無。
-- 在快照來源 `a2bf410`，整合分支相對 `main`：多 84 筆、少 31 筆提交。
+- 在快照來源 `893f65e`，整合分支相對 `main`：多 86 筆、少 31 筆提交。
 - 模擬合併會衝突：`PROJECT_CONTEXT.md`、`README.md`、`main.py`、
   `tests/test_home_view_text.py`、`tests/test_main_window_layout.py`、`ui/home.py`。
 - 不可硬合併、強推或以任一方整檔覆蓋衝突。
@@ -56,41 +56,46 @@
 - `WorkspaceService` 已有模型與測試，但尚未成為正常主程式工作區資訊來源。
 - 正常 `main()` 尚未提供正式預設提醒卡方案，真正遊戲事件也尚未產生提醒卡。
 - 真正斷線偵測、重新登入、背景／最小化能力與遊戲輸入尚未完成實機驗證。
-- 本機整合快照已建立並通過 Windows 11 啟動煙霧測試，但尚未完成乾淨使用者帳號、
+- 遠端整合快照已建立、下載並通過 Windows 11 基本啟閉煙霧測試，但尚未完成乾淨使用者帳號、
   真正遊戲、多視窗、背景／最小化、長時間效能與桌面「更新輔」完整驗收。
-- 尚未由 GitHub Actions 產生並下載核對本次整合快照 artifact；`release/latest`
-  仍維持舊 `main` 工程驗證版，沒有被本機快照覆蓋。
+- GitHub Actions run `30134982561` 已成功產生本次整合快照 artifact；發布步驟
+  明確跳過，`release/latest` 仍維持舊 `main` 工程驗證版。
 
 ## 目前驗證快照
 
-在 Windows 11 Enterprise 10.0.26200 的乾淨虛擬環境，針對
-`integration/sp2-sp3-sp35@a2bf410` 重新執行：
+針對 `integration/sp2-sp3-sp35@893f65e`：
 
-- 484 項測試全部通過。
+- 485 項測試全部通過。
 - 全部 Python 原始碼編譯通過。
 - 完整來源程式自我檢查通過。
 - `ZoneInfo("Asia/Taipei")` 可正常載入。
 - 設定、紀錄、自我檢查報告與視窗註冊檔均成功建立。
-- PyInstaller 6.21.0 已建立 `FLASH.exe`，並明確套用 `zoneinfo` 與 `tzdata` hook。
-- 封裝後 `FLASH.exe --self-check`、解壓後重驗、SHA-256 與建置身分全部通過。
-- Windows 11 GUI 已實際開啟標題為「輔」的主視窗，並可正常關閉。
+- GitHub Actions run `30134982561` 成功建立
+  `輔-整合工程驗證版-SP1-SP2-SP3-0.1.2-893f65e-windows-x64`。
+- artifact 已下載到本機、獨立解壓，包內驗證器與隔離資料環境的
+  `FLASH.exe --self-check` 均通過。
+- Windows 11 GUI 已實際開啟標題為「輔」的主視窗並正常關閉，沒有殘留程序。
+- 整合快照不含更新器；工作流程的正式發布步驟跳過。
 
-本機獨立快照：
-`C:\Users\USER\Documents\輔\成品\輔-整合工程驗證版-SP1-SP2-SP3-0.1.2-a2bf410-windows-x64.zip`
+最新遠端整合快照下載檔：
+`C:\Users\USER\Documents\輔\成品\輔-整合工程驗證版-SP1-SP2-SP3-0.1.2-893f65e-windows-x64.zip`
 
 - `FLASH.exe` SHA-256：
-  `56580bfe6fe3b124ef924faa795cdab9f7fe16979004d325475d1a242c1e3c3a`
+  `36fa8642f552594b21b5e30b2622e7cf385acae090f56436e2f1c9420e9b7e0f`
 - ZIP SHA-256：
-  `216cf43415ab730b8915bfb3941368d2ee314fa09818b030af4c991ba765cbec`
+  `E9E0E39E6E7ACC158B8D3A770180C31DE485554143A8CE2548B3A97CEF5BDA69`
 
-以上證明本機 Windows 11 建置、封裝自我檢查與基本 GUI 啟動通過；不等於
-GitHub Actions artifact、完整玩家情境、真正遊戲或正式發布驗收。
+先前 `a2bf410` 本機快照保留為歷史證據，不再是最新快照。
+
+以上只證明遠端建置、成品完整性、隔離自我檢查與 Windows 11 基本 GUI 啟閉通過；
+不等於乾淨帳號、完整玩家流程、真正遊戲、DPI／多螢幕、背景能力、更新流程或
+正式發布驗收。
 
 ## 下一個小型接續區塊
 
-由 GitHub Actions 手動建置 `integration/sp2-sp3-sp35`，下載並重驗遠端
-artifact；保持 `release/latest` 不變。通過後接續 `WorkspaceService` 正常主流程
-接線，仍以一個可獨立驗證的小區塊為單位。
+遠端整合 artifact 已完成建置、下載與重驗，且 `release/latest` 保持不變。
+下一個小型區塊是接續 `WorkspaceService` 正常主流程接線，仍以一個可獨立驗證
+的小區塊為單位。
 
 ## 固定接續提醒
 
