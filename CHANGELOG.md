@@ -2,17 +2,23 @@
 
 ## SP1 0.1.2 — 2026-07-25
 
-### Latest locally verified anonymous-window-identity source
+### Latest verified anonymous-window-identity release
 
 - Source: `2fae8bfba8b13a3fe05ba67f6af05d37cfc4a9ee`
-- Local tests: 200 passed
-- Source self-checks: 8/8 passed
+- Release source: `49ee6681627fe3b94f94c19fabc1dc193e4f20e2`
+- GitHub Actions: run #128
+- Artifact: `8617136485`
+- Tests: 200 passed
+- Source and packaged self-checks: 8/8 passed
 - Added secret-safe SHA-256 fingerprints for identical Flash windows.
 - Requires exactly one launcher identity per window; invalid, missing, or
   duplicate identities fail closed instead of choosing a substitute.
 - A read-only target-desktop probe confirmed 14 windows, 14 processes, and
   14 distinct fingerprints. It emitted no raw arguments and sent no input.
-- Windows packaging and `release/sp1` publication for this source are pending.
+- Published only to `release/sp1`; the permanent ZIP SHA-256 is
+  `40838dfff48e858079a479242aa670743e8f08b5ec0c5f3e7d73a5f01bd3852d`.
+- The fixed updater, packaged identity selection, installed GUI launch, normal
+  close, and no-residual-process checks passed on Windows 11.
 
 ### Latest verified real-background-capture release
 

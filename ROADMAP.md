@@ -36,7 +36,7 @@ Remaining SP1 verification work:
 - [x] Resolve the final real-desktop entry without overwriting the existing junction
 - [x] Verify read-only capture while partially covered, non-foreground, and minimized
 - [x] Configure the user-confirmed fail-closed anonymous Flash window identity
-- [ ] Build and verify the fingerprint-enabled Windows package on the target desktop
+- [x] Build and verify the fingerprint-enabled Windows package on the target desktop
 - [ ] Complete safe-input, reconnect, and player-control acceptance
 - [ ] Merge only after approval, then verify current `main` and `release/latest`
 - [ ] Complete final target-desktop user acceptance

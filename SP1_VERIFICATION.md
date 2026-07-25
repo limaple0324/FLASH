@@ -74,8 +74,12 @@ The user approved anonymous launcher-argument SHA-256 fingerprints for identical
 Flash windows. Commit `2fae8bf` implements this without returning raw shortcut
 arguments or process command lines to Python. Invalid, missing, non-unique, or
 duplicate identities fail closed. The real desktop probe found 14 windows,
-14 process IDs, and 14 distinct fingerprints, and sent no input. A Windows
-package and `release/sp1` verification for this source are still pending.
+14 process IDs, and 14 distinct fingerprints, and sent no input. The Windows
+package and `release/sp1` verification for source `49ee668` passed in GitHub
+Actions run #128 with artifact `8617136485`. The ZIP SHA-256 is
+`40838dfff48e858079a479242aa670743e8f08b5ec0c5f3e7d73a5f01bd3852d`.
+Packaged unique selection, transactional update, GUI launch, normal close, and
+no-residual-process checks passed on the target Windows 11 desktop.
 
 Every new item must be confirmed as discussed before implementation. The
 player-viewable window-registry area and the five frozen resource areas remain
@@ -143,7 +147,7 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] Configure the approved anonymous Adobe Flash Player window identity.
 - [x] Reject invalid, missing, or duplicate identities without selecting a
   substitute window or exposing raw launcher data.
-- [ ] Verify the fingerprint-enabled packaged application on Windows 11.
+- [x] Verify the fingerprint-enabled packaged application on Windows 11.
 - [x] Verify background capture while the game is partially covered.
 - [x] Verify background capture while the game is not foreground.
 - [x] Verify background capture while the game is minimized.
@@ -185,6 +189,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   and minimized real-Flash acceptance.
 - [x] Local `2fae8bf` source passes all 200 tests, compilation, 8/8 source
   self-checks, and 14-window one-to-one anonymous identity acceptance.
+- [x] GitHub Actions run #128 for `49ee668` passes all 200 tests, packages and
+  publishes only to `release/sp1`, and passes installed identity/GUI acceptance.
 - [ ] Add target-desktop integration tests for capture, overlap, and reconnect behavior.
 
 ## F. Build and delivery
@@ -208,6 +214,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   its junction-preserving first-install/shortcut flow.
 - [x] Verify and permanently save the `960bacb` real-background-capture release,
   including its target-desktop updater and minimized normal-bounds fix.
+- [x] Verify and permanently save the `49ee668` anonymous-window-identity
+  release, including one-to-one packaged selection and target-desktop update.
 - [ ] Confirm a successful GitHub Actions run for current `main`.
 - [x] Download and launch the current artifact on Windows 11 build 26200 with an
   isolated data profile.
@@ -275,6 +283,14 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   `14a6adba241defb0415d92ca66a48d3e1980c05204e5c7f3f4cfadeda13abe7d`.
 - Latest real-background-capture evidence:
   `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-960bacb-sp1-release.md`.
+- Latest anonymous-window-identity release:
+  `FLASH-SP1-Windows-0.1.2-49ee668-sp1-release.zip`, source
+  `49ee6681627fe3b94f94c19fabc1dc193e4f20e2`, GitHub Actions run
+  `30149404672`, artifact `8617136485`, publication commit
+  `5f6cb418e5109f633d3622b897865c873405c084`, SHA-256
+  `40838dfff48e858079a479242aa670743e8f08b5ec0c5f3e7d73a5f01bd3852d`.
+- Latest anonymous-window-identity evidence:
+  `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-49ee668-sp1-release.md`.
 - The latest SP1 artifact record must include branch, full commit, version,
   tests, self-checks, SHA-256, build source, Windows evidence, and publication
   state.
