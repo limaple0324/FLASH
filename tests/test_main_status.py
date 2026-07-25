@@ -1,4 +1,5 @@
-from main import format_registry_status, format_self_check
+from config.path_manager import PathManager
+from main import format_registry_status, format_self_check, format_start_status
 
 
 def test_format_self_check_reports_success():
@@ -55,3 +56,40 @@ def test_registry_status_missing_state_uses_player_facing_words():
     text = format_registry_status({"window_registry": {"loaded": False}})
 
     assert text == "角色資料：未載入。"
+
+
+def test_start_status_includes_all_read_only_sections(tmp_path):
+    paths = PathManager(root=tmp_path)
+    text = format_start_status(
+        {
+            "self_check_passed": True,
+            "self_check": [
+                {"name": "paths", "passed": True, "message": "Paths are writable."},
+            ],
+            "target_window": {
+                "safe": False,
+                "code": "window.not_configured",
+                "message": "No target configured.",
+            },
+            "background_capabilities": {
+                "capabilities": {
+                    "background_capture": {"state": "untested"},
+                    "background_input": {"state": "untested"},
+                    "minimized_input": {"state": "untested"},
+                }
+            },
+            "window_registry": {"loaded": True, "count": 0},
+        },
+        paths,
+    )
+
+    assert "自我檢查通過" in text
+    assert "✓ paths：Paths are writable." in text
+    assert "代碼：window.not_configured" in text
+    assert "被遮擋時讀取畫面：尚未測試" in text
+    assert "非前景背景操作：尚未測試" in text
+    assert "最小化背景操作：尚未測試" in text
+    assert "背景輸入目前仍為停用。" in text
+    assert "角色資料：已載入 0 個角色。" in text
+    assert "遊戲操作尚未啟用" in text
+    assert f"紀錄位置：{paths.logs_dir()}" in text

@@ -12,6 +12,7 @@ def test_main_window_start_message_is_player_facing():
     source = Path("main.py").read_text(encoding="utf-8")
 
     assert "輔｜目前狀態" in source
+    assert "format_start_status(status, paths)" in source
     assert "遊戲操作尚未啟用" in source
     assert "啟動入口已接入首頁" not in source
     assert "RC-01" not in source

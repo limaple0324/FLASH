@@ -49,12 +49,17 @@ class BackgroundCapabilityReport:
         )
 
     def to_dict(self) -> dict[str, object]:
+        def serialize(result: CapabilityResult) -> dict[str, object]:
+            payload = asdict(result)
+            payload["state"] = result.state.value
+            return payload
+
         return {
             "fully_supported": self.fully_supported,
             "capabilities": {
-                "background_capture": asdict(self.background_capture),
-                "background_input": asdict(self.background_input),
-                "minimized_input": asdict(self.minimized_input),
+                "background_capture": serialize(self.background_capture),
+                "background_input": serialize(self.background_input),
+                "minimized_input": serialize(self.minimized_input),
             },
         }
 

@@ -252,6 +252,21 @@ def format_registry_status(status: dict[str, object]) -> str:
     return message + "\n舊視窗紀錄不會在重開後直接視為有效。"
 
 
+def format_start_status(status: dict[str, object], paths: PathManager) -> str:
+    """Build the complete read-only status shown from the player home screen."""
+    self_check_headline, self_check_details = format_self_check(status)
+    return (
+        f"{self_check_headline}\n"
+        f"{self_check_details}\n\n"
+        f"{format_window_status(status)}\n\n"
+        "背景能力\n"
+        f"{format_background_status(status)}\n\n"
+        f"{format_registry_status(status)}\n\n"
+        "遊戲操作尚未啟用，輔不會自動點擊或控制遊戲。\n"
+        f"紀錄位置：{paths.logs_dir()}"
+    )
+
+
 def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window = Tk()
     window.title(APP_TITLE)
@@ -262,11 +277,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def show_start_status() -> None:
         messagebox.showinfo(
             "輔｜目前狀態",
-            (
-                "目前可以查看狀態與紀錄。\n\n"
-                "遊戲操作尚未啟用，輔不會自動點擊或控制遊戲。\n"
-                f"紀錄位置：{paths.logs_dir()}"
-            ),
+            format_start_status(status, paths),
             parent=window,
         )
 
