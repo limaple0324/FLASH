@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from functools import partial
 from typing import Any, Protocol
 
+from services.character_detail_choice_service import (
+    PlayerCharacterDetailChoice,
+)
 from services.character_detail_view_service import PlayerCharacterDetail
 
 
@@ -23,8 +27,7 @@ CharacterSelector = Callable[[PlayerCharacterDetail], None]
 ListRenderer = Callable[
     [
         CharacterListWindowHandle,
-        tuple[PlayerCharacterDetail, ...],
-        CharacterSelector,
+        tuple[PlayerCharacterDetailChoice, ...],
         Callable[[], None],
     ],
     None,
@@ -51,8 +54,7 @@ def _choice_text(detail: PlayerCharacterDetail) -> str:
 
 def render_character_list(
     window: CharacterListWindowHandle,
-    details: tuple[PlayerCharacterDetail, ...],
-    on_select: CharacterSelector,
+    choices: tuple[PlayerCharacterDetailChoice, ...],
     on_close: Callable[[], None],
     *,
     frame_factory: WidgetFactory | None = None,
@@ -68,7 +70,7 @@ def render_character_list(
 
     body = frame_factory(window, padx=24, pady=20)
     body.pack(fill=tk.BOTH, expand=True)
-    if not details:
+    if not choices:
         label_factory(
             body,
             text="目前沒有可顯示的組別與角色資料。",
@@ -76,10 +78,11 @@ def render_character_list(
             anchor="w",
         ).pack(fill=tk.X)
     else:
-        grouped: dict[str, list[PlayerCharacterDetail]] = {}
-        for detail in details:
+        grouped: dict[str, list[PlayerCharacterDetailChoice]] = {}
+        for choice in choices:
+            detail = choice.detail
             group = detail.group.strip() if detail.group and detail.group.strip() else "未分組"
-            grouped.setdefault(group, []).append(detail)
+            grouped.setdefault(group, []).append(choice)
         for group in sorted(grouped, key=lambda value: (value == "未分組", value)):
             characters = grouped[group]
             label_factory(
@@ -88,11 +91,11 @@ def render_character_list(
                 font=("Microsoft JhengHei UI", 11, "bold"),
                 anchor="w",
             ).pack(fill=tk.X, pady=(8, 2))
-            for detail in characters:
+            for choice in characters:
                 button_factory(
                     body,
-                    text=_choice_text(detail),
-                    command=lambda selected=detail: on_select(selected),
+                    text=_choice_text(choice.detail),
+                    command=choice.select,
                     anchor="w",
                 ).pack(fill=tk.X, pady=2)
 
@@ -110,12 +113,12 @@ class CharacterListWindow:
     def __init__(
         self,
         master: Any,
-        on_select: CharacterSelector,
+        on_select: CharacterSelector | None = None,
         *,
         window_factory: WindowFactory | None = None,
         renderer: ListRenderer | None = None,
     ) -> None:
-        if not callable(on_select):
+        if on_select is not None and not callable(on_select):
             raise TypeError("on_select must be callable.")
         if window_factory is not None and not callable(window_factory):
             raise TypeError("window_factory must be callable.")
@@ -135,6 +138,28 @@ class CharacterListWindow:
         snapshots = tuple(details)
         if any(not isinstance(item, PlayerCharacterDetail) for item in snapshots):
             raise TypeError("details must contain PlayerCharacterDetail values.")
+        if self._on_select is None:
+            raise RuntimeError("Character selector is unavailable.")
+        self.open_choices(
+            PlayerCharacterDetailChoice(
+                detail=detail,
+                select=partial(self._on_select, detail),
+            )
+            for detail in snapshots
+        )
+
+    def open_choices(
+        self,
+        choices: Iterable[PlayerCharacterDetailChoice],
+    ) -> None:
+        snapshots = tuple(choices)
+        if any(
+            not isinstance(item, PlayerCharacterDetailChoice)
+            for item in snapshots
+        ):
+            raise TypeError(
+                "choices must contain PlayerCharacterDetailChoice values."
+            )
         if self._window is not None:
             raise RuntimeError("Character list window is already open.")
 
@@ -144,7 +169,7 @@ class CharacterListWindow:
             window.title("輔｜組別角色")
             window.transient(self._master)
             window.protocol("WM_DELETE_WINDOW", self.close)
-            self._renderer(window, snapshots, self._on_select, self.close)
+            self._renderer(window, snapshots, self.close)
         except Exception:
             self._window = None
             window.destroy()

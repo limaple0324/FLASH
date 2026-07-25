@@ -1,5 +1,8 @@
 import pytest
 
+from services.character_detail_choice_service import (
+    PlayerCharacterDetailChoice,
+)
 from services.character_detail_view_service import PlayerCharacterDetail
 from ui.character_list_window import (
     CharacterListWindow,
@@ -19,6 +22,13 @@ def _detail(
         role="古",
         note="守紀優先",
     )
+
+
+def _choice(
+    detail: PlayerCharacterDetail,
+    command=lambda: None,
+) -> PlayerCharacterDetailChoice:
+    return PlayerCharacterDetailChoice(detail, command)
 
 
 class FakeWindow:
@@ -81,8 +91,8 @@ def test_window_opens_once_and_forwards_explicit_selection() -> None:
         master,
         selected.append,
         window_factory=factory,
-        renderer=lambda window, details, on_select, close: rendered.append(
-            (window, details, on_select, close)
+        renderer=lambda window, choices, close: rendered.append(
+            (window, choices, close)
         ),
     )
 
@@ -95,17 +105,42 @@ def test_window_opens_once_and_forwards_explicit_selection() -> None:
         ("transient", master),
     ]
     assert window.operations[2][0:2] == ("protocol", "WM_DELETE_WINDOW")
-    assert rendered[0][1] == (_detail(),)
-    rendered[0][2](_detail())
+    assert tuple(choice.detail for choice in rendered[0][1]) == (_detail(),)
+    rendered[0][1][0].select()
     assert selected == [_detail()]
 
     with pytest.raises(RuntimeError, match="already open"):
         view.open((_detail("小法"),))
 
-    rendered[0][3]()
-    rendered[0][3]()
+    rendered[0][2]()
+    rendered[0][2]()
     assert window.operations.count(("destroy",)) == 1
     assert view.is_open is False
+
+
+def test_window_opens_prebound_choices_without_exposing_identity() -> None:
+    master = object()
+    factory = RecordingWindowFactory()
+    rendered = []
+    selected = []
+    choice = _choice(
+        _detail("同名角色"),
+        lambda: selected.append("stable-character"),
+    )
+    view = CharacterListWindow(
+        master,
+        window_factory=factory,
+        renderer=lambda window, choices, close: rendered.append(
+            (window, choices, close)
+        ),
+    )
+
+    view.open_choices((choice,))
+
+    assert rendered[0][1] == (choice,)
+    assert not hasattr(rendered[0][1][0], "character_id")
+    rendered[0][1][0].select()
+    assert selected == ["stable-character"]
 
 
 def test_window_rejects_untrusted_values_and_cleans_up_render_failure() -> None:
@@ -119,6 +154,8 @@ def test_window_rejects_untrusted_values_and_cleans_up_render_failure() -> None:
 
     with pytest.raises(TypeError, match="PlayerCharacterDetail"):
         view.open((object(),))
+    with pytest.raises(TypeError, match="PlayerCharacterDetailChoice"):
+        view.open_choices((object(),))
     with pytest.raises(RuntimeError, match="render failed"):
         view.open((_detail(),))
 
@@ -135,8 +172,13 @@ def test_renderer_groups_player_facing_buttons_without_internal_identifiers() ->
 
     render_character_list(
         FakeWindow(),
-        (_detail(), _detail("待整理角色", None)),
-        selected.append,
+        (
+            _choice(_detail(), lambda: selected.append(_detail())),
+            _choice(
+                _detail("待整理角色", None),
+                lambda: selected.append(_detail("待整理角色", None)),
+            ),
+        ),
         lambda: close_calls.append("close"),
         frame_factory=frames,
         label_factory=labels,
@@ -169,7 +211,6 @@ def test_renderer_has_clear_empty_state() -> None:
     render_character_list(
         FakeWindow(),
         (),
-        lambda _detail: None,
         lambda: None,
         frame_factory=RecordingWidgetFactory(),
         label_factory=labels,
@@ -179,3 +220,10 @@ def test_renderer_has_clear_empty_state() -> None:
     assert labels.widgets[0].options["text"] == (
         "目前沒有可顯示的組別與角色資料。"
     )
+
+
+def test_window_without_selector_rejects_legacy_details() -> None:
+    view = CharacterListWindow(object())
+
+    with pytest.raises(RuntimeError, match="selector is unavailable"):
+        view.open((_detail(),))
