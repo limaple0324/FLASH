@@ -35,6 +35,7 @@ class CardOverlaySelectionCoordinator:
         self._runtime: CardOverlayRuntime | None = None
         self._active_profile_id: str | None = None
         self._started = False
+        self._last_error: Exception | None = None
 
     @property
     def started(self) -> bool:
@@ -44,17 +45,19 @@ class CardOverlaySelectionCoordinator:
     def active_profile_id(self) -> str | None:
         return self._active_profile_id
 
+    @property
+    def last_error(self) -> Exception | None:
+        runtime_error = getattr(self._runtime, "last_error", None)
+        if isinstance(runtime_error, Exception):
+            return runtime_error
+        return self._last_error
+
     def start(self) -> bool:
         if self._started:
             return False
         self._started = True
         self._selection.subscribe(self.sync_selection)
-        try:
-            return self.sync_selection()
-        except Exception:
-            self._selection.unsubscribe(self.sync_selection)
-            self._started = False
-            raise
+        return self.sync_selection()
 
     def sync_selection(self) -> bool:
         if not self._started:
@@ -63,27 +66,45 @@ class CardOverlaySelectionCoordinator:
         profile = self._selection.selected_profile()
         profile_id = profile.profile_id if profile is not None else None
         if profile_id == self._active_profile_id:
+            runtime_error = getattr(self._runtime, "last_error", None)
+            self._last_error = (
+                runtime_error if isinstance(runtime_error, Exception) else None
+            )
             return False
 
-        replacement = self._runtime_factory(profile) if profile is not None else None
+        replacement: CardOverlayRuntime | None = None
+        if profile is not None:
+            try:
+                replacement = self._runtime_factory(profile)
+                replacement.start()
+                runtime_error = getattr(replacement, "last_error", None)
+                if isinstance(runtime_error, Exception):
+                    raise runtime_error
+            except Exception as error:
+                if replacement is not None:
+                    try:
+                        replacement.stop()
+                    except Exception:
+                        pass
+                self._last_error = error
+                raise
+
         previous = self._runtime
         if previous is not None:
-            previous.stop()
-        self._runtime = None
-        self._active_profile_id = None
-
-        if replacement is None:
-            return True
-        try:
-            replacement.start()
-        except Exception:
             try:
-                replacement.stop()
-            except Exception:
-                pass
-            raise
+                previous.stop()
+            except Exception as error:
+                if replacement is not None:
+                    try:
+                        replacement.stop()
+                    except Exception:
+                        pass
+                self._last_error = error
+                raise
+
         self._runtime = replacement
         self._active_profile_id = profile_id
+        self._last_error = None
         return True
 
     def stop(self) -> bool:
@@ -95,5 +116,10 @@ class CardOverlaySelectionCoordinator:
         self._runtime = None
         self._active_profile_id = None
         if runtime is not None:
-            runtime.stop()
+            try:
+                runtime.stop()
+            except Exception as error:
+                self._last_error = error
+                raise
+        self._last_error = None
         return True

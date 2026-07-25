@@ -36,16 +36,26 @@ def _selection() -> CardPreviewSelectionService:
 
 
 class FakeRuntime:
-    def __init__(self, profile_id: str, *, fail_start: bool = False) -> None:
+    def __init__(
+        self,
+        profile_id: str,
+        *,
+        fail_start: bool = False,
+        record_start_error: bool = False,
+    ) -> None:
         self.profile_id = profile_id
         self.fail_start = fail_start
+        self.record_start_error = record_start_error
         self.start_calls = 0
         self.stop_calls = 0
+        self.last_error: Exception | None = None
 
     def start(self) -> None:
         self.start_calls += 1
         if self.fail_start:
             raise RuntimeError("overlay start failed")
+        if self.record_start_error:
+            self.last_error = RuntimeError("overlay refresh failed")
 
     def stop(self) -> None:
         self.stop_calls += 1
@@ -56,6 +66,7 @@ class RecordingFactory:
         self.created: list[FakeRuntime] = []
         self.fail_profile_id: str | None = None
         self.raise_profile_id: str | None = None
+        self.record_error_profile_id: str | None = None
 
     def __call__(self, profile: CardPreviewProfile) -> FakeRuntime:
         if profile.profile_id == self.raise_profile_id:
@@ -63,6 +74,9 @@ class RecordingFactory:
         runtime = FakeRuntime(
             profile.profile_id,
             fail_start=profile.profile_id == self.fail_profile_id,
+            record_start_error=(
+                profile.profile_id == self.record_error_profile_id
+            ),
         )
         self.created.append(runtime)
         return runtime
@@ -154,7 +168,7 @@ def test_replacement_factory_failure_preserves_running_overlay() -> None:
     assert coordinator.active_profile_id == "compact"
 
 
-def test_failed_replacement_start_is_cleaned_and_leaves_overlay_disabled() -> None:
+def test_failed_replacement_start_is_cleaned_and_preserves_previous_overlay() -> None:
     selection = _selection()
     selection.select("compact")
     factory = RecordingFactory()
@@ -167,9 +181,50 @@ def test_failed_replacement_start_is_cleaned_and_leaves_overlay_disabled() -> No
         selection.select("roomy")
 
     failed = factory.created[1]
-    assert previous.stop_calls == 1
+    assert previous.stop_calls == 0
     assert failed.stop_calls == 1
+    assert selection.snapshot().selected_profile_id == "compact"
+    assert coordinator.active_profile_id == "compact"
+    assert coordinator.last_error is None
+
+
+def test_saved_selection_start_failure_keeps_coordinator_available_for_retry() -> None:
+    selection = _selection()
+    selection.select("compact")
+    factory = RecordingFactory()
+    factory.fail_profile_id = "compact"
+    coordinator = CardOverlaySelectionCoordinator(selection, factory)
+
+    with pytest.raises(RuntimeError, match="overlay start failed"):
+        coordinator.start()
+
+    assert coordinator.started is True
     assert coordinator.active_profile_id is None
+    assert coordinator.last_error is not None
+
+    factory.fail_profile_id = None
+    selection.select("compact")
+
+    assert coordinator.active_profile_id == "compact"
+    assert coordinator.last_error is None
+    assert factory.created[-1].start_calls == 1
+
+
+def test_runtime_recorded_refresh_error_is_treated_as_start_failure() -> None:
+    selection = _selection()
+    selection.select("compact")
+    factory = RecordingFactory()
+    factory.record_error_profile_id = "compact"
+    coordinator = CardOverlaySelectionCoordinator(selection, factory)
+
+    with pytest.raises(RuntimeError, match="overlay refresh failed"):
+        coordinator.start()
+
+    failed = factory.created[0]
+    assert failed.stop_calls == 1
+    assert coordinator.started is True
+    assert coordinator.active_profile_id is None
+    assert coordinator.last_error is not None
 
 
 def test_stop_is_idempotent_and_prevents_future_sync_until_restarted() -> None:

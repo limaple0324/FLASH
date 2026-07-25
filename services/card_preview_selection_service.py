@@ -72,6 +72,51 @@ class CardPreviewSelectionService:
         for listener in tuple(self._change_listeners):
             listener()
 
+    def _change_selection(
+        self,
+        selected_profile_id: str | None,
+    ) -> CardPreviewSelectionState:
+        previous_state = self._state
+        previous_unavailable = self.unavailable_stored_profile_id
+        previous_stored_profile_id = (
+            previous_state.selected_profile_id
+            if previous_state.selected_profile_id is not None
+            else previous_unavailable
+        )
+        next_state = CardPreviewSelectionState(selected_profile_id)
+
+        if self._store is not None:
+            self._store.save(selected_profile_id)
+        self._state = next_state
+        self.unavailable_stored_profile_id = None
+        try:
+            self._notify_changed()
+        except Exception as transition_error:
+            self._state = previous_state
+            self.unavailable_stored_profile_id = previous_unavailable
+            rollback_storage_error: Exception | None = None
+            if self._store is not None:
+                try:
+                    self._store.save(previous_stored_profile_id)
+                except Exception as error:
+                    rollback_storage_error = error
+
+            if (
+                previous_state != next_state
+                or previous_unavailable is not None
+            ):
+                try:
+                    self._notify_changed()
+                except Exception:
+                    pass
+
+            if rollback_storage_error is not None:
+                raise RuntimeError(
+                    "Card preview selection failed and its persisted rollback failed."
+                ) from transition_error
+            raise
+        return self._state
+
     def snapshot(self) -> CardPreviewSelectionState:
         return self._state
 
@@ -94,19 +139,7 @@ class CardPreviewSelectionService:
 
     def select(self, profile_id: str) -> CardPreviewSelectionState:
         profile = self._catalog.select(profile_id)
-        if self._store is not None:
-            self._store.save(profile.profile_id)
-        self._state = CardPreviewSelectionState(
-            selected_profile_id=profile.profile_id,
-        )
-        self.unavailable_stored_profile_id = None
-        self._notify_changed()
-        return self._state
+        return self._change_selection(profile.profile_id)
 
     def clear(self) -> CardPreviewSelectionState:
-        if self._store is not None:
-            self._store.save(None)
-        self._state = CardPreviewSelectionState()
-        self.unavailable_stored_profile_id = None
-        self._notify_changed()
-        return self._state
+        return self._change_selection(None)

@@ -14,13 +14,23 @@ class FakeWindow:
 
 
 class FakeRuntime:
-    def __init__(self, *, stop_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        start_error: Exception | None = None,
+        stop_error: Exception | None = None,
+    ) -> None:
         self.start_calls = 0
         self.stop_calls = 0
+        self.start_error = start_error
         self.stop_error = stop_error
+        self.last_error: Exception | None = None
 
     def start(self) -> None:
         self.start_calls += 1
+        if self.start_error is not None:
+            self.last_error = self.start_error
+            raise self.start_error
 
     def stop(self) -> None:
         self.stop_calls += 1
@@ -73,3 +83,30 @@ def test_runtime_stop_failure_does_not_block_window_close() -> None:
 
     assert window.destroy_calls == 1
     assert window._card_overlay_stop_error is error
+
+
+def test_runtime_start_failure_is_isolated_and_main_window_can_close(
+    monkeypatch,
+) -> None:
+    import main
+
+    window = FakeWindow()
+    error = RuntimeError("overlay start failed")
+    runtime = FakeRuntime(start_error=error)
+    warnings = []
+    monkeypatch.setattr(
+        main.messagebox,
+        "showwarning",
+        lambda title, message, parent: warnings.append((title, message, parent)),
+    )
+
+    _attach_card_overlay_runtime(window, runtime)
+
+    assert runtime.start_calls == 1
+    assert window._card_overlay_start_error is error
+    assert warnings
+    assert "主程式仍可正常使用" in warnings[0][1]
+
+    window.protocols["WM_DELETE_WINDOW"]()
+    assert runtime.stop_calls == 1
+    assert window.destroy_calls == 1

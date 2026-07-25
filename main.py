@@ -50,6 +50,7 @@ from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from services.soul_stone_service import SoulStoneService
+from ui.builtin_card_preview_catalog import build_builtin_card_preview_catalog
 from ui.home import HomeView
 from ui.card_preview_settings import CardPreviewCatalog
 from ui.character_detail_window import CharacterDetailWindow
@@ -69,6 +70,13 @@ CARD_PREVIEW_SELECTION_FILENAME = "card_preview_selection.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 WINDOWS_APP_USER_MODEL_ID = "limaple0324.FLASH"
+
+
+class _UseBuiltinCardPreviewCatalog:
+    __slots__ = ()
+
+
+_USE_BUILTIN_CARD_PREVIEW_CATALOG = _UseBuiltinCardPreviewCatalog()
 
 
 class CardOverlayRuntime(Protocol):
@@ -386,6 +394,37 @@ def format_card_overlay_status(status: dict[str, object]) -> str:
     return "提醒卡浮層：狀態無法判斷，目前保持停用。"
 
 
+def current_card_overlay_status(
+    status: dict[str, object],
+    runtime: CardOverlayRuntime | None = None,
+) -> str:
+    """Read the live selection after startup instead of showing a stale check."""
+    selection = AppContext.get(CardPreviewSelectionService)
+    if selection is None:
+        return format_card_overlay_status(status)
+
+    state = selection.snapshot()
+    if state.overlay_enabled:
+        runtime_error = (
+            getattr(runtime, "last_error", None)
+            if runtime is not None
+            else None
+        )
+        if isinstance(runtime_error, Exception):
+            return (
+                "提醒卡浮層：樣式選擇已保留，但目前無法可靠顯示；"
+                "請重新選擇或關閉預覽。"
+            )
+        return "提醒卡浮層：已選擇樣式，可以顯示。"
+    if selection.unavailable_stored_profile_id is not None:
+        return "提醒卡浮層：原先選擇的樣式已不可用，目前保持停用。"
+
+    store = AppContext.get(CardPreviewSelectionStore)
+    if store is not None and store.recovered_from_corruption:
+        return "提醒卡浮層：選擇資料損壞，已安全停用並保留備份。"
+    return "提醒卡浮層：候選樣式已準備好，尚未選擇。"
+
+
 def format_card_display_settings_status(status: dict[str, object]) -> str:
     """Turn card lifetime diagnostics into a concise player-facing summary."""
     check = next(
@@ -483,13 +522,34 @@ def _attach_card_overlay_runtime(window: Tk, runtime: CardOverlayRuntime | None)
 
     window.protocol("WM_DELETE_WINDOW", close_window)
     window._card_overlay_runtime = runtime
-    runtime.start()
+    try:
+        runtime.start()
+    except Exception as exc:
+        window._card_overlay_start_error = exc
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            try:
+                logger.error(f"Card overlay startup failed and was isolated: {exc}")
+            except Exception:
+                pass
+        try:
+            messagebox.showwarning(
+                "輔｜提醒卡樣式",
+                (
+                    "提醒卡浮層暫時無法啟用，主程式仍可正常使用。\n\n"
+                    "你的樣式選擇已保留；可稍後重新選擇或關閉預覽。"
+                    "錯誤已寫入紀錄。"
+                ),
+                parent=window,
+            )
+        except Exception:
+            pass
 
 
 def _build_registered_card_overlay_runtime(
     window: Tk,
 ) -> CardOverlayRuntime | None:
-    """Build the overlay only when an explicit preview catalog was registered."""
+    """Build the overlay only when a preview catalog was registered."""
     selection = AppContext.get(CardPreviewSelectionService)
     cards = AppContext.get(CardService)
     card_state = AppContext.get(CardViewStateService)
@@ -749,7 +809,7 @@ def create_main_window(
             (
                 "目前可以查看狀態與紀錄。\n\n"
                 "遊戲操作尚未啟用，輔不會自動點擊或控制遊戲。\n"
-                f"{format_card_overlay_status(status)}\n"
+                f"{current_card_overlay_status(status, card_overlay_runtime)}\n"
                 f"{current_card_display_settings_status()}\n"
                 f"紀錄位置：{paths.logs_dir()}"
             ),
@@ -895,12 +955,25 @@ def run(
     *,
     self_check_only: bool = False,
     root: Path | None = None,
-    card_preview_catalog: CardPreviewCatalog | None = None,
+    card_preview_catalog: (
+        CardPreviewCatalog | None | _UseBuiltinCardPreviewCatalog
+    ) = (
+        _USE_BUILTIN_CARD_PREVIEW_CATALOG
+    ),
 ) -> int:
     paths: PathManager | None = None
     logger: LoggerService | None = None
     try:
         apply_windows_app_identity()
+        if card_preview_catalog is _USE_BUILTIN_CARD_PREVIEW_CATALOG:
+            card_preview_catalog = build_builtin_card_preview_catalog()
+        elif card_preview_catalog is not None and not isinstance(
+            card_preview_catalog,
+            CardPreviewCatalog,
+        ):
+            raise TypeError(
+                "card_preview_catalog must be CardPreviewCatalog, None, or omitted."
+            )
         paths, logger = build_services(
             root=root,
             card_preview_catalog=card_preview_catalog,

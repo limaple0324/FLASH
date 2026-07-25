@@ -1,13 +1,22 @@
+import json
+
 from main import (
+    CARD_PREVIEW_SELECTION_FILENAME,
     _build_registered_card_overlay_runtime,
     build_services,
     create_main_window,
     run,
 )
 from core.window_registry import WindowRegistry
+from core.sp1_boundaries import ExternalAdapter
 from services.app_context import AppContext
 from services.card_display_settings_service import CardDisplaySettingsService
 from services.card_preview_selection_service import CardPreviewSelectionService
+from services.card_preview_selection_store import CardPreviewSelectionStore
+from ui.builtin_card_preview_catalog import (
+    BUILTIN_CARD_PREVIEW_DISPLAY_NAME,
+    BUILTIN_CARD_PREVIEW_PROFILE_ID,
+)
 from ui.card_overlay import CardSize
 from ui.card_preview_settings import CardPreviewCatalog, CardPreviewProfile
 from ui.tk_card_presenter import TkCardTextSettings
@@ -38,12 +47,17 @@ def _catalog() -> CardPreviewCatalog:
 
 
 class FakeRuntime:
-    def __init__(self) -> None:
+    def __init__(self, *, start_error: Exception | None = None) -> None:
         self.start_calls = 0
         self.stop_calls = 0
+        self.start_error = start_error
+        self.last_error: Exception | None = None
 
     def start(self) -> None:
         self.start_calls += 1
+        if self.start_error is not None:
+            self.last_error = self.start_error
+            raise self.start_error
 
     def stop(self) -> None:
         self.stop_calls += 1
@@ -135,6 +149,8 @@ def test_main_window_builds_and_manages_registered_overlay(monkeypatch, tmp_path
     created._home_view.kwargs["on_card_preview_select"]("player-selected")
     assert AppContext.get(CardPreviewSelectionService).snapshot().overlay_enabled is True
     assert runtime.start_calls == 1
+    created._home_view.kwargs["on_start"]()
+    assert "提醒卡浮層：已選擇樣式，可以顯示。" in shown_info[-1][1]
     created._home_view.kwargs["on_card_preview_clear"]()
     assert AppContext.get(CardPreviewSelectionService).snapshot().overlay_enabled is False
     assert created._home_view.kwargs["card_display_seconds_provider"]() == 30
@@ -147,7 +163,8 @@ def test_main_window_builds_and_manages_registered_overlay(monkeypatch, tmp_path
         == 75
     )
     created._home_view.kwargs["on_start"]()
-    assert "提醒卡顯示時間：目前設定為 75 秒。" in shown_info[0][1]
+    assert "提醒卡浮層：候選樣式已準備好，尚未選擇。" in shown_info[-1][1]
+    assert "提醒卡顯示時間：目前設定為 75 秒。" in shown_info[-1][1]
     window.protocols["WM_DELETE_WINDOW"]()
     assert runtime.stop_calls == 1
 
@@ -325,3 +342,196 @@ def test_run_forwards_explicit_catalog_into_startup_services(tmp_path) -> None:
     assert exit_code == 0
     assert selection is not None
     assert selection.snapshot().overlay_enabled is False
+    assert [choice.profile_id for choice in selection.available_choices()] == [
+        "player-selected"
+    ]
+
+
+def test_run_uses_builtin_catalog_without_implicitly_enabling_overlay(
+    tmp_path,
+) -> None:
+    exit_code = run(self_check_only=True, root=tmp_path)
+
+    selection = AppContext.get(CardPreviewSelectionService)
+    store = AppContext.get(CardPreviewSelectionStore)
+
+    assert exit_code == 0
+    assert selection is not None
+    assert store is not None
+    assert selection.snapshot().overlay_enabled is False
+    assert selection.snapshot().selected_profile_id is None
+    choices = selection.available_choices()
+    assert len(choices) == 1
+    choice = choices[0]
+    assert choice.profile_id == BUILTIN_CARD_PREVIEW_PROFILE_ID
+    assert choice.display_name == BUILTIN_CARD_PREVIEW_DISPLAY_NAME
+    assert choice.selected is False
+    assert store.path == (
+        tmp_path / "data" / CARD_PREVIEW_SELECTION_FILENAME
+    )
+    assert not store.path.exists()
+    assert AppContext.get(ExternalAdapter) is None
+    report = json.loads(
+        (tmp_path / "data" / "self_check.json").read_text(encoding="utf-8")
+    )
+    selection_check = next(
+        item
+        for item in report["self_check"]
+        if item["name"] == "card_preview_selection"
+    )
+    assert selection_check["passed"] is True
+    assert "has not selected" in selection_check["message"]
+    assert report["target_window"]["code"] == "window.not_configured"
+    assert report["target_window"]["safe"] is False
+    runtime = _build_registered_card_overlay_runtime(object())
+    assert runtime is not None
+    assert runtime.started is False
+    assert runtime.active_profile_id is None
+
+
+
+def test_run_persists_restores_and_clears_builtin_profile(tmp_path) -> None:
+    assert run(self_check_only=True, root=tmp_path) == 0
+    first_selection = AppContext.get(CardPreviewSelectionService)
+    first_store = AppContext.get(CardPreviewSelectionStore)
+    first_selection.select(BUILTIN_CARD_PREVIEW_PROFILE_ID)
+    assert first_store.path.exists()
+
+    assert run(self_check_only=True, root=tmp_path) == 0
+    restored_selection = AppContext.get(CardPreviewSelectionService)
+    restored_store = AppContext.get(CardPreviewSelectionStore)
+
+    assert restored_selection.snapshot().selected_profile_id == (
+        BUILTIN_CARD_PREVIEW_PROFILE_ID
+    )
+    assert restored_selection.snapshot().overlay_enabled is True
+    report = json.loads(
+        (tmp_path / "data" / "self_check.json").read_text(encoding="utf-8")
+    )
+    selection_check = next(
+        item
+        for item in report["self_check"]
+        if item["name"] == "card_preview_selection"
+    )
+    assert selection_check["passed"] is True
+    assert "ready" in selection_check["message"]
+    assert BUILTIN_CARD_PREVIEW_PROFILE_ID in selection_check["message"]
+
+    restored_selection.clear()
+    assert restored_selection.snapshot().overlay_enabled is False
+    assert not restored_store.path.exists()
+
+    assert run(self_check_only=True, root=tmp_path) == 0
+    restarted_selection = AppContext.get(CardPreviewSelectionService)
+    assert restarted_selection.snapshot().selected_profile_id is None
+    assert restarted_selection.snapshot().overlay_enabled is False
+    assert not restored_store.path.exists()
+
+
+def test_run_can_explicitly_disable_builtin_catalog(tmp_path) -> None:
+    exit_code = run(
+        self_check_only=True,
+        root=tmp_path,
+        card_preview_catalog=None,
+    )
+
+    assert exit_code == 0
+    assert AppContext.get(CardPreviewSelectionService) is None
+    assert AppContext.get(CardPreviewSelectionStore) is None
+    assert not (
+        tmp_path / "data" / CARD_PREVIEW_SELECTION_FILENAME
+    ).exists()
+    report = json.loads(
+        (tmp_path / "data" / "self_check.json").read_text(encoding="utf-8")
+    )
+    selection_check = next(
+        item
+        for item in report["self_check"]
+        if item["name"] == "card_preview_selection"
+    )
+    assert selection_check["passed"] is True
+    assert "not configured" in selection_check["message"]
+
+
+def test_run_does_not_fall_back_from_unavailable_saved_profile(tmp_path) -> None:
+    selection_path = (
+        tmp_path / "data" / CARD_PREVIEW_SELECTION_FILENAME
+    )
+    CardPreviewSelectionStore(selection_path).save("retired-profile")
+
+    exit_code = run(self_check_only=True, root=tmp_path)
+    selection = AppContext.get(CardPreviewSelectionService)
+
+    assert exit_code == 0
+    assert selection is not None
+    assert selection.unavailable_stored_profile_id == "retired-profile"
+    assert selection.snapshot().selected_profile_id is None
+    assert selection.snapshot().overlay_enabled is False
+    assert selection_path.exists()
+    report = json.loads(
+        (tmp_path / "data" / "self_check.json").read_text(encoding="utf-8")
+    )
+    selection_check = next(
+        item
+        for item in report["self_check"]
+        if item["name"] == "card_preview_selection"
+    )
+    assert selection_check["passed"] is True
+    assert "disabled" in selection_check["message"]
+    assert "retired-profile" in selection_check["message"]
+
+
+def test_saved_builtin_overlay_failure_does_not_block_normal_main_window(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import main
+
+    assert run(self_check_only=True, root=tmp_path) == 0
+    AppContext.get(CardPreviewSelectionService).select(
+        BUILTIN_CARD_PREVIEW_PROFILE_ID
+    )
+    assert run(self_check_only=True, root=tmp_path) == 0
+
+    window = FakeWindow()
+    runtime_error = RuntimeError("overlay start failed")
+    runtime = FakeRuntime(start_error=runtime_error)
+    warnings = []
+    shown_info = []
+    monkeypatch.setattr(main, "Tk", lambda: window)
+    monkeypatch.setattr(main, "HomeView", FakeHomeView)
+    monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
+    monkeypatch.setattr(
+        main,
+        "_build_registered_card_overlay_runtime",
+        lambda actual_window: runtime if actual_window is window else None,
+    )
+    monkeypatch.setattr(
+        main.messagebox,
+        "showwarning",
+        lambda title, message, parent: warnings.append((title, message, parent)),
+    )
+    monkeypatch.setattr(
+        main.messagebox,
+        "showinfo",
+        lambda title, message, parent: shown_info.append((title, message, parent)),
+    )
+
+    created = create_main_window(
+        {},
+        AppContext.get(main.PathManager),
+    )
+
+    assert created is window
+    assert window._card_overlay_start_error is runtime_error
+    assert warnings
+    assert "主程式仍可正常使用" in warnings[0][1]
+    assert (
+        AppContext.get(CardPreviewSelectionService)
+        .snapshot()
+        .selected_profile_id
+        == BUILTIN_CARD_PREVIEW_PROFILE_ID
+    )
+
+    created._home_view.kwargs["on_start"]()
+    assert "樣式選擇已保留，但目前無法可靠顯示" in shown_info[-1][1]

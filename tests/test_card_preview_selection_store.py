@@ -119,3 +119,28 @@ def test_failed_disk_save_does_not_change_in_memory_selection(tmp_path, monkeypa
         service.select("roomy")
 
     assert service.snapshot().selected_profile_id == "compact"
+
+
+def test_listener_failure_rolls_back_the_persisted_selection(tmp_path) -> None:
+    path = tmp_path / "card-preview-selection.json"
+    service = CardPreviewSelectionService(
+        _catalog(),
+        CardPreviewSelectionStore(path),
+    )
+    service.select("compact")
+
+    def reject_roomy() -> None:
+        if service.snapshot().selected_profile_id == "roomy":
+            raise RuntimeError("preview runtime failed")
+
+    service.subscribe(reject_roomy)
+
+    with pytest.raises(RuntimeError, match="preview runtime failed"):
+        service.select("roomy")
+
+    restarted = CardPreviewSelectionService(
+        _catalog(),
+        CardPreviewSelectionStore(path),
+    )
+    assert service.snapshot().selected_profile_id == "compact"
+    assert restarted.snapshot().selected_profile_id == "compact"

@@ -171,6 +171,40 @@ def test_unsubscribe_stops_future_selection_notifications() -> None:
     assert notifications == ["compact"]
 
 
+def test_listener_failure_rolls_back_to_the_previous_selection() -> None:
+    service = _service()
+    service.select("compact")
+
+    def reject_roomy() -> None:
+        if service.snapshot().selected_profile_id == "roomy":
+            raise RuntimeError("preview runtime failed")
+
+    service.subscribe(reject_roomy)
+
+    with pytest.raises(RuntimeError, match="preview runtime failed"):
+        service.select("roomy")
+
+    assert service.snapshot().selected_profile_id == "compact"
+    assert service.selected_profile().profile_id == "compact"
+
+
+def test_listener_failure_while_clearing_restores_the_selection() -> None:
+    service = _service()
+    service.select("compact")
+
+    def reject_clear() -> None:
+        if service.snapshot().selected_profile_id is None:
+            raise RuntimeError("preview runtime stop failed")
+
+    service.subscribe(reject_clear)
+
+    with pytest.raises(RuntimeError, match="preview runtime stop failed"):
+        service.clear()
+
+    assert service.snapshot().selected_profile_id == "compact"
+    assert service.snapshot().overlay_enabled is True
+
+
 def test_selection_listener_must_be_callable() -> None:
     with pytest.raises(TypeError, match="listener"):
         _service().subscribe(object())
