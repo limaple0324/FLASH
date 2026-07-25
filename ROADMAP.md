@@ -38,7 +38,7 @@ Remaining SP1 verification work:
 - [x] Configure the user-confirmed fail-closed anonymous Flash window identity
 - [x] Build and verify the fingerprint-enabled Windows package on the target desktop
 - [x] Add a repeatable, read-only 14-window identity/capture verifier
-- [ ] Build and verify the packaged `--verify-target-desktop` mode
+- [x] Build and verify the packaged `--verify-target-desktop` mode
 - [ ] Complete safe-input, reconnect, and player-control acceptance
 - [ ] Merge only after approval, then verify current `main` and `release/latest`
 - [ ] Complete final target-desktop user acceptance

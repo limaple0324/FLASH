@@ -218,7 +218,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   including its target-desktop updater and minimized normal-bounds fix.
 - [x] Verify and permanently save the `49ee668` anonymous-window-identity
   release, including one-to-one packaged selection and target-desktop update.
-- [ ] Build and verify the `f47e132` packaged target-desktop verification mode.
+- [x] Build and verify the `f47e132` packaged target-desktop verification mode
+  in `0bd575c` / GitHub Actions run #129.
 - [ ] Confirm a successful GitHub Actions run for current `main`.
 - [x] Download and launch the current artifact on Windows 11 build 26200 with an
   isolated data profile.
@@ -294,6 +295,14 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   `40838dfff48e858079a479242aa670743e8f08b5ec0c5f3e7d73a5f01bd3852d`.
 - Latest anonymous-window-identity evidence:
   `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-49ee668-sp1-release.md`.
+- Latest repeatable target-desktop verification release:
+  `FLASH-SP1-Windows-0.1.2-0bd575c-sp1-release.zip`, source
+  `0bd575c6d049abe686ca539d949e246010a11612`, GitHub Actions run
+  `30150105580`, artifact `8617356997`, publication commit
+  `f1b83ee7787ebc9498556d8112f15924e3aa8035`, SHA-256
+  `ab02bf2b5d8d8eba3fcf5278329cf4c23741da360b2b824c40ce8473f762629f`.
+- Latest repeatable target-desktop evidence:
+  `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-0bd575c-sp1-release.md`.
 - The latest SP1 artifact record must include branch, full commit, version,
   tests, self-checks, SHA-256, build source, Windows evidence, and publication
   state.
