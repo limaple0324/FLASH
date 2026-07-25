@@ -4,8 +4,9 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 
 Scope note (2026-07-25): this checklist governs the SP1 engineering build on `main`
 and the current `release/latest`. The latest integration source
-`integration/sp2-sp3-sp35@2d9f878` has 593 passing tests, compilation, 14 source
-self-checks and a target-window read-only event chain. The latest downloaded Windows
+`integration/sp2-sp3-sp35@a10c3e2` has 602 passing tests, compilation, 14 source
+self-checks, a target-window read-only event chain, and an explicit read-only status
+recheck. The latest downloaded Windows
 integration artifact still comes from older source `893f65e`; neither source evidence
 nor that artifact proves an updated `release/latest` or complete Windows 11 acceptance.
 
