@@ -1,0 +1,4 @@
+release_branch=release/sp1
+source_branch=sp1/completion-2026-07-25
+build_kind=sp1_release
+publish_target=release/sp1

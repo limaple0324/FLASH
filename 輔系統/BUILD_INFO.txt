@@ -1,0 +1,13 @@
+product=FLASH
+version=0.1.2
+milestone=SP1
+build_kind=sp1_release
+event_name=push
+source_ref=refs/heads/sp1/completion-2026-07-25
+source_branch=sp1/completion-2026-07-25
+publish_target=release/sp1
+commit=21586697ef3c0f8083ae8cabb5fedba394103291
+run_id=30145818559
+built_utc=2026-07-25T05:29:55Z
+python=Python 3.12.10
+sha256=020ae197a7bab2a029e9ce75d45aecf254a7af63bbc892ce00bcbd5fc6e02f78
