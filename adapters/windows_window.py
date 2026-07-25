@@ -7,9 +7,14 @@ explicit operation areas before future automation is allowed.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Protocol
 
+from adapters.windows_launch_fingerprint import (
+    LaunchFingerprintResolver,
+    PowerShellLaunchFingerprintResolver,
+    normalize_launch_fingerprint,
+)
 from core.sp1_boundaries import ExternalAdapter, OperationResult
 
 
@@ -64,6 +69,7 @@ class WindowInfo:
     rect: tuple[int, int, int, int]
     process_id: int | None = None
     window_class: str | None = None
+    launch_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +100,9 @@ class WindowBackend(Protocol):
 
 class Win32WindowBackend:
     """ctypes-based backend with no third-party Windows dependency."""
+
+    def __init__(self, fingerprint_resolver: LaunchFingerprintResolver | None = None):
+        self._fingerprint_resolver = fingerprint_resolver
 
     @staticmethod
     def _user32():
@@ -172,6 +181,19 @@ class Win32WindowBackend:
 
         if not user32.EnumWindows(enum_proc_type(callback), 0):
             return []
+        if self._fingerprint_resolver is not None:
+            fingerprints = self._fingerprint_resolver.resolve(
+                window.process_id
+                for window in windows
+                if window.process_id is not None
+            )
+            windows = [
+                replace(
+                    window,
+                    launch_fingerprint=fingerprints.get(window.process_id),
+                )
+                for window in windows
+            ]
         return windows
 
     def foreground_handle(self) -> int | None:
@@ -203,9 +225,26 @@ class Win32WindowBackend:
 class WindowsWindowAdapter(ExternalAdapter):
     """Read-only target-window adapter used before any automation is allowed."""
 
-    def __init__(self, title_keywords: Iterable[str], backend: WindowBackend | None = None):
+    def __init__(
+        self,
+        title_keywords: Iterable[str],
+        backend: WindowBackend | None = None,
+        *,
+        launch_fingerprint: object = None,
+    ):
         self._keywords = tuple(keyword.strip().casefold() for keyword in title_keywords if keyword.strip())
-        self._backend = backend or Win32WindowBackend()
+        self._fingerprint_configured = (
+            launch_fingerprint is not None
+            and not (isinstance(launch_fingerprint, str) and not launch_fingerprint.strip())
+        )
+        self._launch_fingerprint = normalize_launch_fingerprint(launch_fingerprint)
+        self._backend = backend or Win32WindowBackend(
+            fingerprint_resolver=(
+                PowerShellLaunchFingerprintResolver()
+                if self._launch_fingerprint is not None
+                else None
+            )
+        )
         self._last_match: WindowInfo | None = None
 
     @property
@@ -297,20 +336,40 @@ class WindowsWindowAdapter(ExternalAdapter):
         self._last_match = None
         if not self._keywords:
             return OperationResult(False, "window.not_configured", "No target-window title keyword is configured.")
+        if self._fingerprint_configured and self._launch_fingerprint is None:
+            return OperationResult(
+                False,
+                "window.identity_invalid",
+                "The configured anonymous window identity is invalid; input must remain disabled.",
+            )
 
-        matches = [
+        title_matches = [
             window
             for window in self._backend.list_windows()
             if all(keyword in window.title.casefold() for keyword in self._keywords)
         ]
 
-        if not matches:
+        if not title_matches:
             return OperationResult(
                 False,
                 "window.not_found",
                 "No visible window matched the configured title keywords.",
                 {"keywords": self._keywords},
             )
+        matches = title_matches
+        if self._launch_fingerprint is not None:
+            matches = [
+                window
+                for window in title_matches
+                if window.launch_fingerprint == self._launch_fingerprint
+            ]
+            if not matches:
+                return OperationResult(
+                    False,
+                    "window.identity_not_found",
+                    "No title-matched window had the configured anonymous identity; input must remain disabled.",
+                    {"title_match_count": len(title_matches)},
+                )
         if len(matches) > 1:
             return OperationResult(
                 False,
@@ -359,6 +418,11 @@ class WindowsWindowAdapter(ExternalAdapter):
                 "handle": match.handle,
                 "rect": match.rect,
                 "checked_areas": tuple(area.name for area in areas),
+                "identity_method": (
+                    "launch_fingerprint"
+                    if self._launch_fingerprint is not None
+                    else "title_keywords"
+                ),
                 "input_enabled": False,
             },
         )

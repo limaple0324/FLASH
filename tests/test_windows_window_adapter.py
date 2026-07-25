@@ -23,13 +23,21 @@ class FakeBackend:
         return self.foreground_handle()
 
 
-def make_window(title="LaTale", *, handle=100, minimized=False, rect=(10, 20, 810, 620)):
+def make_window(
+    title="LaTale",
+    *,
+    handle=100,
+    minimized=False,
+    rect=(10, 20, 810, 620),
+    launch_fingerprint=None,
+):
     return WindowInfo(
         handle=handle,
         title=title,
         visible=True,
         minimized=minimized,
         rect=rect,
+        launch_fingerprint=launch_fingerprint,
     )
 
 
@@ -59,6 +67,81 @@ def test_adapter_rejects_ambiguous_matches():
     assert result.code == "window.ambiguous"
     assert result.details["count"] == 2
     assert adapter.last_match is None
+
+
+def test_adapter_uses_anonymous_fingerprint_to_select_one_identical_title():
+    first_fingerprint = "1" * 64
+    second_fingerprint = "2" * 64
+    first = make_window(handle=1, launch_fingerprint=first_fingerprint)
+    second = make_window(handle=2, launch_fingerprint=second_fingerprint)
+    adapter = WindowsWindowAdapter(
+        ["latale"],
+        backend=FakeBackend([first, second], foreground=2),
+        launch_fingerprint=second_fingerprint.upper(),
+    )
+
+    result = adapter.find_target()
+
+    assert result.success is True
+    assert result.details["handle"] == 2
+    assert result.details["identity_method"] == "launch_fingerprint"
+    assert adapter.last_match == second
+
+
+def test_adapter_rejects_invalid_anonymous_fingerprint_without_enumerating():
+    class UnexpectedBackend(FakeBackend):
+        def list_windows(self):
+            raise AssertionError("Invalid identity must fail before window enumeration.")
+
+    adapter = WindowsWindowAdapter(
+        ["latale"],
+        backend=UnexpectedBackend([]),
+        launch_fingerprint="not-a-sha256",
+    )
+
+    result = adapter.find_target()
+
+    assert result.success is False
+    assert result.code == "window.identity_invalid"
+    assert result.details is None
+
+
+def test_adapter_rejects_missing_anonymous_identity_without_leaking_fingerprint():
+    configured_fingerprint = "3" * 64
+    adapter = WindowsWindowAdapter(
+        ["latale"],
+        backend=FakeBackend(
+            [make_window(handle=1, launch_fingerprint="4" * 64)],
+            foreground=1,
+        ),
+        launch_fingerprint=configured_fingerprint,
+    )
+
+    result = adapter.find_target()
+
+    assert result.success is False
+    assert result.code == "window.identity_not_found"
+    assert configured_fingerprint not in repr(result.details)
+
+
+def test_adapter_rejects_duplicate_anonymous_identity():
+    fingerprint = "5" * 64
+    adapter = WindowsWindowAdapter(
+        ["latale"],
+        backend=FakeBackend(
+            [
+                make_window(handle=1, launch_fingerprint=fingerprint),
+                make_window(handle=2, launch_fingerprint=fingerprint),
+            ]
+        ),
+        launch_fingerprint=fingerprint,
+    )
+
+    result = adapter.find_target()
+
+    assert result.success is False
+    assert result.code == "window.ambiguous"
+    assert result.details["count"] == 2
 
 
 def test_adapter_rejects_minimized_target():

@@ -185,6 +185,30 @@ def test_window_enumeration_preserves_high_hwnd_and_read_only_identity():
     assert windows[0].window_class == "ObservedClass"
 
 
+def test_window_enumeration_attaches_only_resolved_anonymous_fingerprint():
+    class FakeResolver:
+        def __init__(self):
+            self.process_ids = None
+
+        def resolve(self, process_ids):
+            self.process_ids = list(process_ids)
+            return {9876: "a" * 64}
+
+    resolver = FakeResolver()
+    user32 = _enumerating_user32(
+        hwnd=321,
+        process_id=9876,
+        window_class="ObservedClass",
+    )
+    backend = Win32WindowBackend(fingerprint_resolver=resolver)
+    backend._user32 = lambda: user32
+
+    (window,) = backend.list_windows()
+
+    assert resolver.process_ids == [9876]
+    assert window.launch_fingerprint == "a" * 64
+
+
 def test_window_enumeration_keeps_failed_optional_identity_unknown():
     user32 = _enumerating_user32(
         hwnd=321,

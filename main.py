@@ -11,6 +11,7 @@ from tkinter import PhotoImage, TclError, Tk, messagebox
 
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
+from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
 from adapters.windows_window import WindowsWindowAdapter
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
@@ -26,6 +27,7 @@ from ui.home import HomeView
 APP_TITLE = "輔"
 SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_WINDOW_KEY = "target_window_keywords"
+TARGET_WINDOW_FINGERPRINT_KEY = "target_window_fingerprint"
 REGISTRY_FILENAME = "window_registry.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
@@ -75,6 +77,10 @@ def _normalize_window_keywords(value: object) -> list[str]:
     return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
+def _normalize_window_fingerprint(value: object) -> str | None:
+    return normalize_launch_fingerprint(value)
+
+
 def build_services(root: Path | None = None):
     """Create, load, and register all SP1 services."""
     AppContext.clear()
@@ -103,7 +109,13 @@ def build_services(root: Path | None = None):
 
     keywords = _normalize_window_keywords(config.get(TARGET_WINDOW_KEY, []))
     if keywords:
-        AppContext.register(ExternalAdapter, WindowsWindowAdapter(title_keywords=keywords))
+        AppContext.register(
+            ExternalAdapter,
+            WindowsWindowAdapter(
+                title_keywords=keywords,
+                launch_fingerprint=config.get(TARGET_WINDOW_FINGERPRINT_KEY),
+            ),
+        )
 
     return paths, logger
 
