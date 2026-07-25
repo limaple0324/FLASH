@@ -5,7 +5,7 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 Scope note (2026-07-25): new work is restricted to SP1 on
 `sp1/completion-2026-07-25`, based on `main@538bdbc`. The latest verified source
 commit is
-`03db0624fb64e7b5997502558914a0f706da7b79`. The `5db5b5f` local baseline
+`ac1223a45ccfd12ec3096ccd8fd7933cdbb2bfe3`. The `5db5b5f` local baseline
 passed 171 tests, Python compilation, 8/8 source self-checks, and
 `git diff --check`; the subsequent hash-compatibility fix passed the 24 affected
 updater/release-verifier tests and one focused regression test.
@@ -46,6 +46,16 @@ On Windows 11 build 26200, the same-source packaged window displayed the full
 self-check details, conservative target-window state, all three background
 capability states, registry state, disabled-input notice, and isolated log path.
 
+GitHub Actions run #125 for `ac1223a` passed all 186 tests, source and packaged
+8/8 self-checks, Windows EXE creation, bundle verification, artifact upload,
+and SP1-only publication. The permanent ZIP SHA-256 matches artifact
+`8616653423`:
+`3854f49733dcd5d23f9a8452d0390f5aca31c7aaed1c89bc505f45240d38ff63`.
+On the real Windows 11 desktop, the transactionally installed package preserved
+the existing `輔` project junction, created only `啟動輔.lnk`, passed target,
+working-directory, icon, EXE-hash, GUI launch, and normal-close checks, and left
+no FLASH process behind.
+
 Every new item must be confirmed as discussed before implementation. The
 player-viewable window-registry area and the five frozen resource areas remain
 paused. SP2 and SP3 work does not resume until the prior delivery stage is complete.
@@ -65,6 +75,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] Run `更新輔.cmd` on the target computer and verify the installed build.
 - [x] Implement and verify a complete first installer with rollback and one
   executable-backed shortcut.
+- [x] Verify the real-desktop installer preserves the existing `輔` junction
+  and creates a distinct, working `啟動輔.lnk`.
 
 ## B. Core startup
 
@@ -141,6 +153,9 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] GitHub Actions run #124 for `03db062` passes all 184 tests, publishes only
   to `release/sp1`, and its packaged status window passes Windows 11 display
   acceptance.
+- [x] GitHub Actions run #125 for `ac1223a` passes all 186 tests, publishes only
+  to `release/sp1`, and its collision-safe shortcut passes real-desktop
+  installation and launch acceptance.
 - [ ] Add target-desktop integration tests for capture, overlap, and reconnect behavior.
 
 ## F. Build and delivery
@@ -160,6 +175,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   digest, `release/sp1` identity, and real target-computer updater flow.
 - [x] Verify and permanently save the `cee31ac` complete installer/updater
   release and its isolated Windows 11 first-install/shortcut flow.
+- [x] Verify and permanently save the `ac1223a` real-desktop-entry release and
+  its junction-preserving first-install/shortcut flow.
 - [ ] Confirm a successful GitHub Actions run for current `main`.
 - [x] Download and launch the current artifact on Windows 11 build 26200 with an
   isolated data profile.
@@ -211,6 +228,14 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   `e470f5c71b5c81a182d8d0532c1cfb2f00385233868735cdc797284fe99f097b`.
 - Latest safe-status release evidence:
   `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-03db062-sp1-release.md`.
+- Latest real-desktop-entry release:
+  `FLASH-SP1-Windows-0.1.2-ac1223a-sp1-release.zip`, source
+  `ac1223a45ccfd12ec3096ccd8fd7933cdbb2bfe3`, GitHub Actions run
+  `30147951154`, artifact `8616653423`, publication commit
+  `a59bc3c2c0c5dcb731bee5971660fb391fbcf5b3`, SHA-256
+  `3854f49733dcd5d23f9a8452d0390f5aca31c7aaed1c89bc505f45240d38ff63`.
+- Latest real-desktop-entry evidence:
+  `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-ac1223a-sp1-release.md`.
 - The latest SP1 artifact record must include branch, full commit, version,
   tests, self-checks, SHA-256, build source, Windows evidence, and publication
   state.

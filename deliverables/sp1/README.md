@@ -8,7 +8,7 @@
 - GitHub：`https://github.com/limaple0324/FLASH.git`
 - 分支：`sp1/completion-2026-07-25`
 - 基準：`main@538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`
-- 最新來源提交：`03db0624fb64e7b5997502558914a0f706da7b79`
+- 最新來源提交：`ac1223a45ccfd12ec3096ccd8fd7933cdbb2bfe3`
 - 版本：SP1 0.1.2 工程驗證階段
 
 ## 目前來源驗證
@@ -55,6 +55,14 @@ Windows 11 已在隔離位置完成來源、暫存、安裝後三次成品驗證
 `e470f5c71b5c81a182d8d0532c1cfb2f00385233868735cdc797284fe99f097b`。
 同提交的 Windows 11 包裝視窗已實際顯示完整自我檢查、保守主視窗狀態、
 三項背景能力、角色資料、安全停用與紀錄位置。
+
+最新真實桌面入口版為
+`FLASH-SP1-Windows-0.1.2-ac1223a-sp1-release.zip`。GitHub Actions run #125
+的 186 項完整測試、來源／封裝 8/8 自我檢查與全部 Windows 建置／發布步驟
+通過；ZIP SHA-256 與 artifact `8616653423` digest 均為
+`3854f49733dcd5d23f9a8452d0390f5aca31c7aaed1c89bc505f45240d38ff63`。
+Windows 11 真實桌面安裝保留原有 `輔` 專案 junction，只建立
+`啟動輔.lnk`，並通過捷徑屬性、EXE 雜湊、圖形啟動及正常關閉驗收。
 
 ## 後續成品紀錄
 

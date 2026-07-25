@@ -26,14 +26,14 @@ gates without starting SP2 early.
 
 Remaining SP1 verification work:
 
-- [x] GitHub Actions Windows run #124 succeeds with 184 tests
+- [x] GitHub Actions Windows run #125 succeeds with 186 tests
 - [x] `FLASH.exe` artifact and permanent SP1 ZIP are produced and hash-verified
 - [x] Run the packaged executable on Windows 11 build 26200
 - [x] Confirm configuration, log, self-check, and registry persistence
 - [x] Confirm the obsolete desktop scheduled sync is absent or disabled
 - [x] Confirm installer, updater, shortcut, and full safe-status display
 - [ ] Run the packaged executable under a clean Windows user account
-- [ ] Resolve the final real-desktop entry without overwriting the existing junction
+- [x] Resolve the final real-desktop entry without overwriting the existing junction
 - [ ] Configure the user-confirmed real Flash window identity
 - [ ] Complete real-game capture, safe-input, reconnect, and player-control acceptance
 - [ ] Merge only after approval, then verify current `main` and `release/latest`
