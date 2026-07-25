@@ -62,6 +62,27 @@ function New-DesktopShortcut(
     }
 }
 
+function Get-DesktopShortcutPath([string]$DesktopDirectory) {
+    $defaultShortcut = Join-Path $DesktopDirectory "輔.lnk"
+    $alternateShortcut = Join-Path $DesktopDirectory "啟動輔.lnk"
+    $visibleNameConflict = Join-Path $DesktopDirectory "輔"
+
+    # Preserve the name selected by an earlier installation. When this is the
+    # first installation and Explorer already shows a file, directory, or
+    # junction named "輔", avoid creating a visually indistinguishable second
+    # item while file-name extensions are hidden.
+    if (Test-Path -LiteralPath $defaultShortcut -PathType Leaf) {
+        return $defaultShortcut
+    }
+    if (Test-Path -LiteralPath $alternateShortcut -PathType Leaf) {
+        return $alternateShortcut
+    }
+    if (Test-Path -LiteralPath $visibleNameConflict) {
+        return $alternateShortcut
+    }
+    return $defaultShortcut
+}
+
 if ([string]::IsNullOrWhiteSpace($SourceDirectory)) {
     $scriptSystemDir = Split-Path -Parent $MyInvocation.MyCommand.Path
     $SourceDirectory = Split-Path -Parent $scriptSystemDir
@@ -111,7 +132,7 @@ $transactionId = [Guid]::NewGuid().ToString("N")
 $stageDir = Join-Path $installParent ".輔-SP1-stage-$transactionId"
 $backupDir = Join-Path $installParent ".輔-SP1-backup-$transactionId"
 $failedDir = Join-Path $installParent ".輔-SP1-failed-$transactionId"
-$shortcutPath = Join-Path $DesktopDir "輔.lnk"
+$shortcutPath = Get-DesktopShortcutPath -DesktopDirectory $DesktopDir
 $shortcutTemp = Join-Path $DesktopDir ".FLASH-SP1-$transactionId.lnk"
 $shortcutBackup = Join-Path $installParent ".FLASH-SP1-shortcut-$transactionId.lnk"
 
@@ -161,6 +182,7 @@ try {
         "install_directory=$InstallDir"
         "source_directory=$SourceDir"
         "shortcut=$(-not $NoShortcut)"
+        "shortcut_path=$(if ($NoShortcut) { '' } else { $shortcutPath })"
     ) | Set-Content (Join-Path $InstallDir "安裝紀錄.txt") -Encoding UTF8
 
     $success = $true
