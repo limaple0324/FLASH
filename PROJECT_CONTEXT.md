@@ -8,7 +8,7 @@
 - 工作區：`C:\Users\USER\Documents\輔\SP1`
 - 目前分支：`sp1/completion-2026-07-25`
 - 基準：`origin/main@538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`
-- 最新提交：`f419e07ebdef5e4836e6229df082c6222b2ef551`
+- 最新提交：`cee31ac2124ba3584f3d278d5dd67330d8cb312a`
 - 既有整合分支只保留 SP2／SP3 累積成果；目前不新增上層功能。
 
 ## 目前來源證據
@@ -33,8 +33,13 @@
   `746fc2c630b77e7d7e3d2db87089716cfe5ebf0fda37e5cf9010d264d5fd6b66`。
 - Windows 11 已實際由 `更新輔.cmd` 連線 `release/sp1`，完成安裝前驗證、
   交易式套用與安裝後驗證。
-- 尚未完成乾淨新帳號、完整首次安裝／捷徑、真正遊戲輸入、斷線重連及
-  視窗標題／身分驗收，因此 SP1 尚未正式完成。
+- `cee31ac` 的 GitHub Actions run #123 已通過 183 項完整測試與全部建置／
+  發布步驟；最新完整安裝／更新 ZIP SHA-256 與 artifact digest 均為
+  `40af7b7c6a8e8ab8c768cdf6aa5961cb82f1a28f6c7075204b316adbec52053a`。
+- Windows 11 隔離位置已完成真正成品首次安裝、三次成品驗證及單一捷徑
+  TargetPath／WorkingDirectory／IconLocation 驗收。
+- 尚未完成乾淨新帳號、真實桌面最終入口、真正遊戲輸入、斷線重連及視窗
+  標題／身分驗收，因此 SP1 尚未正式完成。
 
 ## 固定範圍
 
@@ -46,6 +51,7 @@
 
 ## 下一個小型區塊
 
-使用已驗證的 `f419e07` SP1 獨立正式包繼續完整首次安裝、乾淨 Windows 11
-新帳號、捷徑／圖示／工作列驗收；真正遊戲輸入、斷線重連及 Flash 視窗
-身分只依已確認規格執行，不自行猜測。SP1 必要門檻未全部通過前，不開始 SP2。
+使用已驗證的 `cee31ac` SP1 完整安裝／更新包繼續乾淨 Windows 11 新帳號與
+真實桌面入口驗收；現有 `C:\Users\USER\Desktop\輔` 是指向專案工作區的
+junction，不擅自覆寫。真正遊戲輸入、斷線重連及 Flash 視窗身分只依已確認
+規格執行，不自行猜測。SP1 必要門檻未全部通過前，不開始 SP2。
