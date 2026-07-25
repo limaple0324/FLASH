@@ -45,6 +45,7 @@ from services.card_overlay_selection_assembly import (
 from services.card_preview_selection_service import CardPreviewSelectionService
 from services.card_preview_selection_store import CardPreviewSelectionStore
 from services.card_view_state_service import CardViewStateService
+from services.character_detail_choice_service import CharacterDetailChoiceService
 from services.character_detail_view_service import CharacterDetailViewService
 from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
@@ -577,26 +578,14 @@ def create_main_window(
     window.geometry("760x760")
     window.minsize(660, 600)
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
-    detail_identities: dict[int, tuple[object, str]] = {}
     current_detail_character_id: str | None = None
     soul_stone_editor_window: SoulStoneEditorWindow | None = None
 
-    def load_character_details(
-        *,
-        allow_missing_service: bool = False,
-    ) -> tuple[tuple[str, object], ...]:
+    def load_character_details() -> tuple[tuple[str, object], ...]:
         character_details = AppContext.get(CharacterDetailViewService)
         if character_details is None:
-            if allow_missing_service:
-                return ()
             raise RuntimeError("Character detail view service is unavailable.")
         return character_details.all_with_identities()
-
-    def trusted_character_id_for(detail: object) -> str:
-        identity = detail_identities.get(id(detail))
-        if identity is None or identity[0] is not detail:
-            raise LookupError("Character detail has no trusted identity pairing.")
-        return identity[1]
 
     def detail_for_character(character_id: str):
         for paired_character_id, detail in load_character_details():
@@ -767,13 +756,12 @@ def create_main_window(
         on_edit_soul_stone=show_soul_stone_editor,
     )
 
-    def show_character_detail(detail) -> None:
+    def show_character_detail(character_id: str, _listed_detail: object) -> None:
         nonlocal current_detail_character_id
         if soul_stone_editor_is_open():
             show_soul_stone_editor_busy()
             return
         try:
-            character_id = trusted_character_id_for(detail)
             current_detail = detail_for_character(character_id)
             character_detail_window.close()
             character_detail_window.open(current_detail)
@@ -782,10 +770,7 @@ def create_main_window(
             return
         current_detail_character_id = character_id
 
-    character_list_window = CharacterListWindow(
-        window,
-        show_character_detail,
-    )
+    character_list_window = CharacterListWindow(window)
 
     def current_card_display_settings_status() -> str:
         if card_display_settings_service is None:
@@ -817,22 +802,18 @@ def create_main_window(
         )
 
     def show_group_characters() -> None:
-        paired_details = load_character_details(allow_missing_service=True)
-        detail_identities.clear()
-        detail_identities.update(
-            (
-                id(detail),
-                (detail, character_id),
-            )
-            for character_id, detail in paired_details
-        )
-        details = tuple(
-            detail
-            for _character_id, detail in paired_details
+        character_details = AppContext.get(CharacterDetailViewService)
+        choices = (
+            CharacterDetailChoiceService(
+                character_details,
+                show_character_detail,
+            ).all()
+            if character_details is not None
+            else ()
         )
         if character_list_window.is_open:
             character_list_window.close()
-        character_list_window.open(details)
+        character_list_window.open_choices(choices)
 
     def show_card_preview_error(action: str, error: Exception) -> None:
         logger = AppContext.get(LoggerService)

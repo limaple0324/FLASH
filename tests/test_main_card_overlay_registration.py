@@ -237,17 +237,16 @@ def test_main_window_opens_selected_character_in_single_read_only_detail_window(
     detail_windows = []
 
     class FakeCharacterListWindow:
-        def __init__(self, master, on_select):
+        def __init__(self, master):
             self.master = master
-            self.on_select = on_select
             self.is_open = False
             self.open_calls = []
             self.close_calls = 0
             list_windows.append(self)
 
-        def open(self, details):
+        def open_choices(self, choices):
             self.is_open = True
-            self.open_calls.append(tuple(details))
+            self.open_calls.append(tuple(choices))
 
         def close(self):
             self.is_open = False
@@ -277,7 +276,8 @@ def test_main_window_opens_selected_character_in_single_read_only_detail_window(
     created = create_main_window({}, main.AppContext.get(main.PathManager))
     created._home_view.kwargs["on_show_group_characters"]()
 
-    details = list_windows[0].open_calls[0]
+    choices = list_windows[0].open_calls[0]
+    details = tuple(choice.detail for choice in choices)
     assert callable(detail_windows[0].on_edit_soul_stone)
     assert len(details) == 1
     assert details[0].display_name == "小古"
@@ -288,7 +288,7 @@ def test_main_window_opens_selected_character_in_single_read_only_detail_window(
     assert details[0].note == "守紀優先"
     assert "private-character-id" not in repr(details[0])
 
-    list_windows[0].on_select(details[0])
+    choices[0].select()
     assert detail_windows[0].close_calls == 1
     assert detail_windows[0].open_calls == [details[0]]
     assert created._character_list_window is list_windows[0]

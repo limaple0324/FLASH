@@ -131,17 +131,16 @@ def _install_flow_fakes(monkeypatch) -> FlowHarness:
     harness = FlowHarness(root=FakeRootWindow())
 
     class FakeCharacterListWindow:
-        def __init__(self, master, on_select):
+        def __init__(self, master):
             self.master = master
-            self.on_select = on_select
             self.is_open = False
             self.open_calls = []
             self.close_calls = 0
             harness.list_windows.append(self)
 
-        def open(self, details) -> None:
+        def open_choices(self, choices) -> None:
             self.is_open = True
-            self.open_calls.append(tuple(details))
+            self.open_calls.append(tuple(choices))
 
         def close(self) -> None:
             self.is_open = False
@@ -253,9 +252,9 @@ def _create_flow(monkeypatch, tmp_path):
 
 
 def _select_listed_character(harness: FlowHarness, index: int):
-    listed = harness.list_windows[0].open_calls[-1]
-    harness.list_windows[0].on_select(listed[index])
-    return listed
+    choices = harness.list_windows[0].open_calls[-1]
+    choices[index].select()
+    return tuple(choice.detail for choice in choices)
 
 
 def _open_editor(harness: FlowHarness) -> None:
@@ -325,7 +324,7 @@ def test_open_editor_blocks_switching_detail_and_keeps_unsaved_input(
     active_render.pending_note = "尚未保存的內容"
     shown_for_first_character = harness.detail_windows[0].open_calls[-1]
 
-    harness.list_windows[0].on_select(listed[1])
+    harness.list_windows[0].open_calls[-1][1].select()
 
     assert harness.editors == [active_editor]
     assert active_editor.is_open is True
@@ -437,15 +436,16 @@ def test_clicking_old_list_snapshot_fetches_latest_detail_by_identity(
     )
     build_services(root=tmp_path)
     _created, harness = _create_flow(monkeypatch, tmp_path)
-    listed = harness.list_windows[0].open_calls[-1]
-    assert listed[0].soul_stone == "清單建立時的舊紀錄"
+    choices = harness.list_windows[0].open_calls[-1]
+    listed = choices[0].detail
+    assert listed.soul_stone == "清單建立時的舊紀錄"
 
     AppContext.get(SoulStoneService).set_for_character(
         "character-a",
         "點擊前已更新的紀錄",
     )
-    harness.list_windows[0].on_select(listed[0])
+    choices[0].select()
 
     opened = harness.detail_windows[0].open_calls[-1]
     assert opened.soul_stone == "點擊前已更新的紀錄"
-    assert opened is not listed[0]
+    assert opened is not listed
