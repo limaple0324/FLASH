@@ -31,7 +31,7 @@ SP1 目前已包含：
 - Recovery / Smart Reconnect / External Adapter contracts
 - structured self-check system
 - Windows desktop verification window
-- legacy Windows desktop auto-sync scripts（僅保留相容／診斷，不啟用）
+- 舊排程同步的註冊／執行工具已移除，僅保留同步狀態檢查器
 - PyInstaller build specification
 - GitHub Actions test-and-build workflow
 - release bundle metadata and SHA-256 verification
