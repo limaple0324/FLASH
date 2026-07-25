@@ -35,7 +35,8 @@ Remaining SP1 verification work:
 - [ ] Run the packaged executable under a clean Windows user account
 - [x] Resolve the final real-desktop entry without overwriting the existing junction
 - [x] Verify read-only capture while partially covered, non-foreground, and minimized
-- [ ] Configure the user-confirmed real Flash window identity
+- [x] Configure the user-confirmed fail-closed anonymous Flash window identity
+- [ ] Build and verify the fingerprint-enabled Windows package on the target desktop
 - [ ] Complete safe-input, reconnect, and player-control acceptance
 - [ ] Merge only after approval, then verify current `main` and `release/latest`
 - [ ] Complete final target-desktop user acceptance
@@ -47,8 +48,9 @@ The current executable is an SP1 engineering verification application. It
 verifies startup, persistence, service registration, event flow, and stable
 extension boundaries. Concrete game-specific recovery and reconnect adapters
 must be integrated and validated before those behaviors can be called complete.
-Those items remain paused until the window identity, harmless input, login,
-disconnect, reconnect, and failure conditions are confirmed by the user.
+Window identity now uses the user-confirmed anonymous launcher fingerprint.
+Harmless input, login, disconnect, reconnect, failure conditions, and
+player-visible role mapping remain paused until separately confirmed.
 
 ## SP2 — Product Design
 

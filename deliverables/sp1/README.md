@@ -8,7 +8,7 @@
 - GitHub：`https://github.com/limaple0324/FLASH.git`
 - 分支：`sp1/completion-2026-07-25`
 - 基準：`main@538bdbcffd32327cbd3cb32cea1b70cfd9d9e3c3`
-- 最新來源提交：`960bacb7260ea33f59c0724b219472fcbc36924e`
+- 最新功能提交：`2fae8bfba8b13a3fe05ba67f6af05d37cfc4a9ee`
 - 版本：SP1 0.1.2 工程驗證階段
 
 ## 目前來源驗證
@@ -71,6 +71,12 @@ Windows 11 真實桌面安裝保留原有 `輔` 專案 junction，只建立
 `14a6adba241defb0415d92ca66a48d3e1980c05204e5c7f3f4cfadeda13abe7d`。
 14 個真實 Flash 視窗已通過部分／完全遮擋、非前景與最小化唯讀畫面擷取；
 正式安裝亦已由 `更新輔.cmd` 交易式更新到同一提交。
+
+最新本機功能來源 `2fae8bf` 已接入使用者確認的匿名啟動參數指紋；200 項
+完整測試、原始碼編譯及 8/8 來源自我檢查通過。14 個真實 Flash 視窗各有
+一個不同指紋，無效、缺失或重複身分一律拒絕，未輸出原始參數或傳送輸入。
+此提交尚未建立新的 Windows 成品，因此目前永久成品仍是上述 `960bacb` 版，
+不可把本機程式完成誤寫成 Windows 發布完成。
 
 ## 後續成品紀錄
 

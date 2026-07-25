@@ -2,6 +2,18 @@
 
 ## SP1 0.1.2 — 2026-07-25
 
+### Latest locally verified anonymous-window-identity source
+
+- Source: `2fae8bfba8b13a3fe05ba67f6af05d37cfc4a9ee`
+- Local tests: 200 passed
+- Source self-checks: 8/8 passed
+- Added secret-safe SHA-256 fingerprints for identical Flash windows.
+- Requires exactly one launcher identity per window; invalid, missing, or
+  duplicate identities fail closed instead of choosing a substitute.
+- A read-only target-desktop probe confirmed 14 windows, 14 processes, and
+  14 distinct fingerprints. It emitted no raw arguments and sent no input.
+- Windows packaging and `release/sp1` publication for this source are pending.
+
 ### Latest verified real-background-capture release
 
 - Source: `960bacb7260ea33f59c0724b219472fcbc36924e`

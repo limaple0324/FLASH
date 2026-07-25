@@ -4,9 +4,11 @@ This document is the delivery gate for FLASH SP1. A feature is not considered co
 
 Scope note (2026-07-25): new work is restricted to SP1 on
 `sp1/completion-2026-07-25`, based on `main@538bdbc`. The latest verified source
-commit is
-`960bacb7260ea33f59c0724b219472fcbc36924e`. The `5db5b5f` local baseline
-passed 171 tests, Python compilation, 8/8 source self-checks, and
+feature commit is
+`2fae8bfba8b13a3fe05ba67f6af05d37cfc4a9ee`. It passed 200 local tests,
+Python compilation, 8/8 source self-checks, and a read-only one-to-one probe
+of 14 real Flash windows. The earlier `5db5b5f` local baseline passed 171 tests
+and
 `git diff --check`; the subsequent hash-compatibility fix passed the 24 affected
 updater/release-verifier tests and one focused regression test.
 
@@ -67,6 +69,13 @@ covered, one fully covered, and five minimized. All returned non-blank frames;
 the minimized capture fix used the saved normal window bounds and returned
 911/916 by 629 frames instead of the misleading 353 by 39 minimized shell.
 The installed SP1 release was transactionally updated to the same source commit.
+
+The user approved anonymous launcher-argument SHA-256 fingerprints for identical
+Flash windows. Commit `2fae8bf` implements this without returning raw shortcut
+arguments or process command lines to Python. Invalid, missing, non-unique, or
+duplicate identities fail closed. The real desktop probe found 14 windows,
+14 process IDs, and 14 distinct fingerprints, and sent no input. A Windows
+package and `release/sp1` verification for this source are still pending.
 
 Every new item must be confirmed as discussed before implementation. The
 player-viewable window-registry area and the five frozen resource areas remain
@@ -131,7 +140,10 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   source tests.
 - [x] Confirm the result is shown correctly in the packaged SP1 window on the
   target Windows 11 desktop.
-- [ ] Configure the real Adobe Flash Player 11 window identity.
+- [x] Configure the approved anonymous Adobe Flash Player window identity.
+- [x] Reject invalid, missing, or duplicate identities without selecting a
+  substitute window or exposing raw launcher data.
+- [ ] Verify the fingerprint-enabled packaged application on Windows 11.
 - [x] Verify background capture while the game is partially covered.
 - [x] Verify background capture while the game is not foreground.
 - [x] Verify background capture while the game is minimized.
@@ -171,6 +183,8 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] GitHub Actions run #127 for `960bacb` passes all 188 tests, publishes only
   to `release/sp1`, and its read-only capture passes covered, non-foreground,
   and minimized real-Flash acceptance.
+- [x] Local `2fae8bf` source passes all 200 tests, compilation, 8/8 source
+  self-checks, and 14-window one-to-one anonymous identity acceptance.
 - [ ] Add target-desktop integration tests for capture, overlap, and reconnect behavior.
 
 ## F. Build and delivery

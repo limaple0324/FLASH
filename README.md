@@ -21,11 +21,11 @@ FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式
 
 目前版本：**SP1 0.1.2 engineering verification build**
 
-目前最新已驗證來源為
-`03db0624fb64e7b5997502558914a0f706da7b79`。GitHub Actions run #124
-已通過 184 項測試、來源／封裝 8/8 自我檢查、Windows EXE、bundle、
-artifact 上傳及 `release/sp1` 發布；永久成品與證據保存在
-`C:\Users\USER\Documents\輔\SP1成品`。
+目前最新本機已驗證功能來源為
+`2fae8bfba8b13a3fe05ba67f6af05d37cfc4a9ee`：200 項測試、原始碼編譯、
+8/8 來源自我檢查及 14 個真實 Flash 視窗的一對一匿名指紋盤點均通過。
+此提交的 Windows EXE、封裝自檢與 `release/sp1` 發布仍待建立；上一份永久
+成品與證據保存在 `C:\Users\USER\Documents\輔\SP1成品`。
 
 SP1 目前已包含：
 
@@ -43,8 +43,10 @@ SP1 目前已包含：
 - release bundle metadata and SHA-256 verification
 - 完整首次安裝、單一捷徑及交易式 SP1 專用更新
 - Windows 11 包裝視窗的完整唯讀自我檢查與安全狀態顯示
+- 同名 Flash 視窗的不可逆匿名啟動指紋與失敗關閉式一對一篩選
 
-> 注意：目前是工程驗證版本。Recovery、Smart Reconnect 與遊戲視窗操作的介面已固定，但真正的遊戲／視窗適配器仍需接入並完成 Windows 實機驗收。
+> 注意：目前是工程驗證版本。Flash 同名視窗身分已接入，但角色對應、真正
+> 遊戲輸入、Recovery 與 Smart Reconnect 仍需依已確認規格完成實機驗收。
 
 ## Run from source
 
