@@ -22,9 +22,11 @@ $CommonManifestPaths = @(
 $LiveReleaseManifestPaths = @(
     "FLASH.exe",
     "LATEST.txt",
+    "安裝輔.cmd",
     "更新輔.cmd",
     "輔系統/BUILD_INFO.txt",
     "輔系統/verify_windows_release.ps1",
+    "輔系統/安裝輔.ps1",
     "輔系統/輔更新核心.ps1",
     "輔系統/UPDATE_CHANNEL.txt",
     "輔系統/檢查輔同步狀態.cmd",
@@ -191,7 +193,9 @@ if ($buildKind -in @("sp1_snapshot", "validation_build")) {
     }
     foreach ($forbiddenRelativePath in @(
         "LATEST.txt",
+        "安裝輔.cmd",
         "更新輔.cmd",
+        "輔系統/安裝輔.ps1",
         "輔系統/輔更新核心.ps1",
         "輔系統/UPDATE_CHANNEL.txt",
         "輔系統/檢查輔同步狀態.cmd",
