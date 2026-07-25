@@ -541,7 +541,7 @@ try {
     Write-Step "發布 commit：$releaseCommit"
     Write-Step "已保留原本桌面捷徑的名稱與圖示。"
     Write-Host ""
-    Write-Host "更新完成，可以直接打開原本桌面的「輔 V0.2」。" -ForegroundColor Green
+    Write-Host "更新完成，可以直接使用原本桌面的輔啟動捷徑。" -ForegroundColor Green
 }
 catch {
     $failureMessage = $_.Exception.Message
