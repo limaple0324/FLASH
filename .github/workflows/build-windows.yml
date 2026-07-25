@@ -7,7 +7,13 @@ on:
       - sp1/completion-2026-07-25
   pull_request:
     branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      publish_sp1:
+        description: Publish the verified SP1-only updater channel
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -86,6 +92,7 @@ jobs:
           BUILD_EVENT_NAME: ${{ github.event_name }}
           BUILD_REF: ${{ github.ref }}
           BUILD_SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
+          BUILD_PUBLISH_SP1: ${{ inputs.publish_sp1 }}
         run: |
           $metadata = python -c "from core.version import VERSION, MILESTONE; print(f'{VERSION}|{MILESTONE}')"
           $parts = $metadata.Trim().Split('|')
@@ -100,7 +107,19 @@ jobs:
           $sp1DeliveryBranch = 'sp1/completion-2026-07-25'
           $sp1DeliveryRef = "refs/heads/$sp1DeliveryBranch"
           $isSp1Snapshot = (
-            $env:BUILD_EVENT_NAME -in @('push', 'workflow_dispatch') -and
+            $env:BUILD_EVENT_NAME -eq 'workflow_dispatch' -and
+            $env:BUILD_REF -eq $sp1DeliveryRef -and
+            $env:BUILD_SOURCE_BRANCH -eq $sp1DeliveryBranch -and
+            $env:BUILD_PUBLISH_SP1 -ne 'true'
+          )
+          $isSp1Release = (
+            (
+              $env:BUILD_EVENT_NAME -eq 'push' -or
+              (
+                $env:BUILD_EVENT_NAME -eq 'workflow_dispatch' -and
+                $env:BUILD_PUBLISH_SP1 -eq 'true'
+              )
+            ) -and
             $env:BUILD_REF -eq $sp1DeliveryRef -and
             $env:BUILD_SOURCE_BRANCH -eq $sp1DeliveryBranch
           )
@@ -108,6 +127,11 @@ jobs:
             $buildKind = 'main_release'
             $publishTarget = 'release/latest'
             $artifactKind = 'release'
+          }
+          elseif ($isSp1Release) {
+            $buildKind = 'sp1_release'
+            $publishTarget = 'release/sp1'
+            $artifactKind = 'sp1-release'
           }
           elseif ($isSp1Snapshot) {
             $buildKind = 'sp1_snapshot'
@@ -182,7 +206,7 @@ jobs:
           Copy-Item 'dist/FLASH.exe' 'release/FLASH.exe'
           Copy-Item 'tools/verify_windows_release.ps1' 'release/輔系統/verify_windows_release.ps1'
 
-          if ($env:FLASH_BUILD_KIND -eq 'main_release') {
+          if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {
             @(
               '* -text'
               '*.cmd -text'
@@ -194,6 +218,21 @@ jobs:
             Copy-Item 'tools/輔系統/輔更新核心.ps1' 'release/輔系統/輔更新核心.ps1'
             Copy-Item 'tools/檢查輔同步狀態.cmd' 'release/輔系統/檢查輔同步狀態.cmd'
             Copy-Item 'tools/檢查輔同步狀態.ps1' 'release/輔系統/檢查輔同步狀態.ps1'
+
+            if ($env:FLASH_BUILD_KIND -eq 'main_release') {
+              $releaseBranch = 'release/latest'
+              $sourceBranch = 'main'
+            }
+            else {
+              $releaseBranch = 'release/sp1'
+              $sourceBranch = 'sp1/completion-2026-07-25'
+            }
+            @(
+              "release_branch=$releaseBranch"
+              "source_branch=$sourceBranch"
+              "build_kind=$env:FLASH_BUILD_KIND"
+              "publish_target=$env:FLASH_PUBLISH_TARGET"
+            ) | Set-Content 'release/輔系統/UPDATE_CHANNEL.txt' -Encoding utf8
           }
           elseif ($env:FLASH_BUILD_KIND -eq 'sp1_snapshot') {
             @(
@@ -230,9 +269,15 @@ jobs:
             "sha256=$hash"
           ) | Set-Content 'release/輔系統/BUILD_INFO.txt' -Encoding utf8
 
-          if ($env:FLASH_BUILD_KIND -eq 'main_release') {
+          if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {
+            if ($env:FLASH_BUILD_KIND -eq 'main_release') {
+              $latestBranch = 'main'
+            }
+            else {
+              $latestBranch = 'sp1/completion-2026-07-25'
+            }
             @(
-              "branch=main"
+              "branch=$latestBranch"
               "commit=$env:GITHUB_SHA"
               "run_id=$env:GITHUB_RUN_ID"
               "updated_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
@@ -244,7 +289,7 @@ jobs:
             '輔系統/BUILD_INFO.txt'
             '輔系統/verify_windows_release.ps1'
           )
-          if ($env:FLASH_BUILD_KIND -eq 'main_release') {
+          if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {
             $manifestPaths = @(
               'FLASH.exe'
               'LATEST.txt'
@@ -252,6 +297,7 @@ jobs:
               '輔系統/BUILD_INFO.txt'
               '輔系統/verify_windows_release.ps1'
               '輔系統/輔更新核心.ps1'
+              '輔系統/UPDATE_CHANNEL.txt'
               '輔系統/檢查輔同步狀態.cmd'
               '輔系統/檢查輔同步狀態.ps1'
             )
@@ -289,17 +335,18 @@ jobs:
             }
           }
 
-          if ($env:FLASH_BUILD_KIND -eq 'main_release') {
+          if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {
             foreach ($required in @(
               'release/.gitattributes',
               'release/LATEST.txt',
               'release/更新輔.cmd',
               'release/輔系統/輔更新核心.ps1',
+              'release/輔系統/UPDATE_CHANNEL.txt',
               'release/輔系統/檢查輔同步狀態.cmd',
               'release/輔系統/檢查輔同步狀態.ps1'
             )) {
               if (-not (Test-Path $required -PathType Leaf)) {
-                throw "Main release bundle is missing: $required"
+                throw "Live release bundle is missing: $required"
               }
             }
 
@@ -316,7 +363,8 @@ jobs:
           else {
             foreach ($forbidden in @(
               'release/更新輔.cmd',
-              'release/輔系統/輔更新核心.ps1'
+              'release/輔系統/輔更新核心.ps1',
+              'release/輔系統/UPDATE_CHANNEL.txt'
             )) {
               if (Test-Path $forbidden) {
                 throw "SP1 snapshot must not contain a live updater: $forbidden"
@@ -392,3 +440,43 @@ jobs:
           git add -A
           git commit -m "Update latest Windows FLASH build"
           git push origin release/latest --force
+
+      - name: Publish SP1-only desktop updater files
+        if: github.ref == 'refs/heads/sp1/completion-2026-07-25' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_sp1))
+        shell: pwsh
+        run: |
+          $publishRoot = Join-Path $env:RUNNER_TEMP 'flash-sp1-release'
+          Remove-Item -Recurse -Force $publishRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $publishRoot | Out-Null
+
+          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" $publishRoot
+          Set-Location $publishRoot
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          $branchExists = $true
+          git fetch origin release/sp1
+          if ($LASTEXITCODE -ne 0) {
+            $branchExists = $false
+          }
+
+          if ($branchExists) {
+            git checkout release/sp1
+          }
+          else {
+            git checkout --orphan release/sp1
+          }
+
+          Get-ChildItem -Force |
+            Where-Object { $_.Name -ne '.git' } |
+            Remove-Item -Recurse -Force
+
+          Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\.gitattributes" ".\.gitattributes"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\LATEST.txt" ".\LATEST.txt"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\更新輔.cmd" ".\更新輔.cmd"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\輔系統" ".\輔系統" -Recurse -Force
+
+          git add -A
+          git commit -m "Update SP1-only Windows FLASH build"
+          git push origin release/sp1 --force

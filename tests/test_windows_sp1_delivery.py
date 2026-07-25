@@ -49,9 +49,10 @@ def test_manual_build_is_an_independent_sp1_snapshot():
     assert "$buildKind = 'sp1_snapshot'" in metadata_step
     assert "$buildKind = 'validation_build'" in metadata_step
     assert "$sp1DeliveryBranch = 'sp1/completion-2026-07-25'" in metadata_step
-    assert "$env:BUILD_EVENT_NAME -in @('push', 'workflow_dispatch')" in metadata_step
+    assert "$env:BUILD_EVENT_NAME -eq 'workflow_dispatch'" in metadata_step
     assert "$env:BUILD_REF -eq $sp1DeliveryRef" in metadata_step
     assert "$env:BUILD_SOURCE_BRANCH -eq $sp1DeliveryBranch" in metadata_step
+    assert "$env:BUILD_PUBLISH_SP1 -ne 'true'" in metadata_step
     assert "elseif ($isSp1Snapshot)" in metadata_step
     assert "$publishTarget = 'none'" in metadata_step
     assert (
@@ -70,7 +71,9 @@ def test_sp1_snapshot_does_not_include_the_live_updater():
         "Verify release bundle layout",
     )
 
-    assert "if ($env:FLASH_BUILD_KIND -eq 'main_release')" in create_bundle
+    assert "if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release'))" in (
+        create_bundle
+    )
     assert "SP1快照說明.txt" in create_bundle
     assert "本快照不包含「更新輔」，不會追蹤 release/latest。" in create_bundle
 
@@ -92,13 +95,35 @@ def test_main_release_keeps_the_single_live_updater():
         "Create release bundle",
         "Verify release bundle layout",
     )
-    main_release_block = create_bundle.split(
-        "if ($env:FLASH_BUILD_KIND -eq 'main_release') {",
+    live_release_block = create_bundle.split(
+        "if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {",
         1,
-    )[1].split("else {", 1)[0]
+    )[1].split("elseif ($env:FLASH_BUILD_KIND -eq 'sp1_snapshot')", 1)[0]
 
-    assert "Copy-Item 'tools/更新輔.cmd' 'release/更新輔.cmd'" in main_release_block
-    assert "Copy-Item 'tools/輔系統/輔更新核心.ps1'" in main_release_block
+    assert "Copy-Item 'tools/更新輔.cmd' 'release/更新輔.cmd'" in live_release_block
+    assert "Copy-Item 'tools/輔系統/輔更新核心.ps1'" in live_release_block
+    assert "release/輔系統/UPDATE_CHANNEL.txt" in live_release_block
+
+
+def test_sp1_release_uses_one_verified_push_and_its_own_channel():
+    workflow = _workflow()
+    metadata_step = _step(
+        workflow,
+        "Read SP1 delivery metadata",
+        "Build windowed executable",
+    )
+
+    assert "$env:BUILD_PUBLISH_SP1 -eq 'true'" in metadata_step
+    assert "$env:BUILD_EVENT_NAME -eq 'push' -or" in metadata_step
+    assert "$buildKind = 'sp1_release'" in metadata_step
+    assert "$publishTarget = 'release/sp1'" in metadata_step
+    publish_step = workflow.split(
+        "- name: Publish SP1-only desktop updater files",
+        1,
+    )[1]
+    assert "github.event_name == 'push'" in publish_step
+    assert "inputs.publish_sp1" in publish_step
+    assert "git push origin release/sp1 --force" in publish_step
 
 
 def test_main_release_builds_latest_then_a_complete_payload_manifest():
@@ -118,6 +143,7 @@ def test_main_release_builds_latest_then_a_complete_payload_manifest():
         "輔系統/BUILD_INFO.txt",
         "輔系統/verify_windows_release.ps1",
         "輔系統/輔更新核心.ps1",
+        "輔系統/UPDATE_CHANNEL.txt",
         "輔系統/檢查輔同步狀態.cmd",
         "輔系統/檢查輔同步狀態.ps1",
     ):

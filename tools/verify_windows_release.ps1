@@ -13,18 +13,20 @@ $ExePath = Join-Path $ReleaseDir "FLASH.exe"
 $HashPath = Join-Path $SystemDir "SHA256SUMS.txt"
 $InfoPath = Join-Path $SystemDir "BUILD_INFO.txt"
 $LatestPath = Join-Path $ReleaseDir "LATEST.txt"
+$ChannelPath = Join-Path $SystemDir "UPDATE_CHANNEL.txt"
 $CommonManifestPaths = @(
     "FLASH.exe",
     "輔系統/BUILD_INFO.txt",
     "輔系統/verify_windows_release.ps1"
 )
-$MainReleaseManifestPaths = @(
+$LiveReleaseManifestPaths = @(
     "FLASH.exe",
     "LATEST.txt",
     "更新輔.cmd",
     "輔系統/BUILD_INFO.txt",
     "輔系統/verify_windows_release.ps1",
     "輔系統/輔更新核心.ps1",
+    "輔系統/UPDATE_CHANNEL.txt",
     "輔系統/檢查輔同步狀態.cmd",
     "輔系統/檢查輔同步狀態.ps1"
 )
@@ -163,12 +165,12 @@ if ($buildInfo["commit"] -notmatch "^[0-9a-fA-F]{40}$") {
 }
 
 $buildKind = $buildInfo["build_kind"]
-if ($buildKind -notin @("sp1_snapshot", "validation_build", "main_release")) {
+if ($buildKind -notin @("sp1_snapshot", "validation_build", "main_release", "sp1_release")) {
     throw "Release build_kind is invalid: $buildKind"
 }
 
-if ($buildKind -eq "main_release") {
-    $expectedManifestPaths = $MainReleaseManifestPaths
+if ($buildKind -in @("main_release", "sp1_release")) {
+    $expectedManifestPaths = $LiveReleaseManifestPaths
 }
 elseif ($buildKind -eq "sp1_snapshot") {
     $expectedManifestPaths = @($CommonManifestPaths + "SP1快照說明.txt")
@@ -191,6 +193,7 @@ if ($buildKind -in @("sp1_snapshot", "validation_build")) {
         "LATEST.txt",
         "更新輔.cmd",
         "輔系統/輔更新核心.ps1",
+        "輔系統/UPDATE_CHANNEL.txt",
         "輔系統/檢查輔同步狀態.cmd",
         "輔系統/檢查輔同步狀態.ps1"
     )) {
@@ -212,18 +215,57 @@ if (
     throw "An SP1 snapshot must use the dedicated SP1 workflow source identity."
 }
 
-if ($buildKind -eq "main_release") {
-    if ($buildInfo["event_name"] -ne "push") {
-        throw "A main release must use event_name=push."
+if ($buildKind -in @("main_release", "sp1_release")) {
+    if ($buildKind -eq "main_release") {
+        $expectedEventName = "push"
+        $expectedSourceRef = "refs/heads/main"
+        $expectedSourceBranch = "main"
+        $expectedPublishTarget = "release/latest"
     }
-    if ($buildInfo["source_ref"] -ne "refs/heads/main") {
-        throw "A main release must use source_ref=refs/heads/main."
+    else {
+        $expectedEventName = ""
+        $expectedSourceRef = "refs/heads/sp1/completion-2026-07-25"
+        $expectedSourceBranch = "sp1/completion-2026-07-25"
+        $expectedPublishTarget = "release/sp1"
     }
-    if ($buildInfo["source_branch"] -ne "main") {
-        throw "A main release must use source_branch=main."
+    if (
+        $buildKind -eq "sp1_release" -and
+        $buildInfo["event_name"] -notin @("push", "workflow_dispatch")
+    ) {
+        throw "An sp1_release build must use event_name=push or workflow_dispatch."
     }
-    if ($buildInfo["publish_target"] -ne "release/latest") {
-        throw "A main release must use publish_target=release/latest."
+    if (
+        $buildKind -eq "main_release" -and
+        $buildInfo["event_name"] -ne $expectedEventName
+    ) {
+        throw "A $buildKind build must use event_name=$expectedEventName."
+    }
+    if ($buildInfo["source_ref"] -ne $expectedSourceRef) {
+        throw "A $buildKind build must use source_ref=$expectedSourceRef."
+    }
+    if ($buildInfo["source_branch"] -ne $expectedSourceBranch) {
+        throw "A $buildKind build must use source_branch=$expectedSourceBranch."
+    }
+    if ($buildInfo["publish_target"] -ne $expectedPublishTarget) {
+        throw "A $buildKind build must use publish_target=$expectedPublishTarget."
+    }
+
+    $channel = Read-KeyValueFile -Path $ChannelPath -DisplayName "UPDATE_CHANNEL.txt"
+    foreach ($requiredKey in @("release_branch", "source_branch", "build_kind", "publish_target")) {
+        if (
+            -not $channel.ContainsKey($requiredKey) -or
+            [string]::IsNullOrWhiteSpace($channel[$requiredKey])
+        ) {
+            throw "UPDATE_CHANNEL.txt is missing required key: $requiredKey"
+        }
+    }
+    if ($channel["release_branch"] -ne $expectedPublishTarget) {
+        throw "UPDATE_CHANNEL.txt must use release_branch=$expectedPublishTarget."
+    }
+    foreach ($matchingKey in @("source_branch", "build_kind", "publish_target")) {
+        if ($channel[$matchingKey] -ne $buildInfo[$matchingKey]) {
+            throw "UPDATE_CHANNEL.txt $matchingKey does not match BUILD_INFO.txt."
+        }
     }
 
     $latest = Read-KeyValueFile -Path $LatestPath -DisplayName "LATEST.txt"
@@ -235,8 +277,8 @@ if ($buildKind -eq "main_release") {
             throw "LATEST.txt is missing required key: $requiredKey"
         }
     }
-    if ($latest["branch"] -ne "main") {
-        throw "LATEST.txt must use branch=main."
+    if ($latest["branch"] -ne $expectedSourceBranch) {
+        throw "LATEST.txt must use branch=$expectedSourceBranch."
     }
     if ($latest["commit"] -ne $buildInfo["commit"]) {
         throw "LATEST.txt commit does not match BUILD_INFO.txt."

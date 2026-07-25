@@ -66,7 +66,7 @@ def _create_bundle(
         encoding="utf-8",
     )
     if include_live_updater is None:
-        include_live_updater = build_kind == "main_release"
+        include_live_updater = build_kind in {"main_release", "sp1_release"}
     if include_live_updater:
         (release_dir / "更新輔.cmd").write_bytes(b"@echo off\r\n")
         (system_dir / "輔更新核心.ps1").write_text(
@@ -76,6 +76,18 @@ def _create_bundle(
         (system_dir / "檢查輔同步狀態.cmd").write_bytes(b"@echo off\r\n")
         (system_dir / "檢查輔同步狀態.ps1").write_text(
             "# status fixture\n",
+            encoding="utf-8",
+        )
+        (system_dir / "UPDATE_CHANNEL.txt").write_text(
+            "\n".join(
+                (
+                    f"release_branch={publish_target}",
+                    f"source_branch={source_branch}",
+                    f"build_kind={build_kind}",
+                    f"publish_target={publish_target}",
+                    "",
+                )
+            ),
             encoding="utf-8",
         )
     if build_kind == "sp1_snapshot":
@@ -88,11 +100,11 @@ def _create_bundle(
             "validation fixture\n",
             encoding="utf-8",
         )
-    if build_kind == "main_release":
+    if build_kind in {"main_release", "sp1_release"}:
         (release_dir / "LATEST.txt").write_text(
             "\n".join(
                 (
-                    "branch=main",
+                    f"branch={source_branch}",
                     f"commit={build_info['commit']}",
                     f"run_id={build_info['run_id']}",
                     "updated_utc=2026-07-25T00:00:00Z",
@@ -107,7 +119,7 @@ def _create_bundle(
         "輔系統/BUILD_INFO.txt",
         "輔系統/verify_windows_release.ps1",
     ]
-    if build_kind == "main_release":
+    if build_kind in {"main_release", "sp1_release"}:
         manifest_paths = [
             "FLASH.exe",
             "LATEST.txt",
@@ -115,6 +127,7 @@ def _create_bundle(
             "輔系統/BUILD_INFO.txt",
             "輔系統/verify_windows_release.ps1",
             "輔系統/輔更新核心.ps1",
+            "輔系統/UPDATE_CHANNEL.txt",
             "輔系統/檢查輔同步狀態.cmd",
             "輔系統/檢查輔同步狀態.ps1",
         ]
@@ -190,6 +203,33 @@ def test_no_launch_accepts_a_main_release(tmp_path: Path):
     assert result.returncode == 0, _output(result)
 
 
+def test_no_launch_accepts_an_sp1_only_release(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="sp1_release",
+        source_branch="sp1/completion-2026-07-25",
+        publish_target="release/sp1",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode == 0, _output(result)
+
+
+def test_no_launch_accepts_an_sp1_only_push_release(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="sp1_release",
+        source_branch="sp1/completion-2026-07-25",
+        publish_target="release/sp1",
+        event_name="push",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode == 0, _output(result)
+
+
 def test_no_launch_accepts_a_non_release_validation_build(tmp_path: Path):
     verifier_path = _create_bundle(
         tmp_path,
@@ -228,6 +268,43 @@ def test_main_manifest_rejects_a_tampered_updater_core(tmp_path: Path):
 
     assert result.returncode != 0
     assert "Release file hash mismatch" in _output(result)
+
+
+def test_sp1_release_rejects_a_channel_mismatch(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="sp1_release",
+        source_branch="sp1/completion-2026-07-25",
+        publish_target="release/sp1",
+    )
+    channel_path = verifier_path.parent / "UPDATE_CHANNEL.txt"
+    content = channel_path.read_text(encoding="utf-8")
+    channel_path.write_text(
+        content.replace("release_branch=release/sp1", "release_branch=release/latest"),
+        encoding="utf-8",
+    )
+    manifest_path = verifier_path.parent / "SHA256SUMS.txt"
+    manifest = manifest_path.read_text(encoding="utf-8")
+    digest = hashlib.sha256(channel_path.read_bytes()).hexdigest()
+    manifest_path.write_text(
+        "\n".join(
+            (
+                *(
+                    f"{digest}  輔系統/UPDATE_CHANNEL.txt"
+                    if line.endswith("  輔系統/UPDATE_CHANNEL.txt")
+                    else line
+                    for line in manifest.splitlines()
+                ),
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode != 0
+    assert "release_branch=release/sp1" in _output(result)
 
 
 def test_sp1_snapshot_rejects_a_live_publish_target(tmp_path: Path):

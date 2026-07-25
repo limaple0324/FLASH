@@ -1,6 +1,6 @@
 ﻿# 輔更新核心
 # 用途：由固定的「更新輔.cmd」複製到 TEMP 後執行。
-# 所有正式檔案都從同一個 release/latest commit 下載，先驗證，再交易式套用。
+# 所有正式檔案都從安裝包鎖定的更新分支同一個 commit 下載，先驗證，再交易式套用。
 
 param(
     [string]$InstallDirectory = "",
@@ -19,8 +19,9 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $Repo = "limaple0324/FLASH"
-$ReleaseBranch = "release/latest"
+$ReleaseBranch = ""
 $ManifestRelativePath = "輔系統/SHA256SUMS.txt"
+$ChannelRelativePath = "輔系統/UPDATE_CHANNEL.txt"
 $PayloadPaths = @(
     "FLASH.exe",
     "LATEST.txt",
@@ -28,10 +29,11 @@ $PayloadPaths = @(
     "輔系統/BUILD_INFO.txt",
     "輔系統/verify_windows_release.ps1",
     "輔系統/輔更新核心.ps1",
+    $ChannelRelativePath,
     "輔系統/檢查輔同步狀態.cmd",
     "輔系統/檢查輔同步狀態.ps1"
 )
-$FixedBootstrapPath = "更新輔.cmd"
+$FixedIdentityPaths = @("更新輔.cmd", $ChannelRelativePath)
 $DownloadPaths = @($PayloadPaths + $ManifestRelativePath)
 
 if ([string]::IsNullOrWhiteSpace($InstallDirectory)) {
@@ -148,6 +150,43 @@ function Require-MetadataValue(
     }
 }
 
+function Read-InstalledUpdateChannel {
+    $channelPath = Get-PayloadPath -Root $InstallDir -RelativePath $ChannelRelativePath
+    $channel = Read-KeyValueFile -Path $channelPath -DisplayName "UPDATE_CHANNEL.txt"
+    foreach ($requiredKey in @("release_branch", "source_branch", "build_kind", "publish_target")) {
+        if (
+            -not $channel.ContainsKey($requiredKey) -or
+            [string]::IsNullOrWhiteSpace($channel[$requiredKey])
+        ) {
+            throw "UPDATE_CHANNEL.txt 缺少欄位：$requiredKey"
+        }
+    }
+
+    $allowedIdentity = @{
+        "release/latest" = @{
+            source_branch = "main"
+            build_kind = "main_release"
+            publish_target = "release/latest"
+        }
+        "release/sp1" = @{
+            source_branch = "sp1/completion-2026-07-25"
+            build_kind = "sp1_release"
+            publish_target = "release/sp1"
+        }
+    }
+    $releaseBranch = $channel["release_branch"]
+    if (-not $allowedIdentity.ContainsKey($releaseBranch)) {
+        throw "UPDATE_CHANNEL.txt 的 release_branch 不受支援：$releaseBranch"
+    }
+    $expected = $allowedIdentity[$releaseBranch]
+    foreach ($key in @("source_branch", "build_kind", "publish_target")) {
+        if ($channel[$key] -ne $expected[$key]) {
+            throw "UPDATE_CHANNEL.txt 的 $key 與 $releaseBranch 不一致。"
+        }
+    }
+    return $channel
+}
+
 function Read-AndVerifyManifest([string]$Root) {
     $manifestPath = Get-PayloadPath -Root $Root -RelativePath $ManifestRelativePath
     Require-File $manifestPath
@@ -189,20 +228,40 @@ function Read-AndVerifyManifest([string]$Root) {
     return $manifest
 }
 
-function Assert-MainReleaseIdentity([string]$Root, [hashtable]$Manifest) {
+function Assert-ReleaseIdentity(
+    [string]$Root,
+    [hashtable]$Manifest,
+    [hashtable]$ExpectedChannel
+) {
     $buildInfoPath = Get-PayloadPath -Root $Root -RelativePath "輔系統/BUILD_INFO.txt"
     $latestPath = Get-PayloadPath -Root $Root -RelativePath "LATEST.txt"
+    $channelPath = Get-PayloadPath -Root $Root -RelativePath $ChannelRelativePath
     $buildInfo = Read-KeyValueFile -Path $buildInfoPath -DisplayName "BUILD_INFO.txt"
     $latest = Read-KeyValueFile -Path $latestPath -DisplayName "LATEST.txt"
+    $channel = Read-KeyValueFile -Path $channelPath -DisplayName "UPDATE_CHANNEL.txt"
 
     Require-MetadataValue $buildInfo "product" "FLASH" "BUILD_INFO.txt"
     Require-MetadataValue $buildInfo "milestone" "SP1" "BUILD_INFO.txt"
-    Require-MetadataValue $buildInfo "build_kind" "main_release" "BUILD_INFO.txt"
-    Require-MetadataValue $buildInfo "event_name" "push" "BUILD_INFO.txt"
-    Require-MetadataValue $buildInfo "source_ref" "refs/heads/main" "BUILD_INFO.txt"
-    Require-MetadataValue $buildInfo "source_branch" "main" "BUILD_INFO.txt"
-    Require-MetadataValue $buildInfo "publish_target" "release/latest" "BUILD_INFO.txt"
-    Require-MetadataValue $latest "branch" "main" "LATEST.txt"
+    foreach ($key in @("source_branch", "build_kind", "publish_target")) {
+        Require-MetadataValue $buildInfo $key $ExpectedChannel[$key] "BUILD_INFO.txt"
+        Require-MetadataValue $channel $key $ExpectedChannel[$key] "UPDATE_CHANNEL.txt"
+    }
+    Require-MetadataValue $channel "release_branch" $ExpectedChannel["release_branch"] "UPDATE_CHANNEL.txt"
+    Require-MetadataValue $latest "branch" $ExpectedChannel["source_branch"] "LATEST.txt"
+    if ($ExpectedChannel["build_kind"] -eq "main_release") {
+        Require-MetadataValue $buildInfo "event_name" "push" "BUILD_INFO.txt"
+        Require-MetadataValue $buildInfo "source_ref" "refs/heads/main" "BUILD_INFO.txt"
+    }
+    else {
+        if ($buildInfo["event_name"] -notin @("push", "workflow_dispatch")) {
+            throw "BUILD_INFO.txt 的 event_name 必須是 push 或 workflow_dispatch。"
+        }
+        Require-MetadataValue `
+            $buildInfo `
+            "source_ref" `
+            "refs/heads/sp1/completion-2026-07-25" `
+            "BUILD_INFO.txt"
+    }
 
     foreach ($requiredKey in @("commit", "run_id", "sha256")) {
         if (
@@ -252,7 +311,7 @@ function Resolve-ReleaseCommit {
         return $ResolvedReleaseCommit.ToLowerInvariant()
     }
 
-    Write-Step "解析 release/latest 的固定發布版本。"
+    Write-Step "解析 $ReleaseBranch 的固定發布版本。"
     $headers = @{
         "Accept" = "application/vnd.github+json"
         "User-Agent" = "FLASH-SP1-Windows-Updater"
@@ -265,7 +324,7 @@ function Resolve-ReleaseCommit {
         -UseBasicParsing
     $commit = [string]$response.sha
     if ($commit -notmatch "^[0-9a-fA-F]{40}$") {
-        throw "GitHub 沒有回傳有效的 release/latest commit。"
+        throw "GitHub 沒有回傳有效的 $ReleaseBranch commit。"
     }
     return $commit.ToLowerInvariant()
 }
@@ -404,6 +463,10 @@ try {
         Start-Sleep -Milliseconds $TestHoldLockMilliseconds
     }
 
+    $updateChannel = Read-InstalledUpdateChannel
+    $ReleaseBranch = $updateChannel["release_branch"]
+    Write-Step "固定更新來源：$ReleaseBranch"
+
     if (-not $UsingLocalSource) {
         $running = Get-Process -Name "FLASH" -ErrorAction SilentlyContinue
         if ($running) {
@@ -426,21 +489,26 @@ try {
 
     Write-Step "逐檔核對完整 SHA-256 manifest。"
     $manifest = Read-AndVerifyManifest -Root $StageRoot
-    $buildInfo = Assert-MainReleaseIdentity -Root $StageRoot -Manifest $manifest
+    $buildInfo = Assert-ReleaseIdentity `
+        -Root $StageRoot `
+        -Manifest $manifest `
+        -ExpectedChannel $updateChannel
     Invoke-StagedVerifier -Root $StageRoot -Description "安裝前驗證"
 
-    $installedBootstrap = Get-PayloadPath -Root $InstallDir -RelativePath $FixedBootstrapPath
-    $stagedBootstrap = Get-PayloadPath -Root $StageRoot -RelativePath $FixedBootstrapPath
-    Require-File $installedBootstrap
-    $installedBootstrapHash = Get-Sha256Hex -Path $installedBootstrap
-    $stagedBootstrapHash = Get-Sha256Hex -Path $stagedBootstrap
-    if ($installedBootstrapHash -ne $stagedBootstrapHash) {
-        throw "固定更新啟動器版本不相容；未修改任何檔案，請改用完整安裝包更新。"
+    foreach ($fixedIdentityPath in $FixedIdentityPaths) {
+        $installedIdentity = Get-PayloadPath -Root $InstallDir -RelativePath $fixedIdentityPath
+        $stagedIdentity = Get-PayloadPath -Root $StageRoot -RelativePath $fixedIdentityPath
+        Require-File $installedIdentity
+        $installedIdentityHash = Get-Sha256Hex -Path $installedIdentity
+        $stagedIdentityHash = Get-Sha256Hex -Path $stagedIdentity
+        if ($installedIdentityHash -ne $stagedIdentityHash) {
+            throw "固定更新身分檔案版本不相容：$fixedIdentityPath；未修改任何檔案，請改用完整安裝包更新。"
+        }
     }
 
     Write-Step "所有安裝前檢查通過，開始交易式套用。"
     $sequence = 0
-    foreach ($relativePath in ($PayloadPaths | Where-Object { $_ -ne $FixedBootstrapPath })) {
+    foreach ($relativePath in ($PayloadPaths | Where-Object { $FixedIdentityPaths -notcontains $_ })) {
         $sequence++
         $sourcePath = Get-PayloadPath -Root $StageRoot -RelativePath $relativePath
         Install-FileAtomically `

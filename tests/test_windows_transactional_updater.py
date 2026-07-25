@@ -24,12 +24,14 @@ PAYLOAD_PATHS = (
     "輔系統/BUILD_INFO.txt",
     "輔系統/verify_windows_release.ps1",
     "輔系統/輔更新核心.ps1",
+    "輔系統/UPDATE_CHANNEL.txt",
     "輔系統/檢查輔同步狀態.cmd",
     "輔系統/檢查輔同步狀態.ps1",
 )
-MUTABLE_PATHS = tuple(path for path in PAYLOAD_PATHS if path != "更新輔.cmd") + (
-    MANIFEST_PATH,
-)
+FIXED_IDENTITY_PATHS = ("更新輔.cmd", "輔系統/UPDATE_CHANNEL.txt")
+MUTABLE_PATHS = tuple(
+    path for path in PAYLOAD_PATHS if path not in FIXED_IDENTITY_PATHS
+) + (MANIFEST_PATH,)
 
 pytestmark = pytest.mark.skipif(
     POWERSHELL is None,
@@ -68,6 +70,11 @@ def _create_release(
     missing_path: str | None = None,
     corrupt_path: str | None = None,
     latest_commit: str = SOURCE_COMMIT,
+    build_kind: str = "main_release",
+    event_name: str = "push",
+    source_ref: str = "refs/heads/main",
+    source_branch: str = "main",
+    publish_target: str = "release/latest",
 ) -> Path:
     release_root = root / "release"
     (release_root / "輔系統").mkdir(parents=True)
@@ -77,15 +84,27 @@ def _create_release(
     executable_hash = hashlib.sha256(
         (release_root / "FLASH.exe").read_bytes()
     ).hexdigest()
+    _path(release_root, "輔系統/UPDATE_CHANNEL.txt").write_text(
+        "\n".join(
+            (
+                f"release_branch={publish_target}",
+                f"source_branch={source_branch}",
+                f"build_kind={build_kind}",
+                f"publish_target={publish_target}",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
     build_info = {
         "product": "FLASH",
         "version": "0.1.2",
         "milestone": milestone,
-        "build_kind": "main_release",
-        "event_name": "push",
-        "source_ref": "refs/heads/main",
-        "source_branch": "main",
-        "publish_target": "release/latest",
+        "build_kind": build_kind,
+        "event_name": event_name,
+        "source_ref": source_ref,
+        "source_branch": source_branch,
+        "publish_target": publish_target,
         "commit": SOURCE_COMMIT,
         "run_id": "123456789",
         "built_utc": "2026-07-25T00:00:00Z",
@@ -99,7 +118,7 @@ def _create_release(
     (release_root / "LATEST.txt").write_text(
         "\n".join(
             (
-                "branch=main",
+                f"branch={source_branch}",
                 f"commit={latest_commit}",
                 "run_id=123456789",
                 "updated_utc=2026-07-25T00:00:00Z",
@@ -127,10 +146,28 @@ def _create_release(
     return release_root
 
 
-def _create_existing_install(root: Path) -> Path:
+def _create_existing_install(
+    root: Path,
+    *,
+    build_kind: str = "main_release",
+    source_branch: str = "main",
+    publish_target: str = "release/latest",
+) -> Path:
     install_root = root / "安裝"
     (install_root / "輔系統").mkdir(parents=True)
     shutil.copy2(LAUNCHER_SOURCE, install_root / "更新輔.cmd")
+    _path(install_root, "輔系統/UPDATE_CHANNEL.txt").write_text(
+        "\n".join(
+            (
+                f"release_branch={publish_target}",
+                f"source_branch={source_branch}",
+                f"build_kind={build_kind}",
+                f"publish_target={publish_target}",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
     for relative_path in MUTABLE_PATHS:
         target = _path(install_root, relative_path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -321,8 +358,34 @@ def test_changed_fixed_bootstrap_requires_a_full_installer(tmp_path: Path):
     assert result.returncode != 0, _output(result)
     assert _installed_payload_snapshot(install_root) == before
     log = _log(install_root)
-    assert "固定更新啟動器版本不相容" in log
+    assert "固定更新身分檔案版本不相容：更新輔.cmd" in log
     assert "請改用完整安裝包更新" in log
+
+
+def test_changed_update_channel_requires_a_full_installer(tmp_path: Path):
+    release_root = _create_release(tmp_path)
+    install_root = _create_existing_install(tmp_path)
+    _path(install_root, "輔系統/UPDATE_CHANNEL.txt").write_text(
+        "\n".join(
+            (
+                "release_branch=release/sp1",
+                "source_branch=sp1/completion-2026-07-25",
+                "build_kind=sp1_release",
+                "publish_target=release/sp1",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    before = _installed_payload_snapshot(install_root)
+
+    result = _run_updater(install_root, release_root)
+
+    assert result.returncode != 0, _output(result)
+    assert _installed_payload_snapshot(install_root) == before
+    assert "BUILD_INFO.txt 的 source_branch 必須是 sp1/completion-2026-07-25" in (
+        _log(install_root)
+    )
 
 
 def test_second_updater_instance_is_rejected_by_the_single_lock(tmp_path: Path):
@@ -388,3 +451,32 @@ def test_success_uses_one_fixed_release_commit_and_verifies_installed_files(
     assert "commits/$ReleaseBranch" in updater
     assert "raw.githubusercontent.com/$Repo/$ReleaseCommit/$urlPath" in updater
     assert "?t=" not in updater
+
+
+def test_sp1_only_channel_updates_only_from_the_sp1_release_identity(tmp_path: Path):
+    release_root = _create_release(
+        tmp_path,
+        build_kind="sp1_release",
+        event_name="push",
+        source_ref="refs/heads/sp1/completion-2026-07-25",
+        source_branch="sp1/completion-2026-07-25",
+        publish_target="release/sp1",
+    )
+    install_root = _create_existing_install(
+        tmp_path,
+        build_kind="sp1_release",
+        source_branch="sp1/completion-2026-07-25",
+        publish_target="release/sp1",
+    )
+
+    result = _run_updater(install_root, release_root)
+
+    assert result.returncode == 0, _output(result)
+    assert "固定更新來源：release/sp1" in _log(install_root)
+    assert _path(
+        install_root,
+        "輔系統/UPDATE_CHANNEL.txt",
+    ).read_bytes() == _path(
+        release_root,
+        "輔系統/UPDATE_CHANNEL.txt",
+    ).read_bytes()
