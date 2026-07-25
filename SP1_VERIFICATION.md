@@ -9,6 +9,14 @@ self-checks, a target-window read-only event chain, and an explicit read-only st
 recheck. The latest downloaded Windows
 integration artifact still comes from older source `893f65e`; neither source evidence
 nor that artifact proves an updated `release/latest` or complete Windows 11 acceptance.
+New development is now gated in strict SP1 -> SP2 -> SP3 order: no new SP2 or SP3
+features begin until every applicable SP1 gate in this checklist has passed. Existing
+integration work remains preserved and is not rolled back.
+The player-viewable window-registry area is direction-only: fields, status semantics,
+copy, and large-list layout are not yet approved, so implementation remains paused.
+Soul artifacts, pet talents, obsidian, life souls, and inventory also remain frozen.
+SP1, SP2, and SP3 each require a traceable independent delivery area/file; the SP3
+stage additionally requires one complete SP1+SP2+SP3 integrated delivery.
 
 ## A. Repository and delivery update
 
