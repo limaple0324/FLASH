@@ -26,9 +26,10 @@ PowerShell 5.1 包內驗證器，永久檔名為
 `FLASH-SP1-Windows-0.1.2-689a186-snapshot.zip`，ZIP SHA-256 與 GitHub
 artifact digest 均為
 `30aca05eb2e8c84f10c58a86cc34af89cda8559b31989b8b6cb266e007b231fa`。
-此快照沒有發布 `release/latest`。上述工程證據不代表
-乾淨 Windows 11 帳號、真正遊戲視窗、背景／最小化、斷線重連、安全輸入、
-目標電腦更新或正式發布驗收已通過。
+此快照沒有發布 `release/latest`。同一 ZIP 已在 Windows 11 build `26200`
+以隔離資料目錄完成兩次啟動、正常關閉、重開、持久化、8/8 包裝自我檢查及
+無主控台視窗驗收。這不代表乾淨的新 Windows 帳號、真正遊戲視窗、
+背景／最小化、斷線重連、安全輸入、目標電腦更新或正式發布驗收已通過。
 
 ## 後續成品紀錄
 

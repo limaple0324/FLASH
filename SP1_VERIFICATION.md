@@ -15,8 +15,11 @@ packaged self-checks, Windows EXE creation, bundle layout, metadata, hashes, and
 artifact upload. The `689a186` snapshot also passed its bundled verifier under
 local Windows PowerShell 5.1. Its ZIP SHA-256 matches the GitHub artifact digest:
 `30aca05eb2e8c84f10c58a86cc34af89cda8559b31989b8b6cb266e007b231fa`.
-This is not evidence of completed Windows 11/game acceptance, so SP1 is still
-not formally complete.
+On Windows 11 build 26200, the downloaded artifact also passed two GUI launches,
+normal close/reopen, isolated config/log/registry persistence, 8/8 packaged
+self-check results, and no-console verification. This used the current Windows
+account with isolated `APPDATA`/`LOCALAPPDATA`, not a clean new user account, and
+did not exercise a real game flow. SP1 is therefore still not formally complete.
 
 Every new item must be confirmed as discussed before implementation. The
 player-viewable window-registry area and the five frozen resource areas remain
@@ -59,7 +62,7 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] Corrupt configuration is preserved and rebuilt automatically.
 - [ ] Confirm detailed results display correctly in the packaged application on
   the target Windows 11 desktop.
-- [ ] Confirm all checks pass in the packaged executable on the target desktop.
+- [x] Confirm all checks pass in the packaged executable on the target desktop.
 
 ## D. Recovery, reconnect, and window safety
 
@@ -120,9 +123,11 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
 - [x] Verify the `689a186` bundle, metadata, manifest, hashes, artifact digest,
   bundled Windows PowerShell 5.1 verifier, and cloud packaged `--self-check`.
 - [ ] Confirm a successful GitHub Actions run for current `main`.
-- [ ] Download and launch the current artifact.
-- [ ] Confirm config and log persistence after closing and reopening.
-- [ ] Confirm no console window appears.
+- [x] Download and launch the current artifact on Windows 11 build 26200 with an
+  isolated data profile.
+- [x] Confirm config, log, self-check, and window-registry persistence after
+  closing and reopening.
+- [x] Confirm no console window appears.
 - [ ] Complete user acceptance test on the target desktop.
 
 ## Delivery states
