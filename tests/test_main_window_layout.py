@@ -13,7 +13,10 @@ def test_main_window_uses_home_view():
     assert "window.after_idle(" in source
     assert "home_view.refresh_workspace" in source
     assert "card_service.subscribe" in source
-    assert "window.after_idle(home_view.refresh_cards)" in source
+    assert "schedule_home_refresh" in source
+    assert "home_view.refresh_cards" in source
+    assert "target_window_state_service.subscribe" in source
+    assert "home_view.refresh_target_window" in source
     assert "CardExpiryMonitor(card_service, window.after)" in source
     assert "card_expiry_monitor.start()" in source
 

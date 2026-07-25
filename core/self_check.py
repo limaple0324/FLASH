@@ -11,6 +11,7 @@ from cards.settings import CardDisplaySettings, CardDisplaySettingsResolution
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.sp1_boundaries import ExternalAdapter, RecoveryBoundary, SmartReconnectBoundary
+from core.target_window_observation import TargetWindowObservation
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from domain.progress_store import ActivityProgressStore
@@ -21,6 +22,7 @@ from services.card_history_service import CardHistoryService
 from services.card_preview_selection_service import CardPreviewSelectionService
 from services.card_preview_selection_store import CardPreviewSelectionStore
 from services.logger_service import LoggerService
+from services.target_window_state_service import TargetWindowStateService
 from workspace.models import WorkspaceState
 from workspace.service import WorkspaceService
 
@@ -54,6 +56,10 @@ class SelfCheck:
             self._run("window_registry", self._check_window_registry),
             self._run("activity_progress", self._check_activity_progress),
             self._run("workspace_service", self._check_workspace_service),
+            self._run(
+                "target_window_state",
+                self._check_target_window_state,
+            ),
             self._run("card_history", self._check_card_history),
             self._run("card_display_settings", self._check_card_display_settings),
             self._run("card_preview_selection", self._check_card_preview_selection),
@@ -143,6 +149,24 @@ class SelfCheck:
         if not isinstance(state, WorkspaceState):
             raise RuntimeError("WorkspaceService did not return a WorkspaceState.")
         return "Workspace service provides a valid read-only state."
+
+    def _check_target_window_state(self) -> str:
+        service = self.context.get(TargetWindowStateService)
+        event_bus = self.context.get(EventBus)
+        if service is None:
+            raise RuntimeError("TargetWindowStateService is not registered.")
+        if event_bus is None:
+            raise RuntimeError("EventBus is not registered.")
+        if service.event_bus is not event_bus:
+            raise RuntimeError(
+                "Target-window state service does not use the registered EventBus."
+            )
+        state = service.snapshot()
+        if not isinstance(state, TargetWindowObservation):
+            raise RuntimeError(
+                "Target-window state service did not return a valid observation."
+            )
+        return "Target-window state service provides a valid read-only observation."
 
     def _check_card_history(self) -> str:
         store = self.context.get(CardHistoryStore)

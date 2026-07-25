@@ -10,6 +10,8 @@ from collections.abc import Callable, Iterable
 from tkinter import BOTH, X, Button, Entry, Frame, Label
 
 from cards.view_state import CardViewState
+from core.target_window_observation import TargetWindowObservation
+from presentation.target_window_status import target_window_summary
 from services.card_preview_selection_service import CardPreviewChoice
 from services.character_detail_view_service import PlayerCharacterDetail
 from services.character_view_service import PlayerCharacterView
@@ -148,6 +150,18 @@ def _status_text(status: dict[str, object]) -> str:
     return "目前狀態\n● 已準備完成"
 
 
+def _target_window_text(
+    status: dict[str, object],
+    observation: TargetWindowObservation | None,
+) -> str:
+    """Render the safe SP2 snapshot while retaining the legacy status fallback."""
+    if not bool(status.get("self_check_passed", False)):
+        return "目前狀態\n● 需要檢查"
+    if observation is None:
+        return _status_text(status)
+    return f"目前狀態\n● {target_window_summary(observation)}"
+
+
 def _workspace_text(state: WorkspaceState) -> str:
     """Render only confirmed workspace state without exposing stable IDs."""
     if not isinstance(state, WorkspaceState):
@@ -219,12 +233,24 @@ class HomeView:
         workspace_state: WorkspaceState | None = None,
         workspace_state_provider: Callable[[], WorkspaceState] | None = None,
         on_workspace_error: Callable[[Exception], object] | None = None,
+        target_window_state: TargetWindowObservation | None = None,
+        target_window_state_provider: (
+            Callable[[], TargetWindowObservation] | None
+        ) = None,
+        on_target_window_error: Callable[[Exception], object] | None = None,
     ):
         if workspace_state is not None and not isinstance(
             workspace_state,
             WorkspaceState,
         ):
             raise TypeError("workspace_state must be WorkspaceState or None.")
+        if target_window_state is not None and not isinstance(
+            target_window_state,
+            TargetWindowObservation,
+        ):
+            raise TypeError(
+                "target_window_state must be TargetWindowObservation or None."
+            )
         self.parent = parent
         self.status = status
         self.on_start = on_start
@@ -241,8 +267,12 @@ class HomeView:
         self.workspace_state = workspace_state or WorkspaceState()
         self.workspace_state_provider = workspace_state_provider
         self.on_workspace_error = on_workspace_error
+        self.target_window_state = target_window_state
+        self.target_window_state_provider = target_window_state_provider
+        self.on_target_window_error = on_target_window_error
         self._card_label = None
         self._workspace_label = None
+        self._target_window_label = None
         self._card_preview_buttons: dict[str, Button] = {}
         self._card_preview_clear_button: Button | None = None
         self._card_preview_clear_visible = False
@@ -276,6 +306,34 @@ class HomeView:
         self.workspace_state = state
         if self._workspace_label is not None:
             self._workspace_label.configure(text=text)
+        return text
+
+    def refresh_target_window(self) -> str:
+        """Refresh the player-safe observation and keep the last good snapshot."""
+        previous_state = self.target_window_state
+        try:
+            state = (
+                self.target_window_state_provider()
+                if self.target_window_state_provider is not None
+                else previous_state
+            )
+            if state is not None and not isinstance(
+                state,
+                TargetWindowObservation,
+            ):
+                raise TypeError(
+                    "target window provider must return TargetWindowObservation."
+                )
+            text = _target_window_text(self.status, state)
+            if self._target_window_label is not None:
+                self._target_window_label.configure(text=text)
+        except Exception as error:
+            if self.on_target_window_error is None:
+                raise
+            self.on_target_window_error(error)
+            return _target_window_text(self.status, previous_state)
+
+        self.target_window_state = state
         return text
 
     def refresh_card_preview_choices(self) -> tuple[CardPreviewChoice, ...]:
@@ -389,12 +447,13 @@ class HomeView:
             command=self.on_start,
         ).pack(pady=12)
 
-        Label(
+        self._target_window_label = Label(
             body,
-            text=_status_text(self.status),
+            text=self.refresh_target_window(),
             font=("Microsoft JhengHei UI", 11),
             anchor="w",
-        ).pack(fill=X, pady=12)
+        )
+        self._target_window_label.pack(fill=X, pady=12)
 
         self._workspace_label = Label(
             body,

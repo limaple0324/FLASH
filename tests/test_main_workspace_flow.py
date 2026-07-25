@@ -1,8 +1,11 @@
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+from core.target_window_observation import TargetWindowObservation
 from domain.group import CharacterGroup
 from main import build_services, create_main_window
 from services.app_context import AppContext
+from services.event_bus import EventBus
+from services.target_window_state_service import TARGET_WINDOW_OBSERVED_EVENT
 from workspace.models import WorkspaceState
 from workspace.service import WorkspaceService
 
@@ -10,6 +13,7 @@ from workspace.service import WorkspaceService
 class _FakeWindow:
     def __init__(self) -> None:
         self.idle_callbacks = []
+        self.protocols = {}
 
     def title(self, _value) -> None:
         pass
@@ -27,8 +31,8 @@ class _FakeWindow:
         self.after_callback = callback
         return "after-id"
 
-    def protocol(self, _name, _callback) -> None:
-        pass
+    def protocol(self, name, callback) -> None:
+        self.protocols[name] = callback
 
     def destroy(self) -> None:
         pass
@@ -38,6 +42,7 @@ class _FakeHomeView:
     def __init__(self, *_args, **kwargs) -> None:
         self.kwargs = kwargs
         self.workspace_refreshes = []
+        self.target_window_refreshes = []
 
     def build(self) -> None:
         pass
@@ -48,6 +53,11 @@ class _FakeHomeView:
     def refresh_workspace(self) -> None:
         self.workspace_refreshes.append(
             self.kwargs["workspace_state_provider"]()
+        )
+
+    def refresh_target_window(self) -> None:
+        self.target_window_refreshes.append(
+            self.kwargs["target_window_state_provider"]()
         )
 
 
@@ -156,3 +166,126 @@ def test_main_window_workspace_error_is_chinese_and_hides_internal_details(
     assert r"C:\private\workspace.json" in (
         tmp_path / "logs" / "flash.log"
     ).read_text(encoding="utf-8")
+
+
+def test_main_window_wires_event_backed_target_window_provider_and_refresh(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import main
+
+    build_services(root=tmp_path)
+    window = _FakeWindow()
+    monkeypatch.setattr(main, "Tk", lambda: window)
+    monkeypatch.setattr(main, "HomeView", _FakeHomeView)
+    monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
+    monkeypatch.setattr(
+        main,
+        "_build_registered_card_overlay_runtime",
+        lambda _window: None,
+    )
+
+    created = create_main_window(
+        {"self_check_passed": True},
+        AppContext.get(main.PathManager),
+    )
+    provider = created._home_view.kwargs["target_window_state_provider"]
+
+    assert provider() == TargetWindowObservation.not_observed()
+    assert "target_window_state_service" not in created._home_view.kwargs
+
+    observed = TargetWindowObservation.from_detection(
+        {
+            "configured": True,
+            "safe": True,
+            "code": "window.ready",
+        }
+    )
+    AppContext.get(EventBus).publish(TARGET_WINDOW_OBSERVED_EVENT, observed)
+
+    assert len(window.idle_callbacks) == 1
+    window.idle_callbacks[0]()
+    assert created._home_view.target_window_refreshes == [observed]
+
+
+def test_main_window_target_window_refresh_error_is_chinese_and_private(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import main
+
+    build_services(root=tmp_path)
+    window = _FakeWindow()
+    shown = []
+    monkeypatch.setattr(main, "Tk", lambda: window)
+    monkeypatch.setattr(main, "HomeView", _FakeHomeView)
+    monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
+    monkeypatch.setattr(
+        main,
+        "_build_registered_card_overlay_runtime",
+        lambda _window: None,
+    )
+    monkeypatch.setattr(
+        main.messagebox,
+        "showerror",
+        lambda title, message, parent: shown.append((title, message, parent)),
+    )
+
+    created = create_main_window(
+        {"self_check_passed": True},
+        AppContext.get(main.PathManager),
+    )
+    created._home_view.kwargs["on_target_window_error"](
+        OSError(r"C:\private\target-window.json")
+    )
+
+    assert shown == [
+        (
+            "輔｜遊戲視窗狀態",
+            (
+                "無法更新遊戲視窗狀態，已保留上次顯示的內容。\n\n"
+                "所有遊戲操作仍保持停用；錯誤已寫入紀錄。"
+            ),
+            window,
+        )
+    ]
+    assert r"C:\private\target-window.json" not in shown[0][1]
+    assert r"C:\private\target-window.json" in (
+        tmp_path / "logs" / "flash.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_closing_main_window_unsubscribes_target_window_refresh(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import main
+
+    build_services(root=tmp_path)
+    window = _FakeWindow()
+    monkeypatch.setattr(main, "Tk", lambda: window)
+    monkeypatch.setattr(main, "HomeView", _FakeHomeView)
+    monkeypatch.setattr(main, "apply_window_icon", lambda _window: None)
+    monkeypatch.setattr(
+        main,
+        "_build_registered_card_overlay_runtime",
+        lambda _window: None,
+    )
+
+    create_main_window(
+        {"self_check_passed": True},
+        AppContext.get(main.PathManager),
+    )
+    window.protocols["WM_DELETE_WINDOW"]()
+    AppContext.get(EventBus).publish(
+        TARGET_WINDOW_OBSERVED_EVENT,
+        TargetWindowObservation.from_detection(
+            {
+                "configured": True,
+                "safe": True,
+                "code": "window.ready",
+            }
+        ),
+    )
+
+    assert window.idle_callbacks == []

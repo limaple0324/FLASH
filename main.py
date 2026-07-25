@@ -27,12 +27,14 @@ from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.bootstrap import Bootstrap
 from core.sp1_boundaries import ExternalAdapter
+from core.target_window_observation import TargetWindowObservation
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from domain.character_store import CharacterStore
 from domain.life_soul_store import LifeSoulStore
 from domain.progress_store import ActivityProgressStore
 from domain.soul_stone_store import SoulStoneStore
+from presentation.target_window_status import target_window_player_message
 from product.identity import PRODUCT_NAME
 from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
@@ -53,6 +55,10 @@ from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from services.life_soul_service import LifeSoulService
 from services.soul_stone_service import SoulStoneService
+from services.target_window_state_service import (
+    TARGET_WINDOW_OBSERVED_EVENT,
+    TargetWindowStateService,
+)
 from ui.builtin_card_preview_catalog import build_builtin_card_preview_catalog
 from ui.home import HomeView
 from ui.card_preview_settings import CardPreviewCatalog
@@ -146,6 +152,7 @@ def build_services(
     logger = LoggerService(paths.log_file("flash.log"))
     config = ConfigManager(paths.config_file("settings.json"))
     event_bus = EventBus(logger=logger)
+    target_window_state_service = TargetWindowStateService(event_bus, logger)
     card_display_settings_resolution = resolve_card_display_settings(config.data)
 
     registry_store = WindowRegistryStore(paths.data_dir() / REGISTRY_FILENAME)
@@ -192,6 +199,7 @@ def build_services(
         card_display_settings_resolution,
     )
     AppContext.register(EventBus, event_bus)
+    AppContext.register(TargetWindowStateService, target_window_state_service)
     AppContext.register(WindowRegistryStore, registry_store)
     AppContext.register(WindowRegistry, registry)
     AppContext.register(CharacterStore, character_store)
@@ -334,6 +342,46 @@ def registry_status() -> dict[str, object]:
     }
 
 
+def player_home_status(status: dict[str, object]) -> dict[str, object]:
+    """Remove control details before the startup report reaches SP3."""
+    registry = status.get("window_registry", {})
+    raw_characters = (
+        registry.get("characters", [])
+        if isinstance(registry, dict)
+        else []
+    )
+    characters: list[dict[str, object]] = []
+    if isinstance(raw_characters, list):
+        for raw in raw_characters:
+            if not isinstance(raw, dict):
+                continue
+            visible: dict[str, object] = {}
+            for field in ("display_name", "group", "role", "note"):
+                value = raw.get(field)
+                if isinstance(value, str):
+                    visible[field] = value
+            if visible:
+                characters.append(visible)
+
+    target = status.get("target_window", {})
+    configured = (
+        target.get("configured") is True
+        if isinstance(target, dict)
+        else False
+    )
+    safe = (
+        configured and target.get("safe") is True
+        if isinstance(target, dict)
+        else False
+    )
+    target_status = {"configured": configured, "safe": safe}
+    return {
+        "self_check_passed": status.get("self_check_passed") is True,
+        "window_registry": {"characters": characters},
+        "target_window": target_status,
+    }
+
+
 def detect_target_window() -> dict[str, object]:
     adapter = AppContext.get(ExternalAdapter)
     if adapter is None:
@@ -352,6 +400,18 @@ def detect_target_window() -> dict[str, object]:
         "message": result.message,
         "details": dict(result.details) if result.details is not None else None,
     }
+
+
+def publish_target_window_observation(
+    detection: dict[str, object],
+) -> TargetWindowObservation:
+    """Publish one player-safe SP1 fact without forwarding adapter details."""
+    observation = TargetWindowObservation.from_detection(detection)
+    event_bus = AppContext.get(EventBus)
+    if event_bus is None:
+        raise RuntimeError("EventBus is unavailable.")
+    event_bus.publish(TARGET_WINDOW_OBSERVED_EVENT, observation)
+    return observation
 
 
 def detect_background_capabilities() -> dict[str, object]:
@@ -523,7 +583,8 @@ def format_registry_status(status: dict[str, object]) -> str:
 
 
 def _attach_card_overlay_runtime(window: Tk, runtime: CardOverlayRuntime | None) -> None:
-    if runtime is None:
+    cleanup = getattr(window, "_home_view_cleanup", None)
+    if runtime is None and not callable(cleanup):
         return
 
     closed = False
@@ -534,13 +595,21 @@ def _attach_card_overlay_runtime(window: Tk, runtime: CardOverlayRuntime | None)
             return
         closed = True
         try:
-            runtime.stop()
+            if callable(cleanup):
+                cleanup()
+        except Exception as exc:
+            window._home_view_cleanup_error = exc
+        try:
+            if runtime is not None:
+                runtime.stop()
         except Exception as exc:
             window._card_overlay_stop_error = exc
         finally:
             window.destroy()
 
     window.protocol("WM_DELETE_WINDOW", close_window)
+    if runtime is None:
+        return
     window._card_overlay_runtime = runtime
     try:
         runtime.start()
@@ -949,11 +1018,18 @@ def create_main_window(
         return card_display_settings_service.snapshot().settings.lifetime_seconds
 
     def show_start_status() -> None:
+        target_window_state = AppContext.get(TargetWindowStateService)
+        target_window_message = (
+            target_window_player_message(target_window_state.snapshot())
+            if target_window_state is not None
+            else "目前無法取得遊戲視窗狀態；所有遊戲操作保持停用。"
+        )
         messagebox.showinfo(
             "輔｜目前狀態",
             (
                 "目前可以查看狀態與紀錄。\n\n"
                 "遊戲操作尚未啟用，輔不會自動點擊或控制遊戲。\n"
+                f"{target_window_message}\n"
                 f"{current_card_overlay_status(status, card_overlay_runtime)}\n"
                 f"{current_card_display_settings_status()}\n"
                 f"紀錄位置：{paths.logs_dir()}"
@@ -1018,14 +1094,33 @@ def create_main_window(
             parent=window,
         )
 
+    def show_target_window_status_error(error: Exception) -> None:
+        logger = AppContext.get(LoggerService)
+        if logger is not None:
+            try:
+                logger.error(f"Target-window status refresh failed: {error}")
+            except Exception:
+                pass
+        messagebox.showerror(
+            "輔｜遊戲視窗狀態",
+            (
+                "無法更新遊戲視窗狀態，已保留上次顯示的內容。\n\n"
+                "所有遊戲操作仍保持停用；錯誤已寫入紀錄。"
+            ),
+            parent=window,
+        )
+
     card_view_state_service = AppContext.get(CardViewStateService)
     card_preview_selection_service = AppContext.get(CardPreviewSelectionService)
     workspace_service = AppContext.get(WorkspaceService)
+    target_window_state_service = AppContext.get(TargetWindowStateService)
     if workspace_service is None:
         raise RuntimeError("Workspace service is unavailable.")
+    if target_window_state_service is None:
+        raise RuntimeError("Target-window state service is unavailable.")
     home_view = HomeView(
         window,
-        status,
+        player_home_status(status),
         on_start=show_start_status,
         card_view_state=CardViewState(),
         card_view_state_provider=(
@@ -1063,6 +1158,9 @@ def create_main_window(
         on_show_group_characters=show_group_characters,
         workspace_state_provider=workspace_service.snapshot,
         on_workspace_error=show_workspace_error,
+        target_window_state=target_window_state_service.snapshot(),
+        target_window_state_provider=target_window_state_service.snapshot,
+        on_target_window_error=show_target_window_status_error,
     )
     home_view.build()
     window._home_view = home_view
@@ -1070,17 +1168,54 @@ def create_main_window(
     window._character_detail_window = character_detail_window
     window._soul_stone_editor_window = soul_stone_editor_window
     window._life_soul_editor_window = life_soul_editor_window
-    workspace_change_listener = lambda: window.after_idle(
+    view_closed = False
+
+    def schedule_home_refresh(callback) -> None:
+        if view_closed:
+            return
+
+        def refresh_if_open() -> None:
+            if not view_closed:
+                callback()
+
+        window.after_idle(refresh_if_open)
+
+    workspace_change_listener = lambda: schedule_home_refresh(
         home_view.refresh_workspace
     )
     workspace_service.subscribe(workspace_change_listener)
     window._workspace_change_listener = workspace_change_listener
+    target_window_change_listener = lambda: schedule_home_refresh(
+        home_view.refresh_target_window
+    )
+    target_window_state_service.subscribe(target_window_change_listener)
+    window._target_window_change_listener = target_window_change_listener
     card_service = AppContext.get(CardService)
+    card_change_listener = None
+    card_expiry_monitor = None
     if card_service is not None:
-        card_service.subscribe(lambda: window.after_idle(home_view.refresh_cards))
+        card_change_listener = lambda: schedule_home_refresh(
+            home_view.refresh_cards
+        )
+        card_service.subscribe(card_change_listener)
+        window._card_change_listener = card_change_listener
         card_expiry_monitor = CardExpiryMonitor(card_service, window.after)
         card_expiry_monitor.start()
         window._card_expiry_monitor = card_expiry_monitor
+
+    def cleanup_home_view() -> None:
+        nonlocal view_closed
+        if view_closed:
+            return
+        view_closed = True
+        workspace_service.unsubscribe(workspace_change_listener)
+        target_window_state_service.unsubscribe(target_window_change_listener)
+        if card_service is not None and card_change_listener is not None:
+            card_service.unsubscribe(card_change_listener)
+        if card_expiry_monitor is not None:
+            card_expiry_monitor.stop()
+
+    window._home_view_cleanup = cleanup_home_view
     if card_overlay_runtime is None:
         card_overlay_runtime = _build_registered_card_overlay_runtime(window)
     _attach_card_overlay_runtime(window, card_overlay_runtime)
@@ -1123,6 +1258,7 @@ def run(
         status = Bootstrap(context=AppContext).start()
         status["window_registry"] = registry_status()
         status["target_window"] = detect_target_window()
+        publish_target_window_observation(status["target_window"])
         status["background_capabilities"] = detect_background_capabilities()
         write_self_check_report(status, paths)
 
