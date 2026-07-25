@@ -2,14 +2,15 @@
 
 This document is the delivery gate for FLASH SP1. A feature is not considered complete merely because code or a workflow file exists.
 
-## A. Repository and synchronization
+## A. Repository and update
 
 - [x] GitHub default branch is `main`.
-- [x] Desktop synchronization script tracks `origin/main`.
-- [x] Synchronization refuses to overwrite uncommitted local changes.
-- [x] Scheduled task starts shortly after registration and repeats every 15 minutes.
-- [ ] Verify the scheduled task exists on the target Windows computer.
-- [ ] Verify `Desktop\FLASH` HEAD matches `origin/main`.
+- [x] The player-facing update entry is the single `更新輔.cmd`.
+- [x] The update core downloads the current `release/latest`.
+- [x] The updater preserves the existing desktop shortcut name and icon.
+- [x] The repository no longer installs background or 15-minute Git synchronization.
+- [ ] Verify the legacy scheduled task is absent on the target Windows computer.
+- [ ] Verify `更新輔.cmd` obtains the expected `release/latest` on the target Windows computer.
 
 ## B. Core startup
 

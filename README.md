@@ -24,7 +24,7 @@ SP1 目前已包含：
 - Recovery / Smart Reconnect / External Adapter contracts
 - structured self-check system
 - Windows desktop verification window
-- Windows desktop auto-sync scripts
+- player-facing Windows updater and legacy sync status check
 - PyInstaller build specification
 - GitHub Actions test-and-build workflow
 - release bundle metadata and SHA-256 verification
@@ -53,21 +53,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows_setup_sp1.ps1
 
 此腳本會檢查 Python、安裝必要套件、執行測試與無視窗自我檢查，最後啟動 FLASH。
 
-## Desktop synchronization
+## Windows 成品更新
 
-手動同步：
+玩家只需要使用成品資料夾內的 `更新輔.cmd`。更新程式會取得
+`release/latest`，並保留既有桌面捷徑的名稱與圖示。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\sync_desktop_from_github.ps1
-```
-
-註冊每 15 分鐘自動同步：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\register_flash_auto_sync_task.ps1
-```
-
-同步腳本追蹤 `origin/main`，若本機存在未提交修改會停止，避免覆蓋桌面內容。
+倉庫不再提供背景排程或定時 Git 同步。曾安裝舊排程的電腦，可執行
+`檢查輔同步狀態.cmd` 確認並依中文提示停用。
 
 ## Verify a downloaded Windows build
 
@@ -81,4 +73,4 @@ powershell -ExecutionPolicy Bypass -File .\verify_windows_release.ps1
 
 ## Delivery status
 
-正式交付標準請見 `SP1_VERIFICATION.md`。只有 GitHub Actions 建置、Windows 成品驗證、桌面同步與目標電腦實機驗收全部通過，才視為 SP1 完成。
+正式交付標準請見 `SP1_VERIFICATION.md`。只有 GitHub Actions 建置、Windows 成品驗證、更新流程與目標電腦實機驗收全部通過，才視為 SP1 完成。

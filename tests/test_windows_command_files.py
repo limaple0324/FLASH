@@ -30,6 +30,21 @@ def test_updater_preserves_the_existing_desktop_shortcut():
     assert "已保留原本桌面捷徑的名稱與圖示" in updater
 
 
+def test_legacy_auto_sync_installers_are_not_shipped():
+    legacy_installers = (
+        Path("tools/register_flash_auto_sync_task.ps1"),
+        Path("tools/sync_desktop_from_github.ps1"),
+    )
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    for path in legacy_installers:
+        assert not path.exists()
+        assert path.name not in readme
+
+    assert "Windows desktop auto-sync scripts" not in readme
+    assert Path("tools/檢查輔同步狀態.ps1").is_file()
+
+
 def test_pull_request_build_does_not_publish_over_the_live_release():
     workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
 
