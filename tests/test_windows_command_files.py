@@ -35,7 +35,7 @@ def test_updater_runs_a_temporary_core_with_one_fixed_cmd_bootstrap():
     updater = Path("tools/輔系統/輔更新核心.ps1").read_text(encoding="utf-8")
 
     assert 'copy /y "%SCRIPT%" "%TEMPUPDATER%"' in launcher
-    assert '-File "%TEMPUPDATER%" -InstallDirectory "%~dp0"' in launcher
+    assert '-File "%TEMPUPDATER%" -InstallDirectory "%~dp0."' in launcher
     assert 'del /f /q "%TEMPUPDATER%"' in launcher
     assert "ReadKey(" not in updater
     assert updater.count("更新成功；全部檔案已套用並通過再次驗證") == 1
