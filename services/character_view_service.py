@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from core.window_registry import WindowRegistry
-from domain.character import Character
+from domain.character import Character, character_priority_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +43,16 @@ class CharacterViewService:
     ) -> tuple[tuple[str, PlayerCharacterView], ...]:
         """提供內部服務安全配對；角色識別不得傳給顯示層。"""
         snapshots: list[tuple[str, PlayerCharacterView]] = []
-        for record in self._registry.all():
+        records = self._registry.all()
+        ordered_records = sorted(
+            records,
+            key=lambda record: (
+                character_priority_key(self._characters[record.character_id])
+                if record.character_id in self._characters
+                else (len(self._characters) + 3, 0, record.character_id)
+            ),
+        )
+        for record in ordered_records:
             character = self._characters.get(record.character_id)
             snapshots.append(
                 (

@@ -92,6 +92,13 @@ class SmartReconnectMonitor:
         with self._lock:
             if self.running:
                 return False
+            execution_switch = getattr(
+                self._boundary,
+                "set_execution_enabled",
+                None,
+            )
+            if callable(execution_switch):
+                execution_switch(True)
             self._stop_event.clear()
             self._thread = threading.Thread(
                 target=self._run,
@@ -102,6 +109,13 @@ class SmartReconnectMonitor:
             return True
 
     def stop(self, timeout_seconds: float = 5.0) -> bool:
+        execution_switch = getattr(
+            self._boundary,
+            "set_execution_enabled",
+            None,
+        )
+        if callable(execution_switch):
+            execution_switch(False)
         with self._lock:
             thread = self._thread
             if thread is None:

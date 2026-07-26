@@ -7,7 +7,12 @@ from domain.activity_schedule import (
     ScheduledActivityRule,
     build_confirmed_activity_catalog,
 )
-from domain.character import Character, CharacterImportance
+from domain.character import (
+    Character,
+    CharacterImportance,
+    character_importance_rank,
+    character_priority_key,
+)
 from domain.group import CharacterGroup
 from domain.progress import ActivityProgress, TAIPEI_TIMEZONE
 from domain.status import ActivityStatus
@@ -20,6 +25,8 @@ __all__ = [
     "Character",
     "CharacterGroup",
     "CharacterImportance",
+    "character_importance_rank",
+    "character_priority_key",
     "ReminderScope",
     "ResetRule",
     "ScheduledActivityRule",

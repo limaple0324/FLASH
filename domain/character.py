@@ -10,6 +10,31 @@ class CharacterImportance(str, Enum):
     RESERVE = "備用"
 
 
+CHARACTER_IMPORTANCE_ORDER = {
+    CharacterImportance.PRIMARY: 0,
+    CharacterImportance.SECONDARY: 1,
+    CharacterImportance.RESERVE: 2,
+}
+
+
+def character_importance_rank(importance: CharacterImportance) -> int:
+    """Return the project-wide role order used by every character decision."""
+    if not isinstance(importance, CharacterImportance):
+        raise TypeError("importance must be CharacterImportance.")
+    return CHARACTER_IMPORTANCE_ORDER[importance]
+
+
+def character_priority_key(character: "Character") -> tuple[int, int, str]:
+    """Return the shared default order: role, higher level, stable identity."""
+    if not isinstance(character, Character):
+        raise TypeError("character must be Character.")
+    return (
+        character_importance_rank(character.importance),
+        -character.level,
+        character.character_id,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Character:
     """不包含暫時視窗資訊的穩定角色資料。"""

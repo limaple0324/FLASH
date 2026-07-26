@@ -10,6 +10,7 @@ from core.sp1_boundaries import SmartReconnectBoundary
 from main import (
     INPUT_POLICY_KEY,
     SMART_RECONNECT_ENABLED_KEY,
+    SMART_RECONNECT_CONSENT_KEY,
     build_services,
 )
 from services.app_context import AppContext
@@ -26,21 +27,24 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     reconnect_monitor = AppContext.get(SmartReconnectMonitor)
 
     assert config.get(INPUT_POLICY_KEY) == WindowInputPolicy.ALL.value
-    assert config.get(SMART_RECONNECT_ENABLED_KEY) is True
+    assert config.get(SMART_RECONNECT_ENABLED_KEY) is False
+    assert config.get(SMART_RECONNECT_CONSENT_KEY) is False
     assert isinstance(controller, WindowsInputSyncController)
     assert isinstance(reconnect, WindowsSmartReconnectController)
     assert reconnect_boundary is reconnect
     assert isinstance(reconnect_monitor, SmartReconnectMonitor)
 
 
-def test_home_exposes_three_confirmed_input_policies_and_only_b_c():
+def test_home_exposes_three_policies_and_complete_confirmed_shortcuts():
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
     assert "僅允許前台" in source
     assert "允許前台與背景" in source
     assert "全部允許（含最小化）" in source
-    assert "測試 B（背包）" in source
-    assert "測試 C（人物）" in source
+    assert "開始鍵盤同步" in source
+    assert "停止鍵盤同步" in source
+    assert "CONFIRMED_GAME_SHORTCUTS" in source
+    assert "測試 B" not in source
 
 
 def test_input_verifier_has_a_bounded_delay_for_real_foreground_testing():

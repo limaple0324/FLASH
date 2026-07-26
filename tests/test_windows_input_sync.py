@@ -62,6 +62,10 @@ class FakeMessageBackend:
         self.sent.append((handle, virtual_key))
         return handle not in self.rejected
 
+    def send_key_chord(self, handle, virtual_keys):
+        self.sent.append((handle, virtual_keys))
+        return handle not in self.rejected
+
 def controller(window_backend, message_backend=None):
     return WindowsInputSyncController(
         expected_windows=14,
@@ -71,10 +75,14 @@ def controller(window_backend, message_backend=None):
     )
 
 
-def test_normalizers_accept_only_confirmed_values():
+def test_normalizers_accept_complete_confirmed_shortcut_catalog():
     assert normalize_approved_key(" b ") == "B"
     assert normalize_approved_key("c") == "C"
-    assert normalize_approved_key("A") is None
+    assert normalize_approved_key("A") == "A"
+    assert normalize_approved_key("esc") == "ESC"
+    assert normalize_approved_key("Ctrl + Up") == "CTRL+↑"
+    assert normalize_approved_key("CTRL+↓") == "CTRL+↓"
+    assert normalize_approved_key("F1") is None
     assert normalize_approved_key(None) is None
 
     assert normalize_input_policy("ALL") is WindowInputPolicy.ALL
@@ -145,6 +153,20 @@ def test_foreground_only_sends_to_only_the_group_foreground():
     assert result.eligible_windows == 1
     assert result.sent_windows == 1
     assert messages.sent == [(8, 0x43)]
+
+
+def test_confirmed_ctrl_arrow_chord_is_delivered_in_one_batch_per_window():
+    messages = FakeMessageBackend()
+    result = controller(
+        make_windows(),
+        messages,
+    ).send_approved_key("CTRL+UP", policy="all", execute=True)
+
+    assert result.passed is True
+    assert result.approved_key == "CTRL+↑"
+    assert messages.sent == [
+        (handle, (0x11, 0x26)) for handle in range(1, 15)
+    ]
 
 
 def test_identity_failure_aborts_before_any_input():

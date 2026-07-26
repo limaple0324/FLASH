@@ -15,6 +15,7 @@ from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat
 
 from adapters.windows_background_capture import CaptureSample
 from core.reconnect_policy import ReconnectScreenState
+from domain.character import CharacterImportance, character_importance_rank
 
 
 NormalizedRect = tuple[float, float, float, float]
@@ -67,6 +68,39 @@ POPUP_TITLE_REGIONS: dict[ReconnectScreenState, NormalizedRect] = {
     ),
 }
 POPUP_TITLE_MAXIMUM_SCORE = 45.0
+CHARACTER_ENTER_CLICK_POINT: NormalizedPoint = (0.353, 0.854)
+CHARACTER_LEVEL_TEMPLATE_FILES = {
+    100: "character_level_100.png",
+    120: "character_level_120.png",
+    160: "character_level_160.png",
+}
+# The three login slots use the same internal layout. These regions contain
+# only the displayed level digits, never the character name.
+CHARACTER_LEVEL_REGIONS: tuple[NormalizedRect, ...] = (
+    (498.1 / 1348, 657.9 / 937, 568.1 / 1348, 699.9 / 937),
+    (698.1 / 1348, 657.9 / 937, 768.1 / 1348, 699.9 / 937),
+    (903.1 / 1348, 657.9 / 937, 973.1 / 1348, 699.9 / 937),
+)
+CHARACTER_SLOT_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.282, 0.665, 0.426, 0.783),
+    (0.430, 0.665, 0.568, 0.783),
+    (0.582, 0.665, 0.720, 0.783),
+)
+CHARACTER_SLOT_CLICK_POINTS: tuple[NormalizedPoint, ...] = (
+    (0.355, 0.706),
+    (0.500, 0.706),
+    (0.651, 0.706),
+)
+# Confirmed by the player's supplied role templates. The project-wide order is
+# still applied by CharacterImportance rather than by numeric level alone.
+CONFIRMED_LEVEL_IMPORTANCE = {
+    100: CharacterImportance.SECONDARY,
+    120: CharacterImportance.PRIMARY,
+    160: CharacterImportance.PRIMARY,
+}
+CHARACTER_LEVEL_MAXIMUM_SCORE = 48.0
+CHARACTER_LEVEL_MINIMUM_MARGIN = 0.75
+CHARACTER_SELECTED_CYAN_FRACTION = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +232,10 @@ class ScreenRecognition:
     click_point: NormalizedPoint | None
     reference_name: str | None
     line_number: int | None = None
+    character_level: int | None = None
+    character_importance: CharacterImportance | None = None
+    character_slot_index: int | None = None
+    character_slot_selected: bool | None = None
 
     @property
     def recognized(self) -> bool:
@@ -237,7 +275,16 @@ class ReferenceScreenRecognizer:
             for filename in ROUTE_DIGIT_TEMPLATES.values()
             if not (self.reference_dir / filename).is_file()
         )
-        return screen_references + digit_references
+        character_level_references = tuple(
+            filename
+            for filename in CHARACTER_LEVEL_TEMPLATE_FILES.values()
+            if not (self.reference_dir / filename).is_file()
+        )
+        return (
+            screen_references
+            + digit_references
+            + character_level_references
+        )
 
     @property
     def ready(self) -> bool:
@@ -489,6 +536,139 @@ class ReferenceScreenRecognizer:
             return None, round(score, 3)
         return route_number, round(score, 3)
 
+    @staticmethod
+    def _level_signature(image: Image.Image) -> Image.Image | None:
+        pixels = image.convert("RGB")
+        mask = Image.new("L", pixels.size, 0)
+        mask.putdata(
+            [
+                255
+                if min(red, green, blue) >= 150
+                and max(red, green, blue) - min(red, green, blue) < 90
+                else 0
+                for red, green, blue in pixels.get_flattened_data()
+            ]
+        )
+        bounds = mask.getbbox()
+        if bounds is None:
+            return None
+        glyphs = mask.crop(bounds)
+        glyphs.thumbnail((62, 30), Image.Resampling.NEAREST)
+        signature = Image.new("L", (64, 32), 0)
+        signature.paste(
+            glyphs,
+            (
+                (signature.width - glyphs.width) // 2,
+                (signature.height - glyphs.height) // 2,
+            ),
+        )
+        return signature
+
+    def _recognize_character_level(
+        self,
+        image: Image.Image,
+        region: NormalizedRect,
+    ) -> tuple[int | None, float | None]:
+        candidate = self._level_signature(self._crop(image, region))
+        if candidate is None:
+            return None, None
+        scores: list[tuple[float, int]] = []
+        for level, filename in CHARACTER_LEVEL_TEMPLATE_FILES.items():
+            reference = self._level_signature(self._reference(filename))
+            if reference is None:
+                continue
+            difference = ImageChops.difference(candidate, reference)
+            scores.append(
+                (float(ImageStat.Stat(difference).mean[0]), level)
+            )
+        if not scores:
+            return None, None
+        scores.sort()
+        score, level = scores[0]
+        runner_up = scores[1][0] if len(scores) > 1 else 255.0
+        if (
+            score > CHARACTER_LEVEL_MAXIMUM_SCORE
+            or runner_up - score < CHARACTER_LEVEL_MINIMUM_MARGIN
+        ):
+            return None, round(score, 3)
+        return level, round(score, 3)
+
+    @classmethod
+    def _character_slot_is_selected(
+        cls,
+        image: Image.Image,
+        region: NormalizedRect,
+    ) -> bool:
+        crop = cls._crop(image, region).convert("RGB")
+        pixels = crop.get_flattened_data()
+        total = crop.width * crop.height
+        if total <= 0:
+            return False
+        cyan_pixels = sum(
+            1
+            for red, green, blue in pixels
+            if green >= 100
+            and blue >= 100
+            and green > red * 1.2
+            and blue > red * 1.2
+            and green + blue >= 280
+        )
+        return (
+            cyan_pixels / total
+            >= CHARACTER_SELECTED_CYAN_FRACTION
+        )
+
+    def _character_selection_target(
+        self,
+        image: Image.Image,
+    ) -> tuple[
+        NormalizedPoint | None,
+        int | None,
+        CharacterImportance | None,
+        int | None,
+        bool | None,
+    ]:
+        choices: list[
+            tuple[int, int, int, CharacterImportance, bool]
+        ] = []
+        for index, (level_region, slot_region) in enumerate(
+            zip(CHARACTER_LEVEL_REGIONS, CHARACTER_SLOT_REGIONS)
+        ):
+            level, _score = self._recognize_character_level(
+                image,
+                level_region,
+            )
+            if level is None:
+                continue
+            importance = CONFIRMED_LEVEL_IMPORTANCE.get(level)
+            if importance is None:
+                continue
+            selected = self._character_slot_is_selected(image, slot_region)
+            choices.append(
+                (
+                    character_importance_rank(importance),
+                    -level,
+                    index,
+                    importance,
+                    selected,
+                )
+            )
+        if not choices:
+            return None, None, None, None, None
+        (
+            _importance_rank,
+            negative_level,
+            index,
+            importance,
+            selected,
+        ) = min(choices)
+        click_point = (
+            CHARACTER_ENTER_CLICK_POINT
+            if selected
+            else CHARACTER_SLOT_CLICK_POINTS[index]
+        )
+        return click_point, -negative_level, importance, index, selected
+
     @classmethod
     def _region_score(
         cls,
@@ -665,6 +845,10 @@ class ReferenceScreenRecognizer:
             else min(valid_scored, key=lambda item: item[0])
         )
         line_number = None
+        character_level = None
+        character_importance = None
+        character_slot_index = None
+        character_slot_selected = None
         click_point = definition.click_point
         if definition.state is ReconnectScreenState.LINE_SELECTION:
             line_number, _route_score = self._recognize_route_number(candidate)
@@ -673,12 +857,24 @@ class ReferenceScreenRecognizer:
                 if line_number is not None
                 else None
             )
+        elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
+            (
+                click_point,
+                character_level,
+                character_importance,
+                character_slot_index,
+                character_slot_selected,
+            ) = self._character_selection_target(candidate)
         return ScreenRecognition(
             state=definition.state,
             score=round(score, 3),
             click_point=click_point,
             reference_name=definition.filename,
             line_number=line_number,
+            character_level=character_level,
+            character_importance=character_importance,
+            character_slot_index=character_slot_index,
+            character_slot_selected=character_slot_selected,
         )
 
     def recognize_capture(self, sample: CaptureSample | None) -> ScreenRecognition:

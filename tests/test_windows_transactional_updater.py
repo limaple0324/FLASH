@@ -15,6 +15,7 @@ LAUNCHER_SOURCE = PROJECT_ROOT / "tools" / "更新輔.cmd"
 INSTALLER_SOURCE = PROJECT_ROOT / "tools" / "輔系統" / "安裝輔.ps1"
 STATUS_CMD_SOURCE = PROJECT_ROOT / "tools" / "檢查輔同步狀態.cmd"
 STATUS_PS1_SOURCE = PROJECT_ROOT / "tools" / "檢查輔同步狀態.ps1"
+ICON_SOURCE = PROJECT_ROOT / "assets" / "flash_icon.ico"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")
 SOURCE_COMMIT = "a" * 40
 RELEASE_COMMIT = "b" * 40
@@ -25,6 +26,7 @@ PAYLOAD_PATHS = (
     "安裝輔.cmd",
     "更新輔.cmd",
     "輔系統/BUILD_INFO.txt",
+    "輔系統/sync_plus_icon.ico",
     "輔系統/verify_windows_release.ps1",
     "輔系統/安裝輔.ps1",
     "輔系統/輔更新核心.ps1",
@@ -69,6 +71,10 @@ def _copy_payload_sources(release_root: Path) -> None:
     shutil.copy2(
         STATUS_PS1_SOURCE,
         _path(release_root, "輔系統/檢查輔同步狀態.ps1"),
+    )
+    shutil.copy2(
+        ICON_SOURCE,
+        _path(release_root, "輔系統/sync_plus_icon.ico"),
     )
 
 

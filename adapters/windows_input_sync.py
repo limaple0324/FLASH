@@ -1,9 +1,8 @@
-"""Approved keyboard synchronization for individually identified Flash windows.
+"""Confirmed keyboard synchronization for individually identified Flash windows.
 
-Only the explicitly approved B and C test keys are accepted.  Every batch
-fails closed before sending input unless the live desktop contains the exact
-expected number of title-matched windows, process IDs, and anonymous launcher
-fingerprints.  Reports contain aggregate counts only.
+Every batch fails closed before sending input unless the live desktop contains
+the exact expected number of title-matched windows, process IDs, and anonymous
+launcher fingerprints. Reports contain aggregate counts only.
 """
 
 from __future__ import annotations
@@ -20,10 +19,33 @@ from adapters.windows_launch_fingerprint import (
     normalize_launch_fingerprint,
 )
 from adapters.windows_window import Win32WindowBackend, WindowBackend, WindowInfo
+from domain.game_shortcuts import GAME_SHORTCUT_BY_KEY
 
 
-APPROVED_TEST_KEYS = frozenset({"B", "C"})
-VIRTUAL_KEYS = {"B": 0x42, "C": 0x43}
+APPROVED_SYNC_KEYS = frozenset(GAME_SHORTCUT_BY_KEY)
+# Retained as a compatibility name for older callers; the value now contains
+# the complete player-confirmed catalog rather than only B and C.
+APPROVED_TEST_KEYS = APPROVED_SYNC_KEYS
+_KEY_ALIASES = {
+    "CTRL+UP": "CTRL+↑",
+    "CTRL+DOWN": "CTRL+↓",
+}
+_SINGLE_VIRTUAL_KEYS = {
+    **{letter: ord(letter) for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+    "TAB": 0x09,
+    "ESC": 0x1B,
+}
+VIRTUAL_KEY_SEQUENCES = {
+    key: (_SINGLE_VIRTUAL_KEYS[key],)
+    for key in APPROVED_SYNC_KEYS
+    if key in _SINGLE_VIRTUAL_KEYS
+}
+VIRTUAL_KEY_SEQUENCES.update(
+    {
+        "CTRL+↑": (0x11, 0x26),
+        "CTRL+↓": (0x11, 0x28),
+    }
+)
 
 
 class WindowInputPolicy(str, Enum):
@@ -49,8 +71,9 @@ def normalize_input_policy(value: object) -> WindowInputPolicy | None:
 def normalize_approved_key(value: object) -> str | None:
     if not isinstance(value, str):
         return None
-    normalized = value.strip().upper()
-    return normalized if normalized in APPROVED_TEST_KEYS else None
+    normalized = value.strip().upper().replace(" ", "")
+    normalized = _KEY_ALIASES.get(normalized, normalized)
+    return normalized if normalized in APPROVED_SYNC_KEYS else None
 
 
 class KeyMessageBackend(Protocol):
@@ -63,6 +86,13 @@ class KeyMessageBackend(Protocol):
     def send_virtual_key(self, handle: int, virtual_key: int) -> bool:
         """Post one key-down/key-up pair to one already-validated window."""
 
+    def send_key_chord(
+        self,
+        handle: int,
+        virtual_keys: tuple[int, ...],
+    ) -> bool:
+        """Post a modifier chord while preserving down/up ordering."""
+
 
 class Win32KeyMessageBackend:
     """Pure-ctypes Win32 keyboard-message backend."""
@@ -72,6 +102,7 @@ class Win32KeyMessageBackend:
     WM_KEYUP = 0x0101
     SMTO_ABORTIFHUNG = 0x0002
     MAPVK_VK_TO_VSC = 0
+    EXTENDED_KEYS = frozenset({0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28})
 
     @staticmethod
     def _user32():
@@ -130,7 +161,13 @@ class Win32KeyMessageBackend:
             )
         )
 
-    def send_virtual_key(self, handle: int, virtual_key: int) -> bool:
+    def _post_key_event(
+        self,
+        handle: int,
+        virtual_key: int,
+        *,
+        key_up: bool,
+    ) -> bool:
         user32 = self._user32()
         if user32 is None:
             return False
@@ -141,25 +178,62 @@ class Win32KeyMessageBackend:
                 self.MAPVK_VK_TO_VSC,
             )
         )
-        key_down_lparam = 1 | (scan_code << 16)
-        key_up_lparam = key_down_lparam | (1 << 30) | (1 << 31)
-        key_down_ok = bool(
+        lparam = 1 | ((scan_code & 0xFF) << 16)
+        if virtual_key in self.EXTENDED_KEYS:
+            lparam |= 1 << 24
+        if key_up:
+            lparam |= (1 << 30) | (1 << 31)
+        return bool(
             user32.PostMessageW(
                 wintypes.HWND(handle),
-                self.WM_KEYDOWN,
+                self.WM_KEYUP if key_up else self.WM_KEYDOWN,
                 int(virtual_key),
-                key_down_lparam,
+                lparam,
             )
         )
-        key_up_ok = bool(
-            user32.PostMessageW(
-                wintypes.HWND(handle),
-                self.WM_KEYUP,
-                int(virtual_key),
-                key_up_lparam,
-            )
+
+    def send_virtual_key(self, handle: int, virtual_key: int) -> bool:
+        key_down_ok = self._post_key_event(
+            handle,
+            virtual_key,
+            key_up=False,
+        )
+        key_up_ok = self._post_key_event(
+            handle,
+            virtual_key,
+            key_up=True,
         )
         return key_down_ok and key_up_ok
+
+    def send_key_chord(
+        self,
+        handle: int,
+        virtual_keys: tuple[int, ...],
+    ) -> bool:
+        if len(virtual_keys) < 2:
+            return (
+                self.send_virtual_key(handle, virtual_keys[0])
+                if virtual_keys
+                else False
+            )
+        results: list[bool] = []
+        modifiers = virtual_keys[:-1]
+        action_key = virtual_keys[-1]
+        for modifier in modifiers:
+            results.append(
+                self._post_key_event(handle, modifier, key_up=False)
+            )
+        results.append(
+            self._post_key_event(handle, action_key, key_up=False)
+        )
+        results.append(
+            self._post_key_event(handle, action_key, key_up=True)
+        )
+        for modifier in reversed(modifiers):
+            results.append(
+                self._post_key_event(handle, modifier, key_up=True)
+            )
+        return all(results)
 
 @dataclass(frozen=True, slots=True)
 class InputSyncResult:
@@ -243,6 +317,19 @@ class WindowsInputSyncController:
         self._message_backend = message_backend
         self._preflight_timeout_ms = max(1, int(preflight_timeout_ms))
 
+    @property
+    def expected_windows(self) -> int:
+        return self._expected_windows
+
+    def set_expected_windows(self, expected_windows: int) -> None:
+        if (
+            isinstance(expected_windows, bool)
+            or not isinstance(expected_windows, int)
+            or expected_windows <= 0
+        ):
+            raise ValueError("expected_windows must be positive")
+        self._expected_windows = expected_windows
+
     @classmethod
     def for_real_windows(
         cls,
@@ -302,6 +389,7 @@ class WindowsInputSyncController:
         *,
         policy: object,
         execute: bool = False,
+        exclude_foreground: bool = False,
     ) -> InputSyncResult:
         normalized_key = normalize_approved_key(key)
         normalized_policy = normalize_input_policy(policy)
@@ -346,6 +434,9 @@ class WindowsInputSyncController:
             )
 
         foreground = self._window_backend.foreground_handle()
+        matching_handles = {window.handle for window in windows}
+        if exclude_foreground and foreground not in matching_handles:
+            failures.append("foreground_not_in_group")
         if normalized_policy is WindowInputPolicy.FOREGROUND_ONLY:
             eligible = tuple(
                 window for window in windows if window.handle == foreground
@@ -356,6 +447,11 @@ class WindowsInputSyncController:
             eligible = tuple(window for window in windows if not window.minimized)
         else:
             eligible = windows
+
+        if exclude_foreground:
+            eligible = tuple(
+                window for window in eligible if window.handle != foreground
+            )
 
         if not eligible:
             failures.append("no_eligible_windows")
@@ -400,14 +496,20 @@ class WindowsInputSyncController:
                 execute=False,
             )
 
-        virtual_key = VIRTUAL_KEYS[normalized_key]
+        virtual_keys = VIRTUAL_KEY_SEQUENCES[normalized_key]
         sent = 0
         for window in responsive_targets:
             try:
-                delivered = self._message_backend.send_virtual_key(
-                    window.handle,
-                    virtual_key,
-                )
+                if len(virtual_keys) == 1:
+                    delivered = self._message_backend.send_virtual_key(
+                        window.handle,
+                        virtual_keys[0],
+                    )
+                else:
+                    delivered = self._message_backend.send_key_chord(
+                        window.handle,
+                        virtual_keys,
+                    )
                 if delivered:
                     sent += 1
             except OSError:

@@ -8,6 +8,7 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VERIFIER_SOURCE = PROJECT_ROOT / "tools" / "verify_windows_release.ps1"
+ICON_SOURCE = PROJECT_ROOT / "assets" / "flash_icon.ico"
 POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
 
 pytestmark = pytest.mark.skipif(
@@ -34,6 +35,7 @@ def _create_bundle(
 
     verifier_path = system_dir / "verify_windows_release.ps1"
     shutil.copy2(VERIFIER_SOURCE, verifier_path)
+    shutil.copy2(ICON_SOURCE, system_dir / "sync_plus_icon.ico")
 
     executable_path = release_dir / "FLASH.exe"
     executable_path.write_bytes(
@@ -139,6 +141,7 @@ def _create_bundle(
     manifest_paths = [
         "FLASH.exe",
         "輔系統/BUILD_INFO.txt",
+        "輔系統/sync_plus_icon.ico",
         "輔系統/verify_windows_release.ps1",
     ]
     if build_kind in {"main_release", "sp1_release"}:
@@ -148,6 +151,7 @@ def _create_bundle(
             "安裝輔.cmd",
             "更新輔.cmd",
             "輔系統/BUILD_INFO.txt",
+            "輔系統/sync_plus_icon.ico",
             "輔系統/verify_windows_release.ps1",
             "輔系統/安裝輔.ps1",
             "輔系統/輔更新核心.ps1",

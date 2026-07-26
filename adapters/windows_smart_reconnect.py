@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -384,6 +385,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         preflight_timeout_ms: int = 1000,
         monotonic_clock: Callable[[], float] = time.time,
         state_path: Path | None = None,
+        execution_enabled: bool = False,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -404,6 +406,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._monotonic_clock = monotonic_clock
         self._state = ReconnectState.DISCONNECTED
         self._last_result: ReconnectBatchResult | None = None
+        self._execution_enabled = threading.Event()
+        if execution_enabled:
+            self._execution_enabled.set()
         self._runtime_state_store = (
             ReconnectRuntimeStateStore(state_path)
             if state_path is not None
@@ -431,6 +436,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             str,
             tuple[ReconnectScreenState, float],
         ] = runtime_state.retry_after
+        self._character_selection_pending: set[str] = set()
 
     @classmethod
     def for_real_windows(
@@ -460,6 +466,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     @property
     def last_result(self) -> ReconnectBatchResult | None:
         return self._last_result
+
+    @property
+    def expected_windows(self) -> int:
+        return self._expected_windows
+
+    def set_expected_windows(self, expected_windows: int) -> None:
+        if (
+            isinstance(expected_windows, bool)
+            or not isinstance(expected_windows, int)
+            or expected_windows <= 0
+        ):
+            raise ValueError("expected_windows must be positive")
+        self._expected_windows = expected_windows
+
+    def set_execution_enabled(self, enabled: bool) -> None:
+        """Allow an active scan to stop before its next game-changing click."""
+        if enabled:
+            self._execution_enabled.set()
+        else:
+            self._execution_enabled.clear()
 
     def _matching_windows(self) -> tuple[WindowInfo, ...]:
         return tuple(
@@ -603,6 +629,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             retry = self._action_retry_after.get(fingerprint)
             if retry is not None and retry[0] is not recognition.state:
                 self._action_retry_after.pop(fingerprint, None)
+            if recognition.state is not ReconnectScreenState.CHARACTER_SELECTION:
+                self._character_selection_pending.discard(fingerprint)
+            elif (
+                recognition.character_slot_selected is True
+                and fingerprint in self._character_selection_pending
+            ):
+                # Selecting the preferred character does not leave this
+                # screen. Permit the next distinct step ("進入遊戲")
+                # without waiting for the one-minute retry window.
+                self._action_retry_after.pop(fingerprint, None)
             recognized.append((window, fingerprint, recognition))
 
         state_counts = Counter(
@@ -637,6 +673,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         delivery_failures = 0
         if execute:
             for window, fingerprint, item in actionable:
+                if not self._execution_enabled.is_set():
+                    break
                 retry = self._action_retry_after.get(fingerprint)
                 if (
                     retry is not None
@@ -666,6 +704,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     delivered = False
                 if delivered:
                     clicked_windows += 1
+                    if item.state is ReconnectScreenState.CHARACTER_SELECTION:
+                        if item.character_slot_selected is True:
+                            self._character_selection_pending.discard(
+                                fingerprint
+                            )
+                        elif item.character_slot_selected is False:
+                            self._character_selection_pending.add(fingerprint)
                     self._active_automation_fingerprints.add(fingerprint)
                     self._active_automation_until[fingerprint] = (
                         now + POST_LOGIN_AUTOMATION_GRACE_SECONDS

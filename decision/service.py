@@ -12,14 +12,7 @@ from decision.models import (
     DecisionOutput,
     DecisionResult,
 )
-from domain.character import CharacterImportance
-
-
-_IMPORTANCE_ORDER = {
-    CharacterImportance.PRIMARY: 0,
-    CharacterImportance.SECONDARY: 1,
-    CharacterImportance.RESERVE: 2,
-}
+from domain.character import character_importance_rank
 
 
 class DecisionService:
@@ -215,6 +208,6 @@ class DecisionService:
         return (
             int(result.category),
             remaining_seconds,
-            _IMPORTANCE_ORDER[candidate.character_importance],
+            character_importance_rank(candidate.character_importance),
             candidate.candidate_id,
         )

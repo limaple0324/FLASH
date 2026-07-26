@@ -249,6 +249,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path release | Out-Null
           New-Item -ItemType Directory -Force -Path 'release/輔系統' | Out-Null
           Copy-Item 'dist/FLASH.exe' 'release/FLASH.exe'
+          Copy-Item 'assets/flash_icon.ico' 'release/輔系統/sync_plus_icon.ico'
           Copy-Item 'tools/verify_windows_release.ps1' 'release/輔系統/verify_windows_release.ps1'
 
           if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {
@@ -352,6 +353,7 @@ jobs:
           $manifestPaths = @(
             'FLASH.exe'
             '輔系統/BUILD_INFO.txt'
+            '輔系統/sync_plus_icon.ico'
             '輔系統/verify_windows_release.ps1'
           )
           if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {
@@ -361,6 +363,7 @@ jobs:
               '安裝輔.cmd'
               '更新輔.cmd'
               '輔系統/BUILD_INFO.txt'
+              '輔系統/sync_plus_icon.ico'
               '輔系統/verify_windows_release.ps1'
               '輔系統/安裝輔.ps1'
               '輔系統/輔更新核心.ps1'
@@ -401,6 +404,7 @@ jobs:
             'release/FLASH.exe',
             'release/輔系統/SHA256SUMS.txt',
             'release/輔系統/BUILD_INFO.txt',
+            'release/輔系統/sync_plus_icon.ico',
             'release/輔系統/verify_windows_release.ps1'
           )) {
             if (-not (Test-Path $required -PathType Leaf)) {

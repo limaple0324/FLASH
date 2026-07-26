@@ -146,6 +146,7 @@ def make_controller(
             mouse_backend=mouse,
             monotonic_clock=clock or (lambda: 0.0),
             state_path=state_path,
+            execution_enabled=True,
         ),
         capture=capture,
         mouse=mouse,
@@ -164,6 +165,31 @@ def test_read_only_check_detects_reconnect_need_without_clicking():
     assert result.details["connected_windows"] == 1
     assert result.details["actionable_windows"] == 1
     assert result.details["captured_pixels_persisted"] is False
+
+
+def test_new_controller_starts_with_execution_hard_disabled():
+    windows = [make_window(1), make_window(2)]
+    capture = FakeCaptureProvider({1: 2, 2: 1})
+    mouse = FakeMouseBackend()
+    controller = WindowsSmartReconnectController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=FakeWindowBackend(windows),
+        capture_provider=capture,
+        recognizer=FakeRecognizer(
+            {
+                1: ReconnectScreenState.CONNECTED,
+                2: ReconnectScreenState.DISCONNECTED,
+            },
+            {2: (0.5, 0.5)},
+        ),
+        mouse_backend=mouse,
+    )
+
+    result = controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert mouse.clicks == []
 
 
 def test_reconnect_advances_different_known_states_independently():
@@ -339,6 +365,60 @@ def test_changed_screen_allows_next_action_without_waiting_one_minute():
     assert fixture.mouse.clicks == [
         (1, (0.5, 0.5)),
         (1, (0.35, 0.85)),
+    ]
+
+
+def test_character_selection_confirms_preferred_slot_before_entering_game():
+    windows = [make_window(1), make_window(2)]
+    capture = FakeCaptureProvider({1: 5, 2: 1})
+    mouse = FakeMouseBackend()
+
+    class CharacterSequenceRecognizer:
+        def __init__(self):
+            self.selected = False
+
+        def recognize_capture(self, sample):
+            if sample.pixels[0] == 1:
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=0.0,
+                    click_point=None,
+                    reference_name="connected",
+                )
+            return ScreenRecognition(
+                state=ReconnectScreenState.CHARACTER_SELECTION,
+                score=0.0,
+                click_point=(
+                    (0.353, 0.854)
+                    if self.selected
+                    else (0.651, 0.706)
+                ),
+                reference_name="character_selection",
+                character_level=160,
+                character_slot_index=2,
+                character_slot_selected=self.selected,
+            )
+
+    recognizer = CharacterSequenceRecognizer()
+    controller = WindowsSmartReconnectController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=FakeWindowBackend(windows),
+        capture_provider=capture,
+        recognizer=recognizer,
+        mouse_backend=mouse,
+        execution_enabled=True,
+    )
+
+    first = controller.reconnect()
+    recognizer.selected = True
+    second = controller.reconnect()
+
+    assert first.details["clicked_windows"] == 1
+    assert second.details["clicked_windows"] == 1
+    assert mouse.clicks == [
+        (1, (0.651, 0.706)),
+        (1, (0.353, 0.854)),
     ]
 
 

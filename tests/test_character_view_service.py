@@ -98,3 +98,37 @@ def test_view_rejects_duplicate_stable_character_profiles() -> None:
 
     with pytest.raises(ValueError, match="Duplicate stable character ID"):
         CharacterViewService(registry, profiles)
+
+
+def test_view_uses_project_wide_role_priority_instead_of_registry_order() -> None:
+    registry = WindowRegistry()
+    registry.register_character("reserve", "備用", group="14支")
+    registry.register_character("secondary", "分號", group="14支")
+    registry.register_character("primary-low", "主號低等", group="14支")
+    registry.register_character("primary-high", "主號高等", group="14支")
+    profiles = (
+        _character("reserve", "備用", 200, CharacterImportance.RESERVE),
+        _character(
+            "secondary",
+            "分號",
+            300,
+            CharacterImportance.SECONDARY,
+        ),
+        _character(
+            "primary-low",
+            "主號低等",
+            120,
+            CharacterImportance.PRIMARY,
+        ),
+        _character(
+            "primary-high",
+            "主號高等",
+            160,
+            CharacterImportance.PRIMARY,
+        ),
+    )
+
+    assert [
+        item.display_name
+        for item in CharacterViewService(registry, profiles).all()
+    ] == ["主號高等", "主號低等", "分號", "備用"]

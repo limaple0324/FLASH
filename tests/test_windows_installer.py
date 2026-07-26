@@ -103,13 +103,18 @@ def test_complete_installer_verifies_copies_and_creates_one_shortcut(tmp_path: P
         check=True,
         timeout=15,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     inspected_lines = tuple(
         line.strip() for line in inspected.stdout.splitlines() if line.strip()
     )
     assert str(install_root / "FLASH.exe") in inspected_lines
     assert str(install_root) in inspected_lines
-    assert f"{install_root / 'FLASH.exe'},0" in inspected_lines
+    assert (
+        f"{install_root / '輔系統' / 'sync_plus_icon.ico'},0"
+        in inspected_lines
+    )
 
 
 def test_first_install_uses_distinct_shortcut_name_when_desktop_has_fu_directory(

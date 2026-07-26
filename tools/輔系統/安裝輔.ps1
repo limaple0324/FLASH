@@ -47,10 +47,14 @@ function New-DesktopShortcut(
 ) {
     $shell = New-Object -ComObject WScript.Shell
     try {
+        $iconPath = Join-Path $WorkingDirectory "輔系統\sync_plus_icon.ico"
+        if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+            throw "缺少桌面捷徑圖示：$iconPath"
+        }
         $shortcut = $shell.CreateShortcut($ShortcutPath)
         $shortcut.TargetPath = $ExecutablePath
         $shortcut.WorkingDirectory = $WorkingDirectory
-        $shortcut.IconLocation = "$ExecutablePath,0"
+        $shortcut.IconLocation = "$iconPath,0"
         $shortcut.Description = "輔 SP1"
         $shortcut.Save()
     }

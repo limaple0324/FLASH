@@ -54,7 +54,8 @@ def test_installer_uses_a_safe_source_path_and_one_confirmed_shortcut():
     assert 'Join-Path $DesktopDirectory "啟動輔.lnk"' in installer
     assert 'Join-Path $DesktopDirectory "輔"' in installer
     assert '$shortcut.TargetPath = $ExecutablePath' in installer
-    assert '$shortcut.IconLocation = "$ExecutablePath,0"' in installer
+    assert 'Join-Path $WorkingDirectory "輔系統\\sync_plus_icon.ico"' in installer
+    assert '$shortcut.IconLocation = "$iconPath,0"' in installer
 
 
 def test_windows_powershell_download_does_not_require_the_ie_engine():

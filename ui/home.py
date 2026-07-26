@@ -21,6 +21,9 @@ from tkinter import (
 
 from cards.view_state import CardViewState
 from core.target_window_observation import TargetWindowObservation
+from domain.game_shortcuts import (
+    CONFIRMED_GAME_SHORTCUTS,
+)
 from presentation.target_window_status import target_window_summary
 from services.character_detail_choice_service import PlayerCharacterDetailChoice
 from services.character_detail_view_service import PlayerCharacterDetail
@@ -168,7 +171,8 @@ class HomeView:
         *,
         input_policy: str = "all",
         on_input_policy_change=None,
-        on_test_key=None,
+        keyboard_sync_enabled: bool = False,
+        on_keyboard_sync_change: Callable[[bool], object] | None = None,
         group_choices: Iterable[PlayerGroupChoice] = (),
         current_group_name: str | None = None,
         on_group_change: Callable[[str], object] | None = None,
@@ -182,7 +186,8 @@ class HomeView:
         ) = None,
         characters: Iterable[PlayerCharacterView] = (),
         character_choices: Iterable[PlayerCharacterDetailChoice] = (),
-        smart_reconnect_enabled: bool = True,
+        smart_reconnect_enabled: bool = False,
+        on_smart_reconnect_change: Callable[[bool], object] | None = None,
         card_display_seconds_provider: Callable[[], int] | None = None,
         on_card_display_seconds_update: Callable[[int], object] | None = None,
         on_refresh_error: Callable[[Exception], object] | None = None,
@@ -194,7 +199,8 @@ class HomeView:
             input_policy if input_policy in INPUT_POLICY_LABELS else "all"
         )
         self.on_input_policy_change = on_input_policy_change
-        self.on_test_key = on_test_key
+        self.keyboard_sync_enabled = bool(keyboard_sync_enabled)
+        self.on_keyboard_sync_change = on_keyboard_sync_change
         self.group_choices = tuple(group_choices)
         if any(
             not isinstance(choice, PlayerGroupChoice)
@@ -228,6 +234,7 @@ class HomeView:
                 "character_choices must contain PlayerCharacterDetailChoice values."
             )
         self.smart_reconnect_enabled = bool(smart_reconnect_enabled)
+        self.on_smart_reconnect_change = on_smart_reconnect_change
         self.card_display_seconds_provider = card_display_seconds_provider
         self.on_card_display_seconds_update = on_card_display_seconds_update
         self.on_refresh_error = on_refresh_error
@@ -239,6 +246,10 @@ class HomeView:
         self._group_value_label: Label | None = None
         self._group_variable: StringVar | None = None
         self._card_seconds_entry: Entry | None = None
+        self._keyboard_sync_label: Label | None = None
+        self._keyboard_sync_button: Button | None = None
+        self._smart_reconnect_label: Label | None = None
+        self._smart_reconnect_button: Button | None = None
 
     @staticmethod
     def _button(parent, text: str, command=None, *, primary: bool = False):
@@ -620,26 +631,61 @@ class HomeView:
             highlightthickness=0,
         )
         policy_menu.pack(fill=X)
-        tests = Frame(input_card, bg=SURFACE)
-        tests.pack(fill=X, pady=(12, 0))
-        self._button(
-            tests,
-            "測試 B（背包）",
-            (
-                (lambda: self.on_test_key("B"))
-                if self.on_test_key is not None
-                else None
+        shortcut_labels = tuple(
+            shortcut.player_label for shortcut in CONFIRMED_GAME_SHORTCUTS
+        )
+        shortcut_variable = StringVar(
+            master=self.parent,
+            value=shortcut_labels[0],
+        )
+        self._shortcut_variable = shortcut_variable
+        shortcut_menu = OptionMenu(
+            input_card,
+            shortcut_variable,
+            *shortcut_labels,
+        )
+        shortcut_menu.configure(
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            anchor="w",
+        )
+        shortcut_menu["menu"].configure(
+            font=("Microsoft JhengHei UI", 10),
+        )
+        shortcut_menu.pack(fill=X, pady=(12, 0))
+
+        actions = Frame(input_card, bg=SURFACE)
+        actions.pack(fill=X, pady=(10, 0))
+        self._keyboard_sync_button = self._button(
+            actions,
+            "",
+            self._toggle_keyboard_sync,
+            primary=True,
+        )
+        self._keyboard_sync_button.pack(side=LEFT)
+        self._keyboard_sync_label = Label(
+            actions,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+        )
+        self._keyboard_sync_label.pack(side=LEFT, padx=12)
+        Label(
+            actions,
+            text=(
+                f"已確認 {len(CONFIRMED_GAME_SHORTCUTS)} 組快捷鍵；"
+                "請從上方清單查看"
             ),
-        ).pack(side=LEFT, padx=(0, 8))
-        self._button(
-            tests,
-            "測試 C（人物）",
-            (
-                (lambda: self.on_test_key("C"))
-                if self.on_test_key is not None
-                else None
-            ),
-        ).pack(side=LEFT)
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+        ).pack(side=RIGHT)
+        self._refresh_keyboard_sync_controls()
 
         reconnect_card = self._card(page)
         reconnect_card.pack(fill=X, pady=(14, 0))
@@ -651,20 +697,100 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        reconnect_text = (
-            "● 自動監看中｜失敗每 60 秒重試"
-            if self.smart_reconnect_enabled
-            else "● 目前未啟用"
-        )
-        Label(
+        self._smart_reconnect_label = Label(
             reconnect_card,
-            text=reconnect_text,
+            text="",
             font=("Microsoft JhengHei UI", 11),
             bg=SURFACE,
-            fg=SUCCESS if self.smart_reconnect_enabled else MUTED,
+            fg=MUTED,
             anchor="w",
-        ).pack(fill=X, pady=(10, 0))
+        )
+        self._smart_reconnect_label.pack(fill=X, pady=(10, 0))
+        self._smart_reconnect_button = self._button(
+            reconnect_card,
+            "",
+            self._toggle_smart_reconnect,
+            primary=True,
+        )
+        self._smart_reconnect_button.pack(anchor="w", pady=(10, 0))
+        Label(
+            reconnect_card,
+            text="啟用後會自動判定與重試；不需逐次按重連按鈕。",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        ).pack(fill=X, pady=(8, 0))
+        self._refresh_smart_reconnect_controls()
         return page
+
+    def _toggle_keyboard_sync(self) -> None:
+        desired = not self.keyboard_sync_enabled
+        if self.on_keyboard_sync_change is None:
+            return
+        accepted = self.on_keyboard_sync_change(desired)
+        if accepted is False:
+            return
+        self.keyboard_sync_enabled = desired
+        self._refresh_keyboard_sync_controls()
+
+    def _refresh_keyboard_sync_controls(self) -> None:
+        if self._keyboard_sync_button is not None:
+            self._keyboard_sync_button.configure(
+                text=(
+                    "停止鍵盤同步"
+                    if self.keyboard_sync_enabled
+                    else "開始鍵盤同步"
+                ),
+                bg=(
+                    WARNING if self.keyboard_sync_enabled else PRIMARY
+                ),
+            )
+        if self._keyboard_sync_label is not None:
+            self._keyboard_sync_label.configure(
+                text=(
+                    "● 已啟用｜在目前遊戲主視窗按鍵時同步"
+                    if self.keyboard_sync_enabled
+                    else "● 尚未啟用"
+                ),
+                fg=SUCCESS if self.keyboard_sync_enabled else MUTED,
+            )
+
+    def set_keyboard_sync_enabled(self, enabled: bool) -> None:
+        self.keyboard_sync_enabled = bool(enabled)
+        self._refresh_keyboard_sync_controls()
+
+    def _toggle_smart_reconnect(self) -> None:
+        desired = not self.smart_reconnect_enabled
+        if self.on_smart_reconnect_change is None:
+            return
+        accepted = self.on_smart_reconnect_change(desired)
+        if accepted is False:
+            return
+        self.smart_reconnect_enabled = desired
+        self._refresh_smart_reconnect_controls()
+
+    def _refresh_smart_reconnect_controls(self) -> None:
+        if self._smart_reconnect_button is not None:
+            self._smart_reconnect_button.configure(
+                text=(
+                    "停止智慧重連"
+                    if self.smart_reconnect_enabled
+                    else "啟用智慧重連"
+                ),
+                bg=(
+                    WARNING if self.smart_reconnect_enabled else PRIMARY
+                ),
+            )
+        if self._smart_reconnect_label is not None:
+            self._smart_reconnect_label.configure(
+                text=(
+                    "● 自動監看中｜失敗每 60 秒重試"
+                    if self.smart_reconnect_enabled
+                    else "● 安全停止｜不會點擊遊戲視窗"
+                ),
+                fg=SUCCESS if self.smart_reconnect_enabled else MUTED,
+            )
 
     def _build_characters_page(self, parent) -> Frame:
         page = Frame(parent, bg=BACKGROUND)

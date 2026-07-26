@@ -10,6 +10,10 @@ from tkinter import PhotoImage, TclError, Tk, messagebox
 
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
+from adapters.windows_app_identity import (
+    configure_process_app_identity,
+    configure_tk_window_app_identity,
+)
 from adapters.windows_input_sync import (
     WindowInputPolicy,
     WindowsInputSyncController,
@@ -62,6 +66,7 @@ from services.group_selection_service import (
     GroupSelectionService,
     default_legacy_group_config_path,
 )
+from services.keyboard_sync_monitor import KeyboardSyncMonitor
 from services.logger_service import LoggerService
 from services.smart_reconnect_monitor import SmartReconnectMonitor
 from services.target_window_state_service import (
@@ -82,6 +87,7 @@ TARGET_WINDOW_KEY = "target_window_keywords"
 TARGET_WINDOW_FINGERPRINT_KEY = "target_window_fingerprint"
 INPUT_POLICY_KEY = "input_policy"
 SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
+SMART_RECONNECT_CONSENT_KEY = "smart_reconnect_consent_v1"
 CURRENT_GROUP_NAME_KEY = "current_group_name"
 REGISTRY_FILENAME = "window_registry.json"
 RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
@@ -124,6 +130,13 @@ def apply_window_icon(window: Tk) -> None:
             pass
 
 
+def taskbar_icon_resource() -> str:
+    """Return the exact confirmed plus icon resource used by Windows."""
+    if bool(getattr(sys, "frozen", False)):
+        return f"{Path(sys.executable).resolve()},0"
+    return f"{resource_path(APP_ICON_ICO).resolve()},0"
+
+
 def _normalize_window_keywords(value: object) -> list[str]:
     if isinstance(value, str):
         value = [value]
@@ -145,7 +158,8 @@ def build_services(root: Path | None = None):
     config.ensure_defaults(
         {
             INPUT_POLICY_KEY: WindowInputPolicy.ALL.value,
-            SMART_RECONNECT_ENABLED_KEY: True,
+            SMART_RECONNECT_ENABLED_KEY: False,
+            SMART_RECONNECT_CONSENT_KEY: False,
         }
     )
     event_bus = EventBus(logger=logger)
@@ -517,7 +531,7 @@ def format_start_status(status: dict[str, object], paths: PathManager) -> str:
         "背景能力\n"
         f"{format_background_status(status)}\n\n"
         f"{format_registry_status(status)}\n\n"
-        "同步按鍵不會自行送出；目前只允許玩家明確執行 B／C 同步測試。\n"
+        "同步按鍵不會自行送出；只會由玩家從已確認快捷鍵清單明確執行。\n"
         "智慧重連只依已確認畫面自動監看，未知畫面不會點擊。\n"
         f"紀錄位置：{paths.logs_dir()}"
     )
@@ -525,10 +539,17 @@ def format_start_status(status: dict[str, object], paths: PathManager) -> str:
 
 def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window = Tk()
+    window.withdraw()
     window.title(APP_TITLE)
     apply_window_icon(window)
     window.geometry("1040x720")
     window.minsize(900, 620)
+    window.update_idletasks()
+    window_identity = configure_tk_window_app_identity(
+        window,
+        taskbar_icon_resource(),
+    )
+    window.deiconify()
 
     config = AppContext.get(ConfigManager)
     input_controller = AppContext.get(WindowsInputSyncController)
@@ -539,6 +560,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     card_service = AppContext.get(CardService)
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
     target_window_state_service = AppContext.get(TargetWindowStateService)
+    smart_reconnect_monitor = AppContext.get(SmartReconnectMonitor)
+    smart_reconnect_controller = AppContext.get(
+        WindowsSmartReconnectController
+    )
     character_view_service = AppContext.get(CharacterViewService)
     character_detail_view_service = AppContext.get(CharacterDetailViewService)
     character_note_service = AppContext.get(CharacterNoteService)
@@ -607,6 +632,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         workspace_service.set_next_step("查看目前需要注意的內容")
         config.set(CURRENT_GROUP_NAME_KEY, choice.name)
+        if keyboard_sync_monitor is not None and keyboard_sync_monitor.enabled:
+            keyboard_sync_monitor.stop()
+            if home_view is not None:
+                home_view.set_keyboard_sync_enabled(False)
+            if logger is not None:
+                logger.info(
+                    "Keyboard synchronization stopped because the group changed."
+                )
 
     def card_display_seconds() -> int:
         if card_display_settings_service is None:
@@ -664,46 +697,142 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         child = detail_window.open()
         apply_window_icon(child)
 
-    def test_approved_key(key: str) -> None:
-        policy = (
+    def current_input_policy() -> WindowInputPolicy | None:
+        return (
             normalize_input_policy(config.get(INPUT_POLICY_KEY))
             if config is not None
             else None
         )
-        if input_controller is None or policy is None:
-            messagebox.showerror(
-                "輔｜同步輸入測試",
-                "同步輸入尚未正確設定，沒有送出任何按鍵。",
-                parent=window,
-            )
-            return
-        result = input_controller.send_approved_key(
-            key,
-            policy=policy,
-            execute=True,
-        )
+
+    def log_keyboard_sync_result(result) -> None:
         if logger is not None:
             logger.info(
-                "Approved input test completed; "
+                "Keyboard synchronized input completed; "
                 f"key={result.approved_key}; policy={result.policy}; "
                 f"eligible={result.eligible_windows}; sent={result.sent_windows}; "
                 f"failures={','.join(result.failure_codes) or 'none'}"
             )
-        if result.passed:
-            messagebox.showinfo(
-                "輔｜同步輸入測試",
-                f"{key} 已送達 {result.sent_windows} 個已驗證遊戲視窗。",
-                parent=window,
-            )
-        else:
+
+    keyboard_sync_monitor = (
+        KeyboardSyncMonitor(
+            input_controller,
+            policy_provider=current_input_policy,
+            schedule=window.after,
+            cancel=window.after_cancel,
+            result_callback=log_keyboard_sync_result,
+        )
+        if input_controller is not None
+        else None
+    )
+
+    def change_keyboard_sync(enabled: bool) -> bool:
+        if keyboard_sync_monitor is None or input_controller is None:
             messagebox.showerror(
-                "輔｜同步輸入測試",
-                "同步輸入未完整送達；已停止後續操作。\n"
-                f"符合權限：{result.eligible_windows}\n"
-                f"成功送達：{result.sent_windows}\n"
-                f"錯誤代碼：{', '.join(result.failure_codes) or 'unknown'}",
+                "輔｜同步輸入",
+                "同步輸入尚未正確設定，沒有啟用。",
                 parent=window,
             )
+            return False
+        if not enabled:
+            keyboard_sync_monitor.stop()
+            return True
+
+        state = workspace_service.snapshot() if workspace_service is not None else None
+        group_name = (
+            state.current_group.name
+            if state is not None and state.current_group is not None
+            else None
+        )
+        choice = (
+            group_selection_service.find(group_name)
+            if group_selection_service is not None
+            else None
+        )
+        if choice is None or choice.character_count <= 1:
+            messagebox.showerror(
+                "輔｜同步輸入",
+                "請先選擇至少有 2 個視窗設定的組別；目前沒有啟用。",
+                parent=window,
+            )
+            return False
+        if current_input_policy() is None:
+            messagebox.showerror(
+                "輔｜同步輸入",
+                "允許範圍尚未正確設定；目前沒有啟用。",
+                parent=window,
+            )
+            return False
+        input_controller.set_expected_windows(choice.character_count)
+        keyboard_sync_monitor.start()
+        if logger is not None:
+            logger.info(
+                "Keyboard synchronization enabled; "
+                f"group={choice.name}; expected={choice.character_count}"
+            )
+        return True
+
+    def change_smart_reconnect(enabled: bool) -> bool:
+        if (
+            config is None
+            or smart_reconnect_monitor is None
+            or smart_reconnect_controller is None
+        ):
+            messagebox.showerror(
+                "輔｜智慧重連",
+                "智慧重連尚未正確設定；目前維持安全停止。",
+                parent=window,
+            )
+            return False
+        if enabled:
+            state = (
+                workspace_service.snapshot()
+                if workspace_service is not None
+                else None
+            )
+            group_name = (
+                state.current_group.name
+                if state is not None and state.current_group is not None
+                else None
+            )
+            choice = (
+                group_selection_service.find(group_name)
+                if group_selection_service is not None
+                else None
+            )
+            if choice is None or choice.character_count <= 0:
+                messagebox.showerror(
+                    "輔｜智慧重連",
+                    "請先選擇已有視窗設定的組別；目前維持安全停止。",
+                    parent=window,
+                )
+                return False
+            smart_reconnect_controller.set_expected_windows(
+                choice.character_count
+            )
+            config.update_values(
+                {
+                    SMART_RECONNECT_ENABLED_KEY: True,
+                    SMART_RECONNECT_CONSENT_KEY: True,
+                }
+            )
+            smart_reconnect_monitor.start()
+            if logger is not None:
+                logger.info("Smart reconnect explicitly enabled by the player.")
+            return True
+
+        config.update_values(
+            {
+                SMART_RECONNECT_ENABLED_KEY: False,
+                SMART_RECONNECT_CONSENT_KEY: False,
+            }
+        )
+        stopped = smart_reconnect_monitor.stop(timeout_seconds=1.0)
+        if logger is not None:
+            logger.info(
+                "Smart reconnect explicitly disabled by the player; "
+                f"worker_stopped={stopped}"
+            )
+        return True
 
     group_choices = (
         group_selection_service.choices()
@@ -729,7 +858,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_start=show_start_status,
         input_policy=configured_policy.value,
         on_input_policy_change=change_input_policy,
-        on_test_key=test_approved_key,
+        keyboard_sync_enabled=False,
+        on_keyboard_sync_change=change_keyboard_sync,
         group_choices=group_choices,
         current_group_name=(
             workspace_state.current_group.name
@@ -770,8 +900,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         ),
         character_choices=character_choices,
         smart_reconnect_enabled=bool(
-            status.get("smart_reconnect_enabled", True)
+            status.get("smart_reconnect_enabled", False)
         ),
+        on_smart_reconnect_change=change_smart_reconnect,
         card_display_seconds_provider=card_display_seconds,
         on_card_display_seconds_update=update_card_display_seconds,
         on_refresh_error=report_refresh_error,
@@ -812,11 +943,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             expiry_monitor.stop()
         if overlay_runtime is not None:
             overlay_runtime.stop()
+        if keyboard_sync_monitor is not None:
+            keyboard_sync_monitor.stop()
+        if window_identity is not None:
+            window_identity.clear()
         window.destroy()
 
     window.protocol("WM_DELETE_WINDOW", close_window)
     window._card_overlay_runtime = overlay_runtime
     window._card_expiry_monitor = expiry_monitor
+    window._windows_app_identity = window_identity
     return window
 
 
@@ -846,6 +982,7 @@ def run(
     paths: PathManager | None = None
     logger: LoggerService | None = None
     try:
+        configure_process_app_identity()
         paths, logger = build_services(root=root)
         if target_desktop_verify_only:
             try:
@@ -881,22 +1018,21 @@ def run(
             and normalize_input_policy(config.get(INPUT_POLICY_KEY)) is not None
             else WindowInputPolicy.ALL.value
         )
-        status["smart_reconnect_enabled"] = bool(
-            config.get(SMART_RECONNECT_ENABLED_KEY, True)
-            if config is not None
-            else True
-        )
+        # Permission from an older process is never reused. Every program
+        # launch starts in a hard-stopped state and requires a fresh click on
+        # the enable button before any game window may be inspected/clicked.
+        if config is not None:
+            config.update_values(
+                {
+                    SMART_RECONNECT_ENABLED_KEY: False,
+                    SMART_RECONNECT_CONSENT_KEY: False,
+                }
+            )
+        status["smart_reconnect_enabled"] = False
         write_self_check_report(status, paths)
 
         if self_check_only:
             return 0 if bool(status.get("self_check_passed", False)) else 2
-
-        monitor = AppContext.get(SmartReconnectMonitor)
-        if status["smart_reconnect_enabled"] and monitor is not None:
-            monitor.start()
-            logger.info(
-                "Smart reconnect monitor enabled with confirmed screen templates."
-            )
 
         window = create_main_window(status, paths)
         window.mainloop()

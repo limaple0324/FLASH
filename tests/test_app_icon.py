@@ -2,6 +2,7 @@ import hashlib
 from pathlib import Path
 
 import main
+from adapters import windows_app_identity
 from PIL import Image
 from main import APP_ICON_ICO, APP_ICON_PNG, resource_path
 
@@ -55,6 +56,14 @@ def test_windows_build_uses_the_confirmed_icon():
     assert "icon='assets/flash_icon.ico'" in spec
 
 
+def test_taskbar_icon_uses_packaged_executable_resource(monkeypatch, tmp_path):
+    executable = tmp_path / "FLASH.exe"
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(main.sys, "executable", str(executable))
+
+    assert main.taskbar_icon_resource() == f"{executable.resolve()},0"
+
+
 def test_window_icon_sets_the_current_window_icon(monkeypatch, tmp_path):
     ico = tmp_path / "flash_icon.ico"
     png = tmp_path / "flash_icon.png"
@@ -83,3 +92,109 @@ def test_window_icon_sets_the_current_window_icon(monkeypatch, tmp_path):
     assert calls == [
         ("iconbitmap", str(ico)),
     ]
+
+
+def test_process_identity_is_explicit_and_stable(monkeypatch):
+    calls = []
+
+    class FakeBackend:
+        def set_process_identity(self, app_id):
+            calls.append(app_id)
+
+    monkeypatch.setattr(windows_app_identity.sys, "platform", "win32")
+    monkeypatch.setattr(
+        windows_app_identity,
+        "_windows_backend",
+        lambda: FakeBackend(),
+    )
+
+    assert windows_app_identity.configure_process_app_identity() is True
+    assert calls == [windows_app_identity.APP_USER_MODEL_ID]
+
+
+def test_process_identity_failure_does_not_block_program_start(monkeypatch):
+    class FailingBackend:
+        def set_process_identity(self, _app_id):
+            raise OSError("unsupported shell")
+
+    monkeypatch.setattr(windows_app_identity.sys, "platform", "win32")
+    monkeypatch.setattr(
+        windows_app_identity,
+        "_windows_backend",
+        lambda: FailingBackend(),
+    )
+
+    assert windows_app_identity.configure_process_app_identity() is False
+
+
+def test_tk_window_identity_uses_root_handle_and_confirmed_icon(monkeypatch):
+    calls = []
+
+    class FakeBackend:
+        def root_window_handle(self, window_handle):
+            calls.append(("root", window_handle))
+            return 456
+
+        def set_window_identity(self, window_handle, app_id, icon_resource):
+            calls.append(("set", window_handle, app_id, icon_resource))
+
+    class FakeWindow:
+        def winfo_id(self):
+            return 123
+
+    backend = FakeBackend()
+    monkeypatch.setattr(windows_app_identity.sys, "platform", "win32")
+    monkeypatch.setattr(
+        windows_app_identity,
+        "_windows_backend",
+        lambda: backend,
+    )
+
+    identity = windows_app_identity.configure_tk_window_app_identity(
+        FakeWindow(),
+        r"C:\Program Files\輔\FLASH.exe,0",
+    )
+
+    assert identity is not None
+    assert calls == [
+        ("root", 123),
+        (
+            "set",
+            456,
+            windows_app_identity.APP_USER_MODEL_ID,
+            r"C:\Program Files\輔\FLASH.exe,0",
+        ),
+    ]
+
+    identity.clear()
+    identity.clear()
+    assert calls[-1] == ("set", 456, None, None)
+    assert calls.count(("set", 456, None, None)) == 1
+
+
+def test_tk_window_identity_failure_keeps_window_launchable(monkeypatch):
+    class FailingBackend:
+        def root_window_handle(self, window_handle):
+            return window_handle
+
+        def set_window_identity(self, _window_handle, _app_id, _icon_resource):
+            raise OSError("property store unavailable")
+
+    class FakeWindow:
+        def winfo_id(self):
+            return 123
+
+    monkeypatch.setattr(windows_app_identity.sys, "platform", "win32")
+    monkeypatch.setattr(
+        windows_app_identity,
+        "_windows_backend",
+        lambda: FailingBackend(),
+    )
+
+    assert (
+        windows_app_identity.configure_tk_window_app_identity(
+            FakeWindow(),
+            r"C:\Program Files\輔\FLASH.exe,0",
+        )
+        is None
+    )

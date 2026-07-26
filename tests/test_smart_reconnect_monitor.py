@@ -6,6 +6,8 @@ class FakeBoundary:
     def __init__(self, results):
         self.results = list(results)
         self.calls = 0
+        self.execution_enabled = False
+        self.execution_changes = []
 
     @property
     def state(self):
@@ -23,6 +25,10 @@ class FakeBoundary:
             "reconnect.connected",
             details={"next_check_seconds": 5},
         )
+
+    def set_execution_enabled(self, enabled):
+        self.execution_enabled = bool(enabled)
+        self.execution_changes.append(self.execution_enabled)
 
 
 class RecordingLogger:
@@ -115,10 +121,15 @@ def test_invalid_or_missing_delay_uses_one_minute_fallback():
 
 
 def test_start_and_stop_are_idempotent():
-    monitor = SmartReconnectMonitor(FakeBoundary([]))
+    boundary = FakeBoundary([])
+    monitor = SmartReconnectMonitor(boundary)
 
     assert monitor.start() is True
+    assert boundary.execution_enabled is True
     assert monitor.start() is False
     assert monitor.stop() is True
+    assert boundary.execution_enabled is False
     assert monitor.stop() is True
     assert monitor.running is False
+    assert boundary.execution_changes[0] is True
+    assert boundary.execution_changes[-1] is False

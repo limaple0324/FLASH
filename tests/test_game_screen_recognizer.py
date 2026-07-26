@@ -4,6 +4,9 @@ from pathlib import Path
 from PIL import Image
 
 from adapters.game_screen_recognizer import (
+    CHARACTER_ENTER_CLICK_POINT,
+    CHARACTER_LEVEL_REGIONS,
+    CHARACTER_SLOT_CLICK_POINTS,
     DEFAULT_SCREEN_TEMPLATES,
     ROUTE_DIGIT_REFERENCE_REGION,
     LINE_ROUTE_CLICK_POINTS,
@@ -11,6 +14,7 @@ from adapters.game_screen_recognizer import (
 )
 from adapters.windows_background_capture import CaptureSample
 from core.reconnect_policy import ReconnectScreenState
+from domain.character import CharacterImportance
 
 
 REFERENCE_DIR = Path("assets") / "reconnect_reference"
@@ -36,7 +40,7 @@ def test_all_user_reference_images_match_the_fixed_sha256_manifest():
 
     images = sorted(REFERENCE_DIR.glob("*.png"))
 
-    assert len(images) == 12
+    assert len(images) == 15
     assert set(manifest) == {image.name for image in images}
     for image in images:
         assert hashlib.sha256(image.read_bytes()).hexdigest() == manifest[image.name]
@@ -54,8 +58,88 @@ def test_each_confirmed_reference_classifies_to_its_declared_state():
         if definition.state is ReconnectScreenState.LINE_SELECTION:
             assert result.line_number == 8
             assert result.click_point == LINE_ROUTE_CLICK_POINTS[8]
+        elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
+            assert result.character_level == 100
+            assert result.character_importance is CharacterImportance.SECONDARY
+            assert result.character_slot_index == 0
+            assert result.character_slot_selected is True
+            assert result.click_point == CHARACTER_ENTER_CLICK_POINT
         else:
             assert result.click_point == definition.click_point
+
+
+def _paste_level_reference(
+    recognizer,
+    candidate,
+    *,
+    slot_index,
+    level,
+):
+    region = CHARACTER_LEVEL_REGIONS[slot_index]
+    box = (
+        round(candidate.width * region[0]),
+        round(candidate.height * region[1]),
+        round(candidate.width * region[2]),
+        round(candidate.height * region[3]),
+    )
+    reference = recognizer._reference(f"character_level_{level}.png")
+    candidate.paste(
+        reference.resize(
+            (box[2] - box[0], box[3] - box[1]),
+            Image.Resampling.BILINEAR,
+        ),
+        box,
+    )
+
+
+def test_character_login_prefers_confirmed_primary_role_over_leftmost_secondary():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "05_character_selection.png") as source:
+        candidate = source.convert("RGB")
+    _paste_level_reference(
+        recognizer,
+        candidate,
+        slot_index=1,
+        level=120,
+    )
+
+    point, level, importance, slot_index, selected = (
+        recognizer._character_selection_target(candidate)
+    )
+
+    assert level == 120
+    assert importance is CharacterImportance.PRIMARY
+    assert slot_index == 1
+    assert selected is False
+    assert point == CHARACTER_SLOT_CLICK_POINTS[1]
+
+
+def test_character_login_prefers_higher_level_inside_primary_role():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "05_character_selection.png") as source:
+        candidate = source.convert("RGB")
+    _paste_level_reference(
+        recognizer,
+        candidate,
+        slot_index=1,
+        level=120,
+    )
+    _paste_level_reference(
+        recognizer,
+        candidate,
+        slot_index=2,
+        level=160,
+    )
+
+    point, level, importance, slot_index, selected = (
+        recognizer._character_selection_target(candidate)
+    )
+
+    assert level == 160
+    assert importance is CharacterImportance.PRIMARY
+    assert slot_index == 2
+    assert selected is False
+    assert point == CHARACTER_SLOT_CLICK_POINTS[2]
 
 
 def test_recognition_survives_proportional_window_scaling():
