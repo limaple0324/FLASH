@@ -3,8 +3,6 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from core.window_registry import WindowRegistry
-from domain.soul_stone import SoulStoneRecord
-from domain.soul_stone_store import SoulStoneStore
 from services.character_detail_choice_service import (
     CharacterDetailChoiceService,
     PlayerCharacterDetailChoice,
@@ -14,24 +12,13 @@ from services.character_detail_view_service import (
     PlayerCharacterDetail,
 )
 from services.character_view_service import CharacterViewService
-from services.soul_stone_service import SoulStoneService
 
 
 def _detail_service(tmp_path) -> CharacterDetailViewService:
     registry = WindowRegistry()
-    registry.register_character("char-a", "同名角色", group="甲組")
-    registry.register_character("char-b", "同名角色", group="乙組")
-    store = SoulStoneStore(tmp_path / "soul_stones.json")
-    store.save(
-        (
-            SoulStoneRecord("char-a", "甲的紀錄"),
-            SoulStoneRecord("char-b", "乙的紀錄"),
-        )
-    )
-    return CharacterDetailViewService(
-        CharacterViewService(registry, ()),
-        SoulStoneService(store),
-    )
+    registry.register_character("char-a", "同名角色", group="甲組", note="甲的備註")
+    registry.register_character("char-b", "同名角色", group="乙組", note="乙的備註")
+    return CharacterDetailViewService(CharacterViewService(registry, ()))
 
 
 def test_choices_bind_duplicate_names_to_exact_stable_identities(tmp_path) -> None:
@@ -42,9 +29,9 @@ def test_choices_bind_duplicate_names_to_exact_stable_identities(tmp_path) -> No
     ).all()
 
     assert tuple(choice.detail.group for choice in choices) == ("甲組", "乙組")
-    assert tuple(choice.detail.soul_stone for choice in choices) == (
-        "甲的紀錄",
-        "乙的紀錄",
+    assert tuple(choice.detail.note for choice in choices) == (
+        "甲的備註",
+        "乙的備註",
     )
 
     choices[1].select()

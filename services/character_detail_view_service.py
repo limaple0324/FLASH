@@ -6,7 +6,6 @@ from services.character_view_service import (
     CharacterViewService,
     PlayerCharacterView,
 )
-from services.soul_stone_service import SoulStoneService
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,14 +18,11 @@ class PlayerCharacterDetail:
     importance: str | None
     role: str | None
     note: str | None
-    soul_stone: str | None = None
 
     @classmethod
     def from_summary(
         cls,
         summary: PlayerCharacterView,
-        *,
-        soul_stone: str | None = None,
     ) -> "PlayerCharacterDetail":
         if not isinstance(summary, PlayerCharacterView):
             raise TypeError("summary must be PlayerCharacterView.")
@@ -37,7 +33,6 @@ class PlayerCharacterDetail:
             importance=summary.importance,
             role=summary.role,
             note=summary.note,
-            soul_stone=soul_stone,
         )
 
 
@@ -47,14 +42,10 @@ class CharacterDetailViewService:
     def __init__(
         self,
         characters: CharacterViewService,
-        soul_stones: SoulStoneService,
     ) -> None:
         if not isinstance(characters, CharacterViewService):
             raise TypeError("characters must be CharacterViewService.")
-        if not isinstance(soul_stones, SoulStoneService):
-            raise TypeError("soul_stones must be SoulStoneService.")
         self._characters = characters
-        self._soul_stones = soul_stones
 
     def all_with_identities(
         self,
@@ -62,16 +53,10 @@ class CharacterDetailViewService:
         """供控制層安全綁定操作；角色識別不得傳給顯示內容。"""
         details: list[tuple[str, PlayerCharacterDetail]] = []
         for character_id, summary in self._characters.all_with_identities():
-            soul_stone = self._soul_stones.for_character(character_id)
             details.append(
                 (
                     character_id,
-                    PlayerCharacterDetail.from_summary(
-                        summary,
-                        soul_stone=(
-                            soul_stone.note if soul_stone is not None else None
-                        ),
-                    ),
+                    PlayerCharacterDetail.from_summary(summary),
                 )
             )
         return tuple(details)

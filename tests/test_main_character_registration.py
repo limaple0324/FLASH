@@ -88,7 +88,6 @@ def test_build_services_registers_detail_without_frozen_life_soul(tmp_path) -> N
             importance=None,
             role=None,
             note=None,
-            soul_stone=None,
         ),
     )
     assert not hasattr(details.all()[0], "life_soul")

@@ -42,7 +42,6 @@ from domain.activity_schedule import (
 )
 from domain.character_store import CharacterStore
 from domain.progress_store import ActivityProgressStore
-from domain.soul_stone_store import SoulStoneStore
 from habit.service import ActivityOrderHabitService
 from habit.store import ActivityOrderHabitStore
 from services.activity_progress_service import ActivityProgressService
@@ -56,7 +55,6 @@ from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from services.smart_reconnect_monitor import SmartReconnectMonitor
-from services.soul_stone_service import SoulStoneService
 from services.target_window_state_service import (
     TARGET_WINDOW_OBSERVED_EVENT,
     TargetWindowStateService,
@@ -75,7 +73,6 @@ REGISTRY_FILENAME = "window_registry.json"
 RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
 CHARACTER_FILENAME = "characters.json"
-SOUL_STONE_FILENAME = "soul_stones.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
 ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
@@ -153,12 +150,7 @@ def build_services(root: Path | None = None):
     character_store = CharacterStore(paths.data_dir() / CHARACTER_FILENAME)
     characters = character_store.load()
     character_view_service = CharacterViewService(registry, characters)
-    soul_stone_store = SoulStoneStore(paths.data_dir() / SOUL_STONE_FILENAME)
-    soul_stone_service = SoulStoneService(soul_stone_store)
-    character_detail_view_service = CharacterDetailViewService(
-        character_view_service,
-        soul_stone_service,
-    )
+    character_detail_view_service = CharacterDetailViewService(character_view_service)
     progress_store = ActivityProgressStore(
         paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
     )
@@ -210,8 +202,6 @@ def build_services(root: Path | None = None):
     AppContext.register(WindowRegistry, registry)
     AppContext.register(CharacterStore, character_store)
     AppContext.register(CharacterViewService, character_view_service)
-    AppContext.register(SoulStoneStore, soul_stone_store)
-    AppContext.register(SoulStoneService, soul_stone_service)
     AppContext.register(CharacterDetailViewService, character_detail_view_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
@@ -264,14 +254,6 @@ def build_services(root: Path | None = None):
         )
     else:
         logger.info(f"Character profiles loaded: {len(characters)} character(s).")
-
-    if soul_stone_store.recovered_from_corruption:
-        logger.warning(
-            "Soul stone records were corrupt and have been isolated; "
-            f"backup={soul_stone_store.corrupt_backup}"
-        )
-    else:
-        logger.info(f"Soul stone records loaded: {len(soul_stone_service.all())}.")
 
     if progress_store.recovered_from_corruption:
         logger.warning(
