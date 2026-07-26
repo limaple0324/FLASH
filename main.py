@@ -43,6 +43,8 @@ from domain.activity_schedule import (
 from domain.character_store import CharacterStore
 from domain.progress_store import ActivityProgressStore
 from domain.soul_stone_store import SoulStoneStore
+from habit.service import ActivityOrderHabitService
+from habit.store import ActivityOrderHabitStore
 from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
 from services.card_coordinator import CardCoordinator
@@ -76,6 +78,7 @@ CHARACTER_FILENAME = "characters.json"
 SOUL_STONE_FILENAME = "soul_stones.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
+ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 RECONNECT_REFERENCE_DIR = Path("assets") / "reconnect_reference"
@@ -164,6 +167,12 @@ def build_services(root: Path | None = None):
     for rule in activity_schedule_catalog.all():
         progress_service.register_definition(rule.definition)
     decision_service = DecisionService()
+    activity_order_habit_store = ActivityOrderHabitStore(
+        paths.data_dir() / ACTIVITY_ORDER_HABIT_FILENAME
+    )
+    activity_order_habit_service = ActivityOrderHabitService(
+        activity_order_habit_store
+    )
     workspace_service = WorkspaceService()
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
     card_history_service = CardHistoryService(card_history_store)
@@ -208,6 +217,8 @@ def build_services(root: Path | None = None):
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(ActivityScheduleCatalog, activity_schedule_catalog)
     AppContext.register(DecisionService, decision_service)
+    AppContext.register(ActivityOrderHabitStore, activity_order_habit_store)
+    AppContext.register(ActivityOrderHabitService, activity_order_habit_service)
     AppContext.register(WorkspaceService, workspace_service)
     AppContext.register(CardHistoryStore, card_history_store)
     AppContext.register(CardHistoryService, card_history_service)
