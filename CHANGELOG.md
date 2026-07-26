@@ -18,6 +18,11 @@
 - Kept `main.py` registration for a separate batch so the accepted SP1 bootstrap
   is patched deliberately instead of being overwritten from the integration
   branch.
+- Registered the cumulative SP2 stores and services in the accepted SP1
+  bootstrap in `ae76d64`, including managed activity-progress/card-history
+  paths and shared card coordinator/view-state dependencies.
+- 51 registration, service, SP1 bootstrap, and self-check regression tests plus
+  cumulative Python compilation and `git diff --check` passed.
 - No SP3 UI, game input, player-visible registry mapping, or frozen resource
   area was added.
 

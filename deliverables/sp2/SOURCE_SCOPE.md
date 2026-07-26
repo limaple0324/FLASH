@@ -50,3 +50,25 @@
 - `main.py` 與 `build_services()` 註冊；下一批獨立接線與驗證
 - 任何 SP3 畫面或遊戲輸入
 - 第一批已列出的所有暫停領域與未確認內容
+
+## 第三批｜累積正常流程服務註冊
+
+- SP2 程式提交：`ae76d64c10f2bd3f827eda080d613f807aa8de7f`
+- 驗證：51 項 SP2 註冊、服務與 SP1 啟動／自檢回歸測試通過；
+  `main.py`、`services/`、`cards/`、`domain/`、`workspace/` 編譯通過
+
+### 本批 SP2 新增
+
+- 在已驗收 SP1 的 `main.py` 逐項註冊 `ActivityProgressStore`、
+  `ActivityProgressService`、`WorkspaceService`、`CardHistoryStore`、
+  `CardHistoryService`、`CardService`、`CardCoordinator` 與
+  `CardViewStateService`
+- 活動進度與卡片歷史固定保存於受管理 `data/` 目錄
+- 損壞資料沿用 fail-safe 隔離並寫入警告紀錄
+- 5 組正常流程註冊／共用實例測試
+
+### 本批明確沒有新增
+
+- SP3 HomeView 接線或任何 UI
+- 遊戲讀取、鍵盤、滑鼠或自動操作
+- 所有暫停領域與未確認內容

@@ -57,5 +57,9 @@ SP3 的首頁、浮層、角色視窗與陪伴呈現也不在 SP2 階段新增�
 卡片協調與唯讀 View State。核心與服務共 108 項受影響測試、5 份新增
 模組編譯及差異檢查通過。
 
-詳細來源範圍見 [`SOURCE_SCOPE.md`](SOURCE_SCOPE.md)。下一批才獨立接入
-`main.py` 服務註冊；目前仍未搬入任何 SP3、遊戲輸入或暫停領域程式。
+詳細來源範圍見 [`SOURCE_SCOPE.md`](SOURCE_SCOPE.md)。
+
+第三批累積正常流程接線已提交為
+`ae76d64c10f2bd3f827eda080d613f807aa8de7f`：在已驗收 SP1 bootstrap
+逐項註冊 8 個 SP2 store/service，共 51 項 SP2 註冊、服務與 SP1 啟動／
+自檢回歸測試通過。目前仍未搬入任何 SP3、遊戲輸入或暫停領域程式。
