@@ -23,6 +23,10 @@
   paths and shared card coordinator/view-state dependencies.
 - 51 registration, service, SP1 bootstrap, and self-check regression tests plus
   cumulative Python compilation and `git diff --check` passed.
+- Ported atomic character-profile persistence and stable-identity read-only
+  character views in `3bb6ac4`; registered both in the cumulative bootstrap.
+- 31 character, registration, SP1 bootstrap, and self-check regression tests
+  passed without adding character UI or frozen life-soul fields.
 - No SP3 UI, game input, player-visible registry mapping, or frozen resource
   area was added.
 
