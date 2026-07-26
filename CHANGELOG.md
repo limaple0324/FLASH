@@ -32,6 +32,11 @@
   managed data paths.
 - 36 soul-stone, registration, SP1 bootstrap, and self-check regression tests
   passed without adding the SP3 editor or frozen life-soul data.
+- Added immutable character-detail snapshots and stable-identity selection
+  commands in `be94642`; registered the detail service in the cumulative
+  bootstrap.
+- Removed the integration branch's life-soul dependency from character details
+  to honor the current frozen-domain boundary; 52 related tests passed.
 - No SP3 UI, game input, player-visible registry mapping, or frozen resource
   area was added.
 

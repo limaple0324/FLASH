@@ -114,3 +114,27 @@
 - SP3 靈魂石編輯視窗或角色詳細畫面
 - 命魂與其他五個暫停領域
 - 遊戲讀取或輸入操作
+
+## 第六批｜角色詳細唯讀快照與安全選擇
+
+- SP2 程式提交：`be94642ce677b3716ba152cbcc749a0cad7a0e6c`
+- 驗證：52 項角色詳細、靈魂石、註冊與 SP1 啟動／自檢回歸測試通過；
+  新增模組與 `main.py` 編譯、差異檢查通過
+
+### 本批 SP2 新增
+
+- `services/character_detail_view_service.py`：把已確認角色摘要與靈魂石組成
+  不可修改的詳細快照
+- `services/character_detail_choice_service.py`：顯示層不取得角色識別碼，
+  仍能透過無參數命令精確選擇穩定身分
+- `main.py` 註冊 `CharacterDetailViewService`
+
+### 本批刻意調整舊整合設計
+
+- 移除舊版 `CharacterDetailViewService` 對命魂服務的依賴
+- 詳細快照明確不存在 `life_soul`、魂器、寵物、黑曜石與背包欄位
+
+### 本批明確沒有新增
+
+- SP3 角色清單、詳細資料或靈魂石編輯視窗
+- 所有暫停領域與任何遊戲操作
