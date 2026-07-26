@@ -6,6 +6,8 @@ venv/
 logs/
 *.log
 .pytest_cache/
+build/
+dist/
 .DS_Store
 config/settings.json
 data/
