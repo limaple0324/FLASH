@@ -37,6 +37,10 @@
   bootstrap.
 - Removed the integration branch's life-soul dependency from character details
   to honor the current frozen-domain boundary; 52 related tests passed.
+- Added transactional card display-time updates, change notifications, and a
+  scheduler-agnostic expiry monitor in `04bdfc0`; registered settings without
+  wiring any SP3 window or overlay.
+- 53 card and SP1 bootstrap/self-check regression tests passed.
 - No SP3 UI, game input, player-visible registry mapping, or frozen resource
   area was added.
 
