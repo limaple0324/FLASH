@@ -74,6 +74,10 @@
 - The combined schedule, decision, and habit block passed the full current
   source gate: 501 tests, compilation of every current source directory,
   isolated SP2 0.2.0 self-check (8/8), and `git diff --check`.
+- GitHub Actions run `30184919300` built the cumulative
+  `FLASH-SP1+SP2-Windows-0.2.0-43bc04a-snapshot` artifact (`8626722484`).
+  Downloaded bundle verification, packaged 8/8 self-check, hashes, and two
+  Windows 11 GUI launch/normal-close cycles passed with zero residual windows.
 - No SP3 UI, game input, player-visible registry mapping, or frozen resource
   area was added.
 

@@ -245,3 +245,15 @@
 - 全部目前來源目錄與 `main.py` 編譯通過
 - 隔離 SP2 0.2.0 自我檢查 8/8 通過
 - `git diff --check` 通過
+
+## 最新累積 Windows 驗收
+
+- 來源提交：
+  `43bc04a7071dd4b6298ae050050e57d1620a9450`
+- GitHub Actions run：`30184919300`
+- Artifact ID：`8626722484`
+- ZIP SHA-256：
+  `9E4B266FFCD3B3928C56402D20EF635B6E9140377949DF9C8A87A748117588D4`
+- EXE SHA-256：
+  `5C2CA4936E43F2C7118B20C5C9B73FACD1D2F9702D0A5F07679A10A0A01FC0AC`
+- 包內驗證、封裝自檢 8/8 及 Windows 11 兩次 GUI 啟閉通過

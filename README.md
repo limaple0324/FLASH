@@ -73,6 +73,11 @@ bundle、雜湊及封裝版 8/8 自我檢查；Windows 11 上連續兩次顯示�
 與差異檢查通過。尚未建立包含三批新功能的 Windows 成品，因此前述
 `fecf340` artifact 不代表目前最新程式。
 
+目前已補建並驗收最新累積成品
+`FLASH-SP1+SP2-Windows-0.2.0-43bc04a-snapshot`：GitHub Actions run
+`30184919300`／artifact `8626722484` 成功，ZIP／EXE 雜湊、包內驗證、
+封裝自我檢查 8/8 與 Windows 11 兩次圖形啟閉全部通過。
+
 目前最新 SP1 獨立成品來源為
 `28110e6e4857514ee0c99cccacaa2acd5c7b9de7`。278 項測試、原始碼編譯、
 來源與封裝 8/8 自我檢查、真實 14 視窗三種輸入政策、14 視窗同時斷線
