@@ -4,11 +4,11 @@
 
 ## 2026-07-26 SP3 開始基準
 
-- 最新功能來源：`f86112685c51d8ab6aae9089027ab7b1dd9d01ee`
-- 最新驗收文件提交：`cb90359`
-- 最新雲端 run／artifact：`30194797716`／`8629766330`
+- 最新功能來源：`ef6649446cd0071dab9488eef217728e3e4c939f`
+- 最新驗收文件：`deliverables/sp3/ACCEPTANCE_0.3.0_ef66494.md`
+- 最新雲端 run／artifact：`30195335812`／`8629931727`
 - 最新完整累積成品：
-  `FLASH-SP1+SP2+SP3-Windows-0.3.0-f861126-snapshot`
+  `FLASH-SP1+SP2+SP3-Windows-0.3.0-ef66494-snapshot`
 - 本機完整測試 `555 passed`；雲端完整測試、來源／封裝自我檢查、Windows
   EXE、成品結構與雜湊驗證全部通過。
 - 桌面 `輔.lnk` 已指向最新完整累積安裝，未自動啟動程式。
