@@ -30,6 +30,7 @@ from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from domain.character_store import CharacterStore
 from domain.progress_store import ActivityProgressStore
+from domain.soul_stone_store import SoulStoneStore
 from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
 from services.card_coordinator import CardCoordinator
@@ -39,6 +40,7 @@ from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from services.smart_reconnect_monitor import SmartReconnectMonitor
+from services.soul_stone_service import SoulStoneService
 from ui.home import HomeView
 from workspace.service import WorkspaceService
 
@@ -53,6 +55,7 @@ REGISTRY_FILENAME = "window_registry.json"
 RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
 CHARACTER_FILENAME = "characters.json"
+SOUL_STONE_FILENAME = "soul_stones.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
@@ -127,6 +130,8 @@ def build_services(root: Path | None = None):
     character_store = CharacterStore(paths.data_dir() / CHARACTER_FILENAME)
     characters = character_store.load()
     character_view_service = CharacterViewService(registry, characters)
+    soul_stone_store = SoulStoneStore(paths.data_dir() / SOUL_STONE_FILENAME)
+    soul_stone_service = SoulStoneService(soul_stone_store)
     progress_store = ActivityProgressStore(
         paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
     )
@@ -146,6 +151,8 @@ def build_services(root: Path | None = None):
     AppContext.register(WindowRegistry, registry)
     AppContext.register(CharacterStore, character_store)
     AppContext.register(CharacterViewService, character_view_service)
+    AppContext.register(SoulStoneStore, soul_stone_store)
+    AppContext.register(SoulStoneService, soul_stone_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(WorkspaceService, workspace_service)
@@ -192,6 +199,14 @@ def build_services(root: Path | None = None):
         )
     else:
         logger.info(f"Character profiles loaded: {len(characters)} character(s).")
+
+    if soul_stone_store.recovered_from_corruption:
+        logger.warning(
+            "Soul stone records were corrupt and have been isolated; "
+            f"backup={soul_stone_store.corrupt_backup}"
+        )
+    else:
+        logger.info(f"Soul stone records loaded: {len(soul_stone_service.all())}.")
 
     if progress_store.recovered_from_corruption:
         logger.warning(
