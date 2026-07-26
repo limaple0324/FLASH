@@ -41,6 +41,11 @@
   scheduler-agnostic expiry monitor in `04bdfc0`; registered settings without
   wiring any SP3 window or overlay.
 - 53 card and SP1 bootstrap/self-check regression tests passed.
+- Added a read-only SP1 target-window fact to SP2 runtime-state EventBus flow in
+  `d359682`, stripping handles, process data, paths, rectangles, pixels, and raw
+  adapter details.
+- 32 target-window event, EventBus, and SP1 bootstrap/self-check regression
+  tests passed with zero input calls.
 - No SP3 UI, game input, player-visible registry mapping, or frozen resource
   area was added.
 
