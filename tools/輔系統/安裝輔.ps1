@@ -55,7 +55,7 @@ function New-DesktopShortcut(
         $shortcut.TargetPath = $ExecutablePath
         $shortcut.WorkingDirectory = $WorkingDirectory
         $shortcut.IconLocation = "$iconPath,0"
-        $shortcut.Description = "輔 SP1"
+        $shortcut.Description = "輔"
         $shortcut.Save()
     }
     finally {
