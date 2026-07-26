@@ -1,19 +1,21 @@
 # 輔專案接手與開發規則
 
-本檔是 `C:\Users\USER\Documents\輔\SP1` 的專案規則。開始工作前依序閱讀：
+本檔是 `C:\Users\USER\Documents\輔\SP2` 的專案規則。開始工作前依序閱讀：
 
 1. `PROJECT_CONTEXT.md`
 2. `SP1_VERIFICATION.md`
 3. `docs/00_輔_專案完整總整理與未來路線圖.md`
 4. `docs/01_輔_SP1_基礎系統_狀態與驗收.md`
-5. `deliverables/sp1/README.md`
+5. `docs/02_輔_SP2_智慧邏輯_狀態與驗收.md`
+6. `deliverables/sp1/README.md`
+7. `deliverables/sp2/README.md`
 
 ## 固定開發順序
 
-- 嚴格依序完成 SP1、SP2、SP3；SP1 正式完成前不得開始 SP2。
-- SP2 正式完成前不得開始 SP3。
-- 現有 `integration/sp2-sp3-sp35` 只保存既有整合成果；SP1 收尾期間不得新增
-  SP2／SP3 功能，也不得為了方便把整合分支倒灌進 SP1。
+- SP1 0.1.3 獨立本機與雲端驗收已完成；現在只進行 SP2。
+- SP2 正式完成前不得開始新增 SP3。
+- 現有 `integration/sp2-sp3-sp35` 只作既有 SP2／SP3 累積成果的唯讀來源；
+  不得整包倒灌、硬合併或把 SP3／暫停領域混入目前 SP2。
 - `main`、SP1 工作樹與整合分支的差異不可硬合併；先盤點、解衝突、驗證後
   才能依正式流程整合。
 
@@ -86,11 +88,12 @@ SP1 + SP2 + SP3 完整版外另建 SP3 獨立交付區。較新的版本不得�
 
 ## Git 與發布規則
 
-- SP1 收尾只在 `sp1/completion-2026-07-25` 工作。
+- SP2 工作只在 `sp2/completion-2026-07-26` 工作。
 - 不直接修改 `main`，不在未驗收前合併 `main`。
 - `release/latest` 只能由核准的 `main` push 更新；分支、手動與 SP1 快照不得
   發布到正式更新來源。
-- SP1 獨立快照不得包含會自動前進到 SP2、SP3 或完整整合版的即時更新器。
+- SP1 獨立快照不得被 SP2 覆蓋；SP1＋SP2 累積成品必須使用自己的可追溯
+  身分，不得冒充 SP1 獨立快照或 SP2 單獨 EXE。
 - 不覆寫或清除使用者既有改動；提交時只加入本次明確範圍的檔案。
 
 ## 完成與證據
@@ -101,6 +104,9 @@ SP1 + SP2 + SP3 完整版外另建 SP3 獨立交付區。較新的版本不得�
   - `deliverables/sp1/`
   - `docs/01_輔_SP1_基礎系統_狀態與驗收.md`
   - `SP1_VERIFICATION.md`
+- SP2 的文件與交付入口：
+  - `deliverables/sp2/`
+  - `docs/02_輔_SP2_智慧邏輯_狀態與驗收.md`
 - 全專案彙整入口：
   `docs/00_輔_專案完整總整理與未來路線圖.md`
 - 所有必要門檻有直接證據後，才可標示該階段正式完成並開始下一階段。

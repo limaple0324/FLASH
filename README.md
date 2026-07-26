@@ -8,19 +8,25 @@ FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式
 
 - [「輔」專案完整總整理與未來路線圖](docs/00_輔_專案完整總整理與未來路線圖.md)
 - [SP1 基礎系統｜狀態與驗收](docs/01_輔_SP1_基礎系統_狀態與驗收.md)
+- [SP2 智慧邏輯｜狀態與驗收](docs/02_輔_SP2_智慧邏輯_狀態與驗收.md)
 - [SP1 獨立交付區域](deliverables/sp1/README.md)
+- [SP2 獨立交付區域](deliverables/sp2/README.md)
 
 後續進度必須分開標示：**已討論完成、已寫入倉庫、已完成程式實作、
 已通過自動測試、已建立 Windows 成品、已通過 Windows 11 實機驗證、
 已正式發布**。
 
-SP1 0.1.3 獨立 Windows 成品已完成本機正式驗收；下一步才開始獨立 SP2
-區域與 SP1＋SP2 累積版。SP2 完成後才開始新增 SP3。每個項目開始前先確認
-需求已討論完成。
+SP1 0.1.3 獨立 Windows 成品已完成本機與雲端驗收。現在已建立獨立 SP2
+交付區與 SP1＋SP2 累積分支；SP2 完成後才開始新增 SP3。每個項目開始前
+先確認需求已討論完成。
 
 ## Current milestone
 
-目前版本：**SP1 0.1.3 independent local acceptance**
+目前階段：**SP1＋SP2 cumulative engineering start**
+
+SP2 工作區為 `C:\Users\USER\Documents\輔\SP2`，分支為
+`sp2/completion-2026-07-26`，基底是已驗收 SP1 提交 `64ecfc2`。
+既有 `integration/sp2-sp3-sp35@bd685fb` 只作唯讀來源盤點，不整包合併。
 
 目前最新獨立成品來源為
 `28110e6e4857514ee0c99cccacaa2acd5c7b9de7`。278 項測試、原始碼編譯、
