@@ -10,6 +10,14 @@
   persistence, workspace state, and group-card data/lifecycle/history rules.
 - 96 affected tests and compilation of `domain/`, `workspace/`, and `cards/`
   passed.
+- Ported the second pure SP2 service batch in `4d63733`: activity-progress
+  orchestration, retained card history, card/history coordination, and immutable
+  card view state.
+- 108 affected core/service tests, compilation of the five new service/view
+  modules, and `git diff --check` passed.
+- Kept `main.py` registration for a separate batch so the accepted SP1 bootstrap
+  is patched deliberately instead of being overwritten from the integration
+  branch.
 - No SP3 UI, game input, player-visible registry mapping, or frozen resource
   area was added.
 

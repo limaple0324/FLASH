@@ -22,7 +22,7 @@ SP1 0.1.3 獨立 Windows 成品已完成本機與雲端驗收。現在已建立�
 
 ## Current milestone
 
-目前階段：**SP1＋SP2 cumulative engineering start**
+目前階段：**SP1＋SP2 cumulative engineering**
 
 SP2 工作區為 `C:\Users\USER\Documents\輔\SP2`，分支為
 `sp2/completion-2026-07-26`，基底是已驗收 SP1 提交 `64ecfc2`。
@@ -31,6 +31,10 @@ SP2 工作區為 `C:\Users\USER\Documents\輔\SP2`，分支為
 第一批純 SP2 核心提交 `f41e708` 已加入角色、組別、活動、三態、進度、
 台灣時間重置、工作區狀態及組別提醒卡資料規則；96 項受影響測試與新增
 套件編譯通過，尚未接入 SP3 畫面或任何遊戲操作。
+
+第二批純 SP2 服務提交 `4d63733` 已加入活動進度、卡片歷史、卡片協調與
+唯讀 View State；核心與服務共 108 項受影響測試、5 份新增模組編譯及
+差異檢查通過。下一批才獨立接入 `main.py` 服務註冊。
 
 目前最新獨立成品來源為
 `28110e6e4857514ee0c99cccacaa2acd5c7b9de7`。278 項測試、原始碼編譯、

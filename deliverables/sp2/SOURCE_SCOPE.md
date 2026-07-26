@@ -29,3 +29,24 @@
 - 魂器、寵物天賦、黑曜石、命魂、背包
 - 玩家可見視窗登記頁
 - 未確認的提醒區編號／綁定或寵物欄位
+
+## 第二批｜純 SP2 服務層
+
+- SP2 程式提交：`4d6373300563f14f9871c2d59ca8b5fcd795a282`
+- 移植來源：`integration/sp2-sp3-sp35@bd685fbfd346de6cec32d9bbfc2184571dbf4ab0`
+- 驗證：108 項核心與服務受影響測試通過；5 份新增服務／快照模組編譯通過
+
+### 本批 SP2 新增
+
+- `services/activity_progress_service.py`：活動定義、進度、完成與重置協調
+- `services/card_history_service.py`：只保存斷線／恢復必要歷史
+- `services/card_coordinator.py`：可見卡片與必要歷史的一致協調
+- `cards/view_state.py`、`services/card_view_state_service.py`：提供 SP3
+  將來可讀取、但不可反向修改 SP2 的唯讀快照
+- 4 份服務測試檔，共 14 項新增純服務測試
+
+### 本批刻意延後
+
+- `main.py` 與 `build_services()` 註冊；下一批獨立接線與驗證
+- 任何 SP3 畫面或遊戲輸入
+- 第一批已列出的所有暫停領域與未確認內容
