@@ -693,7 +693,29 @@ def run(
                         f"Registry final save failed:\n{traceback.format_exc()}"
                     )
             finally:
-                shutdown_external_adapter(logger)
+                try:
+                    shutdown_external_adapter(logger)
+                finally:
+                    close_logger(logger)
+
+
+def close_logger(logger: LoggerService | None) -> None:
+    """Release logger file handles without replacing the application's result."""
+    if logger is None:
+        return
+    close = getattr(logger, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        try:
+            print(
+                f"Logger final shutdown failed:\n{traceback.format_exc()}",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
 
 
 def main() -> None:
