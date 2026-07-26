@@ -47,7 +47,7 @@ function New-DesktopShortcut(
 ) {
     $shell = New-Object -ComObject WScript.Shell
     try {
-        $iconPath = Join-Path $WorkingDirectory "輔系統\sync_plus_icon.ico"
+        $iconPath = Join-Path $WorkingDirectory "sync_plus_icon.ico"
         if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
             throw "缺少桌面捷徑圖示：$iconPath"
         }

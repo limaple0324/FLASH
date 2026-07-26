@@ -17,7 +17,7 @@ $ChannelPath = Join-Path $SystemDir "UPDATE_CHANNEL.txt"
 $CommonManifestPaths = @(
     "FLASH.exe",
     "輔系統/BUILD_INFO.txt",
-    "輔系統/sync_plus_icon.ico",
+    "sync_plus_icon.ico",
     "輔系統/verify_windows_release.ps1"
 )
 $LiveReleaseManifestPaths = @(
@@ -26,7 +26,7 @@ $LiveReleaseManifestPaths = @(
     "安裝輔.cmd",
     "更新輔.cmd",
     "輔系統/BUILD_INFO.txt",
-    "輔系統/sync_plus_icon.ico",
+    "sync_plus_icon.ico",
     "輔系統/verify_windows_release.ps1",
     "輔系統/安裝輔.ps1",
     "輔系統/輔更新核心.ps1",

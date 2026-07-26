@@ -117,7 +117,7 @@ def test_complete_installer_verifies_copies_and_creates_one_shortcut(tmp_path: P
     assert str(install_root / "FLASH.exe") in inspected_lines
     assert str(install_root) in inspected_lines
     assert (
-        f"{install_root / '輔系統' / 'sync_plus_icon.ico'},0"
+        f"{install_root / 'sync_plus_icon.ico'},0"
         in inspected_lines
     )
 
