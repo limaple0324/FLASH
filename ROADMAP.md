@@ -2,8 +2,8 @@
 
 ## SP1 — Core Foundation
 
-Current target: complete the remaining SP1 Windows and real-game acceptance
-gates without starting SP2 early.
+SP1 0.1.3 independent local Windows acceptance is complete. The next target is
+the separate SP2 delivery area plus the SP1+SP2 cumulative worktree.
 
 - [x] Application entrypoint
 - [x] Config manager
@@ -39,7 +39,7 @@ Remaining SP1 verification work:
 - [x] Build and verify the fingerprint-enabled Windows package on the target desktop
 - [x] Add a repeatable, read-only 14-window identity/capture verifier
 - [x] Build and verify the packaged `--verify-target-desktop` mode
-- [ ] Complete safe-input, reconnect, and player-control acceptance
+- [x] Complete safe-input, reconnect, and player-control acceptance
   - [x] User-approved `B` and `C` background input pass 14/14 live windows
   - [x] One real disconnected window completes forced-login recovery and returns
     the desktop to 14/14 connected windows
@@ -49,25 +49,27 @@ Remaining SP1 verification work:
   - [x] Verify foreground-only B sends to 1, skips 13, and visibly opens backpack
   - [x] Verify foreground/background and minimized-input modes
   - [x] Finish a stable multi-window reconnect run at 14/14 connected
-  - [ ] Verify the current packaged build and player control outside automation
-- [ ] Merge only after approval, then verify current `main` and `release/latest`
-- [ ] Complete final target-desktop user acceptance
-- [ ] Complete final SP1 verification checklist
+  - [x] Verify the current packaged build, normal close/reopen, and restored
+    player control
+- [ ] Merge only after separate approval, then verify current `main` and
+  `release/latest` (not part of the independent SP1 snapshot acceptance)
+- [x] Complete final target-desktop local user acceptance
+- [x] Complete final independent SP1 verification checklist
 
 Important scope note:
 
-The latest released executable remains an SP1 engineering verification
-application. Current unreleased source now includes the confirmed `B`/`C`
-safe-input controller and forced-login reconnect flow. All three input policies,
-line 7 dynamic selection, cross-restart retry context, stacked post-login
-popups, minimized-window reconnect, and a final 14/14 connected state are
-live-proven. The current packaged build, additional failure variants, and
-player control outside automation remain open. Clean-account/another-PC
+The independent SP1 0.1.3 snapshot from `28110e6` has passed all 278 tests,
+source/packaged self-checks, all three input policies, route-7 dynamic
+selection, cross-restart retry context, stacked post-login popups,
+minimized-window reconnect, final 14/14 connected acceptance, verified ZIP
+extraction, and two GUI launch/normal-close cycles. Clean-account/another-PC
 acceptance was explicitly deferred by the user on 2026-07-26 and is not
-claimed as passed.
+claimed as passed. `main` and `release/latest` remain unchanged pending
+separate approval.
 Player-visible role mapping remains paused.
 
 ## SP2 — Product Design
 
-Existing SP2 design is preserved separately. No new SP2 implementation starts
-until every required SP1 gate above has direct evidence.
+Existing SP2 design is preserved separately. SP2 now starts in its own delivery
+area after reconciling only user-confirmed scope from the existing integration
+branch.

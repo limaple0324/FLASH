@@ -1,6 +1,6 @@
 # Changelog
 
-## SP1 0.1.3 completion candidate — 2026-07-26
+## SP1 0.1.3 independent local acceptance — 2026-07-26
 
 - Added `B`/`C`-only Windows input synchronization with foreground-only,
   foreground/background, and all-including-minimized policies.
@@ -34,9 +34,18 @@
 - Tightened popup/progress thresholds and changed recognition to choose the best
   per-template-valid match, preventing stale popup and progress imagery from
   masking a valid connected-game match.
-- Packaged-build and final player acceptance remain open. Clean-account testing
-  was explicitly deferred to another PC by the user and is not claimed passed.
-  This work is not yet a release.
+- Commit `28110e6e4857514ee0c99cccacaa2acd5c7b9de7` passed 278 tests,
+  compilation, source self-check, and diff validation.
+- Built the independent `FLASH-SP1-Windows-0.1.3-28110e6-snapshot` package.
+  Packaged 8/8 self-check, manifest verification, ZIP extraction verification,
+  and two GUI launch/normal-close cycles passed with zero residual processes.
+- `FLASH.exe` SHA-256:
+  `8948e67265929f8e8953afb23c56c09d439aa94696abf2f716702d610e140435`.
+- ZIP SHA-256:
+  `73cc0d59844acb4f0e6e043b55501d2b0d1ab6f639d69a03bc728b6588809d4a`.
+- This independent SP1 snapshot is locally accepted. Clean-account testing was
+  explicitly deferred to another PC and is not claimed passed; `main` and
+  `release/latest` remain unchanged.
 
 ## SP1 0.1.2 — 2026-07-25
 
@@ -132,5 +141,5 @@
 - `689a186`: Windows engineering snapshot and hash compatibility; run #118.
 
 This historical 0.1.2 line remained an engineering verification stage. For the
-0.1.3 completion candidate, clean-account testing is deferred to another PC and
-is not claimed passed.
+0.1.3 independent local acceptance, clean-account testing is deferred to
+another PC and is not claimed passed.

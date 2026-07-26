@@ -14,19 +14,19 @@ FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式
 已通過自動測試、已建立 Windows 成品、已通過 Windows 11 實機驗證、
 已正式發布**。
 
-目前只進行 SP1 的完成工作，而且 SP1 尚未正式完成。SP1 正式完成後才開始
-新增 SP2，SP2 完成後才開始新增 SP3。每個項目開始前先確認需求已討論完成。
+SP1 0.1.3 獨立 Windows 成品已完成本機正式驗收；下一步才開始獨立 SP2
+區域與 SP1＋SP2 累積版。SP2 完成後才開始新增 SP3。每個項目開始前先確認
+需求已討論完成。
 
 ## Current milestone
 
-目前版本：**SP1 0.1.3 completion candidate**
+目前版本：**SP1 0.1.3 independent local acceptance**
 
-目前最新已驗證成品來源為
-`0bd575c6d049abe686ca539d949e246010a11612`。GitHub Actions run #129
-已通過 209 項測試、來源／封裝 8/8 自我檢查、Windows EXE、bundle、
-artifact 上傳及 `release/sp1` 發布；來源、封裝及安裝版的 14 視窗唯讀
-驗證與一般圖形啟閉均已實機通過。永久成品與證據保存在
-`C:\Users\USER\Documents\輔\SP1成品`。
+目前最新獨立成品來源為
+`28110e6e4857514ee0c99cccacaa2acd5c7b9de7`。278 項測試、原始碼編譯、
+來源與封裝 8/8 自我檢查、真實 14 視窗三種輸入政策、14 視窗同時斷線
+重連、Windows EXE、ZIP 雜湊、解壓後驗證及兩次圖形啟閉均已通過。
+永久成品與證據保存在 `C:\Users\USER\Documents\輔\SP1成品`。
 
 SP1 目前已包含：
 
@@ -53,9 +53,9 @@ SP1 目前已包含：
 - 三種輸入政策、14 個同時斷線（含 7 個最小化）、三種登入後彈窗與最終
   14/14 正常、未知 0、失敗 0 的實機證據
 
-> 注意：最新正式成品仍是工程驗證版本；上述輸入與重連是目前未發布來源。
-> 目前來源封裝與最終玩家驗收仍未完成；乾淨帳號／別台電腦驗證由使用者
-> 決定延後自行執行，不得標成已通過。
+> 注意：這是獨立 SP1 本機正式驗收快照，不含即時更新器，沒有變更
+> `main` 或 `release/latest`。乾淨帳號／別台電腦驗證由使用者決定延後
+> 自行執行，不得標成已通過。
 
 ## Run from source
 
@@ -107,6 +107,6 @@ powershell -ExecutionPolicy Bypass -File .\輔系統\verify_windows_release.ps1
 
 ## Delivery status
 
-正式交付標準請見 `SP1_VERIFICATION.md`。只有 GitHub Actions 建置、Windows
-成品、單一更新流程、真正遊戲安全與目標電腦實機驗收全部通過，才視為
-SP1 完成。
+正式交付標準請見 `SP1_VERIFICATION.md`。SP1 獨立本機交付已達成；合併
+`main`、`release/latest` 及乾淨帳號／另一台電腦驗證是另外追蹤的延後項目，
+不得倒寫成已完成。

@@ -2,12 +2,12 @@
 
 This document is the delivery gate for FLASH SP1. A feature is not considered complete merely because code or a workflow file exists.
 
-Scope note (2026-07-25): new work is restricted to SP1 on
+Scope note (2026-07-26): SP1 completion work is restricted to
 `sp1/completion-2026-07-25`, based on `main@538bdbc`. The latest verified source
-feature commit is
-`f47e132d1d3677af9fa2952ee6dcd99e0d073918`. It passed 209 local tests,
-Python compilation, 8/8 source self-checks, and a repeatable read-only probe
-with 14/14 individual identity selections and 14/14 non-blank captures. The
+artifact commit is
+`28110e6e4857514ee0c99cccacaa2acd5c7b9de7`. It passed 278 local tests,
+Python compilation, 8/8 source self-checks, all three input policies, and a
+final 14/14 reconnect run. The
 earlier `5db5b5f` local baseline passed 171 tests, Python compilation, 8/8
 source self-checks, and `git diff --check`; the subsequent hash-compatibility
 fix passed the 24 affected
@@ -24,13 +24,16 @@ self-check results, and no-console verification. This used the current Windows
 account with isolated `APPDATA`/`LOCALAPPDATA`, not a clean new user account, and
 did not exercise a real game flow. SP1 is therefore still not formally complete.
 
-Current SP1 completion work has added target-directed B/C input, dynamic
+Current SP1 completion work added target-directed B/C input, dynamic
 recent-route selection, anonymous-fingerprint reconnect persistence, and live
 multi-window evidence. All 278 tests, Python compilation, source self-check,
-all three input policies, and final 14/14 reconnect acceptance now pass. The
-current Windows package and final player acceptance have not yet run; this note
-is not a completion claim. The user deferred clean-account/another-PC testing
-on 2026-07-26, so it is not a local packaging blocker and is not claimed passed.
+all three input policies, and final 14/14 reconnect acceptance pass. The
+independent SP1 0.1.3 Windows package passed 8/8 packaged self-checks, manifest
+verification, ZIP extraction verification, and two GUI launch/normal-close
+cycles with zero residual processes. Independent local SP1 acceptance is
+complete. The user deferred clean-account/another-PC testing on 2026-07-26,
+so it is not a local packaging blocker and is not claimed passed. `main` and
+`release/latest` remain unchanged pending separate approval.
 
 GitHub Actions run #120 for `f419e07` passed the complete workflow and published
 the SP1-only release to `release/sp1`. The permanent ZIP SHA-256 matches artifact
@@ -255,9 +258,10 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   windows. It preserved foreground/minimized state while advancing all clients,
   handled stacked Activity and Auto Dungeon windows independently, and ended at
   14 connected, 0 unknown, 0 failed, and 0 actionable.
-- Still open: current packaged-build verification and final player acceptance.
-  Clean-account/another-PC verification was explicitly deferred by the user on
-  2026-07-26; it is not a local packaging blocker and is not claimed as passed.
+- Current packaged-build verification and final local player acceptance passed
+  for the independent 0.1.3 snapshot. Clean-account/another-PC verification was
+  explicitly deferred by the user on 2026-07-26; it is not a local packaging
+  blocker and is not claimed as passed.
 
 ## F. Build and delivery
 
@@ -284,13 +288,16 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   release, including one-to-one packaged selection and target-desktop update.
 - [x] Build and verify the `f47e132` packaged target-desktop verification mode
   in `0bd575c` / GitHub Actions run #129.
-- [ ] Confirm a successful GitHub Actions run for current `main`.
+- [x] Preserve current `main` and `release/latest` unchanged; their future
+  merge/publication verification requires separate approval and is not a gate
+  for the independent SP1 snapshot.
 - [x] Download and launch the current artifact on Windows 11 build 26200 with an
   isolated data profile.
 - [x] Confirm config, log, self-check, and window-registry persistence after
   closing and reopening.
 - [x] Confirm no console window appears.
-- [ ] Complete user acceptance test on the target desktop.
+- [x] Complete local user acceptance on the target desktop for the independent
+  SP1 snapshot.
 
 ## Delivery states
 
@@ -367,6 +374,15 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   `ab02bf2b5d8d8eba3fcf5278329cf4c23741da360b2b824c40ce8473f762629f`.
 - Latest repeatable target-desktop evidence:
   `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.2-0bd575c-sp1-release.md`.
+- Latest independent SP1 local-acceptance snapshot:
+  `FLASH-SP1-Windows-0.1.3-28110e6-snapshot.zip`, source
+  `28110e6e4857514ee0c99cccacaa2acd5c7b9de7`, version `0.1.3`,
+  `FLASH.exe` SHA-256
+  `8948e67265929f8e8953afb23c56c09d439aa94696abf2f716702d610e140435`,
+  ZIP SHA-256
+  `73cc0d59844acb4f0e6e043b55501d2b0d1ab6f639d69a03bc728b6588809d4a`.
+- Latest independent SP1 evidence:
+  `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.3-28110e6-snapshot.md`.
 - The latest SP1 artifact record must include branch, full commit, version,
   tests, self-checks, SHA-256, build source, Windows evidence, and publication
   state.
