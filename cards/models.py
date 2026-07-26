@@ -35,6 +35,7 @@ class GroupCard:
     requires_player_action: bool = False
     next_step: str | None = None
     priority_reason: CardPriorityReason = CardPriorityReason.ACTIVITY
+    name_only: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.group, CharacterGroup):
@@ -45,6 +46,8 @@ class GroupCard:
             raise TypeError("requires_player_action must be bool.")
         if not isinstance(self.priority_reason, CardPriorityReason):
             raise TypeError("priority_reason must be CardPriorityReason.")
+        if not isinstance(self.name_only, bool):
+            raise TypeError("name_only must be bool.")
 
         affected_ids = tuple(
             _required_text(item, "affected_character_ids item")
@@ -90,4 +93,5 @@ class GroupCard:
             "next_step": self.next_step,
             "priority_reason": self.priority_reason.value,
             "priority_tier": self.priority_tier.name,
+            "name_only": self.name_only,
         }

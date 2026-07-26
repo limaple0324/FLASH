@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import threading
 import time
@@ -23,6 +24,11 @@ from adapters.windows_background_capture import (
     Win32RecoveringPrintWindowProvider,
     WindowCaptureProvider,
 )
+from adapters.windows_battle_restart import (
+    Win32WindowCloseBackend,
+    WindowsBattleWindowRestarter,
+    WindowsShortcutOpenBackend,
+)
 from adapters.windows_launch_fingerprint import (
     PowerShellLaunchFingerprintResolver,
     normalize_launch_fingerprint,
@@ -34,6 +40,10 @@ from core.reconnect_policy import (
     ReconnectScreenState,
 )
 from core.sp1_boundaries import OperationResult, ReconnectState, SmartReconnectBoundary
+from services.group_launch_service import GroupLaunchPlan
+from services.reconnect_failure_status_service import (
+    ReconnectFailureStatusService,
+)
 
 
 ACTIONABLE_RECONNECT_ACTIONS = frozenset(
@@ -197,6 +207,7 @@ class ReconnectBatchResult:
     connected_windows: int
     actionable_windows: int
     clicked_windows: int
+    restarted_windows: int
     unknown_windows: int
     execution_requested: bool
     next_check_seconds: int
@@ -214,7 +225,9 @@ class ReconnectBatchResult:
 
     @property
     def progressed(self) -> bool:
-        return self.execution_requested and self.clicked_windows > 0
+        return self.execution_requested and (
+            self.clicked_windows > 0 or self.restarted_windows > 0
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return aggregate evidence without identity, pixels, or click coordinates."""
@@ -229,6 +242,7 @@ class ReconnectBatchResult:
             "connected_windows": self.connected_windows,
             "actionable_windows": self.actionable_windows,
             "clicked_windows": self.clicked_windows,
+            "restarted_windows": self.restarted_windows,
             "unknown_windows": self.unknown_windows,
             "execution_requested": self.execution_requested,
             "next_check_seconds": self.next_check_seconds,
@@ -247,12 +261,14 @@ class ReconnectRuntimeState:
     active_fingerprints: set[str]
     active_until: dict[str, float]
     retry_after: dict[str, tuple[ReconnectScreenState, float]]
+    pending_reopen_fingerprints: set[str]
+    reopen_retry_after: dict[str, float]
 
 
 class ReconnectRuntimeStateStore:
     """Persist only anonymous fingerprints and reconnect timing state."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -261,7 +277,7 @@ class ReconnectRuntimeStateStore:
 
     @staticmethod
     def _empty() -> ReconnectRuntimeState:
-        return ReconnectRuntimeState(set(), set(), {}, {})
+        return ReconnectRuntimeState(set(), set(), {}, {}, set(), {})
 
     @staticmethod
     def _fingerprints(values: object) -> set[str]:
@@ -281,7 +297,10 @@ class ReconnectRuntimeStateStore:
             return self._empty()
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict) or payload.get("version") != self.VERSION:
+            if (
+                not isinstance(payload, dict)
+                or payload.get("version") not in {1, self.VERSION}
+            ):
                 raise ValueError("Unsupported reconnect state version")
             pending = self._fingerprints(payload.get("pending_fingerprints", []))
             active = self._fingerprints(payload.get("active_fingerprints", []))
@@ -315,11 +334,29 @@ class ReconnectRuntimeStateStore:
                     ReconnectScreenState(raw_retry["state"]),
                     retry_at,
                 )
+            pending_reopens: set[str] = set()
+            reopen_retries: dict[str, float] = {}
+            if payload.get("version") == self.VERSION:
+                pending_reopens = self._fingerprints(
+                    payload.get("pending_reopen_fingerprints", [])
+                )
+                raw_reopen_retries = payload.get("reopen_retry_after", {})
+                if not isinstance(raw_reopen_retries, dict):
+                    raise ValueError("reopen_retry_after must be an object")
+                for raw_fingerprint, raw_retry_at in raw_reopen_retries.items():
+                    fingerprint = normalize_launch_fingerprint(raw_fingerprint)
+                    retry_at = float(raw_retry_at)
+                    if fingerprint is None or retry_at < 0:
+                        raise ValueError("Invalid reopen retry entry")
+                    pending_reopens.add(fingerprint)
+                    reopen_retries[fingerprint] = retry_at
             return ReconnectRuntimeState(
                 pending,
                 active,
                 active_until,
                 retries,
+                pending_reopens,
+                reopen_retries,
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             self.recovered_from_corruption = True
@@ -350,6 +387,14 @@ class ReconnectRuntimeStateStore:
                 }
                 for fingerprint, (screen_state, retry_at)
                 in sorted(state.retry_after.items())
+            },
+            "pending_reopen_fingerprints": sorted(
+                state.pending_reopen_fingerprints
+            ),
+            "reopen_retry_after": {
+                fingerprint: state.reopen_retry_after[fingerprint]
+                for fingerprint in sorted(state.pending_reopen_fingerprints)
+                if fingerprint in state.reopen_retry_after
             },
         }
         temp_path = self.path.with_name(f"{self.path.name}.tmp")
@@ -386,6 +431,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         monotonic_clock: Callable[[], float] = time.time,
         state_path: Path | None = None,
         execution_enabled: bool = False,
+        allowed_fingerprints: Iterable[str] | None = None,
+        battle_restarter: WindowsBattleWindowRestarter | None = None,
+        failure_status_service: ReconnectFailureStatusService | None = None,
+        failure_record_callback: (
+            Callable[[str, str], object] | None
+        ) = None,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -417,7 +468,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         runtime_state = (
             self._runtime_state_store.load()
             if self._runtime_state_store is not None
-            else ReconnectRuntimeState(set(), set(), {}, {})
+            else ReconnectRuntimeState(set(), set(), {}, {}, set(), {})
         )
         self._pending_reconnect_fingerprints = (
             runtime_state.pending_fingerprints
@@ -436,7 +487,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             str,
             tuple[ReconnectScreenState, float],
         ] = runtime_state.retry_after
+        self._pending_reopen_fingerprints = (
+            runtime_state.pending_reopen_fingerprints
+        )
+        self._reopen_retry_after = runtime_state.reopen_retry_after
         self._character_selection_pending: set[str] = set()
+        self._allowed_fingerprints: frozenset[str] | None = None
+        self.set_allowed_fingerprints(allowed_fingerprints)
+        self._battle_restarter = battle_restarter
+        self._group_launch_plan: GroupLaunchPlan | None = None
+        self._failure_status_service = failure_status_service
+        self._failure_record_callback = failure_record_callback
+        self._screen_state_lock = threading.RLock()
+        self._last_screen_states: dict[str, ReconnectScreenState] = {}
 
     @classmethod
     def for_real_windows(
@@ -446,17 +509,29 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         expected_windows: int = 14,
         title_keywords: Iterable[str] = ("Adobe Flash Player",),
         state_path: Path | None = None,
+        failure_status_service: ReconnectFailureStatusService | None = None,
+        failure_record_callback: (
+            Callable[[str, str], object] | None
+        ) = None,
     ) -> "WindowsSmartReconnectController":
+        window_backend = Win32WindowBackend(
+            PowerShellLaunchFingerprintResolver()
+        )
         return cls(
             expected_windows=expected_windows,
             title_keywords=title_keywords,
-            window_backend=Win32WindowBackend(
-                PowerShellLaunchFingerprintResolver()
-            ),
+            window_backend=window_backend,
             capture_provider=Win32RecoveringPrintWindowProvider(),
             recognizer=ReferenceScreenRecognizer(reference_dir),
             mouse_backend=Win32MouseMessageBackend(),
             state_path=state_path,
+            battle_restarter=WindowsBattleWindowRestarter(
+                window_backend,
+                Win32WindowCloseBackend(),
+                WindowsShortcutOpenBackend(),
+            ),
+            failure_status_service=failure_status_service,
+            failure_record_callback=failure_record_callback,
         )
 
     @property
@@ -471,6 +546,53 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def expected_windows(self) -> int:
         return self._expected_windows
 
+    def role_screen_states(self) -> dict[str, ReconnectScreenState]:
+        with self._screen_state_lock:
+            return dict(self._last_screen_states)
+
+    def observe_screen_states(
+        self,
+        fingerprints: Iterable[str],
+    ) -> dict[str, ReconnectScreenState]:
+        requested = {
+            fingerprint
+            for item in fingerprints
+            if (fingerprint := normalize_launch_fingerprint(item)) is not None
+        }
+        if not requested:
+            return {}
+        candidates = self._candidate_windows()
+        by_fingerprint: dict[str, list[WindowInfo]] = {}
+        for window in candidates:
+            fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+            if fingerprint in requested:
+                by_fingerprint.setdefault(fingerprint, []).append(window)
+        observed: dict[str, ReconnectScreenState] = {}
+        for fingerprint in requested:
+            matches = by_fingerprint.get(fingerprint, ())
+            if len(matches) != 1:
+                continue
+            try:
+                sample = self._capture_provider.capture(matches[0].handle)
+            except OSError:
+                sample = None
+            recognition = self._recognizer.recognize_capture(sample)
+            if recognition.state is not ReconnectScreenState.UNKNOWN:
+                observed[fingerprint] = recognition.state
+        if observed:
+            with self._screen_state_lock:
+                self._last_screen_states.update(observed)
+        return observed
+
+    def reconnecting_fingerprints(self) -> frozenset[str]:
+        return frozenset(
+            self._pending_reconnect_fingerprints
+            | self._pending_reopen_fingerprints
+            | self._active_automation_fingerprints
+        )
+
     def set_expected_windows(self, expected_windows: int) -> None:
         if (
             isinstance(expected_windows, bool)
@@ -479,6 +601,37 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         ):
             raise ValueError("expected_windows must be positive")
         self._expected_windows = expected_windows
+
+    def set_allowed_fingerprints(
+        self,
+        fingerprints: Iterable[str] | None,
+    ) -> None:
+        if fingerprints is None:
+            self._allowed_fingerprints = None
+            return
+        normalized = tuple(
+            normalize_launch_fingerprint(item)
+            for item in fingerprints
+        )
+        if (
+            not normalized
+            or any(item is None for item in normalized)
+            or len(normalized) != len(set(normalized))
+        ):
+            raise ValueError(
+                "fingerprints must contain unique complete SHA-256 digests"
+            )
+        self._allowed_fingerprints = frozenset(normalized)
+
+    def set_group_launch_plan(self, plan: GroupLaunchPlan | None) -> None:
+        if plan is None:
+            self._group_launch_plan = None
+            self.set_allowed_fingerprints(None)
+            return
+        if not isinstance(plan, GroupLaunchPlan) or not plan.ready:
+            raise ValueError("plan must be a ready GroupLaunchPlan.")
+        self._group_launch_plan = plan
+        self.set_allowed_fingerprints(plan.fingerprints)
 
     def set_execution_enabled(self, enabled: bool) -> None:
         """Allow an active scan to stop before its next game-changing click."""
@@ -490,9 +643,140 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def _matching_windows(self) -> tuple[WindowInfo, ...]:
         return tuple(
             window
+            for window in self._candidate_windows()
+            if (
+                self._allowed_fingerprints is None
+                or normalize_launch_fingerprint(window.launch_fingerprint)
+                in self._allowed_fingerprints
+            )
+        )
+
+    def _candidate_windows(self) -> tuple[WindowInfo, ...]:
+        return tuple(
+            window
             for window in self._window_backend.list_windows()
             if all(keyword in window.title.casefold() for keyword in self._keywords)
         )
+
+    def _target_for_fingerprint(self, fingerprint: str):
+        plan = self._group_launch_plan
+        return (
+            plan.target_for_fingerprint(fingerprint)
+            if plan is not None
+            else None
+        )
+
+    def _unknown_failure_key(self) -> str:
+        group_name = (
+            self._group_launch_plan.group_name
+            if self._group_launch_plan is not None
+            else "目前組別"
+        )
+        return f"group:{group_name}:unknown"
+
+    def _report_reconnect_failure(self, fingerprint: str | None) -> None:
+        service = self._failure_status_service
+        if service is None:
+            return
+        target = (
+            self._target_for_fingerprint(fingerprint)
+            if fingerprint is not None
+            else None
+        )
+        if target is not None:
+            key = f"role:{target.fingerprint}"
+            service.report(key, target.display_name)
+            self._record_reconnect_failure(
+                target.display_name,
+                "重連失敗",
+            )
+            restart = self._restart_failed_role(
+                target.fingerprint,
+            )
+            self._record_reconnect_failure(
+                target.display_name,
+                (
+                    "已依原捷徑重新開啟"
+                    if restart.success
+                    else f"重新開啟失敗：{restart.failure_code}"
+                ),
+            )
+            return
+        group_name = (
+            self._group_launch_plan.group_name
+            if self._group_launch_plan is not None
+            else "目前組別"
+        )
+        service.report(
+            self._unknown_failure_key(),
+            f"{group_name}中的未知角色",
+        )
+
+    def _record_reconnect_failure(
+        self,
+        role_name: str,
+        detail: str,
+    ) -> None:
+        if self._failure_record_callback is None:
+            return
+        try:
+            self._failure_record_callback(role_name, detail)
+        except Exception:
+            pass
+
+    def _restart_failed_role(
+        self,
+        fingerprint: str,
+    ) -> BattleRestartResult:
+        target = self._target_for_fingerprint(fingerprint)
+        restarter = self._battle_restarter
+        if target is None or restarter is None:
+            return BattleRestartResult(
+                False,
+                "reconnect_restart_identity_unresolved",
+            )
+        candidates = self._candidate_windows()
+        matches = tuple(
+            window
+            for window in candidates
+            if normalize_launch_fingerprint(window.launch_fingerprint)
+            == fingerprint
+        )
+        if len(matches) > 1:
+            return BattleRestartResult(
+                False,
+                "reconnect_restart_window_ambiguous",
+            )
+        if len(matches) == 1:
+            result = restarter.restart(matches[0], target)
+        else:
+            reopen_missing = getattr(restarter, "reopen_missing", None)
+            if not callable(reopen_missing):
+                return BattleRestartResult(
+                    False,
+                    "reconnect_restart_unavailable",
+                )
+            result = reopen_missing(target, candidates)
+        if result.success:
+            now = self._monotonic_clock()
+            self._pending_reconnect_fingerprints.add(fingerprint)
+            self._pending_reopen_fingerprints.add(fingerprint)
+            self._reopen_retry_after[fingerprint] = (
+                now + self._policy.progress_interval_seconds
+            )
+            self._persist_runtime_state()
+        return result
+
+    def _clear_reconnect_failure(self, fingerprint: str) -> None:
+        service = self._failure_status_service
+        if service is None:
+            return
+        service.clear(f"role:{fingerprint}")
+
+    def _clear_unknown_reconnect_failure(self) -> None:
+        service = self._failure_status_service
+        if service is not None:
+            service.clear(self._unknown_failure_key())
 
     def _group_failures(self, windows: tuple[WindowInfo, ...]) -> list[str]:
         failures: list[str] = []
@@ -520,6 +804,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or len(set(fingerprints)) != len(fingerprints)
         ):
             failures.append("fingerprint_missing_or_duplicate")
+        if (
+            self._allowed_fingerprints is not None
+            and set(fingerprints) != set(self._allowed_fingerprints)
+        ):
+            failures.append("group_identity_set_mismatch")
         return failures
 
     def _runtime_state(self) -> ReconnectRuntimeState:
@@ -528,6 +817,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._active_automation_fingerprints,
             self._active_automation_until,
             self._action_retry_after,
+            self._pending_reopen_fingerprints,
+            self._reopen_retry_after,
+        )
+
+    def _persist_runtime_state(self) -> bool:
+        return (
+            self._runtime_state_store.save(self._runtime_state())
+            if self._runtime_state_store is not None
+            else True
         )
 
     def _runtime_state_signature(self) -> tuple[object, ...]:
@@ -546,12 +844,111 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     in self._action_retry_after.items()
                 )
             ),
+            tuple(sorted(self._pending_reopen_fingerprints)),
+            tuple(sorted(self._reopen_retry_after.items())),
         )
 
+    def _retry_pending_reopens(
+        self,
+        *,
+        candidate_windows: tuple[WindowInfo, ...],
+        execute: bool,
+        now: float,
+    ) -> tuple[int, list[str], int | None]:
+        live_fingerprints = {
+            fingerprint
+            for window in candidate_windows
+            if (
+                fingerprint := normalize_launch_fingerprint(
+                    window.launch_fingerprint
+                )
+            )
+            is not None
+        }
+        appeared = (
+            self._pending_reopen_fingerprints & live_fingerprints
+        )
+        self._pending_reopen_fingerprints.difference_update(appeared)
+        for fingerprint in appeared:
+            self._reopen_retry_after.pop(fingerprint, None)
+
+        missing = tuple(sorted(self._pending_reopen_fingerprints))
+        if not missing:
+            return 0, [], None
+
+        failures: list[str] = []
+        reopened = 0
+        next_delays: list[int] = []
+        for fingerprint in missing:
+            retry_at = self._reopen_retry_after.get(fingerprint, now)
+            if not execute or not self._execution_enabled.is_set():
+                next_delays.append(
+                    max(1, math.ceil(max(0.0, retry_at - now)))
+                )
+                continue
+            if now < retry_at:
+                next_delays.append(max(1, math.ceil(retry_at - now)))
+                continue
+
+            target = self._target_for_fingerprint(fingerprint)
+            retry_open = getattr(
+                self._battle_restarter,
+                "reopen_missing",
+                None,
+            )
+            self._reopen_retry_after[fingerprint] = (
+                now + self._policy.progress_interval_seconds
+            )
+            next_delays.append(self._policy.progress_interval_seconds)
+            if target is None or not callable(retry_open):
+                failures.append("battle_restart_identity_unresolved")
+                self._report_reconnect_failure(None)
+                continue
+
+            result = retry_open(target, candidate_windows)
+            if result.success:
+                reopened += 1
+            else:
+                failures.append(
+                    result.failure_code or "battle_shortcut_open_failed"
+                )
+                # The role still failed. Record it and immediately retry only
+                # this exact role instead of waiting for the old 60-second
+                # interval.
+                self._report_reconnect_failure(fingerprint)
+
+        next_delay = min(next_delays) if next_delays else None
+        return reopened, failures, next_delay
+
     def _scan(self, *, execute: bool) -> ReconnectBatchResult:
-        windows = self._matching_windows()
+        candidate_windows = self._candidate_windows()
+        windows = tuple(
+            window
+            for window in candidate_windows
+            if (
+                self._allowed_fingerprints is None
+                or normalize_launch_fingerprint(window.launch_fingerprint)
+                in self._allowed_fingerprints
+            )
+        )
+        state_before = self._runtime_state_signature()
+        now = self._monotonic_clock()
+        retried_reopens, retry_failures, pending_reopen_delay = (
+            self._retry_pending_reopens(
+                candidate_windows=candidate_windows,
+                execute=execute,
+                now=now,
+            )
+        )
         failures = self._group_failures(windows)
+        failures.extend(retry_failures)
         if failures:
+            if (
+                self._runtime_state_store is not None
+                and state_before != self._runtime_state_signature()
+                and not self._runtime_state_store.save(self._runtime_state())
+            ):
+                failures.append("reconnect_state_persistence_failed")
             result = ReconnectBatchResult(
                 expected_windows=self._expected_windows,
                 discovered_windows=len(windows),
@@ -561,18 +958,28 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 connected_windows=0,
                 actionable_windows=0,
                 clicked_windows=0,
+                restarted_windows=retried_reopens,
                 unknown_windows=0,
                 execution_requested=execute,
-                next_check_seconds=self._policy.retry_interval_seconds,
+                next_check_seconds=(
+                    2
+                    if retried_reopens
+                    else (
+                        pending_reopen_delay
+                        or self._policy.retry_interval_seconds
+                    )
+                ),
                 state_counts=(),
                 failure_codes=tuple(dict.fromkeys(failures)),
             )
             self._last_result = result
-            self._state = ReconnectState.FAILED
+            self._state = (
+                ReconnectState.RECONNECTING
+                if result.progressed
+                else ReconnectState.FAILED
+            )
             return result
 
-        state_before = self._runtime_state_signature()
-        now = self._monotonic_clock()
         expired_automation = {
             fingerprint
             for fingerprint, deadline in self._active_automation_until.items()
@@ -617,6 +1024,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 self._pending_reconnect_fingerprints.add(fingerprint)
             elif recognition.state is ReconnectScreenState.CONNECTED:
                 self._pending_reconnect_fingerprints.discard(fingerprint)
+                self._pending_reopen_fingerprints.discard(fingerprint)
+                self._reopen_retry_after.pop(fingerprint, None)
+                self._clear_reconnect_failure(fingerprint)
             elif (
                 recognition.state is ReconnectScreenState.LOGIN_START
                 and fingerprint in self._pending_reconnect_fingerprints
@@ -657,6 +1067,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if self._policy.decide(item.state).action
             in ACTIONABLE_RECONNECT_ACTIONS
             and item.click_point is not None
+            and not (
+                item.state is ReconnectScreenState.DISCONNECTED
+                and item.battle_context
+            )
             and (
                 item.state
                 not in {
@@ -667,11 +1081,67 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 or fingerprint in self._active_automation_fingerprints
             )
         ]
+        battle_actionable = [
+            (window, fingerprint, item)
+            for window, fingerprint, item in recognized
+            if item.state is ReconnectScreenState.DISCONNECTED
+            and item.battle_context
+        ]
         clicked_windows = 0
+        restarted_windows = retried_reopens
         invalid_targets = 0
         unresponsive_targets = 0
         delivery_failures = 0
         if execute:
+            for window, fingerprint, item in battle_actionable:
+                if not self._execution_enabled.is_set():
+                    break
+                retry = self._action_retry_after.get(fingerprint)
+                if (
+                    retry is not None
+                    and retry[0] is item.state
+                    and now < retry[1]
+                ):
+                    continue
+                self._action_retry_after[fingerprint] = (
+                    item.state,
+                    now + self._policy.retry_interval_seconds,
+                )
+                plan = self._group_launch_plan
+                target = (
+                    plan.target_for_fingerprint(fingerprint)
+                    if plan is not None
+                    else None
+                )
+                if self._battle_restarter is None or target is None:
+                    failures.append("battle_restart_identity_unresolved")
+                    self._report_reconnect_failure(None)
+                    continue
+                restart_result = self._battle_restarter.restart(
+                    window,
+                    target,
+                )
+                if not restart_result.success:
+                    failures.append(
+                        restart_result.failure_code
+                        or "battle_restart_failed"
+                    )
+                    self._report_reconnect_failure(fingerprint)
+                    if restart_result.window_closed:
+                        self._pending_reopen_fingerprints.add(fingerprint)
+                        self._reopen_retry_after[fingerprint] = (
+                            now + self._policy.retry_interval_seconds
+                        )
+                    continue
+                restarted_windows += 1
+                self._pending_reopen_fingerprints.add(fingerprint)
+                self._reopen_retry_after[fingerprint] = (
+                    now + self._policy.retry_interval_seconds
+                )
+                self._active_automation_fingerprints.add(fingerprint)
+                self._active_automation_until[fingerprint] = (
+                    now + POST_LOGIN_AUTOMATION_GRACE_SECONDS
+                )
             for window, fingerprint, item in actionable:
                 if not self._execution_enabled.is_set():
                     break
@@ -734,10 +1204,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._policy.decide(item.state)
             for _window, _fingerprint, item in recognized
         ]
-        if actionable:
+        if battle_actionable and restarted_windows == 0 and execute:
+            next_check_seconds = self._policy.retry_interval_seconds
+        elif actionable or battle_actionable:
             next_check_seconds = min(
                 self._policy.decide(item.state).delay_seconds
-                for _window, _fingerprint, item in actionable
+                for _window, _fingerprint, item in (
+                    actionable + battle_actionable
+                )
             )
         elif unknown_windows or failures:
             next_check_seconds = self._policy.retry_interval_seconds
@@ -763,20 +1237,28 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 ReconnectScreenState.CONNECTED.value,
                 0,
             ),
-            actionable_windows=len(actionable),
+            actionable_windows=len(actionable) + len(battle_actionable),
             clicked_windows=clicked_windows,
+            restarted_windows=restarted_windows,
             unknown_windows=unknown_windows,
             execution_requested=execute,
             next_check_seconds=next_check_seconds,
             state_counts=tuple(sorted(state_counts.items())),
             failure_codes=tuple(dict.fromkeys(failures)),
         )
+        with self._screen_state_lock:
+            self._last_screen_states = {
+                fingerprint: item.state
+                for _window, fingerprint, item in recognized
+            }
+        if result.all_connected:
+            self._clear_unknown_reconnect_failure()
         self._last_result = result
         if result.all_connected:
             self._state = ReconnectState.CONNECTED
         elif result.progressed:
             self._state = ReconnectState.RECONNECTING
-        elif actionable:
+        elif actionable or battle_actionable:
             self._state = ReconnectState.DISCONNECTED
         else:
             self._state = ReconnectState.FAILED

@@ -53,6 +53,7 @@ class SmartReconnectMonitor:
             else (),
             tuple(failure_codes) if isinstance(failure_codes, list) else (),
             details.get("clicked_windows"),
+            details.get("restarted_windows"),
         )
 
     def run_once(self) -> tuple[OperationResult, int]:
@@ -67,6 +68,7 @@ class SmartReconnectMonitor:
                 f"connected={details.get('connected_windows', 0)}; "
                 f"actionable={details.get('actionable_windows', 0)}; "
                 f"clicked={details.get('clicked_windows', 0)}; "
+                f"restarted={details.get('restarted_windows', 0)}; "
                 f"unknown={details.get('unknown_windows', 0)}; "
                 f"next_check_seconds={delay}"
             )

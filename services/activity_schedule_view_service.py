@@ -58,11 +58,7 @@ class ActivityScheduleViewService:
                 PlayerScheduledActivity(
                     activity_id=rule.activity_id,
                     name=rule.definition.name,
-                    time_text=(
-                        rule.local_start.strftime("%H:%M")
-                        if rule.local_start is not None
-                        else "無固定時間"
-                    ),
+                    time_text=rule.time_text,
                     eligibility_text=self._eligibility_text(rule),
                 )
                 for rule in ordered

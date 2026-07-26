@@ -6,6 +6,7 @@ import pytest
 
 from adapters.windows_launch_fingerprint import (
     PowerShellLaunchFingerprintResolver,
+    PowerShellShortcutFingerprintResolver,
     normalize_launch_fingerprint,
 )
 
@@ -84,3 +85,45 @@ def test_resolver_decodes_utf8_bytes_without_decoding_stderr():
     resolver = PowerShellLaunchFingerprintResolver(runner=runner)
 
     assert resolver.resolve([42]) == {42: "a" * 64}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Resolver intentionally runs only on Windows")
+def test_shortcut_resolver_returns_only_valid_indexed_fingerprints(tmp_path):
+    first = tmp_path / "角色甲.lnk"
+    second = tmp_path / "角色乙.lnk"
+    first.touch()
+    second.touch()
+
+    def runner(_command, **kwargs):
+        assert "FLASH_SHORTCUT_PATHS_B64" in kwargs["env"]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "0": "a" * 64,
+                    "1": "b" * 64,
+                    "9": "c" * 64,
+                }
+            ).encode("utf-8"),
+            stderr=b"",
+        )
+
+    resolver = PowerShellShortcutFingerprintResolver(runner=runner)
+
+    assert resolver.resolve([first, second]) == {
+        first: "a" * 64,
+        second: "b" * 64,
+    }
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Resolver intentionally runs only on Windows")
+def test_shortcut_resolver_fails_closed_without_emitting_error_text(tmp_path):
+    shortcut = tmp_path / "角色.lnk"
+    shortcut.touch()
+
+    def runner(_command, **_kwargs):
+        raise OSError("secret shortcut data")
+
+    resolver = PowerShellShortcutFingerprintResolver(runner=runner)
+
+    assert resolver.resolve([shortcut]) == {}

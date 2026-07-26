@@ -28,5 +28,6 @@ def build_windows_card_overlay_runtime(
         settings,
         window_factory=window_factory,
         widget_factory=widget_factory,
+        on_close=cards.remove,
     )
     return CardOverlaySyncService(cards, layout, lifecycle)

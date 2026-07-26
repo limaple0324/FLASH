@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from ui.card_content_renderer import CardContent
@@ -49,11 +50,13 @@ class TkCardTextSettings:
 class TkWidget(Protocol):
     def configure(self, **options: Any) -> Any: ...
     def pack(self, **options: Any) -> Any: ...
+    def pack_forget(self) -> Any: ...
 
 
 class TkWidgetFactory(Protocol):
     def frame(self, parent: Any, **options: Any) -> TkWidget: ...
     def label(self, parent: Any, **options: Any) -> TkWidget: ...
+    def button(self, parent: Any, **options: Any) -> TkWidget: ...
 
 
 class _DefaultTkWidgetFactory:
@@ -67,10 +70,16 @@ class _DefaultTkWidgetFactory:
 
         return tk.Label(parent, **options)
 
+    def button(self, parent: Any, **options: Any) -> TkWidget:
+        import tkinter as tk
+
+        return tk.Button(parent, **options)
+
 
 @dataclass(slots=True)
 class _RenderedCard:
     frame: TkWidget
+    close: TkWidget
     group: TkWidget
     title: TkWidget
     progress: TkWidget
@@ -86,11 +95,15 @@ class TkCardContentPresenter:
         settings: TkCardTextSettings,
         *,
         widget_factory: TkWidgetFactory | None = None,
+        on_close: Callable[[str], object] | None = None,
     ) -> None:
         if not isinstance(settings, TkCardTextSettings):
             raise TypeError("settings must be TkCardTextSettings.")
         self._settings = settings
         self._widgets = widget_factory or _DefaultTkWidgetFactory()
+        if on_close is not None and not callable(on_close):
+            raise TypeError("on_close must be callable.")
+        self._on_close = on_close
 
     def _create(self, window: Any) -> _RenderedCard:
         settings = self._settings
@@ -101,6 +114,19 @@ class TkCardContentPresenter:
             highlightthickness=2,
         )
         frame.pack(fill="both", expand=True)
+        close = self._widgets.button(
+            frame,
+            text="×",
+            background=settings.background,
+            foreground=settings.muted_foreground,
+            activebackground=settings.background,
+            activeforeground=settings.foreground,
+            relief="flat",
+            borderwidth=0,
+            font=(settings.font_family, settings.title_size, "bold"),
+            cursor="hand2",
+        )
+        close.pack(side="right", anchor="n", padx=(4, 10), pady=(6, 0))
         group = self._widgets.label(
             frame,
             background=settings.background,
@@ -137,6 +163,7 @@ class TkCardContentPresenter:
             )
         rendered = _RenderedCard(
             frame=frame,
+            close=close,
             group=group,
             title=title,
             progress=progress,
@@ -151,9 +178,37 @@ class TkCardContentPresenter:
         rendered = getattr(window, _WINDOW_STATE_ATTRIBUTE, None)
         if not isinstance(rendered, _RenderedCard):
             rendered = self._create(window)
-        rendered.group.configure(text=content.group_name)
+        rendered.close.configure(
+            command=(
+                (lambda card_id=content.card_id: self._on_close(card_id))
+                if self._on_close is not None
+                else None
+            )
+        )
         rendered.title.configure(text=content.activity_name)
+        if content.name_only:
+            rendered.group.pack_forget()
+            rendered.progress.pack_forget()
+            rendered.next_step.pack_forget()
+            rendered.title.pack(
+                fill="x",
+                padx=self._settings.horizontal_padding,
+                pady=(18, 0),
+            )
+            return
+        rendered.group.configure(text=content.group_name)
         rendered.progress.configure(text=content.current_progress)
         rendered.next_step.configure(
             text=f"下一步：{content.next_step or '尚未提供'}"
         )
+        for label in (
+            rendered.group,
+            rendered.title,
+            rendered.progress,
+            rendered.next_step,
+        ):
+            label.pack(
+                fill="x",
+                padx=self._settings.horizontal_padding,
+                pady=(3, 0),
+            )

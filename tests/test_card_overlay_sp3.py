@@ -143,6 +143,60 @@ def test_card_change_opens_and_removal_closes_overlay() -> None:
     assert runtime.running is False
 
 
+def test_name_only_activity_card_can_be_closed_without_opening_details() -> None:
+    cards = CardService()
+    state = CardViewStateService(cards)
+    layout = CardOverlayLayoutService(
+        state,
+        FixedWorkArea(),
+        CardSize(360, 140),
+        right_margin=20,
+        bottom_margin=20,
+        gap=12,
+    )
+    widgets = _FakeWidgetFactory()
+    windows = []
+    runtime = build_windows_card_overlay_runtime(
+        object(),
+        cards,
+        layout,
+        TkCardTextSettings(
+            background="#FFFFFF",
+            foreground="#182433",
+            muted_foreground="#617083",
+            accent="#2474C6",
+        ),
+        window_factory=lambda _master: windows.append(FakeWindow()) or windows[-1],
+        widget_factory=widgets,
+    )
+    reminder = _card("activity-reminder")
+    reminder = GroupCard(
+        card_id=reminder.card_id,
+        group=reminder.group,
+        activity=reminder.activity,
+        current_progress=reminder.activity.name,
+        priority_reason=CardPriorityReason.ACTIVITY,
+        name_only=True,
+    )
+
+    runtime.start()
+    cards.upsert(reminder, shown_at=datetime.now(timezone.utc))
+    button = widgets.widgets[1]
+    labels = widgets.widgets[2:]
+
+    assert [widget.options.get("text") for widget in labels] == [
+        None,
+        "諸魔殿",
+        None,
+        None,
+    ]
+    assert callable(button.options["command"])
+    button.options["command"]()
+    assert cards.cards == ()
+    assert windows[0].destroyed is True
+    runtime.stop()
+
+
 def test_card_content_uses_only_confirmed_player_fields() -> None:
     cards = CardService()
     cards.upsert(_card(), shown_at=datetime.now(timezone.utc))
@@ -151,10 +205,12 @@ def test_card_content_uses_only_confirmed_player_fields() -> None:
     content = CardContent.from_card(item)
 
     assert content == CardContent(
+        card_id="daily",
         group_name="120",
         activity_name="諸魔殿",
         current_progress="尚未完成",
         next_step="12:55 前準備",
+        name_only=False,
     )
     assert not hasattr(content, "affected_character_ids")
 
@@ -169,10 +225,24 @@ class _FakeWidget:
     def pack(self, **_options):
         return None
 
+    def pack_forget(self):
+        return None
+
 
 class _FakeWidgetFactory:
+    def __init__(self):
+        self.widgets = []
+
+    def _widget(self, **options):
+        widget = _FakeWidget(**options)
+        self.widgets.append(widget)
+        return widget
+
     def frame(self, _parent, **options):
-        return _FakeWidget(**options)
+        return self._widget(**options)
 
     def label(self, _parent, **options):
-        return _FakeWidget(**options)
+        return self._widget(**options)
+
+    def button(self, _parent, **options):
+        return self._widget(**options)

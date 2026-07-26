@@ -19,25 +19,45 @@ def test_catalog_preserves_all_confirmed_timed_activity_facts():
     catalog = build_confirmed_activity_catalog()
 
     expected = {
-        "hall-of-demons": ("諸魔殿", (0, 1, 2, 3, 4, 5, 6), "12:55"),
-        "world-boss": ("世界BOSS", (1, 2, 5), "14:25"),
-        "academy-duel": ("學院對抗賽", (0, 1, 2, 3, 4, 5, 6), "18:55"),
-        "mystery-examiner": ("神秘考官", (0, 1, 2, 3, 4, 5, 6), "19:50"),
-        "golden-ticket-duel": ("金票對抗賽", (0,), "19:00"),
-        "brave-battlefield": ("勇者戰場", (4,), "21:00"),
-        "void-fury-wild-ghost": ("虛空憤怒野鬼", (5,), "15:00"),
-        "treasure-battlefield": ("奪寶戰場", (5,), "19:00"),
-        "fishing-contest": ("釣魚大賽", (6,), "14:00"),
-        "strange-stone-1420": ("奇石", (6,), "14:20"),
-        "fantasy-realm-alternating-1420": ("幻境（隔週14:20）", (6,), "14:20"),
-        "fantasy-realm-1530": ("幻境（15:30）", (6,), "15:30"),
+        "golden-ticket-duel": ("東玄對抗賽", (0,), "19:00", "20:00"),
+        "carefree-defense": (
+            "無憂保衛戰",
+            (0, 1, 2, 3, 4),
+            "19:00",
+            "20:00",
+        ),
+        "world-boss": ("世界BOSS", (1, 3, 5), "14:30", "15:00"),
+        "quiz-contest": ("答題大賽", (1, 3, 5), "20:00", "20:20"),
+        "brave-battlefield": ("勇者戰場", (4,), "21:00", "22:00"),
+        "void-fury-wild-ghost": ("惡靈現世", (5,), "15:00", "16:00"),
+        "treasure-battlefield": ("奪寶奇兵", (5,), "19:00", "20:10"),
+        "fishing-contest": ("釣魚大賽", (6,), "14:00", "15:00"),
+        "strange-stone-square": ("奇石廣場", (6,), "14:00", "23:59"),
+        "eastern-mystic-arena": ("東玄角斗場", (6,), "20:00", "21:00"),
+        "maze": ("迷陣", (0, 1, 2, 3, 4, 5, 6), "00:00", "23:59"),
+        "magic-soldiers": (
+            "魔兵降臨",
+            (0, 1, 2, 3, 4, 5, 6),
+            "00:00",
+            "23:59",
+        ),
+        "hall-of-demons": (
+            "諸魔殿",
+            (0, 1, 2, 3, 4, 5, 6),
+            "13:00",
+            "14:00",
+        ),
     }
 
-    for activity_id, (name, weekdays, local_start) in expected.items():
+    for activity_id, (name, weekdays, local_start, local_end) in expected.items():
         rule = catalog.get(activity_id)
         assert rule.definition.name == name
         assert rule.weekdays == weekdays
         assert rule.local_start.strftime("%H:%M") == local_start
+        assert rule.local_end.strftime("%H:%M") == local_end
+        assert rule.reminder_lead_minutes == 5
+        assert rule.reminder_enabled is True
+        assert rule.is_ready_for_reminders is True
         assert rule.definition.reset_rule.value == "每日00:00"
 
 
@@ -64,9 +84,10 @@ def test_confirmed_level_restrictions_do_not_guess_other_activity_audiences():
     assert magic_soldiers.level_eligibility(120) is True
     assert magic_soldiers.level_eligibility(160) is True
     assert magic_soldiers.level_eligibility(100) is False
-    assert magic_soldiers.local_start is None
+    assert magic_soldiers.local_start.strftime("%H:%M") == "00:00"
     assert hall.level_eligibility(160) is None
-    assert hall.is_ready_for_reminders is False
+    assert hall.is_ready_for_reminders is True
+    assert hall.reminder_scope is ReminderScope.UNCONFIRMED
 
 
 def test_mystery_examiner_is_one_shared_daily_subject():
@@ -103,7 +124,7 @@ def test_build_services_registers_catalog_and_all_progress_definitions(tmp_path)
 
     assert isinstance(catalog, ActivityScheduleCatalog)
     assert progress.definition("mystery-examiner").max_completions == 1
-    assert progress.definition("magic-soldiers").name == "魔兵"
+    assert progress.definition("magic-soldiers").name == "魔兵降臨"
 
 
 def test_schedule_rule_rejects_invalid_weekday_and_missing_alternating_anchor():

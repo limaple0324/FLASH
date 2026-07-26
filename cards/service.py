@@ -1,7 +1,7 @@
 """管理同時可見的組別級提醒卡。"""
 
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from cards.lifecycle import CardLifecycle, _require_aware
 from cards.models import GroupCard
@@ -49,6 +49,8 @@ class CardService:
         self,
         card: GroupCard,
         shown_at: datetime | None = None,
+        *,
+        lifetime: timedelta | None = None,
     ) -> GroupCard:
         if not isinstance(card, GroupCard):
             raise TypeError("card must be GroupCard.")
@@ -58,7 +60,7 @@ class CardService:
                 self._entries[index] = CardLifecycle(
                     card,
                     current.shown_at,
-                    current.lifetime,
+                    lifetime or current.lifetime,
                 )
                 self._notify_changed()
                 return card
@@ -70,7 +72,7 @@ class CardService:
             CardLifecycle(
                 card,
                 shown_at,
-                self.settings.lifetime,
+                lifetime or self.settings.lifetime,
             )
         )
         self._notify_changed()

@@ -29,6 +29,9 @@ class ScheduledActivityRule:
     definition: ActivityDefinition
     weekdays: tuple[int, ...]
     local_start: time | None
+    local_end: time | None = None
+    reminder_lead_minutes: int = 0
+    reminder_enabled: bool = False
     reminder_scope: ReminderScope = ReminderScope.UNCONFIRMED
     eligible_levels: tuple[int, ...] = ()
     every_n_weeks: int = 1
@@ -48,6 +51,23 @@ class ScheduledActivityRule:
             raise ValueError("weekdays cannot contain duplicates.")
         if self.local_start is not None and self.local_start.tzinfo is not None:
             raise ValueError("local_start must be a timezone-free wall-clock time.")
+        if self.local_end is not None and self.local_end.tzinfo is not None:
+            raise ValueError("local_end must be a timezone-free wall-clock time.")
+        if self.local_start is None and self.local_end is not None:
+            raise ValueError("local_end requires local_start.")
+        if (
+            isinstance(self.reminder_lead_minutes, bool)
+            or not isinstance(self.reminder_lead_minutes, int)
+            or self.reminder_lead_minutes < 0
+            or self.reminder_lead_minutes > 24 * 60
+        ):
+            raise ValueError(
+                "reminder_lead_minutes must be an integer from 0 to 1440."
+            )
+        if not isinstance(self.reminder_enabled, bool):
+            raise TypeError("reminder_enabled must be bool.")
+        if self.reminder_enabled and self.local_start is None:
+            raise ValueError("Timed reminders require local_start.")
         if not isinstance(self.reminder_scope, ReminderScope):
             raise TypeError("reminder_scope must be ReminderScope.")
         if any(
@@ -80,7 +100,7 @@ class ScheduledActivityRule:
 
     @property
     def is_ready_for_reminders(self) -> bool:
-        return self.reminder_scope is not ReminderScope.UNCONFIRMED
+        return self.reminder_enabled and self.local_start is not None
 
     def occurs_on(self, local_date: date) -> bool:
         if local_date.weekday() not in self.weekdays:
@@ -99,6 +119,21 @@ class ScheduledActivityRule:
             self.local_start,
             tzinfo=TAIPEI_TIMEZONE,
         )
+
+    def reminder_on(self, local_date: date) -> datetime | None:
+        occurrence = self.occurrence_on(local_date)
+        if occurrence is None or not self.reminder_enabled:
+            return None
+        return occurrence - timedelta(minutes=self.reminder_lead_minutes)
+
+    @property
+    def time_text(self) -> str:
+        if self.local_start is None:
+            return "無固定時間"
+        start = self.local_start.strftime("%H:%M")
+        if self.local_end is None:
+            return start
+        return f"{start}–{self.local_end.strftime('%H:%M')}"
 
     def level_eligibility(self, level: int) -> bool | None:
         if isinstance(level, bool) or not isinstance(level, int) or level <= 0:
@@ -125,6 +160,11 @@ class ScheduledActivityRule:
             "local_start": (
                 self.local_start.strftime("%H:%M") if self.local_start else None
             ),
+            "local_end": (
+                self.local_end.strftime("%H:%M") if self.local_end else None
+            ),
+            "reminder_lead_minutes": self.reminder_lead_minutes,
+            "reminder_enabled": self.reminder_enabled,
             "reminder_scope": self.reminder_scope.value,
             "eligible_levels": list(self.eligible_levels),
             "every_n_weeks": self.every_n_weeks,
@@ -186,24 +226,32 @@ def _activity(
 
 
 def build_confirmed_activity_catalog() -> ActivityScheduleCatalog:
-    """建立 2026-07-26 已由玩家明確說明的週期事實。"""
+    """建立 2026-07-26 已由玩家明確說明的週期與提醒事實。"""
 
     rules = (
         ScheduledActivityRule(
             _activity("hall-of-demons", "諸魔殿", calendar=False),
             ALL_WEEKDAYS,
-            time(12, 55),
+            time(13, 0),
+            time(14, 0),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
         ),
         ScheduledActivityRule(
             _activity("world-boss", "世界BOSS", calendar=True),
-            (1, 2, 5),
-            time(14, 25),
+            (1, 3, 5),
+            time(14, 30),
+            time(15, 0),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
             eligible_levels=(160,),
         ),
         ScheduledActivityRule(
             _activity("academy-duel", "學院對抗賽", calendar=False),
             ALL_WEEKDAYS,
             time(18, 55),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
         ),
         ScheduledActivityRule(
             _activity(
@@ -214,37 +262,88 @@ def build_confirmed_activity_catalog() -> ActivityScheduleCatalog:
             ),
             ALL_WEEKDAYS,
             time(19, 50),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
             reminder_scope=ReminderScope.GLOBAL_ONCE,
         ),
         ScheduledActivityRule(
-            _activity("golden-ticket-duel", "金票對抗賽", calendar=True),
+            _activity("golden-ticket-duel", "東玄對抗賽", calendar=True),
             (0,),
             time(19, 0),
+            time(20, 0),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
+        ),
+        ScheduledActivityRule(
+            _activity("carefree-defense", "無憂保衛戰", calendar=True),
+            (0, 1, 2, 3, 4),
+            time(19, 0),
+            time(20, 0),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
+        ),
+        ScheduledActivityRule(
+            _activity("quiz-contest", "答題大賽", calendar=True),
+            (1, 3, 5),
+            time(20, 0),
+            time(20, 20),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
         ),
         ScheduledActivityRule(
             _activity("brave-battlefield", "勇者戰場", calendar=True),
             (4,),
             time(21, 0),
+            time(22, 0),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
         ),
         ScheduledActivityRule(
-            _activity("void-fury-wild-ghost", "虛空憤怒野鬼", calendar=True),
+            _activity("void-fury-wild-ghost", "惡靈現世", calendar=True),
             (5,),
             time(15, 0),
+            time(16, 0),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
         ),
         ScheduledActivityRule(
-            _activity("treasure-battlefield", "奪寶戰場", calendar=True),
+            _activity("treasure-battlefield", "奪寶奇兵", calendar=True),
             (5,),
             time(19, 0),
+            time(20, 10),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
         ),
         ScheduledActivityRule(
             _activity("fishing-contest", "釣魚大賽", calendar=True),
             (6,),
             time(14, 0),
+            time(15, 0),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
+        ),
+        ScheduledActivityRule(
+            _activity("strange-stone-square", "奇石廣場", calendar=True),
+            (6,),
+            time(14, 0),
+            time(23, 59),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
+        ),
+        ScheduledActivityRule(
+            _activity("eastern-mystic-arena", "東玄角斗場", calendar=True),
+            (6,),
+            time(20, 0),
+            time(21, 0),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
         ),
         ScheduledActivityRule(
             _activity("strange-stone-1420", "奇石", calendar=True),
             (6,),
             time(14, 20),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
             every_n_weeks=2,
             anchor_date=date(2026, 8, 2),
         ),
@@ -256,6 +355,8 @@ def build_confirmed_activity_catalog() -> ActivityScheduleCatalog:
             ),
             (6,),
             time(14, 20),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
             every_n_weeks=2,
             anchor_date=date(2026, 7, 26),
         ),
@@ -263,11 +364,24 @@ def build_confirmed_activity_catalog() -> ActivityScheduleCatalog:
             _activity("fantasy-realm-1530", "幻境（15:30）", calendar=True),
             (6,),
             time(15, 30),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
         ),
         ScheduledActivityRule(
-            _activity("magic-soldiers", "魔兵", calendar=False),
+            _activity("maze", "迷陣", calendar=False),
             ALL_WEEKDAYS,
-            None,
+            time(0, 0),
+            time(23, 59),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
+        ),
+        ScheduledActivityRule(
+            _activity("magic-soldiers", "魔兵降臨", calendar=False),
+            ALL_WEEKDAYS,
+            time(0, 0),
+            time(23, 59),
+            reminder_lead_minutes=5,
+            reminder_enabled=True,
             eligible_levels=(120, 160),
         ),
     )

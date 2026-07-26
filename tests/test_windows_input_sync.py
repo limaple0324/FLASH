@@ -7,6 +7,9 @@ from adapters.windows_input_sync import (
     normalize_input_policy,
 )
 from adapters.windows_window import WindowInfo
+from services.deferred_sync_operation_service import (
+    DeferredSyncOperationService,
+)
 
 
 def make_windows(*, count=14, minimized=(), foreground=1):
@@ -206,6 +209,87 @@ def test_count_mismatch_aborts_before_any_input():
     assert result.passed is False
     assert result.failure_codes == ("window_count_mismatch",)
     assert messages.sent == []
+
+
+def test_selected_group_identity_excludes_other_open_flash_windows():
+    windows = make_windows(count=3)
+    messages = FakeMessageBackend()
+    selected = {
+        windows.windows[0].launch_fingerprint,
+        windows.windows[2].launch_fingerprint,
+    }
+    sync = WindowsInputSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=messages,
+        allowed_fingerprints=selected,
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+    )
+
+    assert result.passed is True
+    assert result.discovered_windows == 2
+    assert messages.sent == [(1, 0x42), (3, 0x42)]
+
+
+def test_selected_group_missing_one_identity_fails_closed():
+    windows = make_windows(count=2)
+    messages = FakeMessageBackend()
+    sync = WindowsInputSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=messages,
+        allowed_fingerprints={
+            windows.windows[0].launch_fingerprint,
+            "f" * 64,
+        },
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+    )
+
+    assert result.passed is False
+    assert "window_count_mismatch" in result.failure_codes
+    assert "group_identity_set_mismatch" in result.failure_codes
+    assert messages.sent == []
+
+
+def test_one_reconnecting_role_pauses_new_sync_for_entire_group():
+    windows = make_windows()
+    messages = FakeMessageBackend()
+    deferred = DeferredSyncOperationService()
+    fingerprints = {
+        window.launch_fingerprint for window in windows.windows
+    }
+    sync = WindowsInputSyncController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=messages,
+        allowed_fingerprints=fingerprints,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (f"{14:064x}",),
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+        exclude_foreground=True,
+    )
+
+    assert result.failure_codes == ("sync_group_deferred_reconnect",)
+    assert messages.sent == []
+    assert deferred.pending() == 13
 
 
 def test_unresponsive_window_aborts_entire_batch_before_input():

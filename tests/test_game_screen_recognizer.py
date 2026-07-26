@@ -40,7 +40,7 @@ def test_all_user_reference_images_match_the_fixed_sha256_manifest():
 
     images = sorted(REFERENCE_DIR.glob("*.png"))
 
-    assert len(images) == 15
+    assert len(images) == 16
     assert set(manifest) == {image.name for image in images}
     for image in images:
         assert hashlib.sha256(image.read_bytes()).hexdigest() == manifest[image.name]
@@ -159,6 +159,43 @@ def test_recognition_survives_proportional_window_scaling():
 
     assert result.state is ReconnectScreenState.DISCONNECTED
     assert result.click_point == definition.click_point
+
+
+def test_battle_disconnect_is_distinguished_from_normal_disconnect():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(
+        REFERENCE_DIR / "01_disconnected_dialog.png"
+    ) as source:
+        disconnected = source.convert("RGB")
+    with Image.open(REFERENCE_DIR / "13_battle_gameplay.png") as source:
+        battle = source.convert("RGB")
+
+    candidate = Image.new("RGB", disconnected.size, "black")
+    client_top = round(candidate.height * 0.05)
+    client_bottom = round(candidate.height * 0.985)
+    candidate.paste(
+        battle.resize(
+            (candidate.width, client_bottom - client_top),
+            Image.Resampling.BILINEAR,
+        ),
+        (0, client_top),
+    )
+    overlay_region = (0.323, 0.477, 0.677, 0.607)
+    overlay_box = (
+        round(disconnected.width * overlay_region[0]),
+        round(disconnected.height * overlay_region[1]),
+        round(disconnected.width * overlay_region[2]),
+        round(disconnected.height * overlay_region[3]),
+    )
+    candidate.paste(disconnected.crop(overlay_box), overlay_box[:2])
+
+    normal_result = recognizer.recognize_image(disconnected)
+    battle_result = recognizer.recognize_image(candidate)
+
+    assert normal_result.state is ReconnectScreenState.DISCONNECTED
+    assert normal_result.battle_context is False
+    assert battle_result.state is ReconnectScreenState.DISCONNECTED
+    assert battle_result.battle_context is True
 
 
 def test_blank_or_wrong_aspect_image_is_unknown_and_has_no_click_target():

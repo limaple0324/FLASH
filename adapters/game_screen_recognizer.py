@@ -101,6 +101,9 @@ CONFIRMED_LEVEL_IMPORTANCE = {
 CHARACTER_LEVEL_MAXIMUM_SCORE = 48.0
 CHARACTER_LEVEL_MINIMUM_MARGIN = 0.75
 CHARACTER_SELECTED_CYAN_FRACTION = 0.25
+BATTLE_REFERENCE_FILE = "13_battle_gameplay.png"
+BATTLE_CONTEXT_REGION: NormalizedRect = (0.73, 0.0, 1.0, 0.22)
+BATTLE_CONTEXT_MAXIMUM_SCORE = 28.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +239,7 @@ class ScreenRecognition:
     character_importance: CharacterImportance | None = None
     character_slot_index: int | None = None
     character_slot_selected: bool | None = None
+    battle_context: bool = False
 
     @property
     def recognized(self) -> bool:
@@ -280,10 +284,16 @@ class ReferenceScreenRecognizer:
             for filename in CHARACTER_LEVEL_TEMPLATE_FILES.values()
             if not (self.reference_dir / filename).is_file()
         )
+        battle_references = (
+            ()
+            if (self.reference_dir / BATTLE_REFERENCE_FILE).is_file()
+            else (BATTLE_REFERENCE_FILE,)
+        )
         return (
             screen_references
             + digit_references
             + character_level_references
+            + battle_references
         )
 
     @property
@@ -681,6 +691,31 @@ class ReferenceScreenRecognizer:
         difference = ImageChops.difference(candidate_signature, reference_signature)
         return float(ImageStat.Stat(difference).mean[0])
 
+    def _is_battle_context(self, candidate: Image.Image) -> bool:
+        """Match the stable top-right auto-battle panel outside the dialog."""
+        reference = self._reference(BATTLE_REFERENCE_FILE)
+        variants = [candidate]
+        if candidate.height >= 100:
+            variants.append(
+                candidate.crop(
+                    (
+                        0,
+                        round(candidate.height * 0.05),
+                        candidate.width,
+                        round(candidate.height * 0.985),
+                    )
+                )
+            )
+        score = min(
+            self._region_score(
+                variant,
+                reference,
+                BATTLE_CONTEXT_REGION,
+            )
+            for variant in variants
+        )
+        return score <= BATTLE_CONTEXT_MAXIMUM_SCORE
+
     @staticmethod
     def _flat_pixels(image: Image.Image) -> list[tuple[int, int, int]]:
         getter = getattr(image, "get_flattened_data", None)
@@ -782,6 +817,7 @@ class ReferenceScreenRecognizer:
                 score=round(disconnected_score, 3),
                 click_point=disconnected.click_point,
                 reference_name=disconnected.filename,
+                battle_context=self._is_battle_context(candidate),
             )
 
         scored: list[tuple[float, ScreenTemplateDefinition]] = []

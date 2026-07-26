@@ -23,6 +23,7 @@ class CardViewItem:
     priority_level: int
     shown_at: datetime
     expires_at: datetime
+    name_only: bool
 
     @classmethod
     def from_lifecycle(cls, entry: CardLifecycle) -> "CardViewItem":
@@ -44,6 +45,7 @@ class CardViewItem:
             priority_level=int(card.priority_tier),
             shown_at=entry.shown_at,
             expires_at=entry.expires_at,
+            name_only=card.name_only,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -62,6 +64,7 @@ class CardViewItem:
             "priority_level": self.priority_level,
             "shown_at": self.shown_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
+            "name_only": self.name_only,
         }
 
 

@@ -6,7 +6,7 @@ import json
 import sys
 import traceback
 from pathlib import Path
-from tkinter import PhotoImage, TclError, Tk, messagebox
+from tkinter import PhotoImage, TclError, Tk, filedialog, messagebox
 
 from adapters.background_capability import BackgroundCapabilityProbe
 from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
@@ -19,10 +19,15 @@ from adapters.windows_input_sync import (
     WindowsInputSyncController,
     normalize_input_policy,
 )
-from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
+from adapters.windows_launch_fingerprint import (
+    PowerShellLaunchFingerprintResolver,
+    PowerShellShortcutFingerprintResolver,
+    normalize_launch_fingerprint,
+)
 from adapters.windows_smart_reconnect import WindowsSmartReconnectController
+from adapters.windows_pointer_sync import WindowsPointerSyncController
 from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
-from adapters.windows_window import WindowsWindowAdapter
+from adapters.windows_window import Win32WindowBackend, WindowsWindowAdapter
 from adapters.windows_work_area import WindowsWorkAreaReader
 from cards.history_store import CardHistoryStore
 from cards.service import CardService
@@ -35,6 +40,7 @@ from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.bootstrap import Bootstrap
 from core.sp1_boundaries import ExternalAdapter, SmartReconnectBoundary
+from core.reconnect_policy import ReconnectScreenState
 from core.target_window_observation import TargetWindowObservation
 from core.window_registry import WindowRegistry
 from core.version import MILESTONE
@@ -49,8 +55,16 @@ from domain.progress_store import ActivityProgressStore
 from habit.service import ActivityOrderHabitService
 from habit.store import ActivityOrderHabitStore
 from services.activity_progress_service import ActivityProgressService
+from services.activity_reminder_monitor import ActivityReminderMonitor
+from services.activity_reminder_service import ActivityReminderService
 from services.activity_schedule_view_service import ActivityScheduleViewService
 from services.app_context import AppContext
+from services.auto_click_service import (
+    AutoClickHotkeyMonitor,
+    AutoClickService,
+    AutoClickSettings,
+    Win32CursorClickBackend,
+)
 from services.card_coordinator import CardCoordinator
 from services.card_display_settings_service import CardDisplaySettingsService
 from services.card_expiry_monitor import CardExpiryMonitor
@@ -67,9 +81,29 @@ from services.group_selection_service import (
     GroupSelectionService,
     default_legacy_group_config_path,
 )
+from services.group_configuration_service import (
+    GroupConfigurationService,
+    SyncCycleError,
+)
+from services.group_launch_service import GroupLaunchPlan, GroupLaunchService
+from services.group_role_status_monitor import GroupRoleStatusMonitor
+from services.group_role_status_service import GroupRoleStatusService
 from services.keyboard_sync_monitor import KeyboardSyncMonitor
 from services.logger_service import LoggerService
+from services.mouse_sync_monitor import MouseSyncMonitor
+from services.reconnect_failure_status_service import (
+    ReconnectFailureStatusService,
+)
 from services.smart_reconnect_monitor import SmartReconnectMonitor
+from services.sync_scope_service import SyncScopeService
+from services.sync_conflict_arbiter import SyncConflictArbiter
+from services.deferred_sync_operation_service import (
+    DeferredSyncOperationMonitor,
+    DeferredSyncOperationService,
+)
+from services.sync_operation_record_store import (
+    SyncOperationRecordStore,
+)
 from services.target_window_state_service import (
     TARGET_WINDOW_OBSERVED_EVENT,
     TargetWindowStateService,
@@ -92,6 +126,10 @@ SMART_RECONNECT_CONSENT_KEY = "smart_reconnect_consent_v1"
 CURRENT_GROUP_NAME_KEY = "current_group_name"
 REGISTRY_FILENAME = "window_registry.json"
 RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
+GROUP_CONFIGURATION_FILENAME = "group_configuration.json"
+OPERATION_RECORD_FILENAME = "operation_records.json"
+OPERATION_RECORD_ARCHIVE_DIRNAME = "角色每日紀錄"
+DEFERRED_SYNC_STATE_FILENAME = "deferred_sync_operations.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
 CHARACTER_FILENAME = "characters.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
@@ -174,13 +212,27 @@ def build_services(root: Path | None = None):
     character_view_service = CharacterViewService(registry, characters)
     character_detail_view_service = CharacterDetailViewService(character_view_service)
     character_note_service = CharacterNoteService(registry, registry_store)
+    legacy_group_config_path = (
+        default_legacy_group_config_path()
+        if root is None
+        else paths.root / ".legacy-group-import-disabled"
+    )
+    shortcut_fingerprint_resolver = PowerShellShortcutFingerprintResolver()
+    group_configuration_service = GroupConfigurationService(
+        paths.data_dir() / GROUP_CONFIGURATION_FILENAME,
+        legacy_config_path=legacy_group_config_path,
+    )
     group_selection_service = GroupSelectionService(
         registry,
-        legacy_config_path=(
-            default_legacy_group_config_path()
-            if root is None
-            else paths.root / ".legacy-group-import-disabled"
-        ),
+        legacy_config_path=group_configuration_service.path,
+    )
+    group_launch_service = GroupLaunchService(
+        group_configuration_service.path,
+        shortcut_fingerprint_resolver,
+    )
+    sync_scope_service = SyncScopeService(
+        group_configuration_service,
+        shortcut_fingerprint_resolver,
     )
     progress_store = ActivityProgressStore(
         paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
@@ -233,7 +285,33 @@ def build_services(root: Path | None = None):
         on_changed=register_card_display_settings,
     )
     card_coordinator = CardCoordinator(card_service, card_history_service)
+    activity_reminder_service = ActivityReminderService(
+        activity_schedule_catalog,
+        card_coordinator,
+        workspace_service.snapshot,
+    )
     card_view_state_service = CardViewStateService(card_service)
+    reconnect_failure_status_service = ReconnectFailureStatusService()
+
+    def configured_role_names() -> tuple[str, ...]:
+        names: list[str] = []
+        for group in group_configuration_service.groups():
+            plan = group_launch_service.plan(group.name)
+            candidates = (
+                tuple(target.display_name for target in plan.targets)
+                if plan.ready
+                else tuple(entry.display_name for entry in group.entries)
+            )
+            for name in candidates:
+                if name not in names:
+                    names.append(name)
+        return tuple(names)
+
+    operation_record_store = SyncOperationRecordStore(
+        paths.data_dir() / OPERATION_RECORD_FILENAME,
+        paths.data_dir() / OPERATION_RECORD_ARCHIVE_DIRNAME,
+        role_names_provider=configured_role_names,
+    )
 
     AppContext.register(PathManager, paths)
     AppContext.register(LoggerService, logger)
@@ -255,6 +333,12 @@ def build_services(root: Path | None = None):
     AppContext.register(CharacterDetailViewService, character_detail_view_service)
     AppContext.register(CharacterNoteService, character_note_service)
     AppContext.register(GroupSelectionService, group_selection_service)
+    AppContext.register(
+        GroupConfigurationService,
+        group_configuration_service,
+    )
+    AppContext.register(GroupLaunchService, group_launch_service)
+    AppContext.register(SyncScopeService, sync_scope_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(ActivityScheduleCatalog, activity_schedule_catalog)
@@ -268,20 +352,151 @@ def build_services(root: Path | None = None):
     AppContext.register(CardService, card_service)
     AppContext.register(CardDisplaySettingsService, card_display_settings_service)
     AppContext.register(CardCoordinator, card_coordinator)
+    AppContext.register(ActivityReminderService, activity_reminder_service)
     AppContext.register(CardViewStateService, card_view_state_service)
     AppContext.register(
-        WindowsInputSyncController,
-        WindowsInputSyncController.for_real_windows(),
+        ReconnectFailureStatusService,
+        reconnect_failure_status_service,
     )
+
+    def role_name_for_fingerprint(fingerprint: str) -> str:
+        matches: list[str] = []
+        for group in group_configuration_service.groups():
+            plan = group_launch_service.plan(group.name)
+            target = (
+                plan.target_for_fingerprint(fingerprint)
+                if plan.ready
+                else None
+            )
+            if target is not None and target.display_name not in matches:
+                matches.append(target.display_name)
+        return matches[0] if len(matches) == 1 else "未知角色"
+
+    AppContext.register(SyncOperationRecordStore, operation_record_store)
     reconnect_controller = WindowsSmartReconnectController.for_real_windows(
         reference_dir=resource_path(RECONNECT_REFERENCE_DIR),
         state_path=paths.data_dir() / RECONNECT_STATE_FILENAME,
+        failure_status_service=reconnect_failure_status_service,
+        failure_record_callback=lambda role_name, detail: (
+            operation_record_store.append(
+                "智慧重連",
+                role_name,
+                detail,
+            )
+        ),
+    )
+    deferred_sync_service = DeferredSyncOperationService(
+        state_path=paths.data_dir() / DEFERRED_SYNC_STATE_FILENAME,
+        on_failure=lambda record: operation_record_store.append(
+            "同步補做",
+            role_name_for_fingerprint(record.target_id),
+            f"{record.operation}－{record.failure_code}",
+        )
+    )
+    AppContext.register(
+        DeferredSyncOperationService,
+        deferred_sync_service,
+    )
+    sync_conflict_arbiter = SyncConflictArbiter(
+        on_conflict=lambda record: (
+            logger.warning(
+                "Overlapping synchronized operation skipped; "
+                f"active={record.active_operation}; "
+                f"skipped={record.skipped_operation}"
+            ),
+            operation_record_store.append(
+                "同步衝突",
+                role_name_for_fingerprint(record.target_id),
+                (
+                    f"已執行 {record.active_operation}；"
+                    f"略過 {record.skipped_operation}"
+                ),
+            ),
+        )
+    )
+    AppContext.register(SyncConflictArbiter, sync_conflict_arbiter)
+    AppContext.register(
+        WindowsInputSyncController,
+        WindowsInputSyncController.for_real_windows(
+            conflict_arbiter=sync_conflict_arbiter,
+            deferred_service=deferred_sync_service,
+            reconnecting_provider=(
+                reconnect_controller.reconnecting_fingerprints
+            ),
+            role_operation_callback=lambda fingerprint, operation, outcome: (
+                operation_record_store.append(
+                    "同步操作",
+                    role_name_for_fingerprint(fingerprint),
+                    f"{operation}－{outcome}",
+                )
+            ),
+            screen_state_provider=lambda fingerprint: (
+                reconnect_controller.observe_screen_states(
+                    (fingerprint,)
+                ).get(fingerprint)
+            ),
+        ),
+    )
+    AppContext.register(
+        WindowsPointerSyncController,
+        WindowsPointerSyncController.for_real_windows(
+            conflict_arbiter=sync_conflict_arbiter,
+            deferred_service=deferred_sync_service,
+            reconnecting_provider=(
+                reconnect_controller.reconnecting_fingerprints
+            ),
+            role_operation_callback=lambda fingerprint, operation, outcome: (
+                operation_record_store.append(
+                    "同步操作",
+                    role_name_for_fingerprint(fingerprint),
+                    f"{operation}－{outcome}",
+                )
+            ),
+            screen_state_provider=lambda fingerprint: (
+                reconnect_controller.observe_screen_states(
+                    (fingerprint,)
+                ).get(fingerprint)
+            ),
+        ),
     )
     AppContext.register(
         WindowsSmartReconnectController,
         reconnect_controller,
     )
     AppContext.register(SmartReconnectBoundary, reconnect_controller)
+    AppContext.register(
+        GroupRoleStatusService,
+        GroupRoleStatusService(
+            group_launch_service,
+            Win32WindowBackend(PowerShellLaunchFingerprintResolver()),
+            reconnect_failure_status_service,
+            screen_states_provider=reconnect_controller.role_screen_states,
+            reconnecting_provider=(
+                reconnect_controller.reconnecting_fingerprints
+            ),
+            record_callback=operation_record_store.append,
+        ),
+    )
+    AppContext.register(
+        DeferredSyncOperationMonitor,
+        DeferredSyncOperationMonitor(
+            deferred_sync_service,
+            reconnect_controller.reconnecting_fingerprints,
+            lambda: tuple(
+                item.key.removeprefix("role:")
+                for item in reconnect_failure_status_service.snapshot()
+                if item.key.startswith("role:")
+            ),
+            ready_provider=lambda: tuple(
+                fingerprint
+                for fingerprint, screen_state
+                in reconnect_controller.observe_screen_states(
+                    deferred_sync_service.pending_targets()
+                ).items()
+                if screen_state is ReconnectScreenState.CONNECTED
+            ),
+        ),
+    )
     AppContext.register(
         SmartReconnectMonitor,
         SmartReconnectMonitor(reconnect_controller, logger=logger),
@@ -558,22 +773,42 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     config = AppContext.get(ConfigManager)
     input_controller = AppContext.get(WindowsInputSyncController)
+    pointer_sync_controller = AppContext.get(
+        WindowsPointerSyncController
+    )
     logger = AppContext.get(LoggerService)
     group_selection_service = AppContext.get(GroupSelectionService)
+    group_configuration_service = AppContext.get(
+        GroupConfigurationService
+    )
+    group_launch_service = AppContext.get(GroupLaunchService)
+    sync_scope_service = AppContext.get(SyncScopeService)
     workspace_service = AppContext.get(WorkspaceService)
     activity_schedule_view_service = AppContext.get(ActivityScheduleViewService)
     card_view_state_service = AppContext.get(CardViewStateService)
     card_service = AppContext.get(CardService)
+    activity_reminder_service = AppContext.get(ActivityReminderService)
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
     target_window_state_service = AppContext.get(TargetWindowStateService)
     smart_reconnect_monitor = AppContext.get(SmartReconnectMonitor)
     smart_reconnect_controller = AppContext.get(
         WindowsSmartReconnectController
     )
+    reconnect_failure_status_service = AppContext.get(
+        ReconnectFailureStatusService
+    )
+    group_role_status_service = AppContext.get(GroupRoleStatusService)
+    operation_record_store = AppContext.get(SyncOperationRecordStore)
+    deferred_sync_monitor = AppContext.get(DeferredSyncOperationMonitor)
     character_view_service = AppContext.get(CharacterViewService)
     character_detail_view_service = AppContext.get(CharacterDetailViewService)
     character_note_service = AppContext.get(CharacterNoteService)
     home_view: HomeView | None = None
+    auto_click_service = AutoClickService(
+        Win32CursorClickBackend(),
+        schedule=window.after,
+        cancel=window.after_cancel,
+    )
 
     def report_refresh_error(error: Exception) -> None:
         if logger is not None:
@@ -600,6 +835,45 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if config is not None
         else WindowInputPolicy.ALL
     ) or WindowInputPolicy.ALL
+
+    def selected_group_plan(choice) -> GroupLaunchPlan | None:
+        if group_launch_service is None:
+            return None
+        plan = group_launch_service.plan(choice.name)
+        if (
+            not plan.ready
+            or len(plan.targets) != choice.character_count
+        ):
+            return None
+        return plan
+
+    def apply_group_identity(choice) -> GroupLaunchPlan | None:
+        plan = selected_group_plan(choice)
+        if plan is None:
+            return None
+        if input_controller is not None:
+            scope = (
+                sync_scope_service.scope(choice.name)
+                if sync_scope_service is not None
+                else None
+            )
+            if scope is None or not scope.ready:
+                return None
+            input_controller.set_expected_windows(len(scope.fingerprints))
+            input_controller.set_allowed_fingerprints(scope.fingerprints)
+            if pointer_sync_controller is not None:
+                pointer_sync_controller.set_expected_windows(
+                    len(scope.fingerprints)
+                )
+                pointer_sync_controller.set_allowed_fingerprints(
+                    scope.fingerprints
+                )
+        if smart_reconnect_controller is not None:
+            smart_reconnect_controller.set_expected_windows(
+                choice.character_count
+            )
+            smart_reconnect_controller.set_group_launch_plan(plan)
+        return plan
 
     def change_input_policy(value: str) -> None:
         policy = normalize_input_policy(value)
@@ -640,12 +914,134 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         config.set(CURRENT_GROUP_NAME_KEY, choice.name)
         if keyboard_sync_monitor is not None and keyboard_sync_monitor.enabled:
             keyboard_sync_monitor.stop()
+            if mouse_sync_monitor is not None:
+                mouse_sync_monitor.stop()
             if home_view is not None:
                 home_view.set_keyboard_sync_enabled(False)
             if logger is not None:
                 logger.info(
                     "Keyboard synchronization stopped because the group changed."
                 )
+        if smart_reconnect_monitor is not None and smart_reconnect_monitor.running:
+            smart_reconnect_monitor.stop(timeout_seconds=1.0)
+            if config is not None:
+                config.update_values(
+                    {
+                        SMART_RECONNECT_ENABLED_KEY: False,
+                        SMART_RECONNECT_CONSENT_KEY: False,
+                    }
+                )
+            if home_view is not None:
+                home_view.set_smart_reconnect_enabled(False)
+            if logger is not None:
+                logger.info(
+                    "Smart reconnect stopped because the group changed."
+                )
+        apply_group_identity(choice)
+        if group_role_status_service is not None:
+            group_role_status_service.clear_cache()
+
+    def stop_group_automation_for_configuration_change() -> None:
+        if keyboard_sync_monitor is not None:
+            keyboard_sync_monitor.stop()
+            if mouse_sync_monitor is not None:
+                mouse_sync_monitor.stop()
+            if home_view is not None:
+                home_view.set_keyboard_sync_enabled(False)
+        if smart_reconnect_monitor is not None:
+            smart_reconnect_monitor.stop(timeout_seconds=1.0)
+            if home_view is not None:
+                home_view.set_smart_reconnect_enabled(False)
+        if config is not None:
+            config.update_values(
+                {
+                    SMART_RECONNECT_ENABLED_KEY: False,
+                    SMART_RECONNECT_CONSENT_KEY: False,
+                }
+            )
+
+    def group_entries(group_name: str):
+        if group_configuration_service is None:
+            return ()
+        group = group_configuration_service.group(group_name)
+        return group.entries if group is not None else ()
+
+    def add_group_shortcuts(group_name: str) -> object:
+        if group_configuration_service is None:
+            return False
+        selected = filedialog.askopenfilenames(
+            parent=window,
+            title="加入角色到組別",
+            filetypes=(("Windows 捷徑", "*.lnk"),),
+        )
+        if not selected:
+            return False
+        stop_group_automation_for_configuration_change()
+        try:
+            added = group_configuration_service.add_shortcuts(
+                group_name,
+                tuple(Path(path) for path in selected),
+            )
+        except SyncCycleError:
+            return SyncCycleError.player_message
+        if home_view is not None:
+            home_view.refresh_group_entries()
+            home_view.refresh_group_sync_relations()
+        if operation_record_store is not None:
+            operation_record_store.ensure_daily_file()
+        return bool(added)
+
+    def remove_group_shortcut(
+        group_name: str,
+        entry_id: str,
+    ) -> bool:
+        if group_configuration_service is None:
+            return False
+        stop_group_automation_for_configuration_change()
+        removed = group_configuration_service.remove_shortcut(
+            group_name,
+            entry_id,
+        )
+        if removed and home_view is not None:
+            home_view.refresh_group_entries()
+            home_view.refresh_group_sync_relations()
+        if removed and operation_record_store is not None:
+            operation_record_store.ensure_daily_file()
+        return removed
+
+    def add_group_sync_relation(
+        group_name: str,
+        member_entry_id: str,
+    ) -> object:
+        if group_configuration_service is None:
+            return False
+        group = group_configuration_service.group(group_name)
+        if group is None or not group.entries:
+            return False
+        stop_group_automation_for_configuration_change()
+        try:
+            changed = group_configuration_service.add_sync_relation(
+                group.entries[0].entry_id,
+                member_entry_id,
+            )
+        except SyncCycleError:
+            return SyncCycleError.player_message
+        return bool(changed)
+
+    def remove_group_sync_relation(
+        group_name: str,
+        member_entry_id: str,
+    ) -> bool:
+        if group_configuration_service is None:
+            return False
+        group = group_configuration_service.group(group_name)
+        if group is None or not group.entries:
+            return False
+        stop_group_automation_for_configuration_change()
+        return group_configuration_service.remove_sync_relation(
+            group.entries[0].entry_id,
+            member_entry_id,
+        )
 
     def card_display_seconds() -> int:
         if card_display_settings_service is None:
@@ -730,9 +1126,24 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if input_controller is not None
         else None
     )
+    mouse_sync_monitor = (
+        MouseSyncMonitor(
+            pointer_sync_controller,
+            policy_provider=current_input_policy,
+            schedule=window.after,
+            cancel=window.after_cancel,
+        )
+        if pointer_sync_controller is not None
+        else None
+    )
 
     def change_keyboard_sync(enabled: bool) -> bool:
-        if keyboard_sync_monitor is None or input_controller is None:
+        if (
+            keyboard_sync_monitor is None
+            or mouse_sync_monitor is None
+            or input_controller is None
+            or pointer_sync_controller is None
+        ):
             messagebox.showerror(
                 "輔｜同步輸入",
                 "同步輸入尚未正確設定，沒有啟用。",
@@ -741,6 +1152,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return False
         if not enabled:
             keyboard_sync_monitor.stop()
+            mouse_sync_monitor.stop()
             return True
 
         state = workspace_service.snapshot() if workspace_service is not None else None
@@ -761,6 +1173,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
             return False
+        plan = apply_group_identity(choice)
+        if plan is None:
+            messagebox.showerror(
+                "輔｜同步輸入",
+                "目前組別無法完整對應到唯一遊戲視窗；沒有啟用。",
+                parent=window,
+            )
+            return False
         if current_input_policy() is None:
             messagebox.showerror(
                 "輔｜同步輸入",
@@ -768,8 +1188,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
             return False
-        input_controller.set_expected_windows(choice.character_count)
         keyboard_sync_monitor.start()
+        mouse_sync_monitor.start()
         if logger is not None:
             logger.info(
                 "Keyboard synchronization enabled; "
@@ -812,9 +1232,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                     parent=window,
                 )
                 return False
-            smart_reconnect_controller.set_expected_windows(
-                choice.character_count
-            )
+            plan = apply_group_identity(choice)
+            if plan is None:
+                messagebox.showerror(
+                    "輔｜智慧重連",
+                    "目前組別無法完整對應到唯一遊戲視窗；維持安全停止。",
+                    parent=window,
+                )
+                return False
             config.update_values(
                 {
                     SMART_RECONNECT_ENABLED_KEY: True,
@@ -838,6 +1263,24 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "Smart reconnect explicitly disabled by the player; "
                 f"worker_stopped={stopped}"
             )
+        return True
+
+    def change_auto_click(
+        enabled: bool,
+        interval_ms: int,
+        button: str,
+        repeat_forever: bool,
+        repeat_count: int,
+    ) -> bool:
+        settings = AutoClickSettings(
+            interval_ms=interval_ms,
+            button=button,
+            repeat_forever=repeat_forever,
+            repeat_count=repeat_count,
+        )
+        if enabled:
+            return auto_click_service.start(settings)
+        auto_click_service.stop()
         return True
 
     group_choices = (
@@ -873,6 +1316,21 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             else None
         ),
         on_group_change=change_group,
+        group_entries_provider=group_entries,
+        on_add_group_shortcuts=add_group_shortcuts,
+        on_remove_group_shortcut=remove_group_shortcut,
+        group_sync_choices_provider=(
+            group_configuration_service.available_sync_members
+            if group_configuration_service is not None
+            else None
+        ),
+        group_sync_relations_provider=(
+            group_configuration_service.explicit_sync_members
+            if group_configuration_service is not None
+            else None
+        ),
+        on_add_group_sync_relation=add_group_sync_relation,
+        on_remove_group_sync_relation=remove_group_sync_relation,
         workspace_state=workspace_state,
         workspace_state_provider=(
             workspace_service.snapshot
@@ -919,14 +1377,109 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             status.get("smart_reconnect_enabled", False)
         ),
         on_smart_reconnect_change=change_smart_reconnect,
+        reconnect_failure_messages_provider=(
+            lambda: tuple(
+                item.message
+                for item in reconnect_failure_status_service.snapshot()
+                if item.key.startswith("group:")
+            )
+            if reconnect_failure_status_service is not None
+            else None
+        ),
+        group_role_status_provider=(
+            group_role_status_service.snapshot
+            if group_role_status_service is not None
+            else None
+        ),
+        on_group_role_action=(
+            lambda action_id: group_role_status_service.activate_or_launch(
+                home_view.current_group_name if home_view is not None else None,
+                action_id,
+            )
+            if group_role_status_service is not None
+            else None
+        ),
+        operation_record_lines_provider=(
+            operation_record_store.player_lines
+            if operation_record_store is not None
+            else None
+        ),
+        operation_record_files_provider=(
+            operation_record_store.daily_files
+            if operation_record_store is not None
+            else None
+        ),
+        on_open_operation_record_file=(
+            operation_record_store.open_daily_file
+            if operation_record_store is not None
+            else None
+        ),
+        operation_record_search=(
+            operation_record_store.search
+            if operation_record_store is not None
+            else None
+        ),
+        auto_click_running=False,
+        on_auto_click_change=change_auto_click,
         card_display_seconds_provider=card_display_seconds,
         on_card_display_seconds_update=update_card_display_seconds,
         on_refresh_error=report_refresh_error,
     )
     home_view.build()
+    auto_click_service.subscribe(
+        lambda snapshot: home_view.set_auto_click_running(
+            snapshot.running,
+            snapshot.sent_count,
+        )
+    )
+    auto_click_hotkey_monitor = AutoClickHotkeyMonitor(
+        home_view.toggle_auto_click_from_hotkey,
+        schedule=window.after,
+        cancel=window.after_cancel,
+    )
+    auto_click_hotkey_monitor.start()
+
+    def current_group_name() -> str | None:
+        state = (
+            workspace_service.snapshot()
+            if workspace_service is not None
+            else None
+        )
+        return (
+            state.current_group.name
+            if state is not None and state.current_group is not None
+            else None
+        )
+
+    group_role_status_monitor = (
+        GroupRoleStatusMonitor(
+            group_role_status_service,
+            current_group_name,
+        )
+        if group_role_status_service is not None
+        else None
+    )
+    if group_role_status_monitor is not None:
+        group_role_status_monitor.start()
+    if deferred_sync_monitor is not None:
+        deferred_sync_monitor.start()
+
+    reconnect_status_refresh_id: str | None = None
+
+    def refresh_reconnect_status() -> None:
+        nonlocal reconnect_status_refresh_id
+        home_view.refresh_reconnect_failures()
+        home_view.refresh_group_role_statuses()
+        reconnect_status_refresh_id = window.after(
+            1000,
+            refresh_reconnect_status,
+        )
+
+    refresh_reconnect_status()
 
     overlay_runtime = None
     expiry_monitor = None
+    activity_reminder_monitor = None
     if card_service is not None and card_view_state_service is not None:
         overlay_layout = CardOverlayLayoutService(
             card_view_state_service,
@@ -951,16 +1504,38 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         expiry_monitor = CardExpiryMonitor(card_service, window.after)
         expiry_monitor.start()
         card_service.subscribe(home_view.refresh_cards)
+        if activity_reminder_service is not None:
+            activity_reminder_monitor = ActivityReminderMonitor(
+                activity_reminder_service,
+                window.after,
+                window.after_cancel,
+            )
+            activity_reminder_monitor.start()
 
     def close_window() -> None:
+        auto_click_hotkey_monitor.stop()
+        auto_click_service.stop()
+        if group_role_status_monitor is not None:
+            group_role_status_monitor.stop(timeout_seconds=1.0)
+        if deferred_sync_monitor is not None:
+            deferred_sync_monitor.stop(timeout_seconds=1.0)
+        if reconnect_status_refresh_id is not None:
+            try:
+                window.after_cancel(reconnect_status_refresh_id)
+            except TclError:
+                pass
         if card_service is not None:
             card_service.unsubscribe(home_view.refresh_cards)
         if expiry_monitor is not None:
             expiry_monitor.stop()
+        if activity_reminder_monitor is not None:
+            activity_reminder_monitor.stop()
         if overlay_runtime is not None:
             overlay_runtime.stop()
         if keyboard_sync_monitor is not None:
             keyboard_sync_monitor.stop()
+        if mouse_sync_monitor is not None:
+            mouse_sync_monitor.stop()
         if window_identity is not None:
             window_identity.clear()
         window.destroy()
@@ -968,6 +1543,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window.protocol("WM_DELETE_WINDOW", close_window)
     window._card_overlay_runtime = overlay_runtime
     window._card_expiry_monitor = expiry_monitor
+    window._activity_reminder_monitor = activity_reminder_monitor
+    window._auto_click_service = auto_click_service
+    window._auto_click_hotkey_monitor = auto_click_hotkey_monitor
+    window._group_role_status_monitor = group_role_status_monitor
+    window._deferred_sync_monitor = deferred_sync_monitor
     window._windows_app_identity = window_identity
     return window
 

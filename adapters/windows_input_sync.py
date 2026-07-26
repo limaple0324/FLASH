@@ -12,7 +12,7 @@ import ctypes
 from dataclasses import dataclass
 from enum import Enum
 from ctypes import wintypes
-from typing import Iterable, Protocol
+from typing import Callable, Iterable, Mapping, Protocol
 
 from adapters.windows_launch_fingerprint import (
     PowerShellLaunchFingerprintResolver,
@@ -20,6 +20,11 @@ from adapters.windows_launch_fingerprint import (
 )
 from adapters.windows_window import Win32WindowBackend, WindowBackend, WindowInfo
 from domain.game_shortcuts import GAME_SHORTCUT_BY_KEY
+from services.sync_conflict_arbiter import SyncConflictArbiter
+from services.deferred_sync_operation_service import (
+    DeferredSyncOperationService,
+)
+from core.reconnect_policy import ReconnectScreenState
 
 
 APPROVED_SYNC_KEYS = frozenset(GAME_SHORTCUT_BY_KEY)
@@ -302,6 +307,16 @@ class WindowsInputSyncController:
         window_backend: WindowBackend,
         message_backend: KeyMessageBackend,
         preflight_timeout_ms: int = 1000,
+        allowed_fingerprints: Iterable[str] | None = None,
+        conflict_arbiter: SyncConflictArbiter | None = None,
+        deferred_service: DeferredSyncOperationService | None = None,
+        reconnecting_provider: Callable[[], Iterable[str]] | None = None,
+        role_operation_callback: (
+            Callable[[str, str, str], object] | None
+        ) = None,
+        screen_state_provider: (
+            Callable[[str], ReconnectScreenState | None] | None
+        ) = None,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -316,7 +331,32 @@ class WindowsInputSyncController:
         self._window_backend = window_backend
         self._message_backend = message_backend
         self._preflight_timeout_ms = max(1, int(preflight_timeout_ms))
+        self._allowed_fingerprints: frozenset[str] | None = None
+        self._conflict_arbiter = conflict_arbiter
+        self._deferred_service = deferred_service
+        self._reconnecting_provider = reconnecting_provider or (lambda: ())
+        self._role_operation_callback = role_operation_callback
+        self._screen_state_provider = screen_state_provider
+        if self._deferred_service is not None:
+            self._deferred_service.register_handler(
+                "keyboard",
+                self._handle_deferred_key,
+            )
+        self.set_allowed_fingerprints(allowed_fingerprints)
 
+    def _handle_deferred_key(
+        self,
+        fingerprint: str,
+        payload: Mapping[str, object],
+    ) -> bool:
+        key = normalize_approved_key(payload.get("key"))
+        if key is None:
+            return False
+        return self._deliver_deferred_key(
+            fingerprint,
+            key,
+            VIRTUAL_KEY_SEQUENCES[key],
+        )
     @property
     def expected_windows(self) -> int:
         return self._expected_windows
@@ -330,12 +370,42 @@ class WindowsInputSyncController:
             raise ValueError("expected_windows must be positive")
         self._expected_windows = expected_windows
 
+    def set_allowed_fingerprints(
+        self,
+        fingerprints: Iterable[str] | None,
+    ) -> None:
+        if fingerprints is None:
+            self._allowed_fingerprints = None
+            return
+        normalized = tuple(
+            normalize_launch_fingerprint(item)
+            for item in fingerprints
+        )
+        if (
+            not normalized
+            or any(item is None for item in normalized)
+            or len(normalized) != len(set(normalized))
+        ):
+            raise ValueError(
+                "fingerprints must contain unique complete SHA-256 digests"
+            )
+        self._allowed_fingerprints = frozenset(normalized)
+
     @classmethod
     def for_real_windows(
         cls,
         *,
         expected_windows: int = 14,
         title_keywords: Iterable[str] = ("Adobe Flash Player",),
+        conflict_arbiter: SyncConflictArbiter | None = None,
+        deferred_service: DeferredSyncOperationService | None = None,
+        reconnecting_provider: Callable[[], Iterable[str]] | None = None,
+        role_operation_callback: (
+            Callable[[str, str, str], object] | None
+        ) = None,
+        screen_state_provider: (
+            Callable[[str], ReconnectScreenState | None] | None
+        ) = None,
     ) -> "WindowsInputSyncController":
         return cls(
             expected_windows=expected_windows,
@@ -344,13 +414,116 @@ class WindowsInputSyncController:
                 PowerShellLaunchFingerprintResolver()
             ),
             message_backend=Win32KeyMessageBackend(),
+            conflict_arbiter=conflict_arbiter,
+            deferred_service=deferred_service,
+            reconnecting_provider=reconnecting_provider,
+            role_operation_callback=role_operation_callback,
+            screen_state_provider=screen_state_provider,
         )
+
+    def _record_role_operation(
+        self,
+        fingerprint: str,
+        operation: str,
+        outcome: str,
+    ) -> None:
+        if self._role_operation_callback is None:
+            return
+        try:
+            self._role_operation_callback(
+                fingerprint,
+                operation,
+                outcome,
+            )
+        except Exception:
+            pass
+
+    def _deliver_deferred_key(
+        self,
+        fingerprint: str,
+        normalized_key: str,
+        virtual_keys: tuple[int, ...],
+    ) -> bool:
+        if (
+            self._screen_state_provider is None
+            or self._screen_state_provider(fingerprint)
+            is not ReconnectScreenState.CONNECTED
+        ):
+            return False
+        matches = tuple(
+            window
+            for window in self._all_title_matching_windows()
+            if normalize_launch_fingerprint(window.launch_fingerprint)
+            == fingerprint
+        )
+        if len(matches) != 1:
+            return False
+        window = matches[0]
+        if (
+            not self._message_backend.is_window(window.handle)
+            or not self._message_backend.probe_responsive(
+                window.handle,
+                self._preflight_timeout_ms,
+            )
+        ):
+            return False
+        lease = (
+            self._conflict_arbiter.try_begin(
+                fingerprint,
+                f"key:{normalized_key}",
+            )
+            if self._conflict_arbiter is not None
+            else None
+        )
+        if self._conflict_arbiter is not None and lease is None:
+            return False
+        try:
+            if len(virtual_keys) == 1:
+                delivered = bool(
+                    self._message_backend.send_virtual_key(
+                        window.handle,
+                        virtual_keys[0],
+                    )
+                )
+            else:
+                delivered = bool(
+                    self._message_backend.send_key_chord(
+                    window.handle,
+                    virtual_keys,
+                    )
+                )
+            self._record_role_operation(
+                fingerprint,
+                f"快捷鍵 {normalized_key}",
+                "補做成功" if delivered else "補做失敗",
+            )
+            return delivered
+        except OSError:
+            return False
+        finally:
+            if lease is not None:
+                lease.release()
 
     def _matching_windows(self) -> tuple[WindowInfo, ...]:
         return tuple(
             window
             for window in self._window_backend.list_windows()
             if all(keyword in window.title.casefold() for keyword in self._keywords)
+            and (
+                self._allowed_fingerprints is None
+                or normalize_launch_fingerprint(window.launch_fingerprint)
+                in self._allowed_fingerprints
+            )
+        )
+
+    def _all_title_matching_windows(self) -> tuple[WindowInfo, ...]:
+        return tuple(
+            window
+            for window in self._window_backend.list_windows()
+            if all(
+                keyword in window.title.casefold()
+                for keyword in self._keywords
+            )
         )
 
     def _base_result(
@@ -396,6 +569,74 @@ class WindowsInputSyncController:
         windows = self._matching_windows()
         failures: list[str] = []
 
+        reconnecting = {
+            fingerprint
+            for value in self._reconnecting_provider()
+            if (fingerprint := normalize_launch_fingerprint(value)) is not None
+        }
+        group_reconnecting = (
+            bool(reconnecting & self._allowed_fingerprints)
+            if self._allowed_fingerprints is not None
+            else bool(reconnecting)
+        )
+        if (
+            execute
+            and group_reconnecting
+            and normalized_key is not None
+            and normalized_policy is not None
+            and self._deferred_service is not None
+            and self._allowed_fingerprints is not None
+        ):
+            foreground = self._window_backend.foreground_handle()
+            foreground_fingerprint = next(
+                (
+                    normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    )
+                    for window in windows
+                    if window.handle == foreground
+                ),
+                None,
+            )
+            targets = tuple(
+                fingerprint
+                for fingerprint in self._allowed_fingerprints
+                if not (
+                    exclude_foreground
+                    and fingerprint == foreground_fingerprint
+                )
+            )
+            for fingerprint in targets:
+                self._deferred_service.enqueue(
+                    fingerprint,
+                    f"key:{normalized_key}",
+                    kind="keyboard",
+                    payload={"key": normalized_key},
+                )
+                self._record_role_operation(
+                    fingerprint,
+                    f"快捷鍵 {normalized_key}",
+                    "全組等待重連後補做",
+                )
+            return InputSyncResult(
+                approved_key=normalized_key,
+                policy=normalized_policy.value,
+                expected_windows=self._expected_windows,
+                discovered_windows=len(windows),
+                eligible_windows=len(targets),
+                responsive_windows=0,
+                sent_windows=0,
+                minimized_windows=sum(
+                    window.minimized for window in windows
+                ),
+                background_windows=sum(
+                    window.handle != foreground for window in windows
+                ),
+                skipped_windows=0,
+                execution_requested=True,
+                failure_codes=("sync_group_deferred_reconnect",),
+            )
+
         if normalized_key is None:
             failures.append("key_not_approved")
         if normalized_policy is None:
@@ -423,6 +664,11 @@ class WindowsInputSyncController:
             or len(set(fingerprints)) != len(fingerprints)
         ):
             failures.append("fingerprint_missing_or_duplicate")
+        if (
+            self._allowed_fingerprints is not None
+            and set(fingerprints) != set(self._allowed_fingerprints)
+        ):
+            failures.append("group_identity_set_mismatch")
 
         if failures or normalized_key is None or normalized_policy is None:
             return self._base_result(
@@ -498,23 +744,69 @@ class WindowsInputSyncController:
 
         virtual_keys = VIRTUAL_KEY_SEQUENCES[normalized_key]
         sent = 0
+        deferred = 0
+        reconnecting = reconnecting
         for window in responsive_targets:
+            fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+            if (
+                fingerprint in reconnecting
+                and self._deferred_service is not None
+            ):
+                self._deferred_service.enqueue(
+                    fingerprint,
+                    f"key:{normalized_key}",
+                    kind="keyboard",
+                    payload={"key": normalized_key},
+                )
+                deferred += 1
+                self._record_role_operation(
+                    fingerprint,
+                    f"快捷鍵 {normalized_key}",
+                    "等待重連後補做",
+                )
+                failures.append("sync_deferred_reconnect")
+                continue
+            lease = (
+                self._conflict_arbiter.try_begin(
+                    fingerprint,
+                    f"key:{normalized_key}",
+                )
+                if self._conflict_arbiter is not None
+                and fingerprint is not None
+                else None
+            )
+            if self._conflict_arbiter is not None and lease is None:
+                failures.append("sync_conflict_skipped")
+                continue
             try:
-                if len(virtual_keys) == 1:
-                    delivered = self._message_backend.send_virtual_key(
-                        window.handle,
-                        virtual_keys[0],
+                try:
+                    if len(virtual_keys) == 1:
+                        delivered = self._message_backend.send_virtual_key(
+                            window.handle,
+                            virtual_keys[0],
+                        )
+                    else:
+                        delivered = self._message_backend.send_key_chord(
+                            window.handle,
+                            virtual_keys,
+                        )
+                    if delivered:
+                        sent += 1
+                    self._record_role_operation(
+                        fingerprint,
+                        f"快捷鍵 {normalized_key}",
+                        "成功" if delivered else "失敗",
                     )
-                else:
-                    delivered = self._message_backend.send_key_chord(
-                        window.handle,
-                        virtual_keys,
-                    )
-                if delivered:
-                    sent += 1
+                except OSError:
+                    continue
             except OSError:
                 continue
-        if sent != len(eligible):
+            finally:
+                if lease is not None:
+                    lease.release()
+        if sent + deferred != len(eligible):
             failures.append("input_delivery_failed")
 
         return self._base_result(

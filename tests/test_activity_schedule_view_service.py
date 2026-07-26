@@ -21,13 +21,16 @@ def test_current_sunday_shows_corrected_fantasy_realm_not_strange_stone() -> Non
     assert "幻境（隔週14:20）" in names
     assert "奇石" not in names
     assert _activity_schedule_text(state) == (
-        "12:55　諸魔殿\n"
-        "14:00　釣魚大賽\n"
+        "00:00–23:59　魔兵降臨｜僅 120／160 等級\n"
+        "00:00–23:59　迷陣\n"
+        "13:00–14:00　諸魔殿\n"
+        "14:00–15:00　釣魚大賽\n"
+        "14:00–23:59　奇石廣場\n"
         "14:20　幻境（隔週14:20）\n"
         "15:30　幻境（15:30）\n"
         "18:55　學院對抗賽\n"
         "19:50　神秘考官\n"
-        "無固定時間　魔兵｜僅 120／160 等級"
+        "20:00–21:00　東玄角斗場"
     )
 
 

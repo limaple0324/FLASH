@@ -1,6 +1,6 @@
 """協調可見提醒卡與斷線／恢復歷史。"""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from cards.models import GroupCard
 from cards.service import CardService
@@ -20,12 +20,18 @@ class CardCoordinator:
         self,
         card: GroupCard,
         shown_at: datetime | None = None,
+        *,
+        lifetime: timedelta | None = None,
     ) -> GroupCard:
         previous = next(
             (current for current in self.cards.cards if current.card_id == card.card_id),
             None,
         )
-        result = self.cards.upsert(card, shown_at=shown_at)
+        result = self.cards.upsert(
+            card,
+            shown_at=shown_at,
+            lifetime=lifetime,
+        )
         if previous is None or previous.priority_reason is not card.priority_reason:
             entry = next(
                 item for item in self.cards.entries if item.card.card_id == card.card_id

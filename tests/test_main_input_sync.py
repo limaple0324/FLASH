@@ -41,8 +41,8 @@ def test_home_exposes_three_policies_and_complete_confirmed_shortcuts():
     assert "僅允許前台" in source
     assert "允許前台與背景" in source
     assert "全部允許（含最小化）" in source
-    assert "開始鍵盤同步" in source
-    assert "停止鍵盤同步" in source
+    assert "開始同步視窗" in source
+    assert "停止同步視窗" in source
     assert "CONFIRMED_GAME_SHORTCUTS" in source
     assert "測試 B" not in source
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from services.card_overlay_window_lifecycle import CardOverlayWindowLifecycle
@@ -20,10 +21,12 @@ def build_windows_card_overlay_lifecycle(
     *,
     window_factory: WindowFactory | None = None,
     widget_factory: TkWidgetFactory | None = None,
+    on_close: Callable[[str], object] | None = None,
 ) -> CardOverlayWindowLifecycle:
     presenter = TkCardContentPresenter(
         settings,
         widget_factory=widget_factory,
+        on_close=on_close,
     )
     windows = WindowsCardOverlayPort(
         master,
