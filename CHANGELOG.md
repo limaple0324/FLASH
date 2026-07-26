@@ -27,6 +27,11 @@
   character views in `3bb6ac4`; registered both in the cumulative bootstrap.
 - 31 character, registration, SP1 bootstrap, and self-check regression tests
   passed without adding character UI or frozen life-soul fields.
+- Ported immutable per-character soul-stone records, atomic persistence, and
+  transactional query/set/clear services in `acee84c`; registered them on
+  managed data paths.
+- 36 soul-stone, registration, SP1 bootstrap, and self-check regression tests
+  passed without adding the SP3 editor or frozen life-soul data.
 - No SP3 UI, game input, player-visible registry mapping, or frozen resource
   area was added.
 
