@@ -464,17 +464,68 @@ def test_missing_reopen_retries_immediately_without_touching_other_roles(
     assert first.details["restarted_windows"] == 1
     fixture.controller._window_backend.windows = [windows[1]]
 
-    now[0] = 59.0
+    now[0] = 1.0
     before = fixture.controller.reconnect()
-    now[0] = 60.0
+    now[0] = 2.0
     retry = fixture.controller.reconnect()
-    now[0] = 119.0
+    now[0] = 3.0
     no_duplicate = fixture.controller.reconnect()
+    now[0] = 4.0
+    next_retry = fixture.controller.reconnect()
 
     assert before.details["restarted_windows"] == 0
     assert retry.details["restarted_windows"] == 1
-    assert no_duplicate.details["restarted_windows"] == 1
+    assert no_duplicate.details["restarted_windows"] == 0
+    assert next_retry.details["restarted_windows"] == 1
     assert len(restarter.reopen_calls) == 2
+
+
+def test_failed_battle_restart_retries_same_role_after_progress_interval(
+    tmp_path,
+):
+    now = [0.0]
+    windows = [make_window(1), make_window(2)]
+    plan = GroupLaunchPlan(
+        "120",
+        targets=(
+            GroupLaunchTarget(
+                1,
+                "120古",
+                tmp_path / "first.lnk",
+                windows[0].launch_fingerprint,
+            ),
+            GroupLaunchTarget(
+                2,
+                "120靈",
+                tmp_path / "second.lnk",
+                windows[1].launch_fingerprint,
+            ),
+        ),
+    )
+    restarter = FakeBattleRestarter(succeeds=False)
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
+        clock=lambda: now[0],
+        battle_markers={2},
+        battle_restarter=restarter,
+        group_launch_plan=plan,
+        failure_status_service=ReconnectFailureStatusService(),
+    )
+
+    first = fixture.controller.reconnect()
+    assert len(restarter.calls) == 2
+    now[0] = 1.0
+    before = fixture.controller.reconnect()
+    assert len(restarter.calls) == 2
+    now[0] = 2.0
+    retry = fixture.controller.reconnect()
+
+    assert first.details["next_check_seconds"] == 2
+    assert before.details["restarted_windows"] == 0
+    assert retry.details["next_check_seconds"] == 2
+    assert len(restarter.calls) == 4
+    assert all(call[0].handle == windows[0].handle for call in restarter.calls)
 
 
 def test_each_known_role_failure_records_then_restarts_only_that_role(
@@ -647,6 +698,31 @@ def test_delayed_popup_context_expires_and_restores_player_control(tmp_path):
     assert result.code == "reconnect.waiting"
     assert result.details["actionable_windows"] == 0
     assert expired.mouse.clicks == []
+
+
+def test_expired_context_is_removed_without_running_reconnect_scan(tmp_path):
+    state_path = tmp_path / "smart_reconnect_state.json"
+    now = [1000.0]
+    first = make_controller(
+        [3, 1],
+        clock=lambda: now[0],
+        state_path=state_path,
+    )
+
+    first.controller.reconnect()
+    fingerprint = make_window(1).launch_fingerprint
+    assert first.controller.reconnecting_fingerprints() == frozenset(
+        {fingerprint}
+    )
+
+    now[0] = 1181.0
+    assert first.controller.reconnecting_fingerprints() == frozenset()
+    restored = make_controller(
+        [1, 1],
+        clock=lambda: now[0],
+        state_path=state_path,
+    )
+    assert restored.controller.reconnecting_fingerprints() == frozenset()
 
 
 def test_changed_screen_allows_next_action_without_waiting_one_minute():

@@ -1535,7 +1535,7 @@ class HomeView:
         if self._smart_reconnect_label is not None:
             self._smart_reconnect_label.configure(
                 text=(
-                    "● 自動監看中｜失敗每 60 秒重試"
+                    "● 自動監看中｜依目前狀態安全重試"
                     if self.smart_reconnect_enabled
                     else "● 安全停止｜不會點擊遊戲視窗"
                 ),
