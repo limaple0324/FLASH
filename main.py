@@ -35,6 +35,7 @@ from core.target_window_observation import TargetWindowObservation
 from core.window_registry import WindowRegistry
 from core.version import MILESTONE
 from core.window_registry_store import WindowRegistryStore
+from decision.service import DecisionService
 from domain.activity_schedule import (
     ActivityScheduleCatalog,
     build_confirmed_activity_catalog,
@@ -162,6 +163,7 @@ def build_services(root: Path | None = None):
     activity_schedule_catalog = build_confirmed_activity_catalog()
     for rule in activity_schedule_catalog.all():
         progress_service.register_definition(rule.definition)
+    decision_service = DecisionService()
     workspace_service = WorkspaceService()
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
     card_history_service = CardHistoryService(card_history_store)
@@ -205,6 +207,7 @@ def build_services(root: Path | None = None):
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(ActivityScheduleCatalog, activity_schedule_catalog)
+    AppContext.register(DecisionService, decision_service)
     AppContext.register(WorkspaceService, workspace_service)
     AppContext.register(CardHistoryStore, card_history_store)
     AppContext.register(CardHistoryService, card_history_service)
