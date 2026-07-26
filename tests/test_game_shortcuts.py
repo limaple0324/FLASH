@@ -42,4 +42,5 @@ def test_combat_state_shortcuts_keep_both_confirmed_meanings() -> None:
     assert GAME_SHORTCUT_BY_KEY["D"].combat_action == "防禦"
     assert GAME_SHORTCUT_BY_KEY["W"].combat_action == "打開／關閉技能面板"
     assert GAME_SHORTCUT_BY_KEY["T"].combat_action == "打開／關閉寵物面板"
-    assert GAME_SHORTCUT_BY_KEY["E"].combat_action == "打開／關閉道具面板"
+    assert GAME_SHORTCUT_BY_KEY["B"].combat_action == "打開／關閉道具面板"
+    assert GAME_SHORTCUT_BY_KEY["E"].combat_action is None
