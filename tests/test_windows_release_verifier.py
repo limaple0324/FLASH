@@ -48,6 +48,8 @@ def _create_bundle(
             source_ref = "refs/heads/main"
         elif build_kind == "sp2_snapshot":
             source_ref = "refs/heads/sp2/completion-2026-07-26"
+        elif build_kind == "sp3_snapshot":
+            source_ref = "refs/heads/sp3/completion-2026-07-26"
         else:
             source_ref = "refs/heads/sp1/completion-2026-07-25"
 
@@ -110,6 +112,11 @@ def _create_bundle(
             "SP1+SP2 cumulative snapshot fixture\n",
             encoding="utf-8",
         )
+    elif build_kind == "sp3_snapshot":
+        (release_dir / "SP1+SP2+SP3完整累積快照說明.txt").write_text(
+            "SP1+SP2+SP3 cumulative snapshot fixture\n",
+            encoding="utf-8",
+        )
     elif build_kind == "validation_build":
         (release_dir / "分支驗證說明.txt").write_text(
             "validation fixture\n",
@@ -152,6 +159,8 @@ def _create_bundle(
         manifest_paths.append("SP1快照說明.txt")
     elif build_kind == "sp2_snapshot":
         manifest_paths.append("SP1+SP2累積快照說明.txt")
+    elif build_kind == "sp3_snapshot":
+        manifest_paths.append("SP1+SP2+SP3完整累積快照說明.txt")
     else:
         manifest_paths.append("分支驗證說明.txt")
 
@@ -241,6 +250,52 @@ def test_sp2_snapshot_rejects_a_different_source_identity(tmp_path: Path):
 
     assert result.returncode != 0
     assert "dedicated SP2 workflow source identity" in _output(result)
+
+
+def test_no_launch_accepts_an_sp1_plus_sp2_plus_sp3_snapshot(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="sp3_snapshot",
+        source_branch="sp3/completion-2026-07-26",
+        milestone="SP3",
+        version="0.3.0",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode == 0, _output(result)
+    assert "NoLaunch was specified" in _output(result)
+
+
+def test_sp3_snapshot_rejects_sp2_milestone_metadata(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="sp3_snapshot",
+        source_branch="sp3/completion-2026-07-26",
+        milestone="SP2",
+        version="0.3.0",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode != 0
+    assert "SP3 delivery must use milestone=SP3" in _output(result)
+
+
+def test_sp3_snapshot_rejects_a_different_source_identity(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="sp3_snapshot",
+        source_branch="sp3/wrong",
+        source_ref="refs/heads/sp3/wrong",
+        milestone="SP3",
+        version="0.3.0",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode != 0
+    assert "dedicated SP3 workflow source identity" in _output(result)
 
 
 def test_no_launch_accepts_an_sp1_branch_push_snapshot(tmp_path: Path):

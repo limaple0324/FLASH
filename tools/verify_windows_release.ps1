@@ -158,7 +158,7 @@ foreach ($requiredKey in @(
 
 if (
     $buildInfo["product"] -ne "FLASH" -or
-    $buildInfo["milestone"] -notin @("SP1", "SP2")
+    $buildInfo["milestone"] -notin @("SP1", "SP2", "SP3")
 ) {
     throw "Release metadata does not describe a supported FLASH milestone."
 }
@@ -174,6 +174,7 @@ if (
     $buildKind -notin @(
         "sp1_snapshot",
         "sp2_snapshot",
+        "sp3_snapshot",
         "validation_build",
         "main_release",
         "sp1_release"
@@ -193,6 +194,12 @@ if (
 ) {
     throw "An SP2 delivery must use milestone=SP2."
 }
+if (
+    $buildKind -eq "sp3_snapshot" -and
+    $buildInfo["milestone"] -ne "SP3"
+) {
+    throw "An SP3 delivery must use milestone=SP3."
+}
 
 if ($buildKind -in @("main_release", "sp1_release")) {
     $expectedManifestPaths = $LiveReleaseManifestPaths
@@ -202,6 +209,9 @@ elseif ($buildKind -eq "sp1_snapshot") {
 }
 elseif ($buildKind -eq "sp2_snapshot") {
     $expectedManifestPaths = @($CommonManifestPaths + "SP1+SP2累積快照說明.txt")
+}
+elseif ($buildKind -eq "sp3_snapshot") {
+    $expectedManifestPaths = @($CommonManifestPaths + "SP1+SP2+SP3完整累積快照說明.txt")
 }
 else {
     $expectedManifestPaths = @($CommonManifestPaths + "分支驗證說明.txt")
@@ -213,7 +223,7 @@ if ($buildInfo["sha256"].ToLowerInvariant() -ne $actualExeHash) {
     throw "BUILD_INFO.txt hash does not match FLASH.exe."
 }
 
-if ($buildKind -in @("sp1_snapshot", "sp2_snapshot", "validation_build")) {
+if ($buildKind -in @("sp1_snapshot", "sp2_snapshot", "sp3_snapshot", "validation_build")) {
     if ($buildInfo["publish_target"] -ne "none") {
         throw "A non-release build must use publish_target=none."
     }
@@ -254,6 +264,16 @@ if (
     )
 ) {
     throw "An SP2 snapshot must use the dedicated SP2 workflow source identity."
+}
+if (
+    $buildKind -eq "sp3_snapshot" -and
+    (
+        $buildInfo["event_name"] -notin @("push", "workflow_dispatch") -or
+        $buildInfo["source_ref"] -ne "refs/heads/sp3/completion-2026-07-26" -or
+        $buildInfo["source_branch"] -ne "sp3/completion-2026-07-26"
+    )
+) {
+    throw "An SP3 snapshot must use the dedicated SP3 workflow source identity."
 }
 
 if ($buildKind -in @("main_release", "sp1_release")) {

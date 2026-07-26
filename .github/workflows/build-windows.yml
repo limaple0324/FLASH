@@ -6,6 +6,7 @@ on:
       - main
       - sp1/completion-2026-07-25
       - sp2/completion-2026-07-26
+      - sp3/completion-2026-07-26
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -109,6 +110,8 @@ jobs:
           $sp1DeliveryRef = "refs/heads/$sp1DeliveryBranch"
           $sp2DeliveryBranch = 'sp2/completion-2026-07-26'
           $sp2DeliveryRef = "refs/heads/$sp2DeliveryBranch"
+          $sp3DeliveryBranch = 'sp3/completion-2026-07-26'
+          $sp3DeliveryRef = "refs/heads/$sp3DeliveryBranch"
           $isSp1Snapshot = (
             $env:BUILD_EVENT_NAME -eq 'workflow_dispatch' -and
             $env:BUILD_REF -eq $sp1DeliveryRef -and
@@ -131,6 +134,11 @@ jobs:
             $env:BUILD_REF -eq $sp2DeliveryRef -and
             $env:BUILD_SOURCE_BRANCH -eq $sp2DeliveryBranch
           )
+          $isSp3Snapshot = (
+            $env:BUILD_EVENT_NAME -in @('push', 'workflow_dispatch') -and
+            $env:BUILD_REF -eq $sp3DeliveryRef -and
+            $env:BUILD_SOURCE_BRANCH -eq $sp3DeliveryBranch
+          )
           if ($isMainRelease) {
             $buildKind = 'main_release'
             $publishTarget = 'release/latest'
@@ -151,6 +159,11 @@ jobs:
             $publishTarget = 'none'
             $artifactKind = 'snapshot'
           }
+          elseif ($isSp3Snapshot) {
+            $buildKind = 'sp3_snapshot'
+            $publishTarget = 'none'
+            $artifactKind = 'snapshot'
+          }
           else {
             $buildKind = 'validation_build'
             $publishTarget = 'none'
@@ -163,9 +176,15 @@ jobs:
           if ($buildKind -eq 'sp2_snapshot' -and $parts[1] -ne 'SP2') {
             throw "SP2 delivery branch must use milestone=SP2."
           }
+          if ($buildKind -eq 'sp3_snapshot' -and $parts[1] -ne 'SP3') {
+            throw "SP3 delivery branch must use milestone=SP3."
+          }
 
           $shortCommit = $env:GITHUB_SHA.Substring(0, 7)
-          if ($buildKind -eq 'sp2_snapshot') {
+          if ($buildKind -eq 'sp3_snapshot') {
+            $artifactPrefix = 'FLASH-SP1+SP2+SP3-Windows'
+          }
+          elseif ($buildKind -eq 'sp2_snapshot') {
             $artifactPrefix = 'FLASH-SP1+SP2-Windows'
           }
           else {
@@ -280,6 +299,15 @@ jobs:
               '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
             ) | Set-Content 'release/SP1+SP2累積快照說明.txt' -Encoding utf8
           }
+          elseif ($env:FLASH_BUILD_KIND -eq 'sp3_snapshot') {
+            @(
+              '這是 SP1＋SP2＋SP3 完整累積工程驗證快照。'
+              'SP1、SP2 與 SP3 各自的交付檔案仍保留，不會被本快照覆蓋。'
+              'SP3 自己的來源範圍、測試與驗收證據位於 deliverables/sp3。'
+              '本快照不包含「更新輔」，不會追蹤任何正式發布頻道。'
+              '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
+            ) | Set-Content 'release/SP1+SP2+SP3完整累積快照說明.txt' -Encoding utf8
+          }
           else {
             @(
               '這是一般分支驗證包，不是 SP1 獨立成品或正式發布版。'
@@ -346,6 +374,9 @@ jobs:
           }
           elseif ($env:FLASH_BUILD_KIND -eq 'sp2_snapshot') {
             $manifestPaths += 'SP1+SP2累積快照說明.txt'
+          }
+          elseif ($env:FLASH_BUILD_KIND -eq 'sp3_snapshot') {
+            $manifestPaths += 'SP1+SP2+SP3完整累積快照說明.txt'
           }
           else {
             $manifestPaths += '分支驗證說明.txt'
@@ -426,6 +457,11 @@ jobs:
             elseif ($env:FLASH_BUILD_KIND -eq 'sp2_snapshot') {
               if (-not (Test-Path 'release/SP1+SP2累積快照說明.txt' -PathType Leaf)) {
                 throw 'SP1+SP2 cumulative snapshot notice is missing.'
+              }
+            }
+            elseif ($env:FLASH_BUILD_KIND -eq 'sp3_snapshot') {
+              if (-not (Test-Path 'release/SP1+SP2+SP3完整累積快照說明.txt' -PathType Leaf)) {
+                throw 'SP1+SP2+SP3 cumulative snapshot notice is missing.'
               }
             }
             elseif ($env:FLASH_BUILD_KIND -eq 'validation_build') {

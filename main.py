@@ -95,6 +95,12 @@ APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 RECONNECT_REFERENCE_DIR = Path("assets") / "reconnect_reference"
 WINDOWS_APP_USER_MODEL_ID = "limaple0324.FLASH"
+WM_SETICON = 0x0080
+ICON_SMALL = 0
+ICON_BIG = 1
+IMAGE_ICON = 1
+LR_LOADFROMFILE = 0x0010
+LR_DEFAULTSIZE = 0x0040
 
 
 def resource_path(relative_path: Path) -> Path:
@@ -121,7 +127,6 @@ def apply_window_icon(window: Tk) -> None:
             window.iconbitmap(str(ico_path))
         except TclError:
             pass
-
     png_path = resource_path(APP_ICON_PNG)
     if png_path.exists():
         try:
@@ -130,6 +135,43 @@ def apply_window_icon(window: Tk) -> None:
             window._flash_icon = icon
         except TclError:
             pass
+
+
+def apply_windows_native_window_icon(window: Tk) -> None:
+    """Set both native top-level icons so the Windows taskbar never uses Python."""
+    if sys.platform != "win32":
+        return
+    ico_path = resource_path(APP_ICON_ICO)
+    if not ico_path.exists():
+        return
+    try:
+        window.update_idletasks()
+        user32 = ctypes.windll.user32
+        get_parent = user32.GetParent
+        load_image = user32.LoadImageW
+        send_message = user32.SendMessageW
+        get_parent.restype = ctypes.c_void_p
+        load_image.restype = ctypes.c_void_p
+        send_message.restype = ctypes.c_ssize_t
+
+        widget_handle = int(window.winfo_id())
+        parent_handle = get_parent(widget_handle)
+        top_level_handle = int(parent_handle or widget_handle)
+        icon_handle = load_image(
+            None,
+            str(ico_path),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_LOADFROMFILE | LR_DEFAULTSIZE,
+        )
+        if not icon_handle:
+            return
+        send_message(top_level_handle, WM_SETICON, ICON_SMALL, icon_handle)
+        send_message(top_level_handle, WM_SETICON, ICON_BIG, icon_handle)
+        window._flash_native_icon = icon_handle
+    except (AttributeError, OSError, TclError, TypeError, ValueError):
+        pass
 
 
 def _normalize_window_keywords(value: object) -> list[str]:
@@ -535,6 +577,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window = Tk()
     window.title(APP_TITLE)
     apply_window_icon(window)
+    apply_windows_native_window_icon(window)
     window.geometry("1040x720")
     window.minsize(900, 620)
 

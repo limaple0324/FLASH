@@ -2,7 +2,18 @@ from pathlib import Path
 
 import main
 from PIL import Image
-from main import APP_ICON_ICO, APP_ICON_PNG, WINDOWS_APP_USER_MODEL_ID, resource_path
+from main import (
+    APP_ICON_ICO,
+    APP_ICON_PNG,
+    ICON_BIG,
+    ICON_SMALL,
+    IMAGE_ICON,
+    LR_DEFAULTSIZE,
+    LR_LOADFROMFILE,
+    WINDOWS_APP_USER_MODEL_ID,
+    WM_SETICON,
+    resource_path,
+)
 
 
 def test_app_icon_asset_exists():
@@ -90,3 +101,61 @@ def test_window_icon_sets_the_current_window_icon(monkeypatch, tmp_path):
         ("iconphoto", True, icon_object),
     ]
     assert window._flash_icon is icon_object
+
+
+def test_native_window_icon_targets_the_real_windows_top_level(
+    monkeypatch,
+    tmp_path,
+):
+    ico = tmp_path / "flash_icon.ico"
+    ico.write_bytes(b"ico")
+    calls = []
+
+    class FakeApi:
+        def __init__(self, name, result):
+            self.name = name
+            self.result = result
+            self.restype = None
+
+        def __call__(self, *args):
+            calls.append((self.name, args))
+            return self.result
+
+    class FakeUser32:
+        GetParent = FakeApi("GetParent", 222)
+        LoadImageW = FakeApi("LoadImageW", 333)
+        SendMessageW = FakeApi("SendMessageW", 1)
+
+    class FakeWindll:
+        user32 = FakeUser32()
+
+    class FakeWindow:
+        def update_idletasks(self):
+            calls.append(("update_idletasks", ()))
+
+        @staticmethod
+        def winfo_id():
+            return 111
+
+    monkeypatch.setattr(main.sys, "platform", "win32")
+    monkeypatch.setattr(main.ctypes, "windll", FakeWindll(), raising=False)
+    monkeypatch.setattr(main, "resource_path", lambda _path: ico)
+
+    window = FakeWindow()
+    main.apply_windows_native_window_icon(window)
+
+    assert ("GetParent", (111,)) in calls
+    assert (
+        "LoadImageW",
+        (
+            None,
+            str(ico),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_LOADFROMFILE | LR_DEFAULTSIZE,
+        ),
+    ) in calls
+    assert ("SendMessageW", (222, WM_SETICON, ICON_SMALL, 333)) in calls
+    assert ("SendMessageW", (222, WM_SETICON, ICON_BIG, 333)) in calls
+    assert window._flash_native_icon == 333
