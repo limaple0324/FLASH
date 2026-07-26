@@ -127,7 +127,7 @@ function Read-AndVerifyManifest([string[]]$ExpectedPaths) {
     return $manifest
 }
 
-Write-Host "FLASH SP1 release verification" -ForegroundColor Cyan
+Write-Host "FLASH release verification" -ForegroundColor Cyan
 
 Require-File $ExePath
 Require-File $HashPath
@@ -156,8 +156,11 @@ foreach ($requiredKey in @(
     }
 }
 
-if ($buildInfo["product"] -ne "FLASH" -or $buildInfo["milestone"] -ne "SP1") {
-    throw "Release metadata does not describe FLASH SP1."
+if (
+    $buildInfo["product"] -ne "FLASH" -or
+    $buildInfo["milestone"] -notin @("SP1", "SP2")
+) {
+    throw "Release metadata does not describe a supported FLASH milestone."
 }
 if ($buildInfo["version"] -notmatch "^\d+\.\d+\.\d+$") {
     throw "Release version has an invalid format: $($buildInfo['version'])"
@@ -167,8 +170,28 @@ if ($buildInfo["commit"] -notmatch "^[0-9a-fA-F]{40}$") {
 }
 
 $buildKind = $buildInfo["build_kind"]
-if ($buildKind -notin @("sp1_snapshot", "validation_build", "main_release", "sp1_release")) {
+if (
+    $buildKind -notin @(
+        "sp1_snapshot",
+        "sp2_snapshot",
+        "validation_build",
+        "main_release",
+        "sp1_release"
+    )
+) {
     throw "Release build_kind is invalid: $buildKind"
+}
+if (
+    $buildKind -in @("sp1_snapshot", "sp1_release") -and
+    $buildInfo["milestone"] -ne "SP1"
+) {
+    throw "An SP1 delivery must use milestone=SP1."
+}
+if (
+    $buildKind -eq "sp2_snapshot" -and
+    $buildInfo["milestone"] -ne "SP2"
+) {
+    throw "An SP2 delivery must use milestone=SP2."
 }
 
 if ($buildKind -in @("main_release", "sp1_release")) {
@@ -176,6 +199,9 @@ if ($buildKind -in @("main_release", "sp1_release")) {
 }
 elseif ($buildKind -eq "sp1_snapshot") {
     $expectedManifestPaths = @($CommonManifestPaths + "SP1快照說明.txt")
+}
+elseif ($buildKind -eq "sp2_snapshot") {
+    $expectedManifestPaths = @($CommonManifestPaths + "SP1+SP2累積快照說明.txt")
 }
 else {
     $expectedManifestPaths = @($CommonManifestPaths + "分支驗證說明.txt")
@@ -187,7 +213,7 @@ if ($buildInfo["sha256"].ToLowerInvariant() -ne $actualExeHash) {
     throw "BUILD_INFO.txt hash does not match FLASH.exe."
 }
 
-if ($buildKind -in @("sp1_snapshot", "validation_build")) {
+if ($buildKind -in @("sp1_snapshot", "sp2_snapshot", "validation_build")) {
     if ($buildInfo["publish_target"] -ne "none") {
         throw "A non-release build must use publish_target=none."
     }
@@ -217,6 +243,17 @@ if (
     )
 ) {
     throw "An SP1 snapshot must use the dedicated SP1 workflow source identity."
+}
+
+if (
+    $buildKind -eq "sp2_snapshot" -and
+    (
+        $buildInfo["event_name"] -notin @("push", "workflow_dispatch") -or
+        $buildInfo["source_ref"] -ne "refs/heads/sp2/completion-2026-07-26" -or
+        $buildInfo["source_branch"] -ne "sp2/completion-2026-07-26"
+    )
+) {
+    throw "An SP2 snapshot must use the dedicated SP2 workflow source identity."
 }
 
 if ($buildKind -in @("main_release", "sp1_release")) {

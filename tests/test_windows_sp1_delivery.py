@@ -42,7 +42,7 @@ def test_manual_build_is_an_independent_sp1_snapshot():
     workflow = _workflow()
     metadata_step = _step(
         workflow,
-        "Read SP1 delivery metadata",
+        "Read delivery metadata",
         "Build windowed executable",
     )
 
@@ -55,8 +55,9 @@ def test_manual_build_is_an_independent_sp1_snapshot():
     assert "$env:BUILD_PUBLISH_SP1 -ne 'true'" in metadata_step
     assert "elseif ($isSp1Snapshot)" in metadata_step
     assert "$publishTarget = 'none'" in metadata_step
+    assert "$artifactPrefix = 'FLASH-SP1-Windows'" in metadata_step
     assert (
-        '$artifactName = "FLASH-SP1-Windows-$($parts[0])-'
+        '$artifactName = "$artifactPrefix-$($parts[0])-'
         '$shortCommit-$artifactKind"'
     ) in metadata_step
     assert "name: ${{ env.FLASH_ARTIFACT_NAME }}" in workflow
@@ -82,7 +83,7 @@ def test_sp1_snapshot_does_not_include_the_live_updater():
         "Verify release bundle layout",
         "Verify release bundle metadata and hash",
     )
-    assert "SP1 snapshot must not contain a live updater" in verify_layout
+    assert "A snapshot must not contain a live updater" in verify_layout
     assert "'release/更新輔.cmd'" in verify_layout
     assert "'release/輔系統/輔更新核心.ps1'" in verify_layout
     assert "$manifestPaths += 'SP1快照說明.txt'" in create_bundle
@@ -111,7 +112,7 @@ def test_sp1_release_uses_one_verified_push_and_its_own_channel():
     workflow = _workflow()
     metadata_step = _step(
         workflow,
-        "Read SP1 delivery metadata",
+        "Read delivery metadata",
         "Build windowed executable",
     )
 

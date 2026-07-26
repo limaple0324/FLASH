@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - sp1/completion-2026-07-25
+      - sp2/completion-2026-07-26
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -86,7 +87,7 @@ jobs:
             throw 'Source application did not load the window registry.'
           }
 
-      - name: Read SP1 delivery metadata
+      - name: Read delivery metadata
         shell: pwsh
         env:
           BUILD_EVENT_NAME: ${{ github.event_name }}
@@ -106,6 +107,8 @@ jobs:
           )
           $sp1DeliveryBranch = 'sp1/completion-2026-07-25'
           $sp1DeliveryRef = "refs/heads/$sp1DeliveryBranch"
+          $sp2DeliveryBranch = 'sp2/completion-2026-07-26'
+          $sp2DeliveryRef = "refs/heads/$sp2DeliveryBranch"
           $isSp1Snapshot = (
             $env:BUILD_EVENT_NAME -eq 'workflow_dispatch' -and
             $env:BUILD_REF -eq $sp1DeliveryRef -and
@@ -123,6 +126,11 @@ jobs:
             $env:BUILD_REF -eq $sp1DeliveryRef -and
             $env:BUILD_SOURCE_BRANCH -eq $sp1DeliveryBranch
           )
+          $isSp2Snapshot = (
+            $env:BUILD_EVENT_NAME -in @('push', 'workflow_dispatch') -and
+            $env:BUILD_REF -eq $sp2DeliveryRef -and
+            $env:BUILD_SOURCE_BRANCH -eq $sp2DeliveryBranch
+          )
           if ($isMainRelease) {
             $buildKind = 'main_release'
             $publishTarget = 'release/latest'
@@ -138,14 +146,32 @@ jobs:
             $publishTarget = 'none'
             $artifactKind = 'snapshot'
           }
+          elseif ($isSp2Snapshot) {
+            $buildKind = 'sp2_snapshot'
+            $publishTarget = 'none'
+            $artifactKind = 'snapshot'
+          }
           else {
             $buildKind = 'validation_build'
             $publishTarget = 'none'
             $artifactKind = 'validation'
           }
 
+          if ($buildKind -in @('sp1_release', 'sp1_snapshot') -and $parts[1] -ne 'SP1') {
+            throw "SP1 delivery branch must use milestone=SP1."
+          }
+          if ($buildKind -eq 'sp2_snapshot' -and $parts[1] -ne 'SP2') {
+            throw "SP2 delivery branch must use milestone=SP2."
+          }
+
           $shortCommit = $env:GITHUB_SHA.Substring(0, 7)
-          $artifactName = "FLASH-SP1-Windows-$($parts[0])-$shortCommit-$artifactKind"
+          if ($buildKind -eq 'sp2_snapshot') {
+            $artifactPrefix = 'FLASH-SP1+SP2-Windows'
+          }
+          else {
+            $artifactPrefix = 'FLASH-SP1-Windows'
+          }
+          $artifactName = "$artifactPrefix-$($parts[0])-$shortCommit-$artifactKind"
 
           "FLASH_VERSION=$($parts[0])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "FLASH_MILESTONE=$($parts[1])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -245,6 +271,15 @@ jobs:
               '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
             ) | Set-Content 'release/SP1快照說明.txt' -Encoding utf8
           }
+          elseif ($env:FLASH_BUILD_KIND -eq 'sp2_snapshot') {
+            @(
+              '這是 SP1＋SP2 累積工程驗證快照，不是 SP1 單獨成品。'
+              'SP1 獨立成品仍保留，不會被本快照覆蓋。'
+              'SP2 自己的來源範圍、測試與驗收證據位於 deliverables/sp2。'
+              '本快照不包含「更新輔」，不會追蹤 release/latest 或 release/sp1。'
+              '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
+            ) | Set-Content 'release/SP1+SP2累積快照說明.txt' -Encoding utf8
+          }
           else {
             @(
               '這是一般分支驗證包，不是 SP1 獨立成品或正式發布版。'
@@ -308,6 +343,9 @@ jobs:
           }
           elseif ($env:FLASH_BUILD_KIND -eq 'sp1_snapshot') {
             $manifestPaths += 'SP1快照說明.txt'
+          }
+          elseif ($env:FLASH_BUILD_KIND -eq 'sp2_snapshot') {
+            $manifestPaths += 'SP1+SP2累積快照說明.txt'
           }
           else {
             $manifestPaths += '分支驗證說明.txt'
@@ -376,13 +414,18 @@ jobs:
               'release/輔系統/UPDATE_CHANNEL.txt'
             )) {
               if (Test-Path $forbidden) {
-                throw "SP1 snapshot must not contain a live updater: $forbidden"
+                throw "A snapshot must not contain a live updater: $forbidden"
               }
             }
 
             if ($env:FLASH_BUILD_KIND -eq 'sp1_snapshot') {
               if (-not (Test-Path 'release/SP1快照說明.txt' -PathType Leaf)) {
                 throw 'SP1 snapshot notice is missing.'
+              }
+            }
+            elseif ($env:FLASH_BUILD_KIND -eq 'sp2_snapshot') {
+              if (-not (Test-Path 'release/SP1+SP2累積快照說明.txt' -PathType Leaf)) {
+                throw 'SP1+SP2 cumulative snapshot notice is missing.'
               }
             }
             elseif ($env:FLASH_BUILD_KIND -eq 'validation_build') {

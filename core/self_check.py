@@ -1,4 +1,4 @@
-"""Structured SP1 self-checks for local and packaged verification."""
+"""Structured cumulative self-checks for local and packaged verification."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Callable
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.sp1_boundaries import ExternalAdapter, RecoveryBoundary, SmartReconnectBoundary
+from core.version import MILESTONE
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from services.app_context import AppContext
@@ -66,18 +67,18 @@ class SelfCheck:
             raise RuntimeError("ConfigManager is not registered.")
         version = config.get("version", "")
         sprint = config.get("sprint", "")
-        if not version or sprint != "SP1":
-            raise RuntimeError("SP1 configuration is incomplete.")
+        if not version or sprint != MILESTONE:
+            raise RuntimeError(f"{MILESTONE} configuration is incomplete.")
         if config.recovered_from_corruption:
             backup = config.corrupt_backup_path.name if config.corrupt_backup_path else "unknown"
             return f"Configuration was recovered from corruption; backup saved as {backup}."
-        return f"Configuration loaded for SP1 version {version}."
+        return f"Configuration loaded for {MILESTONE} version {version}."
 
     def _check_logger(self) -> str:
         logger = self.context.get(LoggerService)
         if logger is None:
             raise RuntimeError("LoggerService is not registered.")
-        logger.info("FLASH SP1 self-check logger test.")
+        logger.info(f"FLASH {MILESTONE} self-check logger test.")
         if not self.paths.log_file("flash.log").exists():
             raise RuntimeError("Logger did not create flash.log.")
         return "Logger is writable."

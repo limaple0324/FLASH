@@ -1,6 +1,6 @@
-"""Single source of truth for FLASH SP1 release identity."""
+"""Single source of truth for the cumulative FLASH delivery identity."""
 
 PRODUCT_NAME = "FLASH"
-MILESTONE = "SP1"
-VERSION = "0.1.3"
+MILESTONE = "SP2"
+VERSION = "0.2.0"
 DISPLAY_VERSION = f"{MILESTONE} {VERSION}"

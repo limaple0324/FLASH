@@ -1,4 +1,4 @@
-"""FLASH SP1 desktop entrypoint."""
+"""Cumulative FLASH desktop entrypoint."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from core.bootstrap import Bootstrap
 from core.sp1_boundaries import ExternalAdapter, SmartReconnectBoundary
 from core.target_window_observation import TargetWindowObservation
 from core.window_registry import WindowRegistry
+from core.version import MILESTONE
 from core.window_registry_store import WindowRegistryStore
 from domain.character_store import CharacterStore
 from domain.progress_store import ActivityProgressStore
@@ -652,7 +653,7 @@ def run(
 
         window = create_main_window(status, paths)
         window.mainloop()
-        logger.info("FLASH SP1 closed normally.")
+        logger.info(f"FLASH {MILESTONE} closed normally.")
         return 0
     except Exception as exc:
         details = traceback.format_exc()

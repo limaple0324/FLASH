@@ -21,6 +21,8 @@ def _create_bundle(
     *,
     build_kind: str = "sp1_snapshot",
     source_branch: str = "sp1/completion-2026-07-25",
+    milestone: str = "SP1",
+    version: str = "0.1.3",
     publish_target: str = "none",
     event_name: str | None = None,
     source_ref: str | None = None,
@@ -34,22 +36,25 @@ def _create_bundle(
     shutil.copy2(VERIFIER_SOURCE, verifier_path)
 
     executable_path = release_dir / "FLASH.exe"
-    executable_path.write_bytes(b"FLASH SP1 Windows verifier fixture")
+    executable_path.write_bytes(
+        f"FLASH {milestone} Windows verifier fixture".encode()
+    )
     digest = hashlib.sha256(executable_path.read_bytes()).hexdigest()
 
     if event_name is None:
         event_name = "push" if build_kind == "main_release" else "workflow_dispatch"
     if source_ref is None:
-        source_ref = (
-            "refs/heads/main"
-            if build_kind in {"main_release", "validation_build"}
-            else "refs/heads/sp1/completion-2026-07-25"
-        )
+        if build_kind in {"main_release", "validation_build"}:
+            source_ref = "refs/heads/main"
+        elif build_kind == "sp2_snapshot":
+            source_ref = "refs/heads/sp2/completion-2026-07-26"
+        else:
+            source_ref = "refs/heads/sp1/completion-2026-07-25"
 
     build_info = {
         "product": "FLASH",
-        "version": "0.1.2",
-        "milestone": "SP1",
+        "version": version,
+        "milestone": milestone,
         "build_kind": build_kind,
         "event_name": event_name,
         "source_ref": source_ref,
@@ -100,6 +105,11 @@ def _create_bundle(
             "SP1 snapshot fixture\n",
             encoding="utf-8",
         )
+    elif build_kind == "sp2_snapshot":
+        (release_dir / "SP1+SP2累積快照說明.txt").write_text(
+            "SP1+SP2 cumulative snapshot fixture\n",
+            encoding="utf-8",
+        )
     elif build_kind == "validation_build":
         (release_dir / "分支驗證說明.txt").write_text(
             "validation fixture\n",
@@ -140,6 +150,8 @@ def _create_bundle(
         ]
     elif build_kind == "sp1_snapshot":
         manifest_paths.append("SP1快照說明.txt")
+    elif build_kind == "sp2_snapshot":
+        manifest_paths.append("SP1+SP2累積快照說明.txt")
     else:
         manifest_paths.append("分支驗證說明.txt")
 
@@ -184,6 +196,51 @@ def test_no_launch_accepts_an_independent_sp1_snapshot(tmp_path: Path):
 
     assert result.returncode == 0, _output(result)
     assert "NoLaunch was specified" in _output(result)
+
+
+def test_no_launch_accepts_an_sp1_plus_sp2_cumulative_snapshot(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="sp2_snapshot",
+        source_branch="sp2/completion-2026-07-26",
+        milestone="SP2",
+        version="0.2.0",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode == 0, _output(result)
+    assert "NoLaunch was specified" in _output(result)
+
+
+def test_sp2_snapshot_rejects_sp1_milestone_metadata(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="sp2_snapshot",
+        source_branch="sp2/completion-2026-07-26",
+        milestone="SP1",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode != 0
+    assert "SP2 delivery must use milestone=SP2" in _output(result)
+
+
+def test_sp2_snapshot_rejects_a_different_source_identity(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="sp2_snapshot",
+        source_branch="sp2/wrong",
+        source_ref="refs/heads/sp2/wrong",
+        milestone="SP2",
+        version="0.2.0",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode != 0
+    assert "dedicated SP2 workflow source identity" in _output(result)
 
 
 def test_no_launch_accepts_an_sp1_branch_push_snapshot(tmp_path: Path):
