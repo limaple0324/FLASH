@@ -1,3 +1,4 @@
+import base64
 import os
 import shutil
 import subprocess
@@ -93,9 +94,11 @@ def test_complete_installer_verifies_copies_and_creates_one_shortcut(tmp_path: P
             (
                 "$shell=New-Object -ComObject WScript.Shell; "
                 "$shortcut=$shell.CreateShortcut($env:FLASH_TEST_SHORTCUT); "
-                "Write-Output $shortcut.TargetPath; "
-                "Write-Output $shortcut.WorkingDirectory; "
-                "Write-Output $shortcut.IconLocation"
+                "$values=@($shortcut.TargetPath,$shortcut.WorkingDirectory,"
+                "$shortcut.IconLocation); "
+                "foreach($value in $values){ "
+                "[Convert]::ToBase64String("
+                "[Text.Encoding]::UTF8.GetBytes([string]$value)) }"
             ),
         ],
         env=env,
@@ -107,7 +110,9 @@ def test_complete_installer_verifies_copies_and_creates_one_shortcut(tmp_path: P
         errors="replace",
     )
     inspected_lines = tuple(
-        line.strip() for line in inspected.stdout.splitlines() if line.strip()
+        base64.b64decode(line.strip()).decode("utf-8")
+        for line in inspected.stdout.splitlines()
+        if line.strip()
     )
     assert str(install_root / "FLASH.exe") in inspected_lines
     assert str(install_root) in inspected_lines
