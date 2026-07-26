@@ -31,6 +31,7 @@ from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.bootstrap import Bootstrap
 from core.sp1_boundaries import ExternalAdapter, SmartReconnectBoundary
+from core.target_window_observation import TargetWindowObservation
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from domain.character_store import CharacterStore
@@ -48,6 +49,10 @@ from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from services.smart_reconnect_monitor import SmartReconnectMonitor
 from services.soul_stone_service import SoulStoneService
+from services.target_window_state_service import (
+    TARGET_WINDOW_OBSERVED_EVENT,
+    TargetWindowStateService,
+)
 from ui.home import HomeView
 from workspace.service import WorkspaceService
 
@@ -131,6 +136,7 @@ def build_services(root: Path | None = None):
         }
     )
     event_bus = EventBus(logger=logger)
+    target_window_state_service = TargetWindowStateService(event_bus, logger)
     card_display_settings_resolution = resolve_card_display_settings(config.data)
 
     registry_store = WindowRegistryStore(paths.data_dir() / REGISTRY_FILENAME)
@@ -180,6 +186,7 @@ def build_services(root: Path | None = None):
         card_display_settings_resolution,
     )
     AppContext.register(EventBus, event_bus)
+    AppContext.register(TargetWindowStateService, target_window_state_service)
     AppContext.register(WindowRegistryStore, registry_store)
     AppContext.register(WindowRegistry, registry)
     AppContext.register(CharacterStore, character_store)
@@ -359,6 +366,18 @@ def detect_target_window() -> dict[str, object]:
         "message": result.message,
         "details": dict(result.details) if result.details is not None else None,
     }
+
+
+def publish_target_window_observation(
+    detection: dict[str, object],
+) -> TargetWindowObservation:
+    """Publish only the player-safe target-window fact to SP2."""
+    observation = TargetWindowObservation.from_detection(detection)
+    event_bus = AppContext.get(EventBus)
+    if event_bus is None:
+        raise RuntimeError("EventBus is unavailable.")
+    event_bus.publish(TARGET_WINDOW_OBSERVED_EVENT, observation)
+    return observation
 
 
 def detect_background_capabilities() -> dict[str, object]:
@@ -605,6 +624,7 @@ def run(
         status = Bootstrap(context=AppContext).start()
         status["window_registry"] = registry_status()
         status["target_window"] = detect_target_window()
+        publish_target_window_observation(status["target_window"])
         status["background_capabilities"] = detect_background_capabilities()
         config = AppContext.get(ConfigManager)
         status["input_policy"] = (
