@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
-from typing import Iterable, Protocol
+from threading import RLock
+from typing import Callable, Iterable, Protocol
 
 from adapters.windows_launch_fingerprint import (
     LaunchFingerprintResolver,
@@ -101,8 +102,145 @@ class WindowBackend(Protocol):
 class Win32WindowBackend:
     """ctypes-based backend with no third-party Windows dependency."""
 
-    def __init__(self, fingerprint_resolver: LaunchFingerprintResolver | None = None):
+    def __init__(
+        self,
+        fingerprint_resolver: LaunchFingerprintResolver | None = None,
+        *,
+        process_lifecycle_provider: Callable[[int], int | None] | None = None,
+    ):
         self._fingerprint_resolver = fingerprint_resolver
+        self._process_lifecycle_provider = (
+            process_lifecycle_provider
+            or self._process_lifecycle_token
+        )
+        # A fingerprint (including an unresolved ``None``) is trusted only for
+        # one PID creation-time token. Hot input paths reuse this snapshot and
+        # never launch PowerShell again for the same process lifecycle.
+        self._fingerprint_cache: dict[
+            int,
+            tuple[int | None, str | None],
+        ] = {}
+        self._fingerprint_cache_lock = RLock()
+
+    @staticmethod
+    def _process_lifecycle_token(process_id: int) -> int | None:
+        """Return the process creation FILETIME without reading command lines."""
+        if os.name != "nt" or process_id <= 0:
+            return None
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        )
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            int(process_id),
+        )
+        if not handle:
+            return None
+        try:
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            return (
+                int(created.dwHighDateTime) << 32
+            ) | int(created.dwLowDateTime)
+        except OSError:
+            return None
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def invalidate_identity_cache(self) -> None:
+        """Forget lifecycle snapshots only at an explicit configuration gate."""
+        with self._fingerprint_cache_lock:
+            self._fingerprint_cache.clear()
+
+    def _resolve_cached_fingerprints(
+        self,
+        process_ids: Iterable[int],
+    ) -> dict[int, str]:
+        if self._fingerprint_resolver is None:
+            return {}
+        normalized_ids = tuple(
+            dict.fromkeys(
+                process_id
+                for process_id in process_ids
+                if isinstance(process_id, int)
+                and not isinstance(process_id, bool)
+                and process_id > 0
+            )
+        )
+        with self._fingerprint_cache_lock:
+            unresolved: dict[int, int] = {}
+            for process_id in normalized_ids:
+                cached = self._fingerprint_cache.get(process_id)
+                if cached is not None and cached[0] is None:
+                    # A lifecycle token that could not be proven stays unknown
+                    # until an explicit cache invalidation.
+                    continue
+                try:
+                    lifecycle = self._process_lifecycle_provider(
+                        process_id
+                    )
+                except Exception:
+                    lifecycle = None
+                if lifecycle is None:
+                    self._fingerprint_cache[process_id] = (None, None)
+                    continue
+                if cached is not None and cached[0] == lifecycle:
+                    continue
+                unresolved[process_id] = lifecycle
+
+            if unresolved:
+                try:
+                    resolved = self._fingerprint_resolver.resolve(
+                        unresolved
+                    )
+                except Exception:
+                    resolved = {}
+                for process_id, lifecycle in unresolved.items():
+                    self._fingerprint_cache[process_id] = (
+                        lifecycle,
+                        normalize_launch_fingerprint(
+                            resolved.get(process_id)
+                        ),
+                    )
+
+            return {
+                process_id: fingerprint
+                for process_id in normalized_ids
+                if (
+                    (cached := self._fingerprint_cache.get(process_id))
+                    is not None
+                    and (fingerprint := cached[1]) is not None
+                )
+            }
 
     @staticmethod
     def _user32():
@@ -182,7 +320,7 @@ class Win32WindowBackend:
         if not user32.EnumWindows(enum_proc_type(callback), 0):
             return []
         if self._fingerprint_resolver is not None:
-            fingerprints = self._fingerprint_resolver.resolve(
+            fingerprints = self._resolve_cached_fingerprints(
                 window.process_id
                 for window in windows
                 if window.process_id is not None

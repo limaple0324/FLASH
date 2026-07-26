@@ -239,6 +239,7 @@ class ScreenRecognition:
     character_importance: CharacterImportance | None = None
     character_slot_index: int | None = None
     character_slot_selected: bool | None = None
+    character_identity: str | None = None
     battle_context: bool = False
 
     @property
@@ -415,7 +416,10 @@ class ReferenceScreenRecognizer:
         )
         return float(ImageStat.Stat(difference).mean[0])
 
-    def _route_digit_crop(self, candidate: Image.Image) -> Image.Image:
+    def _route_digit_crop(
+        self,
+        candidate: Image.Image,
+    ) -> Image.Image | None:
         route_definition = next(
             definition
             for definition in self.definitions
@@ -468,10 +472,10 @@ class ReferenceScreenRecognizer:
                     )
                 )
         if not matches:
-            return self._crop(candidate, ROUTE_DIGIT_REGION)
+            return None
         prefix_score, left, top = min(matches)
         if prefix_score > 30.0:
-            return self._crop(candidate, ROUTE_DIGIT_REGION)
+            return None
 
         reference_prefix_left = round(
             route_reference.width * ROUTE_PREFIX_REFERENCE_REGION[0]
@@ -518,9 +522,10 @@ class ReferenceScreenRecognizer:
         self,
         candidate: Image.Image,
     ) -> tuple[int | None, float | None]:
-        candidate_signature = self._digit_signature(
-            self._route_digit_crop(candidate)
-        )
+        digit_crop = self._route_digit_crop(candidate)
+        if digit_crop is None:
+            return None, None
+        candidate_signature = self._digit_signature(digit_crop)
         if candidate_signature is None:
             return None, None
         scores: list[tuple[float, int]] = []
@@ -811,7 +816,14 @@ class ReferenceScreenRecognizer:
             candidate,
             disconnected_reference,
         )
-        if disconnected_score <= 42.0:
+        candidate_ratio = candidate.width / candidate.height
+        disconnected_ratio = (
+            disconnected_reference.width / disconnected_reference.height
+        )
+        if (
+            abs(candidate_ratio - disconnected_ratio) <= 0.12
+            and disconnected_score <= disconnected.maximum_score
+        ):
             return ScreenRecognition(
                 state=ReconnectScreenState.DISCONNECTED,
                 score=round(disconnected_score, 3),

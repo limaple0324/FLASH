@@ -4,6 +4,7 @@ from adapters.windows_input_sync import (
     WindowInputPolicy,
     WindowsInputSyncController,
 )
+from adapters.windows_pointer_sync import WindowsPointerSyncController
 from adapters.windows_smart_reconnect import WindowsSmartReconnectController
 from config.config_manager import ConfigManager
 from core.sp1_boundaries import SmartReconnectBoundary
@@ -15,6 +16,7 @@ from main import (
 )
 from services.app_context import AppContext
 from services.smart_reconnect_monitor import SmartReconnectMonitor
+from services.group_role_status_service import GroupRoleStatusService
 
 
 def test_build_services_registers_input_controller_and_safe_default(tmp_path):
@@ -35,6 +37,17 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     assert isinstance(reconnect_monitor, SmartReconnectMonitor)
 
 
+def test_sync_services_share_one_lifecycle_identity_snapshot(tmp_path):
+    build_services(root=tmp_path)
+
+    keyboard = AppContext.get(WindowsInputSyncController)
+    pointer = AppContext.get(WindowsPointerSyncController)
+    statuses = AppContext.get(GroupRoleStatusService)
+
+    assert keyboard._window_backend is pointer._window_backend
+    assert keyboard._window_backend is statuses._window_backend
+
+
 def test_home_exposes_three_policies_and_complete_confirmed_shortcuts():
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
@@ -45,6 +58,22 @@ def test_home_exposes_three_policies_and_complete_confirmed_shortcuts():
     assert "停止同步視窗" in source
     assert "CONFIRMED_GAME_SHORTCUTS" in source
     assert "測試 B" not in source
+
+
+def test_group_member_continuous_click_never_falls_back_to_one_window():
+    source = Path("main.py").read_text(encoding="utf-8")
+
+    assert "block_physical_fallback=lambda source:" in source
+    assert (
+        "pointer_sync_controller.source_must_block_physical_fallback("
+        in source
+    )
+
+
+def test_group_change_and_group_edit_stop_continuous_click_immediately():
+    source = Path("main.py").read_text(encoding="utf-8")
+
+    assert source.count("auto_click_service.stop()") >= 2
 
 
 def test_input_verifier_has_a_bounded_delay_for_real_foreground_testing():

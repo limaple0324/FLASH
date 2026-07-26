@@ -62,9 +62,22 @@ class SmartReconnectMonitor:
         signature = self._signature(result)
         if self._logger is not None and signature != self._last_signature:
             details = result.details or {}
+            state_counts = details.get("state_counts", {})
+            safe_states = (
+                ",".join(
+                    f"{state}:{count}"
+                    for state, count in sorted(state_counts.items())
+                    if isinstance(state, str)
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                )
+                if isinstance(state_counts, dict)
+                else ""
+            )
             self._logger.info(
                 "Smart reconnect state changed; "
                 f"code={result.code}; "
+                f"states={safe_states or 'none'}; "
                 f"connected={details.get('connected_windows', 0)}; "
                 f"actionable={details.get('actionable_windows', 0)}; "
                 f"clicked={details.get('clicked_windows', 0)}; "

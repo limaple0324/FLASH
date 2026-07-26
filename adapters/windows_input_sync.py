@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import os
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from ctypes import wintypes
+from time import perf_counter_ns
 from typing import Callable, Iterable, Mapping, Protocol
 
 from adapters.windows_launch_fingerprint import (
@@ -254,6 +256,10 @@ class InputSyncResult:
     skipped_windows: int
     execution_requested: bool
     failure_codes: tuple[str, ...]
+    controller_elapsed_ns: int = 0
+    preflight_elapsed_ns: int = 0
+    dispatch_spread_ns: int = 0
+    queue_wait_ns: int = 0
 
     @property
     def passed(self) -> bool:
@@ -290,6 +296,16 @@ class InputSyncResult:
             "execution_requested": self.execution_requested,
             "partial_delivery": 0 < self.sent_windows < self.eligible_windows,
             "failure_codes": list(self.failure_codes),
+            "controller_elapsed_ns": self.controller_elapsed_ns,
+            "preflight_elapsed_ns": self.preflight_elapsed_ns,
+            "dispatch_spread_ns": self.dispatch_spread_ns,
+            "queue_wait_ns": self.queue_wait_ns,
+            "controller_elapsed_ms": self.controller_elapsed_ns / 1_000_000,
+            "preflight_elapsed_ms": self.preflight_elapsed_ns / 1_000_000,
+            "dispatch_spread_ms": self.dispatch_spread_ns / 1_000_000,
+            "queue_wait_ms": self.queue_wait_ns / 1_000_000,
+            "timing_scope": "controller_postmessage_scheduling_only",
+            "game_receipt_verified": False,
             "raw_arguments_emitted": False,
             "fingerprints_emitted": False,
             "input_sent": self.sent_windows > 0,
@@ -331,7 +347,8 @@ class WindowsInputSyncController:
         self._window_backend = window_backend
         self._message_backend = message_backend
         self._preflight_timeout_ms = max(1, int(preflight_timeout_ms))
-        self._allowed_fingerprints: frozenset[str] | None = None
+        self._allowed_fingerprints: tuple[str, ...] | None = None
+        self._allowed_fingerprint_set: frozenset[str] | None = None
         self._conflict_arbiter = conflict_arbiter
         self._deferred_service = deferred_service
         self._reconnecting_provider = reconnecting_provider or (lambda: ())
@@ -376,6 +393,7 @@ class WindowsInputSyncController:
     ) -> None:
         if fingerprints is None:
             self._allowed_fingerprints = None
+            self._allowed_fingerprint_set = None
             return
         normalized = tuple(
             normalize_launch_fingerprint(item)
@@ -389,7 +407,13 @@ class WindowsInputSyncController:
             raise ValueError(
                 "fingerprints must contain unique complete SHA-256 digests"
             )
-        self._allowed_fingerprints = frozenset(normalized)
+        ordered = (
+            tuple(sorted(normalized))
+            if isinstance(fingerprints, (set, frozenset))
+            else normalized
+        )
+        self._allowed_fingerprints = ordered
+        self._allowed_fingerprint_set = frozenset(ordered)
 
     @classmethod
     def for_real_windows(
@@ -406,12 +430,16 @@ class WindowsInputSyncController:
         screen_state_provider: (
             Callable[[str], ReconnectScreenState | None] | None
         ) = None,
+        window_backend: WindowBackend | None = None,
     ) -> "WindowsInputSyncController":
         return cls(
             expected_windows=expected_windows,
             title_keywords=title_keywords,
-            window_backend=Win32WindowBackend(
-                PowerShellLaunchFingerprintResolver()
+            window_backend=(
+                window_backend
+                or Win32WindowBackend(
+                    PowerShellLaunchFingerprintResolver()
+                )
             ),
             message_backend=Win32KeyMessageBackend(),
             conflict_arbiter=conflict_arbiter,
@@ -505,15 +533,78 @@ class WindowsInputSyncController:
                 lease.release()
 
     def _matching_windows(self) -> tuple[WindowInfo, ...]:
-        return tuple(
+        windows = tuple(
             window
             for window in self._window_backend.list_windows()
             if all(keyword in window.title.casefold() for keyword in self._keywords)
             and (
-                self._allowed_fingerprints is None
+                self._allowed_fingerprint_set is None
                 or normalize_launch_fingerprint(window.launch_fingerprint)
-                in self._allowed_fingerprints
+                in self._allowed_fingerprint_set
             )
+        )
+        order = (
+            {
+                fingerprint: index
+                for index, fingerprint in enumerate(
+                    self._allowed_fingerprints
+                )
+            }
+            if self._allowed_fingerprints is not None
+            else None
+        )
+        return tuple(
+            sorted(
+                windows,
+                key=lambda window: (
+                    order.get(
+                        normalize_launch_fingerprint(
+                            window.launch_fingerprint
+                        ),
+                        len(order),
+                    )
+                    if order is not None
+                    else 0,
+                    normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    )
+                    or "",
+                    window.process_id or 0,
+                ),
+            )
+        )
+
+    def _responsive_targets(
+        self,
+        targets: tuple[WindowInfo, ...],
+    ) -> tuple[WindowInfo, ...]:
+        """Probe larger batches concurrently while preserving target order."""
+        if len(targets) < 4:
+            states = tuple(
+                self._message_backend.probe_responsive(
+                    window.handle,
+                    self._preflight_timeout_ms,
+                )
+                for window in targets
+            )
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(14, len(targets)),
+                thread_name_prefix="flash-key-preflight",
+            ) as executor:
+                states = tuple(
+                    executor.map(
+                        lambda window: self._message_backend.probe_responsive(
+                            window.handle,
+                            self._preflight_timeout_ms,
+                        ),
+                        targets,
+                    )
+                )
+        return tuple(
+            window
+            for window, responsive in zip(targets, states)
+            if responsive
         )
 
     def _all_title_matching_windows(self) -> tuple[WindowInfo, ...]:
@@ -537,23 +628,49 @@ class WindowsInputSyncController:
         sent: int = 0,
         execute: bool,
         failures: Iterable[str] = (),
+        controller_started_ns: int | None = None,
+        preflight_elapsed_ns: int = 0,
+        dispatch_spread_ns: int = 0,
+        queue_wait_ns: int = 0,
+        eligible_count: int | None = None,
     ) -> InputSyncResult:
         foreground = self._window_backend.foreground_handle()
+        controller_elapsed_ns = (
+            max(0, perf_counter_ns() - controller_started_ns)
+            if controller_started_ns is not None
+            else 0
+        )
         return InputSyncResult(
             approved_key=key,
             policy=policy.value if policy is not None else None,
             expected_windows=self._expected_windows,
             discovered_windows=len(windows),
-            eligible_windows=len(eligible),
+            eligible_windows=(
+                len(eligible)
+                if eligible_count is None
+                else max(0, int(eligible_count))
+            ),
             responsive_windows=responsive,
             sent_windows=sent,
             minimized_windows=sum(window.minimized for window in windows),
             background_windows=sum(
                 window.handle != foreground for window in windows
             ),
-            skipped_windows=max(0, len(windows) - len(eligible)),
+            skipped_windows=max(
+                0,
+                len(windows)
+                - (
+                    len(eligible)
+                    if eligible_count is None
+                    else max(0, int(eligible_count))
+                ),
+            ),
             execution_requested=execute,
             failure_codes=tuple(dict.fromkeys(failures)),
+            controller_elapsed_ns=controller_elapsed_ns,
+            preflight_elapsed_ns=max(0, preflight_elapsed_ns),
+            dispatch_spread_ns=max(0, dispatch_spread_ns),
+            queue_wait_ns=max(0, queue_wait_ns),
         )
 
     def send_approved_key(
@@ -563,7 +680,10 @@ class WindowsInputSyncController:
         policy: object,
         execute: bool = False,
         exclude_foreground: bool = False,
+        source_handle: int | None = None,
+        execution_guard: Callable[[], bool] | None = None,
     ) -> InputSyncResult:
+        controller_started_ns = perf_counter_ns()
         normalized_key = normalize_approved_key(key)
         normalized_policy = normalize_input_policy(policy)
         windows = self._matching_windows()
@@ -575,107 +695,107 @@ class WindowsInputSyncController:
             if (fingerprint := normalize_launch_fingerprint(value)) is not None
         }
         foreground = self._window_backend.foreground_handle()
+        captured_source = (
+            source_handle
+            if (
+                isinstance(source_handle, int)
+                and not isinstance(source_handle, bool)
+                and source_handle > 0
+            )
+            else foreground
+        )
         matching_handles = {window.handle for window in windows}
-        if execute and foreground not in matching_handles:
+        if execute and captured_source not in matching_handles:
             return self._base_result(
                 key=normalized_key,
                 policy=normalized_policy,
                 windows=windows,
                 execute=True,
                 failures=("foreground_not_in_group",),
+                controller_started_ns=controller_started_ns,
             )
-        group_reconnecting = (
-            bool(reconnecting & self._allowed_fingerprints)
-            if self._allowed_fingerprints is not None
-            else bool(reconnecting)
-        )
-        if (
-            execute
-            and group_reconnecting
-            and normalized_key is not None
-            and normalized_policy is not None
-            and self._deferred_service is not None
-            and self._allowed_fingerprints is not None
-        ):
-            foreground_fingerprint = next(
-                (
-                    normalize_launch_fingerprint(
-                        window.launch_fingerprint
-                    )
-                    for window in windows
-                    if window.handle == foreground
-                ),
-                None,
-            )
-            targets = tuple(
-                fingerprint
-                for fingerprint in self._allowed_fingerprints
-                if not (
-                    exclude_foreground
-                    and fingerprint == foreground_fingerprint
-                )
-            )
-            for fingerprint in targets:
-                self._deferred_service.enqueue(
-                    fingerprint,
-                    f"key:{normalized_key}",
-                    kind="keyboard",
-                    payload={"key": normalized_key},
-                )
-                self._record_role_operation(
-                    fingerprint,
-                    f"快捷鍵 {normalized_key}",
-                    "全組等待重連後補做",
-                )
-            return InputSyncResult(
-                approved_key=normalized_key,
-                policy=normalized_policy.value,
-                expected_windows=self._expected_windows,
-                discovered_windows=len(windows),
-                eligible_windows=len(targets),
-                responsive_windows=0,
-                sent_windows=0,
-                minimized_windows=sum(
-                    window.minimized for window in windows
-                ),
-                background_windows=sum(
-                    window.handle != foreground for window in windows
-                ),
-                skipped_windows=0,
-                execution_requested=True,
-                failure_codes=("sync_group_deferred_reconnect",),
-            )
-
         if normalized_key is None:
             failures.append("key_not_approved")
         if normalized_policy is None:
             failures.append("input_policy_invalid")
-        if len(windows) != self._expected_windows:
-            failures.append("window_count_mismatch")
-
         process_ids = [
             window.process_id
             for window in windows
-            if isinstance(window.process_id, int) and window.process_id > 0
+            if isinstance(window.process_id, int)
+            and not isinstance(window.process_id, bool)
+            and window.process_id > 0
         ]
-        if (
+        process_identity_valid = not (
             len(process_ids) != len(windows)
             or len(set(process_ids)) != len(process_ids)
-        ):
+        )
+        if not process_identity_valid:
             failures.append("process_identity_missing_or_duplicate")
 
         fingerprints = [
             normalize_launch_fingerprint(window.launch_fingerprint)
             for window in windows
         ]
-        if (
+        fingerprint_identity_valid = not (
             any(fingerprint is None for fingerprint in fingerprints)
             or len(set(fingerprints)) != len(fingerprints)
-        ):
+        )
+        if not fingerprint_identity_valid:
             failures.append("fingerprint_missing_or_duplicate")
+        visible_fingerprint_set = (
+            set(fingerprints)
+            if fingerprint_identity_valid
+            else set()
+        )
+        missing_allowed = (
+            tuple(
+                fingerprint
+                for fingerprint in self._allowed_fingerprints
+                if fingerprint not in visible_fingerprint_set
+            )
+            if self._allowed_fingerprints is not None
+            else ()
+        )
+        partial_reconnect_candidate = (
+            process_identity_valid
+            and fingerprint_identity_valid
+            and self._allowed_fingerprints is not None
+            and self._allowed_fingerprint_set is not None
+            and len(self._allowed_fingerprints)
+            == self._expected_windows
+            and bool(missing_allowed)
+            and len(windows) + len(missing_allowed)
+            == self._expected_windows
+            and visible_fingerprint_set
+            <= self._allowed_fingerprint_set
+            and set(missing_allowed) <= reconnecting
+        )
+        unresolved_title_identity = False
+        if partial_reconnect_candidate:
+            unresolved_title_identity = any(
+                not isinstance(window.process_id, int)
+                or isinstance(window.process_id, bool)
+                or window.process_id <= 0
+                or normalize_launch_fingerprint(
+                    window.launch_fingerprint
+                )
+                is None
+                for window in self._all_title_matching_windows()
+            )
+        safe_partial_reconnect = (
+            partial_reconnect_candidate
+            and not unresolved_title_identity
+        )
+        if (
+            len(windows) != self._expected_windows
+            and not safe_partial_reconnect
+        ):
+            failures.append("window_count_mismatch")
         if (
             self._allowed_fingerprints is not None
-            and set(fingerprints) != set(self._allowed_fingerprints)
+            and visible_fingerprint_set
+            != self._allowed_fingerprint_set
+            and not safe_partial_reconnect
         ):
             failures.append("group_identity_set_mismatch")
 
@@ -686,13 +806,16 @@ class WindowsInputSyncController:
                 windows=windows,
                 execute=execute,
                 failures=failures,
+                controller_started_ns=controller_started_ns,
             )
 
-        if exclude_foreground and foreground not in matching_handles:
+        if exclude_foreground and captured_source not in matching_handles:
             failures.append("foreground_not_in_group")
         if normalized_policy is WindowInputPolicy.FOREGROUND_ONLY:
             eligible = tuple(
-                window for window in windows if window.handle == foreground
+                window
+                for window in windows
+                if window.handle == captured_source
             )
             if not eligible:
                 failures.append("foreground_not_in_group")
@@ -703,28 +826,132 @@ class WindowsInputSyncController:
 
         if exclude_foreground:
             eligible = tuple(
-                window for window in eligible if window.handle != foreground
+                window
+                for window in eligible
+                if window.handle != captured_source
+            )
+
+        group_reconnecting = (
+            bool(reconnecting & self._allowed_fingerprint_set)
+            if self._allowed_fingerprint_set is not None
+            else bool(reconnecting)
+        )
+        if (
+            not failures
+            and execute
+            and group_reconnecting
+            and normalized_key is not None
+            and normalized_policy is not None
+            and self._deferred_service is not None
+            and self._allowed_fingerprints is not None
+        ):
+            source_fingerprint = next(
+                (
+                    normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    )
+                    for window in windows
+                    if window.handle == captured_source
+                ),
+                None,
+            )
+            visible_background = {
+                normalize_launch_fingerprint(
+                    window.launch_fingerprint
+                )
+                for window in windows
+                if not window.minimized
+            }
+            if normalized_policy is WindowInputPolicy.FOREGROUND_ONLY:
+                candidates = (
+                    (source_fingerprint,)
+                    if source_fingerprint is not None
+                    else ()
+                )
+            elif (
+                normalized_policy
+                is WindowInputPolicy.FOREGROUND_BACKGROUND
+            ):
+                candidate_set = (
+                    visible_background | set(missing_allowed)
+                )
+                candidates = tuple(
+                    fingerprint
+                    for fingerprint in self._allowed_fingerprints
+                    if fingerprint in candidate_set
+                )
+            else:
+                candidates = self._allowed_fingerprints
+            targets = tuple(
+                fingerprint
+                for fingerprint in candidates
+                if not (
+                    exclude_foreground
+                    and fingerprint == source_fingerprint
+                )
+            )
+            if not targets:
+                return self._base_result(
+                    key=normalized_key,
+                    policy=normalized_policy,
+                    windows=windows,
+                    eligible=eligible,
+                    execute=True,
+                    failures=("no_eligible_windows",),
+                    controller_started_ns=controller_started_ns,
+                )
+            for fingerprint in targets:
+                self._deferred_service.enqueue(
+                    fingerprint,
+                    f"key:{normalized_key}",
+                    kind="keyboard",
+                    payload={
+                        "key": normalized_key,
+                        "policy": normalized_policy.value,
+                        "source_eligible_at_capture": True,
+                    },
+                )
+                self._record_role_operation(
+                    fingerprint,
+                    f"快捷鍵 {normalized_key}",
+                    "全組等待重連後補做",
+                )
+            return self._base_result(
+                key=normalized_key,
+                policy=normalized_policy,
+                windows=windows,
+                eligible=eligible,
+                execute=True,
+                failures=("sync_group_deferred_reconnect",),
+                controller_started_ns=controller_started_ns,
+                eligible_count=len(targets),
             )
 
         if not eligible:
-            failures.append("no_eligible_windows")
+            return self._base_result(
+                key=normalized_key,
+                policy=normalized_policy,
+                windows=windows,
+                eligible=eligible,
+                execute=execute,
+                failures=("no_eligible_windows",),
+                controller_started_ns=controller_started_ns,
+            )
 
-        valid_targets = [
+        preflight_started_ns = perf_counter_ns()
+        valid_targets = tuple(
             window
             for window in eligible
             if self._message_backend.is_window(window.handle)
-        ]
+        )
         if len(valid_targets) != len(eligible):
             failures.append("input_target_invalid")
 
-        responsive_targets = [
-            window
-            for window in valid_targets
-            if self._message_backend.probe_responsive(
-                window.handle,
-                self._preflight_timeout_ms,
-            )
-        ]
+        responsive_targets = self._responsive_targets(valid_targets)
+        preflight_elapsed_ns = max(
+            0,
+            perf_counter_ns() - preflight_started_ns,
+        )
         if len(responsive_targets) != len(eligible):
             failures.append("input_target_unresponsive")
 
@@ -737,6 +964,8 @@ class WindowsInputSyncController:
                 responsive=len(responsive_targets),
                 execute=execute,
                 failures=failures,
+                controller_started_ns=controller_started_ns,
+                preflight_elapsed_ns=preflight_elapsed_ns,
             )
 
         if not execute:
@@ -747,12 +976,16 @@ class WindowsInputSyncController:
                 eligible=eligible,
                 responsive=len(responsive_targets),
                 execute=False,
+                controller_started_ns=controller_started_ns,
+                preflight_elapsed_ns=preflight_elapsed_ns,
             )
 
         virtual_keys = VIRTUAL_KEY_SEQUENCES[normalized_key]
         sent = 0
         deferred = 0
         reconnecting = reconnecting
+        dispatch_first_ns: int | None = None
+        dispatch_last_ns: int | None = None
         for window in responsive_targets:
             fingerprint = normalize_launch_fingerprint(
                 window.launch_fingerprint
@@ -789,6 +1022,18 @@ class WindowsInputSyncController:
                 continue
             try:
                 try:
+                    if execution_guard is not None:
+                        try:
+                            execution_allowed = bool(execution_guard())
+                        except Exception:
+                            execution_allowed = False
+                        if not execution_allowed:
+                            failures.append("execution_stopped")
+                            break
+                    dispatch_started_ns = perf_counter_ns()
+                    if dispatch_first_ns is None:
+                        dispatch_first_ns = dispatch_started_ns
+                    dispatch_last_ns = dispatch_started_ns
                     if len(virtual_keys) == 1:
                         delivered = self._message_backend.send_virtual_key(
                             window.handle,
@@ -815,6 +1060,14 @@ class WindowsInputSyncController:
                     lease.release()
         if sent + deferred != len(eligible):
             failures.append("input_delivery_failed")
+        dispatch_spread_ns = (
+            max(0, dispatch_last_ns - dispatch_first_ns)
+            if (
+                dispatch_first_ns is not None
+                and dispatch_last_ns is not None
+            )
+            else 0
+        )
 
         return self._base_result(
             key=normalized_key,
@@ -825,4 +1078,7 @@ class WindowsInputSyncController:
             sent=sent,
             execute=True,
             failures=failures,
+            controller_started_ns=controller_started_ns,
+            preflight_elapsed_ns=preflight_elapsed_ns,
+            dispatch_spread_ns=dispatch_spread_ns,
         )

@@ -76,6 +76,33 @@ def _config(tmp_path, groups):
     return path
 
 
+def _layout_config(tmp_path, group_name, names):
+    path = tmp_path / "legacy-layout.json"
+    payload = {
+        "groups": [
+            {
+                "name": group_name,
+                "launch_entries": [
+                    {
+                        "path": str(tmp_path / f"{name}.lnk"),
+                        "x": -2000 + index,
+                        "y": 100 + index,
+                        "width": 916,
+                        "height": 629,
+                        "delay_ms": index * 100,
+                    }
+                    for index, name in enumerate(names)
+                ],
+            }
+        ]
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_confirmed_14_group_uses_player_order_and_exact_alias(tmp_path):
     resolver = _Resolver()
     service = GroupLaunchService(
@@ -143,3 +170,65 @@ def test_plan_lookup_requires_one_complete_fingerprint(tmp_path):
 
     assert plan.target_for_fingerprint(f"{1:064x}") is plan.targets[0]
     assert plan.target_for_fingerprint("bad") is None
+
+
+def test_plan_reads_saved_layout_from_legacy_without_modifying_it(tmp_path):
+    names = ("120古", "120靈")
+    current = _config(tmp_path, [("120", names)])
+    legacy = _layout_config(tmp_path, "120", names)
+    before = legacy.read_bytes()
+
+    plan = GroupLaunchService(
+        current,
+        _Resolver(),
+        legacy_layout_config_path=legacy,
+    ).plan("120")
+
+    assert plan.ready is True
+    assert plan.targets[0].placement is not None
+    assert (
+        plan.targets[0].placement.x,
+        plan.targets[0].placement.y,
+        plan.targets[0].placement.width,
+        plan.targets[0].placement.height,
+        plan.targets[0].placement.delay_ms,
+    ) == (-2000, 100, 916, 629, 0)
+    assert plan.targets[1].placement.delay_ms == 100
+    assert legacy.read_bytes() == before
+
+
+def test_new_owned_layout_overrides_legacy_after_player_records_again(
+    tmp_path,
+):
+    names = ("120古",)
+    current = _config(tmp_path, [("120", names)])
+    current_payload = json.loads(current.read_text(encoding="utf-8"))
+    current_payload["groups"][0]["launch_entries"][0].update(
+        {
+            "x": 321,
+            "y": 654,
+            "width": 900,
+            "height": 600,
+            "delay_ms": 50,
+        }
+    )
+    current.write_text(
+        json.dumps(current_payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    legacy = _layout_config(tmp_path, "120", names)
+
+    plan = GroupLaunchService(
+        current,
+        _Resolver(),
+        legacy_layout_config_path=legacy,
+    ).plan("120")
+
+    assert plan.targets[0].placement is not None
+    assert (
+        plan.targets[0].placement.x,
+        plan.targets[0].placement.y,
+        plan.targets[0].placement.width,
+        plan.targets[0].placement.height,
+        plan.targets[0].placement.delay_ms,
+    ) == (321, 654, 900, 600, 50)

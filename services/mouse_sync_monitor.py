@@ -5,8 +5,10 @@ from __future__ import annotations
 import ctypes
 import os
 import threading
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 from ctypes import wintypes
+from time import perf_counter_ns
 from typing import Callable, Protocol
 
 from adapters.windows_pointer_sync import (
@@ -81,7 +83,7 @@ class MouseSyncMonitor:
         cancel: Callable[[object], None],
         state_backend: MouseStateBackend | None = None,
         result_callback: Callable[[PointerSyncResult], None] | None = None,
-        interval_ms: int = 10,
+        interval_ms: int = 2,
     ) -> None:
         self._controller = controller
         self._policy_provider = policy_provider
@@ -89,26 +91,44 @@ class MouseSyncMonitor:
         self._cancel = cancel
         self._state_backend = state_backend or Win32MouseStateBackend()
         self._result_callback = result_callback
-        self._interval_ms = max(5, int(interval_ms))
+        self._interval_ms = max(1, int(interval_ms))
         self._enabled = False
         self._after_id: object | None = None
         self._previous: MouseSample | None = None
-        self._busy = False
-        self._lock = threading.Lock()
+        self._queue: deque[
+            tuple[int, MouseSample, str, object, int]
+        ] = deque()
+        self._worker_running = False
+        self._queue_lock = threading.Lock()
+        self._generation = 0
+        self._release_pending_generation: int | None = None
+        self._active_event: str | None = None
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
     def start(self) -> None:
-        if self._enabled:
-            return
-        self._enabled = True
+        with self._queue_lock:
+            if self._enabled:
+                return
+            self._enabled = True
+            self._generation += 1
+            self._release_pending_generation = None
+            self._active_event = None
         self._previous = None
         self._schedule_next()
 
     def stop(self) -> None:
-        self._enabled = False
+        with self._queue_lock:
+            self._enabled = False
+            self._generation += 1
+            self._queue.clear()
+            self._release_pending_generation = None
+        try:
+            self._controller.release_pressed_targets()
+        except Exception:
+            pass
         if self._after_id is not None:
             try:
                 self._cancel(self._after_id)
@@ -159,32 +179,166 @@ class MouseSyncMonitor:
             self._schedule_next()
 
     def _dispatch(self, sample: MouseSample, event: str) -> None:
-        with self._lock:
-            if self._busy:
+        try:
+            policy = self._policy_provider()
+        except Exception:
+            return
+        start_worker = False
+        immediate_release = False
+        item = None
+        with self._queue_lock:
+            if not self._enabled:
                 return
-            self._busy = True
+            item = (
+                self._generation,
+                sample,
+                event,
+                policy,
+                perf_counter_ns(),
+            )
+            if event == "move":
+                if (
+                    self._queue
+                    and self._queue[-1][0] == self._generation
+                    and self._queue[-1][2] == "move"
+                ):
+                    self._queue[-1] = item
+                else:
+                    self._queue.append(item)
+            elif event == "left_up":
+                self._release_pending_generation = self._generation
+                self._queue = deque(
+                    queued
+                    for queued in self._queue
+                    if not (
+                        queued[0] == self._generation
+                        and queued[2] == "move"
+                    )
+                )
+                immediate_release = self._active_event == "move"
+                if not immediate_release:
+                    self._queue.append(item)
+            else:
+                self._queue.append(item)
+            if self._queue and not self._worker_running:
+                self._worker_running = True
+                start_worker = True
 
-        def worker() -> None:
+        if immediate_release:
             try:
+                self._controller.release_pressed_targets()
+                still_pressed = bool(
+                    self._controller.has_pressed_targets()
+                )
+            except Exception:
+                still_pressed = True
+            if still_pressed and item is not None:
+                with self._queue_lock:
+                    if (
+                        self._enabled
+                        and self._generation == item[0]
+                    ):
+                        self._queue.appendleft(item)
+                        if not self._worker_running:
+                            self._worker_running = True
+                            start_worker = True
+
+        if start_worker:
+            threading.Thread(
+                target=self._drain_queue,
+                name="FLASH-MouseSync",
+                daemon=True,
+            ).start()
+
+    def _drain_queue(self) -> None:
+        while True:
+            with self._queue_lock:
+                if not self._queue:
+                    self._worker_running = False
+                    return
+                (
+                    generation,
+                    sample,
+                    event,
+                    policy,
+                    queued_at_ns,
+                ) = self._queue.popleft()
+                self._active_event = event
+            if not self._execution_allowed(generation):
+                with self._queue_lock:
+                    self._active_event = None
+                continue
+            try:
+                queue_wait_ns = max(
+                    0,
+                    perf_counter_ns() - queued_at_ns,
+                )
                 result = self._controller.send(
                     source_handle=sample.source_handle,
                     x_ratio=sample.x_ratio,
                     y_ratio=sample.y_ratio,
                     event=event,
-                    policy=self._policy_provider(),
+                    policy=policy,
                     execute=True,
+                    execution_guard=(
+                        lambda generation=generation, event=event:
+                        self._event_execution_allowed(
+                            generation,
+                            event,
+                        )
+                    ),
                 )
-                if self._result_callback is not None:
+                if isinstance(result, PointerSyncResult):
+                    result = replace(
+                        result,
+                        queue_wait_ns=queue_wait_ns,
+                    )
+                if (
+                    self._result_callback is not None
+                    and self._execution_allowed(generation)
+                ):
                     self._schedule(
                         0,
                         lambda result=result: self._result_callback(result),
                     )
+            except Exception:
+                # One failed delivery must not discard later captured inputs.
+                continue
             finally:
-                with self._lock:
-                    self._busy = False
+                with self._queue_lock:
+                    self._active_event = None
+                    if event == "left_up":
+                        if (
+                            self._release_pending_generation
+                            == generation
+                        ):
+                            self._release_pending_generation = None
+                    elif (
+                        event == "move"
+                        and self._release_pending_generation == generation
+                        and not any(
+                            item[0] == generation
+                            and item[2] == "left_up"
+                            for item in self._queue
+                        )
+                    ):
+                        self._release_pending_generation = None
 
-        threading.Thread(
-            target=worker,
-            name="FLASH-MouseSync",
-            daemon=True,
-        ).start()
+    def _execution_allowed(self, generation: int) -> bool:
+        with self._queue_lock:
+            return self._enabled and self._generation == generation
+
+    def _event_execution_allowed(
+        self,
+        generation: int,
+        event: str,
+    ) -> bool:
+        with self._queue_lock:
+            return (
+                self._enabled
+                and self._generation == generation
+                and not (
+                    event == "move"
+                    and self._release_pending_generation == generation
+                )
+            )

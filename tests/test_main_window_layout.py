@@ -14,6 +14,15 @@ def test_main_window_uses_home_view():
     assert "on_card_display_seconds_update=update_card_display_seconds" in source
     assert "CharacterDetailWindow" in source
     assert "CharacterNoteService" in source
+    assert "auto_click_service.configure_direct_left_sync(" in source
+    assert "pointer_sync_controller.send_click(" in source
+    assert "include_source=True" in source
+    assert "execution_guard=direct_auto_click_execution_allowed" in source
+    assert "BackgroundImageService" in source
+    assert "background_image_service.current_background()" in source
+    assert "on_select_background_image=select_background_image" in source
+    assert "on_clear_background_image=clear_background_image" in source
+    assert '("所有檔案", "*.*")' in source
 
 
 def test_main_window_start_message_is_player_facing():

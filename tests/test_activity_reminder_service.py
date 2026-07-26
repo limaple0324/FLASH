@@ -11,7 +11,7 @@ from services.card_history_service import CardHistoryService
 from workspace.models import WorkspaceState
 
 
-def _service(tmp_path, *, group=True):
+def _service(tmp_path, *, group=True, persisted=True):
     cards = CardService()
     coordinator = CardCoordinator(
         cards,
@@ -26,6 +26,11 @@ def _service(tmp_path, *, group=True):
         build_confirmed_activity_catalog(),
         coordinator,
         lambda: WorkspaceState(current_group=current_group),
+        state_path=(
+            tmp_path / "activity_reminders.json"
+            if persisted
+            else None
+        ),
     )
     return service, cards
 
@@ -103,24 +108,57 @@ def test_simultaneous_activities_create_separate_cards(tmp_path):
     assert len(cards.cards) == 2
 
 
-def test_no_group_means_no_card_and_no_occurrence_is_consumed(tmp_path):
+def test_reminder_is_global_and_does_not_require_a_selected_group(tmp_path):
     service, cards = _service(tmp_path, group=False)
 
     shown = service.poll(
         datetime(2026, 7, 27, 12, 55, 0, tzinfo=TAIPEI_TIMEZONE)
     )
 
-    assert shown == ()
-    assert cards.cards == ()
+    assert tuple(card.activity.name for card in shown) == ("諸魔殿",)
+    assert cards.cards == shown
+    assert shown[0].name_only is True
+
+
+def test_same_occurrence_does_not_reappear_after_program_restart(tmp_path):
+    service, cards = _service(tmp_path)
+    now = datetime(2026, 7, 27, 12, 55, tzinfo=TAIPEI_TIMEZONE)
+    shown = service.poll(now)
+    cards.remove(shown[0].card_id)
+
+    restarted, restarted_cards = _service(tmp_path)
+    repeated = restarted.poll(
+        datetime(2026, 7, 27, 12, 57, tzinfo=TAIPEI_TIMEZONE)
+    )
+
+    assert repeated == ()
+    assert restarted_cards.cards == ()
 
 
 def test_selected_weekdays_use_photo_schedule(tmp_path):
-    service, _cards = _service(tmp_path)
+    monday, _monday_cards = _service(
+        tmp_path / "monday",
+        persisted=False,
+    )
+    tuesday, _tuesday_cards = _service(
+        tmp_path / "tuesday",
+        persisted=False,
+    )
+    thursday, _thursday_cards = _service(
+        tmp_path / "thursday",
+        persisted=False,
+    )
 
-    thursday_world_boss = service.poll(
+    monday_due = monday.poll(
+        datetime(2026, 7, 27, 14, 25, 0, tzinfo=TAIPEI_TIMEZONE)
+    )
+    tuesday_due = tuesday.poll(
+        datetime(2026, 7, 28, 14, 25, 0, tzinfo=TAIPEI_TIMEZONE)
+    )
+    thursday_due = thursday.poll(
         datetime(2026, 7, 30, 14, 25, 0, tzinfo=TAIPEI_TIMEZONE)
     )
 
-    assert tuple(card.activity.name for card in thursday_world_boss) == (
-        "世界BOSS",
-    )
+    assert {card.activity.name for card in monday_due} == {"世界BOSS"}
+    assert {card.activity.name for card in tuesday_due} == set()
+    assert {card.activity.name for card in thursday_due} == {"世界BOSS"}

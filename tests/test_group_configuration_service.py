@@ -6,6 +6,7 @@ from services.group_configuration_service import (
     GroupConfigurationService,
     SyncCycleError,
 )
+from services.group_launch_service import SavedWindowPlacement
 
 
 def _shortcut(tmp_path, name):
@@ -155,3 +156,240 @@ def test_group_sync_choices_and_explicit_relations_are_player_safe(
     assert [(item.label, item.entry_id) for item in relations] == [
         ("第二組｜乙", second_id)
     ]
+
+
+def test_group_create_rename_move_and_delete_preserve_player_order(
+    tmp_path,
+):
+    service = GroupConfigurationService(tmp_path / "groups.json")
+
+    assert service.create_group("第一組") is True
+    assert service.create_group("第二組") is True
+    assert service.create_group("第二組") is False
+    assert service.rename_group("第二組", "新名稱") is True
+    assert service.move_group("新名稱", -1) is True
+    assert tuple(group.name for group in service.groups()) == (
+        "新名稱",
+        "第一組",
+    )
+    assert service.delete_group("新名稱") is True
+    assert service.delete_group("新名稱") is False
+    assert tuple(group.name for group in service.groups()) == ("第一組",)
+
+
+def test_saved_window_layout_survives_owned_configuration_reload(tmp_path):
+    legacy, first, _second = _legacy(tmp_path)
+    payload = json.loads(legacy.read_text(encoding="utf-8"))
+    payload["groups"][0]["launch_entries"][0].update(
+        {
+            "x": -2191,
+            "y": -523,
+            "width": 916,
+            "height": 629,
+            "delay_ms": 200,
+        }
+    )
+    legacy.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    owned = tmp_path / "groups.json"
+
+    first_service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    first_entry = first_service.group("14支").entries[0]
+    second_service = GroupConfigurationService(owned)
+    second_entry = second_service.group("14支").entries[0]
+
+    assert first_entry.shortcut_path == first
+    assert first_entry.placement is not None
+    assert second_entry.placement == first_entry.placement
+    assert (
+        second_entry.placement.x,
+        second_entry.placement.y,
+        second_entry.placement.width,
+        second_entry.placement.height,
+        second_entry.placement.delay_ms,
+    ) == (-2191, -523, 916, 629, 200)
+
+
+def test_existing_owned_copy_is_enriched_from_legacy_saved_layout(
+    tmp_path,
+):
+    legacy, _first, _second = _legacy(tmp_path)
+    legacy_payload = json.loads(legacy.read_text(encoding="utf-8"))
+    legacy_payload["groups"][0]["launch_entries"][0].update(
+        {
+            "x": -3000,
+            "y": 250,
+            "width": 916,
+            "height": 629,
+            "delay_ms": 150,
+        }
+    )
+    legacy.write_text(
+        json.dumps(legacy_payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    owned = tmp_path / "groups.json"
+    first_service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    owned_payload = json.loads(owned.read_text(encoding="utf-8"))
+    for entry in owned_payload["groups"][0]["launch_entries"]:
+        for key in ("x", "y", "width", "height", "delay_ms"):
+            entry.pop(key, None)
+    owned.write_text(
+        json.dumps(owned_payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    enriched = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    placement = enriched.group("14支").entries[0].placement
+
+    assert placement is not None
+    assert (
+        placement.x,
+        placement.y,
+        placement.width,
+        placement.height,
+        placement.delay_ms,
+    ) == (-3000, 250, 916, 629, 150)
+    assert first_service.group("14支") is not None
+
+
+def test_record_current_positions_requires_complete_group_and_saves_all(
+    tmp_path,
+):
+    legacy, first, second = _legacy(tmp_path)
+    owned = tmp_path / "groups.json"
+    service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+
+    assert service.update_saved_placements(
+        "14支",
+        {
+            first: SavedWindowPlacement(10, 20, 900, 600, 0),
+        },
+    ) is False
+    assert service.update_saved_placements(
+        "14支",
+        {
+            first: SavedWindowPlacement(10, 20, 900, 600, 0),
+            second: SavedWindowPlacement(-500, 30, 916, 629, 100),
+        },
+    ) is True
+
+    reloaded = GroupConfigurationService(owned).group("14支")
+    assert tuple(entry.placement for entry in reloaded.entries) == (
+        SavedWindowPlacement(10, 20, 900, 600, 0),
+        SavedWindowPlacement(-500, 30, 916, 629, 100),
+    )
+
+
+def test_set_main_entry_reorders_group_and_clear_keeps_empty_group(
+    tmp_path,
+):
+    legacy, _first, _second = _legacy(tmp_path)
+    service = GroupConfigurationService(
+        tmp_path / "groups.json",
+        legacy_config_path=legacy,
+    )
+    before = service.group("14支").entries
+
+    assert service.set_main_entry("14支", before[1].entry_id) is True
+    reordered = service.group("14支").entries
+    assert reordered[0].entry_id == before[1].entry_id
+    assert reordered[0].role == "主窗口"
+    assert reordered[1].role == "同步窗口"
+    assert service.clear_group("14支") is True
+    assert service.group("14支").entries == ()
+    assert service.clear_group("14支") is False
+
+
+def test_import_same_name_replaces_owned_group_without_duplicate(
+    tmp_path,
+):
+    legacy, _first, _second = _legacy(tmp_path)
+    owned = tmp_path / "groups.json"
+    service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    replacement = _shortcut(tmp_path, "新角色")
+    imported = tmp_path / "import.json"
+    imported.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "14支",
+                        "launch_entries": [
+                            {
+                                "path": str(replacement),
+                                "x": 50,
+                                "y": 60,
+                                "width": 900,
+                                "height": 600,
+                                "delay_ms": 20,
+                            }
+                        ],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    before = imported.read_bytes()
+
+    names = service.import_configuration(imported)
+
+    assert names == ("14支",)
+    assert tuple(group.name for group in service.groups()).count("14支") == 1
+    entries = service.group("14支").entries
+    assert tuple(entry.display_name for entry in entries) == ("新角色",)
+    assert entries[0].placement == SavedWindowPlacement(
+        50,
+        60,
+        900,
+        600,
+        20,
+    )
+    assert imported.read_bytes() == before
+
+
+def test_export_and_import_round_trip_preserves_group_order_and_layout(
+    tmp_path,
+):
+    legacy, _first, _second = _legacy(tmp_path)
+    service = GroupConfigurationService(
+        tmp_path / "groups.json",
+        legacy_config_path=legacy,
+    )
+    third = _shortcut(tmp_path, "第三角色")
+    service.add_shortcuts("第二組", (third,))
+    export_path = service.export_configuration(
+        tmp_path / "export.json"
+    )
+    restored = GroupConfigurationService(tmp_path / "restored.json")
+
+    names = restored.import_configuration(export_path)
+
+    assert names == ("14支", "第二組")
+    assert tuple(group.name for group in restored.groups()) == (
+        "14支",
+        "第二組",
+    )
+    assert (
+        restored.group("14支").entries[0].shortcut_path
+        == service.group("14支").entries[0].shortcut_path
+    )

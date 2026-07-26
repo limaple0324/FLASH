@@ -61,10 +61,12 @@ from services.activity_schedule_view_service import ActivityScheduleViewService
 from services.app_context import AppContext
 from services.auto_click_service import (
     AutoClickHotkeyMonitor,
+    Win32AutoClickPointerSourceBackend,
     AutoClickService,
     AutoClickSettings,
     Win32CursorClickBackend,
 )
+from services.background_image_service import BackgroundImageService
 from services.card_coordinator import CardCoordinator
 from services.card_display_settings_service import CardDisplaySettingsService
 from services.card_expiry_monitor import CardExpiryMonitor
@@ -88,6 +90,10 @@ from services.group_configuration_service import (
 from services.group_launch_service import GroupLaunchPlan, GroupLaunchService
 from services.group_role_status_monitor import GroupRoleStatusMonitor
 from services.group_role_status_service import GroupRoleStatusService
+from services.group_window_launch_service import (
+    GroupWindowLaunchResult,
+    GroupWindowLaunchService,
+)
 from services.keyboard_sync_monitor import KeyboardSyncMonitor
 from services.logger_service import LoggerService
 from services.mouse_sync_monitor import MouseSyncMonitor
@@ -109,6 +115,11 @@ from services.target_window_state_service import (
     TargetWindowStateService,
 )
 from ui.home import HomeView
+from ui.home import (
+    GroupManagementViewResult,
+    UI_THEME_LABELS,
+    theme_palette,
+)
 from ui.character_detail_window import CharacterDetailWindow
 from ui.card_overlay import CardSize
 from ui.tk_card_presenter import TkCardTextSettings
@@ -123,6 +134,7 @@ TARGET_WINDOW_FINGERPRINT_KEY = "target_window_fingerprint"
 INPUT_POLICY_KEY = "input_policy"
 SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
 SMART_RECONNECT_CONSENT_KEY = "smart_reconnect_consent_v1"
+UI_THEME_KEY = "ui_theme"
 CURRENT_GROUP_NAME_KEY = "current_group_name"
 REGISTRY_FILENAME = "window_registry.json"
 RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
@@ -134,10 +146,24 @@ TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
 CHARACTER_FILENAME = "characters.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
+ACTIVITY_REMINDER_STATE_FILENAME = "activity_reminder_state.json"
 ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 RECONNECT_REFERENCE_DIR = Path("assets") / "reconnect_reference"
+BACKGROUND_IMAGE_FILETYPES = (
+    (
+        "圖片與相機 RAW",
+        (
+            "*.png *.jpg *.jpeg *.jpe *.jfif *.gif *.bmp *.dib "
+            "*.tif *.tiff *.webp *.ico *.heic *.heif *.avif "
+            "*.cr2 *.cr3 *.dng *.nef *.nrw *.arw *.srf *.sr2 "
+            "*.orf *.rw2 *.raf *.pef *.raw *.3fr *.erf *.mef "
+            "*.mos *.mrw *.srw *.x3f"
+        ),
+    ),
+    ("所有檔案", "*.*"),
+)
 
 
 def resource_path(relative_path: Path) -> Path:
@@ -194,11 +220,16 @@ def build_services(root: Path | None = None):
     paths = PathManager(root=root)
     logger = LoggerService(paths.log_file("flash.log"))
     config = ConfigManager(paths.config_file("settings.json"))
+    background_image_service = BackgroundImageService(
+        config,
+        paths.data_dir(),
+    )
     config.ensure_defaults(
         {
             INPUT_POLICY_KEY: WindowInputPolicy.ALL.value,
             SMART_RECONNECT_ENABLED_KEY: False,
             SMART_RECONNECT_CONSENT_KEY: False,
+            UI_THEME_KEY: "clear_blue",
         }
     )
     event_bus = EventBus(logger=logger)
@@ -229,6 +260,7 @@ def build_services(root: Path | None = None):
     group_launch_service = GroupLaunchService(
         group_configuration_service.path,
         shortcut_fingerprint_resolver,
+        legacy_layout_config_path=legacy_group_config_path,
     )
     sync_scope_service = SyncScopeService(
         group_configuration_service,
@@ -289,6 +321,7 @@ def build_services(root: Path | None = None):
         activity_schedule_catalog,
         card_coordinator,
         workspace_service.snapshot,
+        state_path=paths.data_dir() / ACTIVITY_REMINDER_STATE_FILENAME,
     )
     card_view_state_service = CardViewStateService(card_service)
     reconnect_failure_status_service = ReconnectFailureStatusService()
@@ -316,6 +349,7 @@ def build_services(root: Path | None = None):
     AppContext.register(PathManager, paths)
     AppContext.register(LoggerService, logger)
     AppContext.register(ConfigManager, config)
+    AppContext.register(BackgroundImageService, background_image_service)
     AppContext.register(
         CardDisplaySettings,
         card_display_settings_resolution.settings,
@@ -415,9 +449,13 @@ def build_services(root: Path | None = None):
         )
     )
     AppContext.register(SyncConflictArbiter, sync_conflict_arbiter)
+    synchronized_window_backend = Win32WindowBackend(
+        PowerShellLaunchFingerprintResolver()
+    )
     AppContext.register(
         WindowsInputSyncController,
         WindowsInputSyncController.for_real_windows(
+            window_backend=synchronized_window_backend,
             conflict_arbiter=sync_conflict_arbiter,
             deferred_service=deferred_sync_service,
             reconnecting_provider=(
@@ -440,6 +478,7 @@ def build_services(root: Path | None = None):
     AppContext.register(
         WindowsPointerSyncController,
         WindowsPointerSyncController.for_real_windows(
+            window_backend=synchronized_window_backend,
             conflict_arbiter=sync_conflict_arbiter,
             deferred_service=deferred_sync_service,
             reconnecting_provider=(
@@ -468,7 +507,7 @@ def build_services(root: Path | None = None):
         GroupRoleStatusService,
         GroupRoleStatusService(
             group_launch_service,
-            Win32WindowBackend(PowerShellLaunchFingerprintResolver()),
+            synchronized_window_backend,
             reconnect_failure_status_service,
             screen_states_provider=reconnect_controller.role_screen_states,
             reconnecting_provider=(
@@ -803,11 +842,41 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     character_view_service = AppContext.get(CharacterViewService)
     character_detail_view_service = AppContext.get(CharacterDetailViewService)
     character_note_service = AppContext.get(CharacterNoteService)
+    background_image_service = AppContext.get(BackgroundImageService)
     home_view: HomeView | None = None
+
+    def dispatch_to_main_window(callback) -> object | None:
+        try:
+            return window.after(0, callback)
+        except TclError:
+            return None
+
+    group_window_launch_service = (
+        GroupWindowLaunchService(
+            group_launch_service,
+            Win32WindowBackend(PowerShellLaunchFingerprintResolver()),
+            completion_dispatch=dispatch_to_main_window,
+            record_callback=(
+                operation_record_store.append
+                if operation_record_store is not None
+                else None
+            ),
+            placement_update_callback=(
+                group_configuration_service.update_saved_placements
+                if group_configuration_service is not None
+                else None
+            ),
+        )
+        if group_launch_service is not None
+        else None
+    )
     auto_click_service = AutoClickService(
         Win32CursorClickBackend(),
         schedule=window.after,
         cancel=window.after_cancel,
+    )
+    auto_click_pointer_source_backend = (
+        Win32AutoClickPointerSourceBackend()
     )
 
     def report_refresh_error(error: Exception) -> None:
@@ -817,6 +886,38 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             "輔｜操作未完成",
             "操作未能完成，原本資料保持不變。",
             parent=window,
+        )
+
+    def complete_group_window_launch(
+        result: GroupWindowLaunchResult,
+    ) -> None:
+        if home_view is None:
+            return
+        home_view.set_group_launch_state(False, result.player_message)
+        home_view.refresh_group_role_statuses()
+
+    def launch_group_and_restore(group_name: str) -> bool:
+        if group_window_launch_service is None:
+            return False
+        return group_window_launch_service.start(
+            group_name,
+            complete_group_window_launch,
+        )
+
+    def restore_group_positions(group_name: str) -> bool:
+        if group_window_launch_service is None:
+            return False
+        return group_window_launch_service.start_restore(
+            group_name,
+            complete_group_window_launch,
+        )
+
+    def record_group_positions(group_name: str) -> bool:
+        if group_window_launch_service is None:
+            return False
+        return group_window_launch_service.start_record(
+            group_name,
+            complete_group_window_launch,
         )
 
     def show_start_status() -> None:
@@ -835,6 +936,35 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if config is not None
         else WindowInputPolicy.ALL
     ) or WindowInputPolicy.ALL
+    configured_theme = (
+        config.get(UI_THEME_KEY)
+        if config is not None
+        and config.get(UI_THEME_KEY) in UI_THEME_LABELS
+        else "clear_blue"
+    )
+
+    def change_ui_theme(theme_name: str) -> bool:
+        if config is None or theme_name not in UI_THEME_LABELS:
+            return False
+        config.set(UI_THEME_KEY, theme_name)
+        return True
+
+    def select_background_image():
+        if background_image_service is None:
+            return None
+        selected = filedialog.askopenfilename(
+            parent=window,
+            title="選擇背景圖片",
+            filetypes=BACKGROUND_IMAGE_FILETYPES,
+        )
+        if not selected:
+            return None
+        return background_image_service.select(Path(selected))
+
+    def clear_background_image():
+        if background_image_service is None:
+            return None
+        return background_image_service.clear()
 
     def selected_group_plan(choice) -> GroupLaunchPlan | None:
         if group_launch_service is None:
@@ -884,6 +1014,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
             return
+        auto_click_service.stop()
         config.set(INPUT_POLICY_KEY, policy.value)
         status["input_policy"] = policy.value
 
@@ -907,6 +1038,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
             return
+        auto_click_service.stop()
         workspace_service.set_current_group(
             group_selection_service.workspace_group(choice)
         )
@@ -942,6 +1074,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             group_role_status_service.clear_cache()
 
     def stop_group_automation_for_configuration_change() -> None:
+        auto_click_service.stop()
         if keyboard_sync_monitor is not None:
             keyboard_sync_monitor.stop()
             if mouse_sync_monitor is not None:
@@ -959,6 +1092,127 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                     SMART_RECONNECT_CONSENT_KEY: False,
                 }
             )
+
+    def finish_group_management(
+        selected_name: str | None,
+    ) -> GroupManagementViewResult:
+        if (
+            group_selection_service is None
+            or workspace_service is None
+            or config is None
+        ):
+            return GroupManagementViewResult(
+                False,
+                None,
+                "組別資料尚未準備完成。",
+            )
+        choice = (
+            group_selection_service.find(selected_name)
+            if selected_name is not None
+            else None
+        )
+        workspace_service.set_current_group(
+            group_selection_service.workspace_group(choice)
+            if choice is not None
+            else None
+        )
+        workspace_service.set_next_step(
+            "查看目前需要注意的內容"
+            if choice is not None
+            else "選擇組別"
+        )
+        config.set(
+            CURRENT_GROUP_NAME_KEY,
+            choice.name if choice is not None else "",
+        )
+        if choice is not None:
+            apply_group_identity(choice)
+        if group_role_status_service is not None:
+            group_role_status_service.clear_cache()
+        if operation_record_store is not None:
+            operation_record_store.ensure_daily_file()
+        return GroupManagementViewResult(
+            True,
+            choice.name if choice is not None else None,
+        )
+
+    def create_group(name: str) -> GroupManagementViewResult:
+        if group_configuration_service is None:
+            return GroupManagementViewResult(
+                False,
+                None,
+                "組別設定尚未準備完成。",
+            )
+        stop_group_automation_for_configuration_change()
+        if not group_configuration_service.create_group(name):
+            return GroupManagementViewResult(
+                False,
+                name,
+                "已有相同名稱的組別。",
+            )
+        return finish_group_management(name)
+
+    def rename_group(
+        old_name: str,
+        new_name: str,
+    ) -> GroupManagementViewResult:
+        if group_configuration_service is None:
+            return GroupManagementViewResult(
+                False,
+                old_name,
+                "組別設定尚未準備完成。",
+            )
+        stop_group_automation_for_configuration_change()
+        if not group_configuration_service.rename_group(
+            old_name,
+            new_name,
+        ):
+            return GroupManagementViewResult(
+                False,
+                old_name,
+                "名稱沒有變更，或已有相同名稱的組別。",
+            )
+        return finish_group_management(new_name)
+
+    def delete_group(name: str) -> GroupManagementViewResult:
+        if (
+            group_configuration_service is None
+            or group_selection_service is None
+        ):
+            return GroupManagementViewResult(
+                False,
+                name,
+                "組別設定尚未準備完成。",
+            )
+        stop_group_automation_for_configuration_change()
+        if not group_configuration_service.delete_group(name):
+            return GroupManagementViewResult(
+                False,
+                name,
+                "找不到要刪除的組別。",
+            )
+        choices = group_selection_service.choices()
+        selected = choices[0].name if choices else None
+        return finish_group_management(selected)
+
+    def move_group(
+        name: str,
+        direction: int,
+    ) -> GroupManagementViewResult:
+        if group_configuration_service is None:
+            return GroupManagementViewResult(
+                False,
+                name,
+                "組別設定尚未準備完成。",
+            )
+        stop_group_automation_for_configuration_change()
+        if not group_configuration_service.move_group(name, direction):
+            return GroupManagementViewResult(
+                False,
+                name,
+                "目前已在最上方或最下方。",
+            )
+        return finish_group_management(name)
 
     def group_entries(group_name: str):
         if group_configuration_service is None:
@@ -1008,6 +1262,42 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if removed and operation_record_store is not None:
             operation_record_store.ensure_daily_file()
         return removed
+
+    def set_group_main(
+        group_name: str,
+        entry_id: str,
+    ) -> object:
+        if group_configuration_service is None:
+            return False
+        stop_group_automation_for_configuration_change()
+        try:
+            changed = group_configuration_service.set_main_entry(
+                group_name,
+                entry_id,
+            )
+        except SyncCycleError:
+            return SyncCycleError.player_message
+        if changed and group_role_status_service is not None:
+            group_role_status_service.clear_cache()
+        return changed
+
+    def clear_group(
+        group_name: str,
+    ) -> GroupManagementViewResult:
+        if group_configuration_service is None:
+            return GroupManagementViewResult(
+                False,
+                group_name,
+                "組別設定尚未準備完成。",
+            )
+        stop_group_automation_for_configuration_change()
+        if not group_configuration_service.clear_group(group_name):
+            return GroupManagementViewResult(
+                False,
+                group_name,
+                "目前組別沒有可清空的角色。",
+            )
+        return finish_group_management(group_name)
 
     def add_group_sync_relation(
         group_name: str,
@@ -1137,6 +1427,69 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         else None
     )
 
+    def direct_auto_click_enabled() -> bool:
+        return (
+            mouse_sync_monitor is not None
+            and mouse_sync_monitor.enabled
+            and current_input_policy() is not None
+        )
+
+    def direct_auto_click_execution_allowed() -> bool:
+        return (
+            auto_click_service.direct_sync_execution_allowed()
+            and direct_auto_click_enabled()
+        )
+
+    def deliver_direct_auto_click(source) -> bool:
+        if pointer_sync_controller is None:
+            return False
+        policy = current_input_policy()
+        if policy is None:
+            return False
+        result = pointer_sync_controller.send_click(
+            source_handle=source.source_handle,
+            x_ratio=source.x_ratio,
+            y_ratio=source.y_ratio,
+            policy=policy,
+            execute=True,
+            include_source=True,
+            execution_guard=direct_auto_click_execution_allowed,
+        )
+        deferred_failures = {
+            "sync_group_deferred_reconnect",
+            "sync_deferred_reconnect",
+        }
+        accepted = result.passed or (
+            result.eligible_windows > 0
+            and bool(result.failure_codes)
+            and set(result.failure_codes) <= deferred_failures
+        )
+        if logger is not None and not accepted:
+            logger.warning(
+                "Direct synchronized continuous click failed; "
+                f"eligible={result.eligible_windows}; "
+                f"sent={result.sent_windows}; "
+                f"failures={','.join(result.failure_codes) or 'none'}"
+            )
+        return accepted
+
+    if pointer_sync_controller is not None:
+        auto_click_service.configure_direct_left_sync(
+            source_provider=auto_click_pointer_source_backend.sample,
+            eligible=lambda source: (
+                pointer_sync_controller.source_is_eligible(
+                    source.source_handle
+                )
+            ),
+            deliver=deliver_direct_auto_click,
+            enabled=direct_auto_click_enabled,
+            block_physical_fallback=lambda source: (
+                pointer_sync_controller.source_must_block_physical_fallback(
+                    source.source_handle
+                )
+            ),
+        )
+
     def change_keyboard_sync(enabled: bool) -> bool:
         if (
             keyboard_sync_monitor is None
@@ -1150,6 +1503,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
             return False
+        auto_click_service.invalidate_direct_sync()
         if not enabled:
             keyboard_sync_monitor.stop()
             mouse_sync_monitor.stop()
@@ -1310,15 +1664,29 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         keyboard_sync_enabled=False,
         on_keyboard_sync_change=change_keyboard_sync,
         group_choices=group_choices,
+        group_choices_provider=(
+            group_selection_service.choices
+            if group_selection_service is not None
+            else None
+        ),
         current_group_name=(
             workspace_state.current_group.name
             if workspace_state.current_group is not None
             else None
         ),
         on_group_change=change_group,
+        on_launch_group=launch_group_and_restore,
+        on_restore_group=restore_group_positions,
+        on_record_group_positions=record_group_positions,
+        on_create_group=create_group,
+        on_rename_group=rename_group,
+        on_delete_group=delete_group,
+        on_move_group=move_group,
         group_entries_provider=group_entries,
         on_add_group_shortcuts=add_group_shortcuts,
         on_remove_group_shortcut=remove_group_shortcut,
+        on_set_group_main=set_group_main,
+        on_clear_group=clear_group,
         group_sync_choices_provider=(
             group_configuration_service.available_sync_members
             if group_configuration_service is not None
@@ -1423,6 +1791,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_auto_click_change=change_auto_click,
         card_display_seconds_provider=card_display_seconds,
         on_card_display_seconds_update=update_card_display_seconds,
+        theme_name=configured_theme,
+        on_theme_change=change_ui_theme,
+        background_image_path=(
+            background_image_service.current_background()
+            if background_image_service is not None
+            else None
+        ),
+        on_select_background_image=select_background_image,
+        on_clear_background_image=clear_background_image,
         on_refresh_error=report_refresh_error,
     )
     home_view.build()
@@ -1489,15 +1866,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             bottom_margin=20,
             gap=12,
         )
+        overlay_palette = theme_palette(configured_theme)
         overlay_runtime = build_windows_card_overlay_runtime(
             window,
             card_service,
             overlay_layout,
             TkCardTextSettings(
-                background="#FFFFFF",
-                foreground="#182433",
-                muted_foreground="#617083",
-                accent="#2474C6",
+                background=overlay_palette["surface"],
+                foreground=overlay_palette["text"],
+                muted_foreground=overlay_palette["muted"],
+                accent=overlay_palette["primary"],
             ),
         )
         overlay_runtime.start()
@@ -1513,8 +1891,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             activity_reminder_monitor.start()
 
     def close_window() -> None:
+        home_view.dispose()
+        if group_window_launch_service is not None:
+            group_window_launch_service.stop()
         auto_click_hotkey_monitor.stop()
-        auto_click_service.stop()
+        auto_click_service.close(timeout_seconds=1.0)
         if group_role_status_monitor is not None:
             group_role_status_monitor.stop(timeout_seconds=1.0)
         if deferred_sync_monitor is not None:

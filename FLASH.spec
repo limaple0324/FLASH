@@ -1,15 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_dynamic_libs
+
+
+rawpy_binaries = collect_dynamic_libs('rawpy')
+
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=rawpy_binaries,
     datas=[
         ('assets/flash_icon.png', 'assets'),
         ('assets/flash_icon.ico', 'assets'),
         ('assets/reconnect_reference', 'assets/reconnect_reference'),
     ],
-    hiddenimports=['tkinter'],
+    hiddenimports=['tkinter', 'rawpy', 'rawpy._rawpy'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

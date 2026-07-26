@@ -200,13 +200,72 @@ def test_window_enumeration_attaches_only_resolved_anonymous_fingerprint():
         process_id=9876,
         window_class="ObservedClass",
     )
-    backend = Win32WindowBackend(fingerprint_resolver=resolver)
+    backend = Win32WindowBackend(
+        fingerprint_resolver=resolver,
+        process_lifecycle_provider=lambda _process_id: 1,
+    )
     backend._user32 = lambda: user32
 
     (window,) = backend.list_windows()
 
     assert resolver.process_ids == [9876]
     assert window.launch_fingerprint == "a" * 64
+
+
+def test_window_identity_is_resolved_once_per_process_lifecycle():
+    class FakeResolver:
+        def __init__(self):
+            self.calls = []
+
+        def resolve(self, process_ids):
+            self.calls.append(tuple(process_ids))
+            return {9876: "a" * 64}
+
+    resolver = FakeResolver()
+    lifecycle = {"value": 111}
+    backend = Win32WindowBackend(
+        fingerprint_resolver=resolver,
+        process_lifecycle_provider=lambda _process_id: lifecycle["value"],
+    )
+    backend._user32 = lambda: _enumerating_user32(
+        hwnd=321,
+        process_id=9876,
+        window_class="ObservedClass",
+    )
+
+    assert backend.list_windows()[0].launch_fingerprint == "a" * 64
+    assert backend.list_windows()[0].launch_fingerprint == "a" * 64
+    assert resolver.calls == [(9876,)]
+
+    lifecycle["value"] = 222
+    assert backend.list_windows()[0].launch_fingerprint == "a" * 64
+    assert resolver.calls == [(9876,), (9876,)]
+
+
+def test_failed_identity_resolution_is_cached_fail_closed_for_same_lifecycle():
+    class FailingResolver:
+        def __init__(self):
+            self.calls = 0
+
+        def resolve(self, process_ids):
+            self.calls += 1
+            tuple(process_ids)
+            return {}
+
+    resolver = FailingResolver()
+    backend = Win32WindowBackend(
+        fingerprint_resolver=resolver,
+        process_lifecycle_provider=lambda _process_id: 111,
+    )
+    backend._user32 = lambda: _enumerating_user32(
+        hwnd=321,
+        process_id=9876,
+        window_class="ObservedClass",
+    )
+
+    assert backend.list_windows()[0].launch_fingerprint is None
+    assert backend.list_windows()[0].launch_fingerprint is None
+    assert resolver.calls == 1
 
 
 def test_window_enumeration_keeps_failed_optional_identity_unknown():

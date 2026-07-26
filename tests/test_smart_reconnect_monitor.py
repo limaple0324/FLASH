@@ -70,6 +70,7 @@ def test_run_once_uses_result_delay_and_logs_only_aggregate_state():
     assert delay == 2
     assert boundary.calls == 1
     assert len(logger.info_messages) == 1
+    assert "states=connected:1,disconnected:1" in logger.info_messages[0]
     assert "connected=1" in logger.info_messages[0]
     assert "clicked=1" in logger.info_messages[0]
     assert "handle" not in logger.info_messages[0]

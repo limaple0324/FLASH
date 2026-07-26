@@ -237,6 +237,37 @@ def test_selected_group_identity_excludes_other_open_flash_windows():
     assert messages.sent == [(1, 0x42), (3, 0x42)]
 
 
+def test_selected_group_dispatch_uses_configured_fingerprint_order():
+    windows = make_windows(count=3)
+    windows.windows = [
+        windows.windows[1],
+        windows.windows[2],
+        windows.windows[0],
+    ]
+    messages = FakeMessageBackend()
+    configured_order = (
+        f"{3:064x}",
+        f"{1:064x}",
+        f"{2:064x}",
+    )
+    sync = WindowsInputSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=messages,
+        allowed_fingerprints=configured_order,
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+    )
+
+    assert result.passed is True
+    assert [handle for handle, _key in messages.sent] == [3, 1, 2]
+
+
 def test_selected_group_missing_one_identity_fails_closed():
     windows = make_windows(count=2)
     messages = FakeMessageBackend()
@@ -290,6 +321,281 @@ def test_one_reconnecting_role_pauses_new_sync_for_entire_group():
     assert result.failure_codes == ("sync_group_deferred_reconnect",)
     assert messages.sent == []
     assert deferred.pending() == 13
+
+
+def test_reconnecting_group_preserves_press_time_policy_and_source_eligibility(
+    tmp_path,
+):
+    windows = make_windows(minimized={2, 3}, foreground=1)
+    deferred_path = tmp_path / "deferred.json"
+    deferred = DeferredSyncOperationService(state_path=deferred_path)
+    fingerprints = tuple(
+        window.launch_fingerprint for window in windows.windows
+    )
+    sync = WindowsInputSyncController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=FakeMessageBackend(),
+        allowed_fingerprints=fingerprints,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (fingerprints[-1],),
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="foreground_background",
+        execute=True,
+        exclude_foreground=True,
+        source_handle=1,
+    )
+    payload = json.loads(deferred_path.read_text(encoding="utf-8"))
+
+    assert result.failure_codes == ("sync_group_deferred_reconnect",)
+    assert deferred.pending() == 11
+    assert {
+        item["target_id"] for item in payload["items"]
+    } == set(fingerprints[3:])
+    assert {
+        item["payload"]["policy"] for item in payload["items"]
+    } == {"foreground_background"}
+    assert {
+        item["payload"]["source_eligible_at_capture"]
+        for item in payload["items"]
+    } == {True}
+
+
+def test_reconnecting_foreground_only_keeps_only_press_time_source(tmp_path):
+    windows = make_windows(foreground=8)
+    deferred_path = tmp_path / "deferred.json"
+    deferred = DeferredSyncOperationService(state_path=deferred_path)
+    fingerprints = tuple(
+        window.launch_fingerprint for window in windows.windows
+    )
+    sync = WindowsInputSyncController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=FakeMessageBackend(),
+        allowed_fingerprints=fingerprints,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (fingerprints[-1],),
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="foreground_only",
+        execute=True,
+        source_handle=8,
+    )
+    payload = json.loads(deferred_path.read_text(encoding="utf-8"))
+
+    assert result.failure_codes == ("sync_group_deferred_reconnect",)
+    assert deferred.pending() == 1
+    assert payload["items"][0]["target_id"] == fingerprints[7]
+    assert payload["items"][0]["payload"]["policy"] == "foreground_only"
+
+
+def test_closed_reconnecting_role_does_not_drop_new_keyboard_operation(tmp_path):
+    windows = make_windows(count=13, foreground=1)
+    state_path = tmp_path / "deferred.json"
+    deferred = DeferredSyncOperationService(state_path=state_path)
+    allowed = tuple(f"{index:064x}" for index in range(1, 15))
+    sync = WindowsInputSyncController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=FakeMessageBackend(),
+        allowed_fingerprints=allowed,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (allowed[-1],),
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+        exclude_foreground=True,
+        source_handle=1,
+    )
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert result.failure_codes == ("sync_group_deferred_reconnect",)
+    assert result.eligible_windows == 13
+    assert deferred.pending() == 13
+    assert {item["target_id"] for item in saved["items"]} == set(
+        allowed[1:]
+    )
+
+
+def test_closed_reconnecting_role_foreground_only_defers_only_source():
+    windows = make_windows(count=1, foreground=1)
+    deferred = DeferredSyncOperationService()
+    allowed = (f"{1:064x}", f"{2:064x}")
+    sync = WindowsInputSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=FakeMessageBackend(),
+        allowed_fingerprints=allowed,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (allowed[-1],),
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="foreground_only",
+        execute=True,
+        exclude_foreground=False,
+        source_handle=1,
+    )
+
+    assert result.failure_codes == ("sync_group_deferred_reconnect",)
+    assert deferred.pending() == 1
+    assert deferred.pending(allowed[0]) == 1
+    assert deferred.pending(allowed[1]) == 0
+
+
+def test_closed_reconnecting_role_is_in_background_policy_but_known_minimized_is_not(
+    tmp_path,
+):
+    windows = make_windows(count=13, minimized={2}, foreground=1)
+    state_path = tmp_path / "deferred.json"
+    deferred = DeferredSyncOperationService(state_path=state_path)
+    allowed = tuple(f"{index:064x}" for index in range(1, 15))
+    sync = WindowsInputSyncController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=FakeMessageBackend(),
+        allowed_fingerprints=allowed,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (allowed[-1],),
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="foreground_background",
+        execute=True,
+        exclude_foreground=True,
+        source_handle=1,
+    )
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    targets = {item["target_id"] for item in saved["items"]}
+
+    assert result.failure_codes == ("sync_group_deferred_reconnect",)
+    assert allowed[0] not in targets
+    assert allowed[1] not in targets
+    assert allowed[-1] in targets
+    assert deferred.pending() == 12
+
+
+def test_background_policy_still_defers_missing_role_when_source_is_only_visible():
+    windows = make_windows(count=1, foreground=1)
+    deferred = DeferredSyncOperationService()
+    allowed = (f"{1:064x}", f"{2:064x}")
+    sync = WindowsInputSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=FakeMessageBackend(),
+        allowed_fingerprints=allowed,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (allowed[-1],),
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="foreground_background",
+        execute=True,
+        exclude_foreground=True,
+        source_handle=1,
+    )
+
+    assert result.failure_codes == ("sync_group_deferred_reconnect",)
+    assert deferred.pending() == 1
+
+
+def test_missing_non_reconnecting_role_still_fails_closed():
+    windows = make_windows(count=13, foreground=1)
+    deferred = DeferredSyncOperationService()
+    allowed = tuple(f"{index:064x}" for index in range(1, 15))
+    sync = WindowsInputSyncController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=FakeMessageBackend(),
+        allowed_fingerprints=allowed,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (),
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+        exclude_foreground=True,
+        source_handle=1,
+    )
+
+    assert "window_count_mismatch" in result.failure_codes
+    assert deferred.pending() == 0
+
+
+def test_partial_reconnect_with_visible_unknown_flash_identity_fails_closed():
+    windows = make_windows(count=13, foreground=1)
+    windows.windows.append(
+        WindowInfo(
+            handle=99,
+            title="Adobe Flash Player 11",
+            visible=True,
+            minimized=False,
+            rect=(0, 0, 916, 629),
+            process_id=1099,
+            window_class="ShockwaveFlash",
+            launch_fingerprint=None,
+        )
+    )
+    deferred = DeferredSyncOperationService()
+    allowed = tuple(f"{index:064x}" for index in range(1, 15))
+    sync = WindowsInputSyncController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=FakeMessageBackend(),
+        allowed_fingerprints=allowed,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (allowed[-1],),
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+        exclude_foreground=True,
+        source_handle=1,
+    )
+
+    assert "window_count_mismatch" in result.failure_codes
+    assert deferred.pending() == 0
+
+
+def test_captured_keyboard_source_is_used_even_if_focus_changes_before_delivery():
+    windows = make_windows(foreground=1)
+    messages = FakeMessageBackend()
+    sync = controller(windows, messages)
+    windows.foreground = 999
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+        exclude_foreground=True,
+        source_handle=1,
+    )
+
+    assert result.passed is True
+    assert {handle for handle, _key in messages.sent} == set(range(2, 15))
 
 
 def test_reconnecting_group_ignores_key_from_non_game_window():
@@ -376,3 +682,42 @@ def test_report_never_contains_handles_process_ids_or_fingerprints():
     assert f"{1:064x}" not in serialized
     assert result.to_dict()["raw_arguments_emitted"] is False
     assert result.to_dict()["fingerprints_emitted"] is False
+
+
+def test_report_contains_nonnegative_aggregate_dispatch_timings():
+    result = controller(make_windows()).send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+    )
+    report = result.to_dict()
+
+    assert result.controller_elapsed_ns >= 0
+    assert result.preflight_elapsed_ns >= 0
+    assert result.dispatch_spread_ns >= 0
+    assert report["controller_elapsed_ns"] == result.controller_elapsed_ns
+    assert report["preflight_elapsed_ns"] == result.preflight_elapsed_ns
+    assert report["dispatch_spread_ns"] == result.dispatch_spread_ns
+    assert report["timing_scope"] == "controller_postmessage_scheduling_only"
+    assert report["game_receipt_verified"] is False
+
+
+def test_execution_guard_stops_before_the_next_keyboard_target():
+    messages = FakeMessageBackend()
+    decisions = iter((True, False))
+    result = controller(
+        make_windows(count=3),
+        messages,
+    )
+    result.set_expected_windows(3)
+
+    report = result.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+        execution_guard=lambda: next(decisions, False),
+    )
+
+    assert report.sent_windows == 1
+    assert "execution_stopped" in report.failure_codes
+    assert messages.sent == [(1, 0x42)]

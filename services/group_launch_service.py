@@ -42,11 +42,30 @@ CONFIRMED_ENTRY_ALIASES: dict[str, dict[str, str]] = {
 
 
 @dataclass(frozen=True, slots=True)
+class SavedWindowPlacement:
+    x: int
+    y: int
+    width: int
+    height: int
+    delay_ms: int = 0
+
+    def __post_init__(self) -> None:
+        values = (self.x, self.y, self.width, self.height, self.delay_ms)
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            raise ValueError("saved window placement values must be integers.")
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("saved window placement size must be positive.")
+        if self.delay_ms < 0:
+            raise ValueError("saved window placement delay must not be negative.")
+
+
+@dataclass(frozen=True, slots=True)
 class GroupLaunchTarget:
     order: int
     display_name: str
     shortcut_path: Path
     fingerprint: str
+    placement: SavedWindowPlacement | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -67,6 +86,11 @@ class GroupLaunchTarget:
         object.__setattr__(self, "display_name", display_name)
         object.__setattr__(self, "shortcut_path", shortcut_path)
         object.__setattr__(self, "fingerprint", fingerprint)
+        if self.placement is not None and not isinstance(
+            self.placement,
+            SavedWindowPlacement,
+        ):
+            raise TypeError("placement must be SavedWindowPlacement or None.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +129,8 @@ class GroupLaunchService:
         self,
         legacy_config_path: Path | None,
         fingerprint_resolver: ShortcutFingerprintResolver,
+        *,
+        legacy_layout_config_path: Path | None = None,
     ) -> None:
         if not callable(getattr(fingerprint_resolver, "resolve", None)):
             raise TypeError("fingerprint_resolver must provide resolve(paths).")
@@ -114,7 +140,15 @@ class GroupLaunchService:
             else None
         )
         self._fingerprint_resolver = fingerprint_resolver
-        self._cache_signature: tuple[int, int] | None = None
+        self._legacy_layout_config_path = (
+            Path(legacy_layout_config_path)
+            if legacy_layout_config_path is not None
+            else None
+        )
+        self._cache_signature: tuple[
+            tuple[int, int] | None,
+            tuple[int, int] | None,
+        ] | None = None
         self._cache: dict[str, GroupLaunchPlan] = {}
 
     @staticmethod
@@ -138,8 +172,8 @@ class GroupLaunchService:
             return None
         return payload if isinstance(payload, Mapping) else None
 
-    def _signature(self) -> tuple[int, int] | None:
-        path = self._legacy_config_path
+    @staticmethod
+    def _path_signature(path: Path | None) -> tuple[int, int] | None:
         if path is None:
             return None
         try:
@@ -147,6 +181,103 @@ class GroupLaunchService:
         except OSError:
             return None
         return stat.st_mtime_ns, stat.st_size
+
+    def _signature(
+        self,
+    ) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+        return (
+            self._path_signature(self._legacy_config_path),
+            self._path_signature(self._legacy_layout_config_path),
+        )
+
+    @staticmethod
+    def _placement(value: object) -> SavedWindowPlacement | None:
+        if not isinstance(value, Mapping):
+            return None
+        fields = tuple(
+            value.get(name)
+            for name in ("x", "y", "width", "height", "delay_ms")
+        )
+        if any(
+            isinstance(item, bool) or not isinstance(item, int)
+            for item in fields
+        ):
+            return None
+        x, y, width, height, delay_ms = fields
+        if (
+            not (-100_000 <= x <= 100_000)
+            or not (-100_000 <= y <= 100_000)
+            or not (1 <= width <= 20_000)
+            or not (1 <= height <= 20_000)
+            or not (0 <= delay_ms <= 600_000)
+        ):
+            return None
+        return SavedWindowPlacement(x, y, width, height, delay_ms)
+
+    @classmethod
+    def _placements_from_payload(
+        cls,
+        group_name: str,
+        payload: Mapping[str, object] | None,
+    ) -> dict[str, SavedWindowPlacement]:
+        if payload is None:
+            return {}
+        raw_groups = payload.get("groups")
+        if not isinstance(raw_groups, list):
+            return {}
+        matching = tuple(
+            item
+            for item in raw_groups
+            if isinstance(item, Mapping)
+            and cls._clean_name(item.get("name")) == group_name
+        )
+        if len(matching) != 1:
+            return {}
+        raw_entries = matching[0].get("launch_entries")
+        if not isinstance(raw_entries, list):
+            return {}
+        placements: dict[str, SavedWindowPlacement] = {}
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, Mapping):
+                continue
+            raw_path = raw_entry.get("path")
+            placement = cls._placement(raw_entry)
+            if (
+                not isinstance(raw_path, str)
+                or not raw_path.strip()
+                or placement is None
+            ):
+                continue
+            normalized_path = str(
+                Path(raw_path).resolve(strict=False)
+            ).casefold()
+            placements[normalized_path] = placement
+        return placements
+
+    def _saved_placements(
+        self,
+        group_name: str,
+        current_payload: Mapping[str, object],
+    ) -> dict[str, SavedWindowPlacement]:
+        legacy = self._placements_from_payload(
+            group_name,
+            self._read_payload(self._legacy_layout_config_path),
+        )
+        current = self._placements_from_payload(
+            group_name,
+            current_payload,
+        )
+        return {**legacy, **current}
+
+    @staticmethod
+    def _read_payload(path: Path | None) -> Mapping[str, object] | None:
+        if path is None or not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, Mapping) else None
 
     def plan(self, group_name: object) -> GroupLaunchPlan:
         cleaned_group = self._clean_name(group_name)
@@ -255,6 +386,7 @@ class GroupLaunchService:
             by_name[aliases.get(display_name, display_name).casefold()]
             for display_name in ordered_names
         )
+        placements = self._saved_placements(cleaned_group, payload)
         resolved = self._fingerprint_resolver.resolve(ordered_paths)
         fingerprints = tuple(
             normalize_launch_fingerprint(resolved.get(path))
@@ -281,6 +413,9 @@ class GroupLaunchService:
                 display_name=display_name,
                 shortcut_path=path,
                 fingerprint=fingerprint,
+                placement=placements.get(
+                    str(path.resolve(strict=False)).casefold()
+                ),
             )
             for index, (display_name, path, fingerprint) in enumerate(
                 zip(ordered_names, ordered_paths, fingerprints),
@@ -290,4 +425,3 @@ class GroupLaunchService:
         plan = GroupLaunchPlan(cleaned_group, targets=targets)
         self._cache[cleaned_group] = plan
         return plan
-

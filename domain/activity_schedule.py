@@ -239,7 +239,7 @@ def build_confirmed_activity_catalog() -> ActivityScheduleCatalog:
         ),
         ScheduledActivityRule(
             _activity("world-boss", "世界BOSS", calendar=True),
-            (1, 3, 5),
+            (0, 3, 5),
             time(14, 30),
             time(15, 0),
             reminder_lead_minutes=5,
@@ -284,7 +284,7 @@ def build_confirmed_activity_catalog() -> ActivityScheduleCatalog:
         ),
         ScheduledActivityRule(
             _activity("quiz-contest", "答題大賽", calendar=True),
-            (1, 3, 5),
+            (0, 3, 5),
             time(20, 0),
             time(20, 20),
             reminder_lead_minutes=5,

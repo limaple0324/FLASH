@@ -3,7 +3,14 @@ from pathlib import Path
 from core.target_window_observation import TargetWindowObservation
 from services.character_view_service import PlayerCharacterView
 from services.group_role_status_service import GroupRoleStatus
-from ui.home import HomeView, _safe_character_lines, _workspace_state_text
+from ui.home import (
+    UI_THEME_LABELS,
+    HomeView,
+    _cover_geometry,
+    _safe_character_lines,
+    _workspace_state_text,
+    theme_palette,
+)
 from workspace.models import WorkspaceState
 
 
@@ -29,6 +36,70 @@ def test_current_group_uses_sidebar_information_card() -> None:
     assert "SIDEBAR_MUTED" in source
     assert "self._group_value_label" in source
     assert "wraplength=118" in source
+
+
+def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+
+    assert "Canvas(" in source
+    assert "Scrollbar(" in source
+    assert "yscrollcommand=scrollbar.set" in source
+    assert "self._on_page_mousewheel" in source
+    assert "一鍵啟動並還原位置" in source
+    assert "只還原位置" in source
+    assert "記錄目前位置" in source
+    for label in ("新增組", "改名", "上移", "下移", "刪除組"):
+        assert label in source
+    assert "設為主窗口" in source
+    assert "清空角色" in source
+
+
+def test_background_controls_and_cached_canvas_rendering_are_wired() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+
+    assert "選擇背景圖片" in source
+    assert "清除背景" in source
+    assert "目前背景：" in source
+    assert "ImageTk.PhotoImage" in source
+    assert "Image.Resampling.LANCZOS" in source
+    assert "self._background_source_image" in source
+    assert "self._background_resize_id" in source
+    assert "canvas.tag_lower(item)" in source
+    assert "messagebox.show" not in source[source.index(
+        "def _choose_background_image"
+    ):source.index("def dispose")]
+
+
+def test_background_cover_geometry_centers_wide_and_tall_images() -> None:
+    assert _cover_geometry((200, 100), (100, 100)) == (200, 100, 50, 0)
+    assert _cover_geometry((100, 200), (100, 100)) == (100, 200, 0, 50)
+    assert _cover_geometry((640, 480), (320, 240)) == (320, 240, 0, 0)
+
+
+def test_four_player_selectable_themes_have_complete_palettes() -> None:
+    assert tuple(UI_THEME_LABELS.values()) == (
+        "俐落藍",
+        "柔和紫",
+        "舊版金色",
+        "極簡黑白",
+    )
+    for name in UI_THEME_LABELS:
+        palette = theme_palette(name)
+        assert {
+            "background",
+            "surface",
+            "sidebar",
+            "sidebar_active",
+            "sidebar_group",
+            "sidebar_muted",
+            "primary",
+            "primary_hover",
+            "text",
+            "muted",
+            "border",
+            "success",
+            "warning",
+        } == set(palette)
 
 
 def test_character_page_uses_confirmed_note_field() -> None:

@@ -9,6 +9,7 @@ from adapters.game_screen_recognizer import (
     CHARACTER_SLOT_CLICK_POINTS,
     DEFAULT_SCREEN_TEMPLATES,
     ROUTE_DIGIT_REFERENCE_REGION,
+    ROUTE_PREFIX_SEARCH_REGION,
     LINE_ROUTE_CLICK_POINTS,
     ReferenceScreenRecognizer,
 )
@@ -317,6 +318,24 @@ def test_route_number_follows_centered_prefix_when_character_name_shifts():
     assert line_number == 8
     assert score is not None
     assert score <= 65.0
+
+
+def test_route_number_is_not_used_without_a_reliable_route_prefix():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "03_line_selection_dialog.png") as source:
+        candidate = source.convert("RGB")
+        prefix_box = (
+            round(candidate.width * ROUTE_PREFIX_SEARCH_REGION[0]),
+            round(candidate.height * ROUTE_PREFIX_SEARCH_REGION[1]),
+            round(candidate.width * ROUTE_PREFIX_SEARCH_REGION[2]),
+            round(candidate.height * ROUTE_PREFIX_SEARCH_REGION[3]),
+        )
+        candidate.paste((29, 88, 111), prefix_box)
+
+    line_number, score = recognizer._recognize_route_number(candidate)
+
+    assert line_number is None
+    assert score is None
 
 
 def test_popup_title_guard_rejects_a_similar_generic_window_frame():

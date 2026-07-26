@@ -6,6 +6,7 @@ import ctypes
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections import Counter
@@ -21,7 +22,7 @@ from adapters.game_screen_recognizer import (
     ScreenRecognition,
 )
 from adapters.windows_background_capture import (
-    Win32RecoveringPrintWindowProvider,
+    Win32PrintWindowProvider,
     WindowCaptureProvider,
 )
 from adapters.windows_battle_restart import (
@@ -57,6 +58,19 @@ ACTIONABLE_RECONNECT_ACTIONS = frozenset(
     }
 )
 POST_LOGIN_AUTOMATION_GRACE_SECONDS = 180.0
+ACTION_CONFIRMATION_FRAMES = 2
+_ROLE_LEVEL_PREFIX = re.compile(r"^\s*(\d{2,3})(?!\d)")
+_SESSION_ONLY_STATES = frozenset(
+    {
+        ReconnectScreenState.LOGIN_START,
+        ReconnectScreenState.FORCE_LOGIN_START,
+        ReconnectScreenState.LINE_SELECTION,
+        ReconnectScreenState.CHARACTER_SELECTION,
+        ReconnectScreenState.POST_LOGIN_ACTIVITY,
+        ReconnectScreenState.POST_LOGIN_RECOMMENDATION,
+        ReconnectScreenState.POST_LOGIN_AUTO_DUNGEON,
+    }
+)
 
 
 class ScreenRecognizer(Protocol):
@@ -268,7 +282,7 @@ class ReconnectRuntimeState:
 class ReconnectRuntimeStateStore:
     """Persist only anonymous fingerprints and reconnect timing state."""
 
-    VERSION = 2
+    VERSION = 3
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -299,9 +313,14 @@ class ReconnectRuntimeStateStore:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             if (
                 not isinstance(payload, dict)
-                or payload.get("version") not in {1, self.VERSION}
+                or payload.get("version") not in {1, 2, self.VERSION}
             ):
                 raise ValueError("Unsupported reconnect state version")
+            # Versions 1/2 could be armed by a manual login screen without a
+            # preceding confirmed disconnect.  They are intentionally not
+            # trusted after the fail-closed session-gating upgrade.
+            if payload.get("version") != self.VERSION:
+                return self._empty()
             pending = self._fingerprints(payload.get("pending_fingerprints", []))
             active = self._fingerprints(payload.get("active_fingerprints", []))
             raw_active_until = payload.get("active_until", {})
@@ -500,6 +519,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._failure_status_service = failure_status_service
         self._failure_record_callback = failure_record_callback
         self._last_screen_states: dict[str, ReconnectScreenState] = {}
+        self._action_confirmations: dict[
+            str,
+            tuple[tuple[object, ...], int],
+        ] = {}
         if self._expire_active_automation(now):
             self._persist_runtime_state()
 
@@ -523,7 +546,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             expected_windows=expected_windows,
             title_keywords=title_keywords,
             window_backend=window_backend,
-            capture_provider=Win32RecoveringPrintWindowProvider(),
+            # Observation must never restore or activate a minimized game.
+            # If a passive PrintWindow frame is stale, the controller fails
+            # closed instead of disturbing the player to refresh it.
+            capture_provider=Win32PrintWindowProvider(),
             recognizer=ReferenceScreenRecognizer(reference_dir),
             mouse_backend=Win32MouseMessageBackend(),
             state_path=state_path,
@@ -660,6 +686,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         else:
             self._execution_enabled.clear()
 
+    def _execution_allowed(self) -> bool:
+        """Read the stop gate immediately before every mutating backend call."""
+        return self._execution_enabled.is_set()
+
     def _matching_windows(self) -> tuple[WindowInfo, ...]:
         return tuple(
             window
@@ -684,6 +714,109 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             plan.target_for_fingerprint(fingerprint)
             if plan is not None
             else None
+        )
+
+    def _has_reconnect_session(self, fingerprint: str) -> bool:
+        return fingerprint in (
+            self._pending_reconnect_fingerprints
+            | self._pending_reopen_fingerprints
+            | self._active_automation_fingerprints
+        )
+
+    @staticmethod
+    def _action_signature(item: ScreenRecognition) -> tuple[object, ...]:
+        return (
+            item.state,
+            item.click_point,
+            item.line_number,
+            item.character_level,
+            item.character_slot_index,
+            item.character_slot_selected,
+            item.character_identity,
+            item.battle_context,
+        )
+
+    def _clear_action_confirmation(self, fingerprint: str | None = None) -> None:
+        if fingerprint is None:
+            self._action_confirmations.clear()
+            return
+        self._action_confirmations.pop(fingerprint, None)
+
+    def _clear_reconnect_session(self, fingerprint: str) -> None:
+        """Revoke every permission granted by a completed reconnect flow."""
+        self._pending_reconnect_fingerprints.discard(fingerprint)
+        self._pending_reopen_fingerprints.discard(fingerprint)
+        self._active_automation_fingerprints.discard(fingerprint)
+        self._active_automation_until.pop(fingerprint, None)
+        self._action_retry_after.pop(fingerprint, None)
+        self._reopen_retry_after.pop(fingerprint, None)
+        self._character_selection_pending.discard(fingerprint)
+        self._clear_action_confirmation(fingerprint)
+
+    def _action_is_confirmed(
+        self,
+        fingerprint: str,
+        item: ScreenRecognition,
+    ) -> bool:
+        signature = self._action_signature(item)
+        previous_signature, previous_count = self._action_confirmations.get(
+            fingerprint,
+            ((), 0),
+        )
+        count = previous_count + 1 if previous_signature == signature else 1
+        self._action_confirmations[fingerprint] = (signature, count)
+        return count >= ACTION_CONFIRMATION_FRAMES
+
+    def _character_target_is_safe(
+        self,
+        fingerprint: str,
+        item: ScreenRecognition,
+    ) -> bool:
+        """Require a unique role identity match to the exact shortcut role.
+
+        A level is not a unique identity because multiple configured roles can
+        share it.  The current image recognizer intentionally emits no role
+        identity, so real character selection remains observation-only until
+        exact role-name evidence is available.
+        """
+        target = self._target_for_fingerprint(fingerprint)
+        plan = self._group_launch_plan
+        identity = (
+            item.character_identity.strip().casefold()
+            if isinstance(item.character_identity, str)
+            and item.character_identity.strip()
+            else None
+        )
+        if (
+            target is None
+            or plan is None
+            or identity is None
+            or item.character_level is None
+        ):
+            return False
+        identity_matches = tuple(
+            candidate
+            for candidate in plan.targets
+            if identity
+            in {
+                candidate.display_name.strip().casefold(),
+                candidate.shortcut_path.stem.strip().casefold(),
+            }
+        )
+        if (
+            len(identity_matches) != 1
+            or identity_matches[0].fingerprint != fingerprint
+        ):
+            return False
+        expected_level = None
+        for label in (target.display_name, target.shortcut_path.stem):
+            match = _ROLE_LEVEL_PREFIX.match(label)
+            if match is not None:
+                expected_level = int(match.group(1))
+                break
+        return (
+            expected_level is not None
+            and expected_level == item.character_level
         )
 
     def _unknown_failure_key(self) -> str:
@@ -751,6 +884,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         target = self._target_for_fingerprint(fingerprint)
         restarter = self._battle_restarter
         if target is None or restarter is None:
+            self._clear_action_confirmation(fingerprint)
             return BattleRestartResult(
                 False,
                 "reconnect_restart_identity_unresolved",
@@ -763,19 +897,27 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             == fingerprint
         )
         if len(matches) > 1:
+            self._clear_action_confirmation(fingerprint)
             return BattleRestartResult(
                 False,
                 "reconnect_restart_window_ambiguous",
             )
+        if not self._execution_allowed():
+            self._clear_action_confirmation(fingerprint)
+            return BattleRestartResult(False, "reconnect_stopped")
         if len(matches) == 1:
             result = restarter.restart(matches[0], target)
         else:
             reopen_missing = getattr(restarter, "reopen_missing", None)
             if not callable(reopen_missing):
+                self._clear_action_confirmation(fingerprint)
                 return BattleRestartResult(
                     False,
                     "reconnect_restart_unavailable",
                 )
+            if not self._execution_allowed():
+                self._clear_action_confirmation(fingerprint)
+                return BattleRestartResult(False, "reconnect_stopped")
             result = reopen_missing(target, candidates)
         if result.success:
             now = self._monotonic_clock()
@@ -903,7 +1045,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         next_delays: list[int] = []
         for fingerprint in missing:
             retry_at = self._reopen_retry_after.get(fingerprint, now)
-            if not execute or not self._execution_enabled.is_set():
+            if not execute or not self._execution_allowed():
                 next_delays.append(
                     max(1, math.ceil(max(0.0, retry_at - now)))
                 )
@@ -923,10 +1065,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
             next_delays.append(self._policy.progress_interval_seconds)
             if target is None or not callable(retry_open):
+                self._clear_action_confirmation(fingerprint)
                 failures.append("battle_restart_identity_unresolved")
                 self._report_reconnect_failure(None)
                 continue
 
+            if not self._execution_allowed():
+                self._clear_action_confirmation(fingerprint)
+                next_delays.append(1)
+                continue
             result = retry_open(target, candidate_windows)
             if result.success:
                 reopened += 1
@@ -965,6 +1112,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         failures = self._group_failures(windows)
         failures.extend(retry_failures)
         if failures:
+            # A partially validated group must never carry a first-frame
+            # confirmation into a later, different group or identity set.
+            self._clear_action_confirmation()
             if (
                 self._runtime_state_store is not None
                 and state_before != self._runtime_state_signature()
@@ -1019,12 +1169,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if fingerprint in live_fingerprints
         }
         recognized: list[tuple[WindowInfo, str, ScreenRecognition]] = []
+        confirmed_action_fingerprints: set[str] = set()
         captured_windows = 0
         for window in windows:
             fingerprint = normalize_launch_fingerprint(
                 window.launch_fingerprint
             )
             if fingerprint is None:
+                self._clear_action_confirmation()
                 continue
             try:
                 sample = self._capture_provider.capture(window.handle)
@@ -1033,22 +1185,58 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             recognition = self._recognizer.recognize_capture(sample)
             if sample is not None and sample.api_succeeded:
                 captured_windows += 1
+            else:
+                self._clear_action_confirmation(fingerprint)
             if recognition.state is ReconnectScreenState.DISCONNECTED:
-                self._pending_reconnect_fingerprints.add(fingerprint)
+                if (
+                    recognition.click_point is not None
+                    and self._action_is_confirmed(fingerprint, recognition)
+                ):
+                    confirmed_action_fingerprints.add(fingerprint)
+                    if execute:
+                        self._pending_reconnect_fingerprints.add(fingerprint)
             elif recognition.state is ReconnectScreenState.CONNECTED:
-                self._pending_reconnect_fingerprints.discard(fingerprint)
-                self._pending_reopen_fingerprints.discard(fingerprint)
-                self._reopen_retry_after.pop(fingerprint, None)
+                # Normal gameplay is the terminal state. Revoke the entire
+                # reconnect session immediately so a later manual login or
+                # popup cannot inherit the previous 180-second authorization.
+                self._clear_reconnect_session(fingerprint)
                 self._clear_reconnect_failure(fingerprint)
             elif (
                 recognition.state is ReconnectScreenState.LOGIN_START
-                and fingerprint in self._pending_reconnect_fingerprints
+                and self._has_reconnect_session(fingerprint)
             ):
                 recognition = replace(
                     recognition,
                     state=ReconnectScreenState.FORCE_LOGIN_START,
                     click_point=FORCE_LOGIN_CLICK_POINT,
                 )
+            if recognition.state is ReconnectScreenState.CHARACTER_SELECTION:
+                if not self._character_target_is_safe(
+                    fingerprint,
+                    recognition,
+                ):
+                    recognition = replace(recognition, click_point=None)
+                    self._clear_action_confirmation(fingerprint)
+            action = self._policy.decide(recognition.state).action
+            is_action_candidate = (
+                action in ACTIONABLE_RECONNECT_ACTIONS
+                and recognition.click_point is not None
+                and (
+                    recognition.state is ReconnectScreenState.DISCONNECTED
+                    or (
+                        recognition.state in _SESSION_ONLY_STATES
+                        and self._has_reconnect_session(fingerprint)
+                    )
+                )
+            )
+            if recognition.state is not ReconnectScreenState.DISCONNECTED:
+                if is_action_candidate and self._action_is_confirmed(
+                    fingerprint,
+                    recognition,
+                ):
+                    confirmed_action_fingerprints.add(fingerprint)
+                elif not is_action_candidate:
+                    self._clear_action_confirmation(fingerprint)
             retry = self._action_retry_after.get(fingerprint)
             if retry is not None and retry[0] is not recognition.state:
                 self._action_retry_after.pop(fingerprint, None)
@@ -1080,6 +1268,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if self._policy.decide(item.state).action
             in ACTIONABLE_RECONNECT_ACTIONS
             and item.click_point is not None
+            and fingerprint in confirmed_action_fingerprints
+            and (
+                item.state is ReconnectScreenState.DISCONNECTED
+                or self._has_reconnect_session(fingerprint)
+            )
             and not (
                 item.state is ReconnectScreenState.DISCONNECTED
                 and item.battle_context
@@ -1099,6 +1292,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             for window, fingerprint, item in recognized
             if item.state is ReconnectScreenState.DISCONNECTED
             and item.battle_context
+            and fingerprint in confirmed_action_fingerprints
         ]
         clicked_windows = 0
         restarted_windows = retried_reopens
@@ -1108,7 +1302,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         delivery_failures = 0
         if execute:
             for window, fingerprint, item in battle_actionable:
-                if not self._execution_enabled.is_set():
+                if not self._execution_allowed():
                     break
                 retry = self._action_retry_after.get(fingerprint)
                 if (
@@ -1128,10 +1322,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     else None
                 )
                 if self._battle_restarter is None or target is None:
+                    self._clear_action_confirmation(fingerprint)
                     failures.append("battle_restart_identity_unresolved")
                     self._report_reconnect_failure(None)
                     continue
                 battle_restart_attempted = True
+                if not self._execution_allowed():
+                    self._clear_action_confirmation(fingerprint)
+                    break
                 restart_result = self._battle_restarter.restart(
                     window,
                     target,
@@ -1158,7 +1356,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     now + POST_LOGIN_AUTOMATION_GRACE_SECONDS
                 )
             for window, fingerprint, item in actionable:
-                if not self._execution_enabled.is_set():
+                if not self._execution_allowed():
                     break
                 retry = self._action_retry_after.get(fingerprint)
                 if (
@@ -1172,14 +1370,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     now + self._policy.retry_interval_seconds,
                 )
                 if not self._mouse_backend.is_window(window.handle):
+                    self._clear_action_confirmation(fingerprint)
                     invalid_targets += 1
                     continue
                 if not self._mouse_backend.probe_responsive(
                     window.handle,
                     self._preflight_timeout_ms,
                 ):
+                    self._clear_action_confirmation(fingerprint)
                     unresponsive_targets += 1
                     continue
+                if not self._execution_allowed():
+                    self._clear_action_confirmation(fingerprint)
+                    break
                 try:
                     delivered = self._mouse_backend.click_relative(
                         window.handle,
@@ -1189,6 +1392,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     delivered = False
                 if delivered:
                     clicked_windows += 1
+                    self._action_confirmations.pop(fingerprint, None)
                     if item.state is ReconnectScreenState.CHARACTER_SELECTION:
                         if item.character_slot_selected is True:
                             self._character_selection_pending.discard(

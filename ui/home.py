@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import (
     BOTH,
@@ -13,14 +14,19 @@ from tkinter import (
     X,
     Y,
     Button,
+    Canvas,
     Checkbutton,
     Entry,
     Frame,
     Label,
     OptionMenu,
+    Scrollbar,
     IntVar,
     StringVar,
 )
+from tkinter import messagebox
+
+from PIL import Image, ImageTk
 
 from cards.view_state import CardViewState
 from core.target_window_observation import TargetWindowObservation
@@ -37,6 +43,7 @@ from services.group_configuration_service import (
     GroupSyncMemberChoice,
 )
 from services.group_role_status_service import GroupRoleStatus
+from services.background_image_service import BackgroundImageResult
 from services.sync_operation_record_store import (
     OperationRecordSearchResult,
 )
@@ -50,19 +57,137 @@ INPUT_POLICY_LABELS = {
     "all": "全部允許（含最小化）",
 }
 
-BACKGROUND = "#F3F6FA"
-SURFACE = "#FFFFFF"
-SIDEBAR = "#17324D"
-SIDEBAR_ACTIVE = "#2D6EA8"
-SIDEBAR_GROUP = "#203E5B"
-SIDEBAR_MUTED = "#B8C9D9"
-PRIMARY = "#2474C6"
-PRIMARY_HOVER = "#1E64AB"
-TEXT = "#182433"
-MUTED = "#617083"
-BORDER = "#DCE4ED"
-SUCCESS = "#26845B"
-WARNING = "#B36A18"
+UI_THEME_LABELS = {
+    "clear_blue": "俐落藍",
+    "soft_violet": "柔和紫",
+    "classic_gold": "舊版金色",
+    "minimal_mono": "極簡黑白",
+}
+
+UI_THEME_PALETTES = {
+    "clear_blue": {
+        "background": "#F3F6FA",
+        "surface": "#FFFFFF",
+        "sidebar": "#17324D",
+        "sidebar_active": "#2D6EA8",
+        "sidebar_group": "#203E5B",
+        "sidebar_muted": "#B8C9D9",
+        "primary": "#2474C6",
+        "primary_hover": "#1E64AB",
+        "text": "#182433",
+        "muted": "#617083",
+        "border": "#DCE4ED",
+        "success": "#26845B",
+        "warning": "#B36A18",
+    },
+    "soft_violet": {
+        "background": "#F6F1F7",
+        "surface": "#FFFBFF",
+        "sidebar": "#51445E",
+        "sidebar_active": "#826795",
+        "sidebar_group": "#655472",
+        "sidebar_muted": "#D7CADD",
+        "primary": "#79588F",
+        "primary_hover": "#674877",
+        "text": "#2D2532",
+        "muted": "#74677A",
+        "border": "#E5DCE8",
+        "success": "#3A8066",
+        "warning": "#A8662B",
+    },
+    "classic_gold": {
+        "background": "#E3C47F",
+        "surface": "#F4E5B8",
+        "sidebar": "#745323",
+        "sidebar_active": "#A3742E",
+        "sidebar_group": "#89642B",
+        "sidebar_muted": "#F0DFB0",
+        "primary": "#916522",
+        "primary_hover": "#765019",
+        "text": "#3B2A13",
+        "muted": "#725A35",
+        "border": "#B78D47",
+        "success": "#39704B",
+        "warning": "#9B4B1E",
+    },
+    "minimal_mono": {
+        "background": "#F4F4F4",
+        "surface": "#FFFFFF",
+        "sidebar": "#222222",
+        "sidebar_active": "#454545",
+        "sidebar_group": "#303030",
+        "sidebar_muted": "#C8C8C8",
+        "primary": "#202020",
+        "primary_hover": "#3A3A3A",
+        "text": "#1C1C1C",
+        "muted": "#666666",
+        "border": "#D7D7D7",
+        "success": "#26714C",
+        "warning": "#9A551E",
+    },
+}
+
+
+def theme_palette(name: object) -> dict[str, str]:
+    key = name if isinstance(name, str) else ""
+    selected = UI_THEME_PALETTES.get(key, UI_THEME_PALETTES["clear_blue"])
+    return dict(selected)
+
+
+def _apply_theme_palette(name: object) -> str:
+    key = (
+        name
+        if isinstance(name, str) and name in UI_THEME_PALETTES
+        else "clear_blue"
+    )
+    palette = UI_THEME_PALETTES[key]
+    global BACKGROUND, SURFACE, SIDEBAR, SIDEBAR_ACTIVE
+    global SIDEBAR_GROUP, SIDEBAR_MUTED, PRIMARY, PRIMARY_HOVER
+    global TEXT, MUTED, BORDER, SUCCESS, WARNING
+    BACKGROUND = palette["background"]
+    SURFACE = palette["surface"]
+    SIDEBAR = palette["sidebar"]
+    SIDEBAR_ACTIVE = palette["sidebar_active"]
+    SIDEBAR_GROUP = palette["sidebar_group"]
+    SIDEBAR_MUTED = palette["sidebar_muted"]
+    PRIMARY = palette["primary"]
+    PRIMARY_HOVER = palette["primary_hover"]
+    TEXT = palette["text"]
+    MUTED = palette["muted"]
+    BORDER = palette["border"]
+    SUCCESS = palette["success"]
+    WARNING = palette["warning"]
+    return key
+
+
+_apply_theme_palette("clear_blue")
+
+
+def _cover_geometry(
+    source_size: tuple[int, int],
+    viewport_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Return resized dimensions and centered crop origin for cover layout."""
+    source_width, source_height = source_size
+    viewport_width, viewport_height = viewport_size
+    if min(source_width, source_height, viewport_width, viewport_height) < 1:
+        raise ValueError("image and viewport dimensions must be positive")
+    scale = max(
+        viewport_width / source_width,
+        viewport_height / source_height,
+    )
+    resized_width = max(viewport_width, round(source_width * scale))
+    resized_height = max(viewport_height, round(source_height * scale))
+    crop_x = max(0, (resized_width - viewport_width) // 2)
+    crop_y = max(0, (resized_height - viewport_height) // 2)
+    return resized_width, resized_height, crop_x, crop_y
+
+
+@dataclass(frozen=True, slots=True)
+class GroupManagementViewResult:
+    success: bool
+    current_group_name: str | None
+    message: str = ""
 
 
 def _characters(status: dict[str, object]) -> list[dict[str, object]]:
@@ -202,14 +327,38 @@ class HomeView:
         keyboard_sync_enabled: bool = False,
         on_keyboard_sync_change: Callable[[bool], object] | None = None,
         group_choices: Iterable[PlayerGroupChoice] = (),
+        group_choices_provider: (
+            Callable[[], tuple[PlayerGroupChoice, ...]] | None
+        ) = None,
         current_group_name: str | None = None,
         on_group_change: Callable[[str], object] | None = None,
+        on_launch_group: Callable[[str], object] | None = None,
+        on_restore_group: Callable[[str], object] | None = None,
+        on_record_group_positions: Callable[[str], object] | None = None,
+        on_create_group: (
+            Callable[[str], GroupManagementViewResult] | None
+        ) = None,
+        on_rename_group: (
+            Callable[[str, str], GroupManagementViewResult] | None
+        ) = None,
+        on_delete_group: (
+            Callable[[str], GroupManagementViewResult] | None
+        ) = None,
+        on_move_group: (
+            Callable[[str, int], GroupManagementViewResult] | None
+        ) = None,
         group_entries_provider: (
             Callable[[str], tuple[GroupConfigurationEntry, ...]] | None
         ) = None,
         on_add_group_shortcuts: Callable[[str], object] | None = None,
         on_remove_group_shortcut: (
             Callable[[str, str], object] | None
+        ) = None,
+        on_set_group_main: (
+            Callable[[str, str], object] | None
+        ) = None,
+        on_clear_group: (
+            Callable[[str], GroupManagementViewResult] | None
         ) = None,
         group_sync_choices_provider: (
             Callable[[str], tuple[GroupSyncMemberChoice, ...]] | None
@@ -265,6 +414,15 @@ class HomeView:
         ) = None,
         card_display_seconds_provider: Callable[[], int] | None = None,
         on_card_display_seconds_update: Callable[[int], object] | None = None,
+        theme_name: str = "clear_blue",
+        on_theme_change: Callable[[str], object] | None = None,
+        background_image_path: Path | None = None,
+        on_select_background_image: (
+            Callable[[], BackgroundImageResult | None] | None
+        ) = None,
+        on_clear_background_image: (
+            Callable[[], BackgroundImageResult] | None
+        ) = None,
         on_refresh_error: Callable[[Exception], object] | None = None,
     ):
         self.parent = parent
@@ -282,15 +440,25 @@ class HomeView:
             for choice in self.group_choices
         ):
             raise TypeError("group_choices must contain PlayerGroupChoice values.")
+        self.group_choices_provider = group_choices_provider
         self.current_group_name = (
             current_group_name.strip()
             if isinstance(current_group_name, str) and current_group_name.strip()
             else None
         )
         self.on_group_change = on_group_change
+        self.on_launch_group = on_launch_group
+        self.on_restore_group = on_restore_group
+        self.on_record_group_positions = on_record_group_positions
+        self.on_create_group = on_create_group
+        self.on_rename_group = on_rename_group
+        self.on_delete_group = on_delete_group
+        self.on_move_group = on_move_group
         self.group_entries_provider = group_entries_provider
         self.on_add_group_shortcuts = on_add_group_shortcuts
         self.on_remove_group_shortcut = on_remove_group_shortcut
+        self.on_set_group_main = on_set_group_main
+        self.on_clear_group = on_clear_group
         self.group_sync_choices_provider = group_sync_choices_provider
         self.group_sync_relations_provider = group_sync_relations_provider
         self.on_add_group_sync_relation = on_add_group_sync_relation
@@ -338,7 +506,23 @@ class HomeView:
         self.on_auto_click_change = on_auto_click_change
         self.card_display_seconds_provider = card_display_seconds_provider
         self.on_card_display_seconds_update = on_card_display_seconds_update
+        self.theme_name = (
+            theme_name
+            if theme_name in UI_THEME_PALETTES
+            else "clear_blue"
+        )
+        self.on_theme_change = on_theme_change
+        self.background_image_path = (
+            Path(background_image_path).resolve(strict=False)
+            if background_image_path is not None
+            else None
+        )
+        self.on_select_background_image = on_select_background_image
+        self.on_clear_background_image = on_clear_background_image
         self.on_refresh_error = on_refresh_error
+        self._root: Frame | None = None
+        self._active_page = "home"
+        self._mousewheel_binding_id: str | None = None
         self._pages: dict[str, Frame] = {}
         self._navigation_buttons: dict[str, Button] = {}
         self._workspace_label: Label | None = None
@@ -367,6 +551,11 @@ class HomeView:
         self._auto_click_toggle_button: Button | None = None
         self._group_entries_frame: Frame | None = None
         self._group_setting_message_label: Label | None = None
+        self._group_launch_button: Button | None = None
+        self._group_restore_button: Button | None = None
+        self._group_record_button: Button | None = None
+        self._group_launch_status_label: Label | None = None
+        self._group_name_entry: Entry | None = None
         self._group_sync_choice_variable: StringVar | None = None
         self._group_sync_choice_ids: dict[str, str] = {}
         self._group_sync_relations_frame: Frame | None = None
@@ -375,6 +564,17 @@ class HomeView:
         self._operation_record_date_entry: Entry | None = None
         self._operation_record_role_entry: Entry | None = None
         self._operation_record_search_frame: Frame | None = None
+        self._page_canvas: Canvas | None = None
+        self._page_canvas_window: int | None = None
+        self._theme_variable: StringVar | None = None
+        self._background_status_label: Label | None = None
+        self._background_canvas_item: int | None = None
+        self._background_page_labels: dict[str, Label] = {}
+        self._background_source_image: Image.Image | None = None
+        self._background_loaded_path: Path | None = None
+        self._background_photo = None
+        self._background_resize_id: str | None = None
+        self._background_render_size: tuple[int, int] | None = None
 
     @staticmethod
     def _button(parent, text: str, command=None, *, primary: bool = False):
@@ -409,16 +609,73 @@ class HomeView:
         )
 
     def build(self):
+        active_page = self._active_page
+        self._cancel_background_resize()
+        if self._mousewheel_binding_id is not None:
+            try:
+                self.parent.unbind(
+                    "<MouseWheel>",
+                    self._mousewheel_binding_id,
+                )
+            except Exception:
+                pass
+            self._mousewheel_binding_id = None
+        if self._root is not None:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+        self._pages.clear()
+        self._navigation_buttons.clear()
+        self._background_page_labels.clear()
+        self._last_group_role_statuses = None
+        self.theme_name = _apply_theme_palette(self.theme_name)
         root = Frame(self.parent, bg=BACKGROUND)
         root.pack(fill=BOTH, expand=True)
+        self._root = root
 
         body = Frame(root, bg=BACKGROUND)
         body.pack(fill=BOTH, expand=True)
         sidebar = Frame(body, bg=SIDEBAR, width=176, padx=12, pady=16)
         sidebar.pack(side=LEFT, fill=Y)
         sidebar.pack_propagate(False)
-        content = Frame(body, bg=BACKGROUND, padx=22, pady=20)
-        content.pack(side=LEFT, fill=BOTH, expand=True)
+        content_shell = Frame(body, bg=BACKGROUND, padx=22, pady=20)
+        content_shell.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar = Scrollbar(content_shell, orient="vertical")
+        scrollbar.pack(side=RIGHT, fill=Y)
+        canvas = Canvas(
+            content_shell,
+            bg=BACKGROUND,
+            highlightthickness=0,
+            bd=0,
+            yscrollcommand=scrollbar.set,
+        )
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.configure(command=canvas.yview)
+        self._background_canvas_item = canvas.create_image(
+            0,
+            0,
+            anchor="nw",
+            state="hidden",
+        )
+        content = Frame(canvas, bg=BACKGROUND)
+        canvas_window = canvas.create_window(
+            (0, 0),
+            window=content,
+            anchor="nw",
+        )
+        self._page_canvas = canvas
+        self._page_canvas_window = canvas_window
+        self._background_photo = None
+        self._background_render_size = None
+        self._set_background_path(self.background_image_path)
+        content.bind("<Configure>", self._sync_page_scroll_region)
+        canvas.bind("<Configure>", self._resize_page_content)
+        self._mousewheel_binding_id = self.parent.bind(
+            "<MouseWheel>",
+            self._on_page_mousewheel,
+            add="+",
+        )
 
         self._build_group_summary(sidebar)
 
@@ -456,8 +713,189 @@ class HomeView:
         self._pages["characters"] = self._build_characters_page(content)
         self._pages["records"] = self._build_records_page(content)
         self._pages["settings"] = self._build_settings_page(content)
-        self.show_page("home")
+        for page_name, page in self._pages.items():
+            background_label = Label(
+                page,
+                bg=BACKGROUND,
+                bd=0,
+                highlightthickness=0,
+                anchor="nw",
+            )
+            background_label.place(x=0, y=0, relwidth=1, relheight=1)
+            background_label.lower()
+            self._background_page_labels[page_name] = background_label
+        self.show_page(
+            active_page if active_page in self._pages else "home"
+        )
         return root
+
+    def _sync_page_scroll_region(self, _event=None) -> None:
+        canvas = self._page_canvas
+        if canvas is not None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _resize_page_content(self, event) -> None:
+        canvas = self._page_canvas
+        canvas_window = self._page_canvas_window
+        if canvas is None or canvas_window is None:
+            return
+        canvas.itemconfigure(canvas_window, width=max(1, int(event.width)))
+        self._schedule_background_resize(
+            max(1, int(event.width)),
+            max(1, int(getattr(event, "height", 1))),
+        )
+        self._sync_page_scroll_region()
+
+    def _cancel_background_resize(self) -> None:
+        if self._background_resize_id is None:
+            return
+        try:
+            self.parent.after_cancel(self._background_resize_id)
+        except Exception:
+            pass
+        self._background_resize_id = None
+
+    def _schedule_background_resize(self, width: int, height: int) -> None:
+        if (
+            self._background_source_image is None
+            or self._background_canvas_item is None
+            or width < 2
+            or height < 2
+        ):
+            return
+        requested_size = (width, height)
+        if requested_size == self._background_render_size:
+            return
+        self._cancel_background_resize()
+        self._background_resize_id = self.parent.after(
+            120,
+            lambda: self._render_background(requested_size),
+        )
+
+    def _render_background(self, viewport_size: tuple[int, int]) -> None:
+        self._background_resize_id = None
+        canvas = self._page_canvas
+        item = self._background_canvas_item
+        source = self._background_source_image
+        if canvas is None or item is None or source is None:
+            return
+        width, height = viewport_size
+        try:
+            resized_width, resized_height, crop_x, crop_y = _cover_geometry(
+                source.size,
+                viewport_size,
+            )
+            resized = source.resize(
+                (resized_width, resized_height),
+                Image.Resampling.LANCZOS,
+            )
+            try:
+                display = resized.crop(
+                    (crop_x, crop_y, crop_x + width, crop_y + height)
+                )
+                try:
+                    photo = ImageTk.PhotoImage(display, master=self.parent)
+                finally:
+                    display.close()
+            finally:
+                resized.close()
+            canvas.itemconfigure(item, image=photo, state="normal")
+            canvas.coords(item, 0, 0)
+            canvas.tag_lower(item)
+            for label in self._background_page_labels.values():
+                label.configure(image=photo)
+                label.lower()
+            self._background_photo = photo
+            self._background_render_size = viewport_size
+        except Exception:
+            canvas.itemconfigure(item, image="", state="hidden")
+            self._background_photo = None
+            self._background_render_size = None
+            self._refresh_background_status(
+                "受管背景副本目前無法顯示，請重新選擇圖片。"
+            )
+
+    def _set_background_path(self, path: Path | None) -> bool:
+        normalized = (
+            Path(path).resolve(strict=False) if path is not None else None
+        )
+        self.background_image_path = normalized
+        if (
+            normalized == self._background_loaded_path
+            and self._background_source_image is not None
+        ):
+            canvas = self._page_canvas
+            if canvas is not None:
+                self._schedule_background_resize(
+                    max(1, int(canvas.winfo_width())),
+                    max(1, int(canvas.winfo_height())),
+                )
+            return True
+
+        self._cancel_background_resize()
+        if self._background_source_image is not None:
+            self._background_source_image.close()
+        self._background_source_image = None
+        self._background_loaded_path = None
+        self._background_photo = None
+        self._background_render_size = None
+
+        canvas = self._page_canvas
+        item = self._background_canvas_item
+        if normalized is None:
+            if canvas is not None and item is not None:
+                canvas.itemconfigure(item, image="", state="hidden")
+            for label in self._background_page_labels.values():
+                label.configure(image="")
+            return True
+        try:
+            with Image.open(normalized) as opened:
+                opened.load()
+                self._background_source_image = opened.convert(
+                    "RGBA" if opened.mode in {"RGBA", "LA"} else "RGB"
+                )
+        except (OSError, ValueError):
+            if canvas is not None and item is not None:
+                canvas.itemconfigure(item, image="", state="hidden")
+            for label in self._background_page_labels.values():
+                label.configure(image="")
+            return False
+        self._background_loaded_path = normalized
+        if canvas is not None:
+            self._schedule_background_resize(
+                max(1, int(canvas.winfo_width())),
+                max(1, int(canvas.winfo_height())),
+            )
+        return True
+
+    def _background_status_text(self, message: str = "") -> str:
+        if self.background_image_path is None:
+            status = "目前背景：未設定，沿用介面配色。"
+        elif self._background_source_image is None:
+            status = "目前背景：受管背景副本無法顯示。"
+        else:
+            status = (
+                "目前背景：已套用受管背景副本"
+                f"（{self.background_image_path.name}）。"
+            )
+        return f"{message}\n{status}" if message else status
+
+    def _refresh_background_status(self, message: str = "") -> None:
+        if self._background_status_label is not None:
+            self._background_status_label.configure(
+                text=self._background_status_text(message)
+            )
+
+    def _on_page_mousewheel(self, event) -> str | None:
+        canvas = self._page_canvas
+        if canvas is None:
+            return None
+        delta = int(getattr(event, "delta", 0))
+        if delta == 0:
+            return None
+        units = -1 if delta > 0 else 1
+        canvas.yview_scroll(units, "units")
+        return "break"
 
     def _build_group_summary(self, parent) -> None:
         group_card = Frame(
@@ -1064,6 +1502,94 @@ class HomeView:
         menu.pack(fill=X, pady=(8, 0))
         if not names:
             menu.configure(state=DISABLED)
+        launch_row = Frame(selector, bg=SURFACE)
+        launch_row.pack(fill=X, pady=(12, 0))
+        self._group_launch_button = self._button(
+            launch_row,
+            "一鍵啟動並還原位置",
+            self._launch_current_group,
+            primary=True,
+        )
+        self._group_launch_button.pack(side=LEFT)
+        if not names or self.on_launch_group is None:
+            self._group_launch_button.configure(state=DISABLED)
+        self._group_restore_button = self._button(
+            launch_row,
+            "只還原位置",
+            self._restore_current_group,
+        )
+        self._group_restore_button.pack(side=LEFT, padx=(8, 0))
+        if not names or self.on_restore_group is None:
+            self._group_restore_button.configure(state=DISABLED)
+        self._group_record_button = self._button(
+            launch_row,
+            "記錄目前位置",
+            self._record_current_group_positions,
+        )
+        self._group_record_button.pack(side=LEFT, padx=(8, 0))
+        if not names or self.on_record_group_positions is None:
+            self._group_record_button.configure(state=DISABLED)
+        self._group_launch_status_label = Label(
+            launch_row,
+            text="",
+            font=("Microsoft JhengHei UI", 9, "bold"),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        )
+        self._group_launch_status_label.pack(
+            side=LEFT,
+            fill=X,
+            expand=True,
+            padx=(12, 0),
+        )
+        group_name_row = Frame(selector, bg=SURFACE)
+        group_name_row.pack(fill=X, pady=(12, 0))
+        self._group_name_entry = Entry(
+            group_name_row,
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+        )
+        self._group_name_entry.insert(
+            0,
+            self.current_group_name or "",
+        )
+        self._group_name_entry.pack(
+            side=LEFT,
+            fill=X,
+            expand=True,
+            ipady=8,
+        )
+        self._button(
+            group_name_row,
+            "新增組",
+            self._create_group,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._button(
+            group_name_row,
+            "改名",
+            self._rename_current_group,
+        ).pack(side=LEFT, padx=(8, 0))
+        group_order_row = Frame(selector, bg=SURFACE)
+        group_order_row.pack(fill=X, pady=(8, 0))
+        self._button(
+            group_order_row,
+            "上移",
+            lambda: self._move_current_group(-1),
+        ).pack(side=LEFT)
+        self._button(
+            group_order_row,
+            "下移",
+            lambda: self._move_current_group(1),
+        ).pack(side=LEFT, padx=(8, 0))
+        self._button(
+            group_order_row,
+            "刪除組",
+            self._delete_current_group,
+        ).pack(side=LEFT, padx=(8, 0))
 
         entry_card = self._card(page, padx=12, pady=12)
         entry_card.pack(fill=X, pady=(14, 0))
@@ -1083,6 +1609,11 @@ class HomeView:
             self._add_shortcuts_to_current_group,
             primary=True,
         ).pack(side=RIGHT)
+        self._button(
+            entry_header,
+            "清空角色",
+            self._clear_current_group,
+        ).pack(side=RIGHT, padx=(0, 8))
         self._group_entries_frame = Frame(entry_card, bg=SURFACE)
         self._group_entries_frame.pack(fill=X, pady=(10, 0))
         self._group_setting_message_label = Label(
@@ -1655,8 +2186,111 @@ class HomeView:
             "設定",
             "只保留玩家需要調整與查看的內容",
         )
+        theme_card = self._card(page)
+        theme_card.pack(fill=X)
+        Label(
+            theme_card,
+            text="介面風格",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        Label(
+            theme_card,
+            text="可隨時切換整個主畫面的配色與閱讀風格。",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        ).pack(fill=X, pady=(6, 12))
+        theme_row = Frame(theme_card, bg=SURFACE)
+        theme_row.pack(fill=X)
+        self._theme_variable = StringVar(
+            master=self.parent,
+            value=UI_THEME_LABELS[self.theme_name],
+        )
+        theme_menu = OptionMenu(
+            theme_row,
+            self._theme_variable,
+            *UI_THEME_LABELS.values(),
+        )
+        theme_menu.configure(
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            activebackground=BORDER,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        theme_menu["menu"].configure(
+            font=("Microsoft JhengHei UI", 10)
+        )
+        theme_menu.pack(side=LEFT, fill=X, expand=True)
+        self._button(
+            theme_row,
+            "套用風格",
+            self._apply_selected_theme,
+            primary=True,
+        ).pack(side=RIGHT, padx=(8, 0))
+
+        background_card = self._card(page)
+        background_card.pack(fill=X, pady=(14, 0))
+        Label(
+            background_card,
+            text="背景圖片",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        Label(
+            background_card,
+            text=(
+                "可選擇一般圖片或相機 RAW；程式只顯示轉換後的"
+                "受管副本，原始圖片不會變更。"
+            ),
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
+            wraplength=680,
+        ).pack(fill=X, pady=(6, 10))
+        self._background_status_label = Label(
+            background_card,
+            text=self._background_status_text(),
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+            justify=LEFT,
+            wraplength=680,
+        )
+        self._background_status_label.pack(fill=X, pady=(0, 12))
+        background_row = Frame(background_card, bg=SURFACE)
+        background_row.pack(fill=X)
+        choose_button = self._button(
+            background_row,
+            "選擇背景圖片",
+            self._choose_background_image,
+            primary=True,
+        )
+        choose_button.pack(side=LEFT)
+        if self.on_select_background_image is None:
+            choose_button.configure(state=DISABLED)
+        clear_button = self._button(
+            background_row,
+            "清除背景",
+            self._clear_background_image,
+        )
+        clear_button.pack(side=LEFT, padx=(8, 0))
+        if self.on_clear_background_image is None:
+            clear_button.configure(state=DISABLED)
+
         card = self._card(page)
-        card.pack(fill=X)
+        card.pack(fill=X, pady=(14, 0))
         Label(
             card,
             text="提醒顯示時間",
@@ -1731,6 +2365,82 @@ class HomeView:
         ).pack(anchor="w")
         return page
 
+    def _apply_selected_theme(self) -> None:
+        if self._theme_variable is None:
+            return
+        selected_label = self._theme_variable.get()
+        selected_name = next(
+            (
+                name
+                for name, label in UI_THEME_LABELS.items()
+                if label == selected_label
+            ),
+            None,
+        )
+        if selected_name is None or selected_name == self.theme_name:
+            return
+        try:
+            if self.on_theme_change is not None:
+                accepted = self.on_theme_change(selected_name)
+                if accepted is False:
+                    return
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self.theme_name = selected_name
+        self._active_page = "settings"
+        self.build()
+
+    def _choose_background_image(self) -> None:
+        if self.on_select_background_image is None:
+            return
+        try:
+            result = self.on_select_background_image()
+        except Exception:
+            self._refresh_background_status(
+                "背景圖片處理失敗，原本背景已保留。"
+            )
+            return
+        if result is None:
+            return
+        if not isinstance(result, BackgroundImageResult):
+            self._refresh_background_status(
+                "背景圖片處理失敗，原本背景已保留。"
+            )
+            return
+        loaded = self._set_background_path(result.managed_path)
+        message = result.message
+        if result.succeeded and result.managed_path is not None and not loaded:
+            message = "受管背景副本無法顯示，請重新選擇圖片。"
+        self._refresh_background_status(message)
+
+    def _clear_background_image(self) -> None:
+        if self.on_clear_background_image is None:
+            return
+        try:
+            result = self.on_clear_background_image()
+        except Exception:
+            self._refresh_background_status(
+                "背景圖片無法清除，原本背景已保留。"
+            )
+            return
+        if not isinstance(result, BackgroundImageResult):
+            self._refresh_background_status(
+                "背景圖片無法清除，原本背景已保留。"
+            )
+            return
+        self._set_background_path(result.managed_path)
+        self._refresh_background_status(result.message)
+
+    def dispose(self) -> None:
+        """Release background image resources before the Tk window closes."""
+        self._cancel_background_resize()
+        if self._background_source_image is not None:
+            self._background_source_image.close()
+        self._background_source_image = None
+        self._background_loaded_path = None
+        self._background_photo = None
+
     def _save_card_display_seconds(self) -> None:
         if (
             self._card_seconds_entry is None
@@ -1769,6 +2479,10 @@ class HomeView:
             )
         if name == "records":
             self.refresh_operation_records()
+        self._active_page = name
+        if self._page_canvas is not None:
+            self._page_canvas.yview_moveto(0.0)
+            self.parent.after_idle(self._sync_page_scroll_region)
 
     def _select_group(self, name: str) -> None:
         if name not in {choice.name for choice in self.group_choices}:
@@ -1780,11 +2494,177 @@ class HomeView:
             self._group_variable.set(name)
         if self._group_value_label is not None:
             self._group_value_label.configure(text=name)
+        if self._group_name_entry is not None:
+            self._group_name_entry.delete(0, "end")
+            self._group_name_entry.insert(0, name)
         self.refresh_workspace()
         self.refresh_group_entries()
         self.refresh_group_sync_relations()
         self.refresh_group_role_statuses()
         self.refresh_operation_records()
+
+    def _launch_current_group(self) -> None:
+        self._run_group_window_action(
+            self.on_launch_group,
+            "正在啟動並還原位置…",
+        )
+
+    def _restore_current_group(self) -> None:
+        self._run_group_window_action(
+            self.on_restore_group,
+            "正在還原目前組別位置…",
+        )
+
+    def _record_current_group_positions(self) -> None:
+        self._run_group_window_action(
+            self.on_record_group_positions,
+            "正在記錄目前組別位置…",
+        )
+
+    def _run_group_window_action(
+        self,
+        callback: Callable[[str], object] | None,
+        progress_message: str,
+    ) -> None:
+        if self.current_group_name is None or callback is None:
+            return
+        self.set_group_launch_state(True, progress_message)
+        try:
+            accepted = callback(self.current_group_name)
+        except Exception as error:
+            self.set_group_launch_state(False, "組別視窗操作未完成。")
+            self._report_refresh_error(error)
+            return
+        if accepted is False:
+            self.set_group_launch_state(
+                False,
+                "整組啟動正在進行，請稍候。",
+            )
+        elif isinstance(accepted, str) and accepted.strip():
+            self.set_group_launch_state(False, accepted.strip())
+
+    def set_group_launch_state(
+        self,
+        running: bool,
+        message: str,
+    ) -> None:
+        for button in (
+            self._group_launch_button,
+            self._group_restore_button,
+            self._group_record_button,
+        ):
+            if button is not None:
+                button.configure(
+                    state=DISABLED if running else NORMAL
+                )
+        if self._group_launch_status_label is not None:
+            self._group_launch_status_label.configure(
+                text=message.strip(),
+                fg=PRIMARY if running else MUTED,
+            )
+
+    def _apply_group_management_result(
+        self,
+        result: object,
+    ) -> None:
+        if not isinstance(result, GroupManagementViewResult):
+            raise TypeError("group management result is invalid.")
+        if not result.success:
+            self._show_group_setting_message(
+                result.message or "組別設定沒有變更。"
+            )
+            return
+        choices = (
+            self.group_choices_provider()
+            if self.group_choices_provider is not None
+            else self.group_choices
+        )
+        if not isinstance(choices, tuple) or any(
+            not isinstance(choice, PlayerGroupChoice)
+            for choice in choices
+        ):
+            raise TypeError("group choices provider returned invalid values.")
+        self.group_choices = choices
+        valid_names = {choice.name for choice in choices}
+        self.current_group_name = (
+            result.current_group_name
+            if result.current_group_name in valid_names
+            else (choices[0].name if choices else None)
+        )
+        self._active_page = "groups"
+        self.build()
+
+    def _create_group(self) -> None:
+        if self._group_name_entry is None or self.on_create_group is None:
+            return
+        name = self._group_name_entry.get().strip()
+        if not name:
+            self._show_group_setting_message("請先輸入組別名稱。")
+            return
+        try:
+            self._apply_group_management_result(
+                self.on_create_group(name)
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+
+    def _rename_current_group(self) -> None:
+        if (
+            self.current_group_name is None
+            or self._group_name_entry is None
+            or self.on_rename_group is None
+        ):
+            return
+        new_name = self._group_name_entry.get().strip()
+        if not new_name:
+            self._show_group_setting_message("請先輸入新的組別名稱。")
+            return
+        try:
+            self._apply_group_management_result(
+                self.on_rename_group(
+                    self.current_group_name,
+                    new_name,
+                )
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+
+    def _delete_current_group(self) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_delete_group is None
+        ):
+            return
+        confirmed = messagebox.askyesno(
+            "輔｜刪除組別",
+            f"確定刪除「{self.current_group_name}」嗎？\n"
+            "舊版設定不會被修改。",
+            parent=self.parent,
+        )
+        if not confirmed:
+            return
+        try:
+            self._apply_group_management_result(
+                self.on_delete_group(self.current_group_name)
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+
+    def _move_current_group(self, direction: int) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_move_group is None
+        ):
+            return
+        try:
+            self._apply_group_management_result(
+                self.on_move_group(
+                    self.current_group_name,
+                    direction,
+                )
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
 
     def _add_shortcuts_to_current_group(self) -> None:
         if (
@@ -1880,7 +2760,54 @@ class HomeView:
                     value
                 ),
             ).pack(side=RIGHT)
+            if entry.role != "主窗口":
+                self._button(
+                    row,
+                    "設為主窗口",
+                    lambda value=entry.entry_id: self._set_group_main(
+                        value
+                    ),
+                ).pack(side=RIGHT, padx=(0, 6))
         return entries
+
+    def _set_group_main(self, entry_id: str) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_set_group_main is None
+        ):
+            return
+        try:
+            result = self.on_set_group_main(
+                self.current_group_name,
+                entry_id,
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._show_group_setting_message(result)
+        self.refresh_group_entries()
+        self.refresh_group_sync_relations()
+
+    def _clear_current_group(self) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_clear_group is None
+        ):
+            return
+        confirmed = messagebox.askyesno(
+            "輔｜清空組別",
+            f"確定清空「{self.current_group_name}」的角色嗎？\n"
+            "組別會保留，舊版設定不會被修改。",
+            parent=self.parent,
+        )
+        if not confirmed:
+            return
+        try:
+            result = self.on_clear_group(self.current_group_name)
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._apply_group_management_result(result)
 
     def _show_group_setting_message(self, value: object) -> None:
         label = self._group_setting_message_label

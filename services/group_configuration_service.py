@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
+
+from services.group_launch_service import SavedWindowPlacement
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +20,7 @@ class GroupConfigurationEntry:
     shortcut_path: Path
     role: str
     order: int
+    placement: SavedWindowPlacement | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +78,30 @@ class GroupConfigurationService:
         normalized = os.path.normcase(str(path.resolve(strict=False)))
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
 
+    @staticmethod
+    def _clean_placement(
+        value: Mapping[str, object],
+    ) -> SavedWindowPlacement | None:
+        fields = tuple(
+            value.get(name)
+            for name in ("x", "y", "width", "height", "delay_ms")
+        )
+        if any(
+            isinstance(item, bool) or not isinstance(item, int)
+            for item in fields
+        ):
+            return None
+        x, y, width, height, delay_ms = fields
+        if (
+            not (-100_000 <= x <= 100_000)
+            or not (-100_000 <= y <= 100_000)
+            or not (1 <= width <= 20_000)
+            or not (1 <= height <= 20_000)
+            or not (0 <= delay_ms <= 600_000)
+        ):
+            return None
+        return SavedWindowPlacement(x, y, width, height, delay_ms)
+
     @classmethod
     def _clean_entry(cls, value: object) -> dict[str, object] | None:
         if not isinstance(value, Mapping):
@@ -85,11 +113,23 @@ class GroupConfigurationService:
         if path.suffix.casefold() != ".lnk" or not path.is_file():
             return None
         role = cls._clean_name(value.get("role")) or "同步窗口"
-        return {
+        entry = {
             "entry_id": cls._entry_id(path),
             "path": str(path),
             "role": role,
         }
+        placement = cls._clean_placement(value)
+        if placement is not None:
+            entry.update(
+                {
+                    "x": placement.x,
+                    "y": placement.y,
+                    "width": placement.width,
+                    "height": placement.height,
+                    "delay_ms": placement.delay_ms,
+                }
+            )
+        return entry
 
     @classmethod
     def _clean_groups(cls, payload: object) -> list[dict[str, object]]:
@@ -147,12 +187,57 @@ class GroupConfigurationService:
             self._sync_edges = self._clean_sync_edges(
                 current.get("sync_edges")
             )
+            if self._merge_legacy_placements():
+                self._save()
             return
         legacy = self._read_json(self._legacy_config_path)
         self._groups = self._clean_groups(legacy or {})
         self._sync_edges = {}
         if self._groups:
             self._save()
+
+    def _merge_legacy_placements(self) -> bool:
+        legacy = self._read_json(self._legacy_config_path)
+        legacy_groups = self._clean_groups(legacy or {})
+        legacy_by_group: dict[str, dict[str, dict[str, object]]] = {}
+        for group in legacy_groups:
+            entries = group.get("launch_entries")
+            if not isinstance(entries, list):
+                continue
+            legacy_by_group[str(group["name"]).casefold()] = {
+                str(entry["entry_id"]): entry
+                for entry in entries
+                if self._clean_placement(entry) is not None
+            }
+        changed = False
+        for group in self._groups:
+            legacy_entries = legacy_by_group.get(
+                str(group["name"]).casefold(),
+                {},
+            )
+            entries = group.get("launch_entries")
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if self._clean_placement(entry) is not None:
+                    continue
+                legacy_entry = legacy_entries.get(str(entry["entry_id"]))
+                if legacy_entry is None:
+                    continue
+                placement = self._clean_placement(legacy_entry)
+                if placement is None:
+                    continue
+                entry.update(
+                    {
+                        "x": placement.x,
+                        "y": placement.y,
+                        "width": placement.width,
+                        "height": placement.height,
+                        "delay_ms": placement.delay_ms,
+                    }
+                )
+                changed = True
+        return changed
 
     def _known_entry_ids(self) -> set[str]:
         return {
@@ -258,6 +343,7 @@ class GroupConfigurationService:
                     shortcut_path=Path(str(raw_entry["path"])),
                     role=str(raw_entry["role"]),
                     order=index,
+                    placement=self._clean_placement(raw_entry),
                 )
                 for index, raw_entry in enumerate(
                     raw_group["launch_entries"],
@@ -275,6 +361,262 @@ class GroupConfigurationService:
             (group for group in self.groups() if group.name == cleaned),
             None,
         )
+
+    def create_group(self, name: object) -> bool:
+        cleaned = self._clean_name(name)
+        if cleaned is None:
+            raise ValueError("group name is invalid.")
+        if any(
+            str(group["name"]).casefold() == cleaned.casefold()
+            for group in self._groups
+        ):
+            return False
+        self._groups.append({"name": cleaned, "launch_entries": []})
+        self._save()
+        return True
+
+    def rename_group(self, old_name: object, new_name: object) -> bool:
+        old_cleaned = self._clean_name(old_name)
+        new_cleaned = self._clean_name(new_name)
+        if old_cleaned is None or new_cleaned is None:
+            raise ValueError("group name is invalid.")
+        target = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == old_cleaned
+            ),
+            None,
+        )
+        if target is None:
+            return False
+        if old_cleaned.casefold() != new_cleaned.casefold() and any(
+            str(group["name"]).casefold() == new_cleaned.casefold()
+            for group in self._groups
+        ):
+            return False
+        if target["name"] == new_cleaned:
+            return False
+        target["name"] = new_cleaned
+        self._save()
+        return True
+
+    def delete_group(self, name: object) -> bool:
+        cleaned = self._clean_name(name)
+        if cleaned is None:
+            return False
+        target = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if target is None:
+            return False
+        removed_ids = {
+            str(entry["entry_id"])
+            for entry in target["launch_entries"]
+        }
+        self._groups.remove(target)
+        for entry_id in removed_ids:
+            self._sync_edges.pop(entry_id, None)
+        for source, targets in tuple(self._sync_edges.items()):
+            remaining = [
+                target_id
+                for target_id in targets
+                if target_id not in removed_ids
+            ]
+            if remaining:
+                self._sync_edges[source] = remaining
+            else:
+                self._sync_edges.pop(source, None)
+        self._save()
+        return True
+
+    def move_group(self, name: object, direction: int) -> bool:
+        cleaned = self._clean_name(name)
+        if cleaned is None or direction not in {-1, 1}:
+            return False
+        index = next(
+            (
+                index
+                for index, group in enumerate(self._groups)
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if index is None:
+            return False
+        target_index = index + direction
+        if target_index < 0 or target_index >= len(self._groups):
+            return False
+        self._groups[index], self._groups[target_index] = (
+            self._groups[target_index],
+            self._groups[index],
+        )
+        self._save()
+        return True
+
+    def update_saved_placements(
+        self,
+        group_name: object,
+        placements: Mapping[Path, SavedWindowPlacement],
+    ) -> bool:
+        cleaned = self._clean_name(group_name)
+        if cleaned is None:
+            return False
+        target = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if target is None:
+            return False
+        entries = target.get("launch_entries")
+        if not isinstance(entries, list) or not entries:
+            return False
+        normalized: dict[str, SavedWindowPlacement] = {}
+        for raw_path, placement in placements.items():
+            if not isinstance(placement, SavedWindowPlacement):
+                raise TypeError(
+                    "placements must contain SavedWindowPlacement values."
+                )
+            normalized[
+                os.path.normcase(
+                    str(Path(raw_path).resolve(strict=False))
+                )
+            ] = placement
+        entry_paths = {
+            os.path.normcase(
+                str(Path(str(entry["path"])).resolve(strict=False))
+            )
+            for entry in entries
+        }
+        if set(normalized) != entry_paths:
+            return False
+        for entry in entries:
+            path_key = os.path.normcase(
+                str(Path(str(entry["path"])).resolve(strict=False))
+            )
+            placement = normalized[path_key]
+            entry.update(
+                {
+                    "x": placement.x,
+                    "y": placement.y,
+                    "width": placement.width,
+                    "height": placement.height,
+                    "delay_ms": placement.delay_ms,
+                }
+            )
+        self._save()
+        return True
+
+    def export_configuration(self, destination: Path) -> Path:
+        path = Path(destination)
+        if path.suffix.casefold() != ".json":
+            raise ValueError("configuration export must be a JSON file.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            temp_path.write_text(
+                json.dumps(
+                    self._payload(),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return path
+
+    def import_configuration(
+        self,
+        source: Path,
+    ) -> tuple[str, ...]:
+        path = Path(source)
+        payload = self._read_json(path)
+        if payload is None:
+            raise ValueError("configuration import is invalid.")
+        imported_groups = self._clean_groups(payload)
+        if not imported_groups:
+            raise ValueError("configuration import has no valid groups.")
+
+        original_groups = self._groups
+        original_edges = self._sync_edges
+        proposed_groups = deepcopy(self._groups)
+        replaced_source_ids: set[str] = set()
+        obsolete_target_ids: set[str] = set()
+        imported_names: list[str] = []
+        for imported_group in imported_groups:
+            imported_name = str(imported_group["name"])
+            imported_names.append(imported_name)
+            existing_index = next(
+                (
+                    index
+                    for index, group in enumerate(proposed_groups)
+                    if str(group["name"]).casefold()
+                    == imported_name.casefold()
+                ),
+                None,
+            )
+            if existing_index is None:
+                proposed_groups.append(imported_group)
+                continue
+            existing_entries = proposed_groups[existing_index].get(
+                "launch_entries"
+            )
+            imported_entries = imported_group.get("launch_entries")
+            existing_ids = {
+                str(entry["entry_id"])
+                for entry in existing_entries
+            } if isinstance(existing_entries, list) else set()
+            imported_ids = {
+                str(entry["entry_id"])
+                for entry in imported_entries
+            } if isinstance(imported_entries, list) else set()
+            replaced_source_ids.update(existing_ids)
+            obsolete_target_ids.update(existing_ids - imported_ids)
+            proposed_groups[existing_index] = imported_group
+
+        proposed_edges: dict[str, list[str]] = {}
+        for source_id, targets in self._sync_edges.items():
+            if source_id in replaced_source_ids:
+                continue
+            remaining = [
+                target
+                for target in targets
+                if target not in obsolete_target_ids
+            ]
+            if remaining:
+                proposed_edges[source_id] = remaining
+
+        self._groups = proposed_groups
+        self._sync_edges = proposed_edges
+        imported_edges = self._clean_sync_edges(payload.get("sync_edges"))
+        for source_id, targets in imported_edges.items():
+            proposed_edges[source_id] = list(targets)
+        if self._has_cycle(
+            self._combined_sync_edges(explicit=proposed_edges)
+        ):
+            self._groups = original_groups
+            self._sync_edges = original_edges
+            raise SyncCycleError(SyncCycleError.player_message)
+        self._sync_edges = proposed_edges
+        try:
+            self._save()
+        except Exception:
+            self._groups = original_groups
+            self._sync_edges = original_edges
+            raise
+        return tuple(imported_names)
 
     def add_shortcuts(
         self,
@@ -374,6 +716,90 @@ class GroupConfigurationService:
             ]
             if filtered:
                 self._sync_edges[source] = filtered
+            else:
+                self._sync_edges.pop(source, None)
+        self._save()
+        return True
+
+    def set_main_entry(
+        self,
+        group_name: object,
+        entry_id: object,
+    ) -> bool:
+        cleaned = self._clean_name(group_name)
+        if (
+            cleaned is None
+            or not isinstance(entry_id, str)
+            or not entry_id.strip()
+        ):
+            return False
+        raw_group = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if raw_group is None:
+            return False
+        entries = raw_group.get("launch_entries")
+        if not isinstance(entries, list):
+            return False
+        index = next(
+            (
+                index
+                for index, entry in enumerate(entries)
+                if entry.get("entry_id") == entry_id.strip()
+            ),
+            None,
+        )
+        if index is None or index == 0:
+            return False
+        original = list(entries)
+        selected = entries.pop(index)
+        entries.insert(0, selected)
+        entries[0]["role"] = "主窗口"
+        for entry in entries[1:]:
+            entry["role"] = "同步窗口"
+        if self._has_cycle(self._combined_sync_edges()):
+            raw_group["launch_entries"] = original
+            raise SyncCycleError(SyncCycleError.player_message)
+        self._save()
+        return True
+
+    def clear_group(self, group_name: object) -> bool:
+        cleaned = self._clean_name(group_name)
+        if cleaned is None:
+            return False
+        raw_group = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if raw_group is None:
+            return False
+        entries = raw_group.get("launch_entries")
+        if not isinstance(entries, list) or not entries:
+            return False
+        removed_ids = {
+            str(entry["entry_id"])
+            for entry in entries
+        }
+        raw_group["launch_entries"] = []
+        for entry_id in removed_ids:
+            self._sync_edges.pop(entry_id, None)
+        for source, targets in tuple(self._sync_edges.items()):
+            remaining = [
+                target
+                for target in targets
+                if target not in removed_ids
+            ]
+            if remaining:
+                self._sync_edges[source] = remaining
             else:
                 self._sync_edges.pop(source, None)
         self._save()
