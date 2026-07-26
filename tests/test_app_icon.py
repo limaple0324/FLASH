@@ -58,3 +58,35 @@ def test_windows_app_identity_is_set_before_window_creation(monkeypatch):
     main.apply_windows_app_identity()
 
     assert calls == [WINDOWS_APP_USER_MODEL_ID]
+
+
+def test_window_icon_sets_the_current_window_icon(monkeypatch, tmp_path):
+    ico = tmp_path / "flash_icon.ico"
+    png = tmp_path / "flash_icon.png"
+    ico.write_bytes(b"ico")
+    png.write_bytes(b"png")
+    calls = []
+    icon_object = object()
+
+    class FakeWindow:
+        def iconbitmap(self, path):
+            calls.append(("iconbitmap", path))
+
+        def iconphoto(self, default, icon):
+            calls.append(("iconphoto", default, icon))
+
+    def fake_resource_path(path):
+        return ico if path == APP_ICON_ICO else png
+
+    monkeypatch.setattr(main.sys, "platform", "win32")
+    monkeypatch.setattr(main, "resource_path", fake_resource_path)
+    monkeypatch.setattr(main, "PhotoImage", lambda **_kwargs: icon_object)
+
+    window = FakeWindow()
+    main.apply_window_icon(window)
+
+    assert calls == [
+        ("iconbitmap", str(ico)),
+        ("iconphoto", True, icon_object),
+    ]
+    assert window._flash_icon is icon_object

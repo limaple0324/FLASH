@@ -7,6 +7,8 @@ def test_main_window_uses_home_view():
     assert "from ui.home import HomeView" in source
     assert "on_input_policy_change=change_input_policy" in source
     assert "on_test_key=test_approved_key" in source
+    assert "group_choices=group_choices" in source
+    assert "on_group_change=change_group" in source
 
 
 def test_main_window_start_message_is_player_facing():

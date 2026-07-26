@@ -53,6 +53,10 @@ from services.card_view_state_service import CardViewStateService
 from services.character_detail_view_service import CharacterDetailViewService
 from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
+from services.group_selection_service import (
+    GroupSelectionService,
+    default_legacy_group_config_path,
+)
 from services.logger_service import LoggerService
 from services.smart_reconnect_monitor import SmartReconnectMonitor
 from services.target_window_state_service import (
@@ -60,6 +64,7 @@ from services.target_window_state_service import (
     TargetWindowStateService,
 )
 from ui.home import HomeView
+from workspace.models import WorkspaceState
 from workspace.service import WorkspaceService
 
 APP_TITLE = "輔"
@@ -69,6 +74,7 @@ TARGET_WINDOW_KEY = "target_window_keywords"
 TARGET_WINDOW_FINGERPRINT_KEY = "target_window_fingerprint"
 INPUT_POLICY_KEY = "input_policy"
 SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
+CURRENT_GROUP_NAME_KEY = "current_group_name"
 REGISTRY_FILENAME = "window_registry.json"
 RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
@@ -100,19 +106,19 @@ def apply_windows_app_identity() -> None:
 
 
 def apply_window_icon(window: Tk) -> None:
+    ico_path = resource_path(APP_ICON_ICO)
+    if sys.platform == "win32" and ico_path.exists():
+        try:
+            window.iconbitmap(str(ico_path))
+        except TclError:
+            pass
+
     png_path = resource_path(APP_ICON_PNG)
     if png_path.exists():
         try:
             icon = PhotoImage(file=str(png_path))
             window.iconphoto(True, icon)
             window._flash_icon = icon
-        except TclError:
-            pass
-
-    ico_path = resource_path(APP_ICON_ICO)
-    if sys.platform == "win32" and ico_path.exists():
-        try:
-            window.iconbitmap(default=str(ico_path))
         except TclError:
             pass
 
@@ -151,6 +157,14 @@ def build_services(root: Path | None = None):
     characters = character_store.load()
     character_view_service = CharacterViewService(registry, characters)
     character_detail_view_service = CharacterDetailViewService(character_view_service)
+    group_selection_service = GroupSelectionService(
+        registry,
+        legacy_config_path=(
+            default_legacy_group_config_path()
+            if root is None
+            else paths.root / ".legacy-group-import-disabled"
+        ),
+    )
     progress_store = ActivityProgressStore(
         paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
     )
@@ -165,7 +179,23 @@ def build_services(root: Path | None = None):
     activity_order_habit_service = ActivityOrderHabitService(
         activity_order_habit_store
     )
-    workspace_service = WorkspaceService()
+    initial_group_choice = group_selection_service.initial_choice(
+        config.get(CURRENT_GROUP_NAME_KEY)
+    )
+    workspace_service = WorkspaceService(
+        WorkspaceState(
+            current_group=(
+                group_selection_service.workspace_group(initial_group_choice)
+                if initial_group_choice is not None
+                else None
+            ),
+            next_step=(
+                "查看目前需要注意的內容"
+                if initial_group_choice is not None
+                else "選擇組別"
+            ),
+        )
+    )
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
     card_history_service = CardHistoryService(card_history_store)
     card_service = CardService(card_display_settings_resolution.settings)
@@ -203,6 +233,7 @@ def build_services(root: Path | None = None):
     AppContext.register(CharacterStore, character_store)
     AppContext.register(CharacterViewService, character_view_service)
     AppContext.register(CharacterDetailViewService, character_detail_view_service)
+    AppContext.register(GroupSelectionService, group_selection_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(ActivityScheduleCatalog, activity_schedule_catalog)
@@ -493,19 +524,34 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window = Tk()
     window.title(APP_TITLE)
     apply_window_icon(window)
-    window.geometry("760x760")
-    window.minsize(660, 600)
+    window.geometry("1040x720")
+    window.minsize(900, 620)
+
+    config = AppContext.get(ConfigManager)
+    input_controller = AppContext.get(WindowsInputSyncController)
+    logger = AppContext.get(LoggerService)
+    group_selection_service = AppContext.get(GroupSelectionService)
+    workspace_service = AppContext.get(WorkspaceService)
+    card_view_state_service = AppContext.get(CardViewStateService)
+    target_window_state_service = AppContext.get(TargetWindowStateService)
+    character_view_service = AppContext.get(CharacterViewService)
+    home_view: HomeView | None = None
+
+    def report_refresh_error(error: Exception) -> None:
+        if logger is not None:
+            logger.error(f"Player view refresh failed and was isolated: {error}")
 
     def show_start_status() -> None:
+        detection = detect_target_window()
+        status["target_window"] = detection
+        publish_target_window_observation(detection)
+        if home_view is not None:
+            home_view.refresh_target_window()
         messagebox.showinfo(
             "輔｜目前狀態",
             format_start_status(status, paths),
             parent=window,
         )
-
-    config = AppContext.get(ConfigManager)
-    input_controller = AppContext.get(WindowsInputSyncController)
-    logger = AppContext.get(LoggerService)
     configured_policy = (
         normalize_input_policy(config.get(INPUT_POLICY_KEY))
         if config is not None
@@ -523,6 +569,32 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return
         config.set(INPUT_POLICY_KEY, policy.value)
         status["input_policy"] = policy.value
+
+    def change_group(name: str) -> None:
+        if (
+            group_selection_service is None
+            or workspace_service is None
+            or config is None
+        ):
+            messagebox.showerror(
+                "輔｜組別",
+                "組別資料尚未準備完成，未變更目前組別。",
+                parent=window,
+            )
+            return
+        choice = group_selection_service.find(name)
+        if choice is None:
+            messagebox.showerror(
+                "輔｜組別",
+                "找不到這個組別，未變更目前組別。",
+                parent=window,
+            )
+            return
+        workspace_service.set_current_group(
+            group_selection_service.workspace_group(choice)
+        )
+        workspace_service.set_next_step("查看目前需要注意的內容")
+        config.set(CURRENT_GROUP_NAME_KEY, choice.name)
 
     def test_approved_key(key: str) -> None:
         policy = (
@@ -565,14 +637,67 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
 
-    HomeView(
+    group_choices = (
+        group_selection_service.choices()
+        if group_selection_service is not None
+        else ()
+    )
+    workspace_state = (
+        workspace_service.snapshot()
+        if workspace_service is not None
+        else WorkspaceState()
+    )
+    home_view = HomeView(
         window,
         status,
         on_start=show_start_status,
         input_policy=configured_policy.value,
         on_input_policy_change=change_input_policy,
         on_test_key=test_approved_key,
-    ).build()
+        group_choices=group_choices,
+        current_group_name=(
+            workspace_state.current_group.name
+            if workspace_state.current_group is not None
+            else None
+        ),
+        on_group_change=change_group,
+        workspace_state=workspace_state,
+        workspace_state_provider=(
+            workspace_service.snapshot
+            if workspace_service is not None
+            else None
+        ),
+        card_view_state=(
+            card_view_state_service.snapshot()
+            if card_view_state_service is not None
+            else None
+        ),
+        card_view_state_provider=(
+            card_view_state_service.snapshot
+            if card_view_state_service is not None
+            else None
+        ),
+        target_window_state=(
+            target_window_state_service.snapshot()
+            if target_window_state_service is not None
+            else None
+        ),
+        target_window_state_provider=(
+            target_window_state_service.snapshot
+            if target_window_state_service is not None
+            else None
+        ),
+        characters=(
+            character_view_service.all()
+            if character_view_service is not None
+            else ()
+        ),
+        smart_reconnect_enabled=bool(
+            status.get("smart_reconnect_enabled", True)
+        ),
+        on_refresh_error=report_refresh_error,
+    )
+    home_view.build()
     return window
 
 
