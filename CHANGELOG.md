@@ -46,6 +46,34 @@
   adapter details.
 - 32 target-window event, EventBus, and SP1 bootstrap/self-check regression
   tests passed with zero input calls.
+- Closed application logger handlers during shutdown in `978d89e`, so source
+  self-checks release their Windows log files immediately instead of leaving
+  temporary validation data locked.
+- Advanced the cumulative delivery identity to SP2 0.2.0 and added a dedicated
+  `sp2_snapshot` Windows workflow in `fecf340`; its artifact is named
+  `FLASH-SP1+SP2-Windows-*` and cannot contain or publish a live updater.
+- The current SP2 source gate passed 478 tests, cumulative compilation, an
+  isolated SP2 0.2.0 self-check, release-verifier tests, and `git diff --check`.
+- GitHub Actions run `30183396825` built artifact
+  `FLASH-SP1+SP2-Windows-0.2.0-fecf340-snapshot` (artifact ID `8626301455`).
+  The downloaded bundle, SHA-256 manifest, packaged 8/8 self-check, and two
+  Windows 11 GUI launch/normal-close cycles passed with zero residual SP2
+  windows.
+- Added the confirmed Taipei activity schedule catalog in `d8327ce`, including
+  daily/weekly times, alternating Sunday 14:20 rules, midnight reset,
+  one shared Mystery Examiner subject, level-160 World Boss eligibility, and
+  level-120/160 Magic Soldiers eligibility. Unconfirmed audiences fail closed.
+- Added the explainable decision module in `5580bcd`. It follows the confirmed
+  ten-step order and emits remind, suggest, or quiet while respecting unknown
+  evidence, player cancellation, context, duplicate reminders, time, and
+  character importance.
+- Added the activity-order habit foundation in `e7d9225`: seven valid days are
+  observation-only, day eight becomes player review, exception days are
+  excluded, and accept/modify/pause/dismiss/remove/clear are persisted. It does
+  not implement the still-unconfirmed automatic stability threshold.
+- The combined schedule, decision, and habit block passed the full current
+  source gate: 501 tests, compilation of every current source directory,
+  isolated SP2 0.2.0 self-check (8/8), and `git diff --check`.
 - No SP3 UI, game input, player-visible registry mapping, or frozen resource
   area was added.
 
