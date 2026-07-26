@@ -402,16 +402,35 @@ class WindowsPointerSyncController:
             and self._deferred_service is not None
             and self._allowed_fingerprints is not None
         ):
-            source_fingerprint = next(
-                (
-                    normalize_launch_fingerprint(
-                        window.launch_fingerprint
-                    )
-                    for window in windows
-                    if window.handle == source_handle
-                ),
-                None,
+            source_matches = tuple(
+                window
+                for window in windows
+                if window.handle == source_handle
             )
+            source_fingerprint = (
+                normalize_launch_fingerprint(
+                    source_matches[0].launch_fingerprint
+                )
+                if len(source_matches) == 1
+                else None
+            )
+            source_failures: list[str] = []
+            if (
+                source_fingerprint is None
+                or source_fingerprint not in self._allowed_fingerprints
+            ):
+                source_failures.append("source_not_in_group")
+            if self._window_backend.foreground_handle() != source_handle:
+                source_failures.append("source_not_foreground")
+            if source_failures:
+                return PointerSyncResult(
+                    self._expected_windows,
+                    len(windows),
+                    0,
+                    0,
+                    normalized_event,
+                    tuple(source_failures),
+                )
             targets = tuple(
                 fingerprint
                 for fingerprint in self._allowed_fingerprints

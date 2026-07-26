@@ -292,6 +292,48 @@ def test_one_reconnecting_role_pauses_new_sync_for_entire_group():
     assert deferred.pending() == 13
 
 
+def test_reconnecting_group_ignores_key_from_non_game_window():
+    windows = make_windows(foreground=999)
+    messages = FakeMessageBackend()
+    deferred = DeferredSyncOperationService()
+    fingerprints = {
+        window.launch_fingerprint for window in windows.windows
+    }
+    sync = WindowsInputSyncController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=messages,
+        allowed_fingerprints=fingerprints,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (f"{14:064x}",),
+    )
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+        exclude_foreground=True,
+    )
+
+    assert result.failure_codes == ("foreground_not_in_group",)
+    assert messages.sent == []
+    assert deferred.pending() == 0
+
+
+def test_normal_group_ignores_key_from_non_game_window():
+    windows = make_windows(foreground=999)
+    messages = FakeMessageBackend()
+
+    result = controller(
+        windows,
+        messages,
+    ).send_approved_key("C", policy="all", execute=True)
+
+    assert result.failure_codes == ("foreground_not_in_group",)
+    assert messages.sent == []
+
+
 def test_unresponsive_window_aborts_entire_batch_before_input():
     messages = FakeMessageBackend(unresponsive={7})
     result = controller(

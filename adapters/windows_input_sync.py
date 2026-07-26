@@ -574,6 +574,16 @@ class WindowsInputSyncController:
             for value in self._reconnecting_provider()
             if (fingerprint := normalize_launch_fingerprint(value)) is not None
         }
+        foreground = self._window_backend.foreground_handle()
+        matching_handles = {window.handle for window in windows}
+        if execute and foreground not in matching_handles:
+            return self._base_result(
+                key=normalized_key,
+                policy=normalized_policy,
+                windows=windows,
+                execute=True,
+                failures=("foreground_not_in_group",),
+            )
         group_reconnecting = (
             bool(reconnecting & self._allowed_fingerprints)
             if self._allowed_fingerprints is not None
@@ -587,7 +597,6 @@ class WindowsInputSyncController:
             and self._deferred_service is not None
             and self._allowed_fingerprints is not None
         ):
-            foreground = self._window_backend.foreground_handle()
             foreground_fingerprint = next(
                 (
                     normalize_launch_fingerprint(
@@ -679,8 +688,6 @@ class WindowsInputSyncController:
                 failures=failures,
             )
 
-        foreground = self._window_backend.foreground_handle()
-        matching_handles = {window.handle for window in windows}
         if exclude_foreground and foreground not in matching_handles:
             failures.append("foreground_not_in_group")
         if normalized_policy is WindowInputPolicy.FOREGROUND_ONLY:

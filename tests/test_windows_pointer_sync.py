@@ -136,3 +136,61 @@ def test_one_reconnecting_role_pauses_pointer_sync_for_entire_group():
     assert result.failure_codes == ("sync_group_deferred_reconnect",)
     assert messages.sent == []
     assert deferred.pending() == 2
+
+
+def test_reconnecting_group_ignores_click_from_non_game_window():
+    windows = [_window(1), _window(2), _window(3)]
+    messages = Messages()
+    deferred = DeferredSyncOperationService()
+    controller = WindowsPointerSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=Windows(windows, foreground=999),
+        message_backend=messages,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (windows[2].launch_fingerprint,),
+    )
+    controller.set_allowed_fingerprints(
+        window.launch_fingerprint for window in windows
+    )
+
+    result = controller.send(
+        source_handle=999,
+        x_ratio=0.25,
+        y_ratio=0.75,
+        event="left_down",
+        policy=WindowInputPolicy.ALL,
+    )
+
+    assert result.failure_codes == ("source_not_in_group",)
+    assert messages.sent == []
+    assert deferred.pending() == 0
+
+
+def test_reconnecting_group_requires_source_game_window_to_be_foreground():
+    windows = [_window(1), _window(2), _window(3)]
+    messages = Messages()
+    deferred = DeferredSyncOperationService()
+    controller = WindowsPointerSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=Windows(windows, foreground=999),
+        message_backend=messages,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (windows[2].launch_fingerprint,),
+    )
+    controller.set_allowed_fingerprints(
+        window.launch_fingerprint for window in windows
+    )
+
+    result = controller.send(
+        source_handle=1,
+        x_ratio=0.25,
+        y_ratio=0.75,
+        event="left_down",
+        policy=WindowInputPolicy.ALL,
+    )
+
+    assert result.failure_codes == ("source_not_foreground",)
+    assert messages.sent == []
+    assert deferred.pending() == 0
