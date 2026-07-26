@@ -8,6 +8,8 @@ from cards.priority import CardPriorityReason
 from cards.service import CardCapacityError, CardService
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.group import CharacterGroup
+from main import build_services
+from services.app_context import AppContext
 from services.card_coordinator import CardCoordinator
 from services.card_history_service import CardHistoryService
 
@@ -114,3 +116,12 @@ def test_rejected_fourth_card_does_not_leave_history(tmp_path):
 
     assert len(coordinator.cards.cards) == 3
     assert coordinator.history.all() == ()
+
+
+def test_build_services_registers_coordinator_with_shared_services(tmp_path):
+    build_services(root=tmp_path)
+
+    coordinator = AppContext.get(CardCoordinator)
+
+    assert coordinator.cards is AppContext.get(CardService)
+    assert coordinator.history is AppContext.get(CardHistoryService)

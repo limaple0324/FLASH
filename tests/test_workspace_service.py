@@ -2,6 +2,8 @@ import pytest
 
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.group import CharacterGroup
+from main import build_services
+from services.app_context import AppContext
 from workspace.models import WorkspaceState
 from workspace.service import WorkspaceService
 
@@ -110,3 +112,12 @@ def test_service_rejects_a_non_callable_listener():
 
     with pytest.raises(TypeError, match="listener"):
         service.subscribe(object())
+
+
+def test_build_services_registers_workspace_service(tmp_path):
+    build_services(root=tmp_path)
+
+    service = AppContext.get(WorkspaceService)
+
+    assert isinstance(service, WorkspaceService)
+    assert service.snapshot() == WorkspaceState()

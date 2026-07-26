@@ -20,17 +20,25 @@ from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
 from adapters.windows_smart_reconnect import WindowsSmartReconnectController
 from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
 from adapters.windows_window import WindowsWindowAdapter
+from cards.history_store import CardHistoryStore
+from cards.service import CardService
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.bootstrap import Bootstrap
 from core.sp1_boundaries import ExternalAdapter, SmartReconnectBoundary
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+from domain.progress_store import ActivityProgressStore
+from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
+from services.card_coordinator import CardCoordinator
+from services.card_history_service import CardHistoryService
+from services.card_view_state_service import CardViewStateService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
 from services.smart_reconnect_monitor import SmartReconnectMonitor
 from ui.home import HomeView
+from workspace.service import WorkspaceService
 
 APP_TITLE = "輔"
 SELF_CHECK_ARGUMENT = "--self-check"
@@ -42,6 +50,8 @@ SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
 REGISTRY_FILENAME = "window_registry.json"
 RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
+ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
+CARD_HISTORY_FILENAME = "card_history.json"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 RECONNECT_REFERENCE_DIR = Path("assets") / "reconnect_reference"
@@ -96,7 +106,7 @@ def _normalize_window_fingerprint(value: object) -> str | None:
 
 
 def build_services(root: Path | None = None):
-    """Create, load, and register all SP1 services."""
+    """Create, load, and register the cumulative SP1+SP2 services."""
     AppContext.clear()
     paths = PathManager(root=root)
     logger = LoggerService(paths.log_file("flash.log"))
@@ -111,6 +121,16 @@ def build_services(root: Path | None = None):
 
     registry_store = WindowRegistryStore(paths.data_dir() / REGISTRY_FILENAME)
     registry = registry_store.load()
+    progress_store = ActivityProgressStore(
+        paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
+    )
+    progress_service = ActivityProgressService(progress_store)
+    workspace_service = WorkspaceService()
+    card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
+    card_history_service = CardHistoryService(card_history_store)
+    card_service = CardService()
+    card_coordinator = CardCoordinator(card_service, card_history_service)
+    card_view_state_service = CardViewStateService(card_service)
 
     AppContext.register(PathManager, paths)
     AppContext.register(LoggerService, logger)
@@ -118,6 +138,14 @@ def build_services(root: Path | None = None):
     AppContext.register(EventBus, event_bus)
     AppContext.register(WindowRegistryStore, registry_store)
     AppContext.register(WindowRegistry, registry)
+    AppContext.register(ActivityProgressStore, progress_store)
+    AppContext.register(ActivityProgressService, progress_service)
+    AppContext.register(WorkspaceService, workspace_service)
+    AppContext.register(CardHistoryStore, card_history_store)
+    AppContext.register(CardHistoryService, card_history_service)
+    AppContext.register(CardService, card_service)
+    AppContext.register(CardCoordinator, card_coordinator)
+    AppContext.register(CardViewStateService, card_view_state_service)
     AppContext.register(
         WindowsInputSyncController,
         WindowsInputSyncController.for_real_windows(),
@@ -143,6 +171,22 @@ def build_services(root: Path | None = None):
         )
     else:
         logger.info(f"Character window registry loaded: {len(registry.all())} character(s).")
+
+    if progress_store.recovered_from_corruption:
+        logger.warning(
+            "Activity progress was corrupt and has been rebuilt; "
+            f"backup={progress_store.corrupt_backup}"
+        )
+    else:
+        logger.info(f"Activity progress loaded: {len(progress_service.all())} record(s).")
+
+    if card_history_store.recovered_from_corruption:
+        logger.warning(
+            "Card history was corrupt and has been rebuilt; "
+            f"backup={card_history_store.corrupt_backup}"
+        )
+    else:
+        logger.info(f"Card history loaded: {len(card_history_service.all())} record(s).")
 
     keywords = _normalize_window_keywords(config.get(TARGET_WINDOW_KEY, []))
     if keywords:

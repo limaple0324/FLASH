@@ -4,7 +4,9 @@ from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.progress import TAIPEI_TIMEZONE
 from domain.progress_store import ActivityProgressStore
 from domain.status import ActivityStatus
+from main import ACTIVITY_PROGRESS_FILENAME, build_services
 from services.activity_progress_service import ActivityProgressService
+from services.app_context import AppContext
 
 
 def _definition() -> ActivityDefinition:
@@ -60,3 +62,13 @@ def test_service_requires_a_registered_activity(tmp_path):
         assert "Unknown activity" in str(exc)
     else:
         raise AssertionError("Unknown activity must be rejected.")
+
+
+def test_build_services_registers_progress_inside_managed_data(tmp_path):
+    paths, _logger = build_services(root=tmp_path)
+
+    store = AppContext.get(ActivityProgressStore)
+    service = AppContext.get(ActivityProgressService)
+
+    assert store.path == paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
+    assert service.store is store

@@ -10,6 +10,8 @@ from cards.view_state import CardViewState
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.character import Character
 from domain.group import CharacterGroup
+from main import build_services
+from services.app_context import AppContext
 from services.card_view_state_service import CardViewStateService
 
 
@@ -88,3 +90,15 @@ def test_snapshot_preserves_visible_order_and_three_card_limit():
     state = CardViewStateService(cards).snapshot()
 
     assert tuple(item.card_id for item in state.cards) == ("first", "second", "third")
+
+
+def test_build_services_registers_view_state_for_shared_card_service(tmp_path):
+    build_services(root=tmp_path)
+    card_service = AppContext.get(CardService)
+    view_state_service = AppContext.get(CardViewStateService)
+    card_service.upsert(
+        _card("guard"),
+        shown_at=datetime(2026, 7, 14, 1, 0, tzinfo=timezone.utc),
+    )
+
+    assert view_state_service.snapshot().cards[0].card_id == "guard"

@@ -6,6 +6,8 @@ from cards.priority import CardPriorityReason
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.character import Character
 from domain.group import CharacterGroup
+from main import CARD_HISTORY_FILENAME, build_services
+from services.app_context import AppContext
 from services.card_history_service import CardHistoryService
 
 
@@ -55,3 +57,13 @@ def test_service_does_not_write_general_reminders(tmp_path):
     assert record is None
     assert service.all() == ()
     assert not path.exists()
+
+
+def test_build_services_registers_history_inside_managed_data(tmp_path):
+    paths, _logger = build_services(root=tmp_path)
+
+    store = AppContext.get(CardHistoryStore)
+    service = AppContext.get(CardHistoryService)
+
+    assert store.path == paths.data_dir() / CARD_HISTORY_FILENAME
+    assert service.store is store
