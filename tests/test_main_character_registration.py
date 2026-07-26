@@ -4,6 +4,10 @@ from domain.character import Character, CharacterImportance
 from domain.character_store import CharacterStore
 from main import CHARACTER_FILENAME, build_services
 from services.app_context import AppContext
+from services.character_detail_view_service import (
+    CharacterDetailViewService,
+    PlayerCharacterDetail,
+)
 from services.character_view_service import CharacterViewService, PlayerCharacterView
 
 
@@ -66,3 +70,25 @@ def test_build_services_isolates_corrupt_character_profiles(tmp_path) -> None:
     assert store.recovered_from_backup is False
     assert AppContext.get(CharacterViewService).all() == ()
     assert list(path.parent.glob("characters.json.corrupt*"))
+
+
+def test_build_services_registers_detail_without_frozen_life_soul(tmp_path) -> None:
+    registry = WindowRegistry()
+    registry.register_character("char-a", "角色甲", group="14支")
+    WindowRegistryStore(tmp_path / "data" / "window_registry.json").save(registry)
+
+    build_services(root=tmp_path)
+
+    details = AppContext.get(CharacterDetailViewService)
+    assert details.all() == (
+        PlayerCharacterDetail(
+            display_name="角色甲",
+            group="14支",
+            level=None,
+            importance=None,
+            role=None,
+            note=None,
+            soul_stone=None,
+        ),
+    )
+    assert not hasattr(details.all()[0], "life_soul")

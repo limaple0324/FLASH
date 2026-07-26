@@ -36,6 +36,7 @@ from services.app_context import AppContext
 from services.card_coordinator import CardCoordinator
 from services.card_history_service import CardHistoryService
 from services.card_view_state_service import CardViewStateService
+from services.character_detail_view_service import CharacterDetailViewService
 from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
@@ -132,6 +133,10 @@ def build_services(root: Path | None = None):
     character_view_service = CharacterViewService(registry, characters)
     soul_stone_store = SoulStoneStore(paths.data_dir() / SOUL_STONE_FILENAME)
     soul_stone_service = SoulStoneService(soul_stone_store)
+    character_detail_view_service = CharacterDetailViewService(
+        character_view_service,
+        soul_stone_service,
+    )
     progress_store = ActivityProgressStore(
         paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
     )
@@ -153,6 +158,7 @@ def build_services(root: Path | None = None):
     AppContext.register(CharacterViewService, character_view_service)
     AppContext.register(SoulStoneStore, soul_stone_store)
     AppContext.register(SoulStoneService, soul_stone_service)
+    AppContext.register(CharacterDetailViewService, character_detail_view_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(WorkspaceService, workspace_service)
