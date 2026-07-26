@@ -71,6 +71,26 @@ def test_windows_app_identity_is_set_before_window_creation(monkeypatch):
     assert calls == [WINDOWS_APP_USER_MODEL_ID]
 
 
+def test_packaged_executable_uses_its_embedded_taskbar_identity(monkeypatch):
+    calls = []
+
+    class FakeShell32:
+        @staticmethod
+        def SetCurrentProcessExplicitAppUserModelID(value):
+            calls.append(value)
+
+    class FakeWindll:
+        shell32 = FakeShell32()
+
+    monkeypatch.setattr(main.sys, "platform", "win32")
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(main.ctypes, "windll", FakeWindll(), raising=False)
+
+    main.apply_windows_app_identity()
+
+    assert calls == []
+
+
 def test_window_icon_sets_the_current_window_icon(monkeypatch, tmp_path):
     ico = tmp_path / "flash_icon.ico"
     png = tmp_path / "flash_icon.png"

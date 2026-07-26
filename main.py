@@ -114,6 +114,12 @@ def resource_path(relative_path: Path) -> Path:
 def apply_windows_app_identity() -> None:
     if sys.platform != "win32":
         return
+    # A frozen executable already has its own Windows identity and embedded
+    # icon. Giving it an explicit development AppUserModelID without a Shell
+    # shortcut carrying the same property makes the taskbar reuse Python's
+    # cached icon group on Windows 11.
+    if bool(getattr(sys, "frozen", False)):
+        return
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_USER_MODEL_ID)
     except (AttributeError, OSError):
