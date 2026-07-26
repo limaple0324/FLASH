@@ -35,6 +35,14 @@ complete. The user deferred clean-account/another-PC testing on 2026-07-26,
 so it is not a local packaging blocker and is not claimed passed. `main` and
 `release/latest` remain unchanged pending separate approval.
 
+GitHub Actions run #130 (ID `30180931066`) for acceptance-document commit
+`8d58315ff00e02729fa7744ba5a0938a021d61cc` subsequently passed compilation,
+all 278 tests, source and packaged self-checks, Windows EXE creation, bundle
+metadata/hash verification, and artifact upload. Artifact `8625523051` has
+digest `caecb7ad0758486007c36c0be2f990e5facc819d642b1b8ea3e7a1affe652fc8`.
+The SP1-only publication advanced `release/sp1` to `4575cfc`; the
+`release/latest` step was skipped.
+
 GitHub Actions run #120 for `f419e07` passed the complete workflow and published
 the SP1-only release to `release/sp1`. The permanent ZIP SHA-256 matches artifact
 `8616031855`:
@@ -383,6 +391,10 @@ paused. SP2 and SP3 work does not resume until the prior delivery stage is compl
   `73cc0d59844acb4f0e6e043b55501d2b0d1ab6f639d69a03bc728b6588809d4a`.
 - Latest independent SP1 evidence:
   `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.3-28110e6-snapshot.md`.
+- Cloud acceptance: GitHub Actions run #130 / `30180931066`, artifact
+  `8625523051`, artifact digest
+  `caecb7ad0758486007c36c0be2f990e5facc819d642b1b8ea3e7a1affe652fc8`,
+  SP1 publication commit `4575cfc357cb1c405e86ae6b8f8149bc537afa85`.
 - The latest SP1 artifact record must include branch, full commit, version,
   tests, self-checks, SHA-256, build source, Windows evidence, and publication
   state.

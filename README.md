@@ -27,6 +27,9 @@ SP1 0.1.3 獨立 Windows 成品已完成本機正式驗收；下一步才開始�
 來源與封裝 8/8 自我檢查、真實 14 視窗三種輸入政策、14 視窗同時斷線
 重連、Windows EXE、ZIP 雜湊、解壓後驗證及兩次圖形啟閉均已通過。
 永久成品與證據保存在 `C:\Users\USER\Documents\輔\SP1成品`。
+驗收文件提交 `8d58315` 的 GitHub Actions run #130 亦已通過 278 項測試與
+完整 Windows 建置；artifact 為 `8625523051`，SP1 專用 `release/sp1`
+成功更新，`release/latest` 正確略過。
 
 SP1 目前已包含：
 

@@ -46,6 +46,10 @@
 - This independent SP1 snapshot is locally accepted. Clean-account testing was
   explicitly deferred to another PC and is not claimed passed; `main` and
   `release/latest` remain unchanged.
+- GitHub Actions run #130 for acceptance-doc commit `8d58315` passed the full
+  278-test Windows workflow and produced artifact `8625523051` with digest
+  `caecb7ad0758486007c36c0be2f990e5facc819d642b1b8ea3e7a1affe652fc8`.
+  `release/sp1` advanced to `4575cfc`; `release/latest` was skipped.
 
 ## SP1 0.1.2 — 2026-07-25
 

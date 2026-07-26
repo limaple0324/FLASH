@@ -119,6 +119,13 @@ manifest、ZIP 解壓後驗證及兩次 GUI 啟動／正常關閉，關閉後殘
   `C:\Users\USER\Documents\輔\SP1成品\FLASH-SP1-Windows-0.1.3-28110e6-snapshot.md`
 - 發布狀態：獨立本機快照；`main`／`release/latest` 未變更。
 
+驗收文件提交 `8d58315ff00e02729fa7744ba5a0938a021d61cc` 的 GitHub
+Actions run #130（ID `30180931066`）完成 278 項測試與完整 Windows 工作，
+artifact `8625523051` digest 為
+`caecb7ad0758486007c36c0be2f990e5facc819d642b1b8ea3e7a1affe652fc8`。
+SP1 專用 `release/sp1` 更新到
+`4575cfc357cb1c405e86ae6b8f8149bc537afa85`；`release/latest` 正確略過。
+
 SP1 獨立本機正式驗收完成。乾淨帳號／別台電腦驗證已由使用者決定延後，
 不得標成已通過。
 

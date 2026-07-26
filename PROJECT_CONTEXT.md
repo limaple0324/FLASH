@@ -95,6 +95,12 @@
 - SP1 獨立本機交付與正式驗收完成。使用者於 2026-07-26 決定乾淨帳號／
   另一台電腦驗證延後自行執行，不得把該外部驗證寫成已通過；`main` 與
   `release/latest` 亦維持原狀，等待另行核准。
+- 驗收文件提交 `8d58315` 的 GitHub Actions run #130（ID `30180931066`）
+  完整成功，278 項測試、來源／封裝自檢、Windows EXE、bundle、雜湊與
+  artifact `8625523051` 全部通過；artifact digest 為
+  `caecb7ad0758486007c36c0be2f990e5facc819d642b1b8ea3e7a1affe652fc8`。
+  `release/sp1` 更新到 `4575cfc357cb1c405e86ae6b8f8149bc537afa85`，
+  `release/latest` 正確跳過。
 
 ## 固定範圍
 
