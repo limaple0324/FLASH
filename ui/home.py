@@ -355,6 +355,9 @@ class HomeView:
         self._reconnect_failure_card: Frame | None = None
         self._reconnect_failure_label: Label | None = None
         self._home_role_rows_frame: Frame | None = None
+        self._last_group_role_statuses: (
+            tuple[GroupRoleStatus, ...] | None
+        ) = None
         self._home_activity_heading: Label | None = None
         self._auto_click_interval_entry: Entry | None = None
         self._auto_click_button_variable: StringVar | None = None
@@ -895,6 +898,9 @@ class HomeView:
             return ()
         if frame is None:
             return rows
+        if rows == self._last_group_role_statuses:
+            return rows
+        self._last_group_role_statuses = rows
         for child in frame.winfo_children():
             child.destroy()
         if not rows:

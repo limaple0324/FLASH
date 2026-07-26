@@ -2,7 +2,8 @@ from pathlib import Path
 
 from core.target_window_observation import TargetWindowObservation
 from services.character_view_service import PlayerCharacterView
-from ui.home import _safe_character_lines, _workspace_state_text
+from services.group_role_status_service import GroupRoleStatus
+from ui.home import HomeView, _safe_character_lines, _workspace_state_text
 from workspace.models import WorkspaceState
 
 
@@ -66,3 +67,25 @@ def test_target_window_observation_remains_safe_read_only_value() -> None:
     )
 
     assert not hasattr(observation, "handle")
+
+
+def test_unchanged_role_status_refresh_does_not_rebuild_home_rows() -> None:
+    row = GroupRoleStatus(
+        action_id="role-1",
+        display_name="100古",
+        status="已開啟",
+        order=1,
+    )
+
+    class FrameThatMustNotRebuild:
+        @staticmethod
+        def winfo_children():
+            raise AssertionError("unchanged role rows must not be rebuilt")
+
+    view = object.__new__(HomeView)
+    view._home_role_rows_frame = FrameThatMustNotRebuild()
+    view._last_group_role_statuses = (row,)
+    view.group_role_status_provider = lambda: (row,)
+    view.on_refresh_error = None
+
+    assert view.refresh_group_role_statuses() == (row,)
