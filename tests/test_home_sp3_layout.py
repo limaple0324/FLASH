@@ -15,6 +15,19 @@ def test_home_has_real_product_pages_and_group_selection() -> None:
     assert "on_group_change" in source
     assert "character_choices" in source
     assert "靈魂石" not in source
+    assert "_build_group_summary(sidebar)" in source
+    assert "_build_header(root)" not in source
+    assert 'text="+"' not in source
+
+
+def test_current_group_uses_sidebar_information_card() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+
+    assert 'text="目前組別"' in source
+    assert "SIDEBAR_GROUP" in source
+    assert "SIDEBAR_MUTED" in source
+    assert "self._group_value_label" in source
+    assert "wraplength=118" in source
 
 
 def test_character_page_uses_confirmed_note_field() -> None:

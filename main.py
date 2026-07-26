@@ -49,6 +49,7 @@ from domain.progress_store import ActivityProgressStore
 from habit.service import ActivityOrderHabitService
 from habit.store import ActivityOrderHabitStore
 from services.activity_progress_service import ActivityProgressService
+from services.activity_schedule_view_service import ActivityScheduleViewService
 from services.app_context import AppContext
 from services.card_coordinator import CardCoordinator
 from services.card_display_settings_service import CardDisplaySettingsService
@@ -186,6 +187,9 @@ def build_services(root: Path | None = None):
     )
     progress_service = ActivityProgressService(progress_store)
     activity_schedule_catalog = build_confirmed_activity_catalog()
+    activity_schedule_view_service = ActivityScheduleViewService(
+        activity_schedule_catalog
+    )
     for rule in activity_schedule_catalog.all():
         progress_service.register_definition(rule.definition)
     decision_service = DecisionService()
@@ -254,6 +258,7 @@ def build_services(root: Path | None = None):
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(ActivityScheduleCatalog, activity_schedule_catalog)
+    AppContext.register(ActivityScheduleViewService, activity_schedule_view_service)
     AppContext.register(DecisionService, decision_service)
     AppContext.register(ActivityOrderHabitStore, activity_order_habit_store)
     AppContext.register(ActivityOrderHabitService, activity_order_habit_service)
@@ -556,6 +561,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     logger = AppContext.get(LoggerService)
     group_selection_service = AppContext.get(GroupSelectionService)
     workspace_service = AppContext.get(WorkspaceService)
+    activity_schedule_view_service = AppContext.get(ActivityScheduleViewService)
     card_view_state_service = AppContext.get(CardViewStateService)
     card_service = AppContext.get(CardService)
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
@@ -871,6 +877,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         workspace_state_provider=(
             workspace_service.snapshot
             if workspace_service is not None
+            else None
+        ),
+        activity_schedule=(
+            activity_schedule_view_service.snapshot()
+            if activity_schedule_view_service is not None
+            else None
+        ),
+        activity_schedule_provider=(
+            activity_schedule_view_service.snapshot
+            if activity_schedule_view_service is not None
             else None
         ),
         card_view_state=(

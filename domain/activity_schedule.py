@@ -246,7 +246,7 @@ def build_confirmed_activity_catalog() -> ActivityScheduleCatalog:
             (6,),
             time(14, 20),
             every_n_weeks=2,
-            anchor_date=date(2026, 7, 26),
+            anchor_date=date(2026, 8, 2),
         ),
         ScheduledActivityRule(
             _activity(
@@ -257,7 +257,7 @@ def build_confirmed_activity_catalog() -> ActivityScheduleCatalog:
             (6,),
             time(14, 20),
             every_n_weeks=2,
-            anchor_date=date(2026, 8, 2),
+            anchor_date=date(2026, 7, 26),
         ),
         ScheduledActivityRule(
             _activity("fantasy-realm-1530", "幻境（15:30）", calendar=True),

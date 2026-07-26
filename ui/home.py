@@ -29,6 +29,7 @@ from services.character_detail_choice_service import PlayerCharacterDetailChoice
 from services.character_detail_view_service import PlayerCharacterDetail
 from services.character_view_service import PlayerCharacterView
 from services.group_selection_service import PlayerGroupChoice
+from services.activity_schedule_view_service import PlayerActivitySchedule
 from workspace.models import WorkspaceState
 
 
@@ -42,6 +43,8 @@ BACKGROUND = "#F3F6FA"
 SURFACE = "#FFFFFF"
 SIDEBAR = "#17324D"
 SIDEBAR_ACTIVE = "#2D6EA8"
+SIDEBAR_GROUP = "#203E5B"
+SIDEBAR_MUTED = "#B8C9D9"
 PRIMARY = "#2474C6"
 PRIMARY_HOVER = "#1E64AB"
 TEXT = "#182433"
@@ -137,6 +140,18 @@ def _workspace_state_text(state: WorkspaceState) -> str:
     return f"目前組別：{group}\n目前活動：{activity}\n下一步：{next_step}"
 
 
+def _activity_schedule_text(state: PlayerActivitySchedule | None) -> str:
+    if state is None or not state.activities:
+        return "今天沒有已登記的固定活動"
+    lines = []
+    for activity in state.activities:
+        eligibility = (
+            f"｜{activity.eligibility_text}" if activity.eligibility_text else ""
+        )
+        lines.append(f"{activity.time_text}　{activity.name}{eligibility}")
+    return "\n".join(lines)
+
+
 def _safe_character_lines(
     characters: Iterable[PlayerCharacterView],
 ) -> tuple[str, ...]:
@@ -178,6 +193,10 @@ class HomeView:
         on_group_change: Callable[[str], object] | None = None,
         workspace_state: WorkspaceState | None = None,
         workspace_state_provider: Callable[[], WorkspaceState] | None = None,
+        activity_schedule: PlayerActivitySchedule | None = None,
+        activity_schedule_provider: (
+            Callable[[], PlayerActivitySchedule] | None
+        ) = None,
         card_view_state: CardViewState | None = None,
         card_view_state_provider: Callable[[], CardViewState] | None = None,
         target_window_state: TargetWindowObservation | None = None,
@@ -215,6 +234,8 @@ class HomeView:
         self.on_group_change = on_group_change
         self.workspace_state = workspace_state or WorkspaceState()
         self.workspace_state_provider = workspace_state_provider
+        self.activity_schedule = activity_schedule
+        self.activity_schedule_provider = activity_schedule_provider
         self.card_view_state = card_view_state
         self.card_view_state_provider = card_view_state_provider
         self.target_window_state = target_window_state
@@ -241,6 +262,7 @@ class HomeView:
         self._pages: dict[str, Frame] = {}
         self._navigation_buttons: dict[str, Button] = {}
         self._workspace_label: Label | None = None
+        self._activity_schedule_label: Label | None = None
         self._card_label: Label | None = None
         self._target_label: Label | None = None
         self._group_value_label: Label | None = None
@@ -286,7 +308,6 @@ class HomeView:
     def build(self):
         root = Frame(self.parent, bg=BACKGROUND)
         root.pack(fill=BOTH, expand=True)
-        self._build_header(root)
 
         body = Frame(root, bg=BACKGROUND)
         body.pack(fill=BOTH, expand=True)
@@ -295,6 +316,8 @@ class HomeView:
         sidebar.pack_propagate(False)
         content = Frame(body, bg=BACKGROUND, padx=22, pady=20)
         content.pack(side=LEFT, fill=BOTH, expand=True)
+
+        self._build_group_summary(sidebar)
 
         page_specs = (
             ("home", "首頁"),
@@ -331,37 +354,40 @@ class HomeView:
         self.show_page("home")
         return root
 
-    def _build_header(self, parent) -> None:
-        header = Frame(parent, bg=SURFACE, padx=20, pady=12)
-        header.pack(fill=X)
-        brand = Frame(header, bg=SURFACE)
-        brand.pack(side=LEFT)
+    def _build_group_summary(self, parent) -> None:
+        group_card = Frame(
+            parent,
+            bg=SIDEBAR_GROUP,
+            highlightbackground="#2A4B69",
+            highlightthickness=1,
+        )
+        group_card.pack(fill=X, pady=(0, 16))
+        accent = Frame(group_card, bg=PRIMARY, width=4)
+        accent.pack(side=LEFT, fill=Y)
+        accent.pack_propagate(False)
+        details = Frame(group_card, bg=SIDEBAR_GROUP, padx=12, pady=10)
+        details.pack(side=LEFT, fill=X, expand=True)
         Label(
-            brand,
-            text="+",
-            width=2,
-            font=("Microsoft JhengHei UI", 16, "bold"),
-            bg=PRIMARY,
-            fg="#FFFFFF",
-        ).pack(side=LEFT)
-        Label(
-            brand,
-            text="輔",
-            font=("Microsoft JhengHei UI", 16, "bold"),
-            bg=SURFACE,
-            fg=TEXT,
-            padx=10,
-        ).pack(side=LEFT)
+            details,
+            text="目前組別",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SIDEBAR_GROUP,
+            fg=SIDEBAR_MUTED,
+            anchor="w",
+        ).pack(fill=X)
 
         current_group = self.current_group_name or "尚未選擇組別"
         self._group_value_label = Label(
-            header,
+            details,
             text=current_group,
-            font=("Microsoft JhengHei UI", 10),
-            bg=SURFACE,
-            fg=MUTED,
+            font=("Microsoft JhengHei UI", 14, "bold"),
+            bg=SIDEBAR_GROUP,
+            fg="#FFFFFF",
+            anchor="w",
+            justify=LEFT,
+            wraplength=118,
         )
-        self._group_value_label.pack(side=RIGHT)
+        self._group_value_label.pack(fill=X, pady=(3, 0))
 
     def _page_heading(self, parent, title: str, subtitle: str) -> None:
         Label(
@@ -432,6 +458,27 @@ class HomeView:
             anchor="w",
         )
         self._target_label.pack(fill=X, pady=(8, 0))
+
+        Label(
+            page,
+            text="今日已登記活動",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=BACKGROUND,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X, pady=(20, 8))
+        schedule_card = self._card(page, pady=12)
+        schedule_card.pack(fill=X)
+        self._activity_schedule_label = Label(
+            schedule_card,
+            text=_activity_schedule_text(self.activity_schedule),
+            justify=LEFT,
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        )
+        self._activity_schedule_label.pack(fill=X)
 
         Label(
             page,
@@ -962,6 +1009,7 @@ class HomeView:
         if self.on_start is not None:
             self.on_start()
         self.refresh_workspace()
+        self.refresh_activity_schedule()
         self.refresh_cards()
         self.refresh_target_window()
 
@@ -980,6 +1028,27 @@ class HomeView:
         self.workspace_state = state
         if self._workspace_label is not None:
             self._workspace_label.configure(text=text)
+        return text
+
+    def refresh_activity_schedule(self) -> str:
+        previous = self.activity_schedule
+        try:
+            state = (
+                self.activity_schedule_provider()
+                if self.activity_schedule_provider is not None
+                else previous
+            )
+            if state is not None and not isinstance(state, PlayerActivitySchedule):
+                raise TypeError(
+                    "activity schedule provider must return PlayerActivitySchedule."
+                )
+            text = _activity_schedule_text(state)
+        except Exception as error:
+            self._report_refresh_error(error)
+            return _activity_schedule_text(previous)
+        self.activity_schedule = state
+        if self._activity_schedule_label is not None:
+            self._activity_schedule_label.configure(text=text)
         return text
 
     def refresh_cards(self) -> str:

@@ -46,11 +46,11 @@ def test_sunday_1420_alternates_from_the_supplied_anchor_week():
     strange_stone = catalog.get("strange-stone-1420")
     fantasy_realm = catalog.get("fantasy-realm-alternating-1420")
 
-    assert strange_stone.occurs_on(date(2026, 7, 26)) is True
-    assert fantasy_realm.occurs_on(date(2026, 7, 26)) is False
-    assert strange_stone.occurs_on(date(2026, 8, 2)) is False
-    assert fantasy_realm.occurs_on(date(2026, 8, 2)) is True
-    assert strange_stone.occurs_on(date(2026, 8, 9)) is True
+    assert strange_stone.occurs_on(date(2026, 7, 26)) is False
+    assert fantasy_realm.occurs_on(date(2026, 7, 26)) is True
+    assert strange_stone.occurs_on(date(2026, 8, 2)) is True
+    assert fantasy_realm.occurs_on(date(2026, 8, 2)) is False
+    assert fantasy_realm.occurs_on(date(2026, 8, 9)) is True
 
 
 def test_confirmed_level_restrictions_do_not_guess_other_activity_audiences():
@@ -92,7 +92,7 @@ def test_next_timed_activity_uses_taipei_time_and_skips_untimed_requirement():
     occurrence, rule = catalog.next_timed_after(after)
 
     assert occurrence == datetime(2026, 7, 26, 14, 20, tzinfo=TAIPEI_TIMEZONE)
-    assert rule.activity_id == "strange-stone-1420"
+    assert rule.activity_id == "fantasy-realm-alternating-1420"
 
 
 def test_build_services_registers_catalog_and_all_progress_definitions(tmp_path):
