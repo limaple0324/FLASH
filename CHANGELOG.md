@@ -1,5 +1,18 @@
 # Changelog
 
+## SP2 cumulative engineering — 2026-07-26
+
+- Established `sp2/completion-2026-07-26` from accepted SP1 commit `64ecfc2`.
+- Added an independent SP2 delivery area without duplicating the cumulative
+  source tree.
+- Ported the first SP2 Brain batch in `f41e708`: characters, groups,
+  activities, three-state progress, Taipei daily reset, atomic progress
+  persistence, workspace state, and group-card data/lifecycle/history rules.
+- 96 affected tests and compilation of `domain/`, `workspace/`, and `cards/`
+  passed.
+- No SP3 UI, game input, player-visible registry mapping, or frozen resource
+  area was added.
+
 ## SP1 0.1.3 independent local acceptance — 2026-07-26
 
 - Added `B`/`C`-only Windows input synchronization with foreground-only,
