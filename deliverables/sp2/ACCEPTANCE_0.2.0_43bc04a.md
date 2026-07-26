@@ -60,7 +60,22 @@ SP2 獨立交付是本層來源範圍、規格、測試與驗收證據，不複�
 - 第二次正常關閉：殘留指定成品視窗 0。
 - 驗收過程未操作 14 個 Flash 遊戲視窗。
 
-## 五、不得擴大宣稱
+## 五、桌面最新進度安裝
+
+- 桌面捷徑：`C:\Users\USER\Desktop\啟動輔.lnk`
+- 最新安裝位置：
+  `C:\Users\USER\AppData\Local\Programs\輔\SP1+SP2\FLASH.exe`
+- 安裝後 EXE SHA-256：
+  `5C2CA4936E43F2C7118B20C5C9B73FACD1D2F9702D0A5F07679A10A0A01FC0AC`
+- 捷徑 TargetPath、WorkingDirectory 與 IconLocation 均已切換到
+  `SP1+SP2` 新位置。
+- 從桌面捷徑實際啟動只出現 1 個指定安裝版「輔」視窗；正常關閉後殘留 0。
+- 原 `C:\Users\USER\AppData\Local\Programs\輔\SP1\FLASH.exe` 保留，
+  沒有被新累積版覆蓋。
+- 舊捷徑與更新紀錄備份於：
+  `C:\Users\USER\AppData\Local\Programs\輔系統\更新交易\20260726-1050-SP1+SP2-0.2.0-43bc04a`
+
+## 六、不得擴大宣稱
 
 - 真正活動地圖名稱、各活動精確完成時機與參與角色範圍仍需隨實際畫面補足。
 - 自動習慣穩定門檻、跨組同步、提醒位、玩家可見登記頁仍待確認。

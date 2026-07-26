@@ -95,6 +95,10 @@
   `5C2CA4936E43F2C7118B20C5C9B73FACD1D2F9702D0A5F07679A10A0A01FC0AC`。
 - 最新包內驗證、封裝自我檢查 8/8 與 Windows 11 兩次唯一「輔」視窗
   啟動／正常關閉通過；兩次殘留指定成品視窗均為 0。
+- 桌面 `啟動輔.lnk` 已切換到獨立新安裝位置
+  `C:\Users\USER\AppData\Local\Programs\輔\SP1+SP2\FLASH.exe`；TargetPath、
+  WorkingDirectory、IconLocation、EXE 雜湊與桌面捷徑實際啟閉均驗收通過。
+  舊 SP1 安裝檔與舊捷徑交易備份均保留。
 
 ## 倉庫與工作基準
 
