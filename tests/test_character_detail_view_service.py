@@ -52,6 +52,16 @@ def test_control_layer_can_pair_detail_with_stable_identity(tmp_path) -> None:
     assert not hasattr(detail, "character_id")
 
 
+def test_get_by_identity_returns_latest_note(tmp_path) -> None:
+    registry = WindowRegistry()
+    registry.register_character("char-a", "角色甲", note="原本備註")
+    service = CharacterDetailViewService(CharacterViewService(registry, ()))
+
+    registry.set_note("char-a", "更新後備註")
+
+    assert service.get_by_identity("char-a").note == "更新後備註"
+
+
 def test_control_pairing_does_not_guess_from_duplicate_display_names(
     tmp_path,
 ) -> None:

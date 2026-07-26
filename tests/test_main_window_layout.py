@@ -9,6 +9,11 @@ def test_main_window_uses_home_view():
     assert "on_test_key=test_approved_key" in source
     assert "group_choices=group_choices" in source
     assert "on_group_change=change_group" in source
+    assert "build_windows_card_overlay_runtime" in source
+    assert "CardExpiryMonitor" in source
+    assert "on_card_display_seconds_update=update_card_display_seconds" in source
+    assert "CharacterDetailWindow" in source
+    assert "CharacterNoteService" in source
 
 
 def test_main_window_start_message_is_player_facing():

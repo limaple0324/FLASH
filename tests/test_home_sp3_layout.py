@@ -13,6 +13,7 @@ def test_home_has_real_product_pages_and_group_selection() -> None:
         assert label in source
     assert "目前組別" in source
     assert "on_group_change" in source
+    assert "character_choices" in source
     assert "靈魂石" not in source
 
 

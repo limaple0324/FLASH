@@ -42,11 +42,17 @@ class CharacterDetailChoiceService:
         self._details = details
         self._on_select = on_select
 
+    def _select(self, character_id: str) -> None:
+        self._on_select(
+            character_id,
+            self._details.get_by_identity(character_id),
+        )
+
     def all(self) -> tuple[PlayerCharacterDetailChoice, ...]:
         return tuple(
             PlayerCharacterDetailChoice(
                 detail=detail,
-                select=partial(self._on_select, character_id, detail),
+                select=partial(self._select, character_id),
             )
             for character_id, detail in self._details.all_with_identities()
         )

@@ -41,8 +41,25 @@ def test_choices_bind_duplicate_names_to_exact_stable_identities(tmp_path) -> No
         "char-b",
         "char-a",
     )
-    assert selected[0][1] is choices[1].detail
-    assert selected[1][1] is choices[0].detail
+    assert selected[0][1] == choices[1].detail
+    assert selected[1][1] == choices[0].detail
+
+
+def test_choice_resolves_latest_note_when_opened_again(tmp_path) -> None:
+    registry = WindowRegistry()
+    registry.register_character("char-a", "角色甲", note="原本備註")
+    details = CharacterDetailViewService(CharacterViewService(registry, ()))
+    selected = []
+    choice = CharacterDetailChoiceService(
+        details,
+        lambda character_id, detail: selected.append((character_id, detail)),
+    ).all()[0]
+
+    registry.set_note("char-a", "更新後備註")
+    choice.select()
+
+    assert selected[0][0] == "char-a"
+    assert selected[0][1].note == "更新後備註"
 
 
 def test_choice_exposes_no_character_identity_field(tmp_path) -> None:

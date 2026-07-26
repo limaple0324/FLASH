@@ -12,6 +12,7 @@ from tkinter import (
     X,
     Y,
     Button,
+    Entry,
     Frame,
     Label,
     OptionMenu,
@@ -21,6 +22,8 @@ from tkinter import (
 from cards.view_state import CardViewState
 from core.target_window_observation import TargetWindowObservation
 from presentation.target_window_status import target_window_summary
+from services.character_detail_choice_service import PlayerCharacterDetailChoice
+from services.character_detail_view_service import PlayerCharacterDetail
 from services.character_view_service import PlayerCharacterView
 from services.group_selection_service import PlayerGroupChoice
 from workspace.models import WorkspaceState
@@ -145,6 +148,15 @@ def _safe_character_lines(
     return tuple(lines)
 
 
+def _safe_character_detail_line(detail: PlayerCharacterDetail) -> str:
+    if not isinstance(detail, PlayerCharacterDetail):
+        raise TypeError("detail must be PlayerCharacterDetail.")
+    level = str(detail.level) if detail.level is not None else "等級未設定"
+    role = detail.role or "定位未設定"
+    note = f"｜備註：{detail.note}" if detail.note else ""
+    return f"{detail.display_name}｜{level}｜{role}{note}"
+
+
 class HomeView:
     """Usable SP3 shell that keeps confirmed capabilities in separate pages."""
 
@@ -169,7 +181,10 @@ class HomeView:
             Callable[[], TargetWindowObservation] | None
         ) = None,
         characters: Iterable[PlayerCharacterView] = (),
+        character_choices: Iterable[PlayerCharacterDetailChoice] = (),
         smart_reconnect_enabled: bool = True,
+        card_display_seconds_provider: Callable[[], int] | None = None,
+        on_card_display_seconds_update: Callable[[int], object] | None = None,
         on_refresh_error: Callable[[Exception], object] | None = None,
     ):
         self.parent = parent
@@ -204,7 +219,17 @@ class HomeView:
             for character in self.characters
         ):
             raise TypeError("characters must contain PlayerCharacterView values.")
+        self.character_choices = tuple(character_choices)
+        if any(
+            not isinstance(choice, PlayerCharacterDetailChoice)
+            for choice in self.character_choices
+        ):
+            raise TypeError(
+                "character_choices must contain PlayerCharacterDetailChoice values."
+            )
         self.smart_reconnect_enabled = bool(smart_reconnect_enabled)
+        self.card_display_seconds_provider = card_display_seconds_provider
+        self.on_card_display_seconds_update = on_card_display_seconds_update
         self.on_refresh_error = on_refresh_error
         self._pages: dict[str, Frame] = {}
         self._navigation_buttons: dict[str, Button] = {}
@@ -213,6 +238,7 @@ class HomeView:
         self._target_label: Label | None = None
         self._group_value_label: Label | None = None
         self._group_variable: StringVar | None = None
+        self._card_seconds_entry: Entry | None = None
 
     @staticmethod
     def _button(parent, text: str, command=None, *, primary: bool = False):
@@ -649,20 +675,29 @@ class HomeView:
         )
         card = self._card(page, padx=0, pady=4)
         card.pack(fill=X)
-        lines = _safe_character_lines(self.characters)
-        if not lines:
-            lines = ("目前沒有可顯示的角色資料。",)
-        for line in lines:
+        rows: tuple[tuple[str, Callable[[], None] | None], ...]
+        if self.character_choices:
+            rows = tuple(
+                (_safe_character_detail_line(choice.detail), choice.select)
+                for choice in self.character_choices
+            )
+        else:
+            rows = tuple((line, None) for line in _safe_character_lines(self.characters))
+        if not rows:
+            rows = (("目前沒有可顯示的角色資料。", None),)
+        for line, select in rows:
+            row = Frame(card, bg=SURFACE, padx=18, pady=6)
+            row.pack(fill=X)
             Label(
-                card,
+                row,
                 text=line,
                 font=("Microsoft JhengHei UI", 10),
                 bg=SURFACE,
-                fg=TEXT if self.characters else MUTED,
+                fg=TEXT if self.characters or self.character_choices else MUTED,
                 anchor="w",
-                padx=18,
-                pady=10,
-            ).pack(fill=X)
+            ).pack(side=LEFT, fill=X, expand=True)
+            if select is not None:
+                self._button(row, "查看", select).pack(side=RIGHT)
         return page
 
     def _build_settings_page(self, parent) -> Frame:
@@ -676,7 +711,7 @@ class HomeView:
         card.pack(fill=X)
         Label(
             card,
-            text="系統狀態",
+            text="提醒顯示時間",
             font=("Microsoft JhengHei UI", 13, "bold"),
             bg=SURFACE,
             fg=TEXT,
@@ -684,6 +719,57 @@ class HomeView:
         ).pack(fill=X)
         Label(
             card,
+            text="設定提醒卡在畫面上保留的秒數。",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        ).pack(fill=X, pady=(6, 12))
+        settings_row = Frame(card, bg=SURFACE)
+        settings_row.pack(fill=X)
+        initial_seconds = (
+            self.card_display_seconds_provider()
+            if self.card_display_seconds_provider is not None
+            else 30
+        )
+        self._card_seconds_entry = Entry(
+            settings_row,
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+            width=10,
+        )
+        self._card_seconds_entry.insert(0, str(initial_seconds))
+        self._card_seconds_entry.pack(side=LEFT, ipady=8)
+        Label(
+            settings_row,
+            text="秒",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=MUTED,
+            padx=8,
+        ).pack(side=LEFT)
+        self._button(
+            settings_row,
+            "儲存",
+            self._save_card_display_seconds,
+            primary=True,
+        ).pack(side=LEFT, padx=(8, 0))
+
+        status_card = self._card(page)
+        status_card.pack(fill=X, pady=(14, 0))
+        Label(
+            status_card,
+            text="系統狀態",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        Label(
+            status_card,
             text="查看目前視窗、安全檢查與資料保存狀態。",
             font=("Microsoft JhengHei UI", 10),
             bg=SURFACE,
@@ -691,12 +777,34 @@ class HomeView:
             anchor="w",
         ).pack(fill=X, pady=(6, 12))
         self._button(
-            card,
+            status_card,
             "查看目前狀態",
             self._refresh_from_player_action,
-            primary=True,
         ).pack(anchor="w")
         return page
+
+    def _save_card_display_seconds(self) -> None:
+        if (
+            self._card_seconds_entry is None
+            or self.on_card_display_seconds_update is None
+        ):
+            return
+        raw = self._card_seconds_entry.get().strip()
+        try:
+            seconds = int(raw)
+            if seconds < 1:
+                raise ValueError("seconds must be positive")
+            self.on_card_display_seconds_update(seconds)
+            confirmed = (
+                self.card_display_seconds_provider()
+                if self.card_display_seconds_provider is not None
+                else seconds
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._card_seconds_entry.delete(0, "end")
+        self._card_seconds_entry.insert(0, str(confirmed))
 
     def show_page(self, name: str) -> None:
         if name not in self._pages:

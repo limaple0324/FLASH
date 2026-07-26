@@ -1,0 +1,178 @@
+from datetime import datetime, timezone
+
+import pytest
+
+from cards.models import GroupCard
+from cards.priority import CardPriorityReason
+from cards.service import CardService
+from domain.activity import ActivityDefinition, ActivityType, ResetRule
+from domain.group import CharacterGroup
+from services.card_overlay_layout_service import (
+    CardOverlayLayoutService,
+    PositionedCard,
+)
+from services.card_overlay_runtime import build_windows_card_overlay_runtime
+from services.card_view_state_service import CardViewStateService
+from ui.card_content_renderer import CardContent
+from ui.card_overlay import CardPlacement, CardSize, WorkArea, calculate_card_stack
+from ui.tk_card_presenter import TkCardTextSettings
+from ui.windows_card_overlay import WindowsCardOverlayPort
+
+
+def _card(card_id: str = "daily") -> GroupCard:
+    return GroupCard(
+        card_id=card_id,
+        group=CharacterGroup(group_id="group-120", name="120"),
+        activity=ActivityDefinition(
+            activity_id="demon-hall",
+            name="諸魔殿",
+            activity_type=ActivityType.DAILY,
+            reset_rule=ResetRule.DAILY_MIDNIGHT,
+        ),
+        current_progress="尚未完成",
+        next_step="12:55 前準備",
+        priority_reason=CardPriorityReason.ACTIVITY,
+    )
+
+
+class FixedWorkArea:
+    def read(self):
+        return WorkArea(0, 0, 1920, 1040)
+
+
+class FakeWindow:
+    def __init__(self):
+        self.calls = []
+        self.destroyed = False
+
+    def overrideredirect(self, value):
+        self.calls.append(("overrideredirect", value))
+
+    def attributes(self, option, value):
+        self.calls.append(("attributes", option, value))
+
+    def geometry(self, value):
+        self.calls.append(("geometry", value))
+
+    def destroy(self):
+        self.destroyed = True
+
+
+def test_card_stack_uses_taskbar_safe_bottom_right_and_max_three() -> None:
+    placements = calculate_card_stack(
+        WorkArea(0, 0, 1920, 1040),
+        CardSize(360, 140),
+        3,
+        right_margin=20,
+        bottom_margin=20,
+        gap=12,
+    )
+
+    assert placements[0] == CardPlacement(0, 1540, 880, 360, 140)
+    assert placements[2] == CardPlacement(2, 1540, 576, 360, 140)
+    with pytest.raises(ValueError, match="more than three"):
+        calculate_card_stack(
+            WorkArea(0, 0, 1920, 1040),
+            CardSize(360, 140),
+            4,
+            right_margin=20,
+            bottom_margin=20,
+            gap=12,
+        )
+
+
+def test_overlay_window_is_topmost_borderless_and_uses_exact_geometry() -> None:
+    cards = CardService()
+    cards.upsert(_card(), shown_at=datetime.now(timezone.utc))
+    item = CardViewStateService(cards).snapshot().cards[0]
+    positioned = PositionedCard(item, CardPlacement(0, 1540, 880, 360, 140))
+    window = FakeWindow()
+    rendered = []
+    port = WindowsCardOverlayPort(
+        object(),
+        lambda target, card: rendered.append((target, card.card_id)),
+        window_factory=lambda _master: window,
+    )
+
+    port.open(positioned)
+
+    assert ("overrideredirect", True) in window.calls
+    assert ("attributes", "-topmost", True) in window.calls
+    assert ("attributes", "-alpha", 0.97) in window.calls
+    assert ("geometry", "360x140+1540+880") in window.calls
+    assert rendered == [(window, "daily")]
+    port.close("daily")
+    assert window.destroyed is True
+
+
+def test_card_change_opens_and_removal_closes_overlay() -> None:
+    cards = CardService()
+    state = CardViewStateService(cards)
+    layout = CardOverlayLayoutService(
+        state,
+        FixedWorkArea(),
+        CardSize(360, 140),
+        right_margin=20,
+        bottom_margin=20,
+        gap=12,
+    )
+    windows = []
+    runtime = build_windows_card_overlay_runtime(
+        object(),
+        cards,
+        layout,
+        TkCardTextSettings(
+            background="#FFFFFF",
+            foreground="#182433",
+            muted_foreground="#617083",
+            accent="#2474C6",
+        ),
+        window_factory=lambda _master: windows.append(FakeWindow()) or windows[-1],
+        widget_factory=_FakeWidgetFactory(),
+    )
+
+    runtime.start()
+    assert runtime.running is True
+    cards.upsert(_card(), shown_at=datetime.now(timezone.utc))
+    assert runtime.last_error is None
+    assert len(windows) == 1
+
+    cards.remove("daily")
+    assert windows[0].destroyed is True
+    runtime.stop()
+    assert runtime.running is False
+
+
+def test_card_content_uses_only_confirmed_player_fields() -> None:
+    cards = CardService()
+    cards.upsert(_card(), shown_at=datetime.now(timezone.utc))
+    item = CardViewStateService(cards).snapshot().cards[0]
+
+    content = CardContent.from_card(item)
+
+    assert content == CardContent(
+        group_name="120",
+        activity_name="諸魔殿",
+        current_progress="尚未完成",
+        next_step="12:55 前準備",
+    )
+    assert not hasattr(content, "affected_character_ids")
+
+
+class _FakeWidget:
+    def __init__(self, **options):
+        self.options = options
+
+    def configure(self, **options):
+        self.options.update(options)
+
+    def pack(self, **_options):
+        return None
+
+
+class _FakeWidgetFactory:
+    def frame(self, _parent, **options):
+        return _FakeWidget(**options)
+
+    def label(self, _parent, **options):
+        return _FakeWidget(**options)

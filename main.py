@@ -20,6 +20,7 @@ from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
 from adapters.windows_smart_reconnect import WindowsSmartReconnectController
 from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
 from adapters.windows_window import WindowsWindowAdapter
+from adapters.windows_work_area import WindowsWorkAreaReader
 from cards.history_store import CardHistoryStore
 from cards.service import CardService
 from cards.settings import (
@@ -48,9 +49,14 @@ from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
 from services.card_coordinator import CardCoordinator
 from services.card_display_settings_service import CardDisplaySettingsService
+from services.card_expiry_monitor import CardExpiryMonitor
 from services.card_history_service import CardHistoryService
+from services.card_overlay_layout_service import CardOverlayLayoutService
+from services.card_overlay_runtime import build_windows_card_overlay_runtime
 from services.card_view_state_service import CardViewStateService
 from services.character_detail_view_service import CharacterDetailViewService
+from services.character_detail_choice_service import CharacterDetailChoiceService
+from services.character_note_service import CharacterNoteService
 from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
 from services.group_selection_service import (
@@ -64,6 +70,9 @@ from services.target_window_state_service import (
     TargetWindowStateService,
 )
 from ui.home import HomeView
+from ui.character_detail_window import CharacterDetailWindow
+from ui.card_overlay import CardSize
+from ui.tk_card_presenter import TkCardTextSettings
 from workspace.models import WorkspaceState
 from workspace.service import WorkspaceService
 
@@ -157,6 +166,7 @@ def build_services(root: Path | None = None):
     characters = character_store.load()
     character_view_service = CharacterViewService(registry, characters)
     character_detail_view_service = CharacterDetailViewService(character_view_service)
+    character_note_service = CharacterNoteService(registry, registry_store)
     group_selection_service = GroupSelectionService(
         registry,
         legacy_config_path=(
@@ -233,6 +243,7 @@ def build_services(root: Path | None = None):
     AppContext.register(CharacterStore, character_store)
     AppContext.register(CharacterViewService, character_view_service)
     AppContext.register(CharacterDetailViewService, character_detail_view_service)
+    AppContext.register(CharacterNoteService, character_note_service)
     AppContext.register(GroupSelectionService, group_selection_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
@@ -533,13 +544,22 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     group_selection_service = AppContext.get(GroupSelectionService)
     workspace_service = AppContext.get(WorkspaceService)
     card_view_state_service = AppContext.get(CardViewStateService)
+    card_service = AppContext.get(CardService)
+    card_display_settings_service = AppContext.get(CardDisplaySettingsService)
     target_window_state_service = AppContext.get(TargetWindowStateService)
     character_view_service = AppContext.get(CharacterViewService)
+    character_detail_view_service = AppContext.get(CharacterDetailViewService)
+    character_note_service = AppContext.get(CharacterNoteService)
     home_view: HomeView | None = None
 
     def report_refresh_error(error: Exception) -> None:
         if logger is not None:
             logger.error(f"Player view refresh failed and was isolated: {error}")
+        messagebox.showerror(
+            "輔｜操作未完成",
+            "操作未能完成，原本資料保持不變。",
+            parent=window,
+        )
 
     def show_start_status() -> None:
         detection = detect_target_window()
@@ -596,6 +616,62 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         workspace_service.set_next_step("查看目前需要注意的內容")
         config.set(CURRENT_GROUP_NAME_KEY, choice.name)
 
+    def card_display_seconds() -> int:
+        if card_display_settings_service is None:
+            return 30
+        return (
+            card_display_settings_service.snapshot().settings.lifetime_seconds
+        )
+
+    def update_card_display_seconds(seconds: int) -> None:
+        if card_display_settings_service is None:
+            raise RuntimeError("card display settings service is unavailable")
+        card_display_settings_service.update_lifetime_seconds(seconds)
+        messagebox.showinfo(
+            "輔｜提醒顯示時間",
+            f"新的提醒卡會顯示 {seconds} 秒。",
+            parent=window,
+        )
+
+    def latest_character_detail(character_id: str):
+        if character_detail_view_service is None:
+            raise RuntimeError("character detail service is unavailable")
+        return character_detail_view_service.get_by_identity(character_id)
+
+    def open_character_detail(character_id: str, detail) -> None:
+        if character_note_service is None:
+            messagebox.showerror(
+                "輔｜角色資料",
+                "角色備註服務尚未準備完成。",
+                parent=window,
+            )
+            return
+
+        def save_note(note: str):
+            character_note_service.set_note(character_id, note)
+            return latest_character_detail(character_id)
+
+        def clear_note():
+            character_note_service.clear_note(character_id)
+            return latest_character_detail(character_id)
+
+        def note_error(_error: Exception) -> None:
+            messagebox.showerror(
+                "輔｜角色備註",
+                "備註未能保存，原本內容保持不變。",
+                parent=window,
+            )
+
+        detail_window = CharacterDetailWindow(
+            window,
+            detail,
+            on_save_note=save_note,
+            on_clear_note=clear_note,
+            on_error=note_error,
+        )
+        child = detail_window.open()
+        apply_window_icon(child)
+
     def test_approved_key(key: str) -> None:
         policy = (
             normalize_input_policy(config.get(INPUT_POLICY_KEY))
@@ -647,6 +723,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if workspace_service is not None
         else WorkspaceState()
     )
+    character_choices = (
+        CharacterDetailChoiceService(
+            character_detail_view_service,
+            open_character_detail,
+        ).all()
+        if character_detail_view_service is not None
+        else ()
+    )
     home_view = HomeView(
         window,
         status,
@@ -692,12 +776,55 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if character_view_service is not None
             else ()
         ),
+        character_choices=character_choices,
         smart_reconnect_enabled=bool(
             status.get("smart_reconnect_enabled", True)
         ),
+        card_display_seconds_provider=card_display_seconds,
+        on_card_display_seconds_update=update_card_display_seconds,
         on_refresh_error=report_refresh_error,
     )
     home_view.build()
+
+    overlay_runtime = None
+    expiry_monitor = None
+    if card_service is not None and card_view_state_service is not None:
+        overlay_layout = CardOverlayLayoutService(
+            card_view_state_service,
+            WindowsWorkAreaReader(),
+            CardSize(width=360, height=140),
+            right_margin=20,
+            bottom_margin=20,
+            gap=12,
+        )
+        overlay_runtime = build_windows_card_overlay_runtime(
+            window,
+            card_service,
+            overlay_layout,
+            TkCardTextSettings(
+                background="#FFFFFF",
+                foreground="#182433",
+                muted_foreground="#617083",
+                accent="#2474C6",
+            ),
+        )
+        overlay_runtime.start()
+        expiry_monitor = CardExpiryMonitor(card_service, window.after)
+        expiry_monitor.start()
+        card_service.subscribe(home_view.refresh_cards)
+
+    def close_window() -> None:
+        if card_service is not None:
+            card_service.unsubscribe(home_view.refresh_cards)
+        if expiry_monitor is not None:
+            expiry_monitor.stop()
+        if overlay_runtime is not None:
+            overlay_runtime.stop()
+        window.destroy()
+
+    window.protocol("WM_DELETE_WINDOW", close_window)
+    window._card_overlay_runtime = overlay_runtime
+    window._card_expiry_monitor = expiry_monitor
     return window
 
 

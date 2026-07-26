@@ -63,3 +63,10 @@ class CharacterDetailViewService:
 
     def all(self) -> tuple[PlayerCharacterDetail, ...]:
         return tuple(detail for _character_id, detail in self.all_with_identities())
+
+    def get_by_identity(self, character_id: str) -> PlayerCharacterDetail:
+        """Resolve the latest safe snapshot for an already-bound internal id."""
+        for current_id, detail in self.all_with_identities():
+            if current_id == character_id:
+                return detail
+        raise KeyError("character detail is no longer available")
