@@ -9,6 +9,8 @@ from core.sp1_boundaries import ExternalAdapter, OperationResult
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from services.app_context import AppContext
+from services.event_bus import EventBus
+from services.target_window_state_service import TargetWindowStateService
 
 
 class RecordingAdapter:
@@ -57,10 +59,14 @@ def prepare_run(monkeypatch, tmp_path, adapter, *, startup_error: Exception | No
     logger = RecordingLogger()
     registry = WindowRegistry()
     store = WindowRegistryStore(paths.data_dir() / main_module.REGISTRY_FILENAME)
+    event_bus = EventBus(logger=logger)
+    target_window_state_service = TargetWindowStateService(event_bus, logger)
 
     AppContext.register(WindowRegistryStore, store)
     AppContext.register(WindowRegistry, registry)
     AppContext.register(ExternalAdapter, adapter)
+    AppContext.register(EventBus, event_bus)
+    AppContext.register(TargetWindowStateService, target_window_state_service)
 
     monkeypatch.setattr(main_module, "build_services", lambda root=None: (paths, logger))
 
