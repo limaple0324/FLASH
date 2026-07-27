@@ -16,6 +16,9 @@ def test_character_detail_uses_note_and_confirmed_game_data_sections() -> None:
     assert "黑曜石" in source
     assert "命魂" in source
     assert "魂器" in source
+    assert "Scrollbar" in source
+    assert 'window.bind("<MouseWheel>"' in source
+    assert "canvas.yview_scroll" in source
 
 
 def test_character_detail_summary_is_player_facing() -> None:

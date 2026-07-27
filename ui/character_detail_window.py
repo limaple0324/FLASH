@@ -3,7 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from tkinter import BOTH, END, LEFT, X, Button, Entry, Frame, Label, Toplevel
+from tkinter import (
+    BOTH,
+    END,
+    LEFT,
+    RIGHT,
+    X,
+    Y,
+    Button,
+    Canvas,
+    Entry,
+    Frame,
+    Label,
+    Scrollbar,
+    Toplevel,
+)
 
 from services.character_detail_view_service import PlayerCharacterDetail
 
@@ -57,8 +71,48 @@ class CharacterDetailWindow:
         window.minsize(500, 390)
         window.configure(bg=BACKGROUND)
 
-        body = Frame(window, bg=BACKGROUND, padx=24, pady=22)
-        body.pack(fill=BOTH, expand=True)
+        viewport = Frame(window, bg=BACKGROUND)
+        viewport.pack(fill=BOTH, expand=True)
+        canvas = Canvas(
+            viewport,
+            bg=BACKGROUND,
+            highlightthickness=0,
+            bd=0,
+            yscrollincrement=20,
+        )
+        scrollbar = Scrollbar(
+            viewport,
+            orient="vertical",
+            command=canvas.yview,
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=RIGHT, fill=Y)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+
+        body = Frame(canvas, bg=BACKGROUND, padx=24, pady=22)
+        body_window = canvas.create_window(
+            (0, 0),
+            window=body,
+            anchor="nw",
+        )
+
+        def refresh_scroll_region(_event=None) -> None:
+            bounds = canvas.bbox("all")
+            if bounds is not None:
+                canvas.configure(scrollregion=bounds)
+
+        def resize_body(event) -> None:
+            canvas.itemconfigure(body_window, width=event.width)
+
+        def scroll_body(event) -> str:
+            delta = getattr(event, "delta", 0)
+            if delta:
+                canvas.yview_scroll(-int(delta / abs(delta)), "units")
+            return "break"
+
+        body.bind("<Configure>", refresh_scroll_region)
+        canvas.bind("<Configure>", resize_body)
+        window.bind("<MouseWheel>", scroll_body)
         Label(
             body,
             text=self.detail.display_name,
