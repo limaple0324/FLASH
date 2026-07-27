@@ -51,6 +51,8 @@ from domain.activity_schedule import (
     build_confirmed_activity_catalog,
 )
 from domain.character_store import CharacterStore
+from domain.character_game_data_store import CharacterGameDataStore
+from domain.game_shortcuts import CONFIRMED_GAME_SHORTCUTS
 from domain.progress_store import ActivityProgressStore
 from habit.service import ActivityOrderHabitService
 from habit.store import ActivityOrderHabitStore
@@ -60,11 +62,14 @@ from services.activity_reminder_service import ActivityReminderService
 from services.activity_schedule_view_service import ActivityScheduleViewService
 from services.app_context import AppContext
 from services.auto_click_service import (
-    AutoClickHotkeyMonitor,
     Win32AutoClickPointerSourceBackend,
     AutoClickService,
     AutoClickSettings,
     Win32CursorClickBackend,
+)
+from services.feature_hotkey_monitor import (
+    FeatureHotkeyMonitor,
+    normalize_feature_hotkey,
 )
 from services.background_image_service import BackgroundImageService
 from services.card_coordinator import CardCoordinator
@@ -75,6 +80,9 @@ from services.card_overlay_layout_service import CardOverlayLayoutService
 from services.card_overlay_runtime import build_windows_card_overlay_runtime
 from services.card_view_state_service import CardViewStateService
 from services.character_detail_view_service import CharacterDetailViewService
+from services.character_game_data_view_service import (
+    CharacterGameDataViewService,
+)
 from services.character_detail_choice_service import CharacterDetailChoiceService
 from services.character_note_service import CharacterNoteService
 from services.character_view_service import CharacterViewService
@@ -86,6 +94,9 @@ from services.group_selection_service import (
 from services.group_configuration_service import (
     GroupConfigurationService,
     SyncCycleError,
+)
+from services.group_character_registration_service import (
+    GroupCharacterRegistrationService,
 )
 from services.group_launch_service import GroupLaunchPlan, GroupLaunchService
 from services.group_role_status_monitor import GroupRoleStatusMonitor
@@ -144,10 +155,13 @@ OPERATION_RECORD_ARCHIVE_DIRNAME = "角色每日紀錄"
 DEFERRED_SYNC_STATE_FILENAME = "deferred_sync_operations.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
 CHARACTER_FILENAME = "characters.json"
+CHARACTER_GAME_DATA_FILENAME = "character_game_data.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
 ACTIVITY_REMINDER_STATE_FILENAME = "activity_reminder_state.json"
 ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
+SYNC_SELECTED_KEYS_KEY = "sync_selected_keys"
+FEATURE_HOTKEYS_KEY = "feature_hotkeys"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 RECONNECT_REFERENCE_DIR = Path("assets") / "reconnect_reference"
@@ -195,6 +209,17 @@ def apply_window_icon(window: Tk) -> None:
             pass
 
 
+def card_display_scale(window: Tk) -> float:
+    """Return the display scale relative to the 96-DPI card baseline."""
+    try:
+        pixels_per_inch = float(window.winfo_fpixels("1i"))
+    except (AttributeError, TclError, TypeError, ValueError):
+        return 1.0
+    if pixels_per_inch <= 0:
+        return 1.0
+    return max(1.0, pixels_per_inch / 96.0)
+
+
 def taskbar_icon_resource() -> str:
     """Return the exact confirmed plus icon resource used by Windows."""
     if bool(getattr(sys, "frozen", False)):
@@ -230,6 +255,12 @@ def build_services(root: Path | None = None):
             SMART_RECONNECT_ENABLED_KEY: False,
             SMART_RECONNECT_CONSENT_KEY: False,
             UI_THEME_KEY: "clear_blue",
+            SYNC_SELECTED_KEYS_KEY: ["ESC"],
+            FEATURE_HOTKEYS_KEY: {
+                "sync": "XBUTTON1",
+                "reconnect": "",
+                "auto_click": "F1",
+            },
         }
     )
     event_bus = EventBus(logger=logger)
@@ -239,10 +270,13 @@ def build_services(root: Path | None = None):
     registry_store = WindowRegistryStore(paths.data_dir() / REGISTRY_FILENAME)
     registry = registry_store.load()
     character_store = CharacterStore(paths.data_dir() / CHARACTER_FILENAME)
+    character_game_data_store = CharacterGameDataStore(
+        paths.data_dir() / CHARACTER_GAME_DATA_FILENAME
+    )
+    character_game_data_view_service = CharacterGameDataViewService(
+        character_game_data_store
+    )
     characters = character_store.load()
-    character_view_service = CharacterViewService(registry, characters)
-    character_detail_view_service = CharacterDetailViewService(character_view_service)
-    character_note_service = CharacterNoteService(registry, registry_store)
     legacy_group_config_path = (
         default_legacy_group_config_path()
         if root is None
@@ -286,6 +320,23 @@ def build_services(root: Path | None = None):
     initial_group_choice = group_selection_service.initial_choice(
         config.get(CURRENT_GROUP_NAME_KEY)
     )
+    group_character_registration_service = GroupCharacterRegistrationService(
+        registry,
+        registry_store,
+        character_store,
+        group_configuration_service,
+    )
+    if initial_group_choice is not None:
+        characters = group_character_registration_service.ensure_group(
+            initial_group_choice.name,
+            characters,
+        )
+    character_view_service = CharacterViewService(registry, characters)
+    character_detail_view_service = CharacterDetailViewService(
+        character_view_service,
+        character_game_data_view_service,
+    )
+    character_note_service = CharacterNoteService(registry, registry_store)
     workspace_service = WorkspaceService(
         WorkspaceState(
             current_group=(
@@ -363,9 +414,18 @@ def build_services(root: Path | None = None):
     AppContext.register(WindowRegistryStore, registry_store)
     AppContext.register(WindowRegistry, registry)
     AppContext.register(CharacterStore, character_store)
+    AppContext.register(CharacterGameDataStore, character_game_data_store)
+    AppContext.register(
+        CharacterGameDataViewService,
+        character_game_data_view_service,
+    )
     AppContext.register(CharacterViewService, character_view_service)
     AppContext.register(CharacterDetailViewService, character_detail_view_service)
     AppContext.register(CharacterNoteService, character_note_service)
+    AppContext.register(
+        GroupCharacterRegistrationService,
+        group_character_registration_service,
+    )
     AppContext.register(GroupSelectionService, group_selection_service)
     AppContext.register(
         GroupConfigurationService,
@@ -842,6 +902,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     character_view_service = AppContext.get(CharacterViewService)
     character_detail_view_service = AppContext.get(CharacterDetailViewService)
     character_note_service = AppContext.get(CharacterNoteService)
+    character_store = AppContext.get(CharacterStore)
+    group_character_registration_service = AppContext.get(
+        GroupCharacterRegistrationService
+    )
     background_image_service = AppContext.get(BackgroundImageService)
     home_view: HomeView | None = None
 
@@ -942,6 +1006,70 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         and config.get(UI_THEME_KEY) in UI_THEME_LABELS
         else "clear_blue"
     )
+    known_sync_keys = {
+        shortcut.key for shortcut in CONFIRMED_GAME_SHORTCUTS
+    }
+    raw_selected_sync_keys = (
+        config.get(SYNC_SELECTED_KEYS_KEY, ["ESC"])
+        if config is not None
+        else ["ESC"]
+    )
+    configured_selected_sync_keys = list(
+        dict.fromkeys(
+            key
+            for key in (
+                raw_selected_sync_keys
+                if isinstance(raw_selected_sync_keys, list)
+                else ["ESC"]
+            )
+            if isinstance(key, str) and key in known_sync_keys
+        )
+    )
+    raw_feature_hotkeys = (
+        config.get(FEATURE_HOTKEYS_KEY, {})
+        if config is not None
+        else {}
+    )
+    configured_feature_hotkeys = {
+        name: normalize_feature_hotkey(
+            raw_feature_hotkeys.get(name)
+            if isinstance(raw_feature_hotkeys, dict)
+            else ""
+        )
+        for name in ("sync", "reconnect", "auto_click")
+    }
+
+    def change_selected_sync_keys(keys: tuple[str, ...]) -> bool:
+        normalized = list(
+            dict.fromkeys(key for key in keys if key in known_sync_keys)
+        )
+        configured_selected_sync_keys[:] = normalized
+        if config is not None:
+            config.set(SYNC_SELECTED_KEYS_KEY, normalized)
+        return True
+
+    def change_feature_hotkey(feature: str, hotkey: str) -> bool:
+        if feature not in configured_feature_hotkeys:
+            return False
+        normalized = normalize_feature_hotkey(hotkey)
+        if normalized and any(
+            value == normalized
+            for name, value in configured_feature_hotkeys.items()
+            if name != feature
+        ):
+            messagebox.showerror(
+                "輔｜快捷鍵",
+                "這個快捷鍵已用於另一項功能，請選擇不同按鍵。",
+                parent=window,
+            )
+            return False
+        configured_feature_hotkeys[feature] = normalized
+        if config is not None:
+            config.set(
+                FEATURE_HOTKEYS_KEY,
+                dict(configured_feature_hotkeys),
+            )
+        return True
 
     def change_ui_theme(theme_name: str) -> bool:
         if config is None or theme_name not in UI_THEME_LABELS:
@@ -949,9 +1077,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         config.set(UI_THEME_KEY, theme_name)
         return True
 
-    def select_background_image():
-        if background_image_service is None:
-            return None
+    def choose_background_source():
         selected = filedialog.askopenfilename(
             parent=window,
             title="選擇背景圖片",
@@ -959,12 +1085,90 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         if not selected:
             return None
-        return background_image_service.select(Path(selected))
+        return Path(selected)
+
+    def prepare_background_image(
+        source: Path,
+        cancelled,
+    ):
+        if background_image_service is None:
+            raise RuntimeError("background image service is unavailable")
+        return background_image_service.prepare(
+            source,
+            cancelled=cancelled,
+        )
+
+    def save_background_image(
+        managed_path: Path,
+        apply_all: bool,
+        pages: tuple[str, ...],
+    ):
+        if background_image_service is None:
+            raise RuntimeError("background image service is unavailable")
+        return background_image_service.commit_prepared(
+            managed_path,
+            apply_all=apply_all,
+            pages=pages,
+        )
+
+    def discard_background_image(managed_path: Path | None) -> None:
+        if background_image_service is not None:
+            background_image_service.discard_prepared(managed_path)
 
     def clear_background_image():
         if background_image_service is None:
             return None
         return background_image_service.clear()
+
+    def clear_page_background(page: str):
+        if background_image_service is None:
+            raise RuntimeError("background image service is unavailable")
+        return background_image_service.clear_page(page)
+
+    def clear_all_backgrounds():
+        if background_image_service is None:
+            raise RuntimeError("background image service is unavailable")
+        return background_image_service.clear_all()
+
+    def export_background_settings():
+        if background_image_service is None:
+            return None
+        selected = filedialog.asksaveasfilename(
+            parent=window,
+            title="匯出背景設定",
+            defaultextension=".zip",
+            filetypes=(("背景設定備份", "*.zip"),),
+        )
+        if not selected:
+            return None
+        return background_image_service.export_settings(Path(selected))
+
+    def import_background_settings():
+        if background_image_service is None:
+            return None
+        selected = filedialog.askopenfilename(
+            parent=window,
+            title="匯入背景設定",
+            filetypes=(("背景設定備份", "*.zip"),),
+        )
+        if not selected:
+            return None
+        return background_image_service.import_settings(Path(selected))
+
+    def update_background_display_settings(
+        fill_color: str,
+        sidebar_opacity: int,
+        panel_opacity: int,
+        role_row_opacity: int,
+    ):
+        if background_image_service is None:
+            raise RuntimeError("background image service is unavailable")
+        return background_image_service.update_display_settings(
+            fill_color=fill_color,
+            sidebar_opacity=sidebar_opacity,
+            panel_opacity=panel_opacity,
+            role_row_opacity=role_row_opacity,
+        )
 
     def selected_group_plan(choice) -> GroupLaunchPlan | None:
         if group_launch_service is None:
@@ -991,12 +1195,18 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 return None
             input_controller.set_expected_windows(len(scope.fingerprints))
             input_controller.set_allowed_fingerprints(scope.fingerprints)
+            input_controller.set_controller_fingerprint(
+                scope.fingerprints[0]
+            )
             if pointer_sync_controller is not None:
                 pointer_sync_controller.set_expected_windows(
                     len(scope.fingerprints)
                 )
                 pointer_sync_controller.set_allowed_fingerprints(
                     scope.fingerprints
+                )
+                pointer_sync_controller.set_controller_fingerprint(
+                    scope.fingerprints[0]
                 )
         if smart_reconnect_controller is not None:
             smart_reconnect_controller.set_expected_windows(
@@ -1072,6 +1282,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         apply_group_identity(choice)
         if group_role_status_service is not None:
             group_role_status_service.clear_cache()
+        refresh_character_data(choice.name)
 
     def stop_group_automation_for_configuration_change() -> None:
         auto_click_service.stop()
@@ -1389,6 +1600,33 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         child = detail_window.open()
         apply_window_icon(child)
 
+    def refresh_character_data(group_name: str | None) -> None:
+        if (
+            character_view_service is None
+            or character_detail_view_service is None
+        ):
+            return
+        if (
+            group_name
+            and character_store is not None
+            and group_character_registration_service is not None
+        ):
+            profiles = group_character_registration_service.ensure_group(
+                group_name,
+                character_store.load(),
+            )
+            character_view_service.replace_characters(profiles)
+        if home_view is None:
+            return
+        choices = CharacterDetailChoiceService(
+            character_detail_view_service,
+            open_character_detail,
+        ).all(group_name)
+        home_view.set_character_data(
+            character_view_service.all(group_name),
+            choices,
+        )
+
     def current_input_policy() -> WindowInputPolicy | None:
         return (
             normalize_input_policy(config.get(INPUT_POLICY_KEY))
@@ -1411,6 +1649,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             policy_provider=current_input_policy,
             schedule=window.after,
             cancel=window.after_cancel,
+            selected_keys_provider=lambda: tuple(
+                configured_selected_sync_keys
+            ),
             result_callback=log_keyboard_sync_result,
         )
         if input_controller is not None
@@ -1647,11 +1888,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if workspace_service is not None
         else WorkspaceState()
     )
+    current_character_group = (
+        workspace_state.current_group.name
+        if workspace_state.current_group is not None
+        else None
+    )
     character_choices = (
         CharacterDetailChoiceService(
             character_detail_view_service,
             open_character_detail,
-        ).all()
+        ).all(current_character_group)
         if character_detail_view_service is not None
         else ()
     )
@@ -1663,6 +1909,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_input_policy_change=change_input_policy,
         keyboard_sync_enabled=False,
         on_keyboard_sync_change=change_keyboard_sync,
+        selected_sync_keys=tuple(configured_selected_sync_keys),
+        on_selected_sync_keys_change=change_selected_sync_keys,
+        feature_hotkeys=configured_feature_hotkeys,
+        on_feature_hotkey_change=change_feature_hotkey,
         group_choices=group_choices,
         group_choices_provider=(
             group_selection_service.choices
@@ -1736,7 +1986,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             else None
         ),
         characters=(
-            character_view_service.all()
+            character_view_service.all(current_character_group)
             if character_view_service is not None
             else ()
         ),
@@ -1798,8 +2048,43 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if background_image_service is not None
             else None
         ),
-        on_select_background_image=select_background_image,
+        background_fill_color=(
+            background_image_service.settings().fill_color
+            if background_image_service is not None
+            else "#C9A35D"
+        ),
+        background_settings=(
+            background_image_service.settings()
+            if background_image_service is not None
+            else None
+        ),
+        background_for_page=(
+            background_image_service.current_background
+            if background_image_service is not None
+            else None
+        ),
+        background_metadata_provider=(
+            background_image_service.metadata
+            if background_image_service is not None
+            else None
+        ),
+        background_settings_provider=(
+            background_image_service.settings
+            if background_image_service is not None
+            else None
+        ),
+        on_choose_background_source=choose_background_source,
+        on_prepare_background_image=prepare_background_image,
+        on_save_background_image=save_background_image,
+        on_discard_background_image=discard_background_image,
         on_clear_background_image=clear_background_image,
+        on_clear_page_background=clear_page_background,
+        on_clear_all_backgrounds=clear_all_backgrounds,
+        on_export_background_settings=export_background_settings,
+        on_import_background_settings=import_background_settings,
+        on_background_display_settings_update=(
+            update_background_display_settings
+        ),
         on_refresh_error=report_refresh_error,
     )
     home_view.build()
@@ -1809,12 +2094,17 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             snapshot.sent_count,
         )
     )
-    auto_click_hotkey_monitor = AutoClickHotkeyMonitor(
-        home_view.toggle_auto_click_from_hotkey,
+    feature_hotkey_monitor = FeatureHotkeyMonitor(
+        {
+            "sync": home_view.toggle_keyboard_sync_from_hotkey,
+            "reconnect": home_view.toggle_smart_reconnect_from_hotkey,
+            "auto_click": home_view.toggle_auto_click_from_hotkey,
+        },
+        hotkeys_provider=lambda: dict(configured_feature_hotkeys),
         schedule=window.after,
         cancel=window.after_cancel,
     )
-    auto_click_hotkey_monitor.start()
+    feature_hotkey_monitor.start()
 
     def current_group_name() -> str | None:
         state = (
@@ -1858,28 +2148,43 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     expiry_monitor = None
     activity_reminder_monitor = None
     if card_service is not None and card_view_state_service is not None:
+        overlay_scale = card_display_scale(window)
+        overlay_width = round(160 * overlay_scale)
+        overlay_height = round(75 * overlay_scale)
         overlay_layout = CardOverlayLayoutService(
             card_view_state_service,
             WindowsWorkAreaReader(),
-            CardSize(width=360, height=140),
-            right_margin=20,
-            bottom_margin=20,
-            gap=12,
+            CardSize(width=overlay_width, height=overlay_height),
+            right_margin=round(12 * overlay_scale),
+            bottom_margin=round(12 * overlay_scale),
+            gap=round(6 * overlay_scale),
         )
-        overlay_palette = theme_palette(configured_theme)
         overlay_runtime = build_windows_card_overlay_runtime(
             window,
             card_service,
             overlay_layout,
             TkCardTextSettings(
-                background=overlay_palette["surface"],
-                foreground=overlay_palette["text"],
-                muted_foreground=overlay_palette["muted"],
-                accent=overlay_palette["primary"],
+                background="#80591F",
+                foreground="#FFF2CF",
+                muted_foreground="#FFF2CF",
+                accent="#FFF2CF",
+                title_size=max(10, round(10 * overlay_scale)),
+                body_size=max(9, round(9 * overlay_scale)),
+                horizontal_padding=max(8, round(8 * overlay_scale)),
+                vertical_padding=max(5, round(5 * overlay_scale)),
+                card_width=overlay_width,
             ),
         )
         overlay_runtime.start()
-        expiry_monitor = CardExpiryMonitor(card_service, window.after)
+        expiry_monitor = CardExpiryMonitor(
+            card_service,
+            window.after,
+            on_pending_expired=lambda card: operation_record_store.append(
+                "提醒卡",
+                "系統",
+                f"{card.activity.name}－排隊期間已過期，未顯示",
+            ),
+        )
         expiry_monitor.start()
         card_service.subscribe(home_view.refresh_cards)
         if activity_reminder_service is not None:
@@ -1891,10 +2196,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             activity_reminder_monitor.start()
 
     def close_window() -> None:
+        if not home_view.prepare_close():
+            return
         home_view.dispose()
         if group_window_launch_service is not None:
             group_window_launch_service.stop()
-        auto_click_hotkey_monitor.stop()
+        feature_hotkey_monitor.stop()
         auto_click_service.close(timeout_seconds=1.0)
         if group_role_status_monitor is not None:
             group_role_status_monitor.stop(timeout_seconds=1.0)
@@ -1926,7 +2233,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window._card_expiry_monitor = expiry_monitor
     window._activity_reminder_monitor = activity_reminder_monitor
     window._auto_click_service = auto_click_service
-    window._auto_click_hotkey_monitor = auto_click_hotkey_monitor
+    window._feature_hotkey_monitor = feature_hotkey_monitor
     window._group_role_status_monitor = group_role_status_monitor
     window._deferred_sync_monitor = deferred_sync_monitor
     window._windows_app_identity = window_identity

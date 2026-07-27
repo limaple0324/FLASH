@@ -1,7 +1,7 @@
 import hashlib
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 from adapters.game_screen_recognizer import (
     CHARACTER_ENTER_CLICK_POINT,
@@ -67,6 +67,20 @@ def test_each_confirmed_reference_classifies_to_its_declared_state():
             assert result.click_point == CHARACTER_ENTER_CLICK_POINT
         else:
             assert result.click_point == definition.click_point
+
+
+def test_disconnect_overlay_accepts_confirmed_darker_game_rendering():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "01_disconnected_dialog.png") as source:
+        candidate = ImageEnhance.Brightness(
+            source.convert("RGB")
+        ).enhance(0.75)
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.DISCONNECTED
+    assert result.score is not None
+    assert 31.0 < result.score <= 38.0
 
 
 def _paste_level_reference(

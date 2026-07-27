@@ -132,3 +132,14 @@ def test_view_uses_project_wide_role_priority_instead_of_registry_order() -> Non
         item.display_name
         for item in CharacterViewService(registry, profiles).all()
     ] == ["主號高等", "主號低等", "分號", "備用"]
+
+
+def test_view_can_limit_results_to_current_group() -> None:
+    registry = WindowRegistry()
+    registry.register_character("a", "甲", group="甲組")
+    registry.register_character("b", "乙", group="乙組")
+
+    assert [
+        item.display_name
+        for item in CharacterViewService(registry, ()).all("乙組")
+    ] == ["乙"]

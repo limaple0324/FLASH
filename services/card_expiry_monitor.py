@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 
 from cards.service import CardService
+from cards.models import GroupCard
 
 
 CARD_EXPIRY_CHECK_MS = 1000
@@ -15,6 +16,7 @@ class CardExpiryMonitor:
         cards: CardService,
         schedule: Callable[[int, Callable[[], None]], object],
         now: Callable[[], datetime] | None = None,
+        on_pending_expired: Callable[[GroupCard], object] | None = None,
     ) -> None:
         if not isinstance(cards, CardService):
             raise TypeError("cards must be CardService.")
@@ -22,9 +24,14 @@ class CardExpiryMonitor:
             raise TypeError("schedule must be callable.")
         if now is not None and not callable(now):
             raise TypeError("now must be callable.")
+        if on_pending_expired is not None and not callable(
+            on_pending_expired
+        ):
+            raise TypeError("on_pending_expired must be callable.")
         self.cards = cards
         self._schedule = schedule
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self._on_pending_expired = on_pending_expired
         self._running = False
 
     @property
@@ -46,5 +53,12 @@ class CardExpiryMonitor:
     def _check(self) -> None:
         if not self._running:
             return
-        self.cards.remove_expired(self._now())
+        pending_ids = {
+            entry.card.card_id for entry in self.cards.pending_entries
+        }
+        expired = self.cards.remove_expired(self._now())
+        if self._on_pending_expired is not None:
+            for card in expired:
+                if card.card_id in pending_ids:
+                    self._on_pending_expired(card)
         self._schedule_next()

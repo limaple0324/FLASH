@@ -22,6 +22,8 @@ def test_confirmed_shortcut_catalog_matches_supplied_screens() -> None:
         "M",
         "TAB",
         "ESC",
+        "CTRL",
+        "SHIFT",
         "G",
         "V",
         "P",
@@ -33,7 +35,7 @@ def test_confirmed_shortcut_catalog_matches_supplied_screens() -> None:
         "CTRL+↑",
         "CTRL+↓",
     )
-    assert len(CONFIRMED_GAME_SHORTCUTS) == 26
+    assert len(CONFIRMED_GAME_SHORTCUTS) == 28
 
 
 def test_combat_state_shortcuts_keep_both_confirmed_meanings() -> None:

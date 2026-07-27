@@ -58,9 +58,9 @@ def _controller(windows, messages):
         window_backend=Windows(windows),
         message_backend=messages,
     )
-    controller.set_allowed_fingerprints(
-        window.launch_fingerprint for window in windows
-    )
+    allowed = tuple(window.launch_fingerprint for window in windows)
+    controller.set_allowed_fingerprints(allowed)
+    controller.set_controller_fingerprint(allowed[0])
     return controller
 
 
@@ -250,6 +250,34 @@ def test_source_eligibility_requires_complete_foreground_group():
     assert controller.source_is_eligible(2) is False
     controller.set_expected_windows(4)
     assert controller.source_is_eligible(1) is False
+
+
+def test_only_configured_controller_can_start_pointer_sync():
+    windows = [_window(1), _window(2), _window(3)]
+    backend = Windows(windows, foreground=2)
+    messages = Messages()
+    controller = WindowsPointerSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+    )
+    controller.set_allowed_fingerprints(
+        window.launch_fingerprint for window in windows
+    )
+    controller.set_controller_fingerprint(windows[0].launch_fingerprint)
+
+    assert controller.source_is_eligible(2) is False
+    result = controller.send(
+        source_handle=2,
+        x_ratio=0.5,
+        y_ratio=0.5,
+        event="left_down",
+        policy=WindowInputPolicy.ALL,
+    )
+
+    assert result.failure_codes == ("source_not_controller",)
+    assert messages.sent == []
 
 
 def test_group_member_remains_known_when_the_configured_group_is_incomplete():

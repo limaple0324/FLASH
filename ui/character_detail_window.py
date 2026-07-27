@@ -113,6 +113,64 @@ class CharacterDetailWindow:
             label.pack(side=LEFT, fill=X, expand=True)
             self._value_labels[key] = label
 
+        game_data = self.detail.game_data
+        extended = Frame(
+            body,
+            bg=SURFACE,
+            padx=16,
+            pady=12,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
+        extended.pack(fill=X, pady=(14, 0))
+        Label(
+            extended,
+            text="遊戲資料",
+            font=("Microsoft JhengHei UI", 11, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X, pady=(0, 4))
+        for title, value in (
+            (
+                "寵物天賦",
+                game_data.pet_talent if game_data is not None else None,
+            ),
+            (
+                "黑曜石",
+                game_data.obsidian if game_data is not None else None,
+            ),
+            (
+                "命魂",
+                game_data.life_soul if game_data is not None else None,
+            ),
+            (
+                "魂器",
+                game_data.artifact if game_data is not None else None,
+            ),
+        ):
+            row = Frame(extended, bg=SURFACE)
+            row.pack(fill=X, pady=3)
+            Label(
+                row,
+                text=title,
+                width=8,
+                font=("Microsoft JhengHei UI", 10),
+                bg=SURFACE,
+                fg=MUTED,
+                anchor="w",
+            ).pack(side=LEFT)
+            Label(
+                row,
+                text=_display_value(value),
+                font=("Microsoft JhengHei UI", 10),
+                bg=SURFACE,
+                fg=TEXT,
+                anchor="w",
+                justify=LEFT,
+                wraplength=390,
+            ).pack(side=LEFT, fill=X, expand=True)
+
         note_card = Frame(
             body,
             bg=SURFACE,

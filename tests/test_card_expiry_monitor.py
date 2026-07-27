@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from cards.models import GroupCard
+from cards.priority import CardPriorityReason
 from cards.service import CardService
 from cards.settings import CardDisplaySettings
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
@@ -108,3 +109,45 @@ def test_start_is_idempotent_and_stop_prevents_pending_check():
 
     assert len(schedule.calls) == 0
     assert monitor.running is False
+
+
+def test_pending_expired_card_is_recorded_without_becoming_visible():
+    shown_at = datetime(2026, 7, 14, 13, 0, tzinfo=timezone.utc)
+    cards = CardService()
+    for card_id in ("one", "two", "three"):
+        base = _card()
+        cards.upsert(
+            GroupCard(
+                card_id=card_id,
+                group=base.group,
+                activity=base.activity,
+                current_progress=card_id,
+                priority_reason=CardPriorityReason.DISCONNECTION,
+            ),
+            shown_at=shown_at,
+            lifetime=timedelta(minutes=5),
+        )
+    pending = _card()
+    cards.upsert(
+        pending,
+        shown_at=shown_at,
+        lifetime=timedelta(seconds=5),
+    )
+    recorded = []
+    schedule = _Schedule()
+    monitor = CardExpiryMonitor(
+        cards,
+        schedule,
+        now=lambda: shown_at + timedelta(seconds=5),
+        on_pending_expired=recorded.append,
+    )
+
+    monitor.start()
+    schedule.run_next()
+
+    assert recorded == [pending]
+    assert tuple(card.card_id for card in cards.cards) == (
+        "one",
+        "two",
+        "three",
+    )

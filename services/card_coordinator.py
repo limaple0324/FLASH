@@ -24,7 +24,11 @@ class CardCoordinator:
         lifetime: timedelta | None = None,
     ) -> GroupCard:
         previous = next(
-            (current for current in self.cards.cards if current.card_id == card.card_id),
+            (
+                current
+                for current in self.cards.all_cards
+                if current.card_id == card.card_id
+            ),
             None,
         )
         result = self.cards.upsert(
@@ -34,7 +38,11 @@ class CardCoordinator:
         )
         if previous is None or previous.priority_reason is not card.priority_reason:
             entry = next(
-                item for item in self.cards.entries if item.card.card_id == card.card_id
+                item
+                for item in (
+                    self.cards.entries + self.cards.pending_entries
+                )
+                if item.card.card_id == card.card_id
             )
             recorded_at = (
                 entry.shown_at

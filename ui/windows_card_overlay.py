@@ -73,7 +73,7 @@ class WindowsCardOverlayPort:
         try:
             window.overrideredirect(True)
             window.attributes("-topmost", True)
-            window.attributes("-alpha", 0.97)
+            window.attributes("-alpha", 1.0)
             self._apply(window, item)
         except Exception:
             window.destroy()

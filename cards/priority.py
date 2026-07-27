@@ -5,8 +5,10 @@ from enum import Enum, IntEnum
 
 class CardPriorityTier(IntEnum):
     HIGHEST = 0
-    ACTIVITY = 1
-    GENERAL = 2
+    EXPIRY = 1
+    ACTIVITY = 2
+    PREFERENCE = 3
+    GENERAL = 4
 
 
 class CardPriorityReason(str, Enum):
@@ -15,6 +17,7 @@ class CardPriorityReason(str, Enum):
     TIME_LIMIT = "時間限制"
     LOSS_RISK = "即將造成損失"
     ACTIVITY = "活動"
+    PREFERENCE = "偏好建議"
     GENERAL = "一般資訊"
 
 
@@ -22,7 +25,6 @@ _HIGHEST_REASONS = frozenset(
     {
         CardPriorityReason.DISCONNECTION,
         CardPriorityReason.RECOVERY,
-        CardPriorityReason.TIME_LIMIT,
         CardPriorityReason.LOSS_RISK,
     }
 )
@@ -35,6 +37,10 @@ def priority_tier(reason: CardPriorityReason) -> CardPriorityTier:
         raise TypeError("reason must be CardPriorityReason.")
     if reason in _HIGHEST_REASONS:
         return CardPriorityTier.HIGHEST
+    if reason is CardPriorityReason.TIME_LIMIT:
+        return CardPriorityTier.EXPIRY
     if reason is CardPriorityReason.ACTIVITY:
         return CardPriorityTier.ACTIVITY
+    if reason is CardPriorityReason.PREFERENCE:
+        return CardPriorityTier.PREFERENCE
     return CardPriorityTier.GENERAL

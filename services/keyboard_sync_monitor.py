@@ -119,6 +119,7 @@ class KeyboardSyncMonitor:
         schedule: Callable[[int, Callable[[], None]], object],
         cancel: Callable[[object], None],
         state_backend: KeyboardStateBackend | None = None,
+        selected_keys_provider: Callable[[], object] | None = None,
         result_callback: Callable[[InputSyncResult], None] | None = None,
         interval_ms: int = 5,
     ) -> None:
@@ -127,6 +128,7 @@ class KeyboardSyncMonitor:
         self._schedule = schedule
         self._cancel = cancel
         self._state_backend = state_backend or Win32KeyboardStateBackend()
+        self._selected_keys_provider = selected_keys_provider
         self._result_callback = result_callback
         self._interval_ms = max(2, int(interval_ms))
         self._enabled = False
@@ -173,9 +175,28 @@ class KeyboardSyncMonitor:
 
     def _shortcut_is_down(self, key: str) -> bool:
         virtual_keys = VIRTUAL_KEY_SEQUENCES[key]
-        if len(virtual_keys) == 1 and self._state_backend.conflicting_modifier_down():
+        if (
+            len(virtual_keys) == 1
+            and key not in {"CTRL", "SHIFT"}
+            and self._state_backend.conflicting_modifier_down()
+        ):
             return False
         return all(self._state_backend.is_down(value) for value in virtual_keys)
+
+    def _selected_keys(self) -> frozenset[str]:
+        if self._selected_keys_provider is None:
+            return frozenset(self._key_states)
+        try:
+            raw_value = self._selected_keys_provider()
+        except Exception:
+            return frozenset()
+        if not isinstance(raw_value, (tuple, list, set, frozenset)):
+            return frozenset()
+        return frozenset(
+            key
+            for key in raw_value
+            if isinstance(key, str) and key in self._key_states
+        )
 
     def poll(self) -> None:
         self._after_id = None
@@ -195,8 +216,22 @@ class KeyboardSyncMonitor:
             if source_handle is None:
                 self._key_states = dict.fromkeys(self._key_states, False)
                 return
+            selected_keys = self._selected_keys()
+            ctrl_chord_down = any(
+                key.startswith("CTRL+")
+                and key in selected_keys
+                and self._shortcut_is_down(key)
+                for key in self._key_states
+            )
             for shortcut in CONFIRMED_GAME_SHORTCUTS:
-                is_down = self._shortcut_is_down(shortcut.key)
+                if shortcut.key not in selected_keys:
+                    self._key_states[shortcut.key] = False
+                    continue
+                is_down = (
+                    False
+                    if shortcut.key == "CTRL" and ctrl_chord_down
+                    else self._shortcut_is_down(shortcut.key)
+                )
                 was_down = self._key_states[shortcut.key]
                 self._key_states[shortcut.key] = is_down
                 if is_down and not was_down:

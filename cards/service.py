@@ -12,7 +12,7 @@ MAX_VISIBLE_CARDS = 3
 
 
 class CardCapacityError(RuntimeError):
-    """加入第四張新卡時回報，避免擅自淘汰既有提醒。"""
+    """Deprecated compatibility error; extra cards now wait in priority order."""
 
 
 class CardService:
@@ -39,11 +39,33 @@ class CardService:
 
     @property
     def cards(self) -> tuple[GroupCard, ...]:
-        return tuple(entry.card for entry in self._entries)
+        return tuple(entry.card for entry in self.entries)
 
     @property
     def entries(self) -> tuple[CardLifecycle, ...]:
-        return tuple(self._entries)
+        return tuple(self._ordered_entries()[:MAX_VISIBLE_CARDS])
+
+    @property
+    def pending_entries(self) -> tuple[CardLifecycle, ...]:
+        return tuple(self._ordered_entries()[MAX_VISIBLE_CARDS:])
+
+    @property
+    def all_cards(self) -> tuple[GroupCard, ...]:
+        return tuple(entry.card for entry in self._entries)
+
+    def _ordered_entries(self) -> list[CardLifecycle]:
+        indexed = tuple(enumerate(self._entries))
+        return [
+            entry
+            for _index, entry in sorted(
+                indexed,
+                key=lambda item: (
+                    int(item[1].card.priority_tier),
+                    item[1].shown_at,
+                    item[0],
+                ),
+            )
+        ]
 
     def upsert(
         self,
@@ -65,8 +87,6 @@ class CardService:
                 self._notify_changed()
                 return card
 
-        if len(self._entries) >= MAX_VISIBLE_CARDS:
-            raise CardCapacityError("At most three cards can be visible.")
         shown_at = shown_at or datetime.now(timezone.utc)
         self._entries.append(
             CardLifecycle(

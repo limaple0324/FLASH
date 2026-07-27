@@ -1,9 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from cards.models import GroupCard
-from cards.service import CardCapacityError, CardService
+from cards.service import CardService
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.group import CharacterGroup
 
@@ -36,7 +34,7 @@ def test_card_changes_notify_home_refresh_listener():
     assert changes == [("guard",), ("guard",), ()]
 
 
-def test_missing_remove_and_rejected_fourth_card_do_not_trigger_refresh():
+def test_missing_remove_is_quiet_and_queued_fourth_card_triggers_refresh():
     service = CardService()
     notifications = 0
 
@@ -50,10 +48,10 @@ def test_missing_remove_and_rejected_fourth_card_do_not_trigger_refresh():
     baseline = notifications
 
     assert service.remove("missing") is None
-    with pytest.raises(CardCapacityError):
-        service.upsert(_card("fourth"))
+    service.upsert(_card("fourth"))
 
-    assert notifications == baseline
+    assert notifications == baseline + 1
+    assert service.pending_entries[0].card.card_id == "fourth"
 
 
 def test_expiry_notifies_once_only_when_cards_are_removed():

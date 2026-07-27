@@ -44,6 +44,8 @@ CONFIRMED_GAME_SHORTCUTS = (
     GameShortcut("M", "打開／關閉地圖面板"),
     GameShortcut("TAB", "打開／關閉地圖面板"),
     GameShortcut("ESC", "關閉目前面板"),
+    GameShortcut("CTRL", "控制鍵（可勾選同步）"),
+    GameShortcut("SHIFT", "切換鍵（可勾選同步）"),
     GameShortcut("G", "打開／關閉打造面板", "選擇捕捉目標"),
     GameShortcut("V", "打開／關閉煉化面板"),
     GameShortcut("P", "打開／關閉系統面板"),

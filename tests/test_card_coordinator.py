@@ -1,11 +1,9 @@
 from datetime import datetime, timezone
 
-import pytest
-
 from cards.history_store import CardHistoryStore
 from cards.models import GroupCard
 from cards.priority import CardPriorityReason
-from cards.service import CardCapacityError, CardService
+from cards.service import CardService
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.group import CharacterGroup
 from main import build_services
@@ -102,20 +100,20 @@ def test_visible_card_transition_to_recovery_adds_recovery_history(tmp_path):
     assert coordinator.history.all()[1].recorded_at == recovered_at
 
 
-def test_rejected_fourth_card_does_not_leave_history(tmp_path):
+def test_priority_queued_fourth_card_keeps_history_and_three_visible(tmp_path):
     coordinator = _coordinator(tmp_path)
     shown_at = datetime(2026, 7, 13, 22, 0, tzinfo=timezone.utc)
     for card_id in ("first", "second", "third"):
         coordinator.show(_card(card_id, CardPriorityReason.GENERAL), shown_at=shown_at)
 
-    with pytest.raises(CardCapacityError):
-        coordinator.show(
-            _card("fourth", CardPriorityReason.DISCONNECTION),
-            shown_at=shown_at,
-        )
+    coordinator.show(
+        _card("fourth", CardPriorityReason.DISCONNECTION),
+        shown_at=shown_at,
+    )
 
     assert len(coordinator.cards.cards) == 3
-    assert coordinator.history.all() == ()
+    assert coordinator.cards.cards[0].card_id == "fourth"
+    assert coordinator.history.all()[0].card_id == "fourth"
 
 
 def test_build_services_registers_coordinator_with_shared_services(tmp_path):

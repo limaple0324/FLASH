@@ -8,7 +8,10 @@ from PIL import Image
 
 from config.config_manager import ConfigManager
 from services.background_image_service import (
+    BACKGROUND_FILL_CONFIG_KEY,
+    BACKGROUND_GLOBAL_CONFIG_KEY,
     BACKGROUND_IMAGE_CONFIG_KEY,
+    BACKGROUND_PAGE_CONFIG_KEY,
     BackgroundImageService,
 )
 
@@ -280,3 +283,177 @@ def test_clear_config_failure_retains_managed_background(
     assert selected.managed_path is not None
     assert selected.managed_path.is_file()
     assert config.config_path.read_text(encoding="utf-8") == before
+
+
+def test_prepare_is_preview_only_until_player_saves_scope(tmp_path) -> None:
+    source = tmp_path / "preview.png"
+    Image.new("RGB", (30, 20), "purple").save(source)
+    service, config = _service(tmp_path)
+
+    preview = service.prepare(source)
+
+    assert preview.succeeded is True
+    assert preview.managed_path is not None
+    assert service.current_background() is None
+    assert config.get(BACKGROUND_GLOBAL_CONFIG_KEY) is None
+
+    saved = service.commit_prepared(
+        preview.managed_path,
+        apply_all=False,
+        pages=("home", "sync"),
+    )
+
+    assert saved.succeeded is True
+    assert service.current_background() is None
+    assert service.current_background("home") == preview.managed_path
+    assert service.current_background("sync") == preview.managed_path
+    assert config.get(BACKGROUND_PAGE_CONFIG_KEY) == {
+        "home": str(preview.managed_path),
+        "sync": str(preview.managed_path),
+    }
+
+
+def test_cancelled_prepare_keeps_original_background_and_no_half_file(
+    tmp_path,
+) -> None:
+    service, _config = _service(tmp_path)
+    existing_source = tmp_path / "existing.png"
+    next_source = tmp_path / "next.png"
+    Image.new("RGB", (12, 12), "navy").save(existing_source)
+    Image.new("RGB", (18, 18), "gold").save(next_source)
+    existing = service.select(existing_source).managed_path
+
+    result = service.prepare(next_source, cancelled=lambda: True)
+
+    assert result.succeeded is False
+    assert "已取消" in result.message
+    assert service.current_background() == existing
+    assert tuple((tmp_path / "data" / "backgrounds").glob("*.tmp")) == ()
+    assert tuple((tmp_path / "data" / "backgrounds").glob("background-*.png")) == (
+        existing,
+    )
+
+
+def test_global_and_page_backgrounds_follow_confirmed_fallback_rules(
+    tmp_path,
+) -> None:
+    service, _config = _service(tmp_path)
+    global_source = tmp_path / "global.png"
+    page_source = tmp_path / "page.png"
+    Image.new("RGB", (10, 10), "green").save(global_source)
+    Image.new("RGB", (11, 11), "orange").save(page_source)
+    global_path = service.select(global_source).managed_path
+    preview = service.prepare(page_source)
+    service.commit_prepared(
+        preview.managed_path,
+        apply_all=False,
+        pages=("characters",),
+    )
+
+    assert service.current_background("home") == global_path
+    assert service.current_background("characters") == preview.managed_path
+
+    service.clear_page("characters")
+    assert service.current_background("characters") == global_path
+
+
+def test_clear_all_removes_every_assignment_and_managed_copy(tmp_path) -> None:
+    service, _config = _service(tmp_path)
+    global_source = tmp_path / "global.png"
+    page_source = tmp_path / "page.png"
+    Image.new("RGB", (20, 20), "#112233").save(global_source)
+    Image.new("RGB", (30, 30), "#445566").save(page_source)
+    global_result = service.select(global_source)
+    page_preview = service.prepare(page_source)
+    page_result = service.commit_prepared(
+        page_preview.managed_path,
+        apply_all=False,
+        pages=("characters",),
+    )
+
+    result = service.clear_all()
+
+    assert global_result.succeeded is True
+    assert page_result.succeeded is True
+    assert result.succeeded is True
+    assert service.current_background() is None
+    assert service.current_background("characters") is None
+    assert global_result.managed_path is not None
+    assert page_result.managed_path is not None
+    assert global_result.managed_path.exists() is False
+    assert page_result.managed_path.exists() is False
+
+
+def test_fill_color_and_three_region_opacities_are_saved_together(
+    tmp_path,
+) -> None:
+    service, config = _service(tmp_path)
+
+    settings = service.update_display_settings(
+        fill_color="#123abc",
+        sidebar_opacity=10,
+        panel_opacity=50,
+        role_row_opacity=100,
+    )
+
+    assert settings.fill_color == "#123ABC"
+    assert settings.sidebar_opacity == 10
+    assert settings.panel_opacity == 50
+    assert settings.role_row_opacity == 100
+    assert config.get(BACKGROUND_FILL_CONFIG_KEY) == "#123ABC"
+
+
+def test_export_and_import_restores_images_scope_and_display_settings(
+    tmp_path,
+) -> None:
+    source_service, _source_config = _service(tmp_path / "source")
+    global_source = tmp_path / "global.png"
+    page_source = tmp_path / "page.png"
+    Image.new("RGB", (22, 14), "#123456").save(global_source)
+    Image.new("RGB", (18, 30), "#ABCDEF").save(page_source)
+    source_service.select(global_source)
+    page_preview = source_service.prepare(page_source)
+    source_service.commit_prepared(
+        page_preview.managed_path,
+        apply_all=False,
+        pages=("characters", "records"),
+    )
+    source_service.update_display_settings(
+        fill_color="#102030",
+        sidebar_opacity=12,
+        panel_opacity=34,
+        role_row_opacity=56,
+    )
+    backup = source_service.export_settings(tmp_path / "backgrounds.zip")
+    restored_service, _restored_config = _service(tmp_path / "restored")
+
+    result = restored_service.import_settings(backup)
+    settings = restored_service.settings()
+
+    assert result.succeeded is True
+    assert settings.global_path is not None
+    assert settings.for_page("characters") is not None
+    assert settings.for_page("records") == settings.for_page("characters")
+    assert settings.fill_color == "#102030"
+    assert settings.sidebar_opacity == 12
+    assert settings.panel_opacity == 34
+    assert settings.role_row_opacity == 56
+    with Image.open(settings.global_path) as restored_global:
+        assert restored_global.size == (22, 14)
+    with Image.open(settings.for_page("characters")) as restored_page:
+        assert restored_page.size == (18, 30)
+
+
+def test_invalid_import_keeps_existing_background(tmp_path) -> None:
+    service, _config = _service(tmp_path)
+    existing_source = tmp_path / "existing.png"
+    Image.new("RGB", (10, 10), "red").save(existing_source)
+    existing = service.select(existing_source).managed_path
+    invalid = tmp_path / "invalid.zip"
+    invalid.write_bytes(b"not a zip")
+
+    result = service.import_settings(invalid)
+
+    assert result.succeeded is False
+    assert service.current_background() == existing
+    assert existing is not None and existing.exists()

@@ -143,7 +143,7 @@ DEFAULT_SCREEN_TEMPLATES: tuple[ScreenTemplateDefinition, ...] = (
             (0.328, 0.486, 0.672, 0.598),
             (0.455, 0.535, 0.545, 0.584),
         ),
-        maximum_score=31.0,
+        maximum_score=38.0,
         click_point=(0.500, 0.536),
     ),
     ScreenTemplateDefinition(

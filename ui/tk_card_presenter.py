@@ -16,10 +16,11 @@ class TkCardTextSettings:
     muted_foreground: str
     accent: str
     font_family: str = "Microsoft JhengHei UI"
-    title_size: int = 12
-    body_size: int = 10
-    horizontal_padding: int = 18
-    vertical_padding: int = 14
+    title_size: int = 10
+    body_size: int = 9
+    horizontal_padding: int = 8
+    vertical_padding: int = 5
+    card_width: int = 160
 
     def __post_init__(self) -> None:
         for field in (
@@ -37,6 +38,7 @@ class TkCardTextSettings:
             "body_size",
             "horizontal_padding",
             "vertical_padding",
+            "card_width",
         ):
             value = getattr(self, field)
             if (
@@ -107,6 +109,7 @@ class TkCardContentPresenter:
 
     def _create(self, window: Any) -> _RenderedCard:
         settings = self._settings
+        display_scale = max(1.0, settings.card_width / 160)
         frame = self._widgets.frame(
             window,
             background=settings.background,
@@ -126,34 +129,47 @@ class TkCardContentPresenter:
             font=(settings.font_family, settings.title_size, "bold"),
             cursor="hand2",
         )
-        close.pack(side="right", anchor="n", padx=(4, 10), pady=(6, 0))
+        close.pack(
+            side="right",
+            anchor="n",
+            padx=(round(4 * display_scale), round(10 * display_scale)),
+            pady=(round(6 * display_scale), 0),
+        )
         group = self._widgets.label(
             frame,
             background=settings.background,
             foreground=settings.muted_foreground,
             font=(settings.font_family, settings.body_size),
-            anchor="w",
+            anchor="center",
+            justify="center",
+            wraplength=settings.card_width - 2 * settings.horizontal_padding,
         )
         title = self._widgets.label(
             frame,
             background=settings.background,
             foreground=settings.foreground,
             font=(settings.font_family, settings.title_size, "bold"),
-            anchor="w",
+            anchor="center",
+            justify="center",
+            wraplength=settings.card_width - 2 * settings.horizontal_padding,
         )
         progress = self._widgets.label(
             frame,
             background=settings.background,
             foreground=settings.foreground,
             font=(settings.font_family, settings.body_size),
-            anchor="w",
+            anchor="center",
+            justify="center",
+            wraplength=settings.card_width - 2 * settings.horizontal_padding,
         )
         next_step = self._widgets.label(
             frame,
             background=settings.background,
             foreground=settings.accent,
             font=(settings.font_family, settings.body_size),
-            anchor="w",
+            anchor="center",
+            justify="center",
+            wraplength=settings.card_width - 2 * settings.horizontal_padding,
         )
         for label in (group, title, progress, next_step):
             label.pack(
@@ -193,22 +209,25 @@ class TkCardContentPresenter:
             rendered.title.pack(
                 fill="x",
                 padx=self._settings.horizontal_padding,
-                pady=(18, 0),
+                pady=(
+                    round(
+                        22
+                        * max(1.0, self._settings.card_width / 160)
+                    ),
+                    0,
+                ),
             )
             return
         rendered.group.configure(text=content.group_name)
         rendered.progress.configure(text=content.current_progress)
-        rendered.next_step.configure(
-            text=f"下一步：{content.next_step or '尚未提供'}"
-        )
+        rendered.next_step.pack_forget()
         for label in (
             rendered.group,
             rendered.title,
             rendered.progress,
-            rendered.next_step,
         ):
             label.pack(
                 fill="x",
                 padx=self._settings.horizontal_padding,
-                pady=(3, 0),
+                pady=(max(3, self._settings.vertical_padding // 2), 0),
             )

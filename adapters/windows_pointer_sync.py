@@ -215,6 +215,7 @@ class WindowsPointerSyncController:
         self._preflight_timeout_ms = max(1, int(preflight_timeout_ms))
         self._allowed_fingerprints: tuple[str, ...] | None = None
         self._allowed_fingerprint_set: frozenset[str] | None = None
+        self._controller_fingerprint: str | None = None
         self._conflict_arbiter = conflict_arbiter
         self._deferred_service = deferred_service
         self._reconnecting_provider = reconnecting_provider or (lambda: ())
@@ -418,6 +419,7 @@ class WindowsPointerSyncController:
         if values is None:
             self._allowed_fingerprints = None
             self._allowed_fingerprint_set = None
+            self._controller_fingerprint = None
             return
         normalized = tuple(
             normalize_launch_fingerprint(value)
@@ -436,6 +438,23 @@ class WindowsPointerSyncController:
         )
         self._allowed_fingerprints = ordered
         self._allowed_fingerprint_set = frozenset(ordered)
+        if self._controller_fingerprint not in self._allowed_fingerprint_set:
+            self._controller_fingerprint = None
+
+    def set_controller_fingerprint(self, fingerprint: object) -> None:
+        normalized = normalize_launch_fingerprint(fingerprint)
+        if normalized is None:
+            raise ValueError(
+                "controller fingerprint must be a complete SHA-256 digest."
+            )
+        if (
+            self._allowed_fingerprint_set is None
+            or normalized not in self._allowed_fingerprint_set
+        ):
+            raise ValueError(
+                "controller fingerprint must belong to the configured scope."
+            )
+        self._controller_fingerprint = normalized
 
     def _windows(self) -> tuple[WindowInfo, ...]:
         windows = tuple(
@@ -637,14 +656,16 @@ class WindowsPointerSyncController:
             normalize_launch_fingerprint(window.launch_fingerprint)
             for window in windows
         )
+        source_fingerprint = normalize_launch_fingerprint(
+            source_matches[0].launch_fingerprint
+        )
         return (
+            self._controller_fingerprint is not None
+            and
             all(fingerprint is not None for fingerprint in fingerprints)
             and len(fingerprints) == len(set(fingerprints))
             and set(fingerprints) == self._allowed_fingerprint_set
-            and normalize_launch_fingerprint(
-                source_matches[0].launch_fingerprint
-            )
-            in self._allowed_fingerprint_set
+            and source_fingerprint == self._controller_fingerprint
         )
 
     def source_is_group_member(self, source_handle: int) -> bool:
@@ -818,6 +839,19 @@ class WindowsPointerSyncController:
             failures.append("source_not_in_group")
         if self._window_backend.foreground_handle() != source_handle:
             failures.append("source_not_foreground")
+        source_fingerprint = next(
+            (
+                normalize_launch_fingerprint(window.launch_fingerprint)
+                for window in windows
+                if window.handle == source_handle
+            ),
+            None,
+        )
+        if (
+            self._controller_fingerprint is not None
+            and source_fingerprint != self._controller_fingerprint
+        ):
+            failures.append("source_not_controller")
         process_ids = [window.process_id for window in windows]
         process_identity_valid = not (
             any(
@@ -942,16 +976,6 @@ class WindowsPointerSyncController:
             operation = (
                 f"pointer:{normalized_event}:"
                 f"{x_ratio:.4f}:{y_ratio:.4f}"
-            )
-            source_fingerprint = next(
-                (
-                    normalize_launch_fingerprint(
-                        window.launch_fingerprint
-                    )
-                    for window in windows
-                    if window.handle == source_handle
-                ),
-                None,
             )
             visible_background = {
                 normalize_launch_fingerprint(

@@ -640,6 +640,27 @@ def test_normal_group_ignores_key_from_non_game_window():
     assert messages.sent == []
 
 
+def test_non_controller_group_member_cannot_start_keyboard_sync():
+    windows = make_windows(foreground=2)
+    messages = FakeMessageBackend()
+    sync = controller(windows, messages)
+    allowed = tuple(
+        window.launch_fingerprint for window in windows.windows
+    )
+    sync.set_allowed_fingerprints(allowed)
+    sync.set_controller_fingerprint(allowed[0])
+
+    result = sync.send_approved_key(
+        "C",
+        policy="all",
+        execute=True,
+        source_handle=2,
+    )
+
+    assert result.failure_codes == ("source_not_controller",)
+    assert messages.sent == []
+
+
 def test_unresponsive_window_aborts_entire_batch_before_input():
     messages = FakeMessageBackend(unresponsive={7})
     result = controller(

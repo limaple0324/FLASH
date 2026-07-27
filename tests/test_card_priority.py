@@ -26,7 +26,6 @@ def _card(reason: CardPriorityReason = CardPriorityReason.ACTIVITY) -> GroupCard
     [
         CardPriorityReason.DISCONNECTION,
         CardPriorityReason.RECOVERY,
-        CardPriorityReason.TIME_LIMIT,
         CardPriorityReason.LOSS_RISK,
     ],
 )
@@ -35,10 +34,21 @@ def test_confirmed_urgent_reasons_share_the_highest_tier(reason):
     assert _card(reason).priority_tier is CardPriorityTier.HIGHEST
 
 
-def test_activity_and_general_information_stay_below_urgent_cards():
+def test_confirmed_card_priority_order_is_preserved():
+    assert priority_tier(CardPriorityReason.TIME_LIMIT) is CardPriorityTier.EXPIRY
     assert priority_tier(CardPriorityReason.ACTIVITY) is CardPriorityTier.ACTIVITY
+    assert (
+        priority_tier(CardPriorityReason.PREFERENCE)
+        is CardPriorityTier.PREFERENCE
+    )
     assert priority_tier(CardPriorityReason.GENERAL) is CardPriorityTier.GENERAL
-    assert CardPriorityTier.HIGHEST < CardPriorityTier.ACTIVITY < CardPriorityTier.GENERAL
+    assert (
+        CardPriorityTier.HIGHEST
+        < CardPriorityTier.EXPIRY
+        < CardPriorityTier.ACTIVITY
+        < CardPriorityTier.PREFERENCE
+        < CardPriorityTier.GENERAL
+    )
 
 
 def test_group_card_defaults_to_activity_priority_without_guessing_urgency():

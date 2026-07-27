@@ -8,6 +8,7 @@ from services.character_detail_view_service import (
     CharacterDetailViewService,
     PlayerCharacterDetail,
 )
+from services.character_game_data_view_service import CharacterGameDataView
 from services.character_view_service import CharacterViewService, PlayerCharacterView
 
 
@@ -72,7 +73,7 @@ def test_build_services_isolates_corrupt_character_profiles(tmp_path) -> None:
     assert list(path.parent.glob("characters.json.corrupt*"))
 
 
-def test_build_services_registers_detail_without_frozen_life_soul(tmp_path) -> None:
+def test_build_services_registers_confirmed_game_data_sections(tmp_path) -> None:
     registry = WindowRegistry()
     registry.register_character("char-a", "角色甲", group="14支")
     WindowRegistryStore(tmp_path / "data" / "window_registry.json").save(registry)
@@ -88,6 +89,11 @@ def test_build_services_registers_detail_without_frozen_life_soul(tmp_path) -> N
             importance=None,
             role=None,
             note=None,
+            game_data=CharacterGameDataView(
+                pet_talent="尚未安全讀取",
+                obsidian="尚未安全讀取",
+                life_soul="尚未安全讀取",
+                artifact="尚未安全讀取",
+            ),
         ),
     )
-    assert not hasattr(details.all()[0], "life_soul")

@@ -41,6 +41,8 @@ _SINGLE_VIRTUAL_KEYS = {
     **{letter: ord(letter) for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
     "TAB": 0x09,
     "ESC": 0x1B,
+    "CTRL": 0x11,
+    "SHIFT": 0x10,
 }
 VIRTUAL_KEY_SEQUENCES = {
     key: (_SINGLE_VIRTUAL_KEYS[key],)
@@ -349,6 +351,7 @@ class WindowsInputSyncController:
         self._preflight_timeout_ms = max(1, int(preflight_timeout_ms))
         self._allowed_fingerprints: tuple[str, ...] | None = None
         self._allowed_fingerprint_set: frozenset[str] | None = None
+        self._controller_fingerprint: str | None = None
         self._conflict_arbiter = conflict_arbiter
         self._deferred_service = deferred_service
         self._reconnecting_provider = reconnecting_provider or (lambda: ())
@@ -394,6 +397,7 @@ class WindowsInputSyncController:
         if fingerprints is None:
             self._allowed_fingerprints = None
             self._allowed_fingerprint_set = None
+            self._controller_fingerprint = None
             return
         normalized = tuple(
             normalize_launch_fingerprint(item)
@@ -414,6 +418,23 @@ class WindowsInputSyncController:
         )
         self._allowed_fingerprints = ordered
         self._allowed_fingerprint_set = frozenset(ordered)
+        if self._controller_fingerprint not in self._allowed_fingerprint_set:
+            self._controller_fingerprint = None
+
+    def set_controller_fingerprint(self, fingerprint: object) -> None:
+        normalized = normalize_launch_fingerprint(fingerprint)
+        if normalized is None:
+            raise ValueError(
+                "controller fingerprint must be a complete SHA-256 digest"
+            )
+        if (
+            self._allowed_fingerprint_set is None
+            or normalized not in self._allowed_fingerprint_set
+        ):
+            raise ValueError(
+                "controller fingerprint must belong to the configured scope"
+            )
+        self._controller_fingerprint = normalized
 
     @classmethod
     def for_real_windows(
@@ -714,6 +735,27 @@ class WindowsInputSyncController:
                 failures=("foreground_not_in_group",),
                 controller_started_ns=controller_started_ns,
             )
+        source_fingerprint = next(
+            (
+                normalize_launch_fingerprint(window.launch_fingerprint)
+                for window in windows
+                if window.handle == captured_source
+            ),
+            None,
+        )
+        if (
+            execute
+            and self._controller_fingerprint is not None
+            and source_fingerprint != self._controller_fingerprint
+        ):
+            return self._base_result(
+                key=normalized_key,
+                policy=normalized_policy,
+                windows=windows,
+                execute=True,
+                failures=("source_not_controller",),
+                controller_started_ns=controller_started_ns,
+            )
         if normalized_key is None:
             failures.append("key_not_approved")
         if normalized_policy is None:
@@ -845,16 +887,6 @@ class WindowsInputSyncController:
             and self._deferred_service is not None
             and self._allowed_fingerprints is not None
         ):
-            source_fingerprint = next(
-                (
-                    normalize_launch_fingerprint(
-                        window.launch_fingerprint
-                    )
-                    for window in windows
-                    if window.handle == captured_source
-                ),
-                None,
-            )
             visible_background = {
                 normalize_launch_fingerprint(
                     window.launch_fingerprint

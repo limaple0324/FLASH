@@ -126,6 +126,61 @@ def test_ctrl_arrow_is_one_confirmed_chord_not_multiple_letter_actions():
     monitor.stop()
 
 
+def test_only_player_checked_keys_are_polled() -> None:
+    controller = FakeController()
+    keyboard = FakeKeyboardState()
+    selected = ["ESC"]
+    monitor = KeyboardSyncMonitor(
+        controller,
+        policy_provider=lambda: "all",
+        selected_keys_provider=lambda: tuple(selected),
+        schedule=lambda _delay, _callback: object(),
+        cancel=lambda _token: None,
+        state_backend=keyboard,
+    )
+    monitor.start()
+    keyboard.down.add(0x42)
+    monitor.poll()
+    assert controller.calls == []
+
+    keyboard.down.clear()
+    keyboard.down.add(0x1B)
+    monitor.poll()
+    assert controller.called.wait(1)
+    assert [item[0] for item in controller.calls] == ["ESC"]
+    monitor.stop()
+
+
+def test_standalone_ctrl_and_shift_can_be_selected() -> None:
+    controller = FakeController()
+    keyboard = FakeKeyboardState()
+    selected = ["CTRL", "SHIFT"]
+    monitor = KeyboardSyncMonitor(
+        controller,
+        policy_provider=lambda: "all",
+        selected_keys_provider=lambda: tuple(selected),
+        schedule=lambda _delay, _callback: object(),
+        cancel=lambda _token: None,
+        state_backend=keyboard,
+    )
+    monitor.start()
+
+    keyboard.down.add(0x11)
+    monitor.poll()
+    assert controller.called.wait(1)
+    keyboard.down.clear()
+    monitor.poll()
+    keyboard.down.add(0x10)
+    monitor.poll()
+
+    for _attempt in range(100):
+        if len(controller.calls) == 2:
+            break
+        threading.Event().wait(0.005)
+    assert [item[0] for item in controller.calls] == ["CTRL", "SHIFT"]
+    monitor.stop()
+
+
 def test_non_game_foreground_never_dispatches_and_stop_cancels_poll():
     monitor, controller, keyboard, scheduled, cancelled = monitor_fixture()
     monitor.start()

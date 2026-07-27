@@ -48,11 +48,15 @@ class CharacterDetailChoiceService:
             self._details.get_by_identity(character_id),
         )
 
-    def all(self) -> tuple[PlayerCharacterDetailChoice, ...]:
+    def all(
+        self,
+        group_name: str | None = None,
+    ) -> tuple[PlayerCharacterDetailChoice, ...]:
         return tuple(
             PlayerCharacterDetailChoice(
                 detail=detail,
                 select=partial(self._select, character_id),
             )
-            for character_id, detail in self._details.all_with_identities()
+            for character_id, detail
+            in self._details.all_with_identities(group_name)
         )

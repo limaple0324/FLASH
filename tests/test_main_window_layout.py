@@ -20,7 +20,8 @@ def test_main_window_uses_home_view():
     assert "execution_guard=direct_auto_click_execution_allowed" in source
     assert "BackgroundImageService" in source
     assert "background_image_service.current_background()" in source
-    assert "on_select_background_image=select_background_image" in source
+    assert "on_choose_background_source=choose_background_source" in source
+    assert "on_prepare_background_image=prepare_background_image" in source
     assert "on_clear_background_image=clear_background_image" in source
     assert '("所有檔案", "*.*")' in source
 

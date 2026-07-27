@@ -8,6 +8,8 @@ logs/
 .pytest_cache/
 build/
 dist/
+.build-cache/
+.flash-build.lock
 .DS_Store
 config/settings.json
 data/

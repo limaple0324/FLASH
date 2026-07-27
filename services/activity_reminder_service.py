@@ -11,7 +11,6 @@ import uuid
 
 from cards.models import GroupCard
 from cards.priority import CardPriorityReason
-from cards.service import CardCapacityError
 from domain.activity_schedule import ActivityScheduleCatalog
 from domain.group import CharacterGroup
 from domain.progress import TAIPEI_TIMEZONE
@@ -159,14 +158,11 @@ class ActivityReminderService:
             lifetime = occurrence.astimezone(timezone.utc) - shown_at
             if lifetime <= timedelta(0):
                 continue
-            try:
-                self._coordinator.show(
-                    card,
-                    shown_at=shown_at,
-                    lifetime=lifetime,
-                )
-            except CardCapacityError:
-                continue
+            self._coordinator.show(
+                card,
+                shown_at=shown_at,
+                lifetime=lifetime,
+            )
             self._emitted[card_id] = occurrence
             self._save_emitted()
             shown.append(card)

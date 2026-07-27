@@ -38,12 +38,30 @@ class CharacterViewService:
                 )
             self._characters[character.character_id] = character
 
+    def replace_characters(
+        self,
+        characters: Iterable[Character],
+    ) -> None:
+        replacement: dict[str, Character] = {}
+        for character in characters:
+            if character.character_id in replacement:
+                raise ValueError(
+                    f"Duplicate stable character ID: {character.character_id}"
+                )
+            replacement[character.character_id] = character
+        self._characters = replacement
+
     def all_with_identities(
         self,
+        group_name: str | None = None,
     ) -> tuple[tuple[str, PlayerCharacterView], ...]:
         """提供內部服務安全配對；角色識別不得傳給顯示層。"""
         snapshots: list[tuple[str, PlayerCharacterView]] = []
-        records = self._registry.all()
+        records = tuple(
+            record
+            for record in self._registry.all()
+            if group_name is None or record.group == group_name
+        )
         ordered_records = sorted(
             records,
             key=lambda record: (
@@ -73,7 +91,12 @@ class CharacterViewService:
             )
         return tuple(snapshots)
 
-    def all(self) -> tuple[PlayerCharacterView, ...]:
+    def all(
+        self,
+        group_name: str | None = None,
+    ) -> tuple[PlayerCharacterView, ...]:
         return tuple(
-            snapshot for _character_id, snapshot in self.all_with_identities()
+            snapshot
+            for _character_id, snapshot
+            in self.all_with_identities(group_name)
         )

@@ -98,7 +98,7 @@ def test_overlay_window_is_topmost_borderless_and_uses_exact_geometry() -> None:
 
     assert ("overrideredirect", True) in window.calls
     assert ("attributes", "-topmost", True) in window.calls
-    assert ("attributes", "-alpha", 0.97) in window.calls
+    assert ("attributes", "-alpha", 1.0) in window.calls
     assert ("geometry", "360x140+1540+880") in window.calls
     assert rendered == [(window, "daily")]
     port.close("daily")
@@ -213,6 +213,34 @@ def test_card_content_uses_only_confirmed_player_fields() -> None:
         name_only=False,
     )
     assert not hasattr(content, "affected_character_ids")
+
+
+def test_long_card_text_keeps_width_and_grows_height() -> None:
+    cards = CardService()
+    long_card = GroupCard(
+        card_id="long",
+        group=CharacterGroup(group_id="group-120", name="120"),
+        activity=ActivityDefinition(
+            activity_id="long-activity",
+            name="這是一個需要自動換行而且必須完整顯示的很長活動名稱",
+            activity_type=ActivityType.DAILY,
+            reset_rule=ResetRule.DAILY_MIDNIGHT,
+        ),
+        current_progress="這是一段需要完整顯示的很長進度內容",
+        priority_reason=CardPriorityReason.ACTIVITY,
+    )
+    cards.upsert(long_card, shown_at=datetime.now(timezone.utc))
+    layout = CardOverlayLayoutService(
+        CardViewStateService(cards),
+        FixedWorkArea(),
+        CardSize(160, 75),
+        right_margin=12,
+        bottom_margin=12,
+        gap=6,
+    ).snapshot()
+
+    assert layout.cards[0].placement.width == 160
+    assert layout.cards[0].placement.height > 75
 
 
 class _FakeWidget:

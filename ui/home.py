@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Event, Thread
 from tkinter import (
     BOTH,
     DISABLED,
@@ -20,13 +22,16 @@ from tkinter import (
     Frame,
     Label,
     OptionMenu,
+    Scale,
     Scrollbar,
+    HORIZONTAL,
     IntVar,
     StringVar,
 )
-from tkinter import messagebox
+from tkinter import colorchooser, messagebox
+from tkinter.ttk import Progressbar
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageStat, ImageTk
 
 from cards.view_state import CardViewState
 from core.target_window_observation import TargetWindowObservation
@@ -43,7 +48,17 @@ from services.group_configuration_service import (
     GroupSyncMemberChoice,
 )
 from services.group_role_status_service import GroupRoleStatus
-from services.background_image_service import BackgroundImageResult
+from services.feature_hotkey_monitor import (
+    FEATURE_HOTKEYS,
+    normalize_feature_hotkey,
+)
+from services.background_image_service import (
+    BackgroundImageResult,
+    BackgroundMetadata,
+    BackgroundSettings,
+    DEFAULT_BACKGROUND_FILL_COLOR,
+    DEFAULT_BACKGROUND_OPACITY,
+)
 from services.sync_operation_record_store import (
     OperationRecordSearchResult,
 )
@@ -55,6 +70,15 @@ INPUT_POLICY_LABELS = {
     "foreground_only": "僅允許前台",
     "foreground_background": "允許前台與背景",
     "all": "全部允許（含最小化）",
+}
+
+BACKGROUND_PAGE_LABELS = {
+    "home": "首頁",
+    "groups": "組別與視窗",
+    "sync": "同步與重連",
+    "characters": "角色資料",
+    "records": "紀錄",
+    "settings": "設定",
 }
 
 UI_THEME_LABELS = {
@@ -134,6 +158,63 @@ def theme_palette(name: object) -> dict[str, str]:
     return dict(selected)
 
 
+def _blend_hex_color(base: str, backdrop: str, opacity: int) -> str:
+    """Blend a legacy UI color over the visible background."""
+    normalized_opacity = max(0, min(100, int(opacity))) / 100
+
+    def rgb(value: str) -> tuple[int, int, int]:
+        return tuple(
+            int(value[index : index + 2], 16)
+            for index in (1, 3, 5)
+        )
+
+    base_rgb = rgb(base)
+    backdrop_rgb = rgb(backdrop)
+    blended = tuple(
+        round(
+            backdrop_channel * (1 - normalized_opacity)
+            + base_channel * normalized_opacity
+        )
+        for base_channel, backdrop_channel in zip(
+            base_rgb,
+            backdrop_rgb,
+        )
+    )
+    return "#" + "".join(f"{channel:02X}" for channel in blended)
+
+
+def _average_image_color(image: Image.Image) -> str:
+    mean = ImageStat.Stat(image.convert("RGB")).mean
+    return "#" + "".join(
+        f"{max(0, min(255, round(value))):02X}" for value in mean[:3]
+    )
+
+
+def _contrast_ratio(first: str, second: str) -> float:
+    def luminance(value: str) -> float:
+        channels = [
+            int(value[index : index + 2], 16) / 255
+            for index in (1, 3, 5)
+        ]
+        linear = [
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return (
+            0.2126 * linear[0]
+            + 0.7152 * linear[1]
+            + 0.0722 * linear[2]
+        )
+
+    light, dark = sorted(
+        (luminance(first), luminance(second)),
+        reverse=True,
+    )
+    return (light + 0.05) / (dark + 0.05)
+
+
 def _apply_theme_palette(name: object) -> str:
     key = (
         name
@@ -163,24 +244,25 @@ def _apply_theme_palette(name: object) -> str:
 _apply_theme_palette("clear_blue")
 
 
-def _cover_geometry(
+def _contain_geometry(
     source_size: tuple[int, int],
     viewport_size: tuple[int, int],
 ) -> tuple[int, int, int, int]:
-    """Return resized dimensions and centered crop origin for cover layout."""
+    """Return no-upscale contain dimensions and centered placement."""
     source_width, source_height = source_size
     viewport_width, viewport_height = viewport_size
     if min(source_width, source_height, viewport_width, viewport_height) < 1:
         raise ValueError("image and viewport dimensions must be positive")
-    scale = max(
+    scale = min(
+        1.0,
         viewport_width / source_width,
         viewport_height / source_height,
     )
-    resized_width = max(viewport_width, round(source_width * scale))
-    resized_height = max(viewport_height, round(source_height * scale))
-    crop_x = max(0, (resized_width - viewport_width) // 2)
-    crop_y = max(0, (resized_height - viewport_height) // 2)
-    return resized_width, resized_height, crop_x, crop_y
+    resized_width = max(1, round(source_width * scale))
+    resized_height = max(1, round(source_height * scale))
+    offset_x = max(0, (viewport_width - resized_width) // 2)
+    offset_y = max(0, (viewport_height - resized_height) // 2)
+    return resized_width, resized_height, offset_x, offset_y
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +408,14 @@ class HomeView:
         on_input_policy_change=None,
         keyboard_sync_enabled: bool = False,
         on_keyboard_sync_change: Callable[[bool], object] | None = None,
+        selected_sync_keys: Iterable[str] = ("ESC",),
+        on_selected_sync_keys_change: (
+            Callable[[tuple[str, ...]], object] | None
+        ) = None,
+        feature_hotkeys: Mapping[str, object] | None = None,
+        on_feature_hotkey_change: (
+            Callable[[str, str], object] | None
+        ) = None,
         group_choices: Iterable[PlayerGroupChoice] = (),
         group_choices_provider: (
             Callable[[], tuple[PlayerGroupChoice, ...]] | None
@@ -417,11 +507,47 @@ class HomeView:
         theme_name: str = "clear_blue",
         on_theme_change: Callable[[str], object] | None = None,
         background_image_path: Path | None = None,
+        background_fill_color: str = "#C9A35D",
+        background_settings: BackgroundSettings | None = None,
+        background_for_page: Callable[[str], Path | None] | None = None,
+        background_metadata_provider: (
+            Callable[[Path | None], BackgroundMetadata | None] | None
+        ) = None,
+        background_settings_provider: (
+            Callable[[], BackgroundSettings] | None
+        ) = None,
         on_select_background_image: (
             Callable[[], BackgroundImageResult | None] | None
         ) = None,
+        on_choose_background_source: (
+            Callable[[], Path | None] | None
+        ) = None,
+        on_prepare_background_image: (
+            Callable[[Path, Callable[[], bool]], BackgroundImageResult]
+            | None
+        ) = None,
+        on_save_background_image: (
+            Callable[[Path, bool, tuple[str, ...]], BackgroundImageResult]
+            | None
+        ) = None,
+        on_discard_background_image: Callable[[Path | None], object] | None = None,
         on_clear_background_image: (
             Callable[[], BackgroundImageResult] | None
+        ) = None,
+        on_clear_page_background: (
+            Callable[[str], BackgroundImageResult] | None
+        ) = None,
+        on_clear_all_backgrounds: (
+            Callable[[], BackgroundImageResult] | None
+        ) = None,
+        on_export_background_settings: (
+            Callable[[], Path | None] | None
+        ) = None,
+        on_import_background_settings: (
+            Callable[[], BackgroundImageResult | None] | None
+        ) = None,
+        on_background_display_settings_update: (
+            Callable[[str, int, int, int], BackgroundSettings] | None
         ) = None,
         on_refresh_error: Callable[[Exception], object] | None = None,
     ):
@@ -434,6 +560,24 @@ class HomeView:
         self.on_input_policy_change = on_input_policy_change
         self.keyboard_sync_enabled = bool(keyboard_sync_enabled)
         self.on_keyboard_sync_change = on_keyboard_sync_change
+        known_shortcut_keys = {
+            shortcut.key for shortcut in CONFIRMED_GAME_SHORTCUTS
+        }
+        self.selected_sync_keys = tuple(
+            dict.fromkeys(
+                key
+                for key in selected_sync_keys
+                if isinstance(key, str) and key in known_shortcut_keys
+            )
+        )
+        self.on_selected_sync_keys_change = on_selected_sync_keys_change
+        self.feature_hotkeys = {
+            name: normalize_feature_hotkey(
+                (feature_hotkeys or {}).get(name)
+            )
+            for name in ("sync", "reconnect", "auto_click")
+        }
+        self.on_feature_hotkey_change = on_feature_hotkey_change
         self.group_choices = tuple(group_choices)
         if any(
             not isinstance(choice, PlayerGroupChoice)
@@ -517,8 +661,30 @@ class HomeView:
             if background_image_path is not None
             else None
         )
+        self.background_fill_color = (
+            background_fill_color
+            if isinstance(background_fill_color, str)
+            and len(background_fill_color) == 7
+            and background_fill_color.startswith("#")
+            else "#C9A35D"
+        )
+        self.background_settings = background_settings
+        self.background_for_page = background_for_page
+        self.background_metadata_provider = background_metadata_provider
+        self.background_settings_provider = background_settings_provider
         self.on_select_background_image = on_select_background_image
+        self.on_choose_background_source = on_choose_background_source
+        self.on_prepare_background_image = on_prepare_background_image
+        self.on_save_background_image = on_save_background_image
+        self.on_discard_background_image = on_discard_background_image
         self.on_clear_background_image = on_clear_background_image
+        self.on_clear_page_background = on_clear_page_background
+        self.on_clear_all_backgrounds = on_clear_all_backgrounds
+        self.on_export_background_settings = on_export_background_settings
+        self.on_import_background_settings = on_import_background_settings
+        self.on_background_display_settings_update = (
+            on_background_display_settings_update
+        )
         self.on_refresh_error = on_refresh_error
         self._root: Frame | None = None
         self._active_page = "home"
@@ -534,6 +700,9 @@ class HomeView:
         self._card_seconds_entry: Entry | None = None
         self._keyboard_sync_label: Label | None = None
         self._keyboard_sync_button: Button | None = None
+        self._sync_key_variables: dict[str, IntVar] = {}
+        self._sync_key_count_label: Label | None = None
+        self._feature_hotkey_variables: dict[str, StringVar] = {}
         self._smart_reconnect_label: Label | None = None
         self._smart_reconnect_button: Button | None = None
         self._reconnect_failure_card: Frame | None = None
@@ -568,13 +737,60 @@ class HomeView:
         self._page_canvas_window: int | None = None
         self._theme_variable: StringVar | None = None
         self._background_status_label: Label | None = None
+        self._background_sidebar_label: Label | None = None
+        self._background_sidebar_photo = None
+        self._background_widget_colors: dict[object, str] = {}
+        self._background_widget_highlights: dict[
+            object,
+            tuple[int, str],
+        ] = {}
+        self._background_choose_button: Button | None = None
+        self._background_cancel_button: Button | None = None
+        self._background_progress_bar: Progressbar | None = None
+        self._background_prepare_cancel = Event()
+        self._background_prepare_results: Queue[
+            BackgroundImageResult | Exception
+        ] = Queue()
+        self._background_prepare_poll_id: str | None = None
+        self._background_prepare_running = False
         self._background_canvas_item: int | None = None
         self._background_page_labels: dict[str, Label] = {}
         self._background_source_image: Image.Image | None = None
         self._background_loaded_path: Path | None = None
         self._background_photo = None
         self._background_resize_id: str | None = None
+        self._background_pending_render_size: tuple[int, int] | None = None
         self._background_render_size: tuple[int, int] | None = None
+        self._pending_background_path: Path | None = None
+        self._pending_background_result: BackgroundImageResult | None = None
+        self._background_apply_all_variable: IntVar | None = None
+        self._background_page_variables: dict[str, IntVar] = {}
+        self._background_preview_page_variable: StringVar | None = None
+        self._background_preview_active = False
+        self._background_fill_entry: Entry | None = None
+        self._background_opacity_scales: dict[str, Scale] = {}
+        self._saved_background_display_values = {
+            "fill_color": (
+                background_settings.fill_color
+                if background_settings is not None
+                else self.background_fill_color
+            ),
+            "sidebar": (
+                background_settings.sidebar_opacity
+                if background_settings is not None
+                else DEFAULT_BACKGROUND_OPACITY["sidebar"]
+            ),
+            "panel": (
+                background_settings.panel_opacity
+                if background_settings is not None
+                else DEFAULT_BACKGROUND_OPACITY["panel"]
+            ),
+            "role_row": (
+                background_settings.role_row_opacity
+                if background_settings is not None
+                else DEFAULT_BACKGROUND_OPACITY["role_row"]
+            ),
+        }
 
     @staticmethod
     def _button(parent, text: str, command=None, *, primary: bool = False):
@@ -628,6 +844,8 @@ class HomeView:
         self._pages.clear()
         self._navigation_buttons.clear()
         self._background_page_labels.clear()
+        self._background_widget_colors.clear()
+        self._background_widget_highlights.clear()
         self._last_group_role_statuses = None
         self.theme_name = _apply_theme_palette(self.theme_name)
         root = Frame(self.parent, bg=BACKGROUND)
@@ -639,6 +857,20 @@ class HomeView:
         sidebar = Frame(body, bg=SIDEBAR, width=176, padx=12, pady=16)
         sidebar.pack(side=LEFT, fill=Y)
         sidebar.pack_propagate(False)
+        self._background_sidebar_label = Label(
+            sidebar,
+            bg=SIDEBAR,
+            bd=0,
+            highlightthickness=0,
+            anchor="nw",
+        )
+        self._background_sidebar_label.place(
+            x=0,
+            y=0,
+            relwidth=1,
+            relheight=1,
+        )
+        self._background_sidebar_label.lower()
         content_shell = Frame(body, bg=BACKGROUND, padx=22, pady=20)
         content_shell.pack(side=LEFT, fill=BOTH, expand=True)
         scrollbar = Scrollbar(content_shell, orient="vertical")
@@ -667,6 +899,7 @@ class HomeView:
         self._page_canvas = canvas
         self._page_canvas_window = canvas_window
         self._background_photo = None
+        self._background_sidebar_photo = None
         self._background_render_size = None
         self._set_background_path(self.background_image_path)
         content.bind("<Configure>", self._sync_page_scroll_region)
@@ -676,8 +909,6 @@ class HomeView:
             self._on_page_mousewheel,
             add="+",
         )
-
-        self._build_group_summary(sidebar)
 
         page_specs = (
             ("home", "首頁"),
@@ -754,6 +985,7 @@ class HomeView:
         except Exception:
             pass
         self._background_resize_id = None
+        self._background_pending_render_size = None
 
     def _schedule_background_resize(self, width: int, height: int) -> None:
         if (
@@ -766,11 +998,20 @@ class HomeView:
         requested_size = (width, height)
         if requested_size == self._background_render_size:
             return
-        self._cancel_background_resize()
+        self._background_pending_render_size = requested_size
+        if self._background_resize_id is not None:
+            return
         self._background_resize_id = self.parent.after(
-            120,
-            lambda: self._render_background(requested_size),
+            33,
+            self._render_pending_background,
         )
+
+    def _render_pending_background(self) -> None:
+        self._background_resize_id = None
+        requested_size = self._background_pending_render_size
+        self._background_pending_render_size = None
+        if requested_size is not None:
+            self._render_background(requested_size)
 
     def _render_background(self, viewport_size: tuple[int, int]) -> None:
         self._background_resize_id = None
@@ -781,20 +1022,97 @@ class HomeView:
             return
         width, height = viewport_size
         try:
-            resized_width, resized_height, crop_x, crop_y = _cover_geometry(
+            root_width = max(
+                width + 176,
+                int(self._root.winfo_width()) if self._root is not None else 0,
+            )
+            root_height = max(
+                height,
+                int(self._root.winfo_height()) if self._root is not None else 0,
+            )
+            resized_width, resized_height, offset_x, offset_y = _contain_geometry(
                 source.size,
-                viewport_size,
+                (root_width, root_height),
             )
             resized = source.resize(
                 (resized_width, resized_height),
                 Image.Resampling.LANCZOS,
             )
             try:
-                display = resized.crop(
-                    (crop_x, crop_y, crop_x + width, crop_y + height)
+                display = Image.new(
+                    "RGB",
+                    (root_width, root_height),
+                    self.background_fill_color,
                 )
                 try:
-                    photo = ImageTk.PhotoImage(display, master=self.parent)
+                    display.paste(
+                        resized,
+                        (offset_x, offset_y),
+                        resized if resized.mode == "RGBA" else None,
+                    )
+                    sidebar_width = min(176, root_width)
+                    content_left = max(0, root_width - width)
+                    sidebar_image = display.crop(
+                        (0, 0, sidebar_width, root_height)
+                    )
+                    content_image = display.crop(
+                        (
+                            content_left,
+                            0,
+                            min(root_width, content_left + width),
+                            min(root_height, height),
+                        )
+                    )
+                    try:
+                        try:
+                            values = self._background_display_values()
+                        except (TypeError, ValueError):
+                            values = self._saved_background_display_values
+                        sidebar_tint = Image.new(
+                            "RGB",
+                            sidebar_image.size,
+                            SIDEBAR,
+                        )
+                        panel_tint = Image.new(
+                            "RGB",
+                            content_image.size,
+                            BACKGROUND,
+                        )
+                        try:
+                            sidebar_display = Image.blend(
+                                sidebar_image,
+                                sidebar_tint,
+                                int(values["sidebar"]) / 100,
+                            )
+                            panel_display = Image.blend(
+                                content_image,
+                                panel_tint,
+                                int(values["panel"]) / 100,
+                            )
+                            try:
+                                photo = ImageTk.PhotoImage(
+                                    panel_display,
+                                    master=self.parent,
+                                )
+                                sidebar_photo = ImageTk.PhotoImage(
+                                    sidebar_display,
+                                    master=self.parent,
+                                )
+                                panel_average = _average_image_color(
+                                    content_image
+                                )
+                                sidebar_average = _average_image_color(
+                                    sidebar_image
+                                )
+                            finally:
+                                sidebar_display.close()
+                                panel_display.close()
+                        finally:
+                            sidebar_tint.close()
+                            panel_tint.close()
+                    finally:
+                        sidebar_image.close()
+                        content_image.close()
                 finally:
                     display.close()
             finally:
@@ -805,12 +1123,29 @@ class HomeView:
             for label in self._background_page_labels.values():
                 label.configure(image=photo)
                 label.lower()
+            if self._background_sidebar_label is not None:
+                self._background_sidebar_label.configure(
+                    image=sidebar_photo
+                )
+                self._background_sidebar_label.lower()
             self._background_photo = photo
+            self._background_sidebar_photo = sidebar_photo
             self._background_render_size = viewport_size
+            self._apply_background_widget_colors(
+                sidebar_average,
+                panel_average,
+                int(values["sidebar"]),
+                int(values["panel"]),
+                int(values["role_row"]),
+            )
         except Exception:
             canvas.itemconfigure(item, image="", state="hidden")
+            if self._background_sidebar_label is not None:
+                self._background_sidebar_label.configure(image="")
             self._background_photo = None
+            self._background_sidebar_photo = None
             self._background_render_size = None
+            self._restore_background_widget_colors()
             self._refresh_background_status(
                 "受管背景副本目前無法顯示，請重新選擇圖片。"
             )
@@ -838,6 +1173,7 @@ class HomeView:
         self._background_source_image = None
         self._background_loaded_path = None
         self._background_photo = None
+        self._background_sidebar_photo = None
         self._background_render_size = None
 
         canvas = self._page_canvas
@@ -847,6 +1183,9 @@ class HomeView:
                 canvas.itemconfigure(item, image="", state="hidden")
             for label in self._background_page_labels.values():
                 label.configure(image="")
+            if self._background_sidebar_label is not None:
+                self._background_sidebar_label.configure(image="")
+            self._restore_background_widget_colors()
             return True
         try:
             with Image.open(normalized) as opened:
@@ -859,6 +1198,9 @@ class HomeView:
                 canvas.itemconfigure(item, image="", state="hidden")
             for label in self._background_page_labels.values():
                 label.configure(image="")
+            if self._background_sidebar_label is not None:
+                self._background_sidebar_label.configure(image="")
+            self._restore_background_widget_colors()
             return False
         self._background_loaded_path = normalized
         if canvas is not None:
@@ -868,16 +1210,181 @@ class HomeView:
             )
         return True
 
+    def _remember_and_blend_widget_tree(
+        self,
+        widget,
+        backdrop: str,
+        opacity: int,
+    ) -> None:
+        try:
+            current = str(widget.cget("background"))
+        except Exception:
+            current = ""
+        if (
+            len(current) == 7
+            and current.startswith("#")
+        ):
+            base = self._background_widget_colors.setdefault(
+                widget,
+                current,
+            )
+            try:
+                blended = _blend_hex_color(
+                    base,
+                    backdrop,
+                    opacity,
+                )
+                widget.configure(background=blended)
+                try:
+                    foreground = str(widget.cget("foreground"))
+                    widget_class = str(widget.winfo_class())
+                except Exception:
+                    foreground = ""
+                    widget_class = ""
+                if (
+                    widget_class == "Label"
+                    and len(foreground) == 7
+                    and foreground.startswith("#")
+                ):
+                    original_highlight = (
+                        int(widget.cget("highlightthickness")),
+                        str(widget.cget("highlightbackground")),
+                    )
+                    self._background_widget_highlights.setdefault(
+                        widget,
+                        original_highlight,
+                    )
+                    if _contrast_ratio(foreground, blended) < 3:
+                        widget.configure(
+                            highlightthickness=1,
+                            highlightbackground=(
+                                "#FFFFFF"
+                                if _contrast_ratio(
+                                    foreground,
+                                    "#FFFFFF",
+                                )
+                                > _contrast_ratio(
+                                    foreground,
+                                    "#000000",
+                                )
+                                else "#000000"
+                            ),
+                        )
+                    else:
+                        widget.configure(
+                            highlightthickness=original_highlight[0],
+                            highlightbackground=original_highlight[1],
+                        )
+            except Exception:
+                pass
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            children = ()
+        for child in children:
+            self._remember_and_blend_widget_tree(
+                child,
+                backdrop,
+                opacity,
+            )
+
+    def _apply_background_widget_colors(
+        self,
+        sidebar_backdrop: str,
+        panel_backdrop: str,
+        sidebar_opacity: int,
+        panel_opacity: int,
+        role_row_opacity: int,
+    ) -> None:
+        if self._background_sidebar_label is not None:
+            sidebar = self._background_sidebar_label.master
+            self._remember_and_blend_widget_tree(
+                sidebar,
+                sidebar_backdrop,
+                sidebar_opacity,
+            )
+        for page in self._pages.values():
+            self._remember_and_blend_widget_tree(
+                page,
+                panel_backdrop,
+                panel_opacity,
+            )
+        if self._home_role_rows_frame is not None:
+            self._remember_and_blend_widget_tree(
+                self._home_role_rows_frame,
+                panel_backdrop,
+                role_row_opacity,
+            )
+
+    def _restore_background_widget_colors(self) -> None:
+        for widget, color in tuple(self._background_widget_colors.items()):
+            try:
+                widget.configure(background=color)
+            except Exception:
+                pass
+        for widget, (thickness, color) in tuple(
+            self._background_widget_highlights.items()
+        ):
+            try:
+                widget.configure(
+                    highlightthickness=thickness,
+                    highlightbackground=color,
+                )
+            except Exception:
+                pass
+
     def _background_status_text(self, message: str = "") -> str:
-        if self.background_image_path is None:
+        pending = self._pending_background_result
+        if pending is not None and pending.managed_path is not None:
+            size = (
+                f"{pending.original_size[0]}×{pending.original_size[1]}"
+                if pending.original_size is not None
+                else "未知"
+            )
+            status = (
+                f"預覽圖片：{pending.original_name or pending.managed_path.name}\n"
+                f"原始尺寸：{size}\n"
+                f"最後更新：{pending.updated_at or '尚未儲存'}"
+            )
+        elif self.background_image_path is None:
             status = "目前背景：未設定，沿用介面配色。"
         elif self._background_source_image is None:
             status = "目前背景：受管背景副本無法顯示。"
         else:
-            status = (
-                "目前背景：已套用受管背景副本"
-                f"（{self.background_image_path.name}）。"
+            metadata = (
+                self.background_metadata_provider(self.background_image_path)
+                if self.background_metadata_provider is not None
+                else None
             )
+            if metadata is None:
+                status = "目前背景：已套用受管背景副本。"
+            else:
+                applied_page_names: list[str] = []
+                if self.background_settings is not None:
+                    if (
+                        self.background_settings.global_path
+                        == self.background_image_path
+                    ):
+                        applied_page_names.append("全部頁面")
+                    applied_page_names.extend(
+                        BACKGROUND_PAGE_LABELS.get(page, page)
+                        for page, path in self.background_settings.page_paths
+                        if path == self.background_image_path
+                    )
+                applied_pages = (
+                    "、".join(dict.fromkeys(applied_page_names))
+                    or BACKGROUND_PAGE_LABELS.get(
+                        self._active_page,
+                        self._active_page,
+                    )
+                )
+                status = (
+                    f"目前圖片：{metadata.original_name}\n"
+                    f"原始尺寸：{metadata.original_size[0]}×"
+                    f"{metadata.original_size[1]}\n"
+                    f"套用頁面：{applied_pages}\n"
+                    f"最後更新：{metadata.updated_at}"
+                )
         return f"{message}\n{status}" if message else status
 
     def _refresh_background_status(self, message: str = "") -> None:
@@ -981,23 +1488,18 @@ class HomeView:
         target_card.pack(side=LEFT, fill=BOTH, expand=True, padx=(8, 0))
         Label(
             target_card,
-            text="遊戲視窗",
+            text="目前組別",
             font=("Microsoft JhengHei UI", 10),
             bg=SURFACE,
             fg=MUTED,
             anchor="w",
         ).pack(fill=X)
-        target_text = (
-            target_window_summary(self.target_window_state)
-            if self.target_window_state is not None
-            else "尚未完成視窗檢查"
-        )
         self._target_label = Label(
             target_card,
-            text=f"● {target_text}",
+            text=self._current_group_summary_text(),
             font=("Microsoft JhengHei UI", 11),
             bg=SURFACE,
-            fg=SUCCESS if self.target_window_state and self.target_window_state.safe else WARNING,
+            fg=TEXT,
             anchor="w",
         )
         self._target_label.pack(fill=X, pady=(8, 0))
@@ -1086,6 +1588,29 @@ class HomeView:
             anchor="w",
         ).pack(fill=X, pady=(12, 0))
         return page
+
+    def _current_group_summary_text(self) -> str:
+        group_name = self.current_group_name
+        if not group_name:
+            return "尚未選擇組別"
+        entries: tuple[GroupConfigurationEntry, ...] = ()
+        if self.group_entries_provider is not None:
+            try:
+                entries = self.group_entries_provider(group_name)
+            except Exception:
+                entries = ()
+        if not entries:
+            return f"{group_name}｜尚未加入角色"
+        return (
+            f"{group_name}｜主控：{entries[0].display_name}｜"
+            f"{len(entries)} 個視窗"
+        )
+
+    def refresh_current_group_summary(self) -> str:
+        text = self._current_group_summary_text()
+        if self._target_label is not None:
+            self._target_label.configure(text=text, fg=TEXT)
+        return text
 
     def _build_records_page(self, parent) -> Frame:
         page = Frame(parent, bg=BACKGROUND)
@@ -1798,32 +2323,36 @@ class HomeView:
             highlightthickness=0,
         )
         policy_menu.pack(fill=X)
-        shortcut_labels = tuple(
-            shortcut.player_label for shortcut in CONFIRMED_GAME_SHORTCUTS
-        )
-        shortcut_variable = StringVar(
-            master=self.parent,
-            value=shortcut_labels[0],
-        )
-        self._shortcut_variable = shortcut_variable
-        shortcut_menu = OptionMenu(
+        Label(
             input_card,
-            shortcut_variable,
-            *shortcut_labels,
-        )
-        shortcut_menu.configure(
-            font=("Microsoft JhengHei UI", 10),
-            bg=BACKGROUND,
+            text="勾選要同步的遊戲按鍵",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=SURFACE,
             fg=TEXT,
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
             anchor="w",
-        )
-        shortcut_menu["menu"].configure(
-            font=("Microsoft JhengHei UI", 10),
-        )
-        shortcut_menu.pack(fill=X, pady=(12, 0))
+        ).pack(fill=X, pady=(12, 4))
+        shortcut_list = Frame(input_card, bg=BACKGROUND, padx=10, pady=8)
+        shortcut_list.pack(fill=X)
+        self._sync_key_variables = {}
+        for shortcut in CONFIRMED_GAME_SHORTCUTS:
+            variable = IntVar(
+                master=self.parent,
+                value=1 if shortcut.key in self.selected_sync_keys else 0,
+            )
+            self._sync_key_variables[shortcut.key] = variable
+            Checkbutton(
+                shortcut_list,
+                text=shortcut.player_label,
+                variable=variable,
+                command=self._sync_key_selection_changed,
+                font=("Microsoft JhengHei UI", 9),
+                bg=BACKGROUND,
+                fg=TEXT,
+                activebackground=BACKGROUND,
+                selectcolor=SURFACE,
+                anchor="w",
+                justify=LEFT,
+            ).pack(fill=X, anchor="w")
 
         actions = Frame(input_card, bg=SURFACE)
         actions.pack(fill=X, pady=(10, 0))
@@ -1842,16 +2371,19 @@ class HomeView:
             fg=MUTED,
         )
         self._keyboard_sync_label.pack(side=LEFT, padx=12)
-        Label(
+        self._sync_key_count_label = Label(
             actions,
-            text=(
-                f"已確認 {len(CONFIRMED_GAME_SHORTCUTS)} 組快捷鍵；"
-                "請從上方清單查看"
-            ),
+            text="",
             font=("Microsoft JhengHei UI", 9),
             bg=SURFACE,
             fg=MUTED,
-        ).pack(side=RIGHT)
+        )
+        self._sync_key_count_label.pack(side=RIGHT)
+        self._build_feature_hotkey_selector(
+            input_card,
+            "sync",
+            "同步啟閉快捷鍵",
+        )
         self._refresh_keyboard_sync_controls()
 
         reconnect_card = self._card(page)
@@ -1880,6 +2412,11 @@ class HomeView:
             primary=True,
         )
         self._smart_reconnect_button.pack(anchor="w", pady=(10, 0))
+        self._build_feature_hotkey_selector(
+            reconnect_card,
+            "reconnect",
+            "智慧重連啟閉快捷鍵",
+        )
         Label(
             reconnect_card,
             text="啟用後會自動判定與重試；不需逐次按重連按鈕。",
@@ -1973,14 +2510,6 @@ class HomeView:
         )
         self._auto_click_count_entry.insert(0, "1")
         self._auto_click_count_entry.pack(side=LEFT, padx=(6, 14), ipady=5)
-        Label(
-            settings_row,
-            text="快捷鍵 F1",
-            font=("Microsoft JhengHei UI", 9),
-            bg=SURFACE,
-            fg=MUTED,
-        ).pack(side=LEFT)
-
         auto_click_actions = Frame(auto_click_card, bg=SURFACE)
         auto_click_actions.pack(fill=X, pady=(10, 0))
         self._auto_click_toggle_button = self._button(
@@ -1998,8 +2527,83 @@ class HomeView:
             fg=MUTED,
         )
         self._auto_click_status_label.pack(side=LEFT, padx=12)
+        self._build_feature_hotkey_selector(
+            auto_click_card,
+            "auto_click",
+            "連續點擊啟閉快捷鍵",
+        )
         self._refresh_auto_click_controls()
         return page
+
+    def _build_feature_hotkey_selector(
+        self,
+        parent,
+        feature: str,
+        title: str,
+    ) -> None:
+        row = Frame(parent, bg=SURFACE)
+        row.pack(fill=X, pady=(10, 0))
+        Label(
+            row,
+            text=title,
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+        ).pack(side=LEFT)
+        display_values = ("未設定",) + tuple(
+            value for value in FEATURE_HOTKEYS if value
+        )
+        current = self.feature_hotkeys.get(feature, "")
+        variable = StringVar(
+            master=self.parent,
+            value=current or "未設定",
+        )
+        self._feature_hotkey_variables[feature] = variable
+
+        def changed(value: str) -> None:
+            normalized = normalize_feature_hotkey(
+                "" if value == "未設定" else value
+            )
+            previous = self.feature_hotkeys.get(feature, "")
+            if self.on_feature_hotkey_change is not None:
+                accepted = self.on_feature_hotkey_change(
+                    feature,
+                    normalized,
+                )
+                if accepted is False:
+                    variable.set(previous or "未設定")
+                    return
+            self.feature_hotkeys[feature] = normalized
+
+        menu = OptionMenu(row, variable, *display_values, command=changed)
+        menu.configure(
+            font=("Microsoft JhengHei UI", 9),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        menu.pack(side=LEFT, padx=(8, 0))
+
+    def _sync_key_selection_changed(self) -> None:
+        selected = tuple(
+            shortcut.key
+            for shortcut in CONFIRMED_GAME_SHORTCUTS
+            if (
+                shortcut.key in self._sync_key_variables
+                and self._sync_key_variables[shortcut.key].get()
+            )
+        )
+        previous = self.selected_sync_keys
+        if self.on_selected_sync_keys_change is not None:
+            accepted = self.on_selected_sync_keys_change(selected)
+            if accepted is False:
+                for key, variable in self._sync_key_variables.items():
+                    variable.set(1 if key in previous else 0)
+                return
+        self.selected_sync_keys = selected
+        self._refresh_keyboard_sync_controls()
 
     def _toggle_keyboard_sync(self) -> None:
         desired = not self.keyboard_sync_enabled
@@ -2032,14 +2636,27 @@ class HomeView:
                 ),
                 fg=SUCCESS if self.keyboard_sync_enabled else MUTED,
             )
+        if self._sync_key_count_label is not None:
+            self._sync_key_count_label.configure(
+                text=(
+                    f"已勾選 {len(self.selected_sync_keys)}／"
+                    f"{len(CONFIRMED_GAME_SHORTCUTS)} 個按鍵"
+                )
+            )
 
     def set_keyboard_sync_enabled(self, enabled: bool) -> None:
         self.keyboard_sync_enabled = bool(enabled)
         self._refresh_keyboard_sync_controls()
 
+    def toggle_keyboard_sync_from_hotkey(self) -> None:
+        self._toggle_keyboard_sync()
+
     def set_smart_reconnect_enabled(self, enabled: bool) -> None:
         self.smart_reconnect_enabled = bool(enabled)
         self._refresh_smart_reconnect_controls()
+
+    def toggle_smart_reconnect_from_hotkey(self) -> None:
+        self._toggle_smart_reconnect()
 
     def _toggle_smart_reconnect(self) -> None:
         desired = not self.smart_reconnect_enabled
@@ -2179,6 +2796,50 @@ class HomeView:
                 self._button(row, "查看", select).pack(side=RIGHT)
         return page
 
+    def set_character_data(
+        self,
+        characters: Iterable[PlayerCharacterView],
+        character_choices: Iterable[PlayerCharacterDetailChoice],
+    ) -> None:
+        updated_characters = tuple(characters)
+        updated_choices = tuple(character_choices)
+        if any(
+            not isinstance(character, PlayerCharacterView)
+            for character in updated_characters
+        ):
+            raise TypeError(
+                "characters must contain PlayerCharacterView values."
+            )
+        if any(
+            not isinstance(choice, PlayerCharacterDetailChoice)
+            for choice in updated_choices
+        ):
+            raise TypeError(
+                "character_choices must contain "
+                "PlayerCharacterDetailChoice values."
+            )
+        self.characters = updated_characters
+        self.character_choices = updated_choices
+        current = self._pages.get("characters")
+        if current is None:
+            return
+        parent = current.master
+        current.destroy()
+        page = self._build_characters_page(parent)
+        self._pages["characters"] = page
+        background_label = Label(
+            page,
+            bg=BACKGROUND,
+            bd=0,
+            highlightthickness=0,
+            anchor="nw",
+        )
+        background_label.place(x=0, y=0, relwidth=1, relheight=1)
+        background_label.lower()
+        self._background_page_labels["characters"] = background_label
+        if self._active_page == "characters":
+            self.show_page("characters")
+
     def _build_settings_page(self, parent) -> Frame:
         page = Frame(parent, bg=BACKGROUND)
         self._page_heading(
@@ -2277,8 +2938,15 @@ class HomeView:
             self._choose_background_image,
             primary=True,
         )
+        self._background_choose_button = choose_button
         choose_button.pack(side=LEFT)
-        if self.on_select_background_image is None:
+        if (
+            self.on_select_background_image is None
+            and (
+                self.on_choose_background_source is None
+                or self.on_prepare_background_image is None
+            )
+        ):
             choose_button.configure(state=DISABLED)
         clear_button = self._button(
             background_row,
@@ -2288,6 +2956,222 @@ class HomeView:
         clear_button.pack(side=LEFT, padx=(8, 0))
         if self.on_clear_background_image is None:
             clear_button.configure(state=DISABLED)
+        clear_pages_button = self._button(
+            background_row,
+            "移除勾選頁面獨立背景",
+            self._clear_selected_page_backgrounds,
+        )
+        clear_pages_button.pack(side=LEFT, padx=(8, 0))
+        if self.on_clear_page_background is None:
+            clear_pages_button.configure(state=DISABLED)
+        progress_row = Frame(background_card, bg=SURFACE)
+        progress_row.pack(fill=X, pady=(8, 0))
+        self._background_progress_bar = Progressbar(
+            progress_row,
+            mode="indeterminate",
+        )
+        self._background_progress_bar.pack(
+            side=LEFT,
+            fill=X,
+            expand=True,
+        )
+        self._background_progress_bar.pack_forget()
+        self._background_cancel_button = self._button(
+            progress_row,
+            "取消轉換",
+            self._cancel_background_prepare,
+        )
+        self._background_cancel_button.pack(side=LEFT, padx=(8, 0))
+        self._background_cancel_button.configure(state=DISABLED)
+
+        scope_frame = Frame(background_card, bg=SURFACE)
+        scope_frame.pack(fill=X, pady=(14, 0))
+        Label(
+            scope_frame,
+            text="套用頁面",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        self._background_apply_all_variable = IntVar(
+            master=self.parent,
+            value=1,
+        )
+        Checkbutton(
+            scope_frame,
+            text="全部頁面（未來新增頁面也自動套用）",
+            variable=self._background_apply_all_variable,
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=TEXT,
+            activebackground=SURFACE,
+            selectcolor=BACKGROUND,
+            anchor="w",
+        ).pack(fill=X, pady=(4, 2))
+        self._background_page_variables = {}
+        for page_key, page_label in BACKGROUND_PAGE_LABELS.items():
+            variable = IntVar(master=self.parent, value=0)
+            self._background_page_variables[page_key] = variable
+            Checkbutton(
+                scope_frame,
+                text=page_label,
+                variable=variable,
+                font=("Microsoft JhengHei UI", 9),
+                bg=SURFACE,
+                fg=TEXT,
+                activebackground=SURFACE,
+                selectcolor=BACKGROUND,
+                anchor="w",
+            ).pack(fill=X)
+        scope_actions = Frame(scope_frame, bg=SURFACE)
+        scope_actions.pack(fill=X, pady=(6, 0))
+        self._button(
+            scope_actions,
+            "全部選取",
+            lambda: self._set_all_background_pages(True),
+        ).pack(side=LEFT)
+        self._button(
+            scope_actions,
+            "全部取消",
+            lambda: self._set_all_background_pages(False),
+        ).pack(side=LEFT, padx=(8, 0))
+        preview_row = Frame(scope_frame, bg=SURFACE)
+        preview_row.pack(fill=X, pady=(8, 0))
+        self._background_preview_page_variable = StringVar(
+            master=self.parent,
+            value=BACKGROUND_PAGE_LABELS["home"],
+        )
+        preview_menu = OptionMenu(
+            preview_row,
+            self._background_preview_page_variable,
+            *BACKGROUND_PAGE_LABELS.values(),
+        )
+        preview_menu.configure(
+            font=("Microsoft JhengHei UI", 9),
+            bg=BACKGROUND,
+            fg=TEXT,
+            activebackground=BORDER,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        preview_menu.pack(side=LEFT, fill=X, expand=True)
+        self._button(
+            preview_row,
+            "預覽選取頁面",
+            self._preview_selected_background_page,
+        ).pack(side=LEFT, padx=(8, 0))
+
+        display_frame = Frame(background_card, bg=SURFACE)
+        display_frame.pack(fill=X, pady=(14, 0))
+        Label(
+            display_frame,
+            text="填補色與區域透明度",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        fill_row = Frame(display_frame, bg=SURFACE)
+        fill_row.pack(fill=X, pady=(6, 4))
+        self._background_fill_entry = Entry(
+            fill_row,
+            width=12,
+            font=("Microsoft JhengHei UI", 9),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+        )
+        self._background_fill_entry.insert(
+            0,
+            str(self._saved_background_display_values["fill_color"]),
+        )
+        self._background_fill_entry.bind(
+            "<KeyRelease>",
+            lambda _event: self._preview_background_display_changes(),
+        )
+        self._background_fill_entry.pack(side=LEFT, ipady=6)
+        self._button(
+            fill_row,
+            "選色",
+            self._choose_background_fill_color,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._button(
+            fill_row,
+            "恢復舊版預設色",
+            self._restore_default_background_fill,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._background_opacity_scales = {}
+        for key, label in (
+            ("sidebar", "左側選單"),
+            ("panel", "操作面板"),
+            ("role_row", "角色列"),
+        ):
+            row = Frame(display_frame, bg=SURFACE)
+            row.pack(fill=X, pady=2)
+            Label(
+                row,
+                text=label,
+                width=10,
+                font=("Microsoft JhengHei UI", 9),
+                bg=SURFACE,
+                fg=MUTED,
+                anchor="w",
+            ).pack(side=LEFT)
+            scale = Scale(
+                row,
+                from_=0,
+                to=100,
+                orient=HORIZONTAL,
+                showvalue=True,
+                resolution=1,
+                command=lambda _value: self._preview_background_display_changes(),
+                bg=SURFACE,
+                fg=TEXT,
+                highlightthickness=0,
+                troughcolor=BACKGROUND,
+                length=280,
+            )
+            scale.set(int(self._saved_background_display_values[key]))
+            scale.pack(side=LEFT, fill=X, expand=True)
+            self._button(
+                row,
+                "恢復此區預設",
+                lambda selected=key: self._restore_background_opacity(
+                    selected
+                ),
+            ).pack(side=LEFT, padx=(8, 0))
+            self._background_opacity_scales[key] = scale
+        save_row = Frame(background_card, bg=SURFACE)
+        save_row.pack(fill=X, pady=(14, 0))
+        self._button(
+            save_row,
+            "儲存背景設定",
+            self._save_background_changes,
+            primary=True,
+        ).pack(side=LEFT)
+        self._button(
+            save_row,
+            "取消未儲存變更",
+            self._discard_background_changes,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._button(
+            save_row,
+            "全部恢復舊版預設",
+            self._restore_all_background_defaults,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._button(
+            save_row,
+            "匯出背景設定",
+            self._export_background_settings,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._button(
+            save_row,
+            "匯入背景設定",
+            self._import_background_settings,
+        ).pack(side=LEFT, padx=(8, 0))
 
         card = self._card(page)
         card.pack(fill=X, pady=(14, 0))
@@ -2392,6 +3276,22 @@ class HomeView:
         self.build()
 
     def _choose_background_image(self) -> None:
+        if self._background_prepare_running:
+            return
+        if (
+            self.on_choose_background_source is not None
+            and self.on_prepare_background_image is not None
+        ):
+            try:
+                source = self.on_choose_background_source()
+            except Exception:
+                self._refresh_background_status(
+                    "背景圖片選取失敗，原本背景已保留。"
+                )
+                return
+            if source is not None:
+                self._start_background_prepare(source)
+            return
         if self.on_select_background_image is None:
             return
         try:
@@ -2408,14 +3308,467 @@ class HomeView:
                 "背景圖片處理失敗，原本背景已保留。"
             )
             return
+        if not result.succeeded or result.managed_path is None:
+            self._refresh_background_status(result.message)
+            return
+        if (
+            self._pending_background_path is not None
+            and self.on_discard_background_image is not None
+        ):
+            self.on_discard_background_image(self._pending_background_path)
+        self._pending_background_path = result.managed_path
+        self._pending_background_result = result
         loaded = self._set_background_path(result.managed_path)
         message = result.message
         if result.succeeded and result.managed_path is not None and not loaded:
             message = "受管背景副本無法顯示，請重新選擇圖片。"
         self._refresh_background_status(message)
 
+    def _start_background_prepare(self, source: Path) -> None:
+        callback = self.on_prepare_background_image
+        if callback is None:
+            return
+        self._background_prepare_cancel = Event()
+        self._background_prepare_results = Queue()
+        self._background_prepare_running = True
+        if self._background_choose_button is not None:
+            self._background_choose_button.configure(state=DISABLED)
+        if self._background_cancel_button is not None:
+            self._background_cancel_button.configure(state=NORMAL)
+        if self._background_progress_bar is not None:
+            self._background_progress_bar.pack(
+                side=LEFT,
+                fill=X,
+                expand=True,
+            )
+            self._background_progress_bar.start(12)
+        self._refresh_background_status("正在轉換背景圖片，請稍候。")
+
+        def worker() -> None:
+            try:
+                result = callback(
+                    Path(source),
+                    self._background_prepare_cancel.is_set,
+                )
+            except Exception as error:
+                self._background_prepare_results.put(error)
+            else:
+                self._background_prepare_results.put(result)
+
+        Thread(
+            target=worker,
+            name="fu-background-prepare",
+            daemon=True,
+        ).start()
+        self._poll_background_prepare()
+
+    def _poll_background_prepare(self) -> None:
+        self._background_prepare_poll_id = None
+        if not self._background_prepare_running:
+            return
+        try:
+            outcome = self._background_prepare_results.get_nowait()
+        except Empty:
+            self._background_prepare_poll_id = self.parent.after(
+                100,
+                self._poll_background_prepare,
+            )
+            return
+        self._background_prepare_running = False
+        if self._background_progress_bar is not None:
+            self._background_progress_bar.stop()
+            self._background_progress_bar.pack_forget()
+        if self._background_choose_button is not None:
+            self._background_choose_button.configure(state=NORMAL)
+        if self._background_cancel_button is not None:
+            self._background_cancel_button.configure(state=DISABLED)
+        if isinstance(outcome, Exception):
+            self._refresh_background_status(
+                "背景圖片處理失敗，原本背景已保留。"
+            )
+            return
+        if self._background_prepare_cancel.is_set():
+            if (
+                outcome.managed_path is not None
+                and self.on_discard_background_image is not None
+            ):
+                self.on_discard_background_image(outcome.managed_path)
+            self._refresh_background_status(
+                "背景圖片轉換已取消，原本背景已保留。"
+            )
+            return
+        if not outcome.succeeded or outcome.managed_path is None:
+            self._refresh_background_status(outcome.message)
+            return
+        if (
+            self._pending_background_path is not None
+            and self.on_discard_background_image is not None
+        ):
+            self.on_discard_background_image(self._pending_background_path)
+        self._pending_background_path = outcome.managed_path
+        self._pending_background_result = outcome
+        loaded = self._set_background_path(outcome.managed_path)
+        self._refresh_background_status(
+            outcome.message
+            if loaded
+            else "受管背景副本無法顯示，請重新選擇圖片。"
+        )
+
+    def _cancel_background_prepare(self) -> None:
+        if not self._background_prepare_running:
+            return
+        self._background_prepare_cancel.set()
+        if self._background_cancel_button is not None:
+            self._background_cancel_button.configure(state=DISABLED)
+        self._refresh_background_status(
+            "正在取消背景圖片轉換；原本背景會保持不變。"
+        )
+
+    def _set_all_background_pages(self, selected: bool) -> None:
+        for variable in self._background_page_variables.values():
+            variable.set(1 if selected else 0)
+        if selected and self._background_apply_all_variable is not None:
+            self._background_apply_all_variable.set(0)
+
+    def _preview_selected_background_page(self) -> None:
+        variable = self._background_preview_page_variable
+        if variable is None:
+            return
+        selected_label = variable.get()
+        page = next(
+            (
+                key
+                for key, label in BACKGROUND_PAGE_LABELS.items()
+                if label == selected_label
+            ),
+            None,
+        )
+        if page is None:
+            return
+        self.show_page(page, _background_preview=True)
+
+    def _choose_background_fill_color(self) -> None:
+        if self._background_fill_entry is None:
+            return
+        selected = colorchooser.askcolor(
+            color=self._background_fill_entry.get().strip(),
+            parent=self.parent,
+            title="選擇背景填補色",
+        )
+        color = selected[1]
+        if not color:
+            return
+        self._background_fill_entry.delete(0, "end")
+        self._background_fill_entry.insert(0, str(color).upper())
+        self._preview_background_display_changes()
+
+    def _restore_default_background_fill(self) -> None:
+        if self._background_fill_entry is None:
+            return
+        self._background_fill_entry.delete(0, "end")
+        self._background_fill_entry.insert(0, DEFAULT_BACKGROUND_FILL_COLOR)
+        self._preview_background_display_changes()
+
+    def _restore_background_opacity(self, region: str) -> None:
+        scale = self._background_opacity_scales.get(region)
+        if scale is None or region not in DEFAULT_BACKGROUND_OPACITY:
+            return
+        scale.set(DEFAULT_BACKGROUND_OPACITY[region])
+        self._preview_background_display_changes()
+
+    def _background_display_values(self) -> dict[str, object]:
+        if self._background_fill_entry is None:
+            return dict(self._saved_background_display_values)
+        fill_color = self._background_fill_entry.get().strip().upper()
+        if (
+            len(fill_color) != 7
+            or not fill_color.startswith("#")
+        ):
+            raise ValueError("背景填補色必須使用 #RRGGBB 色碼。")
+        int(fill_color[1:], 16)
+        return {
+            "fill_color": fill_color,
+            **{
+                key: int(scale.get())
+                for key, scale in self._background_opacity_scales.items()
+            },
+        }
+
+    def _preview_background_display_changes(self) -> None:
+        try:
+            values = self._background_display_values()
+        except (TypeError, ValueError):
+            return
+        self.background_fill_color = str(values["fill_color"])
+        self._background_render_size = None
+        canvas = self._page_canvas
+        if canvas is not None:
+            self._schedule_background_resize(
+                max(1, int(canvas.winfo_width())),
+                max(1, int(canvas.winfo_height())),
+            )
+
+    def _save_background_changes(self) -> bool:
+        if self._background_prepare_running:
+            self._refresh_background_status(
+                "背景圖片仍在轉換，請先等待完成或取消轉換。"
+            )
+            return False
+        try:
+            values = self._background_display_values()
+        except (TypeError, ValueError):
+            self._refresh_background_status(
+                "背景填補色或透明度無效，原本設定已保留。"
+            )
+            return False
+        if self.on_background_display_settings_update is not None:
+            try:
+                settings = self.on_background_display_settings_update(
+                    str(values["fill_color"]),
+                    int(values["sidebar"]),
+                    int(values["panel"]),
+                    int(values["role_row"]),
+                )
+            except Exception:
+                self._refresh_background_status(
+                    "背景顯示設定無法保存，原本設定已保留。"
+                )
+                return False
+            if not isinstance(settings, BackgroundSettings):
+                return False
+            self.background_settings = settings
+        if self._pending_background_path is not None:
+            if self.on_save_background_image is None:
+                return False
+            apply_all = bool(
+                self._background_apply_all_variable
+                and self._background_apply_all_variable.get()
+            )
+            pages = tuple(
+                key
+                for key, variable in self._background_page_variables.items()
+                if variable.get()
+            )
+            try:
+                result = self.on_save_background_image(
+                    self._pending_background_path,
+                    apply_all,
+                    pages,
+                )
+            except Exception:
+                self._refresh_background_status(
+                    "背景圖片無法保存，原本背景已保留。"
+                )
+                return False
+            if not isinstance(result, BackgroundImageResult) or not result.succeeded:
+                self._refresh_background_status(
+                    result.message
+                    if isinstance(result, BackgroundImageResult)
+                    else "背景圖片無法保存，原本背景已保留。"
+                )
+                return False
+            self._pending_background_path = None
+            self._pending_background_result = None
+            self._refresh_background_status(result.message)
+        if self.background_settings_provider is not None:
+            try:
+                self.background_settings = self.background_settings_provider()
+            except Exception:
+                pass
+        self._saved_background_display_values = dict(values)
+        self.background_fill_color = str(values["fill_color"])
+        self._background_preview_active = False
+        self._apply_saved_background_for_page(self._active_page)
+        return True
+
+    def _discard_background_changes(self) -> None:
+        if self._background_prepare_running:
+            self._background_prepare_cancel.set()
+        if (
+            self._pending_background_path is not None
+            and self.on_discard_background_image is not None
+        ):
+            self.on_discard_background_image(self._pending_background_path)
+        self._pending_background_path = None
+        self._pending_background_result = None
+        self._background_preview_active = False
+        values = self._saved_background_display_values
+        if self._background_fill_entry is not None:
+            self._background_fill_entry.delete(0, "end")
+            self._background_fill_entry.insert(0, str(values["fill_color"]))
+        for key, scale in self._background_opacity_scales.items():
+            scale.set(int(values[key]))
+        self.background_fill_color = str(values["fill_color"])
+        self._apply_saved_background_for_page(self._active_page)
+        self._refresh_background_status("未儲存的背景變更已放棄。")
+
+    def _restore_all_background_defaults(self) -> None:
+        if not messagebox.askyesno(
+            "輔｜恢復背景預設",
+            "確定移除全部背景，並將填補色與三區透明度恢復為舊版預設？",
+            parent=self.parent,
+        ):
+            return
+        if (
+            self._pending_background_path is not None
+            and self.on_discard_background_image is not None
+        ):
+            self.on_discard_background_image(self._pending_background_path)
+        self._pending_background_path = None
+        self._pending_background_result = None
+        if self.on_clear_all_backgrounds is not None:
+            try:
+                result = self.on_clear_all_backgrounds()
+            except Exception:
+                self._refresh_background_status(
+                    "所有背景無法恢復預設，原本設定已保留。"
+                )
+                return
+            if not isinstance(result, BackgroundImageResult) or not result.succeeded:
+                self._refresh_background_status(
+                    result.message
+                    if isinstance(result, BackgroundImageResult)
+                    else "所有背景無法恢復預設，原本設定已保留。"
+                )
+                return
+        if self._background_fill_entry is not None:
+            self._background_fill_entry.delete(0, "end")
+            self._background_fill_entry.insert(
+                0,
+                DEFAULT_BACKGROUND_FILL_COLOR,
+            )
+        for key, scale in self._background_opacity_scales.items():
+            scale.set(DEFAULT_BACKGROUND_OPACITY[key])
+        values = self._background_display_values()
+        if self.on_background_display_settings_update is not None:
+            try:
+                self.background_settings = (
+                    self.on_background_display_settings_update(
+                        str(values["fill_color"]),
+                        int(values["sidebar"]),
+                        int(values["panel"]),
+                        int(values["role_row"]),
+                    )
+                )
+            except Exception:
+                self._refresh_background_status(
+                    "背景顯示設定無法恢復預設。"
+                )
+                return
+        self._saved_background_display_values = dict(values)
+        self.background_fill_color = DEFAULT_BACKGROUND_FILL_COLOR
+        self._set_background_path(None)
+        self._refresh_background_status("所有背景設定已恢復舊版預設。")
+
+    def _export_background_settings(self) -> None:
+        if self.on_export_background_settings is None:
+            return
+        if not self._confirm_background_departure():
+            return
+        try:
+            destination = self.on_export_background_settings()
+        except Exception:
+            self._refresh_background_status("背景設定無法匯出。")
+            return
+        if destination is not None:
+            self._refresh_background_status(
+                f"背景設定已匯出：{Path(destination).name}"
+            )
+
+    def _import_background_settings(self) -> None:
+        if self.on_import_background_settings is None:
+            return
+        if not self._confirm_background_departure():
+            return
+        if not messagebox.askyesno(
+            "輔｜匯入背景設定",
+            "匯入後會取代目前背景、套用頁面、填補色與三區透明度。確定繼續？",
+            parent=self.parent,
+        ):
+            return
+        try:
+            result = self.on_import_background_settings()
+        except Exception:
+            self._refresh_background_status(
+                "背景設定無法匯入，原本設定已保留。"
+            )
+            return
+        if result is None:
+            return
+        if not isinstance(result, BackgroundImageResult) or not result.succeeded:
+            self._refresh_background_status(
+                result.message
+                if isinstance(result, BackgroundImageResult)
+                else "背景設定無法匯入，原本設定已保留。"
+            )
+            return
+        if self.background_settings_provider is not None:
+            self.background_settings = self.background_settings_provider()
+        if self.background_settings is not None:
+            self._saved_background_display_values = {
+                "fill_color": self.background_settings.fill_color,
+                "sidebar": self.background_settings.sidebar_opacity,
+                "panel": self.background_settings.panel_opacity,
+                "role_row": self.background_settings.role_row_opacity,
+            }
+        self.background_fill_color = str(
+            self._saved_background_display_values["fill_color"]
+        )
+        self._apply_saved_background_for_page(self._active_page)
+        self._active_page = "settings"
+        self.build()
+        self._refresh_background_status(result.message)
+
+    def _background_changes_dirty(self) -> bool:
+        if self._background_prepare_running:
+            return True
+        if self._pending_background_path is not None:
+            return True
+        try:
+            return (
+                self._background_display_values()
+                != self._saved_background_display_values
+            )
+        except (TypeError, ValueError):
+            return True
+
+    def _confirm_background_departure(self) -> bool:
+        if not self._background_changes_dirty():
+            return True
+        choice = messagebox.askyesnocancel(
+            "輔｜背景尚未儲存",
+            "背景設定尚未儲存。\n"
+            "選「是」儲存、選「否」放棄、選「取消」留在目前頁面。",
+            parent=self.parent,
+        )
+        if choice is None:
+            return False
+        if choice:
+            return self._save_background_changes()
+        self._discard_background_changes()
+        return True
+
+    def prepare_close(self) -> bool:
+        return self._confirm_background_departure()
+
+    def _apply_saved_background_for_page(self, page: str) -> None:
+        if self._pending_background_path is not None:
+            return
+        path = (
+            self.background_for_page(page)
+            if self.background_for_page is not None
+            else self.background_image_path
+        )
+        self._set_background_path(path)
+
     def _clear_background_image(self) -> None:
         if self.on_clear_background_image is None:
+            return
+        if not messagebox.askyesno(
+            "輔｜移除背景",
+            "確定移除全域背景？各頁獨立背景會保留。",
+            parent=self.parent,
+        ):
             return
         try:
             result = self.on_clear_background_image()
@@ -2429,11 +3782,63 @@ class HomeView:
                 "背景圖片無法清除，原本背景已保留。"
             )
             return
-        self._set_background_path(result.managed_path)
+        self._apply_saved_background_for_page(self._active_page)
+        if self.background_settings_provider is not None:
+            try:
+                self.background_settings = self.background_settings_provider()
+            except Exception:
+                pass
         self._refresh_background_status(result.message)
+
+    def _clear_selected_page_backgrounds(self) -> None:
+        if self.on_clear_page_background is None:
+            return
+        pages = tuple(
+            key
+            for key, variable in self._background_page_variables.items()
+            if variable.get()
+        )
+        if not pages:
+            self._refresh_background_status("請先勾選要移除獨立背景的頁面。")
+            return
+        names = "、".join(BACKGROUND_PAGE_LABELS[key] for key in pages)
+        if not messagebox.askyesno(
+            "輔｜移除頁面背景",
+            f"確定移除以下頁面的獨立背景？\n{names}\n"
+            "移除後會恢復使用全域背景；沒有全域背景時顯示填補色。",
+            parent=self.parent,
+        ):
+            return
+        try:
+            for page in pages:
+                result = self.on_clear_page_background(page)
+                if not isinstance(result, BackgroundImageResult) or not result.succeeded:
+                    raise RuntimeError("page background removal failed")
+        except Exception:
+            self._refresh_background_status(
+                "頁面獨立背景無法移除，未完成的部分保持原狀。"
+            )
+            return
+        self._apply_saved_background_for_page(self._active_page)
+        if self.background_settings_provider is not None:
+            try:
+                self.background_settings = self.background_settings_provider()
+            except Exception:
+                pass
+        self._refresh_background_status("已移除勾選頁面的獨立背景。")
 
     def dispose(self) -> None:
         """Release background image resources before the Tk window closes."""
+        self._background_prepare_cancel.set()
+        self._background_prepare_running = False
+        if self._background_prepare_poll_id is not None:
+            try:
+                self.parent.after_cancel(self._background_prepare_poll_id)
+            except Exception:
+                pass
+            self._background_prepare_poll_id = None
+        if self._background_progress_bar is not None:
+            self._background_progress_bar.stop()
         self._cancel_background_resize()
         if self._background_source_image is not None:
             self._background_source_image.close()
@@ -2464,9 +3869,28 @@ class HomeView:
         self._card_seconds_entry.delete(0, "end")
         self._card_seconds_entry.insert(0, str(confirmed))
 
-    def show_page(self, name: str) -> None:
+    def show_page(
+        self,
+        name: str,
+        *,
+        _background_preview: bool = False,
+    ) -> None:
         if name not in self._pages:
             raise KeyError(f"Unknown home page: {name}")
+        if (
+            self._background_preview_active
+            and not _background_preview
+            and name != "settings"
+            and not self._confirm_background_departure()
+        ):
+            return
+        if (
+            self._active_page == "settings"
+            and name != "settings"
+            and not _background_preview
+            and not self._confirm_background_departure()
+        ):
+            return
         for page_name, page in self._pages.items():
             if page_name == name:
                 page.pack(fill=BOTH, expand=True)
@@ -2480,6 +3904,11 @@ class HomeView:
         if name == "records":
             self.refresh_operation_records()
         self._active_page = name
+        self._background_preview_active = bool(_background_preview)
+        if _background_preview and self._pending_background_path is not None:
+            self._set_background_path(self._pending_background_path)
+        else:
+            self._apply_saved_background_for_page(name)
         if self._page_canvas is not None:
             self._page_canvas.yview_moveto(0.0)
             self.parent.after_idle(self._sync_page_scroll_region)
@@ -2498,6 +3927,7 @@ class HomeView:
             self._group_name_entry.delete(0, "end")
             self._group_name_entry.insert(0, name)
         self.refresh_workspace()
+        self.refresh_current_group_summary()
         self.refresh_group_entries()
         self.refresh_group_sync_relations()
         self.refresh_group_role_statuses()
@@ -2706,6 +4136,7 @@ class HomeView:
     def refresh_group_entries(
         self,
     ) -> tuple[GroupConfigurationEntry, ...]:
+        self.refresh_current_group_summary()
         frame = self._group_entries_frame
         if frame is None:
             return ()
@@ -2941,6 +4372,7 @@ class HomeView:
         self.refresh_activity_schedule()
         self.refresh_cards()
         self.refresh_target_window()
+        self.refresh_current_group_summary()
         self.refresh_group_role_statuses()
 
     def refresh_workspace(self) -> str:
@@ -3028,11 +4460,6 @@ class HomeView:
                 else "尚未完成視窗檢查"
             )
         self.target_window_state = state
-        if self._target_label is not None:
-            self._target_label.configure(
-                text=f"● {text}",
-                fg=SUCCESS if state is not None and state.safe else WARNING,
-            )
         return text
 
     def _report_refresh_error(self, error: Exception) -> None:

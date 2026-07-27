@@ -6,7 +6,9 @@ from services.group_role_status_service import GroupRoleStatus
 from ui.home import (
     UI_THEME_LABELS,
     HomeView,
-    _cover_geometry,
+    _blend_hex_color,
+    _contrast_ratio,
+    _contain_geometry,
     _safe_character_lines,
     _workspace_state_text,
     theme_palette,
@@ -23,19 +25,18 @@ def test_home_has_real_product_pages_and_group_selection() -> None:
     assert "on_group_change" in source
     assert "character_choices" in source
     assert "靈魂石" not in source
-    assert "_build_group_summary(sidebar)" in source
+    assert "_build_group_summary(sidebar)" not in source
     assert "_build_header(root)" not in source
     assert 'text="+"' not in source
 
 
-def test_current_group_uses_sidebar_information_card() -> None:
+def test_current_group_uses_home_summary_card_without_sidebar_duplicate() -> None:
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
     assert 'text="目前組別"' in source
-    assert "SIDEBAR_GROUP" in source
-    assert "SIDEBAR_MUTED" in source
-    assert "self._group_value_label" in source
-    assert "wraplength=118" in source
+    assert "主控：" in source
+    assert "個視窗" in source
+    assert "_current_group_summary_text" in source
 
 
 def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
@@ -70,10 +71,16 @@ def test_background_controls_and_cached_canvas_rendering_are_wired() -> None:
     ):source.index("def dispose")]
 
 
-def test_background_cover_geometry_centers_wide_and_tall_images() -> None:
-    assert _cover_geometry((200, 100), (100, 100)) == (200, 100, 50, 0)
-    assert _cover_geometry((100, 200), (100, 100)) == (100, 200, 0, 50)
-    assert _cover_geometry((640, 480), (320, 240)) == (320, 240, 0, 0)
+def test_background_contain_geometry_never_crops_or_upscales() -> None:
+    assert _contain_geometry((200, 100), (100, 100)) == (100, 50, 0, 25)
+
+
+def test_background_region_opacity_blends_legacy_color_over_image() -> None:
+    assert _blend_hex_color("#C9A35D", "#000000", 0) == "#000000"
+    assert _blend_hex_color("#C9A35D", "#000000", 100) == "#C9A35D"
+    assert _contrast_ratio("#000000", "#FFFFFF") == 21
+    assert _contain_geometry((100, 200), (100, 100)) == (50, 100, 25, 0)
+    assert _contain_geometry((80, 60), (320, 240)) == (80, 60, 120, 90)
 
 
 def test_four_player_selectable_themes_have_complete_palettes() -> None:
