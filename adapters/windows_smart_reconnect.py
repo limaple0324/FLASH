@@ -282,7 +282,8 @@ class ReconnectRuntimeState:
 class ReconnectRuntimeStateStore:
     """Persist only anonymous fingerprints and reconnect timing state."""
 
-    VERSION = 3
+    VERSION = 4
+    LEGACY_VERSIONS = frozenset({1, 2, 3})
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -313,14 +314,18 @@ class ReconnectRuntimeStateStore:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             if (
                 not isinstance(payload, dict)
-                or payload.get("version") not in {1, 2, self.VERSION}
+                or payload.get("version")
+                not in self.LEGACY_VERSIONS | {self.VERSION}
             ):
                 raise ValueError("Unsupported reconnect state version")
-            # Versions 1/2 could be armed by a manual login screen without a
-            # preceding confirmed disconnect.  They are intentionally not
-            # trusted after the fail-closed session-gating upgrade.
+            # Versions 1-3 can contain reconnect authorization created before
+            # the current two-frame disconnect gate.  Never carry that
+            # authorization into a newer executable: migrate to a clean
+            # current-version state before the controller can observe or act.
             if payload.get("version") != self.VERSION:
-                return self._empty()
+                empty = self._empty()
+                self.save(empty)
+                return empty
             pending = self._fingerprints(payload.get("pending_fingerprints", []))
             active = self._fingerprints(payload.get("active_fingerprints", []))
             raw_active_until = payload.get("active_until", {})
@@ -355,20 +360,19 @@ class ReconnectRuntimeStateStore:
                 )
             pending_reopens: set[str] = set()
             reopen_retries: dict[str, float] = {}
-            if payload.get("version") == self.VERSION:
-                pending_reopens = self._fingerprints(
-                    payload.get("pending_reopen_fingerprints", [])
-                )
-                raw_reopen_retries = payload.get("reopen_retry_after", {})
-                if not isinstance(raw_reopen_retries, dict):
-                    raise ValueError("reopen_retry_after must be an object")
-                for raw_fingerprint, raw_retry_at in raw_reopen_retries.items():
-                    fingerprint = normalize_launch_fingerprint(raw_fingerprint)
-                    retry_at = float(raw_retry_at)
-                    if fingerprint is None or retry_at < 0:
-                        raise ValueError("Invalid reopen retry entry")
-                    pending_reopens.add(fingerprint)
-                    reopen_retries[fingerprint] = retry_at
+            pending_reopens = self._fingerprints(
+                payload.get("pending_reopen_fingerprints", [])
+            )
+            raw_reopen_retries = payload.get("reopen_retry_after", {})
+            if not isinstance(raw_reopen_retries, dict):
+                raise ValueError("reopen_retry_after must be an object")
+            for raw_fingerprint, raw_retry_at in raw_reopen_retries.items():
+                fingerprint = normalize_launch_fingerprint(raw_fingerprint)
+                retry_at = float(raw_retry_at)
+                if fingerprint is None or retry_at < 0:
+                    raise ValueError("Invalid reopen retry entry")
+                pending_reopens.add(fingerprint)
+                reopen_retries[fingerprint] = retry_at
             return ReconnectRuntimeState(
                 pending,
                 active,

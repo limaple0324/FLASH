@@ -651,6 +651,38 @@ def test_pre_safety_upgrade_session_state_is_never_trusted(tmp_path):
     assert fixture.mouse.clicks == []
 
 
+def test_version_three_session_is_cleared_before_new_controller_can_act(
+    tmp_path,
+):
+    state_path = tmp_path / "smart_reconnect_state.json"
+    fingerprint = make_window(1).launch_fingerprint
+    state_path.write_text(
+        (
+            '{"version":3,'
+            f'"pending_fingerprints":["{fingerprint}"],'
+            f'"active_fingerprints":["{fingerprint}"],'
+            f'"active_until":{{"{fingerprint}":9999999999}},'
+            f'"retry_after":{{"{fingerprint}":'
+            '{"state":"force_login_start","retry_at":0}},'
+            '"pending_reopen_fingerprints":[],'
+            '"reopen_retry_after":{}}\n'
+        ),
+        encoding="utf-8",
+    )
+    fixture = make_controller([4, 1], state_path=state_path)
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["actionable_windows"] == 0
+    assert fixture.controller.reconnecting_fingerprints() == frozenset()
+    assert fixture.mouse.clicks == []
+    migrated = state_path.read_text(encoding="utf-8")
+    assert '"version": 4' in migrated
+    assert '"pending_fingerprints": []' in migrated
+    assert fingerprint not in migrated
+
+
 def test_one_minute_retry_survives_controller_restart(tmp_path):
     state_path = tmp_path / "smart_reconnect_state.json"
     now = [1000.0]
