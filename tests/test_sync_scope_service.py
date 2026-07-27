@@ -56,5 +56,11 @@ def test_scope_recursively_expands_cross_group_and_deduplicates(tmp_path):
     scope = SyncScopeService(configuration, Resolver()).scope("第一組")
 
     assert scope.ready is True
+    assert scope.entry_ids == (
+        configuration.group("第一組").entries[0].entry_id,
+        *configuration.expanded_sync_members(
+            configuration.group("第一組").entries[0].entry_id
+        ),
+    )
     assert len(scope.fingerprints) == 6
     assert len(scope.fingerprints) == len(set(scope.fingerprints))

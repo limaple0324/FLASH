@@ -78,6 +78,11 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "on_group_master_locked_change" in source
     assert "設為主窗口" in source
     assert "清空角色" in source
+    assert "設定主基準點（3秒）" in source
+    assert "啟用角色偏移" in source
+    assert "取目標點（3秒）" in source
+    assert "校正角色ID" in source
+    assert "讀取角色ID" in source
 
 
 def test_background_controls_and_cached_canvas_rendering_are_wired() -> None:

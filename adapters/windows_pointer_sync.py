@@ -26,6 +26,8 @@ from services.deferred_sync_operation_service import (
 )
 from core.reconnect_policy import ReconnectScreenState
 from collections.abc import Callable
+from domain.sync_target_settings import SyncTargetSettings
+from services.sync_dispatch_scheduler import SyncDispatchScheduler
 
 
 POINTER_EVENTS = frozenset({"move", "left_down", "left_up"})
@@ -137,6 +139,38 @@ class Win32PointerMessageBackend:
         }[event]
         return bool(user32.PostMessageW(hwnd, message, flags, lparam))
 
+    def send_pointer_adjusted(
+        self,
+        handle: int,
+        x_ratio: float,
+        y_ratio: float,
+        event: str,
+        offset_x: int,
+        offset_y: int,
+    ) -> bool:
+        """Send only when the pixel-adjusted point remains inside the client."""
+        user32 = self._user32()
+        if user32 is None or event not in POINTER_EVENTS:
+            return False
+        self._configure(user32)
+        rect = wintypes.RECT()
+        hwnd = wintypes.HWND(handle)
+        if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+            return False
+        width = max(1, rect.right - rect.left)
+        height = max(1, rect.bottom - rect.top)
+        x = round(float(x_ratio) * (width - 1)) + int(offset_x)
+        y = round(float(y_ratio) * (height - 1)) + int(offset_y)
+        if not (0 <= x < width and 0 <= y < height):
+            return False
+        lparam = (int(y) << 16) | (int(x) & 0xFFFF)
+        message, flags = {
+            "move": (self.WM_MOUSEMOVE, self.MK_LBUTTON),
+            "left_down": (self.WM_LBUTTONDOWN, self.MK_LBUTTON),
+            "left_up": (self.WM_LBUTTONUP, 0),
+        }[event]
+        return bool(user32.PostMessageW(hwnd, message, flags, lparam))
+
 
 @dataclass(frozen=True, slots=True)
 class PointerSyncResult:
@@ -150,12 +184,14 @@ class PointerSyncResult:
     preflight_elapsed_ns: int = 0
     dispatch_spread_ns: int = 0
     queue_wait_ns: int = 0
+    scheduled_windows: int = 0
 
     @property
     def passed(self) -> bool:
         return (
             not self.failure_codes
-            and self.sent_windows == self.eligible_windows
+            and self.sent_windows + self.scheduled_windows
+            == self.eligible_windows
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -166,9 +202,14 @@ class PointerSyncResult:
             "discovered_windows": self.discovered_windows,
             "eligible_windows": self.eligible_windows,
             "sent_windows": self.sent_windows,
+            "scheduled_windows": self.scheduled_windows,
             "event": self.event,
             "failure_codes": list(self.failure_codes),
-            "partial_delivery": 0 < self.sent_windows < self.eligible_windows,
+            "partial_delivery": (
+                0
+                < self.sent_windows + self.scheduled_windows
+                < self.eligible_windows
+            ),
             "controller_elapsed_ns": self.controller_elapsed_ns,
             "preflight_elapsed_ns": self.preflight_elapsed_ns,
             "dispatch_spread_ns": self.dispatch_spread_ns,
@@ -182,6 +223,7 @@ class PointerSyncResult:
             "raw_arguments_emitted": False,
             "fingerprints_emitted": False,
             "input_sent": self.sent_windows > 0,
+            "input_scheduled": self.scheduled_windows > 0,
         }
 
 
@@ -223,6 +265,10 @@ class WindowsPointerSyncController:
         self._screen_state_provider = screen_state_provider
         self._pressed_targets: dict[int, tuple[float, float]] = {}
         self._pressed_targets_lock = Lock()
+        self._target_settings: dict[str, SyncTargetSettings] = {}
+        self._dispatch_scheduler = SyncDispatchScheduler(
+            thread_name="flash-pointer-delay",
+        )
         if self._deferred_service is not None:
             self._deferred_service.register_handler(
                 "pointer",
@@ -341,59 +387,13 @@ class WindowsPointerSyncController:
         if self._conflict_arbiter is not None and lease is None:
             return False
         try:
-            if event == "click":
-                down_delivered = bool(
-                    self._message_backend.send_pointer(
-                        window.handle,
-                        x_ratio,
-                        y_ratio,
-                        "left_down",
-                    )
-                )
-                self._remember_pointer_delivery(
-                    window.handle,
-                    x_ratio,
-                    y_ratio,
-                    "left_down",
-                    down_delivered,
-                )
-                try:
-                    up_delivered = bool(
-                        self._message_backend.send_pointer(
-                            window.handle,
-                            x_ratio,
-                            y_ratio,
-                            "left_up",
-                        )
-                    )
-                except OSError:
-                    up_delivered = False
-                self._remember_pointer_delivery(
-                    window.handle,
-                    x_ratio,
-                    y_ratio,
-                    "left_up",
-                    up_delivered,
-                )
-                if down_delivered and not up_delivered:
-                    self._release_pressed_handles((window.handle,))
-                delivered = down_delivered and up_delivered
-            else:
-                delivered = bool(
-                    self._message_backend.send_pointer(
-                        window.handle,
-                        x_ratio,
-                        y_ratio,
-                        event,
-                    )
-                )
-                self._remember_pointer_delivery(
-                    window.handle,
-                    x_ratio,
-                    y_ratio,
-                    event,
-                    delivered,
-                )
+            delivered = self._deliver_pointer_now(
+                window,
+                fingerprint,
+                x_ratio,
+                y_ratio,
+                event,
+            )
             if event != "move":
                 self._record_role_operation(
                     fingerprint,
@@ -420,6 +420,8 @@ class WindowsPointerSyncController:
             self._allowed_fingerprints = None
             self._allowed_fingerprint_set = None
             self._controller_fingerprint = None
+            self._target_settings = {}
+            self.invalidate_scheduled()
             return
         normalized = tuple(
             normalize_launch_fingerprint(value)
@@ -440,6 +442,37 @@ class WindowsPointerSyncController:
         self._allowed_fingerprint_set = frozenset(ordered)
         if self._controller_fingerprint not in self._allowed_fingerprint_set:
             self._controller_fingerprint = None
+        self._target_settings = {
+            fingerprint: settings
+            for fingerprint, settings in self._target_settings.items()
+            if fingerprint in self._allowed_fingerprint_set
+        }
+        self.invalidate_scheduled()
+
+    def set_target_settings(
+        self,
+        values: Mapping[str, SyncTargetSettings] | None,
+    ) -> None:
+        normalized: dict[str, SyncTargetSettings] = {}
+        if values is not None:
+            for raw_fingerprint, raw_settings in values.items():
+                fingerprint = normalize_launch_fingerprint(raw_fingerprint)
+                if (
+                    fingerprint is None
+                    or not isinstance(raw_settings, SyncTargetSettings)
+                    or (
+                        self._allowed_fingerprint_set is not None
+                        and fingerprint not in self._allowed_fingerprint_set
+                    )
+                ):
+                    raise ValueError("target settings contain an invalid role.")
+                normalized[fingerprint] = raw_settings
+        self._target_settings = normalized
+        self.invalidate_scheduled()
+
+    def invalidate_scheduled(self) -> None:
+        self._dispatch_scheduler.invalidate()
+        self.release_pressed_targets()
 
     def set_controller_fingerprint(self, fingerprint: object) -> None:
         normalized = normalize_launch_fingerprint(fingerprint)
@@ -531,6 +564,217 @@ class WindowsPointerSyncController:
             if responsive
         )
 
+    def _settings_for(self, fingerprint: str | None) -> SyncTargetSettings:
+        if fingerprint is None:
+            return SyncTargetSettings()
+        return self._target_settings.get(
+            fingerprint,
+            SyncTargetSettings(),
+        )
+
+    def _send_pointer_with_settings(
+        self,
+        window: WindowInfo,
+        fingerprint: str | None,
+        x_ratio: float,
+        y_ratio: float,
+        event: str,
+    ) -> bool:
+        settings = self._settings_for(fingerprint)
+        if (
+            settings.offset_enabled
+            and (settings.offset_x != 0 or settings.offset_y != 0)
+        ):
+            adjusted_sender = getattr(
+                self._message_backend,
+                "send_pointer_adjusted",
+                None,
+            )
+            if not callable(adjusted_sender):
+                return False
+            return bool(
+                adjusted_sender(
+                    window.handle,
+                    x_ratio,
+                    y_ratio,
+                    event,
+                    settings.offset_x,
+                    settings.offset_y,
+                )
+            )
+        return bool(
+            self._message_backend.send_pointer(
+                window.handle,
+                x_ratio,
+                y_ratio,
+                event,
+            )
+        )
+
+    def _deliver_pointer_now(
+        self,
+        window: WindowInfo,
+        fingerprint: str | None,
+        x_ratio: float,
+        y_ratio: float,
+        event: str,
+    ) -> bool:
+        if event == "click":
+            down_delivered = self._send_pointer_with_settings(
+                window,
+                fingerprint,
+                x_ratio,
+                y_ratio,
+                "left_down",
+            )
+            self._remember_pointer_delivery(
+                window.handle,
+                x_ratio,
+                y_ratio,
+                "left_down",
+                down_delivered,
+            )
+            try:
+                up_delivered = self._send_pointer_with_settings(
+                    window,
+                    fingerprint,
+                    x_ratio,
+                    y_ratio,
+                    "left_up",
+                )
+            except OSError:
+                up_delivered = False
+            self._remember_pointer_delivery(
+                window.handle,
+                x_ratio,
+                y_ratio,
+                "left_up",
+                up_delivered,
+            )
+            if down_delivered and not up_delivered:
+                self._release_pressed_handles((window.handle,))
+            return down_delivered and up_delivered
+        delivered = self._send_pointer_with_settings(
+            window,
+            fingerprint,
+            x_ratio,
+            y_ratio,
+            event,
+        )
+        self._remember_pointer_delivery(
+            window.handle,
+            x_ratio,
+            y_ratio,
+            event,
+            delivered,
+        )
+        return delivered
+
+    def _unique_window_for_fingerprint(
+        self,
+        fingerprint: str,
+    ) -> WindowInfo | None:
+        matches = tuple(
+            window
+            for window in self._all_title_matching_windows()
+            if normalize_launch_fingerprint(window.launch_fingerprint)
+            == fingerprint
+        )
+        return matches[0] if len(matches) == 1 else None
+
+    def _run_scheduled_pointer(
+        self,
+        fingerprint: str,
+        x_ratio: float,
+        y_ratio: float,
+        event: str,
+        execution_guard: Callable[[], bool] | None,
+    ) -> None:
+        if execution_guard is not None:
+            try:
+                if not bool(execution_guard()):
+                    return
+            except Exception:
+                return
+        reconnecting = {
+            normalized
+            for value in self._reconnecting_provider()
+            if (
+                normalized := normalize_launch_fingerprint(value)
+            )
+            is not None
+        }
+        operation = f"pointer:{event}:{x_ratio:.4f}:{y_ratio:.4f}"
+        if (
+            fingerprint in reconnecting
+            and self._deferred_service is not None
+        ):
+            self._deferred_service.enqueue(
+                fingerprint,
+                operation,
+                kind="pointer",
+                payload={
+                    "x_ratio": x_ratio,
+                    "y_ratio": y_ratio,
+                    "event": event,
+                    "delay_already_applied": True,
+                },
+            )
+            if event != "move":
+                self._record_role_operation(
+                    fingerprint,
+                    "同步左鍵",
+                    "延遲到期時斷線，等待重連後補做",
+                )
+            return
+        window = self._unique_window_for_fingerprint(fingerprint)
+        if (
+            window is None
+            or not self._message_backend.is_window(window.handle)
+            or not self._message_backend.probe_responsive(
+                window.handle,
+                self._preflight_timeout_ms,
+            )
+        ):
+            if event != "move":
+                self._record_role_operation(
+                    fingerprint,
+                    "同步左鍵",
+                    "延遲送出失敗",
+                )
+            return
+        lease = (
+            self._conflict_arbiter.try_begin(fingerprint, operation)
+            if self._conflict_arbiter is not None
+            else None
+        )
+        if self._conflict_arbiter is not None and lease is None:
+            return
+        try:
+            delivered = self._deliver_pointer_now(
+                window,
+                fingerprint,
+                x_ratio,
+                y_ratio,
+                event,
+            )
+            if event != "move":
+                self._record_role_operation(
+                    fingerprint,
+                    "同步左鍵",
+                    "延遲送出成功" if delivered else "延遲送出失敗",
+                )
+        except OSError:
+            if event != "move":
+                self._record_role_operation(
+                    fingerprint,
+                    "同步左鍵",
+                    "延遲送出失敗",
+                )
+        finally:
+            if lease is not None:
+                lease.release()
+
     def _remember_pointer_delivery(
         self,
         handle: int,
@@ -600,6 +844,7 @@ class WindowsPointerSyncController:
         preflight_elapsed_ns: int = 0,
         dispatch_spread_ns: int = 0,
         queue_wait_ns: int = 0,
+        scheduled_windows: int = 0,
     ) -> PointerSyncResult:
         return PointerSyncResult(
             expected_windows=self._expected_windows,
@@ -616,6 +861,7 @@ class WindowsPointerSyncController:
             preflight_elapsed_ns=max(0, preflight_elapsed_ns),
             dispatch_spread_ns=max(0, dispatch_spread_ns),
             queue_wait_ns=max(0, queue_wait_ns),
+            scheduled_windows=max(0, scheduled_windows),
         )
 
     def _all_title_matching_windows(self) -> tuple[WindowInfo, ...]:
@@ -1076,6 +1322,7 @@ class WindowsPointerSyncController:
                 preflight_elapsed_ns=preflight_elapsed_ns,
             )
         sent = 0
+        scheduled = 0
         deferred = 0
         reconnecting = reconnecting
         dispatch_first_ns: int | None = None
@@ -1116,6 +1363,33 @@ class WindowsPointerSyncController:
                         )
                     failures.append("sync_deferred_reconnect")
                     continue
+                settings = self._settings_for(fingerprint)
+                if settings.delay_ms > 0 and fingerprint is not None:
+                    scheduled_ok = self._dispatch_scheduler.schedule(
+                        settings.delay_ms,
+                        lambda role_fingerprint=fingerprint,
+                        delayed_x=x_ratio,
+                        delayed_y=y_ratio,
+                        delayed_event=normalized_event,
+                        delayed_guard=execution_guard: self._run_scheduled_pointer(
+                            role_fingerprint,
+                            delayed_x,
+                            delayed_y,
+                            delayed_event,
+                            delayed_guard,
+                        ),
+                    )
+                    if scheduled_ok:
+                        scheduled += 1
+                        if normalized_event != "move":
+                            self._record_role_operation(
+                                fingerprint,
+                                "同步左鍵",
+                                f"已排程延遲 {settings.delay_ms} 毫秒",
+                            )
+                    else:
+                        failures.append("input_schedule_failed")
+                    continue
                 lease = (
                     self._conflict_arbiter.try_begin(
                         fingerprint,
@@ -1143,63 +1417,17 @@ class WindowsPointerSyncController:
                         if dispatch_first_ns is None:
                             dispatch_first_ns = dispatch_started_ns
                         dispatch_last_ns = dispatch_started_ns
-                        if normalized_event == "click":
-                            down_delivered = bool(
-                                self._message_backend.send_pointer(
-                                    window.handle,
-                                    x_ratio,
-                                    y_ratio,
-                                    "left_down",
-                                )
-                            )
-                            self._remember_pointer_delivery(
-                                window.handle,
-                                x_ratio,
-                                y_ratio,
-                                "left_down",
-                                down_delivered,
-                            )
-                            if down_delivered:
-                                batch_down_handles.add(window.handle)
-                            dispatch_last_ns = perf_counter_ns()
-                            up_delivered = bool(
-                                self._message_backend.send_pointer(
-                                    window.handle,
-                                    x_ratio,
-                                    y_ratio,
-                                    "left_up",
-                                )
-                            )
-                            self._remember_pointer_delivery(
-                                window.handle,
-                                x_ratio,
-                                y_ratio,
-                                "left_up",
-                                up_delivered,
-                            )
-                            if up_delivered:
-                                batch_down_handles.discard(window.handle)
-                            delivered = down_delivered and up_delivered
-                        else:
-                            delivered = bool(
-                                self._message_backend.send_pointer(
-                                    window.handle,
-                                    x_ratio,
-                                    y_ratio,
-                                    normalized_event,
-                                )
-                            )
-                            self._remember_pointer_delivery(
-                                window.handle,
-                                x_ratio,
-                                y_ratio,
-                                normalized_event,
-                                delivered,
-                            )
-                            if normalized_event == "left_down" and delivered:
-                                batch_down_handles.add(window.handle)
-                            elif normalized_event == "left_up" and delivered:
-                                batch_down_handles.discard(window.handle)
+                        delivered = self._deliver_pointer_now(
+                            window,
+                            fingerprint,
+                            x_ratio,
+                            y_ratio,
+                            normalized_event,
+                        )
+                        if normalized_event == "left_down" and delivered:
+                            batch_down_handles.add(window.handle)
+                        elif normalized_event == "left_up" and delivered:
+                            batch_down_handles.discard(window.handle)
                     except OSError:
                         delivered = False
                 finally:
@@ -1212,13 +1440,13 @@ class WindowsPointerSyncController:
                         "同步左鍵",
                         "成功" if delivered else "失敗",
                     )
-        if execute and sent + deferred != len(eligible):
+        if execute and sent + scheduled + deferred != len(eligible):
             failures.append("input_delivery_failed")
         if execution_stopped:
             self.release_pressed_targets()
         elif (
             normalized_event in {"left_down", "click"}
-            and sent + deferred != len(eligible)
+            and sent + scheduled + deferred != len(eligible)
             and batch_down_handles
         ):
             self._release_pressed_handles(batch_down_handles)
@@ -1239,4 +1467,5 @@ class WindowsPointerSyncController:
             controller_started_ns=controller_started_ns,
             preflight_elapsed_ns=preflight_elapsed_ns,
             dispatch_spread_ns=dispatch_spread_ns,
+            scheduled_windows=scheduled,
         )

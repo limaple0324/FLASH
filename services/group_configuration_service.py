@@ -10,6 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from domain.sync_target_settings import (
+    MAX_SYNC_DELAY_MS,
+    SyncTargetSettings,
+    clamp_sync_delay_ms,
+    clamp_sync_offset_px,
+)
 from services.feature_hotkey_monitor import normalize_feature_hotkey
 from services.group_launch_service import SavedWindowPlacement
 
@@ -22,6 +28,8 @@ class GroupConfigurationEntry:
     role: str
     order: int
     placement: SavedWindowPlacement | None = None
+    sync_settings: SyncTargetSettings = SyncTargetSettings()
+    role_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +38,7 @@ class GroupConfiguration:
     entries: tuple[GroupConfigurationEntry, ...]
     launch_hotkey: str = ""
     master_locked: bool = True
+    sync_base_point: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +122,51 @@ class GroupConfigurationService:
             return None
         return SavedWindowPlacement(x, y, width, height, delay_ms)
 
+    @staticmethod
+    def _clean_role_id(value: object) -> str:
+        if not isinstance(value, str):
+            return ""
+        cleaned = "".join(
+            character
+            for character in value.strip()
+            if not character.isspace() and ord(character) >= 32
+        )
+        return cleaned[:24]
+
+    @staticmethod
+    def _clean_sync_base_point(
+        value: Mapping[str, object],
+    ) -> tuple[int, int] | None:
+        raw_x = value.get("sync_base_x")
+        raw_y = value.get("sync_base_y")
+        if (
+            isinstance(raw_x, bool)
+            or not isinstance(raw_x, int)
+            or isinstance(raw_y, bool)
+            or not isinstance(raw_y, int)
+            or not (-20_000 <= raw_x <= 20_000)
+            or not (-20_000 <= raw_y <= 20_000)
+        ):
+            return None
+        return raw_x, raw_y
+
+    @classmethod
+    def _clean_sync_settings(
+        cls,
+        value: Mapping[str, object],
+        *,
+        placement: SavedWindowPlacement | None = None,
+    ) -> SyncTargetSettings:
+        raw_delay = value.get("sync_delay_ms")
+        if raw_delay is None and placement is not None:
+            raw_delay = min(placement.delay_ms, MAX_SYNC_DELAY_MS)
+        return SyncTargetSettings.normalized(
+            offset_enabled=value.get("sync_offset_enabled", False),
+            offset_x=value.get("sync_offset_x", 0),
+            offset_y=value.get("sync_offset_y", 0),
+            delay_ms=raw_delay if raw_delay is not None else 0,
+        )
+
     @classmethod
     def _clean_entry(cls, value: object) -> dict[str, object] | None:
         if not isinstance(value, Mapping):
@@ -140,6 +194,19 @@ class GroupConfigurationService:
                     "delay_ms": placement.delay_ms,
                 }
             )
+        sync_settings = cls._clean_sync_settings(
+            value,
+            placement=placement,
+        )
+        entry.update(
+            {
+                "sync_offset_enabled": sync_settings.offset_enabled,
+                "sync_offset_x": sync_settings.offset_x,
+                "sync_offset_y": sync_settings.offset_y,
+                "sync_delay_ms": sync_settings.delay_ms,
+                "role_id": cls._clean_role_id(value.get("role_id")),
+            }
+        )
         return entry
 
     @classmethod
@@ -196,6 +263,18 @@ class GroupConfigurationService:
                             bool,
                         )
                         else True
+                    ),
+                    **(
+                        {
+                            "sync_base_x": sync_base_point[0],
+                            "sync_base_y": sync_base_point[1],
+                        }
+                        if (
+                            sync_base_point
+                            := cls._clean_sync_base_point(raw_group)
+                        )
+                        is not None
+                        else {}
                     ),
                 }
             )
@@ -394,6 +473,13 @@ class GroupConfigurationService:
                     role=str(raw_entry["role"]),
                     order=index,
                     placement=self._clean_placement(raw_entry),
+                    sync_settings=self._clean_sync_settings(
+                        raw_entry,
+                        placement=self._clean_placement(raw_entry),
+                    ),
+                    role_id=self._clean_role_id(
+                        raw_entry.get("role_id")
+                    ),
                 )
                 for index, raw_entry in enumerate(
                     raw_group["launch_entries"],
@@ -409,6 +495,9 @@ class GroupConfigurationService:
                     ),
                     master_locked=bool(
                         raw_group.get("master_locked", True)
+                    ),
+                    sync_base_point=self._clean_sync_base_point(
+                        raw_group
                     ),
                 )
             )
@@ -660,6 +749,171 @@ class GroupConfigurationService:
                     "delay_ms": placement.delay_ms,
                 }
             )
+        self._save()
+        return True
+
+    def set_sync_target_settings(
+        self,
+        group_name: object,
+        entry_id: object,
+        *,
+        offset_enabled: object,
+        offset_x: object,
+        offset_y: object,
+        delay_ms: object,
+    ) -> bool:
+        cleaned = self._clean_name(group_name)
+        if (
+            cleaned is None
+            or not isinstance(entry_id, str)
+            or not entry_id.strip()
+            or not isinstance(offset_enabled, bool)
+        ):
+            return False
+        raw_group = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if raw_group is None:
+            return False
+        entries = raw_group.get("launch_entries")
+        if not isinstance(entries, list):
+            return False
+        raw_entry = next(
+            (
+                entry
+                for entry in entries
+                if entry.get("entry_id") == entry_id.strip()
+            ),
+            None,
+        )
+        if raw_entry is None:
+            return False
+        settings = SyncTargetSettings.normalized(
+            offset_enabled=offset_enabled,
+            offset_x=clamp_sync_offset_px(offset_x),
+            offset_y=clamp_sync_offset_px(offset_y),
+            delay_ms=clamp_sync_delay_ms(delay_ms),
+        )
+        current = self._clean_sync_settings(raw_entry)
+        if current == settings:
+            return False
+        raw_entry.update(
+            {
+                "sync_offset_enabled": settings.offset_enabled,
+                "sync_offset_x": settings.offset_x,
+                "sync_offset_y": settings.offset_y,
+                "sync_delay_ms": settings.delay_ms,
+            }
+        )
+        self._save()
+        return True
+
+    def clear_sync_target_settings(
+        self,
+        group_name: object,
+        entry_id: object,
+    ) -> bool:
+        return self.set_sync_target_settings(
+            group_name,
+            entry_id,
+            offset_enabled=False,
+            offset_x=0,
+            offset_y=0,
+            delay_ms=0,
+        )
+
+    def set_sync_base_point(
+        self,
+        group_name: object,
+        point: tuple[int, int] | None,
+    ) -> bool:
+        cleaned = self._clean_name(group_name)
+        if cleaned is None:
+            return False
+        raw_group = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if raw_group is None:
+            return False
+        if point is None:
+            if self._clean_sync_base_point(raw_group) is None:
+                return False
+            raw_group.pop("sync_base_x", None)
+            raw_group.pop("sync_base_y", None)
+            self._save()
+            return True
+        if (
+            not isinstance(point, tuple)
+            or len(point) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in point
+            )
+            or any(not (-20_000 <= value <= 20_000) for value in point)
+        ):
+            return False
+        normalized = (int(point[0]), int(point[1]))
+        if self._clean_sync_base_point(raw_group) == normalized:
+            return False
+        raw_group["sync_base_x"], raw_group["sync_base_y"] = normalized
+        self._save()
+        return True
+
+    def set_role_id(
+        self,
+        group_name: object,
+        entry_id: object,
+        role_id: object,
+    ) -> bool:
+        cleaned = self._clean_name(group_name)
+        normalized_role_id = self._clean_role_id(role_id)
+        if (
+            cleaned is None
+            or not isinstance(entry_id, str)
+            or not entry_id.strip()
+            or (
+                isinstance(role_id, str)
+                and role_id.strip()
+                and not normalized_role_id
+            )
+        ):
+            return False
+        raw_group = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if raw_group is None:
+            return False
+        entries = raw_group.get("launch_entries")
+        if not isinstance(entries, list):
+            return False
+        raw_entry = next(
+            (
+                entry
+                for entry in entries
+                if entry.get("entry_id") == entry_id.strip()
+            ),
+            None,
+        )
+        if raw_entry is None:
+            return False
+        if self._clean_role_id(raw_entry.get("role_id")) == normalized_role_id:
+            return False
+        raw_entry["role_id"] = normalized_role_id
         self._save()
         return True
 

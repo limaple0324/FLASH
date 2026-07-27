@@ -1,4 +1,5 @@
 import json
+from threading import Event
 
 from adapters.windows_input_sync import (
     WindowInputPolicy,
@@ -7,6 +8,7 @@ from adapters.windows_input_sync import (
     normalize_input_policy,
 )
 from adapters.windows_window import WindowInfo
+from domain.sync_target_settings import SyncTargetSettings
 from services.deferred_sync_operation_service import (
     DeferredSyncOperationService,
 )
@@ -68,6 +70,17 @@ class FakeMessageBackend:
     def send_key_chord(self, handle, virtual_keys):
         self.sent.append((handle, virtual_keys))
         return handle not in self.rejected
+
+
+class SignalingMessageBackend(FakeMessageBackend):
+    def __init__(self):
+        super().__init__()
+        self.completed = Event()
+
+    def send_virtual_key(self, handle, virtual_key):
+        delivered = super().send_virtual_key(handle, virtual_key)
+        self.completed.set()
+        return delivered
 
 def controller(window_backend, message_backend=None):
     return WindowsInputSyncController(
@@ -742,3 +755,40 @@ def test_execution_guard_stops_before_the_next_keyboard_target():
     assert report.sent_windows == 1
     assert "execution_stopped" in report.failure_codes
     assert messages.sent == [(1, 0x42)]
+
+
+def test_per_role_keyboard_delay_is_scheduled_from_same_batch():
+    windows = make_windows(count=2, foreground=1)
+    messages = SignalingMessageBackend()
+    sync = WindowsInputSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=windows,
+        message_backend=messages,
+    )
+    allowed = tuple(
+        window.launch_fingerprint for window in windows.windows
+    )
+    sync.set_allowed_fingerprints(allowed)
+    sync.set_controller_fingerprint(allowed[0])
+    sync.set_target_settings(
+        {
+            allowed[1]: SyncTargetSettings(delay_ms=20),
+        }
+    )
+    try:
+        result = sync.send_approved_key(
+            "B",
+            policy="all",
+            execute=True,
+            exclude_foreground=True,
+            source_handle=1,
+        )
+
+        assert result.passed is True
+        assert result.sent_windows == 0
+        assert result.scheduled_windows == 1
+        assert messages.completed.wait(0.5)
+        assert messages.sent == [(2, 0x42)]
+    finally:
+        sync._dispatch_scheduler.close()

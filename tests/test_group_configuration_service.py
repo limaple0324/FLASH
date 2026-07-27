@@ -580,3 +580,71 @@ def test_import_rejects_reserved_feature_hotkey_without_changing_owned(
 
     assert owned.read_bytes() == before
     assert service.group("120") is None
+
+
+def test_sync_offset_delay_base_point_and_role_id_survive_reload(tmp_path):
+    legacy, _first, _second = _legacy(tmp_path)
+    owned = tmp_path / "groups.json"
+    service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    entry = service.group("14支").entries[1]
+
+    assert service.set_sync_base_point("14支", (100, 200)) is True
+    assert service.set_sync_target_settings(
+        "14支",
+        entry.entry_id,
+        offset_enabled=True,
+        offset_x=-35,
+        offset_y=12,
+        delay_ms=450,
+    ) is True
+    assert service.set_role_id(
+        "14支",
+        entry.entry_id,
+        "  001|角色_甲 ",
+    ) is True
+
+    restored = GroupConfigurationService(owned).group("14支")
+    restored_entry = restored.entries[1]
+    assert restored.sync_base_point == (100, 200)
+    assert restored_entry.sync_settings.offset_enabled is True
+    assert restored_entry.sync_settings.offset_x == -35
+    assert restored_entry.sync_settings.offset_y == 12
+    assert restored_entry.sync_settings.delay_ms == 450
+    assert restored_entry.role_id == "001|角色_甲"
+
+
+def test_legacy_launch_delay_seeds_sync_delay_and_clear_resets_only_sync(
+    tmp_path,
+):
+    legacy, _first, _second = _legacy(tmp_path)
+    payload = json.loads(legacy.read_text(encoding="utf-8"))
+    payload["groups"][0]["launch_entries"][1].update(
+        {
+            "x": 0,
+            "y": 0,
+            "width": 916,
+            "height": 629,
+            "delay_ms": 8_000,
+        }
+    )
+    legacy.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    service = GroupConfigurationService(
+        tmp_path / "owned.json",
+        legacy_config_path=legacy,
+    )
+    entry = service.group("14支").entries[1]
+
+    assert entry.sync_settings.delay_ms == 5_000
+    assert service.clear_sync_target_settings(
+        "14支",
+        entry.entry_id,
+    ) is True
+    cleared = service.group("14支").entries[1]
+    assert cleared.sync_settings.delay_ms == 0
+    assert cleared.placement.delay_ms == 8_000

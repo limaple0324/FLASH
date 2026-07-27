@@ -17,6 +17,7 @@ class SyncScope:
     controller_entry_id: str | None = None
     fingerprints: tuple[str, ...] = ()
     failure_codes: tuple[str, ...] = ()
+    entry_ids: tuple[str, ...] = ()
 
     @property
     def ready(self) -> bool:
@@ -95,4 +96,5 @@ class SyncScopeService:
             name,
             controller,
             tuple(fingerprint for fingerprint in fingerprints if fingerprint),
+            entry_ids=ordered_ids,
         )

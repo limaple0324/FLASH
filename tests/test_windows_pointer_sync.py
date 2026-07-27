@@ -1,9 +1,11 @@
 import json
 from dataclasses import replace
+from threading import Event
 
 from adapters.windows_input_sync import WindowInputPolicy
 from adapters.windows_pointer_sync import WindowsPointerSyncController
 from adapters.windows_window import WindowInfo
+from domain.sync_target_settings import SyncTargetSettings
 from services.deferred_sync_operation_service import (
     DeferredSyncOperationService,
 )
@@ -50,6 +52,27 @@ class Messages:
         self.sent.append((handle, x, y, event))
         return True
 
+
+class AdjustedMessages(Messages):
+    def __init__(self):
+        super().__init__()
+        self.adjusted = []
+        self.completed = Event()
+
+    def send_pointer_adjusted(
+        self,
+        handle,
+        x,
+        y,
+        event,
+        offset_x,
+        offset_y,
+    ):
+        self.adjusted.append(
+            (handle, x, y, event, offset_x, offset_y)
+        )
+        self.completed.set()
+        return True
 
 def _controller(windows, messages):
     controller = WindowsPointerSyncController(
@@ -180,6 +203,41 @@ def test_execution_guard_releases_partial_left_down_batch():
         (2, 0.5, 0.5, "left_up"),
     ]
     assert controller.release_pressed_targets() == 0
+
+
+def test_per_role_pointer_offset_and_delay_are_applied_independently():
+    windows = [_window(1), _window(2)]
+    messages = AdjustedMessages()
+    controller = _controller(windows, messages)
+    target_fingerprint = windows[1].launch_fingerprint
+    controller.set_target_settings(
+        {
+            target_fingerprint: SyncTargetSettings(
+                offset_enabled=True,
+                offset_x=12,
+                offset_y=-7,
+                delay_ms=20,
+            )
+        }
+    )
+    try:
+        result = controller.send(
+            source_handle=1,
+            x_ratio=0.25,
+            y_ratio=0.75,
+            event="left_up",
+            policy=WindowInputPolicy.ALL,
+        )
+
+        assert result.passed is True
+        assert result.sent_windows == 0
+        assert result.scheduled_windows == 1
+        assert messages.completed.wait(0.5)
+        assert messages.adjusted == [
+            (2, 0.25, 0.75, "left_up", 12, -7)
+        ]
+    finally:
+        controller._dispatch_scheduler.close()
 
 
 def test_release_pressed_targets_uses_latest_successful_move_position():

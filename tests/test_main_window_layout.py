@@ -27,6 +27,11 @@ def test_main_window_uses_home_view():
     assert "on_prepare_background_image=prepare_background_image" in source
     assert "on_clear_background_image=clear_background_image" in source
     assert '("所有檔案", "*.*")' in source
+    assert "on_capture_sync_base_point=capture_sync_base_point" in source
+    assert "on_capture_sync_target_point=capture_sync_target_point" in source
+    assert "on_save_sync_target_settings=save_sync_target_settings" in source
+    assert "on_calibrate_role_id=calibrate_role_id" in source
+    assert "on_read_role_id=read_role_id" in source
 
 
 def test_main_window_start_message_is_player_facing():

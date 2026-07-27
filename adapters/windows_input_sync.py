@@ -22,7 +22,9 @@ from adapters.windows_launch_fingerprint import (
 )
 from adapters.windows_window import Win32WindowBackend, WindowBackend, WindowInfo
 from domain.game_shortcuts import GAME_SHORTCUT_BY_KEY
+from domain.sync_target_settings import SyncTargetSettings
 from services.sync_conflict_arbiter import SyncConflictArbiter
+from services.sync_dispatch_scheduler import SyncDispatchScheduler
 from services.deferred_sync_operation_service import (
     DeferredSyncOperationService,
 )
@@ -262,6 +264,7 @@ class InputSyncResult:
     preflight_elapsed_ns: int = 0
     dispatch_spread_ns: int = 0
     queue_wait_ns: int = 0
+    scheduled_windows: int = 0
 
     @property
     def passed(self) -> bool:
@@ -269,7 +272,8 @@ class InputSyncResult:
             self.execution_requested
             and not self.failure_codes
             and self.eligible_windows > 0
-            and self.sent_windows == self.eligible_windows
+            and self.sent_windows + self.scheduled_windows
+            == self.eligible_windows
         )
 
     @property
@@ -292,11 +296,16 @@ class InputSyncResult:
             "eligible_windows": self.eligible_windows,
             "responsive_windows": self.responsive_windows,
             "sent_windows": self.sent_windows,
+            "scheduled_windows": self.scheduled_windows,
             "minimized_windows": self.minimized_windows,
             "background_windows": self.background_windows,
             "skipped_windows": self.skipped_windows,
             "execution_requested": self.execution_requested,
-            "partial_delivery": 0 < self.sent_windows < self.eligible_windows,
+            "partial_delivery": (
+                0
+                < self.sent_windows + self.scheduled_windows
+                < self.eligible_windows
+            ),
             "failure_codes": list(self.failure_codes),
             "controller_elapsed_ns": self.controller_elapsed_ns,
             "preflight_elapsed_ns": self.preflight_elapsed_ns,
@@ -311,6 +320,7 @@ class InputSyncResult:
             "raw_arguments_emitted": False,
             "fingerprints_emitted": False,
             "input_sent": self.sent_windows > 0,
+            "input_scheduled": self.scheduled_windows > 0,
         }
 
 
@@ -357,6 +367,10 @@ class WindowsInputSyncController:
         self._reconnecting_provider = reconnecting_provider or (lambda: ())
         self._role_operation_callback = role_operation_callback
         self._screen_state_provider = screen_state_provider
+        self._target_settings: dict[str, SyncTargetSettings] = {}
+        self._dispatch_scheduler = SyncDispatchScheduler(
+            thread_name="flash-key-delay",
+        )
         if self._deferred_service is not None:
             self._deferred_service.register_handler(
                 "keyboard",
@@ -398,6 +412,8 @@ class WindowsInputSyncController:
             self._allowed_fingerprints = None
             self._allowed_fingerprint_set = None
             self._controller_fingerprint = None
+            self._target_settings = {}
+            self.invalidate_scheduled()
             return
         normalized = tuple(
             normalize_launch_fingerprint(item)
@@ -420,6 +436,44 @@ class WindowsInputSyncController:
         self._allowed_fingerprint_set = frozenset(ordered)
         if self._controller_fingerprint not in self._allowed_fingerprint_set:
             self._controller_fingerprint = None
+        self._target_settings = {
+            fingerprint: settings
+            for fingerprint, settings in self._target_settings.items()
+            if fingerprint in self._allowed_fingerprint_set
+        }
+        self.invalidate_scheduled()
+
+    def set_target_settings(
+        self,
+        values: Mapping[str, SyncTargetSettings] | None,
+    ) -> None:
+        normalized: dict[str, SyncTargetSettings] = {}
+        if values is not None:
+            for raw_fingerprint, raw_settings in values.items():
+                fingerprint = normalize_launch_fingerprint(raw_fingerprint)
+                if (
+                    fingerprint is None
+                    or not isinstance(raw_settings, SyncTargetSettings)
+                    or (
+                        self._allowed_fingerprint_set is not None
+                        and fingerprint not in self._allowed_fingerprint_set
+                    )
+                ):
+                    raise ValueError("target settings contain an invalid role.")
+                normalized[fingerprint] = raw_settings
+        self._target_settings = normalized
+        self.invalidate_scheduled()
+
+    def invalidate_scheduled(self) -> None:
+        self._dispatch_scheduler.invalidate()
+
+    def _settings_for(self, fingerprint: str | None) -> SyncTargetSettings:
+        if fingerprint is None:
+            return SyncTargetSettings()
+        return self._target_settings.get(
+            fingerprint,
+            SyncTargetSettings(),
+        )
 
     def set_controller_fingerprint(self, fingerprint: object) -> None:
         normalized = normalize_launch_fingerprint(fingerprint)
@@ -553,6 +607,113 @@ class WindowsInputSyncController:
             if lease is not None:
                 lease.release()
 
+    def _run_scheduled_key(
+        self,
+        fingerprint: str,
+        normalized_key: str,
+        virtual_keys: tuple[int, ...],
+        execution_guard: Callable[[], bool] | None,
+    ) -> None:
+        if execution_guard is not None:
+            try:
+                if not bool(execution_guard()):
+                    return
+            except Exception:
+                return
+        reconnecting = {
+            normalized
+            for value in self._reconnecting_provider()
+            if (
+                normalized := normalize_launch_fingerprint(value)
+            )
+            is not None
+        }
+        if (
+            fingerprint in reconnecting
+            and self._deferred_service is not None
+        ):
+            self._deferred_service.enqueue(
+                fingerprint,
+                f"key:{normalized_key}",
+                kind="keyboard",
+                payload={
+                    "key": normalized_key,
+                    "delay_already_applied": True,
+                },
+            )
+            self._record_role_operation(
+                fingerprint,
+                f"快捷鍵 {normalized_key}",
+                "延遲到期時斷線，等待重連後補做",
+            )
+            return
+        matches = tuple(
+            window
+            for window in self._all_title_matching_windows()
+            if normalize_launch_fingerprint(window.launch_fingerprint)
+            == fingerprint
+        )
+        if len(matches) != 1:
+            self._record_role_operation(
+                fingerprint,
+                f"快捷鍵 {normalized_key}",
+                "延遲送出失敗",
+            )
+            return
+        window = matches[0]
+        if (
+            not self._message_backend.is_window(window.handle)
+            or not self._message_backend.probe_responsive(
+                window.handle,
+                self._preflight_timeout_ms,
+            )
+        ):
+            self._record_role_operation(
+                fingerprint,
+                f"快捷鍵 {normalized_key}",
+                "延遲送出失敗",
+            )
+            return
+        lease = (
+            self._conflict_arbiter.try_begin(
+                fingerprint,
+                f"key:{normalized_key}",
+            )
+            if self._conflict_arbiter is not None
+            else None
+        )
+        if self._conflict_arbiter is not None and lease is None:
+            return
+        try:
+            if len(virtual_keys) == 1:
+                delivered = bool(
+                    self._message_backend.send_virtual_key(
+                        window.handle,
+                        virtual_keys[0],
+                    )
+                )
+            else:
+                delivered = bool(
+                    self._message_backend.send_key_chord(
+                        window.handle,
+                        virtual_keys,
+                    )
+                )
+            self._record_role_operation(
+                fingerprint,
+                f"快捷鍵 {normalized_key}",
+                "延遲送出成功" if delivered else "延遲送出失敗",
+            )
+        except OSError:
+            self._record_role_operation(
+                fingerprint,
+                f"快捷鍵 {normalized_key}",
+                "延遲送出失敗",
+            )
+        finally:
+            if lease is not None:
+                lease.release()
+
     def _matching_windows(self) -> tuple[WindowInfo, ...]:
         windows = tuple(
             window
@@ -654,6 +815,7 @@ class WindowsInputSyncController:
         dispatch_spread_ns: int = 0,
         queue_wait_ns: int = 0,
         eligible_count: int | None = None,
+        scheduled: int = 0,
     ) -> InputSyncResult:
         foreground = self._window_backend.foreground_handle()
         controller_elapsed_ns = (
@@ -692,6 +854,7 @@ class WindowsInputSyncController:
             preflight_elapsed_ns=max(0, preflight_elapsed_ns),
             dispatch_spread_ns=max(0, dispatch_spread_ns),
             queue_wait_ns=max(0, queue_wait_ns),
+            scheduled_windows=max(0, scheduled),
         )
 
     def send_approved_key(
@@ -1014,6 +1177,7 @@ class WindowsInputSyncController:
 
         virtual_keys = VIRTUAL_KEY_SEQUENCES[normalized_key]
         sent = 0
+        scheduled = 0
         deferred = 0
         reconnecting = reconnecting
         dispatch_first_ns: int | None = None
@@ -1039,6 +1203,30 @@ class WindowsInputSyncController:
                     "等待重連後補做",
                 )
                 failures.append("sync_deferred_reconnect")
+                continue
+            settings = self._settings_for(fingerprint)
+            if settings.delay_ms > 0 and fingerprint is not None:
+                scheduled_ok = self._dispatch_scheduler.schedule(
+                    settings.delay_ms,
+                    lambda role_fingerprint=fingerprint,
+                    delayed_key=normalized_key,
+                    delayed_virtual_keys=virtual_keys,
+                    delayed_guard=execution_guard: self._run_scheduled_key(
+                        role_fingerprint,
+                        delayed_key,
+                        delayed_virtual_keys,
+                        delayed_guard,
+                    ),
+                )
+                if scheduled_ok:
+                    scheduled += 1
+                    self._record_role_operation(
+                        fingerprint,
+                        f"快捷鍵 {normalized_key}",
+                        f"已排程延遲 {settings.delay_ms} 毫秒",
+                    )
+                else:
+                    failures.append("input_schedule_failed")
                 continue
             lease = (
                 self._conflict_arbiter.try_begin(
@@ -1090,7 +1278,7 @@ class WindowsInputSyncController:
             finally:
                 if lease is not None:
                     lease.release()
-        if sent + deferred != len(eligible):
+        if sent + scheduled + deferred != len(eligible):
             failures.append("input_delivery_failed")
         dispatch_spread_ns = (
             max(0, dispatch_last_ns - dispatch_first_ns)
@@ -1113,4 +1301,5 @@ class WindowsInputSyncController:
             controller_started_ns=controller_started_ns,
             preflight_elapsed_ns=preflight_elapsed_ns,
             dispatch_spread_ns=dispatch_spread_ns,
+            scheduled=scheduled,
         )

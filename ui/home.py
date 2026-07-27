@@ -478,6 +478,24 @@ class HomeView:
         on_clear_group: (
             Callable[[str], GroupManagementViewResult] | None
         ) = None,
+        on_capture_sync_base_point: (
+            Callable[[str], object] | None
+        ) = None,
+        on_capture_sync_target_point: (
+            Callable[[str, str], object] | None
+        ) = None,
+        on_save_sync_target_settings: (
+            Callable[[str, str, bool, int, int, int], object] | None
+        ) = None,
+        on_clear_sync_target_settings: (
+            Callable[[str, str], object] | None
+        ) = None,
+        on_calibrate_role_id: (
+            Callable[[str, str, str], object] | None
+        ) = None,
+        on_read_role_id: (
+            Callable[[str, str], object] | None
+        ) = None,
         window_size: tuple[int, int] = (
             DEFAULT_FLASH_CLIENT_WIDTH,
             DEFAULT_FLASH_CLIENT_HEIGHT,
@@ -685,6 +703,16 @@ class HomeView:
         self.on_remove_group_shortcut = on_remove_group_shortcut
         self.on_set_group_main = on_set_group_main
         self.on_clear_group = on_clear_group
+        self.on_capture_sync_base_point = on_capture_sync_base_point
+        self.on_capture_sync_target_point = on_capture_sync_target_point
+        self.on_save_sync_target_settings = (
+            on_save_sync_target_settings
+        )
+        self.on_clear_sync_target_settings = (
+            on_clear_sync_target_settings
+        )
+        self.on_calibrate_role_id = on_calibrate_role_id
+        self.on_read_role_id = on_read_role_id
         width, height = window_size
         self.window_size = (
             width
@@ -2360,6 +2388,14 @@ class HomeView:
             self._toggle_group_master_locked,
         )
         self._group_master_lock_button.pack(side=RIGHT, padx=(0, 8))
+        sync_base_button = self._button(
+            entry_header,
+            "設定主基準點（3秒）",
+            self._start_sync_base_point_capture,
+        )
+        sync_base_button.pack(side=RIGHT, padx=(0, 8))
+        if self.on_capture_sync_base_point is None:
+            sync_base_button.configure(state=DISABLED)
         self._group_entries_frame = Frame(entry_card, bg=SURFACE)
         self._group_entries_frame.pack(fill=X, pady=(10, 0))
         self._group_setting_message_label = Label(
@@ -5234,9 +5270,11 @@ class HomeView:
             return ()
         for entry in entries:
             row = Frame(frame, bg=BACKGROUND, padx=10, pady=7)
-            row.pack(fill=X, pady=2)
+            row.pack(fill=X, pady=3)
+            top_row = Frame(row, bg=BACKGROUND)
+            top_row.pack(fill=X)
             Label(
-                row,
+                top_row,
                 text=f"{entry.order}. {entry.display_name}",
                 font=("Microsoft JhengHei UI", 10, "bold"),
                 bg=BACKGROUND,
@@ -5244,14 +5282,14 @@ class HomeView:
                 anchor="w",
             ).pack(side=LEFT, fill=X, expand=True)
             Label(
-                row,
+                top_row,
                 text=entry.role,
                 font=("Microsoft JhengHei UI", 9),
                 bg=BACKGROUND,
                 fg=MUTED,
             ).pack(side=LEFT, padx=10)
             remove_button = self._button(
-                row,
+                top_row,
                 "移除",
                 lambda value=entry.entry_id: self._remove_group_shortcut(
                     value
@@ -5262,7 +5300,7 @@ class HomeView:
                 remove_button.configure(state=DISABLED)
             if entry.role != "主窗口":
                 main_button = self._button(
-                    row,
+                    top_row,
                     "設為主窗口",
                     lambda value=entry.entry_id: self._set_group_main(
                         value
@@ -5271,7 +5309,282 @@ class HomeView:
                 main_button.pack(side=RIGHT, padx=(0, 6))
                 if locked:
                     main_button.configure(state=DISABLED)
+            settings_row = Frame(row, bg=BACKGROUND)
+            settings_row.pack(fill=X, pady=(7, 0))
+            enabled_variable = IntVar(
+                master=self.parent,
+                value=int(entry.sync_settings.offset_enabled),
+            )
+            Checkbutton(
+                settings_row,
+                text="啟用角色偏移",
+                variable=enabled_variable,
+                bg=BACKGROUND,
+                fg=TEXT,
+                activebackground=BACKGROUND,
+                selectcolor=SURFACE,
+                font=("Microsoft JhengHei UI", 9),
+            ).pack(side=LEFT)
+
+            def numeric_entry(value: int, width: int = 6) -> Entry:
+                widget = Entry(
+                    settings_row,
+                    width=width,
+                    font=("Microsoft JhengHei UI", 9),
+                    bg=SURFACE,
+                    fg=TEXT,
+                    relief="flat",
+                    bd=0,
+                )
+                widget.insert(0, str(value))
+                widget.pack(side=LEFT, padx=(4, 8), ipady=4)
+                return widget
+
+            Label(
+                settings_row,
+                text="X",
+                bg=BACKGROUND,
+                fg=MUTED,
+                font=("Microsoft JhengHei UI", 9),
+            ).pack(side=LEFT)
+            offset_x_entry = numeric_entry(entry.sync_settings.offset_x)
+            Label(
+                settings_row,
+                text="Y",
+                bg=BACKGROUND,
+                fg=MUTED,
+                font=("Microsoft JhengHei UI", 9),
+            ).pack(side=LEFT)
+            offset_y_entry = numeric_entry(entry.sync_settings.offset_y)
+            Label(
+                settings_row,
+                text="延遲ms",
+                bg=BACKGROUND,
+                fg=MUTED,
+                font=("Microsoft JhengHei UI", 9),
+            ).pack(side=LEFT)
+            delay_entry = numeric_entry(entry.sync_settings.delay_ms)
+            self._button(
+                settings_row,
+                "套用",
+                lambda value=entry.entry_id,
+                enabled=enabled_variable,
+                x_field=offset_x_entry,
+                y_field=offset_y_entry,
+                delay_field=delay_entry: self._save_sync_target_settings(
+                    value,
+                    enabled,
+                    x_field,
+                    y_field,
+                    delay_field,
+                ),
+                primary=True,
+            ).pack(side=LEFT, padx=(2, 0))
+            self._button(
+                settings_row,
+                "清除",
+                lambda value=entry.entry_id: self._clear_sync_target_settings(
+                    value
+                ),
+            ).pack(side=LEFT, padx=(6, 0))
+            if entry.role != "主窗口":
+                self._button(
+                    settings_row,
+                    "取目標點（3秒）",
+                    lambda value=entry.entry_id: (
+                        self._start_sync_target_point_capture(value)
+                    ),
+                ).pack(side=LEFT, padx=(6, 0))
+            role_row = Frame(row, bg=BACKGROUND)
+            role_row.pack(fill=X, pady=(7, 0))
+            Label(
+                role_row,
+                text="角色ID",
+                bg=BACKGROUND,
+                fg=MUTED,
+                font=("Microsoft JhengHei UI", 9),
+            ).pack(side=LEFT)
+            role_id_entry = Entry(
+                role_row,
+                width=20,
+                font=("Microsoft JhengHei UI", 9),
+                bg=SURFACE,
+                fg=TEXT,
+                relief="flat",
+                bd=0,
+            )
+            role_id_entry.insert(0, entry.role_id)
+            role_id_entry.pack(side=LEFT, padx=(6, 8), ipady=4)
+            self._button(
+                role_row,
+                "校正角色ID",
+                lambda value=entry.entry_id,
+                field=role_id_entry: self._calibrate_group_role_id(
+                    value,
+                    field,
+                ),
+            ).pack(side=LEFT)
+            self._button(
+                role_row,
+                "讀取角色ID",
+                lambda value=entry.entry_id: self._read_group_role_id(
+                    value
+                ),
+            ).pack(side=LEFT, padx=(6, 0))
         return entries
+
+    def _start_sync_base_point_capture(self) -> None:
+        group_name = self.current_group_name
+        if group_name is None or self.on_capture_sync_base_point is None:
+            return
+        self._show_group_setting_message(
+            "請在 3 秒內把滑鼠移到主窗口的基準點。"
+        )
+        self.parent.after(
+            3000,
+            lambda selected_group=group_name: (
+                self._complete_sync_base_point_capture(selected_group)
+            ),
+        )
+
+    def _complete_sync_base_point_capture(self, group_name: str) -> None:
+        if self.on_capture_sync_base_point is None:
+            return
+        try:
+            result = self.on_capture_sync_base_point(group_name)
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._show_group_setting_message(result)
+
+    def _start_sync_target_point_capture(self, entry_id: str) -> None:
+        group_name = self.current_group_name
+        if group_name is None or self.on_capture_sync_target_point is None:
+            return
+        self._show_group_setting_message(
+            "請在 3 秒內把滑鼠移到該角色窗口的對應位置。"
+        )
+        self.parent.after(
+            3000,
+            lambda selected_group=group_name,
+            selected_entry=entry_id: (
+                self._complete_sync_target_point_capture(
+                    selected_group,
+                    selected_entry,
+                )
+            ),
+        )
+
+    def _complete_sync_target_point_capture(
+        self,
+        group_name: str,
+        entry_id: str,
+    ) -> None:
+        if self.on_capture_sync_target_point is None:
+            return
+        try:
+            result = self.on_capture_sync_target_point(
+                group_name,
+                entry_id,
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._show_group_setting_message(result)
+        self.refresh_group_entries()
+
+    def _save_sync_target_settings(
+        self,
+        entry_id: str,
+        enabled: IntVar,
+        offset_x: Entry,
+        offset_y: Entry,
+        delay: Entry,
+    ) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_save_sync_target_settings is None
+        ):
+            return
+        try:
+            x_value = int(offset_x.get().strip())
+            y_value = int(offset_y.get().strip())
+            delay_value = int(delay.get().strip())
+        except ValueError:
+            self._show_group_setting_message(
+                "偏移與延遲必須填入整數。"
+            )
+            return
+        try:
+            result = self.on_save_sync_target_settings(
+                self.current_group_name,
+                entry_id,
+                bool(enabled.get()),
+                x_value,
+                y_value,
+                delay_value,
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._show_group_setting_message(result)
+        self.refresh_group_entries()
+
+    def _clear_sync_target_settings(self, entry_id: str) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_clear_sync_target_settings is None
+        ):
+            return
+        try:
+            result = self.on_clear_sync_target_settings(
+                self.current_group_name,
+                entry_id,
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._show_group_setting_message(result)
+        self.refresh_group_entries()
+
+    def _calibrate_group_role_id(
+        self,
+        entry_id: str,
+        field: Entry,
+    ) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_calibrate_role_id is None
+        ):
+            return
+        try:
+            result = self.on_calibrate_role_id(
+                self.current_group_name,
+                entry_id,
+                field.get(),
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._show_group_setting_message(result)
+        self.refresh_group_entries()
+
+    def _read_group_role_id(self, entry_id: str) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_read_role_id is None
+        ):
+            return
+        try:
+            result = self.on_read_role_id(
+                self.current_group_name,
+                entry_id,
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._show_group_setting_message(result)
+        self.refresh_group_entries()
 
     def _set_group_main(self, entry_id: str) -> None:
         if (

@@ -30,6 +30,7 @@ from adapters.windows_pointer_sync import (
     WindowsPointerSyncController,
 )
 from adapters.windows_timed_click import WindowsTimedClickBackend
+from adapters.windows_sync_calibration import Win32SyncCalibrationBackend
 from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
 from adapters.windows_window import Win32WindowBackend, WindowsWindowAdapter
 from adapters.windows_client_size import Win32WindowClientSizeBackend
@@ -136,6 +137,7 @@ from services.mouse_sync_monitor import MouseSyncMonitor
 from services.reconnect_failure_status_service import (
     ReconnectFailureStatusService,
 )
+from services.role_id_template_service import RoleIdTemplateService
 from services.smart_reconnect_monitor import SmartReconnectMonitor
 from services.sync_scope_service import SyncScopeService
 from services.sync_conflict_arbiter import SyncConflictArbiter
@@ -178,6 +180,7 @@ GROUP_CONFIGURATION_FILENAME = "group_configuration.json"
 OPERATION_RECORD_FILENAME = "operation_records.json"
 OPERATION_RECORD_ARCHIVE_DIRNAME = "角色每日紀錄"
 DEFERRED_SYNC_STATE_FILENAME = "deferred_sync_operations.json"
+ROLE_ID_TEMPLATE_FILENAME = "role_id_templates.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
 CHARACTER_FILENAME = "characters.json"
 CHARACTER_GAME_DATA_FILENAME = "character_game_data.json"
@@ -336,6 +339,11 @@ def build_services(root: Path | None = None):
         group_configuration_service,
         shortcut_fingerprint_resolver,
     )
+    sync_calibration_backend = Win32SyncCalibrationBackend()
+    role_id_template_service = RoleIdTemplateService(
+        paths.data_dir() / ROLE_ID_TEMPLATE_FILENAME,
+        capture_backend=sync_calibration_backend,
+    )
     progress_store = ActivityProgressStore(
         paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
     )
@@ -473,6 +481,11 @@ def build_services(root: Path | None = None):
     )
     AppContext.register(GroupLaunchService, group_launch_service)
     AppContext.register(SyncScopeService, sync_scope_service)
+    AppContext.register(
+        Win32SyncCalibrationBackend,
+        sync_calibration_backend,
+    )
+    AppContext.register(RoleIdTemplateService, role_id_template_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(ActivityScheduleCatalog, activity_schedule_catalog)
@@ -552,6 +565,7 @@ def build_services(root: Path | None = None):
     synchronized_window_backend = Win32WindowBackend(
         PowerShellLaunchFingerprintResolver()
     )
+    AppContext.register(Win32WindowBackend, synchronized_window_backend)
     AppContext.register(
         WindowsInputSyncController,
         WindowsInputSyncController.for_real_windows(
@@ -922,6 +936,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     group_launch_service = AppContext.get(GroupLaunchService)
     sync_scope_service = AppContext.get(SyncScopeService)
+    sync_calibration_backend = AppContext.get(
+        Win32SyncCalibrationBackend
+    )
+    role_id_template_service = AppContext.get(RoleIdTemplateService)
+    synchronized_window_backend = AppContext.get(Win32WindowBackend)
     workspace_service = AppContext.get(WorkspaceService)
     activity_schedule_view_service = AppContext.get(ActivityScheduleViewService)
     card_view_state_service = AppContext.get(CardViewStateService)
@@ -1425,8 +1444,26 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
             if scope is None or not scope.ready:
                 return None
+            entry_by_id = {
+                entry.entry_id: entry
+                for configured_group in (
+                    group_configuration_service.groups()
+                    if group_configuration_service is not None
+                    else ()
+                )
+                for entry in configured_group.entries
+            }
+            target_settings = {
+                fingerprint: entry_by_id[entry_id].sync_settings
+                for entry_id, fingerprint in zip(
+                    scope.entry_ids,
+                    scope.fingerprints,
+                )
+                if entry_id in entry_by_id
+            }
             input_controller.set_expected_windows(len(scope.fingerprints))
             input_controller.set_allowed_fingerprints(scope.fingerprints)
+            input_controller.set_target_settings(target_settings)
             input_controller.set_controller_fingerprint(
                 scope.fingerprints[0]
             )
@@ -1436,6 +1473,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 )
                 pointer_sync_controller.set_allowed_fingerprints(
                     scope.fingerprints
+                )
+                pointer_sync_controller.set_target_settings(
+                    target_settings
                 )
                 pointer_sync_controller.set_controller_fingerprint(
                     scope.fingerprints[0]
@@ -1520,6 +1560,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     def stop_group_automation_for_configuration_change() -> None:
         auto_click_service.stop()
+        if input_controller is not None:
+            input_controller.invalidate_scheduled()
+        if pointer_sync_controller is not None:
+            pointer_sync_controller.invalidate_scheduled()
         if game_time_timed_click_service is not None:
             game_time_timed_click_service.clear_target(notify=False)
         if keyboard_sync_monitor is not None:
@@ -1890,6 +1934,221 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "目前組別沒有可清空的角色。",
             )
         return finish_group_management(group_name)
+
+    def unique_window_for_group_entry(
+        group_name: str,
+        entry_id: str,
+    ):
+        if (
+            group_configuration_service is None
+            or group_launch_service is None
+            or synchronized_window_backend is None
+        ):
+            return None
+        group = group_configuration_service.group(group_name)
+        plan = group_launch_service.plan(group_name)
+        if group is None or not plan.ready:
+            return None
+        entry = next(
+            (
+                item
+                for item in group.entries
+                if item.entry_id == entry_id
+            ),
+            None,
+        )
+        if entry is None:
+            return None
+        normalized_path = str(
+            entry.shortcut_path.resolve(strict=False)
+        ).casefold()
+        target = next(
+            (
+                item
+                for item in plan.targets
+                if str(
+                    item.shortcut_path.resolve(strict=False)
+                ).casefold()
+                == normalized_path
+            ),
+            None,
+        )
+        if target is None:
+            return None
+        matches = tuple(
+            item
+            for item in synchronized_window_backend.list_windows()
+            if normalize_launch_fingerprint(item.launch_fingerprint)
+            == target.fingerprint
+        )
+        return matches[0] if len(matches) == 1 else None
+
+    def refresh_group_sync_identity(group_name: str) -> None:
+        if group_selection_service is None:
+            return
+        choice = group_selection_service.find(group_name)
+        if choice is not None:
+            apply_group_identity(choice)
+
+    def capture_sync_base_point(group_name: str) -> str:
+        if (
+            group_configuration_service is None
+            or sync_calibration_backend is None
+        ):
+            return "主基準點功能尚未準備完成。"
+        group = group_configuration_service.group(group_name)
+        if group is None or not group.entries:
+            return "目前組別沒有可用的主窗口。"
+        window_info = unique_window_for_group_entry(
+            group_name,
+            group.entries[0].entry_id,
+        )
+        if window_info is None:
+            return "無法唯一確認主窗口，未保存基準點。"
+        point = sync_calibration_backend.cursor_client_point(
+            window_info.handle
+        )
+        if point is None:
+            return "滑鼠不在主窗口遊戲內容區，未保存基準點。"
+        group_configuration_service.set_sync_base_point(
+            group_name,
+            point,
+        )
+        return f"已保存主基準點：{point[0]}, {point[1]}"
+
+    def capture_sync_target_point(
+        group_name: str,
+        entry_id: str,
+    ) -> str:
+        if (
+            group_configuration_service is None
+            or sync_calibration_backend is None
+        ):
+            return "角色偏移功能尚未準備完成。"
+        group = group_configuration_service.group(group_name)
+        if group is None or group.sync_base_point is None:
+            return "請先設定主窗口基準點。"
+        entry = next(
+            (
+                item
+                for item in group.entries
+                if item.entry_id == entry_id
+            ),
+            None,
+        )
+        if entry is None:
+            return "找不到這個角色，未保存偏移。"
+        window_info = unique_window_for_group_entry(group_name, entry_id)
+        if window_info is None:
+            return "無法唯一確認角色窗口，未保存偏移。"
+        point = sync_calibration_backend.cursor_client_point(
+            window_info.handle
+        )
+        if point is None:
+            return "滑鼠不在該角色遊戲內容區，未保存偏移。"
+        offset_x = point[0] - group.sync_base_point[0]
+        changed = group_configuration_service.set_sync_target_settings(
+            group_name,
+            entry_id,
+            offset_enabled=True,
+            offset_x=offset_x,
+            offset_y=0,
+            delay_ms=entry.sync_settings.delay_ms,
+        )
+        if changed:
+            stop_group_automation_for_configuration_change()
+            refresh_group_sync_identity(group_name)
+        return f"已套用角色偏移：X {offset_x}、Y 0"
+
+    def save_sync_target_settings(
+        group_name: str,
+        entry_id: str,
+        enabled: bool,
+        offset_x: int,
+        offset_y: int,
+        delay_ms: int,
+    ) -> str:
+        if group_configuration_service is None:
+            return "同步設定尚未準備完成。"
+        if not (-20_000 <= offset_x <= 20_000):
+            return "X 偏移必須介於 -20000 到 20000。"
+        if not (-20_000 <= offset_y <= 20_000):
+            return "Y 偏移必須介於 -20000 到 20000。"
+        if not (0 <= delay_ms <= 5_000):
+            return "延遲必須介於 0 到 5000 毫秒。"
+        changed = group_configuration_service.set_sync_target_settings(
+            group_name,
+            entry_id,
+            offset_enabled=enabled,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            delay_ms=delay_ms,
+        )
+        if not changed:
+            return "同步偏移與延遲沒有變更。"
+        stop_group_automation_for_configuration_change()
+        refresh_group_sync_identity(group_name)
+        return "已保存角色偏移與延遲；同步已安全停止，請重新啟用。"
+
+    def clear_sync_target_settings(
+        group_name: str,
+        entry_id: str,
+    ) -> str:
+        if group_configuration_service is None:
+            return "同步設定尚未準備完成。"
+        changed = group_configuration_service.clear_sync_target_settings(
+            group_name,
+            entry_id,
+        )
+        if not changed:
+            return "角色偏移與延遲原本已是清除狀態。"
+        stop_group_automation_for_configuration_change()
+        refresh_group_sync_identity(group_name)
+        return "已清除角色偏移與延遲；同步已安全停止。"
+
+    def calibrate_role_id(
+        group_name: str,
+        entry_id: str,
+        role_id: str,
+    ) -> str:
+        if (
+            role_id_template_service is None
+            or group_configuration_service is None
+        ):
+            return "角色ID校正尚未準備完成。"
+        window_info = unique_window_for_group_entry(group_name, entry_id)
+        if window_info is None:
+            return "無法唯一確認角色窗口，未校正角色ID。"
+        result = role_id_template_service.calibrate(
+            window_info.handle,
+            role_id,
+        )
+        if result.success:
+            group_configuration_service.set_role_id(
+                group_name,
+                entry_id,
+                result.role_id,
+            )
+        return result.message
+
+    def read_role_id(group_name: str, entry_id: str) -> str:
+        if (
+            role_id_template_service is None
+            or group_configuration_service is None
+        ):
+            return "角色ID讀取尚未準備完成。"
+        window_info = unique_window_for_group_entry(group_name, entry_id)
+        if window_info is None:
+            return "無法唯一確認角色窗口，未讀取角色ID。"
+        result = role_id_template_service.read(window_info.handle)
+        if result.success:
+            group_configuration_service.set_role_id(
+                group_name,
+                entry_id,
+                result.role_id,
+            )
+            return f"已讀取角色ID：{result.role_id}"
+        return result.message
 
     def add_group_sync_relation(
         group_name: str,
@@ -2434,6 +2693,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_remove_group_shortcut=remove_group_shortcut,
         on_set_group_main=set_group_main,
         on_clear_group=clear_group,
+        on_capture_sync_base_point=capture_sync_base_point,
+        on_capture_sync_target_point=capture_sync_target_point,
+        on_save_sync_target_settings=save_sync_target_settings,
+        on_clear_sync_target_settings=clear_sync_target_settings,
+        on_calibrate_role_id=calibrate_role_id,
+        on_read_role_id=read_role_id,
         on_read_main_window_size=read_main_window_size,
         on_apply_group_window_size=apply_group_window_size,
         on_apply_all_window_size=apply_all_window_size,
