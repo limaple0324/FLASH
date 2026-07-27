@@ -22,3 +22,13 @@ def test_group_configuration_transfer_is_wired_to_current_group_page() -> None:
         "on_import_group_configuration=import_group_configuration"
         in source
     )
+    assert "def change_group_launch_hotkey(" in source
+    assert "GroupLaunchHotkeyMonitor(" in source
+    assert (
+        "group_launch_hotkey_provider=group_launch_hotkey"
+        in source
+    )
+    assert (
+        "on_group_launch_hotkey_change=change_group_launch_hotkey"
+        in source
+    )

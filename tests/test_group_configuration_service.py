@@ -4,6 +4,7 @@ import pytest
 
 from services.group_configuration_service import (
     GroupConfigurationService,
+    GroupHotkeyConflictError,
     SyncCycleError,
 )
 from services.group_launch_service import SavedWindowPlacement
@@ -377,6 +378,8 @@ def test_export_and_import_round_trip_preserves_group_order_and_layout(
     )
     third = _shortcut(tmp_path, "第三角色")
     service.add_shortcuts("第二組", (third,))
+    first_group_name = service.groups()[0].name
+    service.set_launch_hotkey(first_group_name, "F3")
     export_path = service.export_configuration(
         tmp_path / "export.json"
     )
@@ -389,7 +392,101 @@ def test_export_and_import_round_trip_preserves_group_order_and_layout(
         "14支",
         "第二組",
     )
+    assert restored.group(first_group_name).launch_hotkey == "F3"
     assert (
         restored.group("14支").entries[0].shortcut_path
         == service.group("14支").entries[0].shortcut_path
     )
+
+
+def test_legacy_launch_hotkey_display_is_imported_without_modifying_source(
+    tmp_path,
+):
+    shortcut = _shortcut(tmp_path, "legacy")
+    legacy = tmp_path / "legacy-hotkey.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "legacy",
+                        "launch_hotkey_display": "f4",
+                        "launch_entries": [{"path": str(shortcut)}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    original = legacy.read_bytes()
+
+    service = GroupConfigurationService(
+        tmp_path / "owned.json",
+        legacy_config_path=legacy,
+    )
+
+    assert service.group("legacy").launch_hotkey == "F4"
+    assert legacy.read_bytes() == original
+
+
+def test_each_group_keeps_one_unique_launch_hotkey(tmp_path):
+    legacy, _first, _second = _legacy(tmp_path)
+    owned = tmp_path / "groups.json"
+    service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    service.create_group("120")
+
+    assert service.set_launch_hotkey("14支", "f2") is True
+    assert service.group("14支").launch_hotkey == "F2"
+    assert service.launch_hotkeys() == {"14支": "F2"}
+    with pytest.raises(
+        GroupHotkeyConflictError,
+        match=GroupHotkeyConflictError.player_message,
+    ):
+        service.set_launch_hotkey("120", "F2")
+
+    restored = GroupConfigurationService(owned)
+    assert restored.group("14支").launch_hotkey == "F2"
+    assert restored.group("120").launch_hotkey == ""
+
+
+def test_import_rejects_reserved_feature_hotkey_without_changing_owned(
+    tmp_path,
+):
+    legacy, _first, _second = _legacy(tmp_path)
+    owned = tmp_path / "groups.json"
+    service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    imported_shortcut = _shortcut(tmp_path, "120古")
+    imported = tmp_path / "reserved-hotkey.json"
+    imported.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "120",
+                        "launch_hotkey": "F1",
+                        "launch_entries": [
+                            {"path": str(imported_shortcut)}
+                        ],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    before = owned.read_bytes()
+
+    with pytest.raises(ValueError, match="reserved hotkey"):
+        service.import_configuration(
+            imported,
+            reserved_hotkeys=("F1",),
+        )
+
+    assert owned.read_bytes() == before
+    assert service.group("120") is None

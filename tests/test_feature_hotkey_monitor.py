@@ -1,5 +1,6 @@
 from services.feature_hotkey_monitor import (
     FeatureHotkeyMonitor,
+    GroupLaunchHotkeyMonitor,
     normalize_feature_hotkey,
 )
 
@@ -81,3 +82,51 @@ def test_unset_or_invalid_hotkey_never_toggles() -> None:
     assert toggles == []
     assert normalize_feature_hotkey("f12") == "F12"
     assert normalize_feature_hotkey("escape") == ""
+
+
+def test_group_launch_hotkey_uses_group_mapping_and_rising_edge() -> None:
+    scheduler = Scheduler()
+    keys = Keys()
+    launched = []
+    hotkeys = {"14支": "F3", "120": "XBUTTON2"}
+    monitor = GroupLaunchHotkeyMonitor(
+        launched.append,
+        hotkeys_provider=lambda: hotkeys,
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+        state_backend=keys,
+    )
+    monitor.start()
+
+    keys.down.add(0x72)
+    scheduler.fire()
+    scheduler.fire()
+    keys.down.clear()
+    scheduler.fire()
+    keys.down.add(0x06)
+    scheduler.fire()
+
+    assert launched == ["14支", "120"]
+
+
+def test_removed_group_hotkey_does_not_keep_stale_pressed_state() -> None:
+    scheduler = Scheduler()
+    keys = Keys()
+    launched = []
+    hotkeys = {"14支": "F3"}
+    monitor = GroupLaunchHotkeyMonitor(
+        launched.append,
+        hotkeys_provider=lambda: dict(hotkeys),
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+        state_backend=keys,
+    )
+    monitor.start()
+    keys.down.add(0x72)
+    scheduler.fire()
+    hotkeys.clear()
+    scheduler.fire()
+    hotkeys["14支"] = "F3"
+    scheduler.fire()
+
+    assert launched == ["14支", "14支"]

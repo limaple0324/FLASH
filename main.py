@@ -69,6 +69,7 @@ from services.auto_click_service import (
 )
 from services.feature_hotkey_monitor import (
     FeatureHotkeyMonitor,
+    GroupLaunchHotkeyMonitor,
     normalize_feature_hotkey,
 )
 from services.background_image_service import BackgroundImageService
@@ -92,6 +93,7 @@ from services.group_selection_service import (
     default_legacy_group_config_path,
 )
 from services.group_configuration_service import (
+    GroupHotkeyConflictError,
     GroupConfigurationService,
     SyncCycleError,
 )
@@ -1071,6 +1073,18 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
             return False
+        if (
+            normalized
+            and group_configuration_service is not None
+            and normalized
+            in group_configuration_service.launch_hotkeys().values()
+        ):
+            messagebox.showerror(
+                "輔｜快捷鍵",
+                "這個快捷鍵已用於整組啟動，請選擇不同按鍵。",
+                parent=window,
+            )
+            return False
         configured_feature_hotkeys[feature] = normalized
         if config is not None:
             config.set(
@@ -1485,7 +1499,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         try:
             imported_names = (
                 group_configuration_service.import_configuration(
-                    Path(selected)
+                    Path(selected),
+                    reserved_hotkeys=(
+                        configured_feature_hotkeys.values()
+                    ),
                 )
             )
         except SyncCycleError:
@@ -1516,6 +1533,30 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             result.current_group_name,
             f"已匯入 {len(imported_names)} 個組別；同名組別已更新。",
         )
+
+    def group_launch_hotkey(group_name: str) -> str:
+        if group_configuration_service is None:
+            return ""
+        group = group_configuration_service.group(group_name)
+        return group.launch_hotkey if group is not None else ""
+
+    def change_group_launch_hotkey(
+        group_name: str,
+        hotkey: str,
+    ) -> object:
+        if group_configuration_service is None:
+            return "組別設定尚未準備完成。"
+        normalized = normalize_feature_hotkey(hotkey)
+        if normalized and normalized in configured_feature_hotkeys.values():
+            return "無法設定：這個快捷鍵已被其他功能使用"
+        try:
+            group_configuration_service.set_launch_hotkey(
+                group_name,
+                normalized,
+            )
+        except GroupHotkeyConflictError:
+            return GroupHotkeyConflictError.player_message
+        return None
 
     def group_entries(group_name: str):
         if group_configuration_service is None:
@@ -2026,6 +2067,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_move_group=move_group,
         on_export_group_configuration=export_group_configuration,
         on_import_group_configuration=import_group_configuration,
+        group_launch_hotkey_provider=group_launch_hotkey,
+        on_group_launch_hotkey_change=change_group_launch_hotkey,
         group_entries_provider=group_entries,
         on_add_group_shortcuts=add_group_shortcuts,
         on_remove_group_shortcut=remove_group_shortcut,
@@ -2200,6 +2243,17 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         cancel=window.after_cancel,
     )
     feature_hotkey_monitor.start()
+    group_launch_hotkey_monitor = GroupLaunchHotkeyMonitor(
+        lambda group_name: launch_group_and_restore(group_name),
+        hotkeys_provider=(
+            group_configuration_service.launch_hotkeys
+            if group_configuration_service is not None
+            else (lambda: {})
+        ),
+        schedule=window.after,
+        cancel=window.after_cancel,
+    )
+    group_launch_hotkey_monitor.start()
 
     def current_group_name() -> str | None:
         state = (
@@ -2297,6 +2351,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if group_window_launch_service is not None:
             group_window_launch_service.stop()
         feature_hotkey_monitor.stop()
+        group_launch_hotkey_monitor.stop()
         auto_click_service.close(timeout_seconds=1.0)
         if group_role_status_monitor is not None:
             group_role_status_monitor.stop(timeout_seconds=1.0)

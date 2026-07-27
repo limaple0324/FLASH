@@ -439,6 +439,12 @@ class HomeView:
         ) = None,
         on_export_group_configuration: Callable[[], object] | None = None,
         on_import_group_configuration: Callable[[], object] | None = None,
+        group_launch_hotkey_provider: (
+            Callable[[str], str] | None
+        ) = None,
+        on_group_launch_hotkey_change: (
+            Callable[[str, str], object] | None
+        ) = None,
         group_entries_provider: (
             Callable[[str], tuple[GroupConfigurationEntry, ...]] | None
         ) = None,
@@ -606,6 +612,12 @@ class HomeView:
         self.on_import_group_configuration = (
             on_import_group_configuration
         )
+        self.group_launch_hotkey_provider = (
+            group_launch_hotkey_provider
+        )
+        self.on_group_launch_hotkey_change = (
+            on_group_launch_hotkey_change
+        )
         self.group_entries_provider = group_entries_provider
         self.on_add_group_shortcuts = on_add_group_shortcuts
         self.on_remove_group_shortcut = on_remove_group_shortcut
@@ -732,6 +744,7 @@ class HomeView:
         self._group_restore_button: Button | None = None
         self._group_record_button: Button | None = None
         self._group_launch_status_label: Label | None = None
+        self._group_launch_hotkey_variable: StringVar | None = None
         self._group_name_entry: Entry | None = None
         self._group_sync_choice_variable: StringVar | None = None
         self._group_sync_choice_ids: dict[str, str] = {}
@@ -2076,6 +2089,48 @@ class HomeView:
             expand=True,
             padx=(12, 0),
         )
+        hotkey_row = Frame(selector, bg=SURFACE)
+        hotkey_row.pack(fill=X, pady=(10, 0))
+        Label(
+            hotkey_row,
+            text="整組啟動快捷鍵",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+        ).pack(side=LEFT)
+        current_group_hotkey = (
+            self.group_launch_hotkey_provider(
+                self.current_group_name
+            )
+            if self.current_group_name is not None
+            and self.group_launch_hotkey_provider is not None
+            else ""
+        )
+        self._group_launch_hotkey_variable = StringVar(
+            master=self.parent,
+            value=current_group_hotkey or "未設定",
+        )
+        group_hotkey_menu = OptionMenu(
+            hotkey_row,
+            self._group_launch_hotkey_variable,
+            "未設定",
+            *(value for value in FEATURE_HOTKEYS if value),
+            command=self._change_group_launch_hotkey,
+        )
+        group_hotkey_menu.configure(
+            font=("Microsoft JhengHei UI", 9),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        group_hotkey_menu.pack(side=LEFT, padx=(8, 0))
+        if (
+            self.current_group_name is None
+            or self.on_group_launch_hotkey_change is None
+        ):
+            group_hotkey_menu.configure(state=DISABLED)
         group_name_row = Frame(selector, bg=SURFACE)
         group_name_row.pack(fill=X, pady=(12, 0))
         self._group_name_entry = Entry(
@@ -4158,6 +4213,53 @@ class HomeView:
             self._apply_group_management_result(result)
             return
         self._show_group_setting_message(result)
+
+    def _change_group_launch_hotkey(self, value: str) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_group_launch_hotkey_change is None
+            or self._group_launch_hotkey_variable is None
+        ):
+            return
+        previous = (
+            self.group_launch_hotkey_provider(
+                self.current_group_name
+            )
+            if self.group_launch_hotkey_provider is not None
+            else ""
+        )
+        normalized = normalize_feature_hotkey(
+            "" if value == "未設定" else value
+        )
+        try:
+            result = self.on_group_launch_hotkey_change(
+                self.current_group_name,
+                normalized,
+            )
+        except Exception as error:
+            self._group_launch_hotkey_variable.set(
+                previous or "未設定"
+            )
+            self._report_refresh_error(error)
+            return
+        if result is False or (
+            isinstance(result, str) and result.strip()
+        ):
+            self._group_launch_hotkey_variable.set(
+                previous or "未設定"
+            )
+            self._show_group_setting_message(result)
+            return
+        self._group_launch_hotkey_variable.set(
+            normalized or "未設定"
+        )
+        self._show_group_setting_message(
+            (
+                f"整組啟動快捷鍵已設定：{normalized}"
+                if normalized
+                else "整組啟動快捷鍵已清除。"
+            )
+        )
 
     def _add_shortcuts_to_current_group(self) -> None:
         if (

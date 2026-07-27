@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from services.feature_hotkey_monitor import normalize_feature_hotkey
 from services.group_launch_service import SavedWindowPlacement
 
 
@@ -27,6 +28,7 @@ class GroupConfigurationEntry:
 class GroupConfiguration:
     name: str
     entries: tuple[GroupConfigurationEntry, ...]
+    launch_hotkey: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +39,10 @@ class GroupSyncMemberChoice:
 
 class SyncCycleError(ValueError):
     player_message = "無法加入：會形成重複控制"
+
+
+class GroupHotkeyConflictError(ValueError):
+    player_message = "無法設定：這個快捷鍵已被其他組別使用"
 
 
 class GroupConfigurationService:
@@ -140,6 +146,7 @@ class GroupConfigurationService:
             return []
         groups: list[dict[str, object]] = []
         seen_names: set[str] = set()
+        seen_launch_hotkeys: set[str] = set()
         for raw_group in raw_groups:
             if not isinstance(raw_group, Mapping):
                 continue
@@ -163,9 +170,39 @@ class GroupConfigurationService:
                 entries[0]["role"] = "主窗口"
                 for entry in entries[1:]:
                     entry["role"] = "同步窗口"
+            launch_hotkey = normalize_feature_hotkey(
+                raw_group.get("launch_hotkey")
+                or raw_group.get("launch_hotkey_display")
+            )
+            if launch_hotkey in seen_launch_hotkeys:
+                launch_hotkey = ""
+            if launch_hotkey:
+                seen_launch_hotkeys.add(launch_hotkey)
             seen_names.add(name.casefold())
-            groups.append({"name": name, "launch_entries": entries})
+            groups.append(
+                {
+                    "name": name,
+                    "launch_entries": entries,
+                    "launch_hotkey": launch_hotkey,
+                }
+            )
         return groups
+
+    @staticmethod
+    def _clear_duplicate_launch_hotkeys(
+        groups: list[dict[str, object]],
+    ) -> None:
+        seen: set[str] = set()
+        for group in groups:
+            hotkey = normalize_feature_hotkey(
+                group.get("launch_hotkey")
+            )
+            if hotkey in seen:
+                group["launch_hotkey"] = ""
+                continue
+            group["launch_hotkey"] = hotkey
+            if hotkey:
+                seen.add(hotkey)
 
     @staticmethod
     def _read_json(path: Path | None) -> Mapping[str, object] | None:
@@ -350,7 +387,15 @@ class GroupConfigurationService:
                     start=1,
                 )
             )
-            result.append(GroupConfiguration(name, entries))
+            result.append(
+                GroupConfiguration(
+                    name,
+                    entries,
+                    normalize_feature_hotkey(
+                        raw_group.get("launch_hotkey")
+                    ),
+                )
+            )
         return tuple(result)
 
     def group(self, name: object) -> GroupConfiguration | None:
@@ -371,9 +416,60 @@ class GroupConfigurationService:
             for group in self._groups
         ):
             return False
-        self._groups.append({"name": cleaned, "launch_entries": []})
+        self._groups.append(
+            {
+                "name": cleaned,
+                "launch_entries": [],
+                "launch_hotkey": "",
+            }
+        )
         self._save()
         return True
+
+    def set_launch_hotkey(
+        self,
+        group_name: object,
+        hotkey: object,
+    ) -> bool:
+        cleaned = self._clean_name(group_name)
+        if cleaned is None:
+            return False
+        normalized = normalize_feature_hotkey(hotkey)
+        raw_group = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if raw_group is None:
+            return False
+        if normalized and any(
+            group is not raw_group
+            and normalize_feature_hotkey(
+                group.get("launch_hotkey")
+            )
+            == normalized
+            for group in self._groups
+        ):
+            raise GroupHotkeyConflictError(
+                GroupHotkeyConflictError.player_message
+            )
+        if normalize_feature_hotkey(
+            raw_group.get("launch_hotkey")
+        ) == normalized:
+            return False
+        raw_group["launch_hotkey"] = normalized
+        self._save()
+        return True
+
+    def launch_hotkeys(self) -> dict[str, str]:
+        return {
+            group.name: group.launch_hotkey
+            for group in self.groups()
+            if group.launch_hotkey
+        }
 
     def rename_group(self, old_name: object, new_name: object) -> bool:
         old_cleaned = self._clean_name(old_name)
@@ -540,6 +636,8 @@ class GroupConfigurationService:
     def import_configuration(
         self,
         source: Path,
+        *,
+        reserved_hotkeys: Iterable[object] = (),
     ) -> tuple[str, ...]:
         path = Path(source)
         payload = self._read_json(path)
@@ -585,6 +683,25 @@ class GroupConfigurationService:
             replaced_source_ids.update(existing_ids)
             obsolete_target_ids.update(existing_ids - imported_ids)
             proposed_groups[existing_index] = imported_group
+        self._clear_duplicate_launch_hotkeys(proposed_groups)
+        reserved = {
+            normalized
+            for normalized in (
+                normalize_feature_hotkey(value)
+                for value in reserved_hotkeys
+            )
+            if normalized
+        }
+        if any(
+            normalize_feature_hotkey(
+                group.get("launch_hotkey")
+            )
+            in reserved
+            for group in proposed_groups
+        ):
+            raise ValueError(
+                "configuration import contains a reserved hotkey."
+            )
 
         proposed_edges: dict[str, list[str]] = {}
         for source_id, targets in self._sync_edges.items():
