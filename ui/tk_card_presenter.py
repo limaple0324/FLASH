@@ -86,6 +86,7 @@ class _RenderedCard:
     title: TkWidget
     progress: TkWidget
     next_step: TkWidget
+    actions: tuple[TkWidget, ...]
 
 
 _WINDOW_STATE_ATTRIBUTE = "_fu_card_rendered"
@@ -98,6 +99,7 @@ class TkCardContentPresenter:
         *,
         widget_factory: TkWidgetFactory | None = None,
         on_close: Callable[[str], object] | None = None,
+        on_action: Callable[[str, str], object] | None = None,
     ) -> None:
         if not isinstance(settings, TkCardTextSettings):
             raise TypeError("settings must be TkCardTextSettings.")
@@ -106,6 +108,9 @@ class TkCardContentPresenter:
         if on_close is not None and not callable(on_close):
             raise TypeError("on_close must be callable.")
         self._on_close = on_close
+        if on_action is not None and not callable(on_action):
+            raise TypeError("on_action must be callable.")
+        self._on_action = on_action
 
     def _create(self, window: Any) -> _RenderedCard:
         settings = self._settings
@@ -171,6 +176,20 @@ class TkCardContentPresenter:
             justify="center",
             wraplength=settings.card_width - 2 * settings.horizontal_padding,
         )
+        action_buttons = tuple(
+            self._widgets.button(
+                frame,
+                background=settings.background,
+                foreground=settings.foreground,
+                activebackground=settings.accent,
+                activeforeground=settings.background,
+                relief="solid",
+                borderwidth=1,
+                font=(settings.font_family, settings.body_size),
+                cursor="hand2",
+            )
+            for _index in range(4)
+        )
         for label in (group, title, progress, next_step):
             label.pack(
                 fill="x",
@@ -184,6 +203,7 @@ class TkCardContentPresenter:
             title=title,
             progress=progress,
             next_step=next_step,
+            actions=action_buttons,
         )
         setattr(window, _WINDOW_STATE_ATTRIBUTE, rendered)
         return rendered
@@ -202,6 +222,32 @@ class TkCardContentPresenter:
             )
         )
         rendered.title.configure(text=content.activity_name)
+        for action_button in rendered.actions:
+            action_button.pack_forget()
+        for action_button, action in zip(
+            rendered.actions,
+            content.actions,
+            strict=False,
+        ):
+            action_button.configure(
+                text=action.label,
+                command=(
+                    (
+                        lambda action_id=action.action_id,
+                        card_id=content.card_id: self._on_action(
+                            card_id,
+                            action_id,
+                        )
+                    )
+                    if self._on_action is not None
+                    else None
+                ),
+            )
+            action_button.pack(
+                side="left",
+                padx=(max(2, self._settings.horizontal_padding // 2), 0),
+                pady=(max(4, self._settings.vertical_padding), 0),
+            )
         if content.name_only:
             rendered.group.pack_forget()
             rendered.progress.pack_forget()

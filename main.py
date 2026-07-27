@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import traceback
+from datetime import datetime
 from pathlib import Path
 from tkinter import PhotoImage, TclError, Tk, filedialog, messagebox
 
@@ -63,9 +64,12 @@ from domain.activity_schedule import (
 from domain.character_store import CharacterStore
 from domain.character_game_data_store import CharacterGameDataStore
 from domain.game_shortcuts import CONFIRMED_GAME_SHORTCUTS
+from domain.progress import TAIPEI_TIMEZONE
 from domain.progress_store import ActivityProgressStore
 from habit.service import ActivityOrderHabitService
 from habit.store import ActivityOrderHabitStore
+from habit.preference_service import PlayerHabitPreferenceService
+from habit.preference_store import PlayerHabitStore
 from services.activity_progress_service import ActivityProgressService
 from services.activity_reminder_monitor import ActivityReminderMonitor
 from services.activity_reminder_service import ActivityReminderService
@@ -90,6 +94,12 @@ from services.card_history_service import CardHistoryService
 from services.card_overlay_layout_service import CardOverlayLayoutService
 from services.card_overlay_runtime import build_windows_card_overlay_runtime
 from services.card_view_state_service import CardViewStateService
+from services.player_habit_reminder_monitor import (
+    PlayerHabitReminderMonitor,
+)
+from services.player_habit_reminder_service import (
+    PlayerHabitReminderService,
+)
 from services.character_detail_view_service import CharacterDetailViewService
 from services.character_game_data_view_service import (
     CharacterGameDataViewService,
@@ -188,6 +198,7 @@ ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
 ACTIVITY_REMINDER_STATE_FILENAME = "activity_reminder_state.json"
 ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
+PLAYER_HABIT_FILENAME = "player_habits.json"
 SYNC_SELECTED_KEYS_KEY = "sync_selected_keys"
 FEATURE_HOTKEYS_KEY = "feature_hotkeys"
 GAME_TIME_OFFSET_MS_KEY = "game_time_offset_ms"
@@ -361,6 +372,10 @@ def build_services(root: Path | None = None):
     activity_order_habit_service = ActivityOrderHabitService(
         activity_order_habit_store
     )
+    player_habit_store = PlayerHabitStore(
+        paths.data_dir() / PLAYER_HABIT_FILENAME
+    )
+    player_habit_service = PlayerHabitPreferenceService(player_habit_store)
     initial_group_choice = group_selection_service.initial_choice(
         config.get(CURRENT_GROUP_NAME_KEY)
     )
@@ -493,6 +508,8 @@ def build_services(root: Path | None = None):
     AppContext.register(DecisionService, decision_service)
     AppContext.register(ActivityOrderHabitStore, activity_order_habit_store)
     AppContext.register(ActivityOrderHabitService, activity_order_habit_service)
+    AppContext.register(PlayerHabitStore, player_habit_store)
+    AppContext.register(PlayerHabitPreferenceService, player_habit_service)
     AppContext.register(WorkspaceService, workspace_service)
     AppContext.register(CardHistoryStore, card_history_store)
     AppContext.register(CardHistoryService, card_history_service)
@@ -945,6 +962,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     activity_schedule_view_service = AppContext.get(ActivityScheduleViewService)
     card_view_state_service = AppContext.get(CardViewStateService)
     card_service = AppContext.get(CardService)
+    card_coordinator = AppContext.get(CardCoordinator)
     activity_reminder_service = AppContext.get(ActivityReminderService)
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
     target_window_state_service = AppContext.get(TargetWindowStateService)
@@ -966,6 +984,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         GroupCharacterRegistrationService
     )
     background_image_service = AppContext.get(BackgroundImageService)
+    player_habit_service = AppContext.get(PlayerHabitPreferenceService)
     home_view: HomeView | None = None
 
     def dispatch_to_main_window(callback) -> object | None:
@@ -2201,6 +2220,61 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             parent=window,
         )
 
+    def update_habit_observation_days(days: int):
+        if player_habit_service is None:
+            raise RuntimeError("player habit service is unavailable")
+        memory = player_habit_service.set_observation_days(days)
+        if operation_record_store is not None:
+            operation_record_store.append(
+                "玩家習慣",
+                "系統",
+                f"觀察天數已調整為 {memory.settings.observation_days} 天",
+            )
+        return player_habit_service.settings_view()
+
+    def remove_habit_preference(preference_id: str):
+        if player_habit_service is None:
+            raise RuntimeError("player habit service is unavailable")
+        removed = player_habit_service.remove_preference(preference_id)
+        if removed and operation_record_store is not None:
+            operation_record_store.append(
+                "玩家習慣",
+                "系統",
+                "已刪除一筆玩家確認的偏好",
+            )
+        return player_habit_service.settings_view()
+
+    def modify_habit_preference(
+        preference_id: str,
+        values: tuple[str, ...],
+    ):
+        if player_habit_service is None:
+            raise RuntimeError("player habit service is unavailable")
+        changed = player_habit_service.modify_preference(
+            preference_id,
+            values,
+            datetime.now(TAIPEI_TIMEZONE),
+        )
+        if operation_record_store is not None:
+            operation_record_store.append(
+                "玩家習慣",
+                changed.subject,
+                f"已修改偏好：{' → '.join(changed.values)}",
+            )
+        return player_habit_service.settings_view()
+
+    def clear_habit_preferences():
+        if player_habit_service is None:
+            raise RuntimeError("player habit service is unavailable")
+        removed = player_habit_service.clear_preferences()
+        if removed and operation_record_store is not None:
+            operation_record_store.append(
+                "玩家習慣",
+                "系統",
+                f"已清除 {removed} 筆玩家確認的偏好",
+            )
+        return player_habit_service.settings_view()
+
     def latest_character_detail(character_id: str):
         if character_detail_view_service is None:
             raise RuntimeError("character detail service is unavailable")
@@ -2828,6 +2902,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_auto_click_change=change_auto_click,
         card_display_seconds_provider=card_display_seconds,
         on_card_display_seconds_update=update_card_display_seconds,
+        habit_settings_provider=(
+            player_habit_service.settings_view
+            if player_habit_service is not None
+            else None
+        ),
+        on_habit_observation_days_update=update_habit_observation_days,
+        on_modify_habit_preference=modify_habit_preference,
+        on_remove_habit_preference=remove_habit_preference,
+        on_clear_habit_preferences=clear_habit_preferences,
         theme_name=configured_theme,
         on_theme_change=change_ui_theme,
         background_image_path=(
@@ -2917,6 +3000,36 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             else None
         )
 
+    player_habit_reminder_service = (
+        PlayerHabitReminderService(
+            player_habit_service,
+            card_coordinator,
+            card_service,
+            current_group_name,
+            record_callback=(
+                operation_record_store.append
+                if operation_record_store is not None
+                else None
+            ),
+        )
+        if player_habit_service is not None
+        and card_coordinator is not None
+        and card_service is not None
+        else None
+    )
+
+    def handle_card_action(card_id: str, action_id: str) -> object | None:
+        if player_habit_reminder_service is None:
+            return None
+        result = player_habit_reminder_service.handle_action(
+            card_id,
+            action_id,
+            datetime.now(TAIPEI_TIMEZONE),
+        )
+        if result is not None:
+            home_view.refresh_habit_settings()
+        return result
+
     group_role_status_monitor = (
         GroupRoleStatusMonitor(
             group_role_status_service,
@@ -2946,6 +3059,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     overlay_runtime = None
     expiry_monitor = None
     activity_reminder_monitor = None
+    player_habit_reminder_monitor = None
     if card_service is not None and card_view_state_service is not None:
         overlay_scale = card_display_scale(window)
         overlay_width = round(160 * overlay_scale)
@@ -2973,6 +3087,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 vertical_padding=max(5, round(5 * overlay_scale)),
                 card_width=overlay_width,
             ),
+            on_action=handle_card_action,
         )
         overlay_runtime.start()
         expiry_monitor = CardExpiryMonitor(
@@ -2993,6 +3108,13 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 window.after_cancel,
             )
             activity_reminder_monitor.start()
+        if player_habit_reminder_service is not None:
+            player_habit_reminder_monitor = PlayerHabitReminderMonitor(
+                player_habit_reminder_service,
+                window.after,
+                window.after_cancel,
+            )
+            player_habit_reminder_monitor.start()
 
     tray_controller: SystemTrayController | None = None
 
@@ -3009,6 +3131,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         auto_click_service.close(timeout_seconds=1.0)
         if game_time_timed_click_service is not None:
             game_time_timed_click_service.stop()
+        if player_habit_reminder_monitor is not None:
+            player_habit_reminder_monitor.stop()
         if group_role_status_monitor is not None:
             group_role_status_monitor.stop(timeout_seconds=1.0)
         if deferred_sync_monitor is not None:

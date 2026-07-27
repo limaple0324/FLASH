@@ -23,6 +23,23 @@ def _optional_text(value: str | None, field: str) -> str | None:
 
 
 @dataclass(frozen=True, slots=True)
+class CardAction:
+    action_id: str
+    label: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "action_id",
+            _required_text(self.action_id, "action_id"),
+        )
+        object.__setattr__(self, "label", _required_text(self.label, "label"))
+
+    def to_dict(self) -> dict[str, str]:
+        return {"action_id": self.action_id, "label": self.label}
+
+
+@dataclass(frozen=True, slots=True)
 class GroupCard:
     """保存已確認的卡片資訊，不在模型內產生提醒或決定優先度。"""
 
@@ -36,6 +53,7 @@ class GroupCard:
     next_step: str | None = None
     priority_reason: CardPriorityReason = CardPriorityReason.ACTIVITY
     name_only: bool = False
+    actions: tuple[CardAction, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.group, CharacterGroup):
@@ -48,6 +66,14 @@ class GroupCard:
             raise TypeError("priority_reason must be CardPriorityReason.")
         if not isinstance(self.name_only, bool):
             raise TypeError("name_only must be bool.")
+        actions = tuple(self.actions)
+        if any(not isinstance(action, CardAction) for action in actions):
+            raise TypeError("actions must contain CardAction values.")
+        if len(actions) > 4:
+            raise ValueError("A card cannot contain more than four actions.")
+        action_ids = [action.action_id for action in actions]
+        if len(action_ids) != len(set(action_ids)):
+            raise ValueError("Card action IDs cannot contain duplicates.")
 
         affected_ids = tuple(
             _required_text(item, "affected_character_ids item")
@@ -76,6 +102,7 @@ class GroupCard:
             "next_step",
             _optional_text(self.next_step, "next_step"),
         )
+        object.__setattr__(self, "actions", actions)
 
     @property
     def priority_tier(self) -> CardPriorityTier:
@@ -94,4 +121,5 @@ class GroupCard:
             "priority_reason": self.priority_reason.value,
             "priority_tier": self.priority_tier.name,
             "name_only": self.name_only,
+            "actions": [action.to_dict() for action in self.actions],
         }

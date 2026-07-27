@@ -17,3 +17,34 @@ __all__ = [
     "ActivityOrderReview",
     "HabitReviewState",
 ]
+"""玩家習慣服務。"""
+
+from habit.preference_models import (
+    HabitDecision,
+    HabitKind,
+    PlayerHabitCandidate,
+    PlayerHabitMemory,
+    PlayerHabitObservation,
+    PlayerHabitPreference,
+    PlayerHabitSettings,
+)
+from habit.preference_service import (
+    PlayerHabitPreferenceService,
+    PlayerHabitPreferenceView,
+    PlayerHabitSettingsView,
+)
+from habit.preference_store import PlayerHabitStore
+
+__all__ = [
+    "HabitDecision",
+    "HabitKind",
+    "PlayerHabitCandidate",
+    "PlayerHabitMemory",
+    "PlayerHabitObservation",
+    "PlayerHabitPreference",
+    "PlayerHabitPreferenceService",
+    "PlayerHabitPreferenceView",
+    "PlayerHabitSettings",
+    "PlayerHabitSettingsView",
+    "PlayerHabitStore",
+]

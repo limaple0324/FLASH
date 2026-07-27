@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from cards.lifecycle import CardLifecycle
+from cards.models import CardAction
 from cards.service import MAX_VISIBLE_CARDS
 
 
@@ -24,6 +25,7 @@ class CardViewItem:
     shown_at: datetime
     expires_at: datetime
     name_only: bool
+    actions: tuple[CardAction, ...] = ()
 
     @classmethod
     def from_lifecycle(cls, entry: CardLifecycle) -> "CardViewItem":
@@ -46,6 +48,7 @@ class CardViewItem:
             shown_at=entry.shown_at,
             expires_at=entry.expires_at,
             name_only=card.name_only,
+            actions=card.actions,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -65,6 +68,7 @@ class CardViewItem:
             "shown_at": self.shown_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
             "name_only": self.name_only,
+            "actions": [action.to_dict() for action in self.actions],
         }
 
 

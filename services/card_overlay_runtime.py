@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from cards.service import CardService
@@ -22,6 +23,7 @@ def build_windows_card_overlay_runtime(
     *,
     window_factory: WindowFactory | None = None,
     widget_factory: TkWidgetFactory | None = None,
+    on_action: Callable[[str, str], object] | None = None,
 ) -> CardOverlaySyncService:
     lifecycle = build_windows_card_overlay_lifecycle(
         master,
@@ -29,5 +31,6 @@ def build_windows_card_overlay_runtime(
         window_factory=window_factory,
         widget_factory=widget_factory,
         on_close=cards.remove,
+        on_action=on_action,
     )
     return CardOverlaySyncService(cards, layout, lifecycle)

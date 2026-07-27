@@ -38,6 +38,7 @@ from core.target_window_observation import TargetWindowObservation
 from domain.game_shortcuts import (
     CONFIRMED_GAME_SHORTCUTS,
 )
+from habit.preference_service import PlayerHabitSettingsView
 from presentation.target_window_status import target_window_summary
 from services.character_detail_choice_service import PlayerCharacterDetailChoice
 from services.character_detail_view_service import PlayerCharacterDetail
@@ -586,6 +587,21 @@ class HomeView:
         ) = None,
         card_display_seconds_provider: Callable[[], int] | None = None,
         on_card_display_seconds_update: Callable[[int], object] | None = None,
+        habit_settings_provider: (
+            Callable[[], PlayerHabitSettingsView] | None
+        ) = None,
+        on_habit_observation_days_update: (
+            Callable[[int], PlayerHabitSettingsView] | None
+        ) = None,
+        on_modify_habit_preference: (
+            Callable[[str, tuple[str, ...]], PlayerHabitSettingsView] | None
+        ) = None,
+        on_remove_habit_preference: (
+            Callable[[str], PlayerHabitSettingsView] | None
+        ) = None,
+        on_clear_habit_preferences: (
+            Callable[[], PlayerHabitSettingsView] | None
+        ) = None,
         theme_name: str = "clear_blue",
         on_theme_change: Callable[[str], object] | None = None,
         background_image_path: Path | None = None,
@@ -804,6 +820,13 @@ class HomeView:
         self.on_auto_click_change = on_auto_click_change
         self.card_display_seconds_provider = card_display_seconds_provider
         self.on_card_display_seconds_update = on_card_display_seconds_update
+        self.habit_settings_provider = habit_settings_provider
+        self.on_habit_observation_days_update = (
+            on_habit_observation_days_update
+        )
+        self.on_modify_habit_preference = on_modify_habit_preference
+        self.on_remove_habit_preference = on_remove_habit_preference
+        self.on_clear_habit_preferences = on_clear_habit_preferences
         self.theme_name = (
             theme_name
             if theme_name in UI_THEME_PALETTES
@@ -852,6 +875,9 @@ class HomeView:
         self._group_value_label: Label | None = None
         self._group_variable: StringVar | None = None
         self._card_seconds_entry: Entry | None = None
+        self._habit_observation_days_entry: Entry | None = None
+        self._habit_preferences_frame: Frame | None = None
+        self._habit_status_label: Label | None = None
         self._keyboard_sync_label: Label | None = None
         self._keyboard_sync_button: Button | None = None
         self._sync_key_variables: dict[str, IntVar] = {}
@@ -3996,6 +4022,99 @@ class HomeView:
             primary=True,
         ).pack(side=LEFT, padx=(8, 0))
 
+        habit_card = self._card(page)
+        habit_card.pack(fill=X, pady=(14, 0))
+        Label(
+            habit_card,
+            text="玩家習慣",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        Label(
+            habit_card,
+            text=(
+                "只觀察活動時間與角色操作順序並提出建議；"
+                "不會直接操作遊戲。"
+            ),
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify="left",
+        ).pack(fill=X, pady=(6, 12))
+        try:
+            habit_settings = (
+                self.habit_settings_provider()
+                if self.habit_settings_provider is not None
+                else PlayerHabitSettingsView(14, 10, 8, ())
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            habit_settings = PlayerHabitSettingsView(14, 10, 8, ())
+        habit_row = Frame(habit_card, bg=SURFACE)
+        habit_row.pack(fill=X)
+        Label(
+            habit_row,
+            text="觀察天數",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+        ).pack(side=LEFT)
+        self._habit_observation_days_entry = Entry(
+            habit_row,
+            width=8,
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+        )
+        self._habit_observation_days_entry.insert(
+            0,
+            str(habit_settings.observation_days),
+        )
+        self._habit_observation_days_entry.pack(
+            side=LEFT,
+            padx=(8, 0),
+            ipady=7,
+        )
+        Label(
+            habit_row,
+            text=(
+                f"天｜同一習慣至少 {habit_settings.minimum_occurrences} 次，"
+                f"分布至少 {habit_settings.minimum_distinct_days} 天"
+            ),
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            padx=8,
+        ).pack(side=LEFT)
+        self._button(
+            habit_row,
+            "儲存",
+            self._save_habit_observation_days,
+            primary=True,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._habit_status_label = Label(
+            habit_card,
+            text="尚未有玩家確認的偏好。",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        )
+        self._habit_status_label.pack(fill=X, pady=(12, 6))
+        self._habit_preferences_frame = Frame(habit_card, bg=SURFACE)
+        self._habit_preferences_frame.pack(fill=X)
+        self._render_habit_preferences(habit_settings)
+        self._button(
+            habit_card,
+            "全部清除已保存偏好",
+            self._clear_habit_preferences,
+        ).pack(anchor="w", pady=(10, 0))
+
         status_card = self._card(page)
         status_card.pack(fill=X, pady=(14, 0))
         Label(
@@ -4642,6 +4761,161 @@ class HomeView:
             return
         self._card_seconds_entry.delete(0, "end")
         self._card_seconds_entry.insert(0, str(confirmed))
+
+    def _render_habit_preferences(
+        self,
+        settings: PlayerHabitSettingsView,
+    ) -> None:
+        frame = self._habit_preferences_frame
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        if self._habit_status_label is not None:
+            self._habit_status_label.configure(
+                text=(
+                    f"已保存 {len(settings.preferences)} 筆偏好。"
+                    if settings.preferences
+                    else "尚未有玩家確認的偏好。"
+                )
+            )
+        for preference in settings.preferences:
+            row = Frame(frame, bg=BACKGROUND, padx=10, pady=7)
+            row.pack(fill=X, pady=2)
+            Label(
+                row,
+                text=(
+                    f"{preference.kind}｜{preference.subject}"
+                    f"｜目前：{preference.decision}"
+                ),
+                font=("Microsoft JhengHei UI", 9),
+                bg=BACKGROUND,
+                fg=TEXT,
+                anchor="w",
+                justify="left",
+            ).pack(fill=X)
+            edit_row = Frame(row, bg=BACKGROUND)
+            edit_row.pack(fill=X, pady=(4, 0))
+            value_entry = Entry(
+                edit_row,
+                font=("Microsoft JhengHei UI", 9),
+                bg=SURFACE,
+                fg=TEXT,
+                relief="flat",
+                bd=0,
+            )
+            value_entry.insert(0, " → ".join(preference.values))
+            value_entry.pack(side=LEFT, fill=X, expand=True, ipady=6)
+            self._button(
+                edit_row,
+                "儲存修改",
+                lambda preference_id=preference.preference_id,
+                entry=value_entry: self._modify_habit_preference(
+                    preference_id,
+                    entry,
+                ),
+                primary=True,
+            ).pack(side=LEFT, padx=(8, 0))
+            self._button(
+                edit_row,
+                "刪除",
+                lambda preference_id=preference.preference_id: (
+                    self._remove_habit_preference(preference_id)
+                ),
+            ).pack(side=LEFT, padx=(8, 0))
+
+    def _save_habit_observation_days(self) -> None:
+        if (
+            self._habit_observation_days_entry is None
+            or self.on_habit_observation_days_update is None
+        ):
+            return
+        try:
+            days = int(self._habit_observation_days_entry.get().strip())
+            settings = self.on_habit_observation_days_update(days)
+            if not isinstance(settings, PlayerHabitSettingsView):
+                raise TypeError("habit callback must return settings view.")
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._habit_observation_days_entry.delete(0, "end")
+        self._habit_observation_days_entry.insert(
+            0,
+            str(settings.observation_days),
+        )
+        self._render_habit_preferences(settings)
+
+    def _remove_habit_preference(self, preference_id: str) -> None:
+        if self.on_remove_habit_preference is None:
+            return
+        try:
+            settings = self.on_remove_habit_preference(preference_id)
+            if not isinstance(settings, PlayerHabitSettingsView):
+                raise TypeError("habit callback must return settings view.")
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._render_habit_preferences(settings)
+
+    def _modify_habit_preference(
+        self,
+        preference_id: str,
+        entry: Entry,
+    ) -> None:
+        if self.on_modify_habit_preference is None:
+            return
+        values = tuple(
+            value.strip()
+            for value in entry.get().split("→")
+            if value.strip()
+        )
+        try:
+            settings = self.on_modify_habit_preference(
+                preference_id,
+                values,
+            )
+            if not isinstance(settings, PlayerHabitSettingsView):
+                raise TypeError("habit callback must return settings view.")
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._render_habit_preferences(settings)
+
+    def _clear_habit_preferences(self) -> None:
+        if self.on_clear_habit_preferences is None:
+            return
+        if not messagebox.askyesno(
+            "輔｜清除玩家習慣",
+            "確定清除全部已保存偏好？\n觀察紀錄會保留。",
+            parent=self.parent,
+        ):
+            return
+        try:
+            settings = self.on_clear_habit_preferences()
+            if not isinstance(settings, PlayerHabitSettingsView):
+                raise TypeError("habit callback must return settings view.")
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._render_habit_preferences(settings)
+
+    def refresh_habit_settings(self) -> None:
+        if self.habit_settings_provider is None:
+            return
+        try:
+            settings = self.habit_settings_provider()
+            if not isinstance(settings, PlayerHabitSettingsView):
+                raise TypeError("habit provider must return settings view.")
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        if self._habit_observation_days_entry is not None:
+            self._habit_observation_days_entry.delete(0, "end")
+            self._habit_observation_days_entry.insert(
+                0,
+                str(settings.observation_days),
+            )
+        self._render_habit_preferences(settings)
 
     def show_page(
         self,

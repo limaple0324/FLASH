@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from cards.view_state import CardViewItem
+from cards.models import CardAction
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +17,7 @@ class CardContent:
     current_progress: str
     next_step: str | None
     name_only: bool
+    actions: tuple[CardAction, ...] = ()
 
     @classmethod
     def from_card(cls, card: CardViewItem) -> "CardContent":
@@ -28,6 +30,7 @@ class CardContent:
             current_progress=card.current_progress,
             next_step=card.next_step,
             name_only=card.name_only,
+            actions=card.actions,
         )
 
 

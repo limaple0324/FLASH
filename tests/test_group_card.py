@@ -1,6 +1,6 @@
 import pytest
 
-from cards.models import GroupCard
+from cards.models import CardAction, GroupCard
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.character import Character
 from domain.group import CharacterGroup
@@ -95,6 +95,25 @@ def test_card_rejects_duplicate_or_foreign_affected_characters():
 
     with pytest.raises(ValueError):
         _card(affected_character_ids=("not-in-group",))
+
+
+def test_card_supports_at_most_four_unique_player_actions():
+    actions = tuple(
+        CardAction(str(index), f"選項{index}")
+        for index in range(4)
+    )
+    card = _card(actions=actions)
+
+    assert card.actions == actions
+    assert card.to_dict()["actions"][0] == {
+        "action_id": "0",
+        "label": "選項0",
+    }
+
+    with pytest.raises(ValueError, match="more than four"):
+        _card(actions=actions + (CardAction("4", "選項4"),))
+    with pytest.raises(ValueError, match="cannot contain duplicates"):
+        _card(actions=(CardAction("same", "一"), CardAction("same", "二")))
 
 
 @pytest.mark.parametrize(

@@ -182,7 +182,7 @@ def test_name_only_activity_card_can_be_closed_without_opening_details() -> None
     runtime.start()
     cards.upsert(reminder, shown_at=datetime.now(timezone.utc))
     button = widgets.widgets[1]
-    labels = widgets.widgets[2:]
+    labels = widgets.widgets[2:6]
 
     assert [widget.options.get("text") for widget in labels] == [
         None,
@@ -194,6 +194,58 @@ def test_name_only_activity_card_can_be_closed_without_opening_details() -> None
     button.options["command"]()
     assert cards.cards == ()
     assert windows[0].destroyed is True
+    runtime.stop()
+
+
+def test_card_actions_are_rendered_and_dispatched_without_opening_a_page() -> None:
+    cards = CardService()
+    state = CardViewStateService(cards)
+    layout = CardOverlayLayoutService(
+        state,
+        FixedWorkArea(),
+        CardSize(160, 75),
+        right_margin=12,
+        bottom_margin=12,
+        gap=6,
+    )
+    widgets = _FakeWidgetFactory()
+    actions = []
+    runtime = build_windows_card_overlay_runtime(
+        object(),
+        cards,
+        layout,
+        TkCardTextSettings(
+            background="#80591F",
+            foreground="#FFF2CF",
+            muted_foreground="#FFF2CF",
+            accent="#FFF2CF",
+        ),
+        window_factory=lambda _master: FakeWindow(),
+        widget_factory=widgets,
+        on_action=lambda card_id, action_id: actions.append(
+            (card_id, action_id)
+        ),
+    )
+    base = _card("preference")
+    from cards.models import CardAction
+
+    cards_with_action = GroupCard(
+        card_id=base.card_id,
+        group=base.group,
+        activity=base.activity,
+        current_progress="建議保存",
+        priority_reason=CardPriorityReason.PREFERENCE,
+        actions=(CardAction("adopt", "採用"),),
+    )
+
+    runtime.start()
+    cards.upsert(cards_with_action, shown_at=datetime.now(timezone.utc))
+    action_button = widgets.widgets[6]
+
+    assert action_button.options["text"] == "採用"
+    assert callable(action_button.options["command"])
+    action_button.options["command"]()
+    assert actions == [("preference", "adopt")]
     runtime.stop()
 
 

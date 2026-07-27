@@ -68,7 +68,16 @@ class CardOverlayLayoutService:
             for text in fields
         )
         line_height = max(17, round(17 * display_scale))
-        return base.height + max(0, wrapped_lines - baseline_lines) * line_height
+        action_height = (
+            max(34, round(34 * display_scale))
+            if card.actions
+            else 0
+        )
+        return (
+            base.height
+            + max(0, wrapped_lines - baseline_lines) * line_height
+            + action_height
+        )
 
     def snapshot(self) -> CardOverlayLayout:
         state = self._card_state.snapshot()

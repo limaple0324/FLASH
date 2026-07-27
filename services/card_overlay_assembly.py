@@ -22,11 +22,13 @@ def build_windows_card_overlay_lifecycle(
     window_factory: WindowFactory | None = None,
     widget_factory: TkWidgetFactory | None = None,
     on_close: Callable[[str], object] | None = None,
+    on_action: Callable[[str, str], object] | None = None,
 ) -> CardOverlayWindowLifecycle:
     presenter = TkCardContentPresenter(
         settings,
         widget_factory=widget_factory,
         on_close=on_close,
+        on_action=on_action,
     )
     windows = WindowsCardOverlayPort(
         master,
