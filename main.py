@@ -94,6 +94,7 @@ from services.group_selection_service import (
 )
 from services.group_configuration_service import (
     GroupHotkeyConflictError,
+    GroupMasterLockedError,
     GroupConfigurationService,
     SyncCycleError,
 )
@@ -989,6 +990,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def record_group_positions(group_name: str) -> bool:
         if group_window_launch_service is None:
             return False
+        if (
+            group_configuration_service is not None
+            and (
+                group_configuration_service.group(group_name) is None
+                or group_configuration_service.group(
+                    group_name
+                ).master_locked
+            )
+        ):
+            return GroupMasterLockedError.player_message
         return group_window_launch_service.start_record(
             group_name,
             complete_group_window_launch,
@@ -1564,6 +1575,29 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group = group_configuration_service.group(group_name)
         return group.entries if group is not None else ()
 
+    def group_master_locked(group_name: str) -> bool:
+        if group_configuration_service is None:
+            return True
+        group = group_configuration_service.group(group_name)
+        return group.master_locked if group is not None else True
+
+    def change_group_master_locked(
+        group_name: str,
+        locked: bool,
+    ) -> object:
+        if group_configuration_service is None:
+            return "組別設定尚未準備完成。"
+        if not group_configuration_service.set_master_locked(
+            group_name,
+            locked,
+        ):
+            return False
+        return (
+            "主窗口已上鎖。"
+            if locked
+            else "主窗口已解鎖，可以調整組別角色。"
+        )
+
     def add_group_shortcuts(group_name: str) -> object:
         if group_configuration_service is None:
             return False
@@ -1580,8 +1614,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 group_name,
                 tuple(Path(path) for path in selected),
             )
-        except SyncCycleError:
-            return SyncCycleError.player_message
+        except (SyncCycleError, GroupMasterLockedError) as error:
+            return error.player_message
         if home_view is not None:
             home_view.refresh_group_entries()
             home_view.refresh_group_sync_relations()
@@ -1592,14 +1626,17 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def remove_group_shortcut(
         group_name: str,
         entry_id: str,
-    ) -> bool:
+    ) -> object:
         if group_configuration_service is None:
             return False
         stop_group_automation_for_configuration_change()
-        removed = group_configuration_service.remove_shortcut(
-            group_name,
-            entry_id,
-        )
+        try:
+            removed = group_configuration_service.remove_shortcut(
+                group_name,
+                entry_id,
+            )
+        except GroupMasterLockedError:
+            return GroupMasterLockedError.player_message
         if removed and home_view is not None:
             home_view.refresh_group_entries()
             home_view.refresh_group_sync_relations()
@@ -1619,8 +1656,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 group_name,
                 entry_id,
             )
-        except SyncCycleError:
-            return SyncCycleError.player_message
+        except (SyncCycleError, GroupMasterLockedError) as error:
+            return error.player_message
         if changed and group_role_status_service is not None:
             group_role_status_service.clear_cache()
         return changed
@@ -1635,7 +1672,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "組別設定尚未準備完成。",
             )
         stop_group_automation_for_configuration_change()
-        if not group_configuration_service.clear_group(group_name):
+        try:
+            changed = group_configuration_service.clear_group(group_name)
+        except GroupMasterLockedError:
+            return GroupManagementViewResult(
+                False,
+                group_name,
+                GroupMasterLockedError.player_message,
+            )
+        if not changed:
             return GroupManagementViewResult(
                 False,
                 group_name,
@@ -2070,6 +2115,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group_launch_hotkey_provider=group_launch_hotkey,
         on_group_launch_hotkey_change=change_group_launch_hotkey,
         group_entries_provider=group_entries,
+        group_master_locked_provider=group_master_locked,
+        on_group_master_locked_change=change_group_master_locked,
         on_add_group_shortcuts=add_group_shortcuts,
         on_remove_group_shortcut=remove_group_shortcut,
         on_set_group_main=set_group_main,

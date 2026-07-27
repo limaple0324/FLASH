@@ -29,6 +29,7 @@ class GroupConfiguration:
     name: str
     entries: tuple[GroupConfigurationEntry, ...]
     launch_hotkey: str = ""
+    master_locked: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,10 @@ class SyncCycleError(ValueError):
 
 class GroupHotkeyConflictError(ValueError):
     player_message = "無法設定：這個快捷鍵已被其他組別使用"
+
+
+class GroupMasterLockedError(ValueError):
+    player_message = "主窗上鎖中，請先解鎖後再調整組別角色。"
 
 
 class GroupConfigurationService:
@@ -184,6 +189,14 @@ class GroupConfigurationService:
                     "name": name,
                     "launch_entries": entries,
                     "launch_hotkey": launch_hotkey,
+                    "master_locked": (
+                        raw_group.get("master_locked")
+                        if isinstance(
+                            raw_group.get("master_locked"),
+                            bool,
+                        )
+                        else True
+                    ),
                 }
             )
         return groups
@@ -389,10 +402,13 @@ class GroupConfigurationService:
             )
             result.append(
                 GroupConfiguration(
-                    name,
-                    entries,
-                    normalize_feature_hotkey(
+                    name=name,
+                    entries=entries,
+                    launch_hotkey=normalize_feature_hotkey(
                         raw_group.get("launch_hotkey")
+                    ),
+                    master_locked=bool(
+                        raw_group.get("master_locked", True)
                     ),
                 )
             )
@@ -421,10 +437,44 @@ class GroupConfigurationService:
                 "name": cleaned,
                 "launch_entries": [],
                 "launch_hotkey": "",
+                "master_locked": True,
             }
         )
         self._save()
         return True
+
+    def set_master_locked(
+        self,
+        group_name: object,
+        locked: object,
+    ) -> bool:
+        cleaned = self._clean_name(group_name)
+        if cleaned is None or not isinstance(locked, bool):
+            return False
+        raw_group = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if raw_group is None:
+            return False
+        if bool(raw_group.get("master_locked", True)) == locked:
+            return False
+        raw_group["master_locked"] = locked
+        self._save()
+        return True
+
+    @staticmethod
+    def _require_master_unlocked(
+        raw_group: Mapping[str, object],
+    ) -> None:
+        if bool(raw_group.get("master_locked", True)):
+            raise GroupMasterLockedError(
+                GroupMasterLockedError.player_message
+            )
 
     def set_launch_hotkey(
         self,
@@ -573,6 +623,7 @@ class GroupConfigurationService:
         )
         if target is None:
             return False
+        self._require_master_unlocked(target)
         entries = target.get("launch_entries")
         if not isinstance(entries, list) or not entries:
             return False
@@ -752,8 +803,14 @@ class GroupConfigurationService:
             None,
         )
         if raw_group is None:
-            raw_group = {"name": cleaned, "launch_entries": []}
+            raw_group = {
+                "name": cleaned,
+                "launch_entries": [],
+                "launch_hotkey": "",
+                "master_locked": False,
+            }
             self._groups.append(raw_group)
+        self._require_master_unlocked(raw_group)
         entries = raw_group["launch_entries"]
         if not isinstance(entries, list):
             raise RuntimeError("group launch entries are malformed.")
@@ -809,6 +866,7 @@ class GroupConfigurationService:
         )
         if raw_group is None:
             return False
+        self._require_master_unlocked(raw_group)
         entries = raw_group["launch_entries"]
         if not isinstance(entries, list):
             return False
@@ -860,6 +918,7 @@ class GroupConfigurationService:
         )
         if raw_group is None:
             return False
+        self._require_master_unlocked(raw_group)
         entries = raw_group.get("launch_entries")
         if not isinstance(entries, list):
             return False
@@ -899,6 +958,7 @@ class GroupConfigurationService:
         )
         if raw_group is None:
             return False
+        self._require_master_unlocked(raw_group)
         entries = raw_group.get("launch_entries")
         if not isinstance(entries, list) or not entries:
             return False

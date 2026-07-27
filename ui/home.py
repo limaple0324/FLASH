@@ -448,6 +448,12 @@ class HomeView:
         group_entries_provider: (
             Callable[[str], tuple[GroupConfigurationEntry, ...]] | None
         ) = None,
+        group_master_locked_provider: (
+            Callable[[str], bool] | None
+        ) = None,
+        on_group_master_locked_change: (
+            Callable[[str, bool], object] | None
+        ) = None,
         on_add_group_shortcuts: Callable[[str], object] | None = None,
         on_remove_group_shortcut: (
             Callable[[str, str], object] | None
@@ -619,6 +625,12 @@ class HomeView:
             on_group_launch_hotkey_change
         )
         self.group_entries_provider = group_entries_provider
+        self.group_master_locked_provider = (
+            group_master_locked_provider
+        )
+        self.on_group_master_locked_change = (
+            on_group_master_locked_change
+        )
         self.on_add_group_shortcuts = on_add_group_shortcuts
         self.on_remove_group_shortcut = on_remove_group_shortcut
         self.on_set_group_main = on_set_group_main
@@ -740,6 +752,9 @@ class HomeView:
         self._auto_click_toggle_button: Button | None = None
         self._group_entries_frame: Frame | None = None
         self._group_setting_message_label: Label | None = None
+        self._group_master_lock_button: Button | None = None
+        self._group_add_button: Button | None = None
+        self._group_clear_button: Button | None = None
         self._group_launch_button: Button | None = None
         self._group_restore_button: Button | None = None
         self._group_record_button: Button | None = None
@@ -2209,17 +2224,25 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(side=LEFT, fill=X, expand=True)
-        self._button(
+        self._group_add_button = self._button(
             entry_header,
             "加入角色到組別",
             self._add_shortcuts_to_current_group,
             primary=True,
-        ).pack(side=RIGHT)
-        self._button(
+        )
+        self._group_add_button.pack(side=RIGHT)
+        self._group_clear_button = self._button(
             entry_header,
             "清空角色",
             self._clear_current_group,
-        ).pack(side=RIGHT, padx=(0, 8))
+        )
+        self._group_clear_button.pack(side=RIGHT, padx=(0, 8))
+        self._group_master_lock_button = self._button(
+            entry_header,
+            "主窗：已上鎖",
+            self._toggle_group_master_locked,
+        )
+        self._group_master_lock_button.pack(side=RIGHT, padx=(0, 8))
         self._group_entries_frame = Frame(entry_card, bg=SURFACE)
         self._group_entries_frame.pack(fill=X, pady=(10, 0))
         self._group_setting_message_label = Label(
@@ -4068,6 +4091,8 @@ class HomeView:
                 button.configure(
                     state=DISABLED if running else NORMAL
                 )
+        if not running:
+            self._refresh_group_edit_controls()
         if self._group_launch_status_label is not None:
             self._group_launch_status_label.configure(
                 text=message.strip(),
@@ -4284,6 +4309,68 @@ class HomeView:
             if label.winfo_manager():
                 label.pack_forget()
 
+    def _current_group_master_locked(self) -> bool:
+        if (
+            self.current_group_name is None
+            or self.group_master_locked_provider is None
+        ):
+            return True
+        value = self.group_master_locked_provider(
+            self.current_group_name
+        )
+        if not isinstance(value, bool):
+            raise TypeError(
+                "group master locked provider returned an invalid value."
+            )
+        return value
+
+    def _refresh_group_edit_controls(self) -> bool:
+        locked = self._current_group_master_locked()
+        has_group = self.current_group_name is not None
+        state = NORMAL if has_group and not locked else DISABLED
+        for button in (
+            self._group_add_button,
+            self._group_clear_button,
+            self._group_record_button,
+        ):
+            if button is not None:
+                button.configure(state=state)
+        if self._group_master_lock_button is not None:
+            self._group_master_lock_button.configure(
+                text=(
+                    "主窗：已上鎖"
+                    if locked
+                    else "主窗：未上鎖"
+                ),
+                state=(
+                    NORMAL
+                    if (
+                        has_group
+                        and self.on_group_master_locked_change is not None
+                    )
+                    else DISABLED
+                ),
+            )
+        return locked
+
+    def _toggle_group_master_locked(self) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_group_master_locked_change is None
+        ):
+            return
+        locked = self._current_group_master_locked()
+        try:
+            result = self.on_group_master_locked_change(
+                self.current_group_name,
+                not locked,
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._show_group_setting_message(result)
+        self.refresh_group_entries()
+
     def _remove_group_shortcut(self, entry_id: str) -> None:
         if (
             self.current_group_name is None
@@ -4291,12 +4378,16 @@ class HomeView:
         ):
             return
         try:
-            self.on_remove_group_shortcut(
+            result = self.on_remove_group_shortcut(
                 self.current_group_name,
                 entry_id,
             )
         except Exception as error:
             self._report_refresh_error(error)
+            return
+        self._show_group_setting_message(result)
+        self.refresh_group_entries()
+        self.refresh_group_sync_relations()
 
     def refresh_group_entries(
         self,
@@ -4321,6 +4412,7 @@ class HomeView:
                 raise TypeError(
                     "group entries provider returned invalid values."
                 )
+        locked = self._refresh_group_edit_controls()
         if not entries:
             Label(
                 frame,
@@ -4349,21 +4441,27 @@ class HomeView:
                 bg=BACKGROUND,
                 fg=MUTED,
             ).pack(side=LEFT, padx=10)
-            self._button(
+            remove_button = self._button(
                 row,
                 "移除",
                 lambda value=entry.entry_id: self._remove_group_shortcut(
                     value
                 ),
-            ).pack(side=RIGHT)
+            )
+            remove_button.pack(side=RIGHT)
+            if locked:
+                remove_button.configure(state=DISABLED)
             if entry.role != "主窗口":
-                self._button(
+                main_button = self._button(
                     row,
                     "設為主窗口",
                     lambda value=entry.entry_id: self._set_group_main(
                         value
                     ),
-                ).pack(side=RIGHT, padx=(0, 6))
+                )
+                main_button.pack(side=RIGHT, padx=(0, 6))
+                if locked:
+                    main_button.configure(state=DISABLED)
         return entries
 
     def _set_group_main(self, entry_id: str) -> None:

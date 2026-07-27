@@ -5,6 +5,7 @@ import pytest
 from services.group_configuration_service import (
     GroupConfigurationService,
     GroupHotkeyConflictError,
+    GroupMasterLockedError,
     SyncCycleError,
 )
 from services.group_launch_service import SavedWindowPlacement
@@ -26,6 +27,7 @@ def _legacy(tmp_path):
                 "groups": [
                     {
                         "name": "14支",
+                        "master_locked": False,
                         "launch_entries": [
                             {"path": str(first), "role": "主窗口"},
                             {"path": str(second), "role": "同步窗口"},
@@ -316,6 +318,92 @@ def test_set_main_entry_reorders_group_and_clear_keeps_empty_group(
     assert service.clear_group("14支") is False
 
 
+def test_master_lock_defaults_safe_and_blocks_group_role_edits(
+    tmp_path,
+):
+    first = _shortcut(tmp_path, "甲")
+    second = _shortcut(tmp_path, "乙")
+    legacy = tmp_path / "legacy-locked.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "上鎖組",
+                        "launch_entries": [
+                            {"path": str(first)},
+                            {"path": str(second)},
+                        ],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    service = GroupConfigurationService(
+        tmp_path / "groups.json",
+        legacy_config_path=legacy,
+    )
+    group = service.group("上鎖組")
+
+    assert group.master_locked is True
+    with pytest.raises(
+        GroupMasterLockedError,
+        match=GroupMasterLockedError.player_message,
+    ):
+        service.add_shortcuts(
+            "上鎖組",
+            (_shortcut(tmp_path, "丙"),),
+        )
+    with pytest.raises(GroupMasterLockedError):
+        service.remove_shortcut(
+            "上鎖組",
+            group.entries[1].entry_id,
+        )
+    with pytest.raises(GroupMasterLockedError):
+        service.set_main_entry(
+            "上鎖組",
+            group.entries[1].entry_id,
+        )
+    with pytest.raises(GroupMasterLockedError):
+        service.clear_group("上鎖組")
+    with pytest.raises(GroupMasterLockedError):
+        service.update_saved_placements(
+            "上鎖組",
+            {
+                first: SavedWindowPlacement(0, 0, 900, 600, 0),
+                second: SavedWindowPlacement(900, 0, 900, 600, 0),
+            },
+        )
+
+
+def test_unlock_allows_role_edits_and_lock_state_survives_reload(
+    tmp_path,
+):
+    legacy, _first, _second = _legacy(tmp_path)
+    owned = tmp_path / "groups.json"
+    service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    before = service.group("14支").entries
+
+    assert service.set_master_locked("14支", True) is True
+    assert service.set_master_locked("14支", True) is False
+    assert GroupConfigurationService(owned).group(
+        "14支"
+    ).master_locked is True
+    assert service.set_master_locked("14支", False) is True
+    assert service.set_main_entry(
+        "14支",
+        before[1].entry_id,
+    ) is True
+    assert GroupConfigurationService(owned).group(
+        "14支"
+    ).master_locked is False
+
+
 def test_import_same_name_replaces_owned_group_without_duplicate(
     tmp_path,
 ):
@@ -380,6 +468,7 @@ def test_export_and_import_round_trip_preserves_group_order_and_layout(
     service.add_shortcuts("第二組", (third,))
     first_group_name = service.groups()[0].name
     service.set_launch_hotkey(first_group_name, "F3")
+    service.set_master_locked(first_group_name, True)
     export_path = service.export_configuration(
         tmp_path / "export.json"
     )
@@ -393,6 +482,7 @@ def test_export_and_import_round_trip_preserves_group_order_and_layout(
         "第二組",
     )
     assert restored.group(first_group_name).launch_hotkey == "F3"
+    assert restored.group(first_group_name).master_locked is True
     assert (
         restored.group("14支").entries[0].shortcut_path
         == service.group("14支").entries[0].shortcut_path

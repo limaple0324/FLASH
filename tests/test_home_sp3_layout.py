@@ -62,6 +62,10 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "整組啟動快捷鍵" in source
     assert "group_launch_hotkey_provider" in source
     assert "on_group_launch_hotkey_change" in source
+    assert "主窗：已上鎖" in source
+    assert "主窗：未上鎖" in source
+    assert "group_master_locked_provider" in source
+    assert "on_group_master_locked_change" in source
     assert "設為主窗口" in source
     assert "清空角色" in source
 
