@@ -74,7 +74,7 @@ INPUT_POLICY_LABELS = {
 
 BACKGROUND_PAGE_LABELS = {
     "home": "首頁",
-    "groups": "組別與視窗",
+    "groups": "目前組別",
     "sync": "同步與重連",
     "characters": "角色資料",
     "records": "紀錄",
@@ -912,7 +912,7 @@ class HomeView:
 
         page_specs = (
             ("home", "首頁"),
-            ("groups", "組別與視窗"),
+            ("groups", "目前組別"),
             ("sync", "同步與重連"),
             ("characters", "角色資料"),
             ("records", "紀錄"),
@@ -1987,7 +1987,7 @@ class HomeView:
         page = Frame(parent, bg=BACKGROUND)
         self._page_heading(
             page,
-            "組別與遊戲視窗",
+            "目前組別",
             "沿用現有組別名稱；不讀取或顯示登入參數",
         )
         selector = self._card(page)

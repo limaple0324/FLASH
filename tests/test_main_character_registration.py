@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from domain.character import Character, CharacterImportance
@@ -97,3 +99,18 @@ def test_build_services_registers_confirmed_game_data_sections(tmp_path) -> None
             ),
         ),
     )
+
+
+def test_main_window_backfills_current_group_character_data_on_start() -> None:
+    source = Path("main.py").read_text(encoding="utf-8")
+    build_index = source.index("home_view.build()")
+    refresh_index = source.index(
+        "refresh_character_data(current_character_group)",
+        build_index,
+    )
+    subscribe_index = source.index(
+        "auto_click_service.subscribe(",
+        refresh_index,
+    )
+
+    assert build_index < refresh_index < subscribe_index

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from core.window_registry import WindowRegistry
 from domain.character import Character, character_priority_key
@@ -28,8 +28,14 @@ class CharacterViewService:
         self,
         registry: WindowRegistry,
         characters: Iterable[Character],
+        *,
+        confirmed_group_orders: Mapping[str, tuple[str, ...]] | None = None,
     ) -> None:
         self._registry = registry
+        self._confirmed_group_orders = {
+            group_name: tuple(order)
+            for group_name, order in (confirmed_group_orders or {}).items()
+        }
         self._characters: dict[str, Character] = {}
         for character in characters:
             if character.character_id in self._characters:
@@ -64,11 +70,7 @@ class CharacterViewService:
         )
         ordered_records = sorted(
             records,
-            key=lambda record: (
-                character_priority_key(self._characters[record.character_id])
-                if record.character_id in self._characters
-                else (len(self._characters) + 3, 0, record.character_id)
-            ),
+            key=self._record_priority_key,
         )
         for record in ordered_records:
             character = self._characters.get(record.character_id)
@@ -90,6 +92,33 @@ class CharacterViewService:
                 )
             )
         return tuple(snapshots)
+
+    def _record_priority_key(self, record) -> tuple[int, int, int, str]:
+        character = self._characters.get(record.character_id)
+        if character is None:
+            return (
+                len(self._characters) + 3,
+                len(self._characters) + 3,
+                0,
+                record.character_id,
+            )
+        base_rank, negative_level, stable_identity = character_priority_key(
+            character
+        )
+        fixed_order = self._confirmed_group_orders.get(record.group or "")
+        if fixed_order is None:
+            fixed_rank = len(self._characters) + 3
+        else:
+            try:
+                fixed_rank = fixed_order.index(record.display_name)
+            except ValueError:
+                fixed_rank = len(fixed_order)
+        return (
+            base_rank,
+            fixed_rank,
+            negative_level,
+            stable_identity,
+        )
 
     def all(
         self,

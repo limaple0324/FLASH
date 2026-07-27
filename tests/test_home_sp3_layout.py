@@ -19,9 +19,11 @@ from workspace.models import WorkspaceState
 def test_home_has_real_product_pages_and_group_selection() -> None:
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
-    for label in ("首頁", "組別與視窗", "同步與重連", "角色資料", "設定"):
+    for label in ("首頁", "目前組別", "同步與重連", "角色資料", "設定"):
         assert label in source
-    assert "目前組別" in source
+    assert '"groups": "組別與視窗"' not in source
+    assert '("groups", "組別與視窗")' not in source
+    assert '"組別與遊戲視窗"' not in source
     assert "on_group_change" in source
     assert "character_choices" in source
     assert "靈魂石" not in source
@@ -30,10 +32,11 @@ def test_home_has_real_product_pages_and_group_selection() -> None:
     assert 'text="+"' not in source
 
 
-def test_current_group_uses_home_summary_card_without_sidebar_duplicate() -> None:
+def test_current_group_page_replaces_sidebar_duplicate() -> None:
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
     assert 'text="目前組別"' in source
+    assert '("groups", "目前組別")' in source
     assert "主控：" in source
     assert "個視窗" in source
     assert "_current_group_summary_text" in source

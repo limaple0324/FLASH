@@ -134,6 +134,29 @@ def test_view_uses_project_wide_role_priority_instead_of_registry_order() -> Non
     ] == ["主號高等", "主號低等", "分號", "備用"]
 
 
+def test_view_uses_confirmed_group_order_inside_the_same_role() -> None:
+    registry = WindowRegistry()
+    registry.register_character("160", "160帥", group="14支")
+    registry.register_character("100", "100古", group="14支")
+    registry.register_character("120", "120古", group="14支")
+    profiles = (
+        _character("160", "160帥", 160, CharacterImportance.PRIMARY),
+        _character("100", "100古", 100, CharacterImportance.SECONDARY),
+        _character("120", "120古", 120, CharacterImportance.PRIMARY),
+    )
+
+    assert [
+        item.display_name
+        for item in CharacterViewService(
+            registry,
+            profiles,
+            confirmed_group_orders={
+                "14支": ("100古", "120古", "160帥"),
+            },
+        ).all("14支")
+    ] == ["120古", "160帥", "100古"]
+
+
 def test_view_can_limit_results_to_current_group() -> None:
     registry = WindowRegistry()
     registry.register_character("a", "甲", group="甲組")

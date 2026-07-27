@@ -98,7 +98,11 @@ from services.group_configuration_service import (
 from services.group_character_registration_service import (
     GroupCharacterRegistrationService,
 )
-from services.group_launch_service import GroupLaunchPlan, GroupLaunchService
+from services.group_launch_service import (
+    CONFIRMED_GROUP_ORDERS,
+    GroupLaunchPlan,
+    GroupLaunchService,
+)
 from services.group_role_status_monitor import GroupRoleStatusMonitor
 from services.group_role_status_service import GroupRoleStatusService
 from services.group_window_launch_service import (
@@ -331,7 +335,11 @@ def build_services(root: Path | None = None):
             initial_group_choice.name,
             characters,
         )
-    character_view_service = CharacterViewService(registry, characters)
+    character_view_service = CharacterViewService(
+        registry,
+        characters,
+        confirmed_group_orders=CONFIRMED_GROUP_ORDERS,
+    )
     character_detail_view_service = CharacterDetailViewService(
         character_view_service,
         character_game_data_view_service,
@@ -2088,6 +2096,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_refresh_error=report_refresh_error,
     )
     home_view.build()
+    refresh_character_data(current_character_group)
     auto_click_service.subscribe(
         lambda snapshot: home_view.set_auto_click_running(
             snapshot.running,
