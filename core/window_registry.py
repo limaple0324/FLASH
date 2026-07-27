@@ -142,6 +142,38 @@ class WindowRegistry:
         self._records[current.character_id] = record
         return record
 
+    def set_group_role(
+        self,
+        character_id: str,
+        *,
+        group: str | None,
+        role: str | None,
+    ) -> CharacterWindowRecord:
+        """Update player-facing membership without changing stable identity."""
+        current = self.get(character_id)
+        normalized_group = (
+            group.strip()
+            if isinstance(group, str) and group.strip()
+            else None
+        )
+        normalized_role = (
+            role.strip()
+            if isinstance(role, str) and role.strip()
+            else None
+        )
+        if (
+            current.group == normalized_group
+            and current.role == normalized_role
+        ):
+            return current
+        record = replace(
+            current,
+            group=normalized_group,
+            role=normalized_role,
+        )
+        self._records[current.character_id] = record
+        return record
+
     def characters_for_handle(self, handle: int) -> tuple[CharacterWindowRecord, ...]:
         """Return all currently confirmed characters associated with a live window."""
         if handle <= 0:

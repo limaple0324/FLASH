@@ -76,6 +76,7 @@ class GroupCharacterRegistrationService:
             for record in candidate.all()
         }
         new_records: list[tuple[str, str, str]] = []
+        updated_records: list[tuple[str, str, str]] = []
         profiles_changed = False
         for entry in group.entries:
             confirmed = CONFIRMED_GROUP_CHARACTER_PROFILES.get(
@@ -102,6 +103,26 @@ class GroupCharacterRegistrationService:
                     role=role,
                 )
                 new_records.append((entry.entry_id, display_name, role))
+            else:
+                role = (
+                    importance.value
+                    if importance is not None
+                    else (
+                        "主控"
+                        if entry.role == "主窗口"
+                        else "同步"
+                    )
+                )
+                existing = existing_records[entry.entry_id]
+                if existing.group != group.name or existing.role != role:
+                    candidate.set_group_role(
+                        entry.entry_id,
+                        group=group.name,
+                        role=role,
+                    )
+                    updated_records.append(
+                        (entry.entry_id, group.name, role)
+                    )
             if confirmed is not None and entry.entry_id not in profile_by_id:
                 profile_by_id[entry.entry_id] = Character(
                     entry.entry_id,
@@ -113,13 +134,19 @@ class GroupCharacterRegistrationService:
 
         if profiles_changed:
             self._character_store.save(profile_by_id.values())
-        if new_records:
+        if new_records or updated_records:
             self._registry_store.save(candidate)
             for character_id, display_name, role in new_records:
                 self._registry.register_character(
                     character_id,
                     display_name,
                     group=group.name,
+                    role=role,
+                )
+            for character_id, group_name, role in updated_records:
+                self._registry.set_group_role(
+                    character_id,
+                    group=group_name,
                     role=role,
                 )
         return tuple(profile_by_id.values())

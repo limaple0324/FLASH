@@ -116,3 +116,53 @@ def test_group_registration_is_idempotent_and_preserves_saved_note(tmp_path):
     assert repeated == profiles
     assert len(registry.all()) == 14
     assert registry.get(character_id).note == "保留備註"
+
+
+def test_existing_ungrouped_records_are_backfilled_without_new_identities(
+    tmp_path,
+):
+    configuration = _configuration(tmp_path)
+    group = configuration.group("14支")
+    registry = WindowRegistry()
+    registry_store = WindowRegistryStore(tmp_path / "registry.json")
+    character_store = CharacterStore(tmp_path / "characters.json")
+    for entry in group.entries:
+        registry.register_character(
+            entry.entry_id,
+            (
+                "亞洛"
+                if entry.display_name == "160福"
+                else entry.display_name
+            ),
+            note=(
+                "原備註"
+                if entry.display_name == "120古"
+                else None
+            ),
+        )
+    registry_store.save(registry)
+    identities_before = {
+        record.character_id for record in registry.all()
+    }
+    service = GroupCharacterRegistrationService(
+        registry,
+        registry_store,
+        character_store,
+        configuration,
+    )
+
+    profiles = service.ensure_group("14支", ())
+    restored = registry_store.load()
+
+    assert {
+        record.character_id for record in restored.all()
+    } == identities_before
+    assert {record.group for record in restored.all()} == {"14支"}
+    assert len(CharacterViewService(registry, profiles).all("14支")) == 14
+    ancient = next(
+        record
+        for record in restored.all()
+        if record.display_name == "120古"
+    )
+    assert ancient.note == "原備註"
+    assert ancient.role == CharacterImportance.PRIMARY.value
