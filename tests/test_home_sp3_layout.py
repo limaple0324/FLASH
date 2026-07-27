@@ -54,6 +54,11 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "記錄目前位置" in source
     for label in ("新增組", "改名", "上移", "下移", "刪除組"):
         assert label in source
+    assert "匯出組別設定" in source
+    assert "匯入組別設定" in source
+    assert "匯入時同名組別會直接更新；舊版設定保持不變。" in source
+    assert "on_export_group_configuration" in source
+    assert "on_import_group_configuration" in source
     assert "設為主窗口" in source
     assert "清空角色" in source
 

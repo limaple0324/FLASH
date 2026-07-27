@@ -437,6 +437,8 @@ class HomeView:
         on_move_group: (
             Callable[[str, int], GroupManagementViewResult] | None
         ) = None,
+        on_export_group_configuration: Callable[[], object] | None = None,
+        on_import_group_configuration: Callable[[], object] | None = None,
         group_entries_provider: (
             Callable[[str], tuple[GroupConfigurationEntry, ...]] | None
         ) = None,
@@ -598,6 +600,12 @@ class HomeView:
         self.on_rename_group = on_rename_group
         self.on_delete_group = on_delete_group
         self.on_move_group = on_move_group
+        self.on_export_group_configuration = (
+            on_export_group_configuration
+        )
+        self.on_import_group_configuration = (
+            on_import_group_configuration
+        )
         self.group_entries_provider = group_entries_provider
         self.on_add_group_shortcuts = on_add_group_shortcuts
         self.on_remove_group_shortcut = on_remove_group_shortcut
@@ -2115,6 +2123,24 @@ class HomeView:
             "刪除組",
             self._delete_current_group,
         ).pack(side=LEFT, padx=(8, 0))
+        self._button(
+            group_order_row,
+            "匯出組別設定",
+            self._export_group_configuration,
+        ).pack(side=LEFT, padx=(16, 0))
+        self._button(
+            group_order_row,
+            "匯入組別設定",
+            self._import_group_configuration,
+        ).pack(side=LEFT, padx=(8, 0))
+        Label(
+            selector,
+            text="匯入時同名組別會直接更新；舊版設定保持不變。",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        ).pack(fill=X, pady=(8, 0))
 
         entry_card = self._card(page, padx=12, pady=12)
         entry_card.pack(fill=X, pady=(14, 0))
@@ -4023,6 +4049,7 @@ class HomeView:
         )
         self._active_page = "groups"
         self.build()
+        self._show_group_setting_message(result.message)
 
     def _create_group(self) -> None:
         if self._group_name_entry is None or self.on_create_group is None:
@@ -4095,6 +4122,42 @@ class HomeView:
             )
         except Exception as error:
             self._report_refresh_error(error)
+
+    def _export_group_configuration(self) -> None:
+        if self.on_export_group_configuration is None:
+            return
+        try:
+            result = self.on_export_group_configuration()
+        except Exception as error:
+            self._show_group_setting_message("組別設定無法匯出。")
+            self._report_refresh_error(error)
+            return
+        if result is None or result is False:
+            return
+        if isinstance(result, Path):
+            self._show_group_setting_message(
+                f"組別設定已匯出：{result.name}"
+            )
+            return
+        self._show_group_setting_message(result)
+
+    def _import_group_configuration(self) -> None:
+        if self.on_import_group_configuration is None:
+            return
+        try:
+            result = self.on_import_group_configuration()
+        except Exception as error:
+            self._show_group_setting_message(
+                "組別設定無法匯入，原本設定已保留。"
+            )
+            self._report_refresh_error(error)
+            return
+        if result is None or result is False:
+            return
+        if isinstance(result, GroupManagementViewResult):
+            self._apply_group_management_result(result)
+            return
+        self._show_group_setting_message(result)
 
     def _add_shortcuts_to_current_group(self) -> None:
         if (

@@ -1433,6 +1433,90 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         return finish_group_management(name)
 
+    def export_group_configuration() -> object:
+        if group_configuration_service is None:
+            return "組別設定尚未準備完成。"
+        selected = filedialog.asksaveasfilename(
+            parent=window,
+            title="匯出組別設定",
+            defaultextension=".json",
+            filetypes=(("JSON 設定檔", "*.json"),),
+            initialfile="輔_組別設定.json",
+        )
+        if not selected:
+            return None
+        try:
+            return group_configuration_service.export_configuration(
+                Path(selected)
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            if logger is not None:
+                logger.warning(
+                    f"Group configuration export failed: {error}"
+                )
+            return "組別設定無法匯出。"
+
+    def import_group_configuration() -> object:
+        if group_configuration_service is None:
+            return GroupManagementViewResult(
+                False,
+                None,
+                "組別設定尚未準備完成。",
+            )
+        selected = filedialog.askopenfilename(
+            parent=window,
+            title="匯入組別設定",
+            filetypes=(("JSON 設定檔", "*.json"),),
+        )
+        if not selected:
+            return None
+        workspace_snapshot = (
+            workspace_service.snapshot()
+            if workspace_service is not None
+            else None
+        )
+        current_name = (
+            workspace_snapshot.current_group.name
+            if workspace_snapshot is not None
+            and workspace_snapshot.current_group is not None
+            else None
+        )
+        stop_group_automation_for_configuration_change()
+        try:
+            imported_names = (
+                group_configuration_service.import_configuration(
+                    Path(selected)
+                )
+            )
+        except SyncCycleError:
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                SyncCycleError.player_message,
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            if logger is not None:
+                logger.warning(
+                    f"Group configuration import failed: {error}"
+                )
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "組別設定無法匯入，原本設定已保留。",
+            )
+        selected_name = (
+            current_name
+            if current_name is not None
+            and group_configuration_service.group(current_name) is not None
+            else imported_names[0]
+        )
+        result = finish_group_management(selected_name)
+        return GroupManagementViewResult(
+            result.success,
+            result.current_group_name,
+            f"已匯入 {len(imported_names)} 個組別；同名組別已更新。",
+        )
+
     def group_entries(group_name: str):
         if group_configuration_service is None:
             return ()
@@ -1940,6 +2024,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_rename_group=rename_group,
         on_delete_group=delete_group,
         on_move_group=move_group,
+        on_export_group_configuration=export_group_configuration,
+        on_import_group_configuration=import_group_configuration,
         group_entries_provider=group_entries,
         on_add_group_shortcuts=add_group_shortcuts,
         on_remove_group_shortcut=remove_group_shortcut,
