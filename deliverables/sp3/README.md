@@ -32,7 +32,7 @@
 
 ## 固定交付
 
-目前最新驗收：`ACCEPTANCE_0.3.0_8d8faa3.md`
+目前最新驗收：`ACCEPTANCE_0.3.0_42a3b2c.md`
 
 SP3 完成時同時建立：
 
