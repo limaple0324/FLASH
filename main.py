@@ -29,6 +29,10 @@ from adapters.windows_pointer_sync import WindowsPointerSyncController
 from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
 from adapters.windows_window import Win32WindowBackend, WindowsWindowAdapter
 from adapters.windows_work_area import WindowsWorkAreaReader
+from adapters.windows_system_tray import (
+    SystemTrayController,
+    WindowsSystemTrayBackend,
+)
 from cards.history_store import CardHistoryStore
 from cards.service import CardService
 from cards.settings import (
@@ -2391,9 +2395,13 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
             activity_reminder_monitor.start()
 
+    tray_controller: SystemTrayController | None = None
+
     def close_window() -> None:
         if not home_view.prepare_close():
             return
+        if tray_controller is not None:
+            tray_controller.stop()
         home_view.dispose()
         if group_window_launch_service is not None:
             group_window_launch_service.stop()
@@ -2426,6 +2434,29 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         window.destroy()
 
     window.protocol("WM_DELETE_WINDOW", close_window)
+    tray_group_state = (
+        workspace_service.snapshot()
+        if workspace_service is not None
+        else WorkspaceState()
+    )
+    tray_group_name = (
+        tray_group_state.current_group.name
+        if tray_group_state.current_group is not None
+        else "尚未設定組別"
+    )
+    tray_controller = SystemTrayController(
+        window,
+        WindowsSystemTrayBackend(),
+        icon_path=resource_path(APP_ICON_ICO),
+        tooltip=f"輔｜{tray_group_name}｜同步安全停止",
+        on_close=close_window,
+    )
+    if tray_controller.start():
+        window.bind("<Unmap>", tray_controller.handle_unmap, add="+")
+    elif logger is not None:
+        logger.error(
+            "System tray icon was not started; the main window remains usable."
+        )
     window._card_overlay_runtime = overlay_runtime
     window._card_expiry_monitor = expiry_monitor
     window._activity_reminder_monitor = activity_reminder_monitor
@@ -2434,6 +2465,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window._group_role_status_monitor = group_role_status_monitor
     window._deferred_sync_monitor = deferred_sync_monitor
     window._windows_app_identity = window_identity
+    window._system_tray_controller = tray_controller
     return window
 
 
