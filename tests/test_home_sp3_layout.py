@@ -52,6 +52,11 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "一鍵啟動並還原位置" in source
     assert "只還原位置" in source
     assert "記錄目前位置" in source
+    assert "還原／調整遊戲視窗尺寸" in source
+    assert "取主窗尺寸" in source
+    assert "套用目前組" in source
+    assert "套用全部遊戲視窗" in source
+    assert "新視窗自動套用" in source
     for label in ("新增組", "改名", "上移", "下移", "刪除組"):
         assert label in source
     assert "匯出組別設定" in source

@@ -63,6 +63,13 @@ from services.sync_operation_record_store import (
     OperationRecordSearchResult,
 )
 from services.activity_schedule_view_service import PlayerActivitySchedule
+from services.window_size_adjustment_service import (
+    DEFAULT_FLASH_CLIENT_HEIGHT,
+    DEFAULT_FLASH_CLIENT_WIDTH,
+    MAX_FLASH_CLIENT_SIZE,
+    MIN_FLASH_CLIENT_SIZE,
+    WindowSizeAdjustmentResult,
+)
 from workspace.models import WorkspaceState
 
 
@@ -464,6 +471,20 @@ class HomeView:
         on_clear_group: (
             Callable[[str], GroupManagementViewResult] | None
         ) = None,
+        window_size: tuple[int, int] = (
+            DEFAULT_FLASH_CLIENT_WIDTH,
+            DEFAULT_FLASH_CLIENT_HEIGHT,
+        ),
+        window_size_auto_enabled: bool = False,
+        on_read_main_window_size: (
+            Callable[[str], WindowSizeAdjustmentResult] | None
+        ) = None,
+        on_apply_group_window_size: (
+            Callable[[str, int, int], WindowSizeAdjustmentResult] | None
+        ) = None,
+        on_apply_all_window_size: (
+            Callable[[int, int], WindowSizeAdjustmentResult] | None
+        ) = None,
         group_sync_choices_provider: (
             Callable[[str], tuple[GroupSyncMemberChoice, ...]] | None
         ) = None,
@@ -635,6 +656,21 @@ class HomeView:
         self.on_remove_group_shortcut = on_remove_group_shortcut
         self.on_set_group_main = on_set_group_main
         self.on_clear_group = on_clear_group
+        width, height = window_size
+        self.window_size = (
+            width
+            if isinstance(width, int)
+            and MIN_FLASH_CLIENT_SIZE <= width <= MAX_FLASH_CLIENT_SIZE
+            else DEFAULT_FLASH_CLIENT_WIDTH,
+            height
+            if isinstance(height, int)
+            and MIN_FLASH_CLIENT_SIZE <= height <= MAX_FLASH_CLIENT_SIZE
+            else DEFAULT_FLASH_CLIENT_HEIGHT,
+        )
+        self.window_size_auto_enabled = bool(window_size_auto_enabled)
+        self.on_read_main_window_size = on_read_main_window_size
+        self.on_apply_group_window_size = on_apply_group_window_size
+        self.on_apply_all_window_size = on_apply_all_window_size
         self.group_sync_choices_provider = group_sync_choices_provider
         self.group_sync_relations_provider = group_sync_relations_provider
         self.on_add_group_sync_relation = on_add_group_sync_relation
@@ -760,6 +796,11 @@ class HomeView:
         self._group_record_button: Button | None = None
         self._group_launch_status_label: Label | None = None
         self._group_launch_hotkey_variable: StringVar | None = None
+        self._window_size_width_entry: Entry | None = None
+        self._window_size_height_entry: Entry | None = None
+        self._window_size_auto_variable: IntVar | None = None
+        self._window_size_status_label: Label | None = None
+        self._window_size_after_id: str | None = None
         self._group_name_entry: Entry | None = None
         self._group_sync_choice_variable: StringVar | None = None
         self._group_sync_choice_ids: dict[str, str] = {}
@@ -863,6 +904,7 @@ class HomeView:
     def build(self):
         active_page = self._active_page
         self._cancel_background_resize()
+        self._cancel_window_size_poll()
         if self._mousewheel_binding_id is not None:
             try:
                 self.parent.unbind(
@@ -980,6 +1022,8 @@ class HomeView:
         self._pages["characters"] = self._build_characters_page(content)
         self._pages["records"] = self._build_records_page(content)
         self._pages["settings"] = self._build_settings_page(content)
+        if self.window_size_auto_enabled:
+            self._schedule_window_size_poll()
         for page_name, page in self._pages.items():
             background_label = Label(
                 page,
@@ -2311,6 +2355,8 @@ class HomeView:
         self._group_sync_relations_frame.pack(fill=X, pady=(10, 0))
         self.refresh_group_sync_relations()
 
+        self._build_window_size_card(page)
+
         Label(
             page,
             text="可用組別",
@@ -2370,6 +2416,113 @@ class HomeView:
                 lambda name=choice.name: self._select_group(name),
             ).pack(side=RIGHT)
         return page
+
+    def _build_window_size_card(self, page) -> None:
+        card = self._card(page)
+        card.pack(fill=X, pady=(14, 0))
+        Label(
+            card,
+            text="還原／調整遊戲視窗尺寸",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        Label(
+            card,
+            text="沿用舊版操作；尺寸是遊戲內容區，不會移動或切換視窗",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        ).pack(fill=X, pady=(3, 10))
+
+        values = Frame(card, bg=SURFACE)
+        values.pack(fill=X)
+        Label(
+            values,
+            text="寬",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=TEXT,
+        ).pack(side=LEFT)
+        self._window_size_width_entry = Entry(
+            values,
+            width=7,
+            font=("Microsoft JhengHei UI", 10),
+            relief="flat",
+            bd=0,
+        )
+        self._window_size_width_entry.pack(side=LEFT, padx=(6, 14))
+        self._window_size_width_entry.insert(0, str(self.window_size[0]))
+        Label(
+            values,
+            text="高",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=TEXT,
+        ).pack(side=LEFT)
+        self._window_size_height_entry = Entry(
+            values,
+            width=7,
+            font=("Microsoft JhengHei UI", 10),
+            relief="flat",
+            bd=0,
+        )
+        self._window_size_height_entry.pack(side=LEFT, padx=(6, 14))
+        self._window_size_height_entry.insert(0, str(self.window_size[1]))
+        self._button(
+            values,
+            "取主窗尺寸",
+            self._load_main_window_size,
+        ).pack(side=LEFT)
+        self._button(
+            values,
+            "套用目前組",
+            self._apply_current_group_window_size,
+            primary=True,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._button(
+            values,
+            "套用全部遊戲視窗",
+            self._apply_all_game_window_size,
+        ).pack(side=LEFT, padx=(8, 0))
+
+        auto_row = Frame(card, bg=SURFACE)
+        auto_row.pack(fill=X, pady=(10, 0))
+        self._window_size_auto_variable = IntVar(
+            master=self.parent,
+            value=1 if self.window_size_auto_enabled else 0,
+        )
+        Checkbutton(
+            auto_row,
+            text="新視窗自動套用",
+            variable=self._window_size_auto_variable,
+            command=self._toggle_auto_window_size,
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=TEXT,
+            activebackground=SURFACE,
+            selectcolor=BACKGROUND,
+        ).pack(side=LEFT)
+        self._window_size_status_label = Label(
+            auto_row,
+            text=(
+                "● 已啟用"
+                if self.window_size_auto_enabled
+                else "● 尚未啟用"
+            ),
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=PRIMARY if self.window_size_auto_enabled else MUTED,
+            anchor="w",
+        )
+        self._window_size_status_label.pack(
+            side=LEFT,
+            fill=X,
+            expand=True,
+            padx=(12, 0),
+        )
 
     def _build_sync_page(self, parent) -> Frame:
         page = Frame(parent, bg=BACKGROUND)
@@ -4036,6 +4189,181 @@ class HomeView:
         self.refresh_group_sync_relations()
         self.refresh_group_role_statuses()
         self.refresh_operation_records()
+
+    @staticmethod
+    def _normalized_window_size_value(
+        entry: Entry | None,
+        fallback: int,
+    ) -> int:
+        try:
+            value = int(entry.get().strip()) if entry is not None else fallback
+        except (TypeError, ValueError):
+            value = fallback
+        return max(
+            MIN_FLASH_CLIENT_SIZE,
+            min(MAX_FLASH_CLIENT_SIZE, value),
+        )
+
+    def _window_size_values(self) -> tuple[int, int]:
+        width = self._normalized_window_size_value(
+            self._window_size_width_entry,
+            self.window_size[0],
+        )
+        height = self._normalized_window_size_value(
+            self._window_size_height_entry,
+            self.window_size[1],
+        )
+        self.window_size = (width, height)
+        for entry, value in (
+            (self._window_size_width_entry, width),
+            (self._window_size_height_entry, height),
+        ):
+            if entry is not None:
+                entry.delete(0, "end")
+                entry.insert(0, str(value))
+        return self.window_size
+
+    def set_window_size_status(
+        self,
+        message: str,
+        *,
+        success: bool = True,
+    ) -> None:
+        if self._window_size_status_label is None:
+            return
+        prefix = "● "
+        self._window_size_status_label.configure(
+            text=prefix + message.strip(),
+            fg=PRIMARY if success else WARNING,
+        )
+
+    def _show_window_size_result(
+        self,
+        result: WindowSizeAdjustmentResult,
+    ) -> None:
+        if not isinstance(result, WindowSizeAdjustmentResult):
+            raise TypeError(
+                "window size callback must return WindowSizeAdjustmentResult."
+            )
+        if result.success and result.action == "read_main":
+            self.window_size = (result.width, result.height)
+            for entry, value in (
+                (self._window_size_width_entry, result.width),
+                (self._window_size_height_entry, result.height),
+            ):
+                if entry is not None:
+                    entry.delete(0, "end")
+                    entry.insert(0, str(value))
+        self.set_window_size_status(
+            result.player_message,
+            success=result.success,
+        )
+
+    def _load_main_window_size(self) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_read_main_window_size is None
+        ):
+            self.set_window_size_status(
+                "目前組別的主窗口尚未設定。",
+                success=False,
+            )
+            return
+        try:
+            result = self.on_read_main_window_size(
+                self.current_group_name
+            )
+            self._show_window_size_result(result)
+        except Exception as error:
+            self.set_window_size_status("讀取主窗口尺寸失敗。", success=False)
+            self._report_refresh_error(error)
+
+    def _apply_current_group_window_size(self) -> None:
+        if (
+            self.current_group_name is None
+            or self.on_apply_group_window_size is None
+        ):
+            self.set_window_size_status(
+                "目前沒有可套用的組別。",
+                success=False,
+            )
+            return
+        width, height = self._window_size_values()
+        try:
+            result = self.on_apply_group_window_size(
+                self.current_group_name,
+                width,
+                height,
+            )
+            self._show_window_size_result(result)
+        except Exception as error:
+            self.set_window_size_status("套用目前組別失敗。", success=False)
+            self._report_refresh_error(error)
+
+    def _apply_all_game_window_size(self, *, quiet: bool = False) -> None:
+        if self.on_apply_all_window_size is None:
+            if not quiet:
+                self.set_window_size_status(
+                    "遊戲視窗尺寸功能目前不可用。",
+                    success=False,
+                )
+            return
+        width, height = self._window_size_values()
+        try:
+            result = self.on_apply_all_window_size(width, height)
+            if (
+                not quiet
+                or not result.success
+                or result.changed_count > 0
+            ):
+                self._show_window_size_result(result)
+        except Exception as error:
+            self.set_window_size_status("套用遊戲視窗失敗。", success=False)
+            self._report_refresh_error(error)
+
+    def _cancel_window_size_poll(self) -> None:
+        if self._window_size_after_id is None:
+            return
+        try:
+            self.parent.after_cancel(self._window_size_after_id)
+        except Exception:
+            pass
+        self._window_size_after_id = None
+
+    def _schedule_window_size_poll(self) -> None:
+        if (
+            not self.window_size_auto_enabled
+            or self._window_size_after_id is not None
+        ):
+            return
+        self._window_size_after_id = self.parent.after(
+            1000,
+            self._poll_auto_window_size,
+        )
+
+    def _poll_auto_window_size(self) -> None:
+        self._window_size_after_id = None
+        if not self.window_size_auto_enabled:
+            return
+        self._apply_all_game_window_size(quiet=True)
+        self._schedule_window_size_poll()
+
+    def _toggle_auto_window_size(self) -> None:
+        enabled = bool(
+            self._window_size_auto_variable is not None
+            and self._window_size_auto_variable.get()
+        )
+        self.window_size_auto_enabled = enabled
+        self._cancel_window_size_poll()
+        if enabled:
+            width, height = self._window_size_values()
+            self.set_window_size_status(
+                f"新視窗自動套用已啟用：{width}×{height}。"
+            )
+            self._apply_all_game_window_size(quiet=True)
+            self._schedule_window_size_poll()
+        else:
+            self.set_window_size_status("新視窗自動套用已關閉。")
 
     def _launch_current_group(self) -> None:
         self._run_group_window_action(

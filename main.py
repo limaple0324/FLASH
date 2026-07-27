@@ -28,6 +28,7 @@ from adapters.windows_smart_reconnect import WindowsSmartReconnectController
 from adapters.windows_pointer_sync import WindowsPointerSyncController
 from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
 from adapters.windows_window import Win32WindowBackend, WindowsWindowAdapter
+from adapters.windows_client_size import Win32WindowClientSizeBackend
 from adapters.windows_work_area import WindowsWorkAreaReader
 from adapters.windows_system_tray import (
     SystemTrayController,
@@ -115,6 +116,10 @@ from services.group_role_status_service import GroupRoleStatusService
 from services.group_window_launch_service import (
     GroupWindowLaunchResult,
     GroupWindowLaunchService,
+)
+from services.window_size_adjustment_service import (
+    WindowSizeAdjustmentResult,
+    WindowSizeAdjustmentService,
 )
 from services.keyboard_sync_monitor import KeyboardSyncMonitor
 from services.logger_service import LoggerService
@@ -930,10 +935,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         except TclError:
             return None
 
+    group_window_backend = (
+        Win32WindowBackend(PowerShellLaunchFingerprintResolver())
+        if group_launch_service is not None
+        else None
+    )
     group_window_launch_service = (
         GroupWindowLaunchService(
             group_launch_service,
-            Win32WindowBackend(PowerShellLaunchFingerprintResolver()),
+            group_window_backend,
             completion_dispatch=dispatch_to_main_window,
             record_callback=(
                 operation_record_store.append
@@ -947,6 +957,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             ),
         )
         if group_launch_service is not None
+        else None
+    )
+    window_size_adjustment_service = (
+        WindowSizeAdjustmentService(
+            group_launch_service,
+            group_window_backend,
+            Win32WindowClientSizeBackend(),
+        )
+        if group_launch_service is not None
+        and group_window_backend is not None
         else None
     )
     auto_click_service = AutoClickService(
@@ -1007,6 +1027,91 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         return group_window_launch_service.start_record(
             group_name,
             complete_group_window_launch,
+        )
+
+    def record_window_size_result(
+        result: WindowSizeAdjustmentResult,
+        role_name: str,
+    ) -> WindowSizeAdjustmentResult:
+        if (
+            operation_record_store is not None
+            and (
+                not result.success
+                or result.action == "read_main"
+                or result.changed_count > 0
+            )
+        ):
+            operation_record_store.append(
+                "視窗尺寸",
+                role_name,
+                result.player_message,
+            )
+        return result
+
+    def read_main_window_size(
+        group_name: str,
+    ) -> WindowSizeAdjustmentResult:
+        if window_size_adjustment_service is None:
+            return WindowSizeAdjustmentResult(
+                False,
+                "read_main",
+                failure_code="group_plan_unavailable",
+            )
+        group = (
+            group_configuration_service.group(group_name)
+            if group_configuration_service is not None
+            else None
+        )
+        main_shortcut = (
+            group.entries[0].shortcut_path
+            if group is not None and group.entries
+            else None
+        )
+        return record_window_size_result(
+            window_size_adjustment_service.read_main(
+                group_name,
+                main_shortcut,
+            ),
+            group_name,
+        )
+
+    def apply_group_window_size(
+        group_name: str,
+        width: int,
+        height: int,
+    ) -> WindowSizeAdjustmentResult:
+        if window_size_adjustment_service is None:
+            return WindowSizeAdjustmentResult(
+                False,
+                "current_group",
+                width=width,
+                height=height,
+                failure_code="group_plan_unavailable",
+            )
+        return record_window_size_result(
+            window_size_adjustment_service.apply_current_group(
+                group_name,
+                width,
+                height,
+            ),
+            group_name,
+        )
+
+    def apply_all_window_size(
+        width: int,
+        height: int,
+    ) -> WindowSizeAdjustmentResult:
+        if window_size_adjustment_service is None:
+            return WindowSizeAdjustmentResult(
+                False,
+                "all",
+                width=width,
+                height=height,
+                failure_code="flash_window_unavailable",
+            )
+        return record_window_size_result(
+            window_size_adjustment_service.apply_all(width, height),
+            "全部遊戲視窗",
         )
 
     def show_start_status() -> None:
@@ -2125,6 +2230,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_remove_group_shortcut=remove_group_shortcut,
         on_set_group_main=set_group_main,
         on_clear_group=clear_group,
+        on_read_main_window_size=read_main_window_size,
+        on_apply_group_window_size=apply_group_window_size,
+        on_apply_all_window_size=apply_all_window_size,
         group_sync_choices_provider=(
             group_configuration_service.available_sync_members
             if group_configuration_service is not None
