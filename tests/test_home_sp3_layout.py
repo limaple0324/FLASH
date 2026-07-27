@@ -30,6 +30,11 @@ def test_home_has_real_product_pages_and_group_selection() -> None:
     assert "_build_group_summary(sidebar)" not in source
     assert "_build_header(root)" not in source
     assert 'text="+"' not in source
+    assert 'text="遊戲時間"' in source
+    assert 'text="定時按下"' in source
+    assert "設定按鈕位置" in source
+    assert "啟用定時" in source
+    assert "時間來源：系統時間" in source
 
 
 def test_current_group_page_replaces_sidebar_duplicate() -> None:

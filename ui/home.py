@@ -70,6 +70,13 @@ from services.window_size_adjustment_service import (
     MIN_FLASH_CLIENT_SIZE,
     WindowSizeAdjustmentResult,
 )
+from services.game_time_timed_click_service import (
+    GameTimeTimedClickResult,
+    GameTimeTimedClickSnapshot,
+    MAX_TIME_OFFSET_MS,
+    MIN_TIME_OFFSET_MS,
+    clamp_time_offset_ms,
+)
 from workspace.models import WorkspaceState
 
 
@@ -485,6 +492,28 @@ class HomeView:
         on_apply_all_window_size: (
             Callable[[int, int], WindowSizeAdjustmentResult] | None
         ) = None,
+        game_time_offset_ms: int = 0,
+        game_time_auto_update: bool = True,
+        timed_click_target_time: str = "",
+        timed_click_lead_ms: int = 120,
+        timed_click_repeat_count: int = 2,
+        timed_click_repeat_interval_ms: int = 250,
+        game_time_snapshot_provider: (
+            Callable[[], GameTimeTimedClickSnapshot] | None
+        ) = None,
+        on_game_time_settings_change: (
+            Callable[[int, bool], GameTimeTimedClickSnapshot] | None
+        ) = None,
+        on_capture_timed_click_target: (
+            Callable[[], GameTimeTimedClickResult] | None
+        ) = None,
+        on_timed_click_change: (
+            Callable[
+                [bool, str, int, int, int],
+                GameTimeTimedClickResult,
+            ]
+            | None
+        ) = None,
         group_sync_choices_provider: (
             Callable[[str], tuple[GroupSyncMemberChoice, ...]] | None
         ) = None,
@@ -671,6 +700,35 @@ class HomeView:
         self.on_read_main_window_size = on_read_main_window_size
         self.on_apply_group_window_size = on_apply_group_window_size
         self.on_apply_all_window_size = on_apply_all_window_size
+        self.game_time_offset_ms = clamp_time_offset_ms(game_time_offset_ms)
+        self.game_time_auto_update = bool(game_time_auto_update)
+        self.timed_click_target_time = (
+            timed_click_target_time.strip()
+            if isinstance(timed_click_target_time, str)
+            else ""
+        )
+        self.timed_click_lead_ms = (
+            timed_click_lead_ms
+            if isinstance(timed_click_lead_ms, int)
+            and 0 <= timed_click_lead_ms <= 5_000
+            else 120
+        )
+        self.timed_click_repeat_count = (
+            timed_click_repeat_count
+            if isinstance(timed_click_repeat_count, int)
+            and 1 <= timed_click_repeat_count <= 10
+            else 2
+        )
+        self.timed_click_repeat_interval_ms = (
+            timed_click_repeat_interval_ms
+            if isinstance(timed_click_repeat_interval_ms, int)
+            and 50 <= timed_click_repeat_interval_ms <= 3_000
+            else 250
+        )
+        self.game_time_snapshot_provider = game_time_snapshot_provider
+        self.on_game_time_settings_change = on_game_time_settings_change
+        self.on_capture_timed_click_target = on_capture_timed_click_target
+        self.on_timed_click_change = on_timed_click_change
         self.group_sync_choices_provider = group_sync_choices_provider
         self.group_sync_relations_provider = group_sync_relations_provider
         self.on_add_group_sync_relation = on_add_group_sync_relation
@@ -801,6 +859,18 @@ class HomeView:
         self._window_size_auto_variable: IntVar | None = None
         self._window_size_status_label: Label | None = None
         self._window_size_after_id: str | None = None
+        self._game_time_offset_entry: Entry | None = None
+        self._game_time_auto_variable: IntVar | None = None
+        self._game_time_value_label: Label | None = None
+        self._game_time_after_id: str | None = None
+        self._timed_click_target_entry: Entry | None = None
+        self._timed_click_lead_entry: Entry | None = None
+        self._timed_click_repeat_entry: Entry | None = None
+        self._timed_click_interval_entry: Entry | None = None
+        self._timed_click_point_label: Label | None = None
+        self._timed_click_status_label: Label | None = None
+        self._timed_click_toggle_button: Button | None = None
+        self._timed_click_capture_after_id: str | None = None
         self._group_name_entry: Entry | None = None
         self._group_sync_choice_variable: StringVar | None = None
         self._group_sync_choice_ids: dict[str, str] = {}
@@ -905,6 +975,8 @@ class HomeView:
         active_page = self._active_page
         self._cancel_background_resize()
         self._cancel_window_size_poll()
+        self._cancel_game_time_tick()
+        self._cancel_timed_click_capture()
         if self._mousewheel_binding_id is not None:
             try:
                 self.parent.unbind(
@@ -1024,6 +1096,7 @@ class HomeView:
         self._pages["settings"] = self._build_settings_page(content)
         if self.window_size_auto_enabled:
             self._schedule_window_size_poll()
+        self._schedule_game_time_tick()
         for page_name, page in self._pages.items():
             background_label = Label(
                 page,
@@ -2684,6 +2757,9 @@ class HomeView:
         ).pack(fill=X, pady=(8, 0))
         self._refresh_smart_reconnect_controls()
 
+        self._build_game_time_card(page)
+        self._build_timed_click_card(page)
+
         auto_click_card = self._card(page)
         auto_click_card.pack(fill=X, pady=(14, 0))
         Label(
@@ -2791,6 +2867,200 @@ class HomeView:
         )
         self._refresh_auto_click_controls()
         return page
+
+    def _build_game_time_card(self, page) -> None:
+        card = self._card(page)
+        card.pack(fill=X, pady=(14, 0))
+        Label(
+            card,
+            text="遊戲時間",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        row = Frame(card, bg=SURFACE)
+        row.pack(fill=X, pady=(10, 0))
+        Label(
+            row,
+            text="時間來源：系統時間",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=TEXT,
+        ).pack(side=LEFT, padx=(0, 12))
+        Label(
+            row,
+            text="偏移ms",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+        ).pack(side=LEFT)
+        self._game_time_offset_entry = Entry(
+            row,
+            width=8,
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+        )
+        self._game_time_offset_entry.insert(0, str(self.game_time_offset_ms))
+        self._game_time_offset_entry.pack(side=LEFT, padx=(6, 12), ipady=5)
+        self._game_time_offset_entry.bind(
+            "<FocusOut>",
+            lambda _event: self._apply_game_time_settings(),
+        )
+        self._game_time_offset_entry.bind(
+            "<Return>",
+            lambda _event: self._apply_game_time_settings(),
+        )
+        self._game_time_auto_variable = IntVar(
+            master=self.parent,
+            value=1 if self.game_time_auto_update else 0,
+        )
+        Checkbutton(
+            row,
+            text="自動更新",
+            variable=self._game_time_auto_variable,
+            command=self._apply_game_time_settings,
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=TEXT,
+            activebackground=SURFACE,
+            selectcolor=BACKGROUND,
+        ).pack(side=LEFT, padx=(0, 12))
+        self._game_time_value_label = Label(
+            row,
+            text="遊戲時間：讀取中",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=SURFACE,
+            fg=PRIMARY,
+            anchor="w",
+        )
+        self._game_time_value_label.pack(side=LEFT, fill=X, expand=True)
+        Label(
+            card,
+            text=(
+                f"偏移可設定 {MIN_TIME_OFFSET_MS}～{MAX_TIME_OFFSET_MS} 毫秒；"
+                "不讀取遊戲畫面或記憶體。"
+            ),
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        ).pack(fill=X, pady=(8, 0))
+
+    def _build_timed_click_card(self, page) -> None:
+        card = self._card(page)
+        card.pack(fill=X, pady=(14, 0))
+        Label(
+            card,
+            text="定時按下",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        row = Frame(card, bg=SURFACE)
+        row.pack(fill=X, pady=(10, 0))
+        Label(
+            row,
+            text="目標時間",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+        ).pack(side=LEFT)
+        self._timed_click_target_entry = Entry(
+            row,
+            width=14,
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+        )
+        self._timed_click_target_entry.insert(0, self.timed_click_target_time)
+        self._timed_click_target_entry.pack(
+            side=LEFT,
+            padx=(6, 12),
+            ipady=5,
+        )
+        for label_text, attribute, initial, width in (
+            ("提前ms", "_timed_click_lead_entry", self.timed_click_lead_ms, 7),
+            ("連點", "_timed_click_repeat_entry", self.timed_click_repeat_count, 5),
+            (
+                "間隔ms",
+                "_timed_click_interval_entry",
+                self.timed_click_repeat_interval_ms,
+                7,
+            ),
+        ):
+            Label(
+                row,
+                text=label_text,
+                font=("Microsoft JhengHei UI", 9),
+                bg=SURFACE,
+                fg=MUTED,
+            ).pack(side=LEFT)
+            entry = Entry(
+                row,
+                width=width,
+                font=("Microsoft JhengHei UI", 10),
+                bg=BACKGROUND,
+                fg=TEXT,
+                relief="flat",
+                bd=0,
+            )
+            entry.insert(0, str(initial))
+            entry.pack(side=LEFT, padx=(6, 12), ipady=5)
+            setattr(self, attribute, entry)
+        actions = Frame(card, bg=SURFACE)
+        actions.pack(fill=X, pady=(10, 0))
+        self._button(
+            actions,
+            "設定按鈕位置",
+            self._capture_timed_click_target,
+        ).pack(side=LEFT)
+        self._timed_click_toggle_button = self._button(
+            actions,
+            "啟用定時",
+            self._toggle_timed_click,
+            primary=True,
+        )
+        self._timed_click_toggle_button.pack(side=LEFT, padx=(8, 0))
+        self._button(
+            actions,
+            "取消",
+            self._cancel_timed_click,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._timed_click_point_label = Label(
+            actions,
+            text="按鈕位置：未設定",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+        )
+        self._timed_click_point_label.pack(side=LEFT, padx=(12, 0))
+        self._timed_click_status_label = Label(
+            card,
+            text="● 定時按下：未啟用",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        )
+        self._timed_click_status_label.pack(fill=X, pady=(8, 0))
+        Label(
+            card,
+            text=(
+                "設定位置後才可啟用；只操作該唯一角色視窗，"
+                "不切換、不啟用、不移動其他視窗。"
+            ),
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        ).pack(fill=X, pady=(4, 0))
 
     def _build_feature_hotkey_selector(
         self,
@@ -3018,6 +3288,215 @@ class HomeView:
                 ),
                 fg=SUCCESS if self.auto_click_running else MUTED,
             )
+
+    def _cancel_game_time_tick(self) -> None:
+        if self._game_time_after_id is None:
+            return
+        try:
+            self.parent.after_cancel(self._game_time_after_id)
+        except Exception:
+            pass
+        self._game_time_after_id = None
+
+    def _schedule_game_time_tick(self) -> None:
+        if self._game_time_after_id is not None:
+            return
+        self._game_time_after_id = self.parent.after(
+            50,
+            self._poll_game_time,
+        )
+
+    def _poll_game_time(self) -> None:
+        self._game_time_after_id = None
+        snapshot = None
+        if self.game_time_snapshot_provider is not None:
+            try:
+                snapshot = self.game_time_snapshot_provider()
+            except Exception as error:
+                self._report_refresh_error(error)
+        if (
+            isinstance(snapshot, GameTimeTimedClickSnapshot)
+            and self._game_time_value_label is not None
+        ):
+            self.game_time_offset_ms = snapshot.offset_ms
+            self.game_time_auto_update = snapshot.auto_update
+            self._game_time_value_label.configure(
+                text=(
+                    f"遊戲時間：{snapshot.current_time_text}"
+                    if snapshot.auto_update
+                    else "遊戲時間：自動更新已關閉"
+                ),
+                fg=PRIMARY if snapshot.auto_update else MUTED,
+            )
+        self._schedule_game_time_tick()
+
+    def _apply_game_time_settings(self) -> None:
+        value = (
+            self._game_time_offset_entry.get().strip()
+            if self._game_time_offset_entry is not None
+            else str(self.game_time_offset_ms)
+        )
+        offset = clamp_time_offset_ms(value)
+        auto_update = bool(
+            self._game_time_auto_variable is not None
+            and self._game_time_auto_variable.get()
+        )
+        self.game_time_offset_ms = offset
+        self.game_time_auto_update = auto_update
+        if self._game_time_offset_entry is not None:
+            self._game_time_offset_entry.delete(0, "end")
+            self._game_time_offset_entry.insert(0, str(offset))
+        if self.on_game_time_settings_change is None:
+            return
+        try:
+            self.on_game_time_settings_change(offset, auto_update)
+        except Exception as error:
+            self._report_refresh_error(error)
+
+    def _timed_click_values(self) -> tuple[str, int, int, int]:
+        if (
+            self._timed_click_target_entry is None
+            or self._timed_click_lead_entry is None
+            or self._timed_click_repeat_entry is None
+            or self._timed_click_interval_entry is None
+        ):
+            raise RuntimeError("timed click controls are unavailable")
+        target = self._timed_click_target_entry.get().strip()
+        try:
+            lead = int(self._timed_click_lead_entry.get().strip())
+            repeats = int(self._timed_click_repeat_entry.get().strip())
+            interval = int(self._timed_click_interval_entry.get().strip())
+        except ValueError as error:
+            raise ValueError("定時按下的數值設定必須是整數。") from error
+        return target, lead, repeats, interval
+
+    def set_timed_click_result(
+        self,
+        result: GameTimeTimedClickResult,
+    ) -> None:
+        if not isinstance(result, GameTimeTimedClickResult):
+            raise TypeError(
+                "timed click callback must return GameTimeTimedClickResult"
+            )
+        snapshot = result.snapshot
+        if snapshot is not None:
+            self.game_time_offset_ms = snapshot.offset_ms
+            self.game_time_auto_update = snapshot.auto_update
+            self.timed_click_lead_ms = snapshot.lead_ms
+            self.timed_click_repeat_count = snapshot.repeat_count
+            self.timed_click_repeat_interval_ms = snapshot.repeat_interval_ms
+            if self._game_time_auto_variable is not None:
+                self._game_time_auto_variable.set(
+                    1 if snapshot.auto_update else 0
+                )
+            if self._timed_click_toggle_button is not None:
+                self._timed_click_toggle_button.configure(
+                    text="取消定時" if snapshot.enabled else "啟用定時",
+                    bg=WARNING if snapshot.enabled else PRIMARY,
+                )
+            if self._timed_click_point_label is not None:
+                target = snapshot.target
+                self._timed_click_point_label.configure(
+                    text=(
+                        "按鈕位置：未設定"
+                        if target is None
+                        else "按鈕位置："
+                        + (target.display_name or "目前角色")
+                        + " 已設定"
+                    ),
+                    fg=PRIMARY if target is not None else MUTED,
+                )
+        if self._timed_click_status_label is not None:
+            self._timed_click_status_label.configure(
+                text="● " + result.message,
+                fg=PRIMARY if result.success else WARNING,
+            )
+
+    def _cancel_timed_click_capture(self) -> None:
+        if self._timed_click_capture_after_id is None:
+            return
+        try:
+            self.parent.after_cancel(self._timed_click_capture_after_id)
+        except Exception:
+            pass
+        self._timed_click_capture_after_id = None
+
+    def _capture_timed_click_target(self) -> None:
+        if self.on_capture_timed_click_target is None:
+            return
+        self._cancel_timed_click_capture()
+        if self._timed_click_status_label is not None:
+            self._timed_click_status_label.configure(
+                text="● 請把滑鼠移到按鈕上，3 秒後抓取。",
+                fg=PRIMARY,
+            )
+        self._timed_click_capture_after_id = self.parent.after(
+            3_000,
+            self._finish_timed_click_capture,
+        )
+
+    def _finish_timed_click_capture(self) -> None:
+        self._timed_click_capture_after_id = None
+        if self.on_capture_timed_click_target is None:
+            return
+        try:
+            self.set_timed_click_result(
+                self.on_capture_timed_click_target()
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+
+    def _toggle_timed_click(self) -> None:
+        if self.on_timed_click_change is None:
+            return
+        snapshot = (
+            self.game_time_snapshot_provider()
+            if self.game_time_snapshot_provider is not None
+            else None
+        )
+        if isinstance(snapshot, GameTimeTimedClickSnapshot) and snapshot.enabled:
+            self._cancel_timed_click()
+            return
+        try:
+            target, lead, repeats, interval = self._timed_click_values()
+            result = self.on_timed_click_change(
+                True,
+                target,
+                lead,
+                repeats,
+                interval,
+            )
+            self.set_timed_click_result(result)
+        except Exception as error:
+            if self._timed_click_status_label is not None:
+                self._timed_click_status_label.configure(
+                    text=f"● {error}",
+                    fg=WARNING,
+                )
+
+    def _cancel_timed_click(self) -> None:
+        self._cancel_timed_click_capture()
+        if self.on_timed_click_change is None:
+            return
+        try:
+            target, lead, repeats, interval = self._timed_click_values()
+        except Exception:
+            target = ""
+            lead = self.timed_click_lead_ms
+            repeats = self.timed_click_repeat_count
+            interval = self.timed_click_repeat_interval_ms
+        try:
+            self.set_timed_click_result(
+                self.on_timed_click_change(
+                    False,
+                    target,
+                    lead,
+                    repeats,
+                    interval,
+                )
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
 
     def _build_characters_page(self, parent) -> Frame:
         page = Frame(parent, bg=BACKGROUND)
@@ -4086,6 +4565,8 @@ class HomeView:
 
     def dispose(self) -> None:
         """Release background image resources before the Tk window closes."""
+        self._cancel_game_time_tick()
+        self._cancel_timed_click_capture()
         self._background_prepare_cancel.set()
         self._background_prepare_running = False
         if self._background_prepare_poll_id is not None:

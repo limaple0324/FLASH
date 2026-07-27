@@ -25,7 +25,11 @@ from adapters.windows_launch_fingerprint import (
     normalize_launch_fingerprint,
 )
 from adapters.windows_smart_reconnect import WindowsSmartReconnectController
-from adapters.windows_pointer_sync import WindowsPointerSyncController
+from adapters.windows_pointer_sync import (
+    Win32PointerMessageBackend,
+    WindowsPointerSyncController,
+)
+from adapters.windows_timed_click import WindowsTimedClickBackend
 from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
 from adapters.windows_window import Win32WindowBackend, WindowsWindowAdapter
 from adapters.windows_client_size import Win32WindowClientSizeBackend
@@ -121,6 +125,11 @@ from services.window_size_adjustment_service import (
     WindowSizeAdjustmentResult,
     WindowSizeAdjustmentService,
 )
+from services.game_time_timed_click_service import (
+    GameTimeTimedClickResult,
+    GameTimeTimedClickService,
+    clamp_time_offset_ms,
+)
 from services.keyboard_sync_monitor import KeyboardSyncMonitor
 from services.logger_service import LoggerService
 from services.mouse_sync_monitor import MouseSyncMonitor
@@ -178,6 +187,9 @@ ACTIVITY_REMINDER_STATE_FILENAME = "activity_reminder_state.json"
 ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
 SYNC_SELECTED_KEYS_KEY = "sync_selected_keys"
 FEATURE_HOTKEYS_KEY = "feature_hotkeys"
+GAME_TIME_OFFSET_MS_KEY = "game_time_offset_ms"
+GAME_TIME_AUTO_UPDATE_KEY = "game_time_auto_update"
+TIMED_CLICK_SETTINGS_KEY = "timed_click_settings"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 RECONNECT_REFERENCE_DIR = Path("assets") / "reconnect_reference"
@@ -276,6 +288,14 @@ def build_services(root: Path | None = None):
                 "sync": "XBUTTON1",
                 "reconnect": "",
                 "auto_click": "F1",
+            },
+            GAME_TIME_OFFSET_MS_KEY: 0,
+            GAME_TIME_AUTO_UPDATE_KEY: True,
+            TIMED_CLICK_SETTINGS_KEY: {
+                "target_time": "",
+                "lead_ms": 120,
+                "repeat_count": 2,
+                "repeat_interval_ms": 250,
             },
         }
     )
@@ -969,6 +989,76 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         and group_window_backend is not None
         else None
     )
+
+    def current_timed_click_fingerprints() -> tuple[str, ...]:
+        if workspace_service is None or sync_scope_service is None:
+            return ()
+        state = workspace_service.snapshot()
+        group_name = (
+            state.current_group.name
+            if state.current_group is not None
+            else None
+        )
+        if group_name is None:
+            return ()
+        scope = sync_scope_service.scope(group_name)
+        return scope.fingerprints if scope.ready else ()
+
+    def current_operation_role_name() -> str:
+        if workspace_service is None:
+            return "目前組別"
+        state = workspace_service.snapshot()
+        return (
+            state.current_group.name
+            if state.current_group is not None
+            else "目前組別"
+        )
+
+    def complete_timed_click_result(
+        result: GameTimeTimedClickResult,
+    ) -> None:
+        if (
+            operation_record_store is not None
+            and (
+                result.action != "poll"
+                or not result.success
+            )
+        ):
+            operation_record_store.append(
+                "定時按下",
+                current_operation_role_name(),
+                result.message,
+            )
+        if home_view is not None:
+            home_view.set_timed_click_result(result)
+
+    game_time_timed_click_service = (
+        GameTimeTimedClickService(
+            WindowsTimedClickBackend(
+                group_window_backend,
+                Win32PointerMessageBackend(),
+            ),
+            schedule=window.after,
+            cancel=window.after_cancel,
+            allowed_fingerprints_provider=current_timed_click_fingerprints,
+            result_callback=complete_timed_click_result,
+        )
+        if group_window_backend is not None
+        else None
+    )
+    if game_time_timed_click_service is not None:
+        game_time_timed_click_service.configure_game_time(
+            offset_ms=(
+                config.get(GAME_TIME_OFFSET_MS_KEY, 0)
+                if config is not None
+                else 0
+            ),
+            auto_update=(
+                config.get(GAME_TIME_AUTO_UPDATE_KEY, True)
+                if config is not None
+                else True
+            ),
+        )
     auto_click_service = AutoClickService(
         Win32CursorClickBackend(),
         schedule=window.after,
@@ -1391,6 +1481,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
             return
         auto_click_service.stop()
+        if game_time_timed_click_service is not None:
+            game_time_timed_click_service.clear_target(notify=False)
         workspace_service.set_current_group(
             group_selection_service.workspace_group(choice)
         )
@@ -1428,6 +1520,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     def stop_group_automation_for_configuration_change() -> None:
         auto_click_service.stop()
+        if game_time_timed_click_service is not None:
+            game_time_timed_click_service.clear_target(notify=False)
         if keyboard_sync_monitor is not None:
             keyboard_sync_monitor.stop()
             if mouse_sync_monitor is not None:
@@ -2165,6 +2259,116 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         auto_click_service.stop()
         return True
 
+    raw_timed_click_settings = (
+        config.get(TIMED_CLICK_SETTINGS_KEY, {})
+        if config is not None
+        else {}
+    )
+    if not isinstance(raw_timed_click_settings, dict):
+        raw_timed_click_settings = {}
+    configured_timed_click_target = (
+        raw_timed_click_settings.get("target_time", "")
+        if isinstance(raw_timed_click_settings.get("target_time", ""), str)
+        else ""
+    )
+
+    def bounded_timed_setting(
+        key: str,
+        fallback: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        try:
+            value = int(raw_timed_click_settings.get(key, fallback))
+        except (TypeError, ValueError):
+            return fallback
+        return value if minimum <= value <= maximum else fallback
+
+    configured_timed_click_lead = bounded_timed_setting(
+        "lead_ms",
+        120,
+        0,
+        5_000,
+    )
+    configured_timed_click_repeat = bounded_timed_setting(
+        "repeat_count",
+        2,
+        1,
+        10,
+    )
+    configured_timed_click_interval = bounded_timed_setting(
+        "repeat_interval_ms",
+        250,
+        50,
+        3_000,
+    )
+
+    def change_game_time_settings(
+        offset_ms: int,
+        auto_update: bool,
+    ):
+        if game_time_timed_click_service is None:
+            raise RuntimeError("遊戲時間服務尚未準備完成。")
+        normalized_offset = clamp_time_offset_ms(offset_ms)
+        snapshot = game_time_timed_click_service.configure_game_time(
+            offset_ms=normalized_offset,
+            auto_update=auto_update,
+        )
+        if config is not None:
+            config.update_values(
+                {
+                    GAME_TIME_OFFSET_MS_KEY: normalized_offset,
+                    GAME_TIME_AUTO_UPDATE_KEY: bool(auto_update),
+                }
+            )
+        return snapshot
+
+    def capture_timed_click_target() -> GameTimeTimedClickResult:
+        if game_time_timed_click_service is None:
+            return GameTimeTimedClickResult(
+                False,
+                "capture",
+                "定時按下服務尚未準備完成。",
+                "timed_click_unavailable",
+            )
+        return game_time_timed_click_service.capture_target()
+
+    def change_timed_click(
+        enabled: bool,
+        target_time: str,
+        lead_ms: int,
+        repeat_count: int,
+        repeat_interval_ms: int,
+    ) -> GameTimeTimedClickResult:
+        if game_time_timed_click_service is None:
+            return GameTimeTimedClickResult(
+                False,
+                "arm" if enabled else "cancel",
+                "定時按下服務尚未準備完成。",
+                "timed_click_unavailable",
+            )
+        if not enabled:
+            return game_time_timed_click_service.cancel()
+        result = game_time_timed_click_service.arm(
+            target_time,
+            lead_ms=lead_ms,
+            repeat_count=repeat_count,
+            repeat_interval_ms=repeat_interval_ms,
+        )
+        if config is not None:
+            values = {
+                TIMED_CLICK_SETTINGS_KEY: {
+                    "target_time": target_time.strip(),
+                    "lead_ms": lead_ms,
+                    "repeat_count": repeat_count,
+                    "repeat_interval_ms": repeat_interval_ms,
+                },
+            }
+            if result.success:
+                values[GAME_TIME_AUTO_UPDATE_KEY] = True
+            config.update_values(values)
+        return result
+
     group_choices = (
         group_selection_service.choices()
         if group_selection_service is not None
@@ -2233,6 +2437,28 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_read_main_window_size=read_main_window_size,
         on_apply_group_window_size=apply_group_window_size,
         on_apply_all_window_size=apply_all_window_size,
+        game_time_offset_ms=(
+            clamp_time_offset_ms(config.get(GAME_TIME_OFFSET_MS_KEY, 0))
+            if config is not None
+            else 0
+        ),
+        game_time_auto_update=(
+            bool(config.get(GAME_TIME_AUTO_UPDATE_KEY, True))
+            if config is not None
+            else True
+        ),
+        timed_click_target_time=configured_timed_click_target,
+        timed_click_lead_ms=configured_timed_click_lead,
+        timed_click_repeat_count=configured_timed_click_repeat,
+        timed_click_repeat_interval_ms=configured_timed_click_interval,
+        game_time_snapshot_provider=(
+            game_time_timed_click_service.snapshot
+            if game_time_timed_click_service is not None
+            else None
+        ),
+        on_game_time_settings_change=change_game_time_settings,
+        on_capture_timed_click_target=capture_timed_click_target,
+        on_timed_click_change=change_timed_click,
         group_sync_choices_provider=(
             group_configuration_service.available_sync_members
             if group_configuration_service is not None
@@ -2516,6 +2742,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         feature_hotkey_monitor.stop()
         group_launch_hotkey_monitor.stop()
         auto_click_service.close(timeout_seconds=1.0)
+        if game_time_timed_click_service is not None:
+            game_time_timed_click_service.stop()
         if group_role_status_monitor is not None:
             group_role_status_monitor.stop(timeout_seconds=1.0)
         if deferred_sync_monitor is not None:

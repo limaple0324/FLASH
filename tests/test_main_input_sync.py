@@ -9,9 +9,12 @@ from adapters.windows_smart_reconnect import WindowsSmartReconnectController
 from config.config_manager import ConfigManager
 from core.sp1_boundaries import SmartReconnectBoundary
 from main import (
+    GAME_TIME_AUTO_UPDATE_KEY,
+    GAME_TIME_OFFSET_MS_KEY,
     INPUT_POLICY_KEY,
     SMART_RECONNECT_ENABLED_KEY,
     SMART_RECONNECT_CONSENT_KEY,
+    TIMED_CLICK_SETTINGS_KEY,
     build_services,
 )
 from services.app_context import AppContext
@@ -31,6 +34,14 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     assert config.get(INPUT_POLICY_KEY) == WindowInputPolicy.ALL.value
     assert config.get(SMART_RECONNECT_ENABLED_KEY) is False
     assert config.get(SMART_RECONNECT_CONSENT_KEY) is False
+    assert config.get(GAME_TIME_OFFSET_MS_KEY) == 0
+    assert config.get(GAME_TIME_AUTO_UPDATE_KEY) is True
+    assert config.get(TIMED_CLICK_SETTINGS_KEY) == {
+        "target_time": "",
+        "lead_ms": 120,
+        "repeat_count": 2,
+        "repeat_interval_ms": 250,
+    }
     assert isinstance(controller, WindowsInputSyncController)
     assert isinstance(reconnect, WindowsSmartReconnectController)
     assert reconnect_boundary is reconnect

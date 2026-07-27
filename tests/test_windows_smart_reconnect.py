@@ -1015,6 +1015,34 @@ def test_one_transient_disconnect_frame_does_not_start_automation():
     assert fixture.mouse.clicks == []
 
 
+def test_unknown_peer_does_not_delay_disconnect_second_frame_for_one_minute():
+    fixture = make_controller([2, 255])
+
+    result = fixture.controller.reconnect()
+
+    assert result.details["unknown_windows"] == 1
+    assert result.details["actionable_windows"] == 0
+    assert result.details["next_check_seconds"] == 2
+    assert fixture.mouse.clicks == []
+
+
+def test_unknown_peer_does_not_delay_force_login_second_frame_for_one_minute():
+    fixture = make_controller([2, 255])
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    fixture.capture.states[1] = 3
+
+    result = fixture.controller.reconnect()
+
+    assert result.details["state_counts"] == {
+        "force_login_start": 1,
+        "unknown": 1,
+    }
+    assert result.details["actionable_windows"] == 0
+    assert result.details["next_check_seconds"] == 10
+    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
+
+
 def test_changed_action_target_requires_two_new_matching_frames():
     fixture = make_controller([4, 1])
     fingerprint = make_window(1).launch_fingerprint

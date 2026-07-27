@@ -1170,6 +1170,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         }
         recognized: list[tuple[WindowInfo, str, ScreenRecognition]] = []
         confirmed_action_fingerprints: set[str] = set()
+        pending_confirmation_delays: list[int] = []
         captured_windows = 0
         for window in windows:
             fingerprint = normalize_launch_fingerprint(
@@ -1237,6 +1238,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     confirmed_action_fingerprints.add(fingerprint)
                 elif not is_action_candidate:
                     self._clear_action_confirmation(fingerprint)
+            if (
+                is_action_candidate
+                and fingerprint not in confirmed_action_fingerprints
+            ):
+                pending_confirmation_delays.append(
+                    self._policy.decide(recognition.state).delay_seconds
+                )
             retry = self._action_retry_after.get(fingerprint)
             if retry is not None and retry[0] is not recognition.state:
                 self._action_retry_after.pop(fingerprint, None)
@@ -1436,6 +1444,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     actionable + battle_actionable
                 )
             )
+        elif pending_confirmation_delays:
+            # A first safe frame is not an unknown failure. Recheck at the
+            # state-specific progress interval so the required second frame
+            # is confirmed promptly even when other windows are unknown.
+            next_check_seconds = min(pending_confirmation_delays)
         elif unknown_windows or failures:
             next_check_seconds = self._policy.retry_interval_seconds
         elif decisions:
