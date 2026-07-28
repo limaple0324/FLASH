@@ -27,7 +27,7 @@ def test_sp3_branch_builds_the_complete_cumulative_snapshot():
     assert "$buildKind = 'sp3_snapshot'" in metadata_step
     assert "$publishTarget = 'none'" in metadata_step
     assert "$artifactPrefix = 'FLASH-SP1+SP2+SP3-Windows'" in metadata_step
-    assert "$parts[1] -ne 'SP3'" in metadata_step
+    assert "$metadata.milestone -ne 'SP3'" in metadata_step
 
 
 def test_sp3_snapshot_preserves_every_independent_delivery():

@@ -60,6 +60,10 @@ from services.background_image_service import (
     DEFAULT_BACKGROUND_FILL_COLOR,
     DEFAULT_BACKGROUND_OPACITY,
 )
+from services.card_preview_selection_service import (
+    CardPreviewChoice,
+    CardPreviewSelectionState,
+)
 from services.sync_operation_record_store import (
     OperationRecordSearchResult,
 )
@@ -587,6 +591,15 @@ class HomeView:
         ) = None,
         card_display_seconds_provider: Callable[[], int] | None = None,
         on_card_display_seconds_update: Callable[[int], object] | None = None,
+        card_preview_choices_provider: (
+            Callable[[], tuple[CardPreviewChoice, ...]] | None
+        ) = None,
+        on_card_preview_select: (
+            Callable[[str], CardPreviewSelectionState] | None
+        ) = None,
+        on_card_preview_clear: (
+            Callable[[], CardPreviewSelectionState] | None
+        ) = None,
         habit_settings_provider: (
             Callable[[], PlayerHabitSettingsView] | None
         ) = None,
@@ -820,6 +833,11 @@ class HomeView:
         self.on_auto_click_change = on_auto_click_change
         self.card_display_seconds_provider = card_display_seconds_provider
         self.on_card_display_seconds_update = on_card_display_seconds_update
+        self.card_preview_choices_provider = (
+            card_preview_choices_provider
+        )
+        self.on_card_preview_select = on_card_preview_select
+        self.on_card_preview_clear = on_card_preview_clear
         self.habit_settings_provider = habit_settings_provider
         self.on_habit_observation_days_update = (
             on_habit_observation_days_update
@@ -934,6 +952,8 @@ class HomeView:
         self._operation_record_date_entry: Entry | None = None
         self._operation_record_role_entry: Entry | None = None
         self._operation_record_search_frame: Frame | None = None
+        self._card_preview_variable: StringVar | None = None
+        self._card_preview_status_label: Label | None = None
         self._page_canvas: Canvas | None = None
         self._page_canvas_window: int | None = None
         self._theme_variable: StringVar | None = None
@@ -4022,6 +4042,95 @@ class HomeView:
             primary=True,
         ).pack(side=LEFT, padx=(8, 0))
 
+        preview_card = self._card(page)
+        preview_card.pack(fill=X, pady=(14, 0))
+        Label(
+            preview_card,
+            text="提醒卡樣式",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        Label(
+            preview_card,
+            text=(
+                "只會套用已確認的提醒卡樣式；選擇會保存，"
+                "下次開啟程式自動恢復。"
+            ),
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
+        ).pack(fill=X, pady=(6, 12))
+        preview_choices = self._card_preview_choices()
+        selected_choice = next(
+            (choice for choice in preview_choices if choice.selected),
+            None,
+        )
+        preview_row = Frame(preview_card, bg=SURFACE)
+        preview_row.pack(fill=X)
+        choice_labels = tuple(
+            choice.display_name for choice in preview_choices
+        )
+        self._card_preview_variable = StringVar(
+            master=self.parent,
+            value=(
+                selected_choice.display_name
+                if selected_choice is not None
+                else (choice_labels[0] if choice_labels else "尚無可用樣式")
+            ),
+        )
+        preview_menu = OptionMenu(
+            preview_row,
+            self._card_preview_variable,
+            *(choice_labels or ("尚無可用樣式",)),
+        )
+        preview_menu.configure(
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            activebackground=BORDER,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        preview_menu["menu"].configure(
+            font=("Microsoft JhengHei UI", 10)
+        )
+        preview_menu.pack(side=LEFT, fill=X, expand=True)
+        apply_preview_button = self._button(
+            preview_row,
+            "套用樣式",
+            self._apply_card_preview_choice,
+            primary=True,
+        )
+        apply_preview_button.pack(side=LEFT, padx=(8, 0))
+        clear_preview_button = self._button(
+            preview_row,
+            "停用提醒浮層",
+            self._clear_card_preview_choice,
+        )
+        clear_preview_button.pack(side=LEFT, padx=(8, 0))
+        if not preview_choices or self.on_card_preview_select is None:
+            apply_preview_button.configure(state=DISABLED)
+        if self.on_card_preview_clear is None:
+            clear_preview_button.configure(state=DISABLED)
+        self._card_preview_status_label = Label(
+            preview_card,
+            text=(
+                f"目前樣式：{selected_choice.display_name}"
+                if selected_choice is not None
+                else "提醒浮層目前已停用。"
+            ),
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        )
+        self._card_preview_status_label.pack(fill=X, pady=(10, 0))
+
         habit_card = self._card(page)
         habit_card.pack(fill=X, pady=(14, 0))
         Label(
@@ -4761,6 +4870,68 @@ class HomeView:
             return
         self._card_seconds_entry.delete(0, "end")
         self._card_seconds_entry.insert(0, str(confirmed))
+
+    def _card_preview_choices(self) -> tuple[CardPreviewChoice, ...]:
+        if self.card_preview_choices_provider is None:
+            return ()
+        choices = self.card_preview_choices_provider()
+        if not isinstance(choices, tuple) or any(
+            not isinstance(choice, CardPreviewChoice)
+            for choice in choices
+        ):
+            raise TypeError(
+                "card preview choices provider returned invalid values."
+            )
+        return choices
+
+    def _set_card_preview_status(self) -> None:
+        choices = self._card_preview_choices()
+        selected = next(
+            (choice for choice in choices if choice.selected),
+            None,
+        )
+        if self._card_preview_variable is not None and selected is not None:
+            self._card_preview_variable.set(selected.display_name)
+        if self._card_preview_status_label is not None:
+            self._card_preview_status_label.configure(
+                text=(
+                    f"目前樣式：{selected.display_name}"
+                    if selected is not None
+                    else "提醒浮層目前已停用。"
+                )
+            )
+
+    def _apply_card_preview_choice(self) -> None:
+        if (
+            self._card_preview_variable is None
+            or self.on_card_preview_select is None
+        ):
+            return
+        selected_label = self._card_preview_variable.get()
+        choice = next(
+            (
+                item
+                for item in self._card_preview_choices()
+                if item.display_name == selected_label
+            ),
+            None,
+        )
+        if choice is None:
+            return
+        try:
+            self.on_card_preview_select(choice.profile_id)
+            self._set_card_preview_status()
+        except Exception as error:
+            self._report_refresh_error(error)
+
+    def _clear_card_preview_choice(self) -> None:
+        if self.on_card_preview_clear is None:
+            return
+        try:
+            self.on_card_preview_clear()
+            self._set_card_preview_status()
+        except Exception as error:
+            self._report_refresh_error(error)
 
     def _render_habit_preferences(
         self,

@@ -243,7 +243,8 @@ function Assert-ReleaseIdentity(
     $latest = Read-KeyValueFile -Path $latestPath -DisplayName "LATEST.txt"
     $channel = Read-KeyValueFile -Path $channelPath -DisplayName "UPDATE_CHANNEL.txt"
 
-    Require-MetadataValue $buildInfo "product" "FLASH" "BUILD_INFO.txt"
+    Require-MetadataValue $buildInfo "product" ([string][char]0x8F14) "BUILD_INFO.txt"
+    Require-MetadataValue $buildInfo "technical_name" "FLASH" "BUILD_INFO.txt"
     Require-MetadataValue $buildInfo "milestone" "SP1" "BUILD_INFO.txt"
     foreach ($key in @("source_branch", "build_kind", "publish_target")) {
         Require-MetadataValue $buildInfo $key $ExpectedChannel[$key] "BUILD_INFO.txt"

@@ -27,7 +27,7 @@ def test_sp2_branch_builds_a_separate_cumulative_snapshot():
     assert "$buildKind = 'sp2_snapshot'" in metadata_step
     assert "$publishTarget = 'none'" in metadata_step
     assert "$artifactPrefix = 'FLASH-SP1+SP2-Windows'" in metadata_step
-    assert "$parts[1] -ne 'SP2'" in metadata_step
+    assert "$metadata.milestone -ne 'SP2'" in metadata_step
 
 
 def test_sp2_snapshot_is_explicitly_separate_from_sp1_and_live_updaters():

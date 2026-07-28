@@ -24,7 +24,8 @@ def test_sp1_build_info_records_delivery_identity():
     )
 
     for metadata_line in (
-        '"product=FLASH"',
+        '"product=$env:FLASH_PRODUCT_NAME"',
+        '"technical_name=$env:FLASH_TECHNICAL_NAME"',
         '"version=$env:FLASH_VERSION"',
         '"milestone=$env:FLASH_MILESTONE"',
         '"build_kind=$env:FLASH_BUILD_KIND"',
@@ -57,7 +58,7 @@ def test_manual_build_is_an_independent_sp1_snapshot():
     assert "$publishTarget = 'none'" in metadata_step
     assert "$artifactPrefix = 'FLASH-SP1-Windows'" in metadata_step
     assert (
-        '$artifactName = "$artifactPrefix-$($parts[0])-'
+        '$artifactName = "$artifactPrefix-$($metadata.version)-'
         '$shortCommit-$artifactKind"'
     ) in metadata_step
     assert "name: ${{ env.FLASH_ARTIFACT_NAME }}" in workflow
@@ -212,7 +213,9 @@ def test_release_payload_bytes_survive_git_round_trip_with_autocrlf(tmp_path: Pa
         "安裝輔.cmd": b"@echo off\r\necho installer\r\n",
         "更新輔.cmd": b"@echo off\r\necho updater\r\n",
         "LATEST.txt": b"\xef\xbb\xbfbranch=main\r\ncommit=abc\r\n",
-        "輔系統/BUILD_INFO.txt": b"\xef\xbb\xbfproduct=FLASH\r\nmilestone=SP1\r\n",
+        "輔系統/BUILD_INFO.txt": (
+            "\ufeffproduct=輔\r\ntechnical_name=FLASH\r\nmilestone=SP1\r\n"
+        ).encode("utf-8"),
         "輔系統/SHA256SUMS.txt": b"0" * 64 + b"  FLASH.exe\r\n",
         "輔系統/verify_windows_release.ps1": (
             b"\xef\xbb\xbfWrite-Host 'verify'\r\n"

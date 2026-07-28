@@ -13,16 +13,31 @@ from ui.card_content_renderer import CardContent
 class TkCardTextSettings:
     background: str
     foreground: str
-    muted_foreground: str
-    accent: str
+    muted_foreground: str = ""
+    accent: str = ""
     font_family: str = "Microsoft JhengHei UI"
     title_size: int = 10
     body_size: int = 9
     horizontal_padding: int = 8
     vertical_padding: int = 5
     card_width: int = 160
+    font_size: int | None = None
+    line_spacing: int = 0
 
     def __post_init__(self) -> None:
+        if not self.muted_foreground:
+            object.__setattr__(self, "muted_foreground", self.foreground)
+        if not self.accent:
+            object.__setattr__(self, "accent", self.foreground)
+        if self.font_size is not None:
+            if (
+                isinstance(self.font_size, bool)
+                or not isinstance(self.font_size, int)
+                or self.font_size < 1
+            ):
+                raise ValueError("font_size must be a positive integer.")
+            object.__setattr__(self, "title_size", self.font_size)
+            object.__setattr__(self, "body_size", self.font_size)
         for field in (
             "background",
             "foreground",
@@ -47,6 +62,12 @@ class TkCardTextSettings:
                 or value < 1
             ):
                 raise ValueError(f"{field} must be a positive integer.")
+        if (
+            isinstance(self.line_spacing, bool)
+            or not isinstance(self.line_spacing, int)
+            or self.line_spacing < 0
+        ):
+            raise ValueError("line_spacing must be a non-negative integer.")
 
 
 class TkWidget(Protocol):

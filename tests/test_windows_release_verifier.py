@@ -56,7 +56,8 @@ def _create_bundle(
             source_ref = "refs/heads/sp1/completion-2026-07-25"
 
     build_info = {
-        "product": "FLASH",
+        "product": "輔",
+        "technical_name": "FLASH",
         "version": version,
         "milestone": milestone,
         "build_kind": build_kind,

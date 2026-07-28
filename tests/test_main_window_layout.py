@@ -9,7 +9,7 @@ def test_main_window_uses_home_view():
     assert "on_keyboard_sync_change=change_keyboard_sync" in source
     assert "group_choices=group_choices" in source
     assert "on_group_change=change_group" in source
-    assert "build_windows_card_overlay_runtime" in source
+    assert "build_windows_card_overlay_selection_coordinator" in source
     assert "CardExpiryMonitor" in source
     assert "on_card_display_seconds_update=update_card_display_seconds" in source
     assert "CharacterDetailWindow" in source
@@ -49,7 +49,7 @@ def test_main_window_start_message_is_player_facing():
 def test_main_window_title_is_player_facing():
     source = Path("main.py").read_text(encoding="utf-8")
 
-    assert 'APP_TITLE = "輔"' in source
+    assert "APP_TITLE = PRODUCT_NAME" in source
     assert 'APP_TITLE = "輔｜FLASH SP1"' not in source
 
 

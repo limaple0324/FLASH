@@ -112,7 +112,8 @@ def _create_release(
         encoding="utf-8",
     )
     build_info = {
-        "product": "FLASH",
+        "product": "輔",
+        "technical_name": "FLASH",
         "version": "0.1.2",
         "milestone": milestone,
         "build_kind": build_kind,

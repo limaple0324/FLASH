@@ -24,7 +24,7 @@ class CardViewItem:
     priority_level: int
     shown_at: datetime
     expires_at: datetime
-    name_only: bool
+    name_only: bool = False
     actions: tuple[CardAction, ...] = ()
 
     @classmethod

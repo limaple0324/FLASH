@@ -43,6 +43,7 @@ from adapters.windows_system_tray import (
 from cards.history_store import CardHistoryStore
 from cards.service import CardService
 from cards.settings import (
+    DEFAULT_CARD_LIFETIME_SECONDS,
     CardDisplaySettings,
     CardDisplaySettingsResolution,
     resolve_card_display_settings,
@@ -54,7 +55,7 @@ from core.sp1_boundaries import ExternalAdapter, SmartReconnectBoundary
 from core.reconnect_policy import ReconnectScreenState
 from core.target_window_observation import TargetWindowObservation
 from core.window_registry import WindowRegistry
-from core.version import MILESTONE
+from core.version import MILESTONE, PRODUCT_NAME
 from core.window_registry_store import WindowRegistryStore
 from decision.service import DecisionService
 from domain.activity_schedule import (
@@ -91,8 +92,15 @@ from services.card_coordinator import CardCoordinator
 from services.card_display_settings_service import CardDisplaySettingsService
 from services.card_expiry_monitor import CardExpiryMonitor
 from services.card_history_service import CardHistoryService
-from services.card_overlay_layout_service import CardOverlayLayoutService
-from services.card_overlay_runtime import build_windows_card_overlay_runtime
+from services.card_overlay_selection_assembly import (
+    build_windows_card_overlay_selection_coordinator,
+)
+from services.card_preview_selection_service import (
+    CardPreviewSelectionService,
+)
+from services.card_preview_selection_store import (
+    CardPreviewSelectionStore,
+)
 from services.card_view_state_service import CardViewStateService
 from services.player_habit_reminder_monitor import (
     PlayerHabitReminderMonitor,
@@ -169,12 +177,15 @@ from ui.home import (
     theme_palette,
 )
 from ui.character_detail_window import CharacterDetailWindow
-from ui.card_overlay import CardSize
-from ui.tk_card_presenter import TkCardTextSettings
+from ui.builtin_card_preview_catalog import (
+    BUILTIN_CARD_PREVIEW_PROFILE_ID,
+    build_builtin_card_preview_catalog,
+)
+from ui.card_preview_settings import CardPreviewCatalog
 from workspace.models import WorkspaceState
 from workspace.service import WorkspaceService
 
-APP_TITLE = "輔"
+APP_TITLE = PRODUCT_NAME
 SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_DESKTOP_VERIFY_ARGUMENT = "--verify-target-desktop"
 TARGET_WINDOW_KEY = "target_window_keywords"
@@ -196,6 +207,7 @@ CHARACTER_FILENAME = "characters.json"
 CHARACTER_GAME_DATA_FILENAME = "character_game_data.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
+CARD_PREVIEW_SELECTION_FILENAME = "card_preview_selection.json"
 ACTIVITY_REMINDER_STATE_FILENAME = "activity_reminder_state.json"
 ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
 PLAYER_HABIT_FILENAME = "player_habits.json"
@@ -281,7 +293,10 @@ def _normalize_window_fingerprint(value: object) -> str | None:
     return normalize_launch_fingerprint(value)
 
 
-def build_services(root: Path | None = None):
+def build_services(
+    root: Path | None = None,
+    card_preview_catalog: CardPreviewCatalog | None = None,
+):
     """Create, load, and register the cumulative SP1+SP2 services."""
     AppContext.clear()
     paths = PathManager(root=root)
@@ -417,6 +432,31 @@ def build_services(root: Path | None = None):
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
     card_history_service = CardHistoryService(card_history_store)
     card_service = CardService(card_display_settings_resolution.settings)
+    card_preview_selection_store = CardPreviewSelectionStore(
+        paths.data_dir() / CARD_PREVIEW_SELECTION_FILENAME
+    )
+    preview_catalog = (
+        card_preview_catalog
+        if card_preview_catalog is not None
+        else build_builtin_card_preview_catalog()
+    )
+    card_preview_selection_service = CardPreviewSelectionService(
+        preview_catalog,
+        card_preview_selection_store,
+    )
+    if (
+        card_preview_catalog is None
+        and not card_preview_selection_store.configured
+        and not card_preview_selection_store.recovered_from_corruption
+    ):
+        card_preview_selection_service.select(
+            BUILTIN_CARD_PREVIEW_PROFILE_ID
+        )
+    if card_preview_selection_service.unavailable_stored_profile_id is not None:
+        logger.warning(
+            "Card preview selection references an unavailable profile; "
+            "the overlay remains disabled."
+        )
 
     def register_card_display_settings(
         resolution: CardDisplaySettingsResolution,
@@ -514,6 +554,15 @@ def build_services(root: Path | None = None):
     AppContext.register(CardHistoryStore, card_history_store)
     AppContext.register(CardHistoryService, card_history_service)
     AppContext.register(CardService, card_service)
+    AppContext.register(
+        CardPreviewSelectionStore,
+        card_preview_selection_store,
+    )
+    AppContext.register(CardPreviewCatalog, preview_catalog)
+    AppContext.register(
+        CardPreviewSelectionService,
+        card_preview_selection_service,
+    )
     AppContext.register(CardDisplaySettingsService, card_display_settings_service)
     AppContext.register(CardCoordinator, card_coordinator)
     AppContext.register(ActivityReminderService, activity_reminder_service)
@@ -854,6 +903,64 @@ def format_self_check(status: dict[str, object]) -> tuple[str, str]:
     return ("自我檢查通過" if passed else "自我檢查發現問題", "\n".join(lines))
 
 
+def format_card_overlay_status(status: dict[str, object]) -> str:
+    """把提醒卡樣式檢查結果轉成簡短中文。"""
+    check = next(
+        (
+            item
+            for item in _self_check_items(status)
+            if item.get("name") == "card_preview_selection"
+        ),
+        None,
+    )
+    if check is None:
+        return "提醒卡浮層：未取得狀態，目前保持停用。"
+    if not bool(check.get("passed", False)):
+        return "提醒卡浮層：設定檢查未通過，目前保持停用。"
+    message = str(check.get("message", ""))
+    if "not configured" in message:
+        return "提醒卡浮層：尚未提供候選樣式，因此目前不顯示。"
+    if "has not selected" in message:
+        return "提醒卡浮層：候選樣式已準備好，尚未選擇。"
+    if "ready with selected preview profile" in message:
+        return "提醒卡浮層：已選擇樣式，可以顯示。"
+    if "selection was corrupt" in message:
+        return "提醒卡浮層：選擇資料損壞，已安全停用並保留備份。"
+    if "saved preview profile is unavailable" in message:
+        return "提醒卡浮層：原先選擇的樣式已不可用，目前保持停用。"
+    return "提醒卡浮層：狀態無法判斷，目前保持停用。"
+
+
+def format_card_display_settings_status(
+    status: dict[str, object],
+) -> str:
+    """把提醒卡顯示時間檢查結果轉成簡短中文。"""
+    check = next(
+        (
+            item
+            for item in _self_check_items(status)
+            if item.get("name") == "card_display_settings"
+        ),
+        None,
+    )
+    if check is None:
+        return "提醒卡顯示時間：未取得設定狀態。"
+    if not bool(check.get("passed", False)):
+        return "提醒卡顯示時間：設定檢查未通過，目前使用安全預設值。"
+    message = str(check.get("message", ""))
+    seconds = next(
+        (part for part in message.split() if part.isdecimal()),
+        str(DEFAULT_CARD_LIFETIME_SECONDS),
+    )
+    if "setting was invalid" in message:
+        return f"提醒卡顯示時間：原設定無效，已安全改用 {seconds} 秒。"
+    if "uses default" in message:
+        return f"提醒卡顯示時間：目前使用預設 {seconds} 秒。"
+    if "is configured" in message:
+        return f"提醒卡顯示時間：目前設定為 {seconds} 秒。"
+    return "提醒卡顯示時間：狀態無法判斷，目前使用安全預設值。"
+
+
 def format_window_status(status: dict[str, object]) -> str:
     item = status.get("target_window", {})
     if not isinstance(item, dict):
@@ -921,6 +1028,8 @@ def format_start_status(status: dict[str, object], paths: PathManager) -> str:
         "背景能力\n"
         f"{format_background_status(status)}\n\n"
         f"{format_registry_status(status)}\n\n"
+        f"{format_card_overlay_status(status)}\n"
+        f"{format_card_display_settings_status(status)}\n\n"
         "同步按鍵不會自行送出；只會由玩家從已確認快捷鍵清單明確執行。\n"
         "智慧重連只依已確認畫面自動監看，未知畫面不會點擊。\n"
         f"紀錄位置：{paths.logs_dir()}"
@@ -965,6 +1074,33 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     card_coordinator = AppContext.get(CardCoordinator)
     activity_reminder_service = AppContext.get(ActivityReminderService)
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
+    card_preview_selection_store = AppContext.get(
+        CardPreviewSelectionStore
+    )
+    card_preview_catalog = AppContext.get(CardPreviewCatalog)
+    card_preview_selection_service = AppContext.get(
+        CardPreviewSelectionService
+    )
+    if (
+        card_preview_selection_store is not None
+        and card_preview_catalog is not None
+    ):
+        if (
+            len(card_preview_catalog.profiles) == 1
+            and card_preview_catalog.profiles[0].profile_id
+            == BUILTIN_CARD_PREVIEW_PROFILE_ID
+        ):
+            card_preview_catalog = build_builtin_card_preview_catalog(
+                card_display_scale(window)
+            )
+        card_preview_selection_service = CardPreviewSelectionService(
+            card_preview_catalog,
+            card_preview_selection_store,
+        )
+        AppContext.register(
+            CardPreviewSelectionService,
+            card_preview_selection_service,
+        )
     target_window_state_service = AppContext.get(TargetWindowStateService)
     smart_reconnect_monitor = AppContext.get(SmartReconnectMonitor)
     smart_reconnect_controller = AppContext.get(
@@ -2220,6 +2356,21 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             parent=window,
         )
 
+    def card_preview_choices():
+        if card_preview_selection_service is None:
+            return ()
+        return card_preview_selection_service.available_choices()
+
+    def select_card_preview(profile_id: str):
+        if card_preview_selection_service is None:
+            raise RuntimeError("提醒卡樣式服務目前不可用。")
+        return card_preview_selection_service.select(profile_id)
+
+    def clear_card_preview():
+        if card_preview_selection_service is None:
+            raise RuntimeError("提醒卡樣式服務目前不可用。")
+        return card_preview_selection_service.clear()
+
     def update_habit_observation_days(days: int):
         if player_habit_service is None:
             raise RuntimeError("player habit service is unavailable")
@@ -2902,6 +3053,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_auto_click_change=change_auto_click,
         card_display_seconds_provider=card_display_seconds,
         on_card_display_seconds_update=update_card_display_seconds,
+        card_preview_choices_provider=card_preview_choices,
+        on_card_preview_select=select_card_preview,
+        on_card_preview_clear=clear_card_preview,
         habit_settings_provider=(
             player_habit_service.settings_view
             if player_habit_service is not None
@@ -3061,35 +3215,18 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     activity_reminder_monitor = None
     player_habit_reminder_monitor = None
     if card_service is not None and card_view_state_service is not None:
-        overlay_scale = card_display_scale(window)
-        overlay_width = round(160 * overlay_scale)
-        overlay_height = round(75 * overlay_scale)
-        overlay_layout = CardOverlayLayoutService(
-            card_view_state_service,
-            WindowsWorkAreaReader(),
-            CardSize(width=overlay_width, height=overlay_height),
-            right_margin=round(12 * overlay_scale),
-            bottom_margin=round(12 * overlay_scale),
-            gap=round(6 * overlay_scale),
-        )
-        overlay_runtime = build_windows_card_overlay_runtime(
-            window,
-            card_service,
-            overlay_layout,
-            TkCardTextSettings(
-                background="#80591F",
-                foreground="#FFF2CF",
-                muted_foreground="#FFF2CF",
-                accent="#FFF2CF",
-                title_size=max(10, round(10 * overlay_scale)),
-                body_size=max(9, round(9 * overlay_scale)),
-                horizontal_padding=max(8, round(8 * overlay_scale)),
-                vertical_padding=max(5, round(5 * overlay_scale)),
-                card_width=overlay_width,
-            ),
-            on_action=handle_card_action,
-        )
-        overlay_runtime.start()
+        if card_preview_selection_service is not None:
+            overlay_runtime = (
+                build_windows_card_overlay_selection_coordinator(
+                    window,
+                    card_service,
+                    card_preview_selection_service,
+                    card_view_state_service,
+                    WindowsWorkAreaReader(),
+                    on_action=handle_card_action,
+                )
+            )
+            overlay_runtime.start()
         expiry_monitor = CardExpiryMonitor(
             card_service,
             window.after,

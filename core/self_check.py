@@ -6,15 +6,26 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
+from cards.history_store import CardHistoryStore
+from cards.settings import CardDisplaySettings, CardDisplaySettingsResolution
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.sp1_boundaries import ExternalAdapter, RecoveryBoundary, SmartReconnectBoundary
+from core.target_window_observation import TargetWindowObservation
 from core.version import MILESTONE
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+from domain.progress_store import ActivityProgressStore
+from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
+from services.card_history_service import CardHistoryService
+from services.card_preview_selection_service import CardPreviewSelectionService
+from services.card_preview_selection_store import CardPreviewSelectionStore
 from services.event_bus import EventBus
 from services.logger_service import LoggerService
+from services.target_window_state_service import TargetWindowStateService
+from workspace.models import WorkspaceState
+from workspace.service import WorkspaceService
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +55,18 @@ class SelfCheck:
             self._run("logger_service", self._check_logger),
             self._run("event_bus", self._check_event_bus),
             self._run("window_registry", self._check_window_registry),
+            self._run("activity_progress", self._check_activity_progress),
+            self._run("workspace_service", self._check_workspace_service),
+            self._run("target_window_state", self._check_target_window_state),
+            self._run("card_history", self._check_card_history),
+            self._run(
+                "card_display_settings",
+                self._check_card_display_settings,
+            ),
+            self._run(
+                "card_preview_selection",
+                self._check_card_preview_selection,
+            ),
             self._run("recovery_boundary", lambda: self._check_optional(RecoveryBoundary)),
             self._run("smart_reconnect_boundary", lambda: self._check_optional(SmartReconnectBoundary)),
             self._run("external_adapter", lambda: self._check_optional(ExternalAdapter)),
@@ -107,6 +130,138 @@ class SelfCheck:
             backup = store.corrupt_backup.name if store.corrupt_backup else "unknown"
             return f"Character registry recovered from corruption; backup saved as {backup}."
         return f"Character registry loaded with {len(registry.all())} character(s)."
+
+    def _check_activity_progress(self) -> str:
+        store = self.context.get(ActivityProgressStore)
+        service = self.context.get(ActivityProgressService)
+        if store is None:
+            raise RuntimeError("ActivityProgressStore is not registered.")
+        if service is None:
+            raise RuntimeError("ActivityProgressService is not registered.")
+        if store.path.parent != self.paths.data_dir():
+            raise RuntimeError(
+                "Activity progress path is outside the managed data directory."
+            )
+        if store.recovered_from_corruption:
+            backup = (
+                store.corrupt_backup.name
+                if store.corrupt_backup is not None
+                else "unknown"
+            )
+            return (
+                "Activity progress recovered from corruption; "
+                f"backup saved as {backup}."
+            )
+        return f"Activity progress loaded with {len(service.all())} record(s)."
+
+    def _check_workspace_service(self) -> str:
+        service = self.context.get(WorkspaceService)
+        if service is None:
+            raise RuntimeError("WorkspaceService is not registered.")
+        if not isinstance(service.snapshot(), WorkspaceState):
+            raise RuntimeError(
+                "WorkspaceService did not return a WorkspaceState."
+            )
+        return "Workspace service provides a valid read-only state."
+
+    def _check_target_window_state(self) -> str:
+        service = self.context.get(TargetWindowStateService)
+        event_bus = self.context.get(EventBus)
+        if service is None:
+            raise RuntimeError("TargetWindowStateService is not registered.")
+        if event_bus is None or service.event_bus is not event_bus:
+            raise RuntimeError(
+                "Target-window state service does not use the registered EventBus."
+            )
+        if not isinstance(service.snapshot(), TargetWindowObservation):
+            raise RuntimeError(
+                "Target-window state service did not return a valid observation."
+            )
+        return "Target-window state service provides a valid read-only observation."
+
+    def _check_card_history(self) -> str:
+        store = self.context.get(CardHistoryStore)
+        service = self.context.get(CardHistoryService)
+        if store is None:
+            raise RuntimeError("CardHistoryStore is not registered.")
+        if service is None:
+            raise RuntimeError("CardHistoryService is not registered.")
+        if service.store is not store:
+            raise RuntimeError(
+                "Card history service does not use the registered store."
+            )
+        if store.path.parent != self.paths.data_dir():
+            raise RuntimeError(
+                "Card history path is outside the managed data directory."
+            )
+        if store.recovered_from_corruption:
+            backup = (
+                store.corrupt_backup.name
+                if store.corrupt_backup is not None
+                else "unknown"
+            )
+            return (
+                "Card history recovered from corruption; "
+                f"backup saved as {backup}."
+            )
+        return f"Card history loaded with {len(service.all())} record(s)."
+
+    def _check_card_display_settings(self) -> str:
+        settings = self.context.get(CardDisplaySettings)
+        resolution = self.context.get(CardDisplaySettingsResolution)
+        if settings is None:
+            raise RuntimeError("CardDisplaySettings is not registered.")
+        if resolution is None or resolution.settings is not settings:
+            raise RuntimeError(
+                "Card display settings resolution does not use the registered settings."
+            )
+        seconds = settings.lifetime_seconds
+        if resolution.recovered_from_invalid:
+            return (
+                "Card lifetime setting was invalid; "
+                f"using safe default of {seconds} seconds."
+            )
+        if not resolution.configured:
+            return f"Card lifetime uses default of {seconds} seconds."
+        return f"Card lifetime is configured to {seconds} seconds."
+
+    def _check_card_preview_selection(self) -> str:
+        service = self.context.get(CardPreviewSelectionService)
+        store = self.context.get(CardPreviewSelectionStore)
+        if service is None:
+            raise RuntimeError("CardPreviewSelectionService is not registered.")
+        if store is None:
+            raise RuntimeError("CardPreviewSelectionStore is not registered.")
+        if store.path.parent != self.paths.data_dir():
+            raise RuntimeError(
+                "Card preview selection path is outside the managed data directory."
+            )
+        if store.recovered_from_corruption:
+            backup = (
+                store.corrupt_backup.name
+                if store.corrupt_backup is not None
+                else "unknown"
+            )
+            return (
+                "Card overlay is disabled because its selection was corrupt; "
+                f"backup saved as {backup}."
+            )
+        unavailable = service.unavailable_stored_profile_id
+        if unavailable is not None:
+            return (
+                "Card overlay is disabled because the saved preview profile is "
+                f"unavailable: {unavailable}."
+            )
+        state = service.snapshot()
+        if not state.overlay_enabled:
+            return (
+                "Card overlay is configured; "
+                "the player has not selected a preview profile."
+            )
+        return (
+            "Card overlay is ready with selected preview profile "
+            f"{state.selected_profile_id}."
+        )
 
     def _check_optional(self, contract: type[object]) -> str:
         service = self.context.get(contract)

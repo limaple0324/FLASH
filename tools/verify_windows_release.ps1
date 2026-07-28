@@ -14,6 +14,8 @@ $HashPath = Join-Path $SystemDir "SHA256SUMS.txt"
 $InfoPath = Join-Path $SystemDir "BUILD_INFO.txt"
 $LatestPath = Join-Path $ReleaseDir "LATEST.txt"
 $ChannelPath = Join-Path $SystemDir "UPDATE_CHANNEL.txt"
+$ExpectedProduct = [string][char]0x8F14
+$ExpectedTechnicalName = "FLASH"
 $CommonManifestPaths = @(
     "FLASH.exe",
     "輔系統/BUILD_INFO.txt",
@@ -129,7 +131,7 @@ function Read-AndVerifyManifest([string[]]$ExpectedPaths) {
     return $manifest
 }
 
-Write-Host "FLASH release verification" -ForegroundColor Cyan
+Write-Host "$ExpectedProduct Windows artifact verification" -ForegroundColor Cyan
 
 Require-File $ExePath
 Require-File $HashPath
@@ -138,6 +140,7 @@ Require-File $InfoPath
 $buildInfo = Read-KeyValueFile -Path $InfoPath -DisplayName "BUILD_INFO.txt"
 foreach ($requiredKey in @(
     "product",
+    "technical_name",
     "version",
     "milestone",
     "build_kind",
@@ -159,10 +162,11 @@ foreach ($requiredKey in @(
 }
 
 if (
-    $buildInfo["product"] -ne "FLASH" -or
+    $buildInfo["product"] -cne $ExpectedProduct -or
+    $buildInfo["technical_name"] -cne $ExpectedTechnicalName -or
     $buildInfo["milestone"] -notin @("SP1", "SP2", "SP3")
 ) {
-    throw "Release metadata does not describe a supported FLASH milestone."
+    throw "Release metadata does not describe a supported 輔 milestone."
 }
 if ($buildInfo["version"] -notmatch "^\d+\.\d+\.\d+$") {
     throw "Release version has an invalid format: $($buildInfo['version'])"
@@ -352,6 +356,8 @@ if ($buildKind -in @("main_release", "sp1_release")) {
 }
 
 Write-Host "Verification passed." -ForegroundColor Green
+Write-Host "Product: $($buildInfo['product'])"
+Write-Host "Technical name: $($buildInfo['technical_name'])"
 Write-Host "Version: $($buildInfo['version'])"
 Write-Host "Milestone: $($buildInfo['milestone'])"
 Write-Host "Build kind: $buildKind"
