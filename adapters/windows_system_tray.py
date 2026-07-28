@@ -13,7 +13,10 @@ from queue import Empty, Queue
 
 class SystemTrayEvent(str, Enum):
     SHOW = "show"
-    CLOSE = "close"
+    HIDE = "hide"
+    RESTORE = "restore"
+    STOP_ALL = "stop_all"
+    EXIT = "exit"
 
 
 class WindowsSystemTrayBackend:
@@ -45,6 +48,7 @@ class WindowsSystemTrayBackend:
         self._events: Queue[SystemTrayEvent] = Queue()
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
+        self._stop_requested = threading.Event()
         self._start_error: Exception | None = None
         self._hwnd = 0
         self._icon = 0
@@ -76,15 +80,20 @@ class WindowsSystemTrayBackend:
             else "輔"
         )
         self._ready.clear()
+        self._stop_requested.clear()
         self._start_error = None
+        self.poll_events()
         self._thread = threading.Thread(
             target=self._run,
             name="FU-SystemTray",
             daemon=True,
         )
         self._thread.start()
-        self._ready.wait(timeout=5.0)
-        return self.running and self._start_error is None
+        ready = self._ready.wait(timeout=5.0)
+        started = ready and self.running and self._start_error is None
+        if not started:
+            self.stop(timeout_seconds=2.0)
+        return started
 
     def poll_events(self) -> tuple[SystemTrayEvent, ...]:
         events: list[SystemTrayEvent] = []
@@ -94,7 +103,8 @@ class WindowsSystemTrayBackend:
             except Empty:
                 return tuple(events)
 
-    def stop(self) -> None:
+    def stop(self, timeout_seconds: float = 2.0) -> bool:
+        self._stop_requested.set()
         hwnd = self._hwnd
         thread = self._thread
         if hwnd and os.name == "nt":
@@ -108,9 +118,12 @@ class WindowsSystemTrayBackend:
             except (AttributeError, OSError):
                 pass
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
-        self._thread = None
-        self._hwnd = 0
+            thread.join(timeout=max(0.0, float(timeout_seconds)))
+        stopped = thread is None or not thread.is_alive()
+        if stopped:
+            self._thread = None
+            self._hwnd = 0
+        return stopped
 
     def _run(self) -> None:
         try:
@@ -220,10 +233,12 @@ class WindowsSystemTrayBackend:
             if not menu:
                 return
             try:
-                user32.AppendMenuW(menu, self.MF_STRING, 1, "輔")
+                user32.AppendMenuW(menu, self.MF_STRING, 1, "顯示主視窗")
+                user32.AppendMenuW(menu, self.MF_STRING, 2, "隱藏主視窗")
+                user32.AppendMenuW(menu, self.MF_STRING, 3, "恢復主視窗")
                 user32.AppendMenuW(menu, self.MF_SEPARATOR, 0, None)
-                user32.AppendMenuW(menu, self.MF_STRING, 2, "顯示")
-                user32.AppendMenuW(menu, self.MF_STRING, 3, "關閉")
+                user32.AppendMenuW(menu, self.MF_STRING, 4, "停止全部")
+                user32.AppendMenuW(menu, self.MF_STRING, 5, "完全退出")
                 user32.SetForegroundWindow(wintypes.HWND(hwnd))
                 command = user32.TrackPopupMenu(
                     menu,
@@ -238,10 +253,16 @@ class WindowsSystemTrayBackend:
                     wintypes.HWND(hwnd),
                     None,
                 )
-                if command in {1, 2}:
+                if command == 1:
                     self._events.put(SystemTrayEvent.SHOW)
+                elif command == 2:
+                    self._events.put(SystemTrayEvent.HIDE)
                 elif command == 3:
-                    self._events.put(SystemTrayEvent.CLOSE)
+                    self._events.put(SystemTrayEvent.RESTORE)
+                elif command == 4:
+                    self._events.put(SystemTrayEvent.STOP_ALL)
+                elif command == 5:
+                    self._events.put(SystemTrayEvent.EXIT)
             finally:
                 user32.DestroyMenu(menu)
 
@@ -250,7 +271,7 @@ class WindowsSystemTrayBackend:
             if message == self.WM_TRAY:
                 event = int(lparam) & 0xFFFF
                 if event in {self.WM_LBUTTONUP, self.WM_LBUTTONDBLCLK}:
-                    self._events.put(SystemTrayEvent.SHOW)
+                    self._events.put(SystemTrayEvent.RESTORE)
                     return 0
                 if event in {self.WM_RBUTTONUP, self.WM_CONTEXTMENU}:
                     show_menu(int(hwnd))
@@ -321,17 +342,26 @@ class WindowsSystemTrayBackend:
             user32.UnregisterClassW(self._class_name, instance)
             raise OSError("system tray icon could not be added")
         self._ready.set()
-        message = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
-            user32.TranslateMessage(ctypes.byref(message))
-            user32.DispatchMessageW(ctypes.byref(message))
-        shell32.Shell_NotifyIconW(
-            self.NIM_DELETE,
-            ctypes.byref(tray_data),
-        )
-        user32.DestroyIcon(icon)
-        user32.UnregisterClassW(self._class_name, instance)
-        self._icon = 0
+        if self._stop_requested.is_set():
+            user32.PostMessageW(
+                wintypes.HWND(hwnd),
+                self.WM_CLOSE,
+                0,
+                0,
+            )
+        try:
+            message = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+        finally:
+            shell32.Shell_NotifyIconW(
+                self.NIM_DELETE,
+                ctypes.byref(tray_data),
+            )
+            user32.DestroyIcon(icon)
+            user32.UnregisterClassW(self._class_name, instance)
+            self._icon = 0
 
 
 class SystemTrayController:
@@ -344,21 +374,42 @@ class SystemTrayController:
         *,
         icon_path: Path,
         tooltip: str,
-        on_close,
+        on_stop_all,
+        on_exit,
+        operations_stopped: bool = True,
         poll_ms: int = 100,
     ) -> None:
         self._window = window
         self._backend = backend
         self._icon_path = Path(icon_path)
         self._tooltip = tooltip
-        self._on_close = on_close
+        self._on_stop_all = on_stop_all
+        self._on_exit = on_exit
         self._poll_ms = max(20, int(poll_ms))
         self._poll_id = None
         self._running = False
+        self._window_visible = True
+        self._operations_stopped = bool(operations_stopped)
+        self._exiting = False
 
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def window_visible(self) -> bool:
+        return self._window_visible
+
+    @property
+    def operations_stopped(self) -> bool:
+        return self._operations_stopped
+
+    @property
+    def exiting(self) -> bool:
+        return self._exiting
+
+    def mark_operations_running(self) -> None:
+        self._operations_stopped = False
 
     def start(self) -> bool:
         if self._running:
@@ -383,9 +434,17 @@ class SystemTrayController:
             return
         for event in self._backend.poll_events():
             if event is SystemTrayEvent.SHOW:
+                self.show()
+            elif event is SystemTrayEvent.HIDE:
+                self.hide()
+            elif event is SystemTrayEvent.RESTORE:
                 self.restore()
-            elif event is SystemTrayEvent.CLOSE:
-                self._on_close()
+            elif event is SystemTrayEvent.STOP_ALL:
+                self._operations_stopped = bool(self._on_stop_all())
+            elif event is SystemTrayEvent.EXIT:
+                self._exiting = True
+                if self._on_exit() is False:
+                    self._exiting = False
         self._schedule_poll()
 
     def handle_unmap(self, _event=None) -> None:
@@ -398,7 +457,22 @@ class SystemTrayController:
             return
         try:
             if self._window.state() == "iconic":
-                self._window.withdraw()
+                self.hide()
+        except Exception:
+            return
+
+    def hide(self) -> None:
+        try:
+            self._window.withdraw()
+            self._window_visible = False
+        except Exception:
+            return
+
+    def show(self) -> None:
+        try:
+            self._window.deiconify()
+            self._window.state("normal")
+            self._window_visible = True
         except Exception:
             return
 
@@ -408,15 +482,22 @@ class SystemTrayController:
             self._window.state("normal")
             self._window.lift()
             self._window.focus_force()
+            self._window_visible = True
         except Exception:
             return
 
-    def stop(self) -> None:
-        self._running = False
+    def stop(self, timeout_seconds: float = 2.0) -> bool:
         if self._poll_id is not None:
             try:
                 self._window.after_cancel(self._poll_id)
             except Exception:
                 pass
             self._poll_id = None
-        self._backend.stop()
+        try:
+            stopped = self._backend.stop(timeout_seconds=timeout_seconds)
+        except Exception:
+            stopped = False
+        self._running = not stopped
+        if self._running:
+            self._schedule_poll()
+        return stopped

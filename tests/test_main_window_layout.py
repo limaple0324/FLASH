@@ -18,7 +18,11 @@ def test_main_window_uses_home_view():
     assert "pointer_sync_controller.send_click(" in source
     assert "WindowsSystemTrayBackend" in source
     assert 'window.bind("<Unmap>"' in source
-    assert "tray_controller.stop()" in source
+    assert "tray_controller.stop(" in source
+    assert "on_stop_all=stop_all_automation_from_tray" in source
+    assert "on_exit=close_window" in source
+    assert "stop_complete_background_services" in source
+    assert "沒有假裝已退出" in source
     assert "include_source=True" in source
     assert "execution_guard=direct_auto_click_execution_allowed" in source
     assert "BackgroundImageService" in source

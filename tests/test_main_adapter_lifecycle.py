@@ -229,3 +229,34 @@ def test_shutdown_failure_does_not_hide_startup_failure(monkeypatch, tmp_path):
     assert adapter.shutdown_calls == 1
     assert any("original startup failure" in message for message in logger.error_messages)
     assert any("cleanup failure" in message for message in logger.error_messages)
+
+
+def test_sync_controller_shutdown_reports_a_live_background_queue():
+    class Controller:
+        def close(self, timeout_seconds):
+            assert timeout_seconds == 1.0
+            return False
+
+    logger = RecordingLogger()
+    AppContext.register(main_module.WindowsInputSyncController, Controller())
+
+    assert main_module.shutdown_sync_controllers(logger) is False
+    assert any(
+        "did not stop cleanly" in message
+        for message in logger.error_messages
+    )
+
+
+def test_event_subscription_shutdown_reports_detach_failure():
+    class StateService:
+        def close(self):
+            return False
+
+    logger = RecordingLogger()
+    AppContext.register(TargetWindowStateService, StateService())
+
+    assert main_module.shutdown_event_subscriptions(logger) is False
+    assert any(
+        "listeners were not detached" in message
+        for message in logger.error_messages
+    )

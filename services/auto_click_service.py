@@ -338,20 +338,23 @@ class AutoClickService:
                 and generation == self._direct_generation
             )
 
-    def close(self, timeout_seconds: float = 1.0) -> None:
+    def close(self, timeout_seconds: float = 1.0) -> bool:
         self.stop()
         with self._direct_lock:
-            if self._closed:
-                return
             self._closed = True
             worker = self._direct_worker
-        if worker is not None:
+        if worker is not None and worker.is_alive():
             self._direct_queue.put(self._DIRECT_STOP)
             if (
-                worker.is_alive()
-                and worker is not threading.current_thread()
+                worker is not threading.current_thread()
             ):
                 worker.join(max(0.0, float(timeout_seconds)))
+        stopped = worker is None or not worker.is_alive()
+        if stopped:
+            with self._direct_lock:
+                if self._direct_worker is worker:
+                    self._direct_worker = None
+        return stopped
 
     def _ensure_direct_worker(self) -> bool:
         with self._direct_lock:

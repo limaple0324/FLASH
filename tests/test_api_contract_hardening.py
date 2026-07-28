@@ -596,6 +596,20 @@ def test_lifecycle_contract_never_reports_a_failed_stop_as_stopped():
     assert stopped.code == "lifecycle.stop_failed"
 
 
+def test_lifecycle_contract_treats_an_already_stopped_service_as_stopped():
+    class Service:
+        running = False
+
+        def stop(self):
+            return False
+
+    stopped = stop_service(Service())
+
+    assert stopped.success is True
+    assert stopped.running is False
+    assert stopped.code == "lifecycle.stopped"
+
+
 def test_lifecycle_contract_keeps_cancel_and_join_failures_explicit():
     class Service:
         running = True

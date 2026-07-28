@@ -58,11 +58,10 @@ def stop_service(service: object, *args, **kwargs) -> LifecycleResult:
             "lifecycle.stop_failed",
         )
     running = _running(service)
-    reported_success = raw_result is not False
     success = (
-        reported_success and not running
+        not running
         if running is not None
-        else reported_success
+        else raw_result is not False
     )
     return LifecycleResult(
         LifecycleResult.SCHEMA_VERSION,

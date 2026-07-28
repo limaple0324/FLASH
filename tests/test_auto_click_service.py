@@ -348,3 +348,34 @@ def test_first_direct_failure_blocks_later_same_generation_without_tk_tick():
     assert delivered == [source]
     assert clicker.buttons == []
     service.close()
+
+
+def test_close_timeout_never_claims_background_worker_stopped():
+    scheduler = Scheduler()
+    clicker = Clicker()
+    source = AutoClickPointerSource(101, 0.5, 0.5)
+    started = threading.Event()
+    release = threading.Event()
+
+    def deliver(_value):
+        started.set()
+        release.wait(1)
+        return True
+
+    service = AutoClickService(
+        clicker,
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+    )
+    service.configure_direct_left_sync(
+        source_provider=lambda: source,
+        eligible=lambda _source: True,
+        deliver=deliver,
+        enabled=lambda: True,
+    )
+    service.start(AutoClickSettings())
+    assert started.wait(1)
+
+    assert service.close(timeout_seconds=0) is False
+    release.set()
+    assert service.close(timeout_seconds=1) is True

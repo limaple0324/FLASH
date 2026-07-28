@@ -943,12 +943,13 @@ def shutdown_smart_reconnect_monitor(
 
 def shutdown_event_subscriptions(
     logger: LoggerService | None = None,
-) -> None:
+) -> bool:
     """Detach long-lived event listeners before the service registry is released."""
     try:
         state_service = AppContext.get(TargetWindowStateService)
         if state_service is not None and not state_service.close():
             raise RuntimeError("Target-window listeners were not detached.")
+        return True
     except Exception:
         if logger is not None:
             try:
@@ -958,12 +959,14 @@ def shutdown_event_subscriptions(
                 )
             except Exception:
                 pass
+        return False
 
 
 def shutdown_sync_controllers(
     logger: LoggerService | None = None,
-) -> None:
+) -> bool:
     """Stop delayed input queues and ensure no callback survives shutdown."""
+    stopped = True
     for controller_type in (
         WindowsInputSyncController,
         WindowsPointerSyncController,
@@ -985,6 +988,8 @@ def shutdown_sync_controllers(
                     )
                 except Exception:
                     pass
+            stopped = False
+    return stopped
 
 
 def registry_status() -> dict[str, object]:
@@ -1322,6 +1327,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     background_image_service = AppContext.get(BackgroundImageService)
     player_habit_service = AppContext.get(PlayerHabitPreferenceService)
     home_view: HomeView | None = None
+    tray_controller: SystemTrayController | None = None
+
+    def mark_tray_operations_running() -> None:
+        if tray_controller is not None:
+            tray_controller.mark_operations_running()
 
     def dispatch_to_main_window(callback) -> object | None:
         try:
@@ -3332,6 +3342,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "Keyboard synchronization enabled; "
                 f"group={choice.name}; expected={choice.character_count}"
             )
+        mark_tray_operations_running()
         return True
 
     def change_smart_reconnect(enabled: bool) -> bool:
@@ -3388,6 +3399,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
             if logger is not None:
                 logger.info("Smart reconnect explicitly enabled by the player.")
+            mark_tray_operations_running()
             return True
 
         stopped_result = stop_service(
@@ -3442,7 +3454,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             repeat_count=repeat_count,
         )
         if enabled:
-            return auto_click_service.start(settings)
+            started = auto_click_service.start(settings)
+            if started:
+                mark_tray_operations_running()
+            return started
         auto_click_service.stop()
         return True
 
@@ -3554,6 +3569,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if result.success:
                 values[GAME_TIME_AUTO_UPDATE_KEY] = True
             config.update_values(values)
+        if result.success:
+            mark_tray_operations_running()
         return result
 
     group_choices = (
@@ -3969,56 +3986,118 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
             start_service(player_habit_reminder_monitor)
 
-    tray_controller: SystemTrayController | None = None
-
-    def close_window() -> None:
-        if not home_view.prepare_close():
-            return
-        if tray_controller is not None:
-            tray_controller.stop()
-        home_view.dispose()
+    def stop_all_automation_from_tray() -> bool:
+        stopped = stop_group_automation_for_configuration_change()
         if group_window_launch_service is not None:
-            stop_service(group_window_launch_service)
-        stop_service(feature_hotkey_monitor)
-        stop_service(group_launch_hotkey_monitor)
-        auto_click_service.close(timeout_seconds=1.0)
-        if game_time_timed_click_service is not None:
-            stop_service(game_time_timed_click_service)
-        if player_habit_reminder_monitor is not None:
-            stop_service(player_habit_reminder_monitor)
-        if group_role_status_monitor is not None:
-            stop_service(
-                group_role_status_monitor,
+            launch_stopped = stop_service(
+                group_window_launch_service,
                 timeout_seconds=1.0,
             )
-        if deferred_sync_monitor is not None:
-            stop_service(
-                deferred_sync_monitor,
-                timeout_seconds=1.0,
+            stopped = stopped and launch_stopped.success
+        if logger is not None:
+            logger.info(
+                "System tray stop-all completed; "
+                f"stopped={stopped}"
             )
+        return stopped
+
+    def stop_complete_background_services() -> tuple[str, ...]:
+        failures: list[str] = []
+
+        def stop_named(name: str, service, **kwargs) -> None:
+            if service is None:
+                return
+            result = stop_service(service, **kwargs)
+            if not result.success:
+                failures.append(name)
+
+        stop_named(
+            "group_window_launch",
+            group_window_launch_service,
+            timeout_seconds=1.0,
+        )
+        stop_named("feature_hotkey", feature_hotkey_monitor)
+        stop_named("group_launch_hotkey", group_launch_hotkey_monitor)
+        if not auto_click_service.close(timeout_seconds=1.0):
+            failures.append("auto_click")
+        stop_named("timed_click", game_time_timed_click_service)
+        stop_named("player_habit", player_habit_reminder_monitor)
+        stop_named(
+            "group_role_status",
+            group_role_status_monitor,
+            timeout_seconds=1.0,
+        )
+        stop_named(
+            "deferred_sync",
+            deferred_sync_monitor,
+            timeout_seconds=1.0,
+        )
+        stop_named("card_expiry", expiry_monitor)
+        stop_named("activity_reminder", activity_reminder_monitor)
+        stop_named("card_overlay", overlay_runtime)
+        stop_named("keyboard_sync", keyboard_sync_monitor)
+        stop_named("mouse_sync", mouse_sync_monitor)
+        stop_named(
+            "smart_reconnect",
+            smart_reconnect_monitor,
+            timeout_seconds=1.0,
+        )
+        if not shutdown_sync_controllers(logger):
+            failures.append("sync_dispatch")
+        if not shutdown_event_subscriptions(logger):
+            failures.append("event_subscriptions")
+        return tuple(failures)
+
+    closing = False
+
+    def close_window() -> bool:
+        nonlocal closing
+        if closing:
+            return False
+        if not home_view.prepare_close():
+            return False
+        closing = True
+        failures = list(stop_complete_background_services())
         if reconnect_status_refresh_id is not None:
             try:
                 window.after_cancel(reconnect_status_refresh_id)
             except TclError:
                 pass
+        if failures:
+            closing = False
+            if logger is not None:
+                logger.error(
+                    "Complete exit was blocked because services remained active; "
+                    f"services={','.join(failures)}"
+                )
+            messagebox.showerror(
+                "輔｜無法完全退出",
+                "部分背景服務尚未完全停止，程式仍保持開啟，沒有假裝已退出。",
+                parent=window,
+            )
+            return False
+        if tray_controller is not None and not tray_controller.stop(
+            timeout_seconds=2.0
+        ):
+            closing = False
+            if logger is not None:
+                logger.error(
+                    "Complete exit was blocked because the system tray "
+                    "thread remained active."
+                )
+            messagebox.showerror(
+                "輔｜無法完全退出",
+                "系統匣尚未完全停止，程式仍保持開啟，沒有假裝已退出。",
+                parent=window,
+            )
+            return False
         if card_service is not None:
             card_service.unsubscribe(home_view.refresh_cards)
-        if expiry_monitor is not None:
-            stop_service(expiry_monitor)
-        if activity_reminder_monitor is not None:
-            stop_service(activity_reminder_monitor)
-        if overlay_runtime is not None:
-            stop_service(overlay_runtime)
-        if keyboard_sync_monitor is not None:
-            stop_service(keyboard_sync_monitor)
-        if mouse_sync_monitor is not None:
-            stop_service(mouse_sync_monitor)
-        shutdown_sync_controllers(logger)
-        if target_window_state_service is not None:
-            target_window_state_service.close()
+        home_view.dispose()
         if window_identity is not None:
             window_identity.clear()
         window.destroy()
+        return True
 
     window.protocol("WM_DELETE_WINDOW", close_window)
     tray_group_state = (
@@ -4035,8 +4114,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         window,
         WindowsSystemTrayBackend(),
         icon_path=resource_path(APP_ICON_ICO),
-        tooltip=f"輔｜{tray_group_name}｜同步安全停止",
-        on_close=close_window,
+        tooltip=f"輔｜{tray_group_name}",
+        on_stop_all=stop_all_automation_from_tray,
+        on_exit=close_window,
+        operations_stopped=True,
     )
     if tray_controller.start():
         window.bind("<Unmap>", tray_controller.handle_unmap, add="+")
