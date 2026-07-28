@@ -1997,6 +1997,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             or len(plan.targets) != choice.character_count
         ):
             return None
+        return plan
 
     def write_clipboard(value: str) -> bool:
         try:
@@ -2009,7 +2010,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     if farm_timer_service is not None:
         farm_timer_service.set_clipboard_writer(write_clipboard)
-        return plan
 
     def scoped_group_entries(group_name: str, entry_ids):
         if group_configuration_service is None:

@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 
@@ -67,6 +68,36 @@ def test_main_window_title_is_player_facing():
 
     assert "APP_TITLE = PRODUCT_NAME" in source
     assert 'APP_TITLE = "輔｜FLASH SP1"' not in source
+
+
+def test_selected_group_plan_returns_its_local_plan_without_startup_leak():
+    source = Path("main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    build_window = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "create_main_window"
+    )
+    selected_group_plan = next(
+        node
+        for node in build_window.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "selected_group_plan"
+    )
+
+    assert any(
+        isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "plan"
+        for node in selected_group_plan.body
+    )
+    assert not any(
+        isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "plan"
+        for node in build_window.body
+    )
 
 
 def test_startup_error_uses_product_name():
