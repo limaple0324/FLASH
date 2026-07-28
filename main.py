@@ -130,6 +130,7 @@ from services.character_detail_choice_service import CharacterDetailChoiceServic
 from services.character_note_service import CharacterNoteService
 from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
+from services.event_subscription_scope import EventSubscriptionScope
 from services.farm_timer_monitor import FarmTimerMonitor
 from services.farm_timer_service import (
     FARM_COMPLETED_EVENT,
@@ -218,6 +219,7 @@ from services.target_window_contract_service import (
     TargetWindowContractService,
 )
 from services.true_event_card_service import TrueEventCardService
+from services.ui_callback_dispatcher import UiCallbackDispatcher
 from ui.home import HomeView
 from ui.home import (
     GroupManagementViewResult,
@@ -1395,11 +1397,13 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if tray_controller is not None:
             tray_controller.mark_operations_running()
 
+    ui_callback_dispatcher = UiCallbackDispatcher(
+        window.after,
+        window.after_cancel,
+    )
+
     def dispatch_to_main_window(callback) -> object | None:
-        try:
-            return window.after(0, callback)
-        except TclError:
-            return None
+        return ui_callback_dispatcher.dispatch(callback)
 
     group_window_backend = (
         AppContext.get(Win32WindowBackend)
@@ -4058,20 +4062,25 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         ):
             dispatch_to_main_window(lambda: farm_timer_service.complete(event))
 
-    if event_bus is not None:
-        event_bus.subscribe(
+    event_subscription_scope = (
+        EventSubscriptionScope(event_bus)
+        if event_bus is not None
+        else None
+    )
+    if event_subscription_scope is not None:
+        event_subscription_scope.subscribe(
             ACTIVITY_PROGRESS_CHANGED_EVENT,
             activity_progress_changed_handler,
         )
-        event_bus.subscribe(
+        event_subscription_scope.subscribe(
             GROUP_ROLE_STATUS_CHANGED_EVENT,
             group_role_status_changed_handler,
         )
-        event_bus.subscribe(
+        event_subscription_scope.subscribe(
             FARM_PLANTING_CONFIRMED_EVENT,
             farm_planting_confirmed_handler,
         )
-        event_bus.subscribe(
+        event_subscription_scope.subscribe(
             FARM_COMPLETED_EVENT,
             farm_completed_handler,
         )
@@ -4315,6 +4324,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if not home_view.prepare_close():
             return False
         closing = True
+        ui_callback_dispatcher.pause()
         failures = list(stop_complete_background_services())
         if reconnect_status_refresh_id is not None:
             try:
@@ -4323,6 +4333,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 pass
         if failures:
             closing = False
+            ui_callback_dispatcher.resume()
+            if card_service is not None:
+                card_service.resync(home_view.refresh_cards)
             if logger is not None:
                 logger.error(
                     "Complete exit was blocked because services remained active; "
@@ -4338,6 +4351,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             timeout_seconds=2.0
         ):
             closing = False
+            ui_callback_dispatcher.resume()
+            if card_service is not None:
+                card_service.resync(home_view.refresh_cards)
             if logger is not None:
                 logger.error(
                     "Complete exit was blocked because the system tray "
@@ -4351,23 +4367,26 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return False
         if card_service is not None:
             card_service.unsubscribe(home_view.refresh_cards)
-        if event_bus is not None:
-            event_bus.unsubscribe(
-                ACTIVITY_PROGRESS_CHANGED_EVENT,
-                activity_progress_changed_handler,
+        if (
+            event_subscription_scope is not None
+            and not event_subscription_scope.close()
+        ):
+            closing = False
+            ui_callback_dispatcher.resume()
+            if card_service is not None:
+                card_service.subscribe(home_view.refresh_cards)
+                card_service.resync(home_view.refresh_cards)
+            if logger is not None:
+                logger.error(
+                    "Main-window event subscriptions were not detached."
+                )
+            messagebox.showerror(
+                "輔｜無法完全退出",
+                "部分介面事件尚未停止，程式仍保持開啟，沒有假裝已退出。",
+                parent=window,
             )
-            event_bus.unsubscribe(
-                GROUP_ROLE_STATUS_CHANGED_EVENT,
-                group_role_status_changed_handler,
-            )
-            event_bus.unsubscribe(
-                FARM_PLANTING_CONFIRMED_EVENT,
-                farm_planting_confirmed_handler,
-            )
-            event_bus.unsubscribe(
-                FARM_COMPLETED_EVENT,
-                farm_completed_handler,
-            )
+            return False
+        ui_callback_dispatcher.close()
         home_view.dispose()
         if window_identity is not None:
             window_identity.clear()

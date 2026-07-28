@@ -42,10 +42,12 @@ class FakeRuntime:
         *,
         fail_start: bool = False,
         record_start_error: bool = False,
+        stop_result: bool | None = None,
     ) -> None:
         self.profile_id = profile_id
         self.fail_start = fail_start
         self.record_start_error = record_start_error
+        self.stop_result = stop_result
         self.start_calls = 0
         self.stop_calls = 0
         self.last_error: Exception | None = None
@@ -57,8 +59,9 @@ class FakeRuntime:
         if self.record_start_error:
             self.last_error = RuntimeError("overlay refresh failed")
 
-    def stop(self) -> None:
+    def stop(self) -> bool | None:
         self.stop_calls += 1
+        return self.stop_result
 
 
 class RecordingFactory:
@@ -250,3 +253,23 @@ def test_stopped_coordinator_unsubscribes_from_selection_changes() -> None:
     selection.select("compact")
 
     assert factory.created == []
+
+
+def test_failed_stop_keeps_active_runtime_for_a_safe_retry() -> None:
+    selection = _selection()
+    selection.select("compact")
+    factory = RecordingFactory()
+    coordinator = CardOverlaySelectionCoordinator(selection, factory)
+    coordinator.start()
+    runtime = factory.created[0]
+    runtime.stop_result = False
+
+    with pytest.raises(RuntimeError, match="overlay stop failed"):
+        coordinator.stop()
+
+    assert coordinator.started is True
+    assert coordinator.active_profile_id == "compact"
+    runtime.stop_result = True
+    assert coordinator.stop() is True
+    assert runtime.stop_calls == 2
+    assert coordinator.started is False

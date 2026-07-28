@@ -76,7 +76,8 @@ class CardOverlaySelectionCoordinator:
         if profile is not None:
             try:
                 replacement = self._runtime_factory(profile)
-                replacement.start()
+                if replacement.start() is False:
+                    raise RuntimeError("overlay start failed")
                 runtime_error = getattr(replacement, "last_error", None)
                 if isinstance(runtime_error, Exception):
                     raise runtime_error
@@ -92,7 +93,8 @@ class CardOverlaySelectionCoordinator:
         previous = self._runtime
         if previous is not None:
             try:
-                previous.stop()
+                if previous.stop() is False:
+                    raise RuntimeError("overlay stop failed")
             except Exception as error:
                 if replacement is not None:
                     try:
@@ -110,16 +112,17 @@ class CardOverlaySelectionCoordinator:
     def stop(self) -> bool:
         if not self._started:
             return False
-        self._started = False
-        self._selection.unsubscribe(self.sync_selection)
         runtime = self._runtime
-        self._runtime = None
-        self._active_profile_id = None
         if runtime is not None:
             try:
-                runtime.stop()
+                if runtime.stop() is False:
+                    raise RuntimeError("overlay stop failed")
             except Exception as error:
                 self._last_error = error
                 raise
+        self._started = False
+        self._selection.unsubscribe(self.sync_selection)
+        self._runtime = None
+        self._active_profile_id = None
         self._last_error = None
         return True

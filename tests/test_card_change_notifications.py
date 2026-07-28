@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import threading
 
 from cards.models import GroupCard
 from cards.service import CardService
@@ -80,3 +81,32 @@ def test_unsubscribe_stops_future_refresh_notifications():
     service.remove("first")
 
     assert notifications == [True]
+
+
+def test_parallel_updates_converge_to_one_consistent_snapshot():
+    service = CardService()
+    barrier = threading.Barrier(9)
+
+    def add_card(index):
+        barrier.wait()
+        service.upsert(_card(f"parallel-{index}"))
+
+    threads = [
+        threading.Thread(target=add_card, args=(index,))
+        for index in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    snapshot = service.snapshot()
+    all_ids = tuple(
+        card.card_id
+        for card in snapshot.visible_cards + snapshot.pending_cards
+    )
+    assert len(all_ids) == 8
+    assert len(set(all_ids)) == 8
+    assert len(snapshot.visible_cards) == 3
+    assert snapshot.revision == 8
