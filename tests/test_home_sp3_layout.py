@@ -97,6 +97,19 @@ def test_failed_group_change_keeps_previous_group_selected() -> None:
     assert messages == ["自動操作尚未完全停止，未切換組別。"]
 
 
+def test_smart_reconnect_stop_timeout_never_displays_safe_stop() -> None:
+    view = object.__new__(HomeView)
+    view.smart_reconnect_enabled = True
+    view.on_smart_reconnect_change = lambda _enabled: False
+    refreshes: list[bool] = []
+    view._refresh_smart_reconnect_controls = lambda: refreshes.append(True)
+
+    view._toggle_smart_reconnect()
+
+    assert view.smart_reconnect_enabled is True
+    assert refreshes == []
+
+
 def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     source = Path("ui/home.py").read_text(encoding="utf-8")
 

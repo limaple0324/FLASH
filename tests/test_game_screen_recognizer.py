@@ -65,6 +65,8 @@ def test_each_confirmed_reference_classifies_to_its_declared_state():
             assert result.character_slot_index == 0
             assert result.character_slot_selected is True
             assert result.click_point == CHARACTER_ENTER_CLICK_POINT
+            assert len(result.character_candidates) == 1
+            assert result.character_candidates[0].level == 100
         else:
             assert result.click_point == definition.click_point
 

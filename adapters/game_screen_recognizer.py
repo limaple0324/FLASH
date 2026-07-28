@@ -229,6 +229,15 @@ DEFAULT_SCREEN_TEMPLATES: tuple[ScreenTemplateDefinition, ...] = (
 
 
 @dataclass(frozen=True, slots=True)
+class CharacterSelectionCandidate:
+    level: int
+    importance: CharacterImportance
+    slot_index: int
+    selected: bool
+    click_point: NormalizedPoint
+
+
+@dataclass(frozen=True, slots=True)
 class ScreenRecognition:
     state: ReconnectScreenState
     score: float | None
@@ -240,6 +249,7 @@ class ScreenRecognition:
     character_slot_index: int | None = None
     character_slot_selected: bool | None = None
     character_identity: str | None = None
+    character_candidates: tuple[CharacterSelectionCandidate, ...] = ()
     battle_context: bool = False
 
     @property
@@ -633,16 +643,10 @@ class ReferenceScreenRecognizer:
             >= CHARACTER_SELECTED_CYAN_FRACTION
         )
 
-    def _character_selection_target(
+    def _character_selection_candidates(
         self,
         image: Image.Image,
-    ) -> tuple[
-        NormalizedPoint | None,
-        int | None,
-        CharacterImportance | None,
-        int | None,
-        bool | None,
-    ]:
+    ) -> tuple[CharacterSelectionCandidate, ...]:
         choices: list[
             tuple[int, int, int, CharacterImportance, bool]
         ] = []
@@ -668,21 +672,49 @@ class ReferenceScreenRecognizer:
                     selected,
                 )
             )
-        if not choices:
-            return None, None, None, None, None
-        (
-            _importance_rank,
-            negative_level,
-            index,
-            importance,
-            selected,
-        ) = min(choices)
-        click_point = (
-            CHARACTER_ENTER_CLICK_POINT
-            if selected
-            else CHARACTER_SLOT_CLICK_POINTS[index]
+        ordered = sorted(choices)
+        return tuple(
+            CharacterSelectionCandidate(
+                level=-negative_level,
+                importance=importance,
+                slot_index=index,
+                selected=selected,
+                click_point=(
+                    CHARACTER_ENTER_CLICK_POINT
+                    if selected
+                    else CHARACTER_SLOT_CLICK_POINTS[index]
+                ),
+            )
+            for (
+                _importance_rank,
+                negative_level,
+                index,
+                importance,
+                selected,
+            ) in ordered
         )
-        return click_point, -negative_level, importance, index, selected
+
+    def _character_selection_target(
+        self,
+        image: Image.Image,
+    ) -> tuple[
+        NormalizedPoint | None,
+        int | None,
+        CharacterImportance | None,
+        int | None,
+        bool | None,
+    ]:
+        candidates = self._character_selection_candidates(image)
+        if not candidates:
+            return None, None, None, None, None
+        selected_candidate = candidates[0]
+        return (
+            selected_candidate.click_point,
+            selected_candidate.level,
+            selected_candidate.importance,
+            selected_candidate.slot_index,
+            selected_candidate.selected,
+        )
 
     @classmethod
     def _region_score(
@@ -897,6 +929,7 @@ class ReferenceScreenRecognizer:
         character_importance = None
         character_slot_index = None
         character_slot_selected = None
+        character_candidates: tuple[CharacterSelectionCandidate, ...] = ()
         click_point = definition.click_point
         if definition.state is ReconnectScreenState.LINE_SELECTION:
             line_number, _route_score = self._recognize_route_number(candidate)
@@ -906,13 +939,26 @@ class ReferenceScreenRecognizer:
                 else None
             )
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
+            character_candidates = self._character_selection_candidates(
+                candidate
+            )
             (
                 click_point,
                 character_level,
                 character_importance,
                 character_slot_index,
                 character_slot_selected,
-            ) = self._character_selection_target(candidate)
+            ) = (
+                (
+                    character_candidates[0].click_point,
+                    character_candidates[0].level,
+                    character_candidates[0].importance,
+                    character_candidates[0].slot_index,
+                    character_candidates[0].selected,
+                )
+                if character_candidates
+                else (None, None, None, None, None)
+            )
         return ScreenRecognition(
             state=definition.state,
             score=round(score, 3),
@@ -923,6 +969,7 @@ class ReferenceScreenRecognizer:
             character_importance=character_importance,
             character_slot_index=character_slot_index,
             character_slot_selected=character_slot_selected,
+            character_candidates=character_candidates,
         )
 
     def recognize_capture(self, sample: CaptureSample | None) -> ScreenRecognition:

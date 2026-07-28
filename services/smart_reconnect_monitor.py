@@ -8,6 +8,24 @@ from core.sp1_boundaries import OperationResult, SmartReconnectBoundary
 from services.logger_service import LoggerService
 
 
+DEFAULT_SMART_RECONNECT_INTERVAL_MS = 1000
+
+
+def normalize_smart_reconnect_interval_ms(
+    value: object,
+    *,
+    default: int = DEFAULT_SMART_RECONNECT_INTERVAL_MS,
+) -> int:
+    """Preserve the V0.2 millisecond setting while rejecting invalid values."""
+    if isinstance(value, bool):
+        return default
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return default
+    return normalized if normalized > 0 else default
+
+
 class SmartReconnectMonitor:
     """Run safe reconnect scans until explicitly stopped with the application."""
 
@@ -17,13 +35,18 @@ class SmartReconnectMonitor:
         *,
         logger: LoggerService | None = None,
         fallback_delay_seconds: int = 60,
+        monitor_interval_ms: int = DEFAULT_SMART_RECONNECT_INTERVAL_MS,
     ):
         if fallback_delay_seconds <= 0:
             raise ValueError("fallback_delay_seconds must be positive")
         self._boundary = boundary
         self._logger = logger
         self._fallback_delay_seconds = fallback_delay_seconds
+        self._monitor_interval_ms = normalize_smart_reconnect_interval_ms(
+            monitor_interval_ms
+        )
         self._stop_event = threading.Event()
+        self._settings_changed_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._last_signature: tuple[object, ...] | None = None
@@ -32,6 +55,25 @@ class SmartReconnectMonitor:
     def running(self) -> bool:
         thread = self._thread
         return bool(thread is not None and thread.is_alive())
+
+    @property
+    def monitor_interval_ms(self) -> int:
+        with self._lock:
+            return self._monitor_interval_ms
+
+    def set_monitor_interval_ms(self, value: object) -> bool:
+        normalized = normalize_smart_reconnect_interval_ms(
+            value,
+            default=0,
+        )
+        if normalized <= 0:
+            return False
+        with self._lock:
+            changed = normalized != self._monitor_interval_ms
+            self._monitor_interval_ms = normalized
+        if changed:
+            self._settings_changed_event.set()
+        return True
 
     @staticmethod
     def _safe_delay(result: OperationResult, fallback: int) -> int:
@@ -56,12 +98,18 @@ class SmartReconnectMonitor:
             details.get("restarted_windows"),
         )
 
-    def run_once(self) -> tuple[OperationResult, int]:
+    def run_once(self) -> tuple[OperationResult, float]:
         result = self._boundary.reconnect()
         delay = self._safe_delay(result, self._fallback_delay_seconds)
+        details = result.details or {}
+        if (
+            result.code in {"reconnect.connected", "reconnect.waiting"}
+            and not details.get("clicked_windows", 0)
+            and not details.get("restarted_windows", 0)
+        ):
+            delay = max(0.001, self.monitor_interval_ms / 1000.0)
         signature = self._signature(result)
         if self._logger is not None and signature != self._last_signature:
-            details = result.details or {}
             state_counts = details.get("state_counts", {})
             safe_states = (
                 ",".join(
@@ -100,7 +148,9 @@ class SmartReconnectMonitor:
                         f"error_type={type(exc).__name__}; "
                         f"next_check_seconds={delay}"
                     )
-            if self._stop_event.wait(delay):
+            if self._settings_changed_event.wait(delay):
+                self._settings_changed_event.clear()
+            if self._stop_event.is_set():
                 break
 
     def start(self) -> bool:
@@ -115,6 +165,7 @@ class SmartReconnectMonitor:
             if callable(execution_switch):
                 execution_switch(True)
             self._stop_event.clear()
+            self._settings_changed_event.clear()
             self._thread = threading.Thread(
                 target=self._run,
                 name="FLASH-SmartReconnect",
@@ -136,6 +187,7 @@ class SmartReconnectMonitor:
             if thread is None:
                 return True
             self._stop_event.set()
+            self._settings_changed_event.set()
         if thread is not threading.current_thread():
             thread.join(max(0.0, timeout_seconds))
         stopped = not thread.is_alive()

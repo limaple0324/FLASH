@@ -174,7 +174,11 @@ from services.reconnect_failure_status_service import (
     ReconnectFailureStatusService,
 )
 from services.role_id_template_service import RoleIdTemplateService
-from services.smart_reconnect_monitor import SmartReconnectMonitor
+from services.smart_reconnect_monitor import (
+    DEFAULT_SMART_RECONNECT_INTERVAL_MS,
+    SmartReconnectMonitor,
+    normalize_smart_reconnect_interval_ms,
+)
 from services.sync_scope_service import SyncScopeService
 from services.sync_conflict_arbiter import SyncConflictArbiter
 from services.deferred_sync_operation_service import (
@@ -217,6 +221,7 @@ TARGET_WINDOW_FINGERPRINT_KEY = "target_window_fingerprint"
 INPUT_POLICY_KEY = "input_policy"
 SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
 SMART_RECONNECT_CONSENT_KEY = "smart_reconnect_consent_v1"
+SMART_RECONNECT_INTERVAL_MS_KEY = "disconnect_detect_interval_ms"
 UI_THEME_KEY = "ui_theme"
 CURRENT_GROUP_NAME_KEY = "current_group_name"
 REGISTRY_FILENAME = "window_registry.json"
@@ -337,6 +342,9 @@ def build_services(
             INPUT_POLICY_KEY: WindowInputPolicy.ALL.value,
             SMART_RECONNECT_ENABLED_KEY: False,
             SMART_RECONNECT_CONSENT_KEY: False,
+            SMART_RECONNECT_INTERVAL_MS_KEY: (
+                DEFAULT_SMART_RECONNECT_INTERVAL_MS
+            ),
             UI_THEME_KEY: "clear_blue",
             SYNC_SELECTED_KEYS_KEY: ["ESC"],
             SYNC_KEYS_COLLAPSED_KEY: True,
@@ -818,7 +826,13 @@ def build_services(
     )
     AppContext.register(
         SmartReconnectMonitor,
-        SmartReconnectMonitor(reconnect_controller, logger=logger),
+        SmartReconnectMonitor(
+            reconnect_controller,
+            logger=logger,
+            monitor_interval_ms=normalize_smart_reconnect_interval_ms(
+                config.get(SMART_RECONNECT_INTERVAL_MS_KEY)
+            ),
+        ),
     )
 
     if registry_store.recovered_from_corruption:
@@ -3395,6 +3409,25 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         return stopped
 
+    def change_smart_reconnect_interval(interval_ms: int) -> bool:
+        if config is None or smart_reconnect_monitor is None:
+            return False
+        normalized = normalize_smart_reconnect_interval_ms(
+            interval_ms,
+            default=0,
+        )
+        if normalized <= 0:
+            return False
+        if not smart_reconnect_monitor.set_monitor_interval_ms(normalized):
+            return False
+        config.set(SMART_RECONNECT_INTERVAL_MS_KEY, normalized)
+        if logger is not None:
+            logger.info(
+                "Smart reconnect monitoring interval changed; "
+                f"interval_ms={normalized}"
+            )
+        return True
+
     def change_auto_click(
         enabled: bool,
         interval_ms: int,
@@ -3681,6 +3714,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             status.get("smart_reconnect_enabled", False)
         ),
         on_smart_reconnect_change=change_smart_reconnect,
+        smart_reconnect_interval_ms=(
+            smart_reconnect_monitor.monitor_interval_ms
+            if smart_reconnect_monitor is not None
+            else DEFAULT_SMART_RECONNECT_INTERVAL_MS
+        ),
+        on_smart_reconnect_interval_change=(
+            change_smart_reconnect_interval
+        ),
         reconnect_failure_messages_provider=(
             lambda: tuple(
                 item.message

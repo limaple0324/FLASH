@@ -1,3 +1,5 @@
+import threading
+
 from core.sp1_boundaries import OperationResult, ReconnectState
 from services.smart_reconnect_monitor import SmartReconnectMonitor
 
@@ -41,6 +43,22 @@ class RecordingLogger:
 
     def error(self, message):
         self.error_messages.append(message)
+
+
+class BlockingBoundary(FakeBoundary):
+    def __init__(self):
+        super().__init__([])
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def reconnect(self):
+        self.started.set()
+        self.release.wait(2)
+        return OperationResult(
+            True,
+            "reconnect.connected",
+            details={"next_check_seconds": 5},
+        )
 
 
 def test_run_once_uses_result_delay_and_logs_only_aggregate_state():
@@ -103,7 +121,7 @@ def test_repeated_identical_state_does_not_spam_log():
     assert len(logger.info_messages) == 1
 
 
-def test_invalid_or_missing_delay_uses_one_minute_fallback():
+def test_passive_waiting_uses_saved_monitoring_interval():
     monitor = SmartReconnectMonitor(
         FakeBoundary(
             [
@@ -114,11 +132,22 @@ def test_invalid_or_missing_delay_uses_one_minute_fallback():
                     details={"next_check_seconds": 0},
                 ),
             ]
-        )
+        ),
+        monitor_interval_ms=1500,
     )
 
-    assert monitor.run_once()[1] == 60
-    assert monitor.run_once()[1] == 1
+    assert monitor.run_once()[1] == 1.5
+    assert monitor.run_once()[1] == 1.5
+
+
+def test_monitoring_interval_can_change_without_restarting_monitor():
+    monitor = SmartReconnectMonitor(FakeBoundary([]))
+
+    assert monitor.monitor_interval_ms == 1000
+    assert monitor.set_monitor_interval_ms(2500) is True
+    assert monitor.monitor_interval_ms == 2500
+    assert monitor.set_monitor_interval_ms(0) is False
+    assert monitor.monitor_interval_ms == 2500
 
 
 def test_start_and_stop_are_idempotent():
@@ -134,3 +163,18 @@ def test_start_and_stop_are_idempotent():
     assert monitor.running is False
     assert boundary.execution_changes[0] is True
     assert boundary.execution_changes[-1] is False
+
+
+def test_stop_timeout_remains_running_and_disables_all_execution():
+    boundary = BlockingBoundary()
+    monitor = SmartReconnectMonitor(boundary)
+
+    assert monitor.start() is True
+    assert boundary.started.wait(1) is True
+    assert monitor.stop(timeout_seconds=0) is False
+    assert monitor.running is True
+    assert boundary.execution_enabled is False
+
+    boundary.release.set()
+    assert monitor.stop(timeout_seconds=1) is True
+    assert monitor.running is False

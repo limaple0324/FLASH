@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from adapters.windows_input_sync import (
@@ -14,6 +15,7 @@ from main import (
     INPUT_POLICY_KEY,
     SMART_RECONNECT_ENABLED_KEY,
     SMART_RECONNECT_CONSENT_KEY,
+    SMART_RECONNECT_INTERVAL_MS_KEY,
     SYNC_KEYS_COLLAPSED_KEY,
     TIMED_CLICK_SETTINGS_KEY,
     build_services,
@@ -36,6 +38,7 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     assert config.get(INPUT_POLICY_KEY) == WindowInputPolicy.ALL.value
     assert config.get(SMART_RECONNECT_ENABLED_KEY) is False
     assert config.get(SMART_RECONNECT_CONSENT_KEY) is False
+    assert config.get(SMART_RECONNECT_INTERVAL_MS_KEY) == 1000
     assert config.get(GAME_TIME_OFFSET_MS_KEY) == 0
     assert config.get(GAME_TIME_AUTO_UPDATE_KEY) is True
     assert config.get(SYNC_KEYS_COLLAPSED_KEY) is True
@@ -49,6 +52,26 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     assert isinstance(reconnect, WindowsSmartReconnectController)
     assert reconnect_boundary is reconnect
     assert isinstance(reconnect_monitor, SmartReconnectMonitor)
+    assert reconnect_monitor.monitor_interval_ms == 1000
+
+
+def test_smart_reconnect_monitor_restores_saved_interval(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {SMART_RECONNECT_INTERVAL_MS_KEY: 2750},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    build_services(root=tmp_path)
+
+    config = AppContext.get(ConfigManager)
+    monitor = AppContext.get(SmartReconnectMonitor)
+    assert config.get(SMART_RECONNECT_INTERVAL_MS_KEY) == 2750
+    assert monitor.monitor_interval_ms == 2750
 
 
 def test_sync_services_share_one_lifecycle_identity_snapshot(tmp_path):
@@ -92,6 +115,25 @@ def test_sync_key_collapsed_state_is_loaded_saved_and_wired_to_home():
     assert "sync_keys_collapsed=configured_sync_keys_collapsed" in source
     assert (
         "on_sync_keys_collapsed_change=change_sync_keys_collapsed"
+        in source
+    )
+
+
+def test_smart_reconnect_interval_uses_legacy_key_and_is_saved():
+    source = Path("main.py").read_text(encoding="utf-8")
+
+    assert (
+        'SMART_RECONNECT_INTERVAL_MS_KEY = "disconnect_detect_interval_ms"'
+        in source
+    )
+    assert "def change_smart_reconnect_interval(" in source
+    assert (
+        "config.set(SMART_RECONNECT_INTERVAL_MS_KEY, normalized)"
+        in source
+    )
+    assert "smart_reconnect_interval_ms=(" in source
+    assert (
+        "on_smart_reconnect_interval_change=("
         in source
     )
 

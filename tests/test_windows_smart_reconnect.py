@@ -1,13 +1,17 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from adapters.game_screen_recognizer import ScreenRecognition
+from adapters.game_screen_recognizer import (
+    CharacterSelectionCandidate,
+    ScreenRecognition,
+)
 from adapters.windows_background_capture import CaptureSample, Win32PrintWindowProvider
 from adapters.windows_battle_restart import BattleRestartResult
 from adapters.windows_smart_reconnect import WindowsSmartReconnectController
 from adapters.windows_window import WindowInfo
 from core.reconnect_policy import ReconnectScreenState
 from core.sp1_boundaries import ReconnectState
+from domain.character import CharacterImportance
 from services.group_launch_service import GroupLaunchPlan, GroupLaunchTarget
 from services.reconnect_failure_status_service import (
     ReconnectFailureStatusService,
@@ -57,6 +61,8 @@ class FakeCaptureProvider:
     def capture(self, handle):
         self.calls.append(handle)
         marker = self.states.get(handle, 255)
+        if marker is None:
+            return None
         return CaptureSample(
             width=2,
             height=2,
@@ -1047,7 +1053,7 @@ def test_one_transient_disconnect_frame_does_not_start_automation():
     assert fixture.mouse.clicks == []
 
 
-def test_unknown_peer_does_not_delay_disconnect_second_frame_for_one_minute():
+def test_unknown_peer_blocks_disconnected_batch_without_clicking():
     fixture = make_controller([2, 255])
 
     result = fixture.controller.reconnect()
@@ -1058,7 +1064,7 @@ def test_unknown_peer_does_not_delay_disconnect_second_frame_for_one_minute():
     assert fixture.mouse.clicks == []
 
 
-def test_unknown_peer_does_not_delay_force_login_second_frame_for_one_minute():
+def test_unknown_peer_never_creates_a_force_login_session():
     fixture = make_controller([2, 255])
     fixture.controller.reconnect()
     fixture.controller.reconnect()
@@ -1067,12 +1073,12 @@ def test_unknown_peer_does_not_delay_force_login_second_frame_for_one_minute():
     result = fixture.controller.reconnect()
 
     assert result.details["state_counts"] == {
-        "force_login_start": 1,
+        "login_start": 1,
         "unknown": 1,
     }
     assert result.details["actionable_windows"] == 0
-    assert result.details["next_check_seconds"] == 10
-    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
+    assert result.details["next_check_seconds"] == 60
+    assert fixture.mouse.clicks == []
 
 
 def test_changed_action_target_requires_two_new_matching_frames():
@@ -1210,6 +1216,170 @@ def test_same_level_without_unique_role_identity_never_selects_character(
                     2,
                     "160副",
                     tmp_path / "160-secondary.lnk",
+                    windows[1].launch_fingerprint,
+                ),
+            ),
+        )
+    )
+    controller._pending_reconnect_fingerprints.add(
+        windows[0].launch_fingerprint
+    )
+
+    controller.reconnect()
+    result = controller.reconnect()
+
+    assert result.details["actionable_windows"] == 0
+    assert mouse.clicks == []
+
+
+def test_known_shortcut_role_selects_its_unique_level_instead_of_leftmost(
+    tmp_path,
+):
+    windows = [make_window(1), make_window(2)]
+    capture = FakeCaptureProvider({1: 5, 2: 1})
+    mouse = FakeMouseBackend()
+    candidates = (
+        CharacterSelectionCandidate(
+            160,
+            CharacterImportance.PRIMARY,
+            2,
+            False,
+            (0.651, 0.706),
+        ),
+        CharacterSelectionCandidate(
+            120,
+            CharacterImportance.PRIMARY,
+            1,
+            False,
+            (0.500, 0.706),
+        ),
+    )
+
+    class CandidateRecognizer:
+        def recognize_capture(self, sample):
+            if sample.pixels[0] == 1:
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=0.0,
+                    click_point=None,
+                    reference_name="connected",
+                )
+            return ScreenRecognition(
+                state=ReconnectScreenState.CHARACTER_SELECTION,
+                score=0.0,
+                click_point=candidates[0].click_point,
+                reference_name="character_selection",
+                character_level=candidates[0].level,
+                character_importance=candidates[0].importance,
+                character_slot_index=candidates[0].slot_index,
+                character_slot_selected=False,
+                character_candidates=candidates,
+            )
+
+    controller = WindowsSmartReconnectController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=FakeWindowBackend(windows),
+        capture_provider=capture,
+        recognizer=CandidateRecognizer(),
+        mouse_backend=mouse,
+        execution_enabled=True,
+    )
+    controller.set_group_launch_plan(
+        GroupLaunchPlan(
+            "混合",
+            targets=(
+                GroupLaunchTarget(
+                    1,
+                    "120古",
+                    tmp_path / "120古.lnk",
+                    windows[0].launch_fingerprint,
+                ),
+                GroupLaunchTarget(
+                    2,
+                    "160靈",
+                    tmp_path / "160靈.lnk",
+                    windows[1].launch_fingerprint,
+                ),
+            ),
+        )
+    )
+    controller._pending_reconnect_fingerprints.add(
+        windows[0].launch_fingerprint
+    )
+
+    controller.reconnect()
+    result = controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert mouse.clicks == [(1, (0.500, 0.706))]
+
+
+def test_duplicate_target_level_never_guesses_a_character_slot(tmp_path):
+    windows = [make_window(1), make_window(2)]
+    capture = FakeCaptureProvider({1: 5, 2: 1})
+    mouse = FakeMouseBackend()
+    candidates = (
+        CharacterSelectionCandidate(
+            120,
+            CharacterImportance.PRIMARY,
+            0,
+            False,
+            (0.355, 0.706),
+        ),
+        CharacterSelectionCandidate(
+            120,
+            CharacterImportance.PRIMARY,
+            1,
+            False,
+            (0.500, 0.706),
+        ),
+    )
+
+    class AmbiguousRecognizer:
+        def recognize_capture(self, sample):
+            if sample.pixels[0] == 1:
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=0.0,
+                    click_point=None,
+                    reference_name="connected",
+                )
+            return ScreenRecognition(
+                state=ReconnectScreenState.CHARACTER_SELECTION,
+                score=0.0,
+                click_point=candidates[0].click_point,
+                reference_name="character_selection",
+                character_level=120,
+                character_importance=CharacterImportance.PRIMARY,
+                character_slot_index=0,
+                character_slot_selected=False,
+                character_candidates=candidates,
+            )
+
+    controller = WindowsSmartReconnectController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=FakeWindowBackend(windows),
+        capture_provider=capture,
+        recognizer=AmbiguousRecognizer(),
+        mouse_backend=mouse,
+        execution_enabled=True,
+    )
+    controller.set_group_launch_plan(
+        GroupLaunchPlan(
+            "120",
+            targets=(
+                GroupLaunchTarget(
+                    1,
+                    "120古",
+                    tmp_path / "120古.lnk",
+                    windows[0].launch_fingerprint,
+                ),
+                GroupLaunchTarget(
+                    2,
+                    "120靈",
+                    tmp_path / "120靈.lnk",
                     windows[1].launch_fingerprint,
                 ),
             ),
@@ -1371,6 +1541,44 @@ def test_unknown_screen_never_clicks_and_uses_one_minute_retry():
     assert result.details["unknown_windows"] == 1
     assert result.details["next_check_seconds"] == 60
     assert "screen_unknown" in result.details["failure_codes"]
+
+
+def test_unknown_sibling_aborts_the_complete_disconnected_batch():
+    fixture = make_controller([2, 255])
+
+    first = fixture.controller.reconnect()
+    second = fixture.controller.reconnect()
+
+    assert first.code == "reconnect.waiting"
+    assert second.code == "reconnect.waiting"
+    assert fixture.mouse.clicks == []
+    assert second.details["actionable_windows"] == 0
+    assert "screen_unknown" in second.details["failure_codes"]
+    assert fixture.controller.reconnecting_fingerprints() == frozenset()
+
+
+def test_failed_capture_aborts_the_complete_disconnected_batch():
+    fixture = make_controller([2, 1])
+    fixture.capture.states[2] = None
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert fixture.mouse.clicks == []
+    assert result.details["actionable_windows"] == 0
+    assert "capture_failed" in result.details["failure_codes"]
+    assert fixture.controller.reconnecting_fingerprints() == frozenset()
+
+
+def test_minimized_disconnected_window_is_still_monitored():
+    windows = [make_window(1, minimized=True), make_window(2)]
+    fixture = make_controller([2, 1], windows=windows)
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
 
 
 def test_all_connected_is_reported_without_sending_input():

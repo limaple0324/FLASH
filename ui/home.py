@@ -609,6 +609,10 @@ class HomeView:
         character_choices: Iterable[PlayerCharacterDetailChoice] = (),
         smart_reconnect_enabled: bool = False,
         on_smart_reconnect_change: Callable[[bool], object] | None = None,
+        smart_reconnect_interval_ms: int = 1000,
+        on_smart_reconnect_interval_change: (
+            Callable[[int], object] | None
+        ) = None,
         reconnect_failure_messages_provider: (
             Callable[[], tuple[str, ...]] | None
         ) = None,
@@ -864,6 +868,16 @@ class HomeView:
             )
         self.smart_reconnect_enabled = bool(smart_reconnect_enabled)
         self.on_smart_reconnect_change = on_smart_reconnect_change
+        self.smart_reconnect_interval_ms = (
+            smart_reconnect_interval_ms
+            if isinstance(smart_reconnect_interval_ms, int)
+            and not isinstance(smart_reconnect_interval_ms, bool)
+            and smart_reconnect_interval_ms > 0
+            else 1000
+        )
+        self.on_smart_reconnect_interval_change = (
+            on_smart_reconnect_interval_change
+        )
         self.reconnect_failure_messages_provider = (
             reconnect_failure_messages_provider
         )
@@ -957,6 +971,7 @@ class HomeView:
         self._feature_hotkey_variables: dict[str, StringVar] = {}
         self._smart_reconnect_label: Label | None = None
         self._smart_reconnect_button: Button | None = None
+        self._smart_reconnect_interval_entry: Entry | None = None
         self._reconnect_failure_card: Frame | None = None
         self._reconnect_failure_label: Label | None = None
         self._home_role_rows_frame: Frame | None = None
@@ -2952,6 +2967,37 @@ class HomeView:
             primary=True,
         )
         self._smart_reconnect_button.pack(anchor="w", pady=(10, 0))
+        interval_row = Frame(reconnect_card, bg=SURFACE)
+        interval_row.pack(fill=X, pady=(10, 0))
+        Label(
+            interval_row,
+            text="監看間隔毫秒",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+        ).pack(side=LEFT)
+        self._smart_reconnect_interval_entry = Entry(
+            interval_row,
+            width=10,
+            font=("Microsoft JhengHei UI", 10),
+            bg="#F8FAFD",
+            fg=TEXT,
+            relief="flat",
+        )
+        self._smart_reconnect_interval_entry.insert(
+            0,
+            str(self.smart_reconnect_interval_ms),
+        )
+        self._smart_reconnect_interval_entry.pack(
+            side=LEFT,
+            padx=(8, 8),
+            ipady=5,
+        )
+        self._button(
+            interval_row,
+            "保存間隔",
+            self._save_smart_reconnect_interval,
+        ).pack(side=LEFT)
         self._build_feature_hotkey_selector(
             reconnect_card,
             "reconnect",
@@ -3429,6 +3475,29 @@ class HomeView:
 
     def toggle_smart_reconnect_from_hotkey(self) -> None:
         self._toggle_smart_reconnect()
+
+    def _save_smart_reconnect_interval(self) -> None:
+        entry = self._smart_reconnect_interval_entry
+        if entry is None:
+            return
+        try:
+            interval_ms = int(entry.get().strip())
+        except ValueError:
+            interval_ms = 0
+        if interval_ms <= 0:
+            messagebox.showerror(
+                "輔｜智慧重連",
+                "監看間隔必須是大於 0 的毫秒整數。",
+                parent=self.parent,
+            )
+            return
+        if self.on_smart_reconnect_interval_change is None:
+            return
+        if self.on_smart_reconnect_interval_change(interval_ms) is False:
+            return
+        self.smart_reconnect_interval_ms = interval_ms
+        entry.delete(0, "end")
+        entry.insert(0, str(interval_ms))
 
     def _toggle_smart_reconnect(self) -> None:
         desired = not self.smart_reconnect_enabled

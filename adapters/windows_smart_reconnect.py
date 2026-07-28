@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
 from adapters.game_screen_recognizer import (
+    CharacterSelectionCandidate,
     FORCE_LOGIN_CLICK_POINT,
     NormalizedPoint,
     ReferenceScreenRecognizer,
@@ -757,6 +758,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             item.character_slot_index,
             item.character_slot_selected,
             item.character_identity,
+            item.character_candidates,
             item.battle_context,
         )
 
@@ -791,18 +793,20 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._action_confirmations[fingerprint] = (signature, count)
         return count >= ACTION_CONFIRMATION_FRAMES
 
+    @staticmethod
+    def _target_level(target) -> int | None:
+        for label in (target.display_name, target.shortcut_path.stem):
+            match = _ROLE_LEVEL_PREFIX.match(label)
+            if match is not None:
+                return int(match.group(1))
+        return None
+
     def _character_target_is_safe(
         self,
         fingerprint: str,
         item: ScreenRecognition,
-    ) -> bool:
-        """Require a unique role identity match to the exact shortcut role.
-
-        A level is not a unique identity because multiple configured roles can
-        share it.  The current image recognizer intentionally emits no role
-        identity, so real character selection remains observation-only until
-        exact role-name evidence is available.
-        """
+    ) -> ScreenRecognition | None:
+        """Choose the original shortcut role without guessing tied slots."""
         target = self._target_for_fingerprint(fingerprint)
         plan = self._group_launch_plan
         identity = (
@@ -811,36 +815,61 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             and item.character_identity.strip()
             else None
         )
-        if (
-            target is None
-            or plan is None
-            or identity is None
-            or item.character_level is None
-        ):
-            return False
-        identity_matches = tuple(
-            candidate
-            for candidate in plan.targets
-            if identity
-            in {
-                candidate.display_name.strip().casefold(),
-                candidate.shortcut_path.stem.strip().casefold(),
-            }
+        if target is None or plan is None:
+            return None
+        expected_level = self._target_level(target)
+        if identity is not None:
+            if item.character_level is None:
+                return None
+            identity_matches = tuple(
+                candidate
+                for candidate in plan.targets
+                if identity
+                in {
+                    candidate.display_name.strip().casefold(),
+                    candidate.shortcut_path.stem.strip().casefold(),
+                }
+            )
+            if (
+                len(identity_matches) != 1
+                or identity_matches[0].fingerprint != fingerprint
+                or expected_level is None
+                or expected_level != item.character_level
+            ):
+                return None
+            return item
+
+        candidates: tuple[CharacterSelectionCandidate, ...] = (
+            item.character_candidates
         )
-        if (
-            len(identity_matches) != 1
-            or identity_matches[0].fingerprint != fingerprint
-        ):
-            return False
-        expected_level = None
-        for label in (target.display_name, target.shortcut_path.stem):
-            match = _ROLE_LEVEL_PREFIX.match(label)
-            if match is not None:
-                expected_level = int(match.group(1))
-                break
-        return (
-            expected_level is not None
-            and expected_level == item.character_level
+        if not candidates:
+            return None
+        if expected_level is not None:
+            matching = tuple(
+                candidate
+                for candidate in candidates
+                if candidate.level == expected_level
+            )
+        else:
+            first = candidates[0]
+            matching = tuple(
+                candidate
+                for candidate in candidates
+                if (
+                    candidate.importance is first.importance
+                    and candidate.level == first.level
+                )
+            )
+        if len(matching) != 1:
+            return None
+        selected = matching[0]
+        return replace(
+            item,
+            click_point=selected.click_point,
+            character_level=selected.level,
+            character_importance=selected.importance,
+            character_slot_index=selected.slot_index,
+            character_slot_selected=selected.selected,
         )
 
     def _unknown_failure_key(self) -> str:
@@ -1218,8 +1247,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     and self._action_is_confirmed(fingerprint, recognition)
                 ):
                     confirmed_action_fingerprints.add(fingerprint)
-                    if execute:
-                        self._pending_reconnect_fingerprints.add(fingerprint)
             elif recognition.state is ReconnectScreenState.CONNECTED:
                 # Normal gameplay is the terminal state. Revoke the entire
                 # reconnect session immediately so a later manual login or
@@ -1236,12 +1263,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     click_point=FORCE_LOGIN_CLICK_POINT,
                 )
             if recognition.state is ReconnectScreenState.CHARACTER_SELECTION:
-                if not self._character_target_is_safe(
+                role_target = self._character_target_is_safe(
                     fingerprint,
                     recognition,
-                ):
+                )
+                if role_target is None:
                     recognition = replace(recognition, click_point=None)
                     self._clear_action_confirmation(fingerprint)
+                else:
+                    recognition = role_target
             action = self._policy.decide(recognition.state).action
             is_action_candidate = (
                 action in ACTIONABLE_RECONNECT_ACTIONS
@@ -1293,6 +1323,20 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             failures.append("capture_failed")
         if unknown_windows:
             failures.append("screen_unknown")
+        batch_action_safe = not failures
+        if not batch_action_safe:
+            # One unknown or failed capture invalidates the complete frame set.
+            # No recognized sibling window may inherit confirmation or receive
+            # input from a partially trustworthy batch.
+            confirmed_action_fingerprints.clear()
+            self._clear_action_confirmation()
+        elif execute:
+            self._pending_reconnect_fingerprints.update(
+                fingerprint
+                for _window, fingerprint, item in recognized
+                if item.state is ReconnectScreenState.DISCONNECTED
+                and fingerprint in confirmed_action_fingerprints
+            )
 
         actionable = [
             (window, fingerprint, item)
@@ -1301,6 +1345,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             in ACTIONABLE_RECONNECT_ACTIONS
             and item.click_point is not None
             and fingerprint in confirmed_action_fingerprints
+            and batch_action_safe
             and (
                 item.state is ReconnectScreenState.DISCONNECTED
                 or self._has_reconnect_session(fingerprint)
@@ -1325,6 +1370,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if item.state is ReconnectScreenState.DISCONNECTED
             and item.battle_context
             and fingerprint in confirmed_action_fingerprints
+            and batch_action_safe
         ]
         clicked_windows = 0
         restarted_windows = retried_reopens
