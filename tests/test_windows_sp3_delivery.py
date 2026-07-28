@@ -69,6 +69,10 @@ def test_main_release_is_the_complete_cumulative_identity():
         "$buildKind -in @('main_release', 'sp3_snapshot')"
         in metadata_step
     )
+    assert (
+        "$buildKind -eq 'validation_build' -and "
+        "$metadata.milestone -eq 'SP3'"
+    ) in metadata_step
     assert "$artifactPrefix = 'FLASH-SP1+SP2+SP3-Windows'" in metadata_step
     assert "$publishTarget = 'release/latest'" in metadata_step
 

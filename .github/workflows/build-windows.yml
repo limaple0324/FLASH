@@ -197,10 +197,16 @@ jobs:
           }
 
           $shortCommit = $env:GITHUB_SHA.Substring(0, 7)
-          if ($buildKind -in @('main_release', 'sp3_snapshot')) {
+          if (
+            $buildKind -in @('main_release', 'sp3_snapshot') -or
+            ($buildKind -eq 'validation_build' -and $metadata.milestone -eq 'SP3')
+          ) {
             $artifactPrefix = 'FLASH-SP1+SP2+SP3-Windows'
           }
-          elseif ($buildKind -eq 'sp2_snapshot') {
+          elseif (
+            $buildKind -eq 'sp2_snapshot' -or
+            ($buildKind -eq 'validation_build' -and $metadata.milestone -eq 'SP2')
+          ) {
             $artifactPrefix = 'FLASH-SP1+SP2-Windows'
           }
           else {
