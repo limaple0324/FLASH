@@ -68,6 +68,7 @@ from services.card_preview_selection_service import (
 from services.sync_operation_record_store import (
     OperationRecordSearchResult,
 )
+from services.activity_description_service import ActivityDescriptionChoice
 from services.activity_schedule_view_service import PlayerActivitySchedule
 from services.window_size_adjustment_service import (
     DEFAULT_FLASH_CLIENT_HEIGHT,
@@ -426,10 +427,15 @@ def _activity_schedule_text(state: PlayerActivitySchedule | None) -> str:
         return "今天沒有已登記的固定活動"
     lines = []
     for activity in state.activities:
-        eligibility = (
-            f"｜{activity.eligibility_text}" if activity.eligibility_text else ""
+        lines.append(
+            f"{activity.name}｜{activity.time_text}"
+            f"｜適用：{activity.eligibility_text or '尚未確認'}"
+            f"｜狀態：{activity.status_text}"
+            f"｜下一步：{activity.next_step}"
         )
-        lines.append(f"{activity.time_text}　{activity.name}{eligibility}")
+        if activity.description:
+            description = " ".join(activity.description.split())
+            lines.append(f"　敘述：{description}")
     return "\n".join(lines)
 
 
@@ -624,6 +630,15 @@ class HomeView:
         activity_schedule: PlayerActivitySchedule | None = None,
         activity_schedule_provider: (
             Callable[[], PlayerActivitySchedule] | None
+        ) = None,
+        activity_description_choices: Iterable[
+            ActivityDescriptionChoice
+        ] = (),
+        activity_description_choices_provider: (
+            Callable[[], tuple[ActivityDescriptionChoice, ...]] | None
+        ) = None,
+        on_activity_description_change: (
+            Callable[[str, str], ActivityDescriptionChoice] | None
         ) = None,
         card_view_state: CardViewState | None = None,
         card_view_state_provider: Callable[[], CardViewState] | None = None,
@@ -907,6 +922,23 @@ class HomeView:
         self.workspace_state_provider = workspace_state_provider
         self.activity_schedule = activity_schedule
         self.activity_schedule_provider = activity_schedule_provider
+        self.activity_description_choices = tuple(
+            activity_description_choices
+        )
+        if any(
+            not isinstance(choice, ActivityDescriptionChoice)
+            for choice in self.activity_description_choices
+        ):
+            raise TypeError(
+                "activity_description_choices must contain "
+                "ActivityDescriptionChoice values."
+            )
+        self.activity_description_choices_provider = (
+            activity_description_choices_provider
+        )
+        self.on_activity_description_change = (
+            on_activity_description_change
+        )
         self.card_view_state = card_view_state
         self.card_view_state_provider = card_view_state_provider
         self.target_window_state = target_window_state
@@ -1044,6 +1076,10 @@ class HomeView:
         self._navigation_buttons: dict[str, Button] = {}
         self._workspace_label: Label | None = None
         self._activity_schedule_label: Label | None = None
+        self._activity_description_variable: StringVar | None = None
+        self._activity_description_entry: Entry | None = None
+        self._activity_description_status_label: Label | None = None
+        self._activity_description_choice_ids: dict[str, str] = {}
         self._card_label: Label | None = None
         self._target_label: Label | None = None
         self._group_value_label: Label | None = None
@@ -2436,8 +2472,10 @@ class HomeView:
             bg=SURFACE,
             fg=TEXT,
             anchor="w",
+            wraplength=740,
         )
         self._activity_schedule_label.pack(fill=X)
+        self._build_activity_description_editor(schedule_card)
 
         Label(
             page,
@@ -5181,6 +5219,171 @@ class HomeView:
         ).pack(anchor="w")
         self._build_feature_card_settings_card(page)
         return page
+
+    def _activity_description_options(
+        self,
+    ) -> tuple[ActivityDescriptionChoice, ...]:
+        if self.activity_description_choices_provider is None:
+            return self.activity_description_choices
+        choices = self.activity_description_choices_provider()
+        if any(
+            not isinstance(choice, ActivityDescriptionChoice)
+            for choice in choices
+        ):
+            raise TypeError(
+                "activity description provider must return "
+                "ActivityDescriptionChoice values."
+            )
+        self.activity_description_choices = tuple(choices)
+        return self.activity_description_choices
+
+    def _build_activity_description_editor(self, parent: Frame) -> None:
+        try:
+            choices = self._activity_description_options()
+        except Exception as error:
+            self._report_refresh_error(error)
+            choices = ()
+        editor = Frame(parent, bg=SURFACE)
+        editor.pack(fill=X, pady=(12, 0))
+        Label(
+            editor,
+            text="調整活動敘述",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+        ).pack(side=LEFT)
+        labels: list[str] = []
+        self._activity_description_choice_ids = {}
+        for index, choice in enumerate(choices, start=1):
+            label = choice.name
+            if label in self._activity_description_choice_ids:
+                label = f"{choice.name}（第 {index} 項）"
+            labels.append(label)
+            self._activity_description_choice_ids[label] = choice.activity_id
+        selected_label = labels[0] if labels else "尚無活動"
+        self._activity_description_variable = StringVar(
+            master=self.parent,
+            value=selected_label,
+        )
+        menu = OptionMenu(
+            editor,
+            self._activity_description_variable,
+            *(labels or ("尚無活動",)),
+            command=self._select_activity_description,
+        )
+        menu.configure(
+            font=("Microsoft JhengHei UI", 9),
+            bg=BACKGROUND,
+            fg=TEXT,
+            activebackground=BORDER,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        menu["menu"].configure(font=("Microsoft JhengHei UI", 9))
+        menu.pack(side=LEFT, padx=(8, 0))
+        self._activity_description_entry = Entry(
+            editor,
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+        )
+        self._activity_description_entry.pack(
+            side=LEFT,
+            fill=X,
+            expand=True,
+            padx=(8, 0),
+            ipady=7,
+        )
+        self._button(
+            editor,
+            "儲存敘述",
+            self._save_activity_description,
+            primary=True,
+        ).pack(side=LEFT, padx=(8, 0))
+        if not choices or self.on_activity_description_change is None:
+            self._activity_description_entry.configure(state=DISABLED)
+        self._activity_description_status_label = Label(
+            parent,
+            text="空白後儲存可清除自訂敘述；不會改變活動識別或進度。",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        )
+        self._activity_description_status_label.pack(fill=X, pady=(8, 0))
+        if choices:
+            self._load_activity_description(choices[0].activity_id)
+
+    def _select_activity_description(self, _selected: str) -> None:
+        if self._activity_description_variable is None:
+            return
+        activity_id = self._activity_description_choice_ids.get(
+            self._activity_description_variable.get()
+        )
+        if activity_id is not None:
+            self._load_activity_description(activity_id)
+
+    def _load_activity_description(self, activity_id: str) -> None:
+        if self._activity_description_entry is None:
+            return
+        choice = next(
+            (
+                item
+                for item in self.activity_description_choices
+                if item.activity_id == activity_id
+            ),
+            None,
+        )
+        self._activity_description_entry.configure(state=NORMAL)
+        self._activity_description_entry.delete(0, "end")
+        if choice is not None:
+            self._activity_description_entry.insert(0, choice.description)
+        if self.on_activity_description_change is None:
+            self._activity_description_entry.configure(state=DISABLED)
+
+    def _save_activity_description(self) -> None:
+        if (
+            self.on_activity_description_change is None
+            or self._activity_description_variable is None
+            or self._activity_description_entry is None
+        ):
+            return
+        activity_id = self._activity_description_choice_ids.get(
+            self._activity_description_variable.get()
+        )
+        if activity_id is None:
+            return
+        try:
+            saved = self.on_activity_description_change(
+                activity_id,
+                self._activity_description_entry.get(),
+            )
+            if not isinstance(saved, ActivityDescriptionChoice):
+                raise TypeError(
+                    "activity description callback must return "
+                    "ActivityDescriptionChoice."
+                )
+            self._activity_description_options()
+            self.refresh_activity_schedule()
+            if self._activity_description_status_label is not None:
+                self._activity_description_status_label.configure(
+                    text=(
+                        f"{saved.name}敘述已保存。"
+                        if saved.description
+                        else f"{saved.name}自訂敘述已清除。"
+                    ),
+                    fg=SUCCESS,
+                )
+        except Exception as error:
+            self._report_refresh_error(error)
+            if self._activity_description_status_label is not None:
+                self._activity_description_status_label.configure(
+                    text=f"活動敘述保存失敗：{error}",
+                    fg=WARNING,
+                )
 
     def _build_feature_card_settings_card(self, page) -> None:
         layout_card = self._card(

@@ -79,6 +79,7 @@ from habit.store import ActivityOrderHabitStore
 from habit.preference_service import PlayerHabitPreferenceService
 from habit.preference_store import PlayerHabitStore
 from services.activity_progress_service import ActivityProgressService
+from services.activity_description_service import ActivityDescriptionService
 from services.activity_reminder_monitor import ActivityReminderMonitor
 from services.activity_reminder_service import ActivityReminderService
 from services.activity_schedule_view_service import ActivityScheduleViewService
@@ -437,8 +438,14 @@ def build_services(
     )
     progress_service = ActivityProgressService(progress_store)
     activity_schedule_catalog = build_confirmed_activity_catalog()
+    activity_description_service = ActivityDescriptionService(
+        config,
+        activity_schedule_catalog,
+    )
     activity_schedule_view_service = ActivityScheduleViewService(
-        activity_schedule_catalog
+        activity_schedule_catalog,
+        activity_description_service,
+        progress_service,
     )
     for rule in activity_schedule_catalog.all():
         progress_service.register_definition(rule.definition)
@@ -625,6 +632,10 @@ def build_services(
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
     AppContext.register(ActivityScheduleCatalog, activity_schedule_catalog)
+    AppContext.register(
+        ActivityDescriptionService,
+        activity_description_service,
+    )
     AppContext.register(ActivityScheduleViewService, activity_schedule_view_service)
     AppContext.register(DecisionService, decision_service)
     AppContext.register(ActivityOrderHabitStore, activity_order_habit_store)
@@ -1278,6 +1289,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     synchronized_window_backend = AppContext.get(Win32WindowBackend)
     workspace_service = AppContext.get(WorkspaceService)
     activity_schedule_view_service = AppContext.get(ActivityScheduleViewService)
+    activity_description_service = AppContext.get(ActivityDescriptionService)
     card_view_state_service = AppContext.get(CardViewStateService)
     card_service = AppContext.get(CardService)
     card_coordinator = AppContext.get(CardCoordinator)
@@ -3757,6 +3769,21 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         activity_schedule_provider=(
             activity_schedule_view_service.snapshot
             if activity_schedule_view_service is not None
+            else None
+        ),
+        activity_description_choices=(
+            activity_description_service.choices()
+            if activity_description_service is not None
+            else ()
+        ),
+        activity_description_choices_provider=(
+            activity_description_service.choices
+            if activity_description_service is not None
+            else None
+        ),
+        on_activity_description_change=(
+            activity_description_service.set_description
+            if activity_description_service is not None
             else None
         ),
         card_view_state=(

@@ -318,6 +318,17 @@ def test_workspace_player_text_does_not_expose_ids() -> None:
     assert "group_id" not in text
 
 
+def test_activity_table_and_player_description_editor_are_concise() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+
+    assert "適用：" in source
+    assert "狀態：" in source
+    assert "下一步：" in source
+    assert "調整活動敘述" in source
+    assert "儲存敘述" in source
+    assert "不會改變活動識別或進度" in source
+
+
 def test_target_window_observation_remains_safe_read_only_value() -> None:
     observation = TargetWindowObservation(
         configured=True,
