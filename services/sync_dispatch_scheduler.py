@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import heapq
 from collections.abc import Callable
-from threading import Condition, Thread
+from threading import Condition, Thread, current_thread
 from time import monotonic
 
 
@@ -57,12 +57,15 @@ class SyncDispatchScheduler:
             self._queue.clear()
             self._condition.notify_all()
 
-    def close(self) -> None:
+    def close(self, timeout_seconds: float = 5.0) -> bool:
         with self._condition:
             self._closed = True
             self._generation += 1
             self._queue.clear()
             self._condition.notify_all()
+        if self._worker is not current_thread():
+            self._worker.join(max(0.0, timeout_seconds))
+        return not self._worker.is_alive()
 
     def _run(self) -> None:
         while True:

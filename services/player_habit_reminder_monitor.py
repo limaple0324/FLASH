@@ -40,19 +40,28 @@ class PlayerHabitReminderMonitor:
     def running(self) -> bool:
         return self._running
 
-    def start(self) -> None:
+    def start(self) -> bool:
         if self._running:
-            return
+            return True
         self._running = True
-        self._tick()
+        try:
+            self._tick()
+        except Exception:
+            self._running = False
+            self._after_id = None
+            raise
+        return True
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self._running = False
         if self._after_id is not None:
+            after_id = self._after_id
+            self._after_id = None
             try:
-                self._cancel(self._after_id)
-            finally:
-                self._after_id = None
+                self._cancel(after_id)
+            except Exception:
+                return False
+        return True
 
     def _tick(self) -> None:
         self._after_id = None

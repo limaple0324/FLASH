@@ -83,23 +83,27 @@ class FeatureHotkeyMonitor:
 
     def start(self) -> bool:
         if self._running:
-            return False
+            return True
         self._running = True
         self._was_down = dict.fromkeys(self._callbacks, False)
-        self._schedule_next()
+        try:
+            self._schedule_next()
+        except Exception:
+            self._running = False
+            raise
         return True
 
     def stop(self) -> bool:
-        was_running = self._running
         self._running = False
+        cancelled = True
         if self._after_id is not None:
             try:
                 self._cancel(self._after_id)
             except Exception:
-                pass
+                cancelled = False
         self._after_id = None
         self._was_down = dict.fromkeys(self._callbacks, False)
-        return was_running
+        return cancelled
 
     def _schedule_next(self) -> None:
         if self._running:
@@ -160,23 +164,27 @@ class GroupLaunchHotkeyMonitor:
 
     def start(self) -> bool:
         if self._running:
-            return False
+            return True
         self._running = True
         self._was_down = {}
-        self._schedule_next()
+        try:
+            self._schedule_next()
+        except Exception:
+            self._running = False
+            raise
         return True
 
     def stop(self) -> bool:
-        was_running = self._running
         self._running = False
+        cancelled = True
         if self._after_id is not None:
             try:
                 self._cancel(self._after_id)
             except Exception:
-                pass
+                cancelled = False
         self._after_id = None
         self._was_down = {}
-        return was_running
+        return cancelled
 
     def _schedule_next(self) -> None:
         if self._running:

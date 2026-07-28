@@ -10,7 +10,22 @@ from pathlib import Path
 from typing import Mapping
 
 from core.window_registry import WindowRegistry
+from domain.character import Character
 from domain.group import CharacterGroup
+from services.group_configuration_service import GroupConfigurationService
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerGroupMember:
+    """Versioned, player-safe group member without shortcut paths."""
+
+    entry_id: str
+    display_name: str
+    role: str
+    role_id: str | None = None
+    character_id: str | None = None
+
+    SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +35,9 @@ class PlayerGroupChoice:
     group_id: str
     name: str
     character_count: int
+    members: tuple[PlayerGroupMember, ...] = ()
+
+    SCHEMA_VERSION = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.group_id, str) or not self.group_id.strip():
@@ -32,6 +50,32 @@ class PlayerGroupChoice:
             or self.character_count < 0
         ):
             raise ValueError("character_count must be a non-negative integer.")
+        if any(
+            not isinstance(member, PlayerGroupMember)
+            for member in self.members
+        ):
+            raise TypeError("members must contain PlayerGroupMember values.")
+        if self.members and self.character_count != len(self.members):
+            raise ValueError("character_count must match available members.")
+
+    def to_public_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "group_id": self.group_id,
+            "name": self.name,
+            "character_count": self.character_count,
+            "members": [
+                {
+                    "schema_version": member.SCHEMA_VERSION,
+                    "entry_id": member.entry_id,
+                    "display_name": member.display_name,
+                    "role": member.role,
+                    "role_id": member.role_id,
+                    "character_id": member.character_id,
+                }
+                for member in self.members
+            ],
+        }
 
 
 def default_legacy_group_config_path() -> Path | None:
@@ -50,10 +94,12 @@ class GroupSelectionService:
         registry: WindowRegistry,
         *,
         legacy_config_path: Path | None = None,
+        configuration: GroupConfigurationService | None = None,
     ) -> None:
         if not isinstance(registry, WindowRegistry):
             raise TypeError("registry must be WindowRegistry.")
         self._registry = registry
+        self._configuration = configuration
         self._legacy_config_path = (
             Path(legacy_config_path)
             if legacy_config_path is not None
@@ -110,19 +156,61 @@ class GroupSelectionService:
 
     def choices(self) -> tuple[PlayerGroupChoice, ...]:
         counts = self._legacy_groups()
-        registry_counts: dict[str, int] = {}
+        configured_members: dict[str, tuple[PlayerGroupMember, ...]] = {}
+        if self._configuration is not None:
+            for group in self._configuration.groups():
+                members: list[PlayerGroupMember] = []
+                for entry in group.entries:
+                    try:
+                        record = self._registry.get(entry.entry_id)
+                    except KeyError:
+                        record = None
+                    members.append(
+                        PlayerGroupMember(
+                            entry_id=entry.entry_id,
+                            display_name=entry.display_name,
+                            role=entry.role,
+                            role_id=entry.role_id or None,
+                            character_id=(
+                                record.character_id
+                                if record is not None
+                                and record.group == group.name
+                                else None
+                            ),
+                        )
+                    )
+                configured_members[group.name] = tuple(members)
+                counts[group.name] = len(members)
+        registry_members: dict[str, list[PlayerGroupMember]] = {}
         for record in self._registry.all():
             name = self._clean_name(record.group)
             if name is not None:
-                registry_counts[name] = registry_counts.get(name, 0) + 1
-        for name in sorted(registry_counts, key=str.casefold):
-            counts[name] = max(counts.get(name, 0), registry_counts[name])
+                registry_members.setdefault(name, []).append(
+                    PlayerGroupMember(
+                        entry_id=record.character_id,
+                        display_name=record.display_name,
+                        role=record.role or "",
+                        character_id=record.character_id,
+                    )
+                )
+        for name in sorted(registry_members, key=str.casefold):
+            if name not in configured_members:
+                configured_members[name] = tuple(registry_members[name])
+            counts[name] = max(
+                counts.get(name, 0),
+                len(registry_members[name]),
+            )
 
         return tuple(
             PlayerGroupChoice(
                 group_id=self._group_id(name),
                 name=name,
-                character_count=counts[name],
+                character_count=(
+                    len(configured_members[name])
+                    if name in configured_members
+                    else counts[name]
+                ),
+                members=configured_members.get(name, ()),
             )
             for name in counts
         )
@@ -147,7 +235,24 @@ class GroupSelectionService:
         return choices[0] if choices else None
 
     @staticmethod
-    def workspace_group(choice: PlayerGroupChoice) -> CharacterGroup:
+    def workspace_group(
+        choice: PlayerGroupChoice,
+        characters: tuple[Character, ...] = (),
+    ) -> CharacterGroup:
         if not isinstance(choice, PlayerGroupChoice):
             raise TypeError("choice must be PlayerGroupChoice.")
-        return CharacterGroup(group_id=choice.group_id, name=choice.name)
+        by_id = {
+            character.character_id: character
+            for character in characters
+            if isinstance(character, Character)
+        }
+        ordered = tuple(
+            by_id[member.character_id or member.entry_id]
+            for member in choice.members
+            if (member.character_id or member.entry_id) in by_id
+        )
+        return CharacterGroup(
+            group_id=choice.group_id,
+            name=choice.name,
+            characters=ordered,
+        )

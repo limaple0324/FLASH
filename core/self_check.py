@@ -111,8 +111,12 @@ class SelfCheck:
         if bus is None:
             raise RuntimeError("EventBus is not registered.")
         received: list[dict[str, object]] = []
-        bus.subscribe("self_check", received.append)
-        bus.publish("self_check", {"ok": True})
+        handler = received.append
+        bus.subscribe("self_check", handler)
+        try:
+            bus.publish("self_check", {"ok": True})
+        finally:
+            bus.unsubscribe("self_check", handler)
         if received != [{"ok": True}]:
             raise RuntimeError("Event bus did not deliver the test event.")
         return "Event bus delivery succeeded."

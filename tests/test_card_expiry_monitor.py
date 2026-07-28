@@ -34,7 +34,6 @@ class _Schedule:
         _delay_ms, callback = self.calls.pop(0)
         callback()
 
-
 def test_monitor_removes_card_at_thirty_seconds_and_triggers_change_notice():
     shown_at = datetime(2026, 7, 14, 13, 0, tzinfo=timezone.utc)
     cards = CardService()
@@ -109,6 +108,26 @@ def test_start_is_idempotent_and_stop_prevents_pending_check():
 
     assert len(schedule.calls) == 0
     assert monitor.running is False
+
+
+def test_stop_cancels_pending_desktop_callback():
+    cards = CardService()
+    pending = {}
+
+    def schedule(delay_ms, callback):
+        token = object()
+        pending[token] = (delay_ms, callback)
+        return token
+
+    def cancel(token):
+        pending.pop(token)
+
+    monitor = CardExpiryMonitor(cards, schedule, cancel=cancel)
+
+    assert monitor.start() is True
+    assert len(pending) == 1
+    assert monitor.stop() is True
+    assert pending == {}
 
 
 def test_pending_expired_card_is_recorded_without_becoming_visible():

@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from ctypes import wintypes
 from time import perf_counter_ns
-from typing import Callable, Protocol
+from typing import Callable, Iterable, Protocol
 
 from adapters.windows_pointer_sync import (
     PointerSyncResult,
@@ -32,12 +32,51 @@ class MouseStateBackend(Protocol):
 class Win32MouseStateBackend:
     VK_LBUTTON = 0x01
 
+    def __init__(
+        self,
+        *,
+        foreground_handle_provider: Callable[[], int | None] | None = None,
+        target_handles_provider: Callable[[], Iterable[int]] | None = None,
+    ) -> None:
+        if foreground_handle_provider is not None and not callable(
+            foreground_handle_provider
+        ):
+            raise TypeError("foreground_handle_provider must be callable.")
+        if target_handles_provider is not None and not callable(
+            target_handles_provider
+        ):
+            raise TypeError("target_handles_provider must be callable.")
+        self._foreground_handle_provider = foreground_handle_provider
+        self._target_handles_provider = target_handles_provider
+
     def sample(self) -> MouseSample | None:
         if os.name != "nt":
             return None
         user32 = ctypes.windll.user32
-        user32.GetForegroundWindow.argtypes = ()
-        user32.GetForegroundWindow.restype = wintypes.HWND
+        if self._foreground_handle_provider is not None:
+            try:
+                hwnd = self._foreground_handle_provider()
+            except Exception:
+                return None
+        else:
+            user32.GetForegroundWindow.argtypes = ()
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            hwnd = user32.GetForegroundWindow()
+        if (
+            not isinstance(hwnd, int)
+            or isinstance(hwnd, bool)
+            or hwnd <= 0
+        ):
+            return None
+        if self._target_handles_provider is not None:
+            try:
+                target_handles = {
+                    int(item) for item in self._target_handles_provider()
+                }
+            except Exception:
+                return None
+            if hwnd not in target_handles:
+                return None
         user32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
         user32.GetCursorPos.restype = wintypes.BOOL
         user32.ScreenToClient.argtypes = (
@@ -52,9 +91,6 @@ class Win32MouseStateBackend:
         user32.GetClientRect.restype = wintypes.BOOL
         user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
         user32.GetAsyncKeyState.restype = wintypes.SHORT
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return None
         point = wintypes.POINT()
         rect = wintypes.RECT()
         if (
@@ -108,34 +144,44 @@ class MouseSyncMonitor:
     def enabled(self) -> bool:
         return self._enabled
 
-    def start(self) -> None:
+    def start(self) -> bool:
         with self._queue_lock:
             if self._enabled:
-                return
+                return True
             self._enabled = True
             self._generation += 1
             self._release_pending_generation = None
             self._active_event = None
         self._previous = None
-        self._schedule_next()
+        try:
+            self._schedule_next()
+        except Exception:
+            with self._queue_lock:
+                self._enabled = False
+                self._generation += 1
+            raise
+        return True
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         with self._queue_lock:
             self._enabled = False
             self._generation += 1
             self._queue.clear()
             self._release_pending_generation = None
+        released = True
         try:
             self._controller.release_pressed_targets()
         except Exception:
-            pass
+            released = False
+        cancelled = True
         if self._after_id is not None:
             try:
                 self._cancel(self._after_id)
             except Exception:
-                pass
+                cancelled = False
             self._after_id = None
         self._previous = None
+        return released and cancelled
 
     def _schedule_next(self) -> None:
         if self._enabled:

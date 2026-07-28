@@ -56,16 +56,23 @@ class CardOverlaySyncService:
         if self._running:
             self.refresh()
 
-    def start(self) -> None:
+    def start(self) -> bool:
         if self._running:
-            return
+            return True
         self._running = True
         self._cards.subscribe(self._on_cards_changed)
-        self.refresh()
+        self._cards.resync(self._on_cards_changed)
+        return self._running
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         if not self._running:
-            return
+            return True
         self._cards.unsubscribe(self._on_cards_changed)
         self._running = False
-        self._lifecycle.close_all()
+        try:
+            self._lifecycle.close_all()
+        except Exception as exc:
+            self._last_error = exc
+            return False
+        self._last_error = None
+        return True

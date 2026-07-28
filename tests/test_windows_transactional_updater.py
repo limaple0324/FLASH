@@ -336,19 +336,19 @@ def test_rollback_failure_preserves_recovery_backups(tmp_path: Path):
 
 
 @pytest.mark.parametrize("milestone", ["SP2", "SP3"])
-def test_updater_rejects_sp2_and_sp3_metadata_without_installing(
+def test_full_release_accepts_cumulative_milestones(
     tmp_path: Path,
     milestone: str,
 ):
     release_root = _create_release(tmp_path, milestone=milestone)
     install_root = _create_existing_install(tmp_path)
-    before = _installed_payload_snapshot(install_root)
 
     result = _run_updater(install_root, release_root)
 
-    assert result.returncode != 0, _output(result)
-    assert _installed_payload_snapshot(install_root) == before
-    assert "milestone 必須是 SP1" in _log(install_root)
+    assert result.returncode == 0, _output(result)
+    assert (install_root / "FLASH.exe").read_bytes() == (
+        release_root / "FLASH.exe"
+    ).read_bytes()
 
 
 def test_updater_rejects_latest_and_build_info_commit_mismatch(tmp_path: Path):
@@ -399,9 +399,8 @@ def test_changed_update_channel_requires_a_full_installer(tmp_path: Path):
 
     assert result.returncode != 0, _output(result)
     assert _installed_payload_snapshot(install_root) == before
-    assert "BUILD_INFO.txt 的 source_branch 必須是 sp1/completion-2026-07-25" in (
-        _log(install_root)
-    )
+    assert "已安裝 BUILD_INFO.txt" in _log(install_root)
+    assert "格式不正確" in _log(install_root)
 
 
 def test_second_updater_instance_is_rejected_by_the_single_lock(tmp_path: Path):
@@ -469,30 +468,92 @@ def test_success_uses_one_fixed_release_commit_and_verifies_installed_files(
     assert "?t=" not in updater
 
 
-def test_sp1_only_channel_updates_only_from_the_sp1_release_identity(tmp_path: Path):
-    release_root = _create_release(
-        tmp_path,
-        build_kind="sp1_release",
-        event_name="push",
-        source_ref="refs/heads/sp1/completion-2026-07-25",
-        source_branch="sp1/completion-2026-07-25",
-        publish_target="release/sp1",
-    )
+def test_sp1_install_migrates_transactionally_to_the_full_release(
+    tmp_path: Path,
+):
+    release_root = _create_release(tmp_path, milestone="SP3")
     install_root = _create_existing_install(
         tmp_path,
         build_kind="sp1_release",
         source_branch="sp1/completion-2026-07-25",
         publish_target="release/sp1",
     )
+    _path(install_root, "輔系統/BUILD_INFO.txt").write_text(
+        "\n".join(
+            (
+                "source_branch=sp1/completion-2026-07-25",
+                "build_kind=sp1_release",
+                "publish_target=release/sp1",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
 
     result = _run_updater(install_root, release_root)
 
     assert result.returncode == 0, _output(result)
-    assert "固定更新來源：release/sp1" in _log(install_root)
-    assert _path(
+    assert "SP1 獨立版" in _log(install_root)
+    installed_channel = _path(
         install_root,
         "輔系統/UPDATE_CHANNEL.txt",
-    ).read_bytes() == _path(
-        release_root,
-        "輔系統/UPDATE_CHANNEL.txt",
+    ).read_text(encoding="utf-8")
+    assert "release_branch=release/latest" in installed_channel
+    assert (install_root / "FLASH.exe").read_bytes() == (
+        release_root / "FLASH.exe"
     ).read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_message"),
+    (
+        ("offline", "目前無法連上網路"),
+        ("dns", "無法解析網路位址"),
+        ("tls", "安全連線驗證失敗"),
+        ("403", "GitHub 拒絕存取（403）"),
+        ("404", "找不到更新檔案（404）"),
+        ("429", "下載過於頻繁（429）"),
+        ("500", "更新伺服器暫時無法使用"),
+        ("timeout", "連線逾時"),
+        ("github_limit", "GitHub 下載次數已達限制"),
+    ),
+)
+def test_network_failures_have_distinct_chinese_results_without_installing(
+    tmp_path: Path,
+    failure_kind: str,
+    expected_message: str,
+):
+    release_root = _create_release(tmp_path)
+    install_root = _create_existing_install(tmp_path)
+    before = _installed_payload_snapshot(install_root)
+
+    result = _run_updater(
+        install_root,
+        release_root,
+        "-TestNetworkFailureKind",
+        failure_kind,
+    )
+
+    assert result.returncode != 0
+    assert _installed_payload_snapshot(install_root) == before
+    assert expected_message in _log(install_root)
+
+
+def test_transient_network_failures_retry_then_complete_transaction(
+    tmp_path: Path,
+):
+    release_root = _create_release(tmp_path)
+    install_root = _create_existing_install(tmp_path)
+
+    result = _run_updater(
+        install_root,
+        release_root,
+        "-TestTransientFailuresBeforeSuccess",
+        "2",
+    )
+
+    assert result.returncode == 0, _output(result)
+    log = _log(install_root)
+    assert "第 2 次嘗試" in log
+    assert "第 3 次嘗試" in log
+    assert "更新成功" in log

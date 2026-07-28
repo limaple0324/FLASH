@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import replace
 from ctypes import wintypes
 from time import perf_counter_ns
-from typing import Callable, Protocol
+from typing import Callable, Iterable, Protocol
 
 from adapters.windows_input_sync import (
     VIRTUAL_KEY_SEQUENCES,
@@ -44,12 +44,25 @@ class Win32KeyboardStateBackend:
     def __init__(
         self,
         title_keywords: tuple[str, ...] = ("Adobe Flash Player",),
+        *,
+        foreground_handle_provider: Callable[[], int | None] | None = None,
+        target_handles_provider: Callable[[], Iterable[int]] | None = None,
     ) -> None:
         self._keywords = tuple(
             keyword.strip().casefold()
             for keyword in title_keywords
             if keyword.strip()
         )
+        if foreground_handle_provider is not None and not callable(
+            foreground_handle_provider
+        ):
+            raise TypeError("foreground_handle_provider must be callable.")
+        if target_handles_provider is not None and not callable(
+            target_handles_provider
+        ):
+            raise TypeError("target_handles_provider must be callable.")
+        self._foreground_handle_provider = foreground_handle_provider
+        self._target_handles_provider = target_handles_provider
 
     @staticmethod
     def _user32():
@@ -58,11 +71,36 @@ class Win32KeyboardStateBackend:
         return ctypes.windll.user32
 
     def foreground_game_handle(self) -> int | None:
+        if self._foreground_handle_provider is not None:
+            try:
+                handle = self._foreground_handle_provider()
+            except Exception:
+                return None
+        else:
+            user32 = self._user32()
+            if user32 is None:
+                return None
+            user32.GetForegroundWindow.argtypes = ()
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            handle = user32.GetForegroundWindow()
+        if (
+            not isinstance(handle, int)
+            or isinstance(handle, bool)
+            or handle <= 0
+        ):
+            return None
+        if self._target_handles_provider is not None:
+            try:
+                target_handles = {
+                    int(item) for item in self._target_handles_provider()
+                }
+            except Exception:
+                return None
+            return handle if handle in target_handles else None
+
         user32 = self._user32()
         if user32 is None:
             return None
-        user32.GetForegroundWindow.argtypes = ()
-        user32.GetForegroundWindow.restype = wintypes.HWND
         user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
         user32.GetWindowTextLengthW.restype = ctypes.c_int
         user32.GetWindowTextW.argtypes = (
@@ -72,9 +110,6 @@ class Win32KeyboardStateBackend:
         )
         user32.GetWindowTextW.restype = ctypes.c_int
 
-        handle = user32.GetForegroundWindow()
-        if not handle:
-            return None
         length = max(0, int(user32.GetWindowTextLengthW(handle)))
         buffer = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(handle, buffer, len(buffer))
@@ -83,7 +118,7 @@ class Win32KeyboardStateBackend:
             keyword in title for keyword in self._keywords
         ):
             return None
-        return int(handle)
+        return handle
 
     def foreground_is_game(self) -> bool:
         return self.foreground_game_handle() is not None
@@ -147,27 +182,36 @@ class KeyboardSyncMonitor:
     def enabled(self) -> bool:
         return self._enabled
 
-    def start(self) -> None:
+    def start(self) -> bool:
         with self._queue_lock:
             if self._enabled:
-                return
+                return True
             self._enabled = True
             self._generation += 1
         self._key_states = dict.fromkeys(self._key_states, False)
-        self._schedule_next()
+        try:
+            self._schedule_next()
+        except Exception:
+            with self._queue_lock:
+                self._enabled = False
+                self._generation += 1
+            raise
+        return True
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         with self._queue_lock:
             self._enabled = False
             self._generation += 1
             self._queue.clear()
+        cancelled = True
         if self._after_id is not None:
             try:
                 self._cancel(self._after_id)
             except Exception:
-                pass
+                cancelled = False
         self._after_id = None
         self._key_states = dict.fromkeys(self._key_states, False)
+        return cancelled
 
     def _schedule_next(self) -> None:
         if self._enabled:

@@ -245,6 +245,9 @@ class WindowsPointerSyncController:
         screen_state_provider: (
             Callable[[str], ReconnectScreenState | None] | None
         ) = None,
+        target_windows_provider: (
+            Callable[[], Iterable[WindowInfo]] | None
+        ) = None,
     ) -> None:
         self._expected_windows = max(1, int(expected_windows))
         self._keywords = tuple(
@@ -263,6 +266,7 @@ class WindowsPointerSyncController:
         self._reconnecting_provider = reconnecting_provider or (lambda: ())
         self._role_operation_callback = role_operation_callback
         self._screen_state_provider = screen_state_provider
+        self._target_windows_provider = target_windows_provider
         self._pressed_targets: dict[int, tuple[float, float]] = {}
         self._pressed_targets_lock = Lock()
         self._target_settings: dict[str, SyncTargetSettings] = {}
@@ -313,6 +317,9 @@ class WindowsPointerSyncController:
             Callable[[str], ReconnectScreenState | None] | None
         ) = None,
         window_backend: WindowBackend | None = None,
+        target_windows_provider: (
+            Callable[[], Iterable[WindowInfo]] | None
+        ) = None,
     ) -> "WindowsPointerSyncController":
         return cls(
             expected_windows=14,
@@ -329,6 +336,7 @@ class WindowsPointerSyncController:
             reconnecting_provider=reconnecting_provider,
             role_operation_callback=role_operation_callback,
             screen_state_provider=screen_state_provider,
+            target_windows_provider=target_windows_provider,
         )
 
     def _record_role_operation(
@@ -474,6 +482,12 @@ class WindowsPointerSyncController:
         self._dispatch_scheduler.invalidate()
         self.release_pressed_targets()
 
+    def close(self, timeout_seconds: float = 5.0) -> bool:
+        self.set_allowed_fingerprints(None)
+        released = not self.has_pressed_targets()
+        stopped = self._dispatch_scheduler.close(timeout_seconds)
+        return released and stopped
+
     def set_controller_fingerprint(self, fingerprint: object) -> None:
         normalized = normalize_launch_fingerprint(fingerprint)
         if normalized is None:
@@ -492,9 +506,8 @@ class WindowsPointerSyncController:
     def _windows(self) -> tuple[WindowInfo, ...]:
         windows = tuple(
             window
-            for window in self._window_backend.list_windows()
-            if all(keyword in window.title.casefold() for keyword in self._keywords)
-            and (
+            for window in self._candidate_windows()
+            if (
                 self._allowed_fingerprint_set is None
                 or normalize_launch_fingerprint(window.launch_fingerprint)
                 in self._allowed_fingerprint_set
@@ -865,6 +878,14 @@ class WindowsPointerSyncController:
         )
 
     def _all_title_matching_windows(self) -> tuple[WindowInfo, ...]:
+        return self._candidate_windows()
+
+    def _candidate_windows(self) -> tuple[WindowInfo, ...]:
+        if self._target_windows_provider is not None:
+            try:
+                return tuple(self._target_windows_provider())
+            except Exception:
+                return ()
         return tuple(
             window
             for window in self._window_backend.list_windows()

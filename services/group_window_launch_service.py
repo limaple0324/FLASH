@@ -121,6 +121,7 @@ class GroupWindowLaunchService:
         self._lock = threading.RLock()
         self._running = False
         self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
 
     @property
     def running(self) -> bool:
@@ -414,25 +415,38 @@ class GroupWindowLaunchService:
 
         def worker() -> None:
             try:
-                result = runner(cleaned_group)
-            except Exception:
-                result = GroupWindowLaunchResult(
-                    False,
-                    cleaned_group,
-                    failure_code="group_launch_failed",
-                )
+                try:
+                    result = runner(cleaned_group)
+                except Exception:
+                    result = GroupWindowLaunchResult(
+                        False,
+                        cleaned_group,
+                        failure_code="group_launch_failed",
+                    )
+                if on_complete is not None:
+                    self._completion_dispatch(
+                        lambda: on_complete(result)
+                    )
             finally:
                 with self._lock:
                     self._running = False
+                    if self._thread is threading.current_thread():
+                        self._thread = None
 
-            if on_complete is not None:
-                self._completion_dispatch(lambda: on_complete(result))
-
-        threading.Thread(
+        thread = threading.Thread(
             target=worker,
             name="GroupWindowLaunchService",
             daemon=True,
-        ).start()
+        )
+        with self._lock:
+            self._thread = thread
+        try:
+            thread.start()
+        except Exception:
+            with self._lock:
+                self._running = False
+                self._thread = None
+            raise
         return True
 
     def start(
@@ -468,5 +482,24 @@ class GroupWindowLaunchService:
             on_complete,
         )
 
-    def stop(self) -> None:
+    def stop(self, timeout_seconds: float = 5.0) -> bool:
         self._stop_event.set()
+        return self.join(timeout_seconds=timeout_seconds)
+
+    def cancel(self, timeout_seconds: float = 5.0) -> bool:
+        return self.stop(timeout_seconds=timeout_seconds)
+
+    def join(self, timeout_seconds: float = 5.0) -> bool:
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        if thread is not threading.current_thread():
+            thread.join(max(0.0, timeout_seconds))
+        stopped = not thread.is_alive()
+        if stopped:
+            with self._lock:
+                self._running = False
+                if self._thread is thread:
+                    self._thread = None
+        return stopped

@@ -63,9 +63,14 @@ def test_installer_uses_a_safe_source_path_and_one_confirmed_shortcut():
 def test_windows_powershell_download_does_not_require_the_ie_engine():
     updater = Path("tools/輔系統/輔更新核心.ps1").read_text(encoding="utf-8")
 
-    assert "Invoke-WebRequest -Uri $url -OutFile $TargetPath -UseBasicParsing" in updater
+    assert "Invoke-WebRequest `" in updater
+    assert "-OutFile $TargetPath `" in updater
     assert "Invoke-RestMethod `" in updater
     assert updater.count("-UseBasicParsing") == 2
+    assert "-TimeoutSec $ConnectionTimeoutSeconds" in updater
+    assert "-TimeoutSec $DownloadTimeoutSeconds" in updater
+    assert "Invoke-WithNetworkRetry" in updater
+    assert "TestTransientFailuresBeforeSuccess" in updater
 
 
 def test_hash_verification_does_not_require_powershell_module_autoload():

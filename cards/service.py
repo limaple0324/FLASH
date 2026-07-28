@@ -1,7 +1,9 @@
 """管理同時可見的組別級提醒卡。"""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from threading import RLock
 
 from cards.lifecycle import CardLifecycle, _require_aware
 from cards.models import GroupCard
@@ -15,27 +17,94 @@ class CardCapacityError(RuntimeError):
     """Deprecated compatibility error; extra cards now wait in priority order."""
 
 
+@dataclass(frozen=True, slots=True)
+class CardServiceState:
+    schema_version: int
+    revision: int
+    visible_cards: tuple[GroupCard, ...]
+    pending_cards: tuple[GroupCard, ...]
+
+    SCHEMA_VERSION = 1
+
+
 class CardService:
-    def __init__(self, settings: CardDisplaySettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: CardDisplaySettings | None = None,
+        *,
+        listener_error_callback: Callable[[Exception], None] | None = None,
+    ) -> None:
         if settings is not None and not isinstance(settings, CardDisplaySettings):
             raise TypeError("settings must be CardDisplaySettings.")
         self.settings = settings or CardDisplaySettings()
         self._entries: list[CardLifecycle] = []
         self._change_listeners: list[Callable[[], None]] = []
+        self._revision = 0
+        self._lock = RLock()
+        self._listener_error_callback = listener_error_callback
 
-    def subscribe(self, listener: Callable[[], None]) -> None:
+    def subscribe(
+        self,
+        listener: Callable[[], None],
+        *,
+        resync: bool = False,
+    ) -> bool:
         if not callable(listener):
             raise TypeError("listener must be callable.")
-        if listener not in self._change_listeners:
-            self._change_listeners.append(listener)
+        with self._lock:
+            if listener in self._change_listeners:
+                added = False
+            else:
+                self._change_listeners.append(listener)
+                added = True
+        if resync:
+            self.resync(listener)
+        return added
 
-    def unsubscribe(self, listener: Callable[[], None]) -> None:
-        if listener in self._change_listeners:
+    def unsubscribe(self, listener: Callable[[], None]) -> bool:
+        with self._lock:
+            if listener not in self._change_listeners:
+                return False
             self._change_listeners.remove(listener)
+            return True
 
     def _notify_changed(self) -> None:
-        for listener in tuple(self._change_listeners):
+        with self._lock:
+            self._revision += 1
+            listeners = tuple(self._change_listeners)
+        for listener in listeners:
+            self._notify_one(listener)
+
+    def _notify_one(self, listener: Callable[[], None]) -> bool:
+        try:
             listener()
+            return True
+        except Exception as error:
+            if self._listener_error_callback is not None:
+                try:
+                    self._listener_error_callback(error)
+                except Exception:
+                    pass
+            return False
+
+    def resync(self, listener: Callable[[], None] | None = None) -> int:
+        """Request a recoverable full snapshot refresh after a missed update."""
+        if listener is not None:
+            if not callable(listener):
+                raise TypeError("listener must be callable.")
+            listeners = (listener,)
+        else:
+            with self._lock:
+                listeners = tuple(self._change_listeners)
+        return sum(not self._notify_one(item) for item in listeners)
+
+    def snapshot(self) -> CardServiceState:
+        return CardServiceState(
+            CardServiceState.SCHEMA_VERSION,
+            self._revision,
+            self.cards,
+            tuple(entry.card for entry in self.pending_entries),
+        )
 
     @property
     def cards(self) -> tuple[GroupCard, ...]:

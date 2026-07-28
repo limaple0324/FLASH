@@ -1,0 +1,488 @@
+import hashlib
+import json
+
+from adapters.windows_input_sync import (
+    WindowInputPolicy,
+    WindowsInputSyncController,
+)
+from adapters.windows_pointer_sync import WindowsPointerSyncController
+from adapters.windows_smart_reconnect import (
+    ReconnectRuntimeStateStore,
+    WindowsSmartReconnectController,
+)
+from adapters.windows_window import WindowInfo
+from cards.models import GroupCard
+from cards.priority import CardPriorityReason
+from cards.service import CardService
+from config.config_manager import ConfigManager
+from core.target_window_contract import TargetWindowPhase
+from core.window_registry import WindowRegistry
+from domain.activity import ActivityDefinition, ActivityType, ResetRule
+from domain.group import CharacterGroup
+from services.data_contract_migration_service import (
+    DataContractMigrationService,
+)
+from services.event_bus import EventBus
+from services.group_configuration_service import GroupConfigurationService
+from services.group_selection_service import GroupSelectionService
+from services.keyboard_sync_monitor import Win32KeyboardStateBackend
+from services.lifecycle_contract import (
+    cancel_service,
+    join_service,
+    start_service,
+    stop_service,
+)
+from services.sync_scope_service import SyncScopeService
+from services.target_window_contract_service import (
+    TargetWindowContractService,
+)
+
+
+class _Resolver:
+    def resolve(self, paths):
+        return {
+            path: hashlib.sha256(str(path).encode()).hexdigest()
+            for path in paths
+        }
+
+
+class _WindowBackend:
+    def __init__(self, windows=(), foreground=None, *, fail=False):
+        self.windows = tuple(windows)
+        self.foreground = foreground
+        self.fail = fail
+
+    def list_windows(self):
+        if self.fail:
+            raise OSError("fault injection")
+        return self.windows
+
+    def foreground_handle(self):
+        return self.foreground
+
+    def top_window_at(self, _x, _y):
+        return None
+
+
+class _MessageBackend:
+    def __init__(self):
+        self.sent = []
+
+    def is_window(self, _handle):
+        return True
+
+    def probe_responsive(self, _handle, _timeout):
+        return True
+
+    def send_virtual_key(self, handle, key):
+        self.sent.append((handle, key))
+        return True
+
+    def send_key_chord(self, handle, keys):
+        self.sent.append((handle, keys))
+        return True
+
+
+def _configured_group(tmp_path):
+    shortcuts = []
+    for name in ("主號", "分號"):
+        shortcut = tmp_path / f"{name}.lnk"
+        shortcut.write_bytes(b"shortcut")
+        shortcuts.append(shortcut)
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "測試組",
+                        "launch_entries": [
+                            {"path": str(shortcuts[0]), "role": "主控"},
+                            {"path": str(shortcuts[1]), "role": "同步"},
+                        ],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    configuration = GroupConfigurationService(
+        tmp_path / "groups.json",
+        legacy_config_path=legacy,
+    )
+    resolver = _Resolver()
+    scope_service = SyncScopeService(configuration, resolver)
+    scope = scope_service.scope("測試組")
+    return configuration, scope_service, scope
+
+
+def test_event_bus_deduplicates_unsubscribes_and_isolates_handlers():
+    bus = EventBus()
+    calls = []
+
+    def broken(_payload):
+        raise RuntimeError("fault injection")
+
+    def working(payload):
+        calls.append(payload)
+
+    assert bus.subscribe("changed", broken) is True
+    assert bus.subscribe("changed", broken) is False
+    assert bus.subscribe("changed", working) is True
+    bus.publish("changed", 1)
+    assert calls == [1]
+    assert bus.unsubscribe("changed", broken) is True
+    assert bus.unsubscribe("changed", broken) is False
+    bus.publish("changed", 2)
+    assert calls == [1, 2]
+
+
+def test_target_window_contract_is_shared_versioned_and_player_safe(tmp_path):
+    configuration, scope_service, scope = _configured_group(tmp_path)
+    registry = WindowRegistry()
+    for entry in configuration.group("測試組").entries:
+        registry.register_character(
+            entry.entry_id,
+            entry.display_name,
+            group="測試組",
+            role=entry.role,
+        )
+    windows = (
+        WindowInfo(
+            11,
+            "Adobe Flash Player 11",
+            True,
+            False,
+            (0, 0, 900, 600),
+            101,
+            "Flash",
+            scope.fingerprints[0],
+        ),
+        WindowInfo(
+            12,
+            "Adobe Flash Player 11",
+            True,
+            True,
+            (900, 0, 1800, 600),
+            102,
+            "Flash",
+            scope.fingerprints[1],
+        ),
+    )
+    backend = _WindowBackend(windows, foreground=11)
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        registry,
+        backend,
+    )
+
+    snapshot = service.snapshot("測試組")
+
+    assert snapshot.schema_version == 1
+    assert tuple(item.phase for item in snapshot.targets) == (
+        TargetWindowPhase.FOREGROUND,
+        TargetWindowPhase.MINIMIZED,
+    )
+    assert tuple(item.handle for item in snapshot.targets) == (11, 12)
+    public = snapshot.to_public_dict()
+    assert all("handle" not in item for item in public["targets"])
+    assert all("title" not in item for item in public["targets"])
+    assert tuple(window.handle for window in service.windows("測試組")) == (
+        11,
+        12,
+    )
+
+
+def test_target_window_enumeration_failure_fails_closed(tmp_path):
+    configuration, scope_service, _scope = _configured_group(tmp_path)
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        _WindowBackend(fail=True),
+    )
+
+    snapshot = service.snapshot("測試組")
+
+    assert snapshot.safe_targets == ()
+    assert "window_enumeration_failed" in snapshot.failure_codes
+
+
+def test_sync_controller_accepts_only_the_shared_target_provider():
+    windows = (
+        WindowInfo(
+            11,
+            "",
+            True,
+            False,
+            (0, 0, 900, 600),
+            101,
+            None,
+            "1" * 64,
+        ),
+        WindowInfo(
+            12,
+            "",
+            True,
+            False,
+            (900, 0, 1800, 600),
+            102,
+            None,
+            "2" * 64,
+        ),
+    )
+    messages = _MessageBackend()
+    controller = WindowsInputSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=_WindowBackend((), foreground=11),
+        message_backend=messages,
+        allowed_fingerprints=("1" * 64, "2" * 64),
+        target_windows_provider=lambda: windows,
+    )
+    controller.set_controller_fingerprint("1" * 64)
+
+    try:
+        result = controller.send_approved_key(
+            "B",
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            exclude_foreground=True,
+            source_handle=11,
+        )
+
+        assert result.sent_windows == 1
+        assert messages.sent[0][0] == 12
+    finally:
+        assert controller.close() is True
+
+
+def test_sync_pointer_and_reconnect_receive_the_same_target_set():
+    windows = (
+        WindowInfo(
+            11,
+            "",
+            True,
+            False,
+            (0, 0, 900, 600),
+            101,
+            None,
+            "1" * 64,
+        ),
+        WindowInfo(
+            12,
+            "",
+            True,
+            False,
+            (900, 0, 1800, 600),
+            102,
+            None,
+            "2" * 64,
+        ),
+    )
+    provider = lambda: windows
+    backend = _WindowBackend((), foreground=11)
+    keyboard = WindowsInputSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=_MessageBackend(),
+        target_windows_provider=provider,
+    )
+    pointer = WindowsPointerSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=object(),
+        target_windows_provider=provider,
+    )
+    reconnect = WindowsSmartReconnectController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        capture_provider=object(),
+        recognizer=object(),
+        mouse_backend=object(),
+        target_windows_provider=provider,
+    )
+    try:
+        assert keyboard._candidate_windows() == windows
+        assert pointer._candidate_windows() == windows
+        assert reconnect._candidate_windows() == windows
+    finally:
+        assert keyboard.close() is True
+        assert pointer.close() is True
+
+
+def test_foreground_monitor_accepts_only_shared_group_targets():
+    current = {"handle": 12}
+    backend = Win32KeyboardStateBackend(
+        foreground_handle_provider=lambda: current["handle"],
+        target_handles_provider=lambda: (11,),
+    )
+
+    assert backend.foreground_game_handle() is None
+    current["handle"] = 11
+    assert backend.foreground_game_handle() == 11
+
+
+def test_group_choice_exposes_real_members_without_paths(tmp_path):
+    configuration, _scope_service, _scope = _configured_group(tmp_path)
+    registry = WindowRegistry()
+    for entry in configuration.group("測試組").entries:
+        registry.register_character(
+            entry.entry_id,
+            entry.display_name,
+            group="測試組",
+            role=entry.role,
+        )
+    service = GroupSelectionService(
+        registry,
+        legacy_config_path=configuration.path,
+        configuration=configuration,
+    )
+
+    choice = service.find("測試組")
+
+    assert choice.character_count == 2
+    assert tuple(item.display_name for item in choice.members) == (
+        "主號",
+        "分號",
+    )
+    assert all(item.character_id for item in choice.members)
+    assert "shortcut_path" not in json.dumps(
+        choice.to_public_dict(),
+        ensure_ascii=False,
+    )
+
+
+def test_card_listener_failure_is_recoverable_by_full_resync():
+    failures = []
+    service = CardService(listener_error_callback=failures.append)
+    working_calls = []
+
+    def broken():
+        raise RuntimeError("fault injection")
+
+    service.subscribe(broken)
+    service.subscribe(lambda: working_calls.append(service.snapshot().revision))
+    service.upsert(
+        GroupCard(
+            card_id="one",
+            group=CharacterGroup("group", "測試組"),
+            activity=ActivityDefinition(
+                "activity",
+                "測試",
+                ActivityType.DAILY,
+                ResetRule.DAILY_MIDNIGHT,
+            ),
+            current_progress="測試",
+            priority_reason=CardPriorityReason.PREFERENCE,
+        )
+    )
+
+    assert failures
+    assert working_calls == [1]
+    assert service.snapshot().schema_version == 1
+    assert service.resync() == 1
+    assert working_calls == [1, 1]
+
+
+def test_lifecycle_contract_never_reports_a_failed_stop_as_stopped():
+    class Service:
+        running = True
+
+        def start(self):
+            return False
+
+        def stop(self):
+            return False
+
+    service = Service()
+    assert start_service(service).success is True
+    stopped = stop_service(service)
+    assert stopped.success is False
+    assert stopped.running is True
+    assert stopped.code == "lifecycle.stop_failed"
+
+
+def test_lifecycle_contract_keeps_cancel_and_join_failures_explicit():
+    class Service:
+        running = True
+
+        def cancel(self):
+            return False
+
+        def join(self):
+            return False
+
+    service = Service()
+
+    assert cancel_service(service).code == "lifecycle.cancel_failed"
+    joined = join_service(service)
+    assert joined.success is False
+    assert joined.running is True
+    assert joined.code == "lifecycle.join_failed"
+
+
+def test_data_contract_migration_is_sequential_and_rejects_future(tmp_path):
+    config = ConfigManager(tmp_path / "settings.json")
+    service = DataContractMigrationService(config)
+    assert service.state.component_versions["reconnect"] == 4
+    migrated = service.migrate_component(
+        "reconnect",
+        {"version": 1, "value": "kept"},
+        migrations={
+            1: lambda payload: {**payload, "version": 2},
+            2: lambda payload: {**payload, "version": 3},
+            3: lambda payload: {**payload, "version": 4},
+        },
+        version_key="version",
+    )
+    assert migrated == {"version": 4, "value": "kept"}
+    try:
+        service.verify_supported_versions(
+            {
+                **service.CURRENT_VERSIONS,
+                "reconnect": 3,
+            }
+        )
+    except RuntimeError as error:
+        assert "reconnect" in str(error)
+    else:
+        raise AssertionError("version drift must be rejected")
+    try:
+        service.migrate_component(
+            "cards",
+            {"schema_version": 2},
+            migrations={},
+        )
+    except ValueError as error:
+        assert "newer" in str(error)
+    else:
+        raise AssertionError("future data must be rejected")
+
+
+def test_oldest_reconnect_contract_migrates_to_safe_current_state(tmp_path):
+    state_path = tmp_path / "reconnect.json"
+    fingerprint = "1" * 64
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "pending_fingerprints": [fingerprint],
+                "active_fingerprints": [fingerprint],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = ReconnectRuntimeStateStore(state_path).load()
+
+    assert state.pending_fingerprints == set()
+    assert state.active_fingerprints == set()
+    assert json.loads(
+        state_path.read_text(encoding="utf-8")
+    )["version"] == 4

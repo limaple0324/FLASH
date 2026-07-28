@@ -45,6 +45,14 @@ class TargetWindowStateService:
         if listener in self._change_listeners:
             self._change_listeners.remove(listener)
 
+    def close(self) -> bool:
+        self._event_bus.unsubscribe(
+            TARGET_WINDOW_OBSERVED_EVENT,
+            self._on_observed,
+        )
+        self._change_listeners.clear()
+        return True
+
     def _on_observed(self, payload: object) -> None:
         if not isinstance(payload, TargetWindowObservation):
             self._log_error(

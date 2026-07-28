@@ -11,7 +11,17 @@ param(
     [ValidateRange(0, 60000)]
     [int]$TestHoldLockMilliseconds = 0,
     [ValidateRange(0, 1000)]
-    [int]$TestFailDuringRollbackAt = 0
+    [int]$TestFailDuringRollbackAt = 0,
+    [ValidateRange(5, 300)]
+    [int]$ConnectionTimeoutSeconds = 15,
+    [ValidateRange(10, 1800)]
+    [int]$DownloadTimeoutSeconds = 90,
+    [ValidateRange(1, 8)]
+    [int]$NetworkRetryCount = 4,
+    [ValidateRange(0, 8)]
+    [int]$TestTransientFailuresBeforeSuccess = 0,
+    [ValidateSet("", "offline", "dns", "tls", "403", "404", "429", "500", "timeout", "github_limit")]
+    [string]$TestNetworkFailureKind = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,6 +74,7 @@ $TemporaryTargetPaths = New-Object System.Collections.ArrayList
 $UpdateSucceeded = $false
 $PreserveTransaction = $false
 $ExitCode = 1
+$script:TransientFailuresRemaining = $TestTransientFailuresBeforeSuccess
 
 function Write-Step([string]$Message) {
     $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
@@ -79,6 +90,116 @@ function Write-Step([string]$Message) {
                 return
             }
             Start-Sleep -Milliseconds 40
+        }
+    }
+}
+
+function Get-NetworkFailureMessage([System.Exception]$Exception) {
+    $response = $Exception.Response
+    $statusCode = $null
+    if ($response -and $response.StatusCode) {
+        try {
+            $statusCode = [int]$response.StatusCode
+        }
+        catch {
+            $statusCode = $null
+        }
+    }
+    if ($statusCode -eq 403) {
+        $remaining = $null
+        try {
+            $remaining = [string]$response.Headers["X-RateLimit-Remaining"]
+        }
+        catch {
+            $remaining = $null
+        }
+        if ($remaining -eq "0") {
+            return "GitHub 下載次數已達限制，請稍後再試。"
+        }
+        return "GitHub 拒絕存取（403），請稍後再試。"
+    }
+    if ($statusCode -eq 404) {
+        return "找不到更新檔案（404），目前版本沒有被修改。"
+    }
+    if ($statusCode -eq 429) {
+        return "下載過於頻繁（429），請稍後再試。"
+    }
+    if ($statusCode -ge 500 -and $statusCode -le 599) {
+        return "更新伺服器暫時無法使用，請稍後再試。"
+    }
+    $webStatus = $null
+    if ($Exception -is [System.Net.WebException]) {
+        $webStatus = $Exception.Status
+    }
+    if ($webStatus -eq [System.Net.WebExceptionStatus]::NameResolutionFailure) {
+        return "無法解析網路位址，請檢查網路或 DNS 設定。"
+    }
+    if (
+        $webStatus -eq [System.Net.WebExceptionStatus]::TrustFailure -or
+        $webStatus -eq [System.Net.WebExceptionStatus]::SecureChannelFailure
+    ) {
+        return "安全連線驗證失敗，請確認系統時間與網路憑證。"
+    }
+    if ($webStatus -eq [System.Net.WebExceptionStatus]::Timeout) {
+        return "連線逾時，請確認網路後再試。"
+    }
+    if (
+        $webStatus -eq [System.Net.WebExceptionStatus]::ConnectFailure -or
+        $webStatus -eq [System.Net.WebExceptionStatus]::ProxyNameResolutionFailure
+    ) {
+        return "目前無法連上網路，請確認網路連線後再試。"
+    }
+    return "下載更新時發生網路錯誤，請稍後再試。"
+}
+
+function Test-TransientNetworkFailure([System.Exception]$Exception) {
+    $response = $Exception.Response
+    $statusCode = $null
+    if ($response -and $response.StatusCode) {
+        try {
+            $statusCode = [int]$response.StatusCode
+        }
+        catch {
+            $statusCode = $null
+        }
+    }
+    if ($statusCode -in @(408, 429)) {
+        return $true
+    }
+    if ($statusCode -ge 500 -and $statusCode -le 599) {
+        return $true
+    }
+    if ($Exception -is [System.Net.WebException]) {
+        return $Exception.Status -in @(
+            [System.Net.WebExceptionStatus]::ConnectFailure,
+            [System.Net.WebExceptionStatus]::ConnectionClosed,
+            [System.Net.WebExceptionStatus]::KeepAliveFailure,
+            [System.Net.WebExceptionStatus]::NameResolutionFailure,
+            [System.Net.WebExceptionStatus]::ProxyNameResolutionFailure,
+            [System.Net.WebExceptionStatus]::ReceiveFailure,
+            [System.Net.WebExceptionStatus]::SendFailure,
+            [System.Net.WebExceptionStatus]::Timeout
+        )
+    }
+    return $false
+}
+
+function Invoke-WithNetworkRetry(
+    [string]$Description,
+    [scriptblock]$Action
+) {
+    for ($attempt = 1; $attempt -le $NetworkRetryCount; $attempt++) {
+        try {
+            return & $Action
+        }
+        catch {
+            $transient = Test-TransientNetworkFailure $_.Exception
+            if (-not $transient -or $attempt -eq $NetworkRetryCount) {
+                throw (Get-NetworkFailureMessage $_.Exception)
+            }
+            $delay = [Math]::Min(8000, 500 * [Math]::Pow(2, $attempt - 1))
+            Write-Step "$Description 暫時失敗；即將進行第 $($attempt + 1) 次嘗試。"
+            Start-Sleep -Milliseconds ([int]$delay)
         }
     }
 }
@@ -190,6 +311,41 @@ function Read-InstalledUpdateChannel {
     return $channel
 }
 
+function Resolve-TargetUpdateChannel([hashtable]$InstalledChannel) {
+    if ($InstalledChannel["release_branch"] -eq "release/sp1") {
+        Write-Step "偵測到 SP1 獨立版；本次將安全升級為完整整合版。"
+        return @{
+            release_branch = "release/latest"
+            source_branch = "main"
+            build_kind = "main_release"
+            publish_target = "release/latest"
+        }
+    }
+    return $InstalledChannel
+}
+
+function Assert-InstalledMigrationIdentity(
+    [hashtable]$InstalledChannel
+) {
+    if ($InstalledChannel["release_branch"] -ne "release/sp1") {
+        return
+    }
+    $buildInfoPath = Get-PayloadPath `
+        -Root $InstallDir `
+        -RelativePath "輔系統/BUILD_INFO.txt"
+    $buildInfo = Read-KeyValueFile `
+        -Path $buildInfoPath `
+        -DisplayName "已安裝 BUILD_INFO.txt"
+    foreach ($key in @("source_branch", "build_kind", "publish_target")) {
+        if (
+            -not $buildInfo.ContainsKey($key) -or
+            $buildInfo[$key] -ne $InstalledChannel[$key]
+        ) {
+            throw "已安裝 BUILD_INFO.txt 的 $key 與 SP1 更新頻道不一致；未進行遷移。"
+        }
+    }
+}
+
 function Read-AndVerifyManifest([string]$Root) {
     $manifestPath = Get-PayloadPath -Root $Root -RelativePath $ManifestRelativePath
     Require-File $manifestPath
@@ -245,7 +401,18 @@ function Assert-ReleaseIdentity(
 
     Require-MetadataValue $buildInfo "product" ([string][char]0x8F14) "BUILD_INFO.txt"
     Require-MetadataValue $buildInfo "technical_name" "FLASH" "BUILD_INFO.txt"
-    Require-MetadataValue $buildInfo "milestone" "SP1" "BUILD_INFO.txt"
+    if (
+        -not $buildInfo.ContainsKey("milestone") -or
+        $buildInfo["milestone"] -notin @("SP1", "SP2", "SP3")
+    ) {
+        throw "BUILD_INFO.txt 的 milestone 不受支援。"
+    }
+    if (
+        $ExpectedChannel["build_kind"] -eq "sp1_release" -and
+        $buildInfo["milestone"] -ne "SP1"
+    ) {
+        throw "SP1 獨立版發布必須使用 SP1 里程碑。"
+    }
     foreach ($key in @("source_branch", "build_kind", "publish_target")) {
         Require-MetadataValue $buildInfo $key $ExpectedChannel[$key] "BUILD_INFO.txt"
         Require-MetadataValue $channel $key $ExpectedChannel[$key] "UPDATE_CHANNEL.txt"
@@ -308,6 +475,37 @@ function Convert-ToUrlPath([string]$RelativePath) {
 }
 
 function Resolve-ReleaseCommit {
+    if (-not [string]::IsNullOrWhiteSpace($TestNetworkFailureKind)) {
+        $testMessages = @{
+            offline = "目前無法連上網路，請確認網路連線後再試。"
+            dns = "無法解析網路位址，請檢查網路或 DNS 設定。"
+            tls = "安全連線驗證失敗，請確認系統時間與網路憑證。"
+            "403" = "GitHub 拒絕存取（403），請稍後再試。"
+            "404" = "找不到更新檔案（404），目前版本沒有被修改。"
+            "429" = "下載過於頻繁（429），請稍後再試。"
+            "500" = "更新伺服器暫時無法使用，請稍後再試。"
+            timeout = "連線逾時，請確認網路後再試。"
+            github_limit = "GitHub 下載次數已達限制，請稍後再試。"
+        }
+        throw $testMessages[$TestNetworkFailureKind]
+    }
+    if ($TestTransientFailuresBeforeSuccess -gt 0) {
+        $resolved = Invoke-WithNetworkRetry "測試暫時性網路錯誤" {
+            if ($script:TransientFailuresRemaining -gt 0) {
+                $script:TransientFailuresRemaining--
+                $testException = [System.Net.WebException]::new(
+                    "測試暫時性逾時",
+                    [System.Net.WebExceptionStatus]::Timeout
+                )
+                throw $testException
+            }
+            return $ResolvedReleaseCommit
+        }
+        if ($resolved -notmatch "^[0-9a-fA-F]{40}$") {
+            throw "測試暫時性網路錯誤沒有回傳有效 commit。"
+        }
+        return $resolved.ToLowerInvariant()
+    }
     if ($UsingLocalSource) {
         if ($ResolvedReleaseCommit -notmatch "^[0-9a-fA-F]{40}$") {
             throw "本機測試來源必須指定 40 碼的固定發布 commit。"
@@ -321,11 +519,14 @@ function Resolve-ReleaseCommit {
         "User-Agent" = "FLASH-SP1-Windows-Updater"
     }
     $apiUrl = "https://api.github.com/repos/$Repo/commits/$ReleaseBranch"
-    $response = Invoke-RestMethod `
-        -Uri $apiUrl `
-        -Headers $headers `
-        -Method Get `
-        -UseBasicParsing
+    $response = Invoke-WithNetworkRetry "解析固定發布版本" {
+        Invoke-RestMethod `
+            -Uri $apiUrl `
+            -Headers $headers `
+            -Method Get `
+            -TimeoutSec $ConnectionTimeoutSeconds `
+            -UseBasicParsing
+    }
     $commit = [string]$response.sha
     if ($commit -notmatch "^[0-9a-fA-F]{40}$") {
         throw "GitHub 沒有回傳有效的 $ReleaseBranch commit。"
@@ -351,7 +552,13 @@ function Copy-OrDownloadPayload(
     else {
         $urlPath = Convert-ToUrlPath -RelativePath $RelativePath
         $url = "https://raw.githubusercontent.com/$Repo/$ReleaseCommit/$urlPath"
-        Invoke-WebRequest -Uri $url -OutFile $TargetPath -UseBasicParsing
+        Invoke-WithNetworkRetry "下載 $RelativePath" {
+            Invoke-WebRequest `
+                -Uri $url `
+                -OutFile $TargetPath `
+                -TimeoutSec $DownloadTimeoutSeconds `
+                -UseBasicParsing
+        } | Out-Null
     }
     Require-File $TargetPath
 }
@@ -467,7 +674,9 @@ try {
         Start-Sleep -Milliseconds $TestHoldLockMilliseconds
     }
 
-    $updateChannel = Read-InstalledUpdateChannel
+    $installedChannel = Read-InstalledUpdateChannel
+    Assert-InstalledMigrationIdentity $installedChannel
+    $updateChannel = Resolve-TargetUpdateChannel $installedChannel
     $ReleaseBranch = $updateChannel["release_branch"]
     Write-Step "固定更新來源：$ReleaseBranch"
 
@@ -499,7 +708,14 @@ try {
         -ExpectedChannel $updateChannel
     Invoke-StagedVerifier -Root $StageRoot -Description "安裝前驗證"
 
+    $migratingChannel = (
+        $installedChannel["release_branch"] -ne
+        $updateChannel["release_branch"]
+    )
     foreach ($fixedIdentityPath in $FixedIdentityPaths) {
+        if ($migratingChannel) {
+            continue
+        }
         $installedIdentity = Get-PayloadPath -Root $InstallDir -RelativePath $fixedIdentityPath
         $stagedIdentity = Get-PayloadPath -Root $StageRoot -RelativePath $fixedIdentityPath
         Require-File $installedIdentity
@@ -512,7 +728,13 @@ try {
 
     Write-Step "所有安裝前檢查通過，開始交易式套用。"
     $sequence = 0
-    foreach ($relativePath in ($PayloadPaths | Where-Object { $FixedIdentityPaths -notcontains $_ })) {
+    $installPaths = (
+        $PayloadPaths |
+        Where-Object {
+            $migratingChannel -or $FixedIdentityPaths -notcontains $_
+        }
+    )
+    foreach ($relativePath in $installPaths) {
         $sequence++
         $sourcePath = Get-PayloadPath -Root $StageRoot -RelativePath $relativePath
         Install-FileAtomically `

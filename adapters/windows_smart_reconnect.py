@@ -460,6 +460,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         failure_record_callback: (
             Callable[[str, str], object] | None
         ) = None,
+        target_windows_provider: (
+            Callable[[], Iterable[WindowInfo]] | None
+        ) = None,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -522,6 +525,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._group_launch_plan: GroupLaunchPlan | None = None
         self._failure_status_service = failure_status_service
         self._failure_record_callback = failure_record_callback
+        self._target_windows_provider = target_windows_provider
         self._last_screen_states: dict[str, ReconnectScreenState] = {}
         self._action_confirmations: dict[
             str,
@@ -538,13 +542,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         expected_windows: int = 14,
         title_keywords: Iterable[str] = ("Adobe Flash Player",),
         state_path: Path | None = None,
+        window_backend: WindowBackend | None = None,
         failure_status_service: ReconnectFailureStatusService | None = None,
         failure_record_callback: (
             Callable[[str, str], object] | None
         ) = None,
+        target_windows_provider: (
+            Callable[[], Iterable[WindowInfo]] | None
+        ) = None,
     ) -> "WindowsSmartReconnectController":
-        window_backend = Win32WindowBackend(
-            PowerShellLaunchFingerprintResolver()
+        window_backend = (
+            window_backend
+            or Win32WindowBackend(PowerShellLaunchFingerprintResolver())
         )
         return cls(
             expected_windows=expected_windows,
@@ -564,6 +573,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             ),
             failure_status_service=failure_status_service,
             failure_record_callback=failure_record_callback,
+            target_windows_provider=target_windows_provider,
         )
 
     @property
@@ -706,6 +716,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
 
     def _candidate_windows(self) -> tuple[WindowInfo, ...]:
+        if self._target_windows_provider is not None:
+            try:
+                return tuple(self._target_windows_provider())
+            except Exception:
+                return ()
         return tuple(
             window
             for window in self._window_backend.list_windows()

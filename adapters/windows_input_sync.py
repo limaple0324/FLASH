@@ -345,6 +345,9 @@ class WindowsInputSyncController:
         screen_state_provider: (
             Callable[[str], ReconnectScreenState | None] | None
         ) = None,
+        target_windows_provider: (
+            Callable[[], Iterable[WindowInfo]] | None
+        ) = None,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -367,6 +370,7 @@ class WindowsInputSyncController:
         self._reconnecting_provider = reconnecting_provider or (lambda: ())
         self._role_operation_callback = role_operation_callback
         self._screen_state_provider = screen_state_provider
+        self._target_windows_provider = target_windows_provider
         self._target_settings: dict[str, SyncTargetSettings] = {}
         self._dispatch_scheduler = SyncDispatchScheduler(
             thread_name="flash-key-delay",
@@ -467,6 +471,10 @@ class WindowsInputSyncController:
     def invalidate_scheduled(self) -> None:
         self._dispatch_scheduler.invalidate()
 
+    def close(self, timeout_seconds: float = 5.0) -> bool:
+        self.set_allowed_fingerprints(None)
+        return self._dispatch_scheduler.close(timeout_seconds)
+
     def _settings_for(self, fingerprint: str | None) -> SyncTargetSettings:
         if fingerprint is None:
             return SyncTargetSettings()
@@ -506,6 +514,9 @@ class WindowsInputSyncController:
             Callable[[str], ReconnectScreenState | None] | None
         ) = None,
         window_backend: WindowBackend | None = None,
+        target_windows_provider: (
+            Callable[[], Iterable[WindowInfo]] | None
+        ) = None,
     ) -> "WindowsInputSyncController":
         return cls(
             expected_windows=expected_windows,
@@ -522,6 +533,7 @@ class WindowsInputSyncController:
             reconnecting_provider=reconnecting_provider,
             role_operation_callback=role_operation_callback,
             screen_state_provider=screen_state_provider,
+            target_windows_provider=target_windows_provider,
         )
 
     def _record_role_operation(
@@ -717,9 +729,8 @@ class WindowsInputSyncController:
     def _matching_windows(self) -> tuple[WindowInfo, ...]:
         windows = tuple(
             window
-            for window in self._window_backend.list_windows()
-            if all(keyword in window.title.casefold() for keyword in self._keywords)
-            and (
+            for window in self._candidate_windows()
+            if (
                 self._allowed_fingerprint_set is None
                 or normalize_launch_fingerprint(window.launch_fingerprint)
                 in self._allowed_fingerprint_set
@@ -753,6 +764,21 @@ class WindowsInputSyncController:
                     or "",
                     window.process_id or 0,
                 ),
+            )
+        )
+
+    def _candidate_windows(self) -> tuple[WindowInfo, ...]:
+        if self._target_windows_provider is not None:
+            try:
+                return tuple(self._target_windows_provider())
+            except Exception:
+                return ()
+        return tuple(
+            window
+            for window in self._window_backend.list_windows()
+            if all(
+                keyword in window.title.casefold()
+                for keyword in self._keywords
             )
         )
 
@@ -790,14 +816,7 @@ class WindowsInputSyncController:
         )
 
     def _all_title_matching_windows(self) -> tuple[WindowInfo, ...]:
-        return tuple(
-            window
-            for window in self._window_backend.list_windows()
-            if all(
-                keyword in window.title.casefold()
-                for keyword in self._keywords
-            )
-        )
+        return self._candidate_windows()
 
     def _base_result(
         self,

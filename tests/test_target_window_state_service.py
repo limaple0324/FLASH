@@ -102,3 +102,16 @@ def test_subscribe_requires_a_callable() -> None:
         assert str(error) == "listener must be callable."
     else:
         raise AssertionError("non-callable listener should be rejected")
+
+
+def test_close_detaches_event_subscription_and_local_listeners() -> None:
+    event_bus = EventBus()
+    service = TargetWindowStateService(event_bus)
+    calls: list[str] = []
+    service.subscribe(lambda: calls.append("changed"))
+
+    assert service.close() is True
+    event_bus.publish(TARGET_WINDOW_OBSERVED_EVENT, _ready())
+
+    assert service.snapshot() == TargetWindowObservation.not_observed()
+    assert calls == []
