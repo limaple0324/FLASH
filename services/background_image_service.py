@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
+import traceback
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -65,8 +66,11 @@ RAW_IMAGE_SUFFIXES = frozenset(
         ".x3f",
     }
 )
+HEIF_IMAGE_SUFFIXES = frozenset({".heic", ".heif"})
 
 RawpyLoader = Callable[[], ModuleType]
+HeifLoader = Callable[[], ModuleType]
+TechnicalErrorLogger = Callable[[str], object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +118,8 @@ class BackgroundImageService:
         managed_data_dir: Path,
         *,
         rawpy_loader: RawpyLoader | None = None,
+        heif_loader: HeifLoader | None = None,
+        error_logger: TechnicalErrorLogger | None = None,
     ) -> None:
         if not isinstance(config, ConfigManager):
             raise TypeError("config must be ConfigManager.")
@@ -125,6 +131,10 @@ class BackgroundImageService:
         self._rawpy_loader = rawpy_loader or (
             lambda: importlib.import_module("rawpy")
         )
+        self._heif_loader = heif_loader or (
+            lambda: importlib.import_module("pillow_heif")
+        )
+        self._error_logger = error_logger
         self._prepared_metadata: dict[Path, dict[str, object]] = {}
 
     def _managed_path(self, value: object) -> Path | None:
@@ -322,9 +332,14 @@ class BackgroundImageService:
                 original_size=size,
                 updated_at=updated_at,
             )
-        except (OSError, ValueError):
+        except Exception as error:
             if published_path is not None:
                 published_path.unlink(missing_ok=True)
+            self._log_technical_failure(
+                stage="建立可顯示背景副本",
+                source=source_path,
+                error=error,
+            )
             return self._failure("背景圖片無法準備預覽，原本背景已保留。")
         finally:
             decoded.close()
@@ -845,7 +860,45 @@ class BackgroundImageService:
             managed_path=self.current_background(),
         )
 
+    def _log_technical_failure(
+        self,
+        *,
+        stage: str,
+        source: Path,
+        error: BaseException,
+    ) -> None:
+        if self._error_logger is None:
+            return
+        details = "".join(
+            traceback.format_exception(
+                type(error),
+                error,
+                error.__traceback__,
+            )
+        ).rstrip()
+        message = (
+            "背景圖片處理失敗\n"
+            f"階段：{stage}\n"
+            f"來源：{source.resolve(strict=False)}\n"
+            f"副檔名：{source.suffix.casefold() or '無'}\n"
+            f"例外類型：{type(error).__name__}\n"
+            f"例外內容：{error}\n"
+            f"完整追蹤：\n{details}"
+        )
+        try:
+            self._error_logger(message)
+        except Exception:
+            # Error reporting must never replace the player-safe result.
+            pass
+
     def _decode(self, source: Path) -> tuple[Image.Image | None, str]:
+        heif_error: Exception | None = None
+        try:
+            heif_module = self._heif_loader()
+            heif_module.register_heif_opener()
+        except Exception as error:
+            heif_error = error
+
         try:
             with Image.open(source) as opened:
                 opened.load()
@@ -853,9 +906,28 @@ class BackgroundImageService:
         except (UnidentifiedImageError, OSError, ValueError):
             pass
 
+        if (
+            source.suffix.casefold() in HEIF_IMAGE_SUFFIXES
+            and heif_error is not None
+        ):
+            self._log_technical_failure(
+                stage="載入 HEIC／HEIF 圖片解碼元件",
+                source=source,
+                error=heif_error,
+            )
+            return (
+                None,
+                "HEIC／HEIF 圖片解碼元件目前無法使用，原本背景已保留。",
+            )
+
         try:
             rawpy = self._rawpy_loader()
-        except (ImportError, ModuleNotFoundError, OSError):
+        except Exception as error:
+            self._log_technical_failure(
+                stage="載入相機原始圖片解碼元件",
+                source=source,
+                error=error,
+            )
             if source.suffix.casefold() in RAW_IMAGE_SUFFIXES:
                 return (
                     None,
@@ -881,7 +953,12 @@ class BackgroundImageService:
                 return self._display_image(raw_image), ""
             finally:
                 raw_image.close()
-        except Exception:
+        except Exception as error:
+            self._log_technical_failure(
+                stage="解碼相機原始圖片",
+                source=source,
+                error=error,
+            )
             return (
                 None,
                 "選取的檔案不是可解碼的圖片，原本背景已保留。",

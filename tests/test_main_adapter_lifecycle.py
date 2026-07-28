@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 import main as main_module
+from config.config_manager import ConfigManager
 from core.sp1_boundaries import ExternalAdapter, OperationResult
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from services.app_context import AppContext
+from services.background_image_service import BackgroundImageService
 from services.event_bus import EventBus
 from services.target_window_state_service import TargetWindowStateService
 
@@ -180,6 +184,45 @@ def test_target_desktop_verification_sanitizes_unexpected_failure(
     assert exit_code == 4
     assert "verifier_execution_failed" in report
     assert "raw launcher arguments" not in report
+    assert adapter.shutdown_calls == 1
+
+
+def test_background_image_runtime_verification_uses_real_service_without_ui(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    adapter = RecordingAdapter()
+    prepare_run(monkeypatch, tmp_path, adapter)
+    config = ConfigManager(tmp_path / "config" / "settings.json")
+    service = BackgroundImageService(config, tmp_path / "data")
+    AppContext.register(BackgroundImageService, service)
+    source = tmp_path / "月球原圖.png"
+    Image.new("RGB", (14, 9), "#203040").save(source)
+    before = source.read_bytes()
+    monkeypatch.setattr(
+        main_module,
+        "create_main_window",
+        lambda *_args: pytest.fail("背景圖片驗證不得開啟主畫面。"),
+    )
+
+    exit_code = main_module.run(
+        background_image_verify_path=source,
+        root=tmp_path,
+    )
+
+    assert exit_code == 0
+    assert source.read_bytes() == before
+    report_path = (
+        tmp_path
+        / "data"
+        / main_module.BACKGROUND_IMAGE_VERIFY_REPORT_FILENAME
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["passed"] is True
+    assert report["source_unchanged"] is True
+    assert report["managed_copy_created"] is True
+    assert report["original_size"] == [14, 9]
+    assert tuple((tmp_path / "data" / "backgrounds").glob("*.png")) == ()
     assert adapter.shutdown_calls == 1
 
 

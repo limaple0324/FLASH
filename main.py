@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import traceback
@@ -241,6 +242,7 @@ from workspace.service import WorkspaceService
 APP_TITLE = PRODUCT_NAME
 SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_DESKTOP_VERIFY_ARGUMENT = "--verify-target-desktop"
+BACKGROUND_IMAGE_VERIFY_ARGUMENT_PREFIX = "--verify-background-image="
 TARGET_WINDOW_KEY = "target_window_keywords"
 TARGET_WINDOW_FINGERPRINT_KEY = "target_window_fingerprint"
 INPUT_POLICY_KEY = "input_policy"
@@ -258,6 +260,7 @@ OPERATION_RECORD_ARCHIVE_DIRNAME = "角色每日紀錄"
 DEFERRED_SYNC_STATE_FILENAME = "deferred_sync_operations.json"
 ROLE_ID_TEMPLATE_FILENAME = "role_id_templates.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
+BACKGROUND_IMAGE_VERIFY_REPORT_FILENAME = "background_image_verification.json"
 CHARACTER_FILENAME = "characters.json"
 CHARACTER_GAME_DATA_FILENAME = "character_game_data.json"
 ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
@@ -286,7 +289,8 @@ BACKGROUND_IMAGE_FILETYPES = (
             "*.tif *.tiff *.webp *.ico *.heic *.heif *.avif "
             "*.cr2 *.cr3 *.dng *.nef *.nrw *.arw *.srf *.sr2 "
             "*.orf *.rw2 *.raf *.pef *.raw *.3fr *.erf *.mef "
-            "*.mos *.mrw *.srw *.x3f"
+            "*.mos *.mrw *.srw *.x3f *.bay *.dcr *.fff *.iiq "
+            "*.k25 *.kdc *.rwl"
         ),
     ),
     ("所有檔案", "*.*"),
@@ -364,6 +368,7 @@ def build_services(
     background_image_service = BackgroundImageService(
         config,
         paths.data_dir(),
+        error_logger=logger.error,
     )
     feature_card_layout_service = FeatureCardLayoutService(config)
     config.ensure_defaults(
@@ -4491,10 +4496,71 @@ def write_target_desktop_report(
     return report_path
 
 
+def _sha256_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_background_image_runtime(
+    source: Path,
+    paths: PathManager,
+) -> tuple[int, Path]:
+    """Exercise the packaged decoder without opening or changing the GUI."""
+    source = Path(source).resolve(strict=False)
+    service = AppContext.get(BackgroundImageService)
+    before_hash = _sha256_file(source)
+    result = service.prepare(source)
+    after_hash = _sha256_file(source)
+    managed_copy_created = bool(
+        result.succeeded
+        and result.managed_path is not None
+        and result.managed_path.is_file()
+    )
+    source_unchanged = bool(
+        before_hash is not None
+        and after_hash is not None
+        and before_hash == after_hash
+    )
+    payload = {
+        "passed": bool(
+            result.succeeded
+            and managed_copy_created
+            and source_unchanged
+        ),
+        "source": str(source),
+        "source_suffix": source.suffix.casefold(),
+        "source_unchanged": source_unchanged,
+        "managed_copy_created": managed_copy_created,
+        "original_size": (
+            list(result.original_size)
+            if result.original_size is not None
+            else None
+        ),
+        "message": result.message,
+    }
+    service.discard_prepared(
+        result.managed_path if result.succeeded else None
+    )
+    report_path = (
+        paths.data_dir() / BACKGROUND_IMAGE_VERIFY_REPORT_FILENAME
+    )
+    report_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return (0 if payload["passed"] else 5), report_path
+
+
 def run(
     *,
     self_check_only: bool = False,
     target_desktop_verify_only: bool = False,
+    background_image_verify_path: Path | None = None,
     root: Path | None = None,
 ) -> int:
     paths: PathManager | None = None
@@ -4502,6 +4568,17 @@ def run(
     try:
         configure_process_app_identity()
         paths, logger = build_services(root=root)
+        if background_image_verify_path is not None:
+            exit_code, report_path = verify_background_image_runtime(
+                background_image_verify_path,
+                paths,
+            )
+            logger.info(
+                "背景圖片執行期驗證"
+                f"{'通過' if exit_code == 0 else '失敗'}；"
+                f"報告={report_path}"
+            )
+            return exit_code
         if target_desktop_verify_only:
             try:
                 verification = TargetDesktopVerifier.for_real_windows().verify()
@@ -4567,7 +4644,11 @@ def run(
             except OSError:
                 pass
 
-        if self_check_only or target_desktop_verify_only:
+        if (
+            self_check_only
+            or target_desktop_verify_only
+            or background_image_verify_path is not None
+        ):
             return 1
         try:
             root_window = Tk()
@@ -4628,15 +4709,27 @@ def close_logger(logger: LoggerService | None) -> None:
 
 
 def main() -> None:
-    arguments = set(sys.argv[1:])
+    raw_arguments = tuple(sys.argv[1:])
+    arguments = set(raw_arguments)
     target_desktop_verify_only = TARGET_DESKTOP_VERIFY_ARGUMENT in arguments
+    background_image_verify_path = next(
+        (
+            Path(argument[len(BACKGROUND_IMAGE_VERIFY_ARGUMENT_PREFIX) :])
+            for argument in raw_arguments
+            if argument.startswith(BACKGROUND_IMAGE_VERIFY_ARGUMENT_PREFIX)
+            and argument[len(BACKGROUND_IMAGE_VERIFY_ARGUMENT_PREFIX) :]
+        ),
+        None,
+    )
     raise SystemExit(
         run(
             self_check_only=(
                 SELF_CHECK_ARGUMENT in arguments
                 and not target_desktop_verify_only
+                and background_image_verify_path is None
             ),
             target_desktop_verify_only=target_desktop_verify_only,
+            background_image_verify_path=background_image_verify_path,
         )
     )
 

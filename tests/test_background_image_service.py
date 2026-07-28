@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from PIL import Image
+from pillow_heif import from_pillow
 
 from config.config_manager import ConfigManager
 from services.background_image_service import (
@@ -36,12 +37,16 @@ def _service(
     tmp_path: Path,
     *,
     rawpy_loader=None,
+    heif_loader=None,
+    error_logger=None,
 ) -> tuple[BackgroundImageService, ConfigManager]:
     config = ConfigManager(tmp_path / "config" / "settings.json")
     service = BackgroundImageService(
         config,
         tmp_path / "data",
         rawpy_loader=rawpy_loader,
+        heif_loader=heif_loader,
+        error_logger=error_logger,
     )
     return service, config
 
@@ -109,6 +114,26 @@ def test_raw_image_uses_rawpy_and_keeps_original_unchanged(tmp_path) -> None:
         assert converted.size == (7, 6)
 
 
+def test_heif_image_is_decoded_and_original_is_unchanged(tmp_path) -> None:
+    source = tmp_path / "手機原圖.heic"
+    original_image = Image.new("RGB", (9, 7), "#507090")
+    try:
+        from_pillow(original_image).save(source, quality=90)
+    finally:
+        original_image.close()
+    original_bytes = source.read_bytes()
+    service, _config = _service(tmp_path)
+
+    result = service.select(source)
+
+    assert result.succeeded is True
+    assert source.read_bytes() == original_bytes
+    assert result.managed_path is not None
+    with Image.open(result.managed_path) as converted:
+        converted.load()
+        assert converted.size == (9, 7)
+
+
 def test_non_image_returns_clear_failure_and_retains_existing_background(
     tmp_path,
 ) -> None:
@@ -140,11 +165,16 @@ def test_non_image_returns_clear_failure_and_retains_existing_background(
 def test_missing_raw_decoder_reports_specific_player_safe_reason(tmp_path) -> None:
     source = tmp_path / "camera.cr2"
     source.write_bytes(b"raw")
+    technical_errors: list[str] = []
 
     def missing():
         raise ModuleNotFoundError("rawpy")
 
-    service, _config = _service(tmp_path, rawpy_loader=missing)
+    service, _config = _service(
+        tmp_path,
+        rawpy_loader=missing,
+        error_logger=technical_errors.append,
+    )
 
     result = service.select(source)
 
@@ -153,6 +183,102 @@ def test_missing_raw_decoder_reports_specific_player_safe_reason(tmp_path) -> No
         "相機 RAW 圖片解碼元件目前無法使用，原本背景已保留。"
     )
     assert result.managed_path is None
+    assert len(technical_errors) == 1
+    assert "階段：載入相機原始圖片解碼元件" in technical_errors[0]
+    assert f"來源：{source.resolve()}" in technical_errors[0]
+    assert "副檔名：.cr2" in technical_errors[0]
+    assert "例外類型：ModuleNotFoundError" in technical_errors[0]
+    assert "ModuleNotFoundError: rawpy" in technical_errors[0]
+
+
+def test_missing_heif_decoder_reports_specific_player_safe_reason(
+    tmp_path,
+) -> None:
+    source = tmp_path / "camera.heic"
+    source.write_bytes(b"heif")
+    technical_errors: list[str] = []
+
+    def missing():
+        raise ModuleNotFoundError("pillow_heif")
+
+    service, _config = _service(
+        tmp_path,
+        heif_loader=missing,
+        error_logger=technical_errors.append,
+    )
+
+    result = service.select(source)
+
+    assert result.succeeded is False
+    assert result.message == (
+        "HEIC／HEIF 圖片解碼元件目前無法使用，原本背景已保留。"
+    )
+    assert result.managed_path is None
+    assert len(technical_errors) == 1
+    assert "階段：載入 HEIC／HEIF 圖片解碼元件" in technical_errors[0]
+    assert "例外類型：ModuleNotFoundError" in technical_errors[0]
+    assert "ModuleNotFoundError: pillow_heif" in technical_errors[0]
+
+
+def test_raw_decode_failure_keeps_player_message_short_and_logs_details(
+    tmp_path,
+) -> None:
+    source = tmp_path / "損壞月球.CR2"
+    source.write_bytes(b"damaged raw")
+    technical_errors: list[str] = []
+
+    def fail_decode(_path: str):
+        raise ValueError("invalid camera header")
+
+    service, _config = _service(
+        tmp_path,
+        rawpy_loader=lambda: SimpleNamespace(imread=fail_decode),
+        error_logger=technical_errors.append,
+    )
+
+    result = service.select(source)
+
+    assert result.succeeded is False
+    assert result.message == "選取的檔案不是可解碼的圖片，原本背景已保留。"
+    assert result.managed_path is None
+    assert len(technical_errors) == 1
+    assert "階段：解碼相機原始圖片" in technical_errors[0]
+    assert f"來源：{source.resolve()}" in technical_errors[0]
+    assert "例外類型：ValueError" in technical_errors[0]
+    assert "ValueError: invalid camera header" in technical_errors[0]
+
+
+def test_publish_failure_keeps_old_background_and_logs_full_details(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    existing_source = tmp_path / "existing.png"
+    next_source = tmp_path / "next.png"
+    Image.new("RGB", (4, 4), "navy").save(existing_source)
+    Image.new("RGB", (6, 5), "gold").save(next_source)
+    technical_errors: list[str] = []
+    service, _config = _service(
+        tmp_path,
+        error_logger=technical_errors.append,
+    )
+    existing = service.select(existing_source).managed_path
+
+    def fail_publish(_image):
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(service, "_publish", fail_publish)
+
+    result = service.prepare(next_source)
+
+    assert result.succeeded is False
+    assert result.message == "背景圖片無法準備預覽，原本背景已保留。"
+    assert result.managed_path == existing
+    assert existing is not None and existing.is_file()
+    assert len(technical_errors) == 1
+    assert "階段：建立可顯示背景副本" in technical_errors[0]
+    assert f"來源：{next_source.resolve()}" in technical_errors[0]
+    assert "例外類型：OSError" in technical_errors[0]
+    assert "OSError: storage unavailable" in technical_errors[0]
 
 
 def test_config_save_failure_removes_candidate_and_retains_old_setting(
@@ -504,3 +630,16 @@ def test_invalid_import_keeps_existing_background(tmp_path) -> None:
     assert result.succeeded is False
     assert service.current_background() == existing
     assert existing is not None and existing.exists()
+
+
+def test_raw_decoder_is_declared_and_collected_for_windows_package() -> None:
+    requirements = Path("requirements.txt").read_text(encoding="utf-8")
+    specification = Path("FLASH.spec").read_text(encoding="utf-8")
+
+    assert "rawpy>=0.25.0" in requirements
+    assert "pillow-heif>=1.5.0" in requirements
+    assert "collect_dynamic_libs('rawpy')" in specification
+    assert "collect_dynamic_libs('pillow_heif')" in specification
+    assert "collect_submodules('pillow_heif')" in specification
+    assert "'rawpy'" in specification
+    assert "'rawpy._rawpy'" in specification

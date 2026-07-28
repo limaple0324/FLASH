@@ -1,20 +1,27 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 
 
 rawpy_binaries = collect_dynamic_libs('rawpy')
+pillow_heif_binaries = collect_dynamic_libs('pillow_heif')
+pillow_heif_hiddenimports = collect_submodules('pillow_heif')
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=rawpy_binaries,
+    binaries=rawpy_binaries + pillow_heif_binaries,
     datas=[
         ('assets/flash_icon.png', 'assets'),
         ('assets/flash_icon.ico', 'assets'),
         ('assets/reconnect_reference', 'assets/reconnect_reference'),
     ],
-    hiddenimports=['tkinter', 'rawpy', 'rawpy._rawpy'],
+    hiddenimports=[
+        'tkinter',
+        'rawpy',
+        'rawpy._rawpy',
+        *pillow_heif_hiddenimports,
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
