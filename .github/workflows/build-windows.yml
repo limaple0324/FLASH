@@ -505,10 +505,19 @@ jobs:
       - name: Create and verify Windows ZIP
         shell: pwsh
         run: |
-          $zipPath = Join-Path 'dist' "$env:FLASH_ARTIFACT_NAME.zip"
+          $zipPath = [IO.Path]::GetFullPath(
+            (Join-Path 'dist' "$env:FLASH_ARTIFACT_NAME.zip")
+          )
+          $releaseRoot = [IO.Path]::GetFullPath('release')
           Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
-          tar.exe -a -c -f $zipPath -C release .
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::CreateFromDirectory(
+            $releaseRoot,
+            $zipPath,
+            [IO.Compression.CompressionLevel]::Optimal,
+            $false
+          )
+          if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
             throw 'Windows ZIP was not created.'
           }
 

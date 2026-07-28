@@ -77,7 +77,9 @@ def test_complete_release_gate_verifies_zip_install_update_and_rollback():
     workflow = _workflow()
 
     assert "- name: Create and verify Windows ZIP" in workflow
-    assert "tar.exe -a -c -f $zipPath -C release ." in workflow
+    assert "[IO.Compression.ZipFile]::CreateFromDirectory(" in workflow
+    assert "[IO.Compression.CompressionLevel]::Optimal" in workflow
+    assert "tar.exe -a -c -f" not in workflow
     assert "Expand-Archive -LiteralPath $zipPath" in workflow
     assert "- name: Verify live install update rollback and desktop entries" in workflow
     assert "$shortcutNames -notcontains '輔.lnk'" in workflow
