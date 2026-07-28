@@ -7,36 +7,141 @@ import os
 from collections.abc import Callable, Mapping
 
 
-FEATURE_HOTKEYS = (
-    "",
-    "XBUTTON1",
-    "XBUTTON2",
-    "F1",
-    "F2",
-    "F3",
-    "F4",
-    "F5",
-    "F6",
-    "F7",
-    "F8",
-    "F9",
-    "F10",
-    "F11",
-    "F12",
-)
-
 FEATURE_HOTKEY_VIRTUAL_KEYS = {
+    "LBUTTON": 0x01,
+    "RBUTTON": 0x02,
+    "MBUTTON": 0x04,
     "XBUTTON1": 0x05,
     "XBUTTON2": 0x06,
-    **{f"F{number}": 0x6F + number for number in range(1, 13)},
+    "BACKSPACE": 0x08,
+    "TAB": 0x09,
+    "CLEAR": 0x0C,
+    "ENTER": 0x0D,
+    "SHIFT": 0x10,
+    "CTRL": 0x11,
+    "ALT": 0x12,
+    "PAUSE": 0x13,
+    "CAPSLOCK": 0x14,
+    "ESC": 0x1B,
+    "SPACE": 0x20,
+    "PAGEUP": 0x21,
+    "PAGEDOWN": 0x22,
+    "END": 0x23,
+    "HOME": 0x24,
+    "LEFT": 0x25,
+    "UP": 0x26,
+    "RIGHT": 0x27,
+    "DOWN": 0x28,
+    "SELECT": 0x29,
+    "PRINT": 0x2A,
+    "EXECUTE": 0x2B,
+    "PRINTSCREEN": 0x2C,
+    "INSERT": 0x2D,
+    "DELETE": 0x2E,
+    "HELP": 0x2F,
+    **{str(number): 0x30 + number for number in range(10)},
+    **{letter: ord(letter) for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+    "LWIN": 0x5B,
+    "RWIN": 0x5C,
+    "APPS": 0x5D,
+    "SLEEP": 0x5F,
+    **{f"NUMPAD{number}": 0x60 + number for number in range(10)},
+    "MULTIPLY": 0x6A,
+    "ADD": 0x6B,
+    "SEPARATOR": 0x6C,
+    "SUBTRACT": 0x6D,
+    "DECIMAL": 0x6E,
+    "DIVIDE": 0x6F,
+    **{f"F{number}": 0x6F + number for number in range(1, 25)},
+    "NUMLOCK": 0x90,
+    "SCROLLLOCK": 0x91,
+    "LSHIFT": 0xA0,
+    "RSHIFT": 0xA1,
+    "LCTRL": 0xA2,
+    "RCTRL": 0xA3,
+    "LALT": 0xA4,
+    "RALT": 0xA5,
+    "BROWSER_BACK": 0xA6,
+    "BROWSER_FORWARD": 0xA7,
+    "BROWSER_REFRESH": 0xA8,
+    "BROWSER_STOP": 0xA9,
+    "BROWSER_SEARCH": 0xAA,
+    "BROWSER_FAVORITES": 0xAB,
+    "BROWSER_HOME": 0xAC,
+    "VOLUME_MUTE": 0xAD,
+    "VOLUME_DOWN": 0xAE,
+    "VOLUME_UP": 0xAF,
+    "MEDIA_NEXT": 0xB0,
+    "MEDIA_PREVIOUS": 0xB1,
+    "MEDIA_STOP": 0xB2,
+    "MEDIA_PLAY_PAUSE": 0xB3,
+    "LAUNCH_MAIL": 0xB4,
+    "LAUNCH_MEDIA": 0xB5,
+    "LAUNCH_APP1": 0xB6,
+    "LAUNCH_APP2": 0xB7,
+    "OEM_1": 0xBA,
+    "OEM_PLUS": 0xBB,
+    "OEM_COMMA": 0xBC,
+    "OEM_MINUS": 0xBD,
+    "OEM_PERIOD": 0xBE,
+    "OEM_2": 0xBF,
+    "OEM_3": 0xC0,
+    "OEM_4": 0xDB,
+    "OEM_5": 0xDC,
+    "OEM_6": 0xDD,
+    "OEM_7": 0xDE,
+    "OEM_8": 0xDF,
+    "OEM_102": 0xE2,
+}
+
+FEATURE_HOTKEYS = ("", *FEATURE_HOTKEY_VIRTUAL_KEYS)
+
+_FEATURE_HOTKEY_ALIASES = {
+    "MOUSELEFT": "LBUTTON",
+    "MOUSERIGHT": "RBUTTON",
+    "MOUSEMIDDLE": "MBUTTON",
+    "MOUSE4": "XBUTTON1",
+    "MOUSE5": "XBUTTON2",
+    "ESCAPE": "ESC",
+    "RETURN": "ENTER",
+    "CONTROL": "CTRL",
+    "MENU": "ALT",
+    "SPACEBAR": "SPACE",
+    "PGUP": "PAGEUP",
+    "PGDN": "PAGEDOWN",
+    "INS": "INSERT",
+    "DEL": "DELETE",
+    "ARROWLEFT": "LEFT",
+    "ARROWUP": "UP",
+    "ARROWRIGHT": "RIGHT",
+    "ARROWDOWN": "DOWN",
 }
 
 
 def normalize_feature_hotkey(value: object) -> str:
     if not isinstance(value, str):
         return ""
-    normalized = value.strip().upper()
-    return normalized if normalized in FEATURE_HOTKEY_VIRTUAL_KEYS else ""
+    normalized = value.strip().upper().replace(" ", "")
+    normalized = _FEATURE_HOTKEY_ALIASES.get(normalized, normalized)
+    if normalized in FEATURE_HOTKEY_VIRTUAL_KEYS:
+        return normalized
+    if normalized.startswith("VK_") and len(normalized) == 5:
+        try:
+            virtual_key = int(normalized[3:], 16)
+        except ValueError:
+            return ""
+        if 0x01 <= virtual_key <= 0xFE:
+            return normalized
+    return ""
+
+
+def feature_hotkey_virtual_key(value: object) -> int | None:
+    normalized = normalize_feature_hotkey(value)
+    if not normalized:
+        return None
+    if normalized.startswith("VK_"):
+        return int(normalized[3:], 16)
+    return FEATURE_HOTKEY_VIRTUAL_KEYS[normalized]
 
 
 class Win32FeatureHotkeyStateBackend:
@@ -120,11 +225,10 @@ class FeatureHotkeyMonitor:
                 raw_hotkeys = {}
             for name, callback in self._callbacks.items():
                 hotkey = normalize_feature_hotkey(raw_hotkeys.get(name))
+                virtual_key = feature_hotkey_virtual_key(hotkey)
                 is_down = bool(
-                    hotkey
-                    and self._state_backend.is_down(
-                        FEATURE_HOTKEY_VIRTUAL_KEYS[hotkey]
-                    )
+                    virtual_key is not None
+                    and self._state_backend.is_down(virtual_key)
                 )
                 if is_down and not self._was_down[name]:
                     callback()
@@ -208,11 +312,10 @@ class GroupLaunchHotkeyMonitor:
                     continue
                 group_name = raw_name.strip()
                 hotkey = normalize_feature_hotkey(raw_hotkey)
+                virtual_key = feature_hotkey_virtual_key(hotkey)
                 is_down = bool(
-                    hotkey
-                    and self._state_backend.is_down(
-                        FEATURE_HOTKEY_VIRTUAL_KEYS[hotkey]
-                    )
+                    virtual_key is not None
+                    and self._state_backend.is_down(virtual_key)
                 )
                 if is_down and not self._was_down.get(
                     group_name,

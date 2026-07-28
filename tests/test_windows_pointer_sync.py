@@ -119,6 +119,22 @@ def test_all_policy_includes_minimized_and_deduplicated_recursive_scope():
     assert [item[0] for item in messages.sent] == [2, 3]
 
 
+def test_fourteen_window_left_sync_sends_once_to_each_non_controller():
+    windows = [_window(handle) for handle in range(1, 15)]
+    messages = Messages()
+
+    result = _controller(windows, messages).send(
+        source_handle=1,
+        x_ratio=0.5,
+        y_ratio=0.5,
+        event="left_up",
+        policy=WindowInputPolicy.ALL,
+    )
+
+    assert result.passed is True
+    assert [item[0] for item in messages.sent] == list(range(2, 15))
+
+
 def test_send_click_uses_configured_order_and_one_preflight():
     windows = [_window(2), _window(3), _window(1)]
     messages = Messages()

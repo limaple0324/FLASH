@@ -595,6 +595,22 @@ def test_each_group_keeps_one_unique_launch_hotkey(tmp_path):
     assert restored.group("120").launch_hotkey == ""
 
 
+def test_top_row_and_numpad_launch_hotkeys_persist_as_distinct_keys(tmp_path):
+    owned = tmp_path / "groups.json"
+    service = GroupConfigurationService(owned)
+    service.create_group("上排數字")
+    service.create_group("數字鍵盤")
+
+    assert service.set_launch_hotkey("上排數字", "1") is True
+    assert service.set_launch_hotkey("數字鍵盤", "NUMPAD1") is True
+
+    restored = GroupConfigurationService(owned)
+    assert restored.launch_hotkeys() == {
+        "上排數字": "1",
+        "數字鍵盤": "NUMPAD1",
+    }
+
+
 def test_import_rejects_reserved_feature_hotkey_without_changing_owned(
     tmp_path,
 ):
