@@ -78,7 +78,11 @@ from habit.service import ActivityOrderHabitService
 from habit.store import ActivityOrderHabitStore
 from habit.preference_service import PlayerHabitPreferenceService
 from habit.preference_store import PlayerHabitStore
-from services.activity_progress_service import ActivityProgressService
+from services.activity_progress_monitor import ActivityProgressMonitor
+from services.activity_progress_service import (
+    ACTIVITY_PROGRESS_CHANGED_EVENT,
+    ActivityProgressService,
+)
 from services.activity_description_service import ActivityDescriptionService
 from services.activity_reminder_monitor import ActivityReminderMonitor
 from services.activity_reminder_service import ActivityReminderService
@@ -436,7 +440,7 @@ def build_services(
     progress_store = ActivityProgressStore(
         paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
     )
-    progress_service = ActivityProgressService(progress_store)
+    progress_service = ActivityProgressService(progress_store, event_bus)
     activity_schedule_catalog = build_confirmed_activity_catalog()
     activity_description_service = ActivityDescriptionService(
         config,
@@ -1290,6 +1294,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     workspace_service = AppContext.get(WorkspaceService)
     activity_schedule_view_service = AppContext.get(ActivityScheduleViewService)
     activity_description_service = AppContext.get(ActivityDescriptionService)
+    activity_progress_service = AppContext.get(ActivityProgressService)
+    event_bus = AppContext.get(EventBus)
     card_view_state_service = AppContext.get(CardViewStateService)
     card_service = AppContext.get(CardService)
     card_coordinator = AppContext.get(CardCoordinator)
@@ -3967,6 +3973,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     home_view.build()
     refresh_character_data(current_character_group)
+    activity_progress_changed_handler = (
+        lambda _change: home_view.refresh_activity_schedule()
+    )
+    if event_bus is not None:
+        event_bus.subscribe(
+            ACTIVITY_PROGRESS_CHANGED_EVENT,
+            activity_progress_changed_handler,
+        )
     auto_click_service.subscribe(
         lambda snapshot: home_view.set_auto_click_running(
             snapshot.running,
@@ -4050,6 +4064,17 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         start_service(group_role_status_monitor)
     if deferred_sync_monitor is not None:
         start_service(deferred_sync_monitor)
+    activity_progress_monitor = (
+        ActivityProgressMonitor(
+            activity_progress_service,
+            window.after,
+            window.after_cancel,
+        )
+        if activity_progress_service is not None
+        else None
+    )
+    if activity_progress_monitor is not None:
+        start_service(activity_progress_monitor)
 
     reconnect_status_refresh_id: str | None = None
 
@@ -4156,6 +4181,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         stop_named("card_expiry", expiry_monitor)
         stop_named("activity_reminder", activity_reminder_monitor)
+        stop_named("activity_progress", activity_progress_monitor)
         stop_named("card_overlay", overlay_runtime)
         stop_named("keyboard_sync", keyboard_sync_monitor)
         stop_named("mouse_sync", mouse_sync_monitor)
@@ -4215,6 +4241,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return False
         if card_service is not None:
             card_service.unsubscribe(home_view.refresh_cards)
+        if event_bus is not None:
+            event_bus.unsubscribe(
+                ACTIVITY_PROGRESS_CHANGED_EVENT,
+                activity_progress_changed_handler,
+            )
         home_view.dispose()
         if window_identity is not None:
             window_identity.clear()
@@ -4250,6 +4281,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window._card_overlay_runtime = overlay_runtime
     window._card_expiry_monitor = expiry_monitor
     window._activity_reminder_monitor = activity_reminder_monitor
+    window._activity_progress_monitor = activity_progress_monitor
     window._auto_click_service = auto_click_service
     window._feature_hotkey_monitor = feature_hotkey_monitor
     window._group_role_status_monitor = group_role_status_monitor

@@ -61,6 +61,38 @@ def test_daily_progress_resets_at_the_first_check_after_midnight():
     assert reset.completed_at is None
 
 
+def test_running_activity_moves_to_new_day_without_silently_stopping():
+    definition = _guard()
+    before_midnight = datetime(
+        2026,
+        7,
+        11,
+        23,
+        59,
+        tzinfo=TAIPEI_TIMEZONE,
+    )
+    after_midnight = datetime(
+        2026,
+        7,
+        12,
+        0,
+        0,
+        tzinfo=TAIPEI_TIMEZONE,
+    )
+    progress = ActivityProgress(
+        activity_id="guard",
+        subject_id="character-a",
+        current_count=3,
+    ).start(before_midnight)
+
+    carried = progress.reset_if_due(definition, after_midnight)
+
+    assert carried.status is ActivityStatus.RUNNING
+    assert carried.started_at == before_midnight
+    assert carried.period_started_on == after_midnight.date()
+    assert carried.current_count == 0
+
+
 def test_daily_progress_does_not_reset_twice_on_the_same_day():
     definition = _guard()
     now = datetime(2026, 7, 11, 20, 0, tzinfo=TAIPEI_TIMEZONE)

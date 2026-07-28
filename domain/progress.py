@@ -101,6 +101,15 @@ class ActivityProgress:
             return replace(self, period_started_on=today)
         if self.period_started_on >= today:
             return self
+        if self.status is ActivityStatus.RUNNING:
+            return ActivityProgress(
+                activity_id=self.activity_id,
+                subject_id=self.subject_id,
+                current_count=0,
+                status=ActivityStatus.RUNNING,
+                period_started_on=today,
+                started_at=self.started_at,
+            )
         return ActivityProgress(
             activity_id=self.activity_id,
             subject_id=self.subject_id,

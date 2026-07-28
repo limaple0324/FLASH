@@ -6,7 +6,12 @@ from domain.progress_store import ActivityProgressStore
 from domain.status import ActivityStatus
 from main import ACTIVITY_PROGRESS_FILENAME, build_services
 from services.activity_progress_service import ActivityProgressService
+from services.activity_progress_service import (
+    ACTIVITY_PROGRESS_CHANGED_EVENT,
+    ActivityProgressChange,
+)
 from services.app_context import AppContext
+from services.event_bus import EventBus
 
 
 def _definition() -> ActivityDefinition:
@@ -72,3 +77,86 @@ def test_build_services_registers_progress_inside_managed_data(tmp_path):
 
     assert store.path == paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
     assert service.store is store
+
+
+def test_each_real_change_is_saved_before_one_event(tmp_path):
+    bus = EventBus()
+    changes: list[ActivityProgressChange] = []
+    path = tmp_path / "activity_progress.json"
+    disk_snapshots = []
+    bus.subscribe(ACTIVITY_PROGRESS_CHANGED_EVENT, changes.append)
+    bus.subscribe(
+        ACTIVITY_PROGRESS_CHANGED_EVENT,
+        lambda _change: disk_snapshots.append(
+            ActivityProgressStore(path).load()
+        ),
+    )
+    service = ActivityProgressService(
+        ActivityProgressStore(path),
+        bus,
+    )
+    service.register_definition(_definition())
+    now = datetime(2026, 7, 11, 20, 0, tzinfo=TAIPEI_TIMEZONE)
+
+    service.start("farm", "character-a", now)
+    service.record_completion("farm", "character-a", now)
+
+    assert [change.reason for change in changes] == [
+        "started",
+        "completion_recorded",
+    ]
+    assert all(isinstance(change, ActivityProgressChange) for change in changes)
+    assert ActivityProgressService(
+        ActivityProgressStore(path)
+    ).get("farm", "character-a") == changes[-1].current
+    assert disk_snapshots[-1][0] == changes[-1].current
+
+
+def test_unchanged_completion_does_not_save_or_publish_again(tmp_path):
+    bus = EventBus()
+    changes: list[ActivityProgressChange] = []
+    bus.subscribe(ACTIVITY_PROGRESS_CHANGED_EVENT, changes.append)
+    service = ActivityProgressService(
+        ActivityProgressStore(tmp_path / "activity_progress.json"),
+        bus,
+    )
+    definition = ActivityDefinition(
+        activity_id="once",
+        name="單次活動",
+        activity_type=ActivityType.DAILY,
+        reset_rule=ResetRule.DAILY_MIDNIGHT,
+        max_completions=1,
+    )
+    service.register_definition(definition)
+    now = datetime(2026, 7, 11, 20, 0, tzinfo=TAIPEI_TIMEZONE)
+
+    service.record_completion("once", "character-a", now)
+    service.record_completion("once", "character-a", now)
+
+    assert len(changes) == 1
+
+
+def test_failed_atomic_save_keeps_old_memory_and_publishes_nothing(tmp_path):
+    class FailingStore(ActivityProgressStore):
+        def save(self, progress):
+            raise OSError("simulated save failure")
+
+    bus = EventBus()
+    changes: list[ActivityProgressChange] = []
+    bus.subscribe(ACTIVITY_PROGRESS_CHANGED_EVENT, changes.append)
+    service = ActivityProgressService(
+        FailingStore(tmp_path / "activity_progress.json"),
+        bus,
+    )
+    service.register_definition(_definition())
+    now = datetime(2026, 7, 11, 20, 0, tzinfo=TAIPEI_TIMEZONE)
+
+    try:
+        service.start("farm", "character-a", now)
+    except OSError as error:
+        assert "simulated save failure" in str(error)
+    else:
+        raise AssertionError("save failure must be reported")
+
+    assert service.all() == ()
+    assert changes == []
