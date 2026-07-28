@@ -87,6 +87,31 @@ def test_group_change_and_group_edit_stop_continuous_click_immediately():
     assert source.count("auto_click_service.stop()") >= 2
 
 
+def test_group_change_stops_all_automation_before_publishing_new_group():
+    source = Path("main.py").read_text(encoding="utf-8")
+    change_group = source[
+        source.index("    def change_group("):
+        source.index(
+            "    def stop_group_automation_for_configuration_change(",
+        )
+    ]
+
+    stop_index = change_group.index(
+        "stop_group_automation_for_configuration_change()"
+    )
+    workspace_index = change_group.index(
+        "workspace_service.set_current_group("
+    )
+    config_index = change_group.index(
+        "config.set(CURRENT_GROUP_NAME_KEY"
+    )
+
+    assert stop_index < workspace_index < config_index
+    assert "if not stop_group_automation_for_configuration_change()" in (
+        change_group
+    )
+
+
 def test_input_verifier_has_a_bounded_delay_for_real_foreground_testing():
     source = Path("scripts/verify_input_sync_sp1.py").read_text(
         encoding="utf-8"

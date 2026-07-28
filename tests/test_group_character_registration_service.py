@@ -9,6 +9,7 @@ from services.group_character_registration_service import (
     GroupCharacterRegistrationService,
 )
 from services.group_configuration_service import GroupConfigurationService
+from services.group_selection_service import GroupSelectionService
 
 
 def _configuration(tmp_path):
@@ -166,3 +167,41 @@ def test_existing_ungrouped_records_are_backfilled_without_new_identities(
     )
     assert ancient.note == "原備註"
     assert ancient.role == CharacterImportance.PRIMARY.value
+
+
+def test_detaching_removed_entries_preserves_identity_and_note_without_ghost_group(
+    tmp_path,
+):
+    configuration = _configuration(tmp_path)
+    registry = WindowRegistry()
+    registry_store = WindowRegistryStore(tmp_path / "registry.json")
+    character_store = CharacterStore(tmp_path / "characters.json")
+    service = GroupCharacterRegistrationService(
+        registry,
+        registry_store,
+        character_store,
+        configuration,
+    )
+    service.ensure_group("14支", ())
+    identities = tuple(record.character_id for record in registry.all())
+    noted_id = identities[0]
+    registry.set_note(noted_id, "永久保留")
+    registry_store.save(registry)
+
+    detached = service.detach_entries("14支", identities)
+    configuration.delete_group("14支")
+    restored = registry_store.load()
+    choices = GroupSelectionService(
+        registry,
+        legacy_config_path=tmp_path / "legacy.json",
+        configuration=configuration,
+    ).choices()
+
+    assert detached == identities
+    assert {record.character_id for record in restored.all()} == set(
+        identities
+    )
+    assert all(record.group is None for record in restored.all())
+    assert all(record.role is None for record in restored.all())
+    assert restored.get(noted_id).note == "永久保留"
+    assert choices == ()

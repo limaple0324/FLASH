@@ -161,7 +161,12 @@ class GroupSelectionService:
         return groups
 
     def choices(self) -> tuple[PlayerGroupChoice, ...]:
-        counts = self._legacy_groups()
+        legacy_counts = self._legacy_groups()
+        counts = (
+            dict(legacy_counts)
+            if self._configuration is None
+            else {}
+        )
         configured_members: dict[str, tuple[PlayerGroupMember, ...]] = {}
         configured_group_ids: dict[str, str] = {}
         if self._configuration is not None:

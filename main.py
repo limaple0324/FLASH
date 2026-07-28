@@ -1820,74 +1820,55 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             tuple(profiles),
         )
 
-    def change_group(name: str) -> None:
+    def change_group(name: str) -> GroupManagementViewResult:
+        current_group = (
+            workspace_service.snapshot().current_group
+            if workspace_service is not None
+            else None
+        )
+        current_name = (
+            current_group.name
+            if current_group is not None
+            else None
+        )
         if (
             group_selection_service is None
             or workspace_service is None
             or config is None
         ):
-            messagebox.showerror(
-                "輔｜組別",
+            return GroupManagementViewResult(
+                False,
+                current_name,
                 "組別資料尚未準備完成，未變更目前組別。",
-                parent=window,
             )
-            return
         choice = group_selection_service.find(name)
         if choice is None:
-            messagebox.showerror(
-                "輔｜組別",
+            return GroupManagementViewResult(
+                False,
+                current_name,
                 "找不到這個組別，未變更目前組別。",
-                parent=window,
             )
-            return
-        auto_click_service.stop()
-        if game_time_timed_click_service is not None:
-            game_time_timed_click_service.clear_target(notify=False)
+        if choice.name == current_name:
+            return GroupManagementViewResult(True, choice.name)
+        if not stop_group_automation_for_configuration_change():
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "自動操作尚未完全停止，未切換組別。",
+            )
+        selected_workspace_group = workspace_group_for_choice(choice)
+        apply_group_identity(choice)
         workspace_service.set_current_group(
-            workspace_group_for_choice(choice)
+            selected_workspace_group
         )
         workspace_service.set_next_step("查看目前需要注意的內容")
         config.set(CURRENT_GROUP_NAME_KEY, choice.name)
-        if keyboard_sync_monitor is not None and keyboard_sync_monitor.enabled:
-            keyboard_stopped = stop_service(keyboard_sync_monitor)
-            mouse_stopped = (
-                stop_service(mouse_sync_monitor)
-                if mouse_sync_monitor is not None
-                else None
-            )
-            sync_stopped = keyboard_stopped.success and (
-                mouse_stopped is None or mouse_stopped.success
-            )
-            if home_view is not None and sync_stopped:
-                home_view.set_keyboard_sync_enabled(False)
-            if logger is not None:
-                logger.info(
-                    "Keyboard synchronization stopped because the group changed."
-                )
-        if smart_reconnect_monitor is not None and smart_reconnect_monitor.running:
-            reconnect_stopped = stop_service(
-                smart_reconnect_monitor,
-                timeout_seconds=1.0,
-            )
-            if config is not None and reconnect_stopped.success:
-                config.update_values(
-                    {
-                        SMART_RECONNECT_ENABLED_KEY: False,
-                        SMART_RECONNECT_CONSENT_KEY: False,
-                    }
-                )
-            if home_view is not None and reconnect_stopped.success:
-                home_view.set_smart_reconnect_enabled(False)
-            if logger is not None:
-                logger.info(
-                    "Smart reconnect stopped because the group changed."
-                )
-        apply_group_identity(choice)
         if group_role_status_service is not None:
             group_role_status_service.clear_cache()
         refresh_character_data(choice.name)
+        return GroupManagementViewResult(True, choice.name)
 
-    def stop_group_automation_for_configuration_change() -> None:
+    def stop_group_automation_for_configuration_change() -> bool:
         auto_click_service.stop()
         if input_controller is not None:
             input_controller.invalidate_scheduled()
@@ -1895,18 +1876,20 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             pointer_sync_controller.invalidate_scheduled()
         if game_time_timed_click_service is not None:
             game_time_timed_click_service.clear_target(notify=False)
+        sync_stopped = True
+        keyboard_stopped = None
+        mouse_stopped = None
         if keyboard_sync_monitor is not None:
             keyboard_stopped = stop_service(keyboard_sync_monitor)
-            mouse_stopped = (
-                stop_service(mouse_sync_monitor)
-                if mouse_sync_monitor is not None
-                else None
-            )
-            sync_stopped = keyboard_stopped.success and (
-                mouse_stopped is None or mouse_stopped.success
-            )
-            if home_view is not None and sync_stopped:
-                home_view.set_keyboard_sync_enabled(False)
+        if mouse_sync_monitor is not None:
+            mouse_stopped = stop_service(mouse_sync_monitor)
+        sync_stopped = (
+            (keyboard_stopped is None or keyboard_stopped.success)
+            and (mouse_stopped is None or mouse_stopped.success)
+        )
+        if home_view is not None and sync_stopped:
+            home_view.set_keyboard_sync_enabled(False)
+        reconnect_stopped = None
         if smart_reconnect_monitor is not None:
             reconnect_stopped = stop_service(
                 smart_reconnect_monitor,
@@ -1927,6 +1910,19 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                     SMART_RECONNECT_CONSENT_KEY: False,
                 }
             )
+        stopped = (
+            sync_stopped
+            and (
+                reconnect_stopped is None
+                or reconnect_stopped.success
+            )
+        )
+        if logger is not None and not stopped:
+            logger.warning(
+                "Group configuration change was blocked because "
+                "an automation service did not stop."
+            )
+        return stopped
 
     def finish_group_management(
         selected_name: str | None,
@@ -1971,6 +1967,25 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             choice.name if choice is not None else None,
         )
 
+    def group_configuration_stop_failure(
+        current_name: str | None,
+    ) -> GroupManagementViewResult:
+        return GroupManagementViewResult(
+            False,
+            current_name,
+            "自動操作尚未完全停止，組別設定未變更。",
+        )
+
+    def detach_group_entries(
+        group_name: str,
+        entry_ids,
+    ) -> None:
+        if group_character_registration_service is not None:
+            group_character_registration_service.detach_entries(
+                group_name,
+                entry_ids,
+            )
+
     def create_group(name: str) -> GroupManagementViewResult:
         if group_configuration_service is None:
             return GroupManagementViewResult(
@@ -1978,11 +1993,20 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 None,
                 "組別設定尚未準備完成。",
             )
-        stop_group_automation_for_configuration_change()
+        current_group = (
+            workspace_service.snapshot().current_group
+            if workspace_service is not None
+            else None
+        )
+        current_name = (
+            current_group.name if current_group is not None else None
+        )
+        if not stop_group_automation_for_configuration_change():
+            return group_configuration_stop_failure(current_name)
         if not group_configuration_service.create_group(name):
             return GroupManagementViewResult(
                 False,
-                name,
+                current_name,
                 "已有相同名稱的組別。",
             )
         return finish_group_management(name)
@@ -1997,7 +2021,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 old_name,
                 "組別設定尚未準備完成。",
             )
-        stop_group_automation_for_configuration_change()
+        if not stop_group_automation_for_configuration_change():
+            return group_configuration_stop_failure(old_name)
         if not group_configuration_service.rename_group(
             old_name,
             new_name,
@@ -2019,13 +2044,21 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 name,
                 "組別設定尚未準備完成。",
             )
-        stop_group_automation_for_configuration_change()
+        group = group_configuration_service.group(name)
+        removed_entry_ids = (
+            tuple(entry.entry_id for entry in group.entries)
+            if group is not None
+            else ()
+        )
+        if not stop_group_automation_for_configuration_change():
+            return group_configuration_stop_failure(name)
         if not group_configuration_service.delete_group(name):
             return GroupManagementViewResult(
                 False,
                 name,
                 "找不到要刪除的組別。",
             )
+        detach_group_entries(name, removed_entry_ids)
         choices = group_selection_service.choices()
         selected = choices[0].name if choices else None
         return finish_group_management(selected)
@@ -2040,7 +2073,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 name,
                 "組別設定尚未準備完成。",
             )
-        stop_group_automation_for_configuration_change()
+        if not stop_group_automation_for_configuration_change():
+            return group_configuration_stop_failure(name)
         if not group_configuration_service.move_group(name, direction):
             return GroupManagementViewResult(
                 False,
@@ -2097,7 +2131,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             and workspace_snapshot.current_group is not None
             else None
         )
-        stop_group_automation_for_configuration_change()
+        previous_entries = {
+            group.name: frozenset(
+                entry.entry_id for entry in group.entries
+            )
+            for group in group_configuration_service.groups()
+        }
+        if not stop_group_automation_for_configuration_change():
+            return group_configuration_stop_failure(current_name)
         try:
             imported_names = (
                 group_configuration_service.import_configuration(
@@ -2122,6 +2163,21 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 False,
                 current_name,
                 "組別設定無法匯入，原本設定已保留。",
+            )
+        for old_group_name, old_entry_ids in previous_entries.items():
+            current_group = group_configuration_service.group(
+                old_group_name
+            )
+            current_entry_ids = (
+                frozenset(
+                    entry.entry_id for entry in current_group.entries
+                )
+                if current_group is not None
+                else frozenset()
+            )
+            detach_group_entries(
+                old_group_name,
+                old_entry_ids - current_entry_ids,
             )
         selected_name = (
             current_name
@@ -2199,7 +2255,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         if not selected:
             return False
-        stop_group_automation_for_configuration_change()
+        if not stop_group_automation_for_configuration_change():
+            return "自動操作尚未完全停止，未加入角色。"
         try:
             added = group_configuration_service.add_shortcuts(
                 group_name,
@@ -2207,6 +2264,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         except (SyncCycleError, GroupMasterLockedError) as error:
             return error.player_message
+        if added:
+            finish_group_management(group_name)
         if home_view is not None:
             home_view.refresh_group_entries()
             home_view.refresh_group_sync_relations()
@@ -2220,7 +2279,21 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     ) -> object:
         if group_configuration_service is None:
             return False
-        stop_group_automation_for_configuration_change()
+        group = group_configuration_service.group(group_name)
+        removed_entry = (
+            next(
+                (
+                    entry
+                    for entry in group.entries
+                    if entry.entry_id == entry_id
+                ),
+                None,
+            )
+            if group is not None
+            else None
+        )
+        if not stop_group_automation_for_configuration_change():
+            return "自動操作尚未完全停止，未移除角色。"
         try:
             removed = group_configuration_service.remove_shortcut(
                 group_name,
@@ -2228,6 +2301,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         except GroupMasterLockedError:
             return GroupMasterLockedError.player_message
+        if removed and removed_entry is not None:
+            detach_group_entries(group_name, (removed_entry.entry_id,))
+            finish_group_management(group_name)
         if removed and home_view is not None:
             home_view.refresh_group_entries()
             home_view.refresh_group_sync_relations()
@@ -2241,7 +2317,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     ) -> object:
         if group_configuration_service is None:
             return False
-        stop_group_automation_for_configuration_change()
+        if not stop_group_automation_for_configuration_change():
+            return "自動操作尚未完全停止，未變更主窗口。"
         try:
             changed = group_configuration_service.set_main_entry(
                 group_name,
@@ -2249,6 +2326,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         except (SyncCycleError, GroupMasterLockedError) as error:
             return error.player_message
+        if changed:
+            finish_group_management(group_name)
         if changed and group_role_status_service is not None:
             group_role_status_service.clear_cache()
         return changed
@@ -2262,7 +2341,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 group_name,
                 "組別設定尚未準備完成。",
             )
-        stop_group_automation_for_configuration_change()
+        group = group_configuration_service.group(group_name)
+        removed_entry_ids = (
+            tuple(entry.entry_id for entry in group.entries)
+            if group is not None
+            else ()
+        )
+        if not stop_group_automation_for_configuration_change():
+            return group_configuration_stop_failure(group_name)
         try:
             changed = group_configuration_service.clear_group(group_name)
         except GroupMasterLockedError:
@@ -2277,6 +2363,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 group_name,
                 "目前組別沒有可清空的角色。",
             )
+        detach_group_entries(group_name, removed_entry_ids)
         return finish_group_management(group_name)
 
     def unique_window_for_group_entry(
@@ -2391,6 +2478,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if point is None:
             return "滑鼠不在該角色遊戲內容區，未保存偏移。"
         offset_x = point[0] - group.sync_base_point[0]
+        if not stop_group_automation_for_configuration_change():
+            return "自動操作尚未完全停止，未保存角色偏移。"
         changed = group_configuration_service.set_sync_target_settings(
             group_name,
             entry_id,
@@ -2400,7 +2489,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             delay_ms=entry.sync_settings.delay_ms,
         )
         if changed:
-            stop_group_automation_for_configuration_change()
             refresh_group_sync_identity(group_name)
         return f"已套用角色偏移：X {offset_x}、Y 0"
 
@@ -2420,6 +2508,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return "Y 偏移必須介於 -20000 到 20000。"
         if not (0 <= delay_ms <= 5_000):
             return "延遲必須介於 0 到 5000 毫秒。"
+        if not stop_group_automation_for_configuration_change():
+            return "自動操作尚未完全停止，未保存角色偏移與延遲。"
         changed = group_configuration_service.set_sync_target_settings(
             group_name,
             entry_id,
@@ -2430,7 +2520,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         if not changed:
             return "同步偏移與延遲沒有變更。"
-        stop_group_automation_for_configuration_change()
         refresh_group_sync_identity(group_name)
         return "已保存角色偏移與延遲；同步已安全停止，請重新啟用。"
 
@@ -2440,13 +2529,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     ) -> str:
         if group_configuration_service is None:
             return "同步設定尚未準備完成。"
+        if not stop_group_automation_for_configuration_change():
+            return "自動操作尚未完全停止，未清除角色偏移與延遲。"
         changed = group_configuration_service.clear_sync_target_settings(
             group_name,
             entry_id,
         )
         if not changed:
             return "角色偏移與延遲原本已是清除狀態。"
-        stop_group_automation_for_configuration_change()
         refresh_group_sync_identity(group_name)
         return "已清除角色偏移與延遲；同步已安全停止。"
 
@@ -2503,7 +2593,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group = group_configuration_service.group(group_name)
         if group is None or not group.entries:
             return False
-        stop_group_automation_for_configuration_change()
+        if not stop_group_automation_for_configuration_change():
+            return "自動操作尚未完全停止，未加入同步關係。"
         try:
             changed = group_configuration_service.add_sync_relation(
                 group.entries[0].entry_id,
@@ -2522,7 +2613,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group = group_configuration_service.group(group_name)
         if group is None or not group.entries:
             return False
-        stop_group_automation_for_configuration_change()
+        if not stop_group_automation_for_configuration_change():
+            return False
         return group_configuration_service.remove_sync_relation(
             group.entries[0].entry_id,
             member_entry_id,

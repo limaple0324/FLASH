@@ -5135,16 +5135,41 @@ class HomeView:
     def _select_group(self, name: str) -> None:
         if name not in {choice.name for choice in self.group_choices}:
             return
+        previous_name = self.current_group_name
+        result = None
         if self.on_group_change is not None:
-            self.on_group_change(name)
-        self.current_group_name = name
+            result = self.on_group_change(name)
+        if isinstance(result, GroupManagementViewResult):
+            if not result.success:
+                if self._group_variable is not None:
+                    self._group_variable.set(previous_name or "")
+                self._show_group_setting_message(
+                    result.message or "組別沒有切換。"
+                )
+                return
+            selected_name = result.current_group_name
+        elif result is False:
+            if self._group_variable is not None:
+                self._group_variable.set(previous_name or "")
+            self._show_group_setting_message("組別沒有切換。")
+            return
+        else:
+            selected_name = name
+        if selected_name not in {
+            choice.name for choice in self.group_choices
+        }:
+            if self._group_variable is not None:
+                self._group_variable.set(previous_name or "")
+            self._show_group_setting_message("組別沒有切換。")
+            return
+        self.current_group_name = selected_name
         if self._group_variable is not None:
-            self._group_variable.set(name)
+            self._group_variable.set(selected_name)
         if self._group_value_label is not None:
-            self._group_value_label.configure(text=name)
+            self._group_value_label.configure(text=selected_name)
         if self._group_name_entry is not None:
             self._group_name_entry.delete(0, "end")
-            self._group_name_entry.insert(0, name)
+            self._group_name_entry.insert(0, selected_name)
         self.refresh_workspace()
         self.refresh_current_group_summary()
         self.refresh_group_entries()

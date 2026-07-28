@@ -150,3 +150,49 @@ class GroupCharacterRegistrationService:
                     role=role,
                 )
         return tuple(profile_by_id.values())
+
+    def detach_entries(
+        self,
+        group_name: object,
+        entry_ids: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Detach removed saved entries without deleting identity or notes."""
+        if not isinstance(group_name, str) or not group_name.strip():
+            return ()
+        cleaned_group = group_name.strip()
+        identities = tuple(
+            dict.fromkeys(
+                entry_id.strip()
+                for entry_id in entry_ids
+                if isinstance(entry_id, str) and entry_id.strip()
+            )
+        )
+        if not identities:
+            return ()
+
+        candidate = WindowRegistry.from_dict(self._registry.to_dict())
+        detached: list[str] = []
+        for character_id in identities:
+            try:
+                record = candidate.get(character_id)
+            except KeyError:
+                continue
+            if record.group != cleaned_group:
+                continue
+            candidate.set_group_role(
+                character_id,
+                group=None,
+                role=None,
+            )
+            detached.append(character_id)
+
+        if not detached:
+            return ()
+        self._registry_store.save(candidate)
+        for character_id in detached:
+            self._registry.set_group_role(
+                character_id,
+                group=None,
+                role=None,
+            )
+        return tuple(detached)

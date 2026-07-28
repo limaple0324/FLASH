@@ -2,8 +2,10 @@ from pathlib import Path
 
 from core.target_window_observation import TargetWindowObservation
 from services.character_view_service import PlayerCharacterView
+from services.group_selection_service import PlayerGroupChoice
 from services.group_role_status_service import GroupRoleStatus
 from ui.home import (
+    GroupManagementViewResult,
     UI_THEME_LABELS,
     HomeView,
     _blend_hex_color,
@@ -14,6 +16,14 @@ from ui.home import (
     theme_palette,
 )
 from workspace.models import WorkspaceState
+
+
+class _ValueStub:
+    def __init__(self, value: str):
+        self.value = value
+
+    def set(self, value: str) -> None:
+        self.value = value
 
 
 def test_home_has_real_product_pages_and_group_selection() -> None:
@@ -45,6 +55,29 @@ def test_current_group_page_replaces_sidebar_duplicate() -> None:
     assert "主控：" in source
     assert "個視窗" in source
     assert "_current_group_summary_text" in source
+
+
+def test_failed_group_change_keeps_previous_group_selected() -> None:
+    view = object.__new__(HomeView)
+    view.group_choices = (
+        PlayerGroupChoice("group-a", "甲組", 0),
+        PlayerGroupChoice("group-b", "乙組", 0),
+    )
+    view.current_group_name = "甲組"
+    view._group_variable = _ValueStub("乙組")
+    messages: list[str] = []
+    view._show_group_setting_message = messages.append
+    view.on_group_change = lambda _name: GroupManagementViewResult(
+        False,
+        "甲組",
+        "自動操作尚未完全停止，未切換組別。",
+    )
+
+    view._select_group("乙組")
+
+    assert view.current_group_name == "甲組"
+    assert view._group_variable.value == "甲組"
+    assert messages == ["自動操作尚未完全停止，未切換組別。"]
 
 
 def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
