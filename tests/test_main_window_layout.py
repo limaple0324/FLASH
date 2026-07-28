@@ -45,6 +45,9 @@ def test_main_window_uses_home_view():
     assert "current_card_background" in source
     assert "on_save_card_background=save_card_background" in source
     assert "on_clear_card_background=clear_card_background" in source
+    assert 'GROUP_ROLE_DETAILS_EXPANDED_KEY = "group_role_details_expanded"' in source
+    assert "group_role_details_expanded_provider=(" in source
+    assert "on_group_role_details_expanded_change=(" in source
 
 
 def test_main_window_start_message_is_player_facing():

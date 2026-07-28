@@ -244,6 +244,7 @@ ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
 PLAYER_HABIT_FILENAME = "player_habits.json"
 SYNC_SELECTED_KEYS_KEY = "sync_selected_keys"
 SYNC_KEYS_COLLAPSED_KEY = "sync_keys_collapsed"
+GROUP_ROLE_DETAILS_EXPANDED_KEY = "group_role_details_expanded"
 FEATURE_HOTKEYS_KEY = "feature_hotkeys"
 GAME_TIME_OFFSET_MS_KEY = "game_time_offset_ms"
 GAME_TIME_AUTO_UPDATE_KEY = "game_time_auto_update"
@@ -350,6 +351,7 @@ def build_services(
             UI_THEME_KEY: "clear_blue",
             SYNC_SELECTED_KEYS_KEY: ["ESC"],
             SYNC_KEYS_COLLAPSED_KEY: True,
+            GROUP_ROLE_DETAILS_EXPANDED_KEY: {},
             FEATURE_HOTKEYS_KEY: {
                 "sync": "XBUTTON1",
                 "reconnect": "",
@@ -2551,6 +2553,34 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group = group_configuration_service.group(group_name)
         return group.entries if group is not None else ()
 
+    def group_role_details_expanded(entry_id: str) -> bool:
+        if config is None or not isinstance(entry_id, str):
+            return False
+        raw = config.get(GROUP_ROLE_DETAILS_EXPANDED_KEY, {})
+        return bool(
+            isinstance(raw, dict)
+            and raw.get(entry_id) is True
+        )
+
+    def change_group_role_details_expanded(
+        entry_id: str,
+        expanded: bool,
+    ) -> bool:
+        if (
+            config is None
+            or not isinstance(entry_id, str)
+            or not entry_id.strip()
+        ):
+            return False
+        raw = config.get(GROUP_ROLE_DETAILS_EXPANDED_KEY, {})
+        values = dict(raw) if isinstance(raw, dict) else {}
+        if expanded:
+            values[entry_id.strip()] = True
+        else:
+            values.pop(entry_id.strip(), None)
+        config.set(GROUP_ROLE_DETAILS_EXPANDED_KEY, values)
+        return True
+
     def reorder_group_entries(
         group_name: str,
         entry_ids: tuple[str, ...],
@@ -3657,6 +3687,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group_launch_hotkey_provider=group_launch_hotkey,
         on_group_launch_hotkey_change=change_group_launch_hotkey,
         group_entries_provider=group_entries,
+        group_role_details_expanded_provider=(
+            group_role_details_expanded
+        ),
+        on_group_role_details_expanded_change=(
+            change_group_role_details_expanded
+        ),
         on_reorder_group_entries=reorder_group_entries,
         group_master_locked_provider=group_master_locked,
         on_group_master_locked_change=change_group_master_locked,

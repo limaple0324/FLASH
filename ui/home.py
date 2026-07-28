@@ -528,6 +528,12 @@ class HomeView:
         group_entries_provider: (
             Callable[[str], tuple[GroupConfigurationEntry, ...]] | None
         ) = None,
+        group_role_details_expanded_provider: (
+            Callable[[str], bool] | None
+        ) = None,
+        on_group_role_details_expanded_change: (
+            Callable[[str, bool], object] | None
+        ) = None,
         on_reorder_group_entries: (
             Callable[[str, tuple[str, ...]], object] | None
         ) = None,
@@ -822,6 +828,12 @@ class HomeView:
             on_group_launch_hotkey_change
         )
         self.group_entries_provider = group_entries_provider
+        self.group_role_details_expanded_provider = (
+            group_role_details_expanded_provider
+        )
+        self.on_group_role_details_expanded_change = (
+            on_group_role_details_expanded_change
+        )
         self.on_reorder_group_entries = on_reorder_group_entries
         self.group_master_locked_provider = (
             group_master_locked_provider
@@ -7416,6 +7428,11 @@ class HomeView:
             ).pack(fill=X, pady=4)
             return ()
         for display_order, entry in enumerate(entries, start=1):
+            expanded = bool(
+                self.group_role_details_expanded_provider(entry.entry_id)
+                if self.group_role_details_expanded_provider is not None
+                else False
+            )
             row = Frame(frame, bg=BACKGROUND, padx=10, pady=7)
             row._group_entry_id = entry.entry_id
             row.pack(fill=X, pady=3)
@@ -7429,14 +7446,58 @@ class HomeView:
                 bg=BACKGROUND,
                 fg=TEXT,
                 anchor="w",
-            ).pack(side=LEFT, fill=X, expand=True)
+                width=18,
+            ).pack(side=LEFT)
+            Label(
+                top_row,
+                text="角色 ID",
+                bg=BACKGROUND,
+                fg=MUTED,
+                font=("Microsoft JhengHei UI", 9),
+            ).pack(side=LEFT, padx=(8, 4))
+            role_id_entry = Entry(
+                top_row,
+                width=16,
+                font=("Microsoft JhengHei UI", 9),
+                bg=SURFACE,
+                fg=TEXT,
+                relief="flat",
+                bd=0,
+            )
+            role_id_entry.insert(0, entry.role_id)
+            role_id_entry.pack(side=LEFT, padx=(0, 6), ipady=4)
+            self._button(
+                top_row,
+                "校正角色 ID",
+                lambda value=entry.entry_id,
+                field=role_id_entry: self._calibrate_group_role_id(
+                    value,
+                    field,
+                ),
+            ).pack(side=LEFT)
+            self._button(
+                top_row,
+                "讀取角色 ID",
+                lambda value=entry.entry_id: self._read_group_role_id(
+                    value
+                ),
+            ).pack(side=LEFT, padx=(6, 0))
             Label(
                 top_row,
                 text=entry.role,
                 font=("Microsoft JhengHei UI", 9),
                 bg=BACKGROUND,
                 fg=MUTED,
-            ).pack(side=LEFT, padx=10)
+            ).pack(side=LEFT, padx=10, fill=X, expand=True)
+            self._button(
+                top_row,
+                "收起設定" if expanded else "展開設定",
+                lambda value=entry.entry_id,
+                current=expanded: self._toggle_group_role_details(
+                    value,
+                    not current,
+                ),
+            ).pack(side=RIGHT, padx=(6, 0))
             remove_button = self._button(
                 top_row,
                 "移除",
@@ -7473,7 +7534,8 @@ class HomeView:
                 )
                 continue
             settings_row = Frame(row, bg=BACKGROUND)
-            settings_row.pack(fill=X, pady=(7, 0))
+            if expanded:
+                settings_row.pack(fill=X, pady=(7, 0))
             enabled_variable = IntVar(
                 master=self.parent,
                 value=int(entry.sync_settings.offset_enabled),
@@ -7558,43 +7620,25 @@ class HomeView:
                         self._start_sync_target_point_capture(value)
                     ),
                 ).pack(side=LEFT, padx=(6, 0))
-            role_row = Frame(row, bg=BACKGROUND)
-            role_row.pack(fill=X, pady=(7, 0))
-            Label(
-                role_row,
-                text="角色ID",
-                bg=BACKGROUND,
-                fg=MUTED,
-                font=("Microsoft JhengHei UI", 9),
-            ).pack(side=LEFT)
-            role_id_entry = Entry(
-                role_row,
-                width=20,
-                font=("Microsoft JhengHei UI", 9),
-                bg=SURFACE,
-                fg=TEXT,
-                relief="flat",
-                bd=0,
-            )
-            role_id_entry.insert(0, entry.role_id)
-            role_id_entry.pack(side=LEFT, padx=(6, 8), ipady=4)
-            self._button(
-                role_row,
-                "校正角色ID",
-                lambda value=entry.entry_id,
-                field=role_id_entry: self._calibrate_group_role_id(
-                    value,
-                    field,
-                ),
-            ).pack(side=LEFT)
-            self._button(
-                role_row,
-                "讀取角色ID",
-                lambda value=entry.entry_id: self._read_group_role_id(
-                    value
-                ),
-            ).pack(side=LEFT, padx=(6, 0))
         return entries
+
+    def _toggle_group_role_details(
+        self,
+        entry_id: str,
+        expanded: bool,
+    ) -> None:
+        if self.on_group_role_details_expanded_change is not None:
+            try:
+                accepted = self.on_group_role_details_expanded_change(
+                    entry_id,
+                    expanded,
+                )
+            except Exception as exc:
+                self._report_refresh_error(exc)
+                return
+            if accepted is False:
+                return
+        self.refresh_group_entries()
 
     def _start_sync_base_point_capture(self) -> None:
         group_name = self.current_group_name

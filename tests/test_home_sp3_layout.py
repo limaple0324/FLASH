@@ -150,8 +150,8 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "設定主基準點（3秒）" in source
     assert "啟用角色偏移" in source
     assert "取目標點（3秒）" in source
-    assert "校正角色ID" in source
-    assert "讀取角色ID" in source
+    assert "校正角色 ID" in source
+    assert "讀取角色 ID" in source
 
 
 def test_group_drag_order_is_preview_only_until_saved() -> None:
@@ -170,6 +170,33 @@ def test_group_drag_order_is_preview_only_until_saved() -> None:
         "丁",
     )
     assert _reordered_entry_ids(original, "甲", "未知") == original
+
+
+def test_role_rows_are_compact_by_default_and_keep_role_id_actions_visible() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+
+    assert "group_role_details_expanded_provider" in source
+    assert "on_group_role_details_expanded_change" in source
+    assert '"收起設定" if expanded else "展開設定"' in source
+    assert "if expanded:" in source
+    assert 'text="角色 ID"' in source
+    assert '"校正角色 ID"' in source
+    assert '"讀取角色 ID"' in source
+    assert "text=entry.entry_id" not in source
+    assert 'text=f"{entry.entry_id}"' not in source
+
+
+def test_role_row_expand_change_is_saved_before_refresh() -> None:
+    view = object.__new__(HomeView)
+    calls: list[tuple[str, bool] | str] = []
+    view.on_group_role_details_expanded_change = (
+        lambda entry_id, expanded: calls.append((entry_id, expanded)) or True
+    )
+    view.refresh_group_entries = lambda: calls.append("refresh")
+
+    view._toggle_group_role_details("role-a", True)
+
+    assert calls == [("role-a", True), "refresh"]
 
 
 def test_background_controls_and_cached_canvas_rendering_are_wired() -> None:
