@@ -81,6 +81,8 @@ def test_complete_release_gate_verifies_zip_install_update_and_rollback():
     assert "[IO.Compression.CompressionLevel]::Optimal" in workflow
     assert "tar.exe -a -c -f" not in workflow
     assert "Expand-Archive -LiteralPath $zipPath" in workflow
+    assert "$zipVerified = $?" in workflow
+    assert "if (-not $zipVerified)" in workflow
     assert "- name: Verify live install update rollback and desktop entries" in workflow
     assert "$shortcutNames -notcontains '輔.lnk'" in workflow
     assert "$shortcutNames -notcontains '更新輔.lnk'" in workflow
