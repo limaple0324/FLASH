@@ -53,10 +53,11 @@ def test_installer_uses_safe_paths_and_two_confirmed_shortcuts():
     assert 'Join-Path $DesktopDir "輔.lnk"' in installer
     assert 'Join-Path $DesktopDir "更新輔.lnk"' in installer
     assert "啟動輔.lnk" not in installer
-    assert '$shortcut.TargetPath = $ExecutablePath' in installer
+    assert "[FlashNativeShortcutWriter]::Create(" in installer
+    assert "shellLink.SetPath(executablePath);" in installer
     assert 'Join-Path $WorkingDirectory "sync_plus_icon.ico"' in installer
-    assert '$shortcut.IconLocation = "$iconPath,0"' in installer
-    assert '$shortcut.Description = $Description' in installer
+    assert "shellLink.SetIconLocation(iconPath, 0);" in installer
+    assert "shellLink.SetDescription(description);" in installer
     assert '-Description "輔"' in installer
     assert '-Description "更新輔"' in installer
     assert '$shortcut.Description = "輔 SP1"' not in installer

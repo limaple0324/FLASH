@@ -90,6 +90,16 @@ def _inspect_shortcut(shortcut_path: Path, inspected_path: Path) -> tuple[str, .
     )
 
 
+def _assert_shortcut_targets(
+    inspected_lines: tuple[str, ...],
+    expected_target: Path,
+) -> None:
+    assert inspected_lines
+    actual_target = Path(inspected_lines[0])
+    assert actual_target.is_file()
+    assert os.path.samefile(actual_target, expected_target)
+
+
 def test_complete_installer_creates_only_main_and_update_shortcuts(tmp_path: Path):
     release_root = _create_release(
         tmp_path,
@@ -123,7 +133,7 @@ def test_complete_installer_creates_only_main_and_update_shortcuts(tmp_path: Pat
         shortcut_path,
         tmp_path / "main-shortcut-under-test.lnk",
     )
-    assert str(install_root / "FLASH.exe") in inspected_lines
+    _assert_shortcut_targets(inspected_lines, install_root / "FLASH.exe")
     assert str(install_root) in inspected_lines
     assert (
         f"{install_root / 'sync_plus_icon.ico'},0"
@@ -133,7 +143,7 @@ def test_complete_installer_creates_only_main_and_update_shortcuts(tmp_path: Pat
         update_shortcut_path,
         tmp_path / "update-shortcut-under-test.lnk",
     )
-    assert str(install_root / "更新輔.cmd") in update_lines
+    _assert_shortcut_targets(update_lines, install_root / "更新輔.cmd")
     assert str(install_root) in update_lines
     assert f"{install_root / 'sync_plus_icon.ico'},0" in update_lines
 
