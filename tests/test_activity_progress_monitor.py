@@ -138,4 +138,4 @@ def test_main_window_starts_stops_and_detaches_progress_monitor():
     assert "ActivityProgressMonitor(" in source
     assert 'stop_named("activity_progress", activity_progress_monitor)' in source
     assert "ACTIVITY_PROGRESS_CHANGED_EVENT" in source
-    assert "event_bus.unsubscribe(" in source
+    assert "event_subscription_scope.close()" in source
