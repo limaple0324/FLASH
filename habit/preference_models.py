@@ -8,10 +8,11 @@ from enum import Enum
 from typing import Mapping
 
 
-DEFAULT_OBSERVATION_DAYS = 14
-MINIMUM_OCCURRENCES = 10
-MINIMUM_DISTINCT_DAYS = 8
+DEFAULT_OBSERVATION_DAYS = 7
+MINIMUM_OCCURRENCES = 7
+MINIMUM_DISTINCT_DAYS = 7
 ASK_LATER_MINUTES = 10
+OBSERVATION_RETENTION_DAYS = 30
 
 
 def _required_text(value: str, field: str) -> str:
@@ -58,16 +59,23 @@ class PlayerHabitSettings:
         if (
             isinstance(self.observation_days, bool)
             or not isinstance(self.observation_days, int)
-            or not 1 <= self.observation_days <= 365
+            or not DEFAULT_OBSERVATION_DAYS <= self.observation_days <= 365
         ):
-            raise ValueError("observation_days must be between 1 and 365.")
+            raise ValueError(
+                "observation_days must be between 7 and 365."
+            )
 
     def to_dict(self) -> dict[str, object]:
         return {"observation_days": self.observation_days}
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "PlayerHabitSettings":
-        return cls(observation_days=int(payload.get("observation_days", 14)))
+        stored_days = int(
+            payload.get("observation_days", DEFAULT_OBSERVATION_DAYS)
+        )
+        return cls(
+            observation_days=max(DEFAULT_OBSERVATION_DAYS, stored_days)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +85,7 @@ class PlayerHabitObservation:
     subject: str
     values: tuple[str, ...]
     is_exception: bool = False
+    source_event_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -98,6 +107,13 @@ class PlayerHabitObservation:
         )
         if not isinstance(self.is_exception, bool):
             raise TypeError("is_exception must be bool.")
+        source_event_ids = tuple(
+            _required_text(value, "source_event_ids")
+            for value in self.source_event_ids
+        )
+        if len(source_event_ids) != len(set(source_event_ids)):
+            raise ValueError("source_event_ids must not contain duplicates.")
+        object.__setattr__(self, "source_event_ids", source_event_ids)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -106,6 +122,7 @@ class PlayerHabitObservation:
             "subject": self.subject,
             "values": list(self.values),
             "is_exception": self.is_exception,
+            "source_event_ids": list(self.source_event_ids),
         }
 
     @classmethod
@@ -114,10 +131,15 @@ class PlayerHabitObservation:
         payload: Mapping[str, object],
     ) -> "PlayerHabitObservation":
         raw_values = payload.get("values")
+        raw_source_event_ids = payload.get("source_event_ids", [])
         if not isinstance(raw_values, list) or any(
             not isinstance(value, str) for value in raw_values
         ):
             raise ValueError("values must be a list of strings.")
+        if not isinstance(raw_source_event_ids, list) or any(
+            not isinstance(value, str) for value in raw_source_event_ids
+        ):
+            raise ValueError("source_event_ids must be a list of strings.")
         return cls(
             observed_at=datetime.fromisoformat(
                 _required_text(str(payload.get("observed_at", "")), "observed_at")
@@ -128,6 +150,7 @@ class PlayerHabitObservation:
             subject=_required_text(str(payload.get("subject", "")), "subject"),
             values=tuple(raw_values),
             is_exception=bool(payload.get("is_exception", False)),
+            source_event_ids=tuple(raw_source_event_ids),
         )
 
 

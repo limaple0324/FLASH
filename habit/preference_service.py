@@ -12,6 +12,7 @@ from habit.preference_models import (
     ASK_LATER_MINUTES,
     MINIMUM_DISTINCT_DAYS,
     MINIMUM_OCCURRENCES,
+    OBSERVATION_RETENTION_DAYS,
     HabitDecision,
     HabitKind,
     PlayerHabitCandidate,
@@ -34,11 +35,23 @@ class PlayerHabitPreferenceView:
 
 
 @dataclass(frozen=True, slots=True)
+class PlayerHabitObservationView:
+    observation_id: str
+    observed_at: datetime
+    kind: str
+    subject: str
+    values: tuple[str, ...]
+    is_exception: bool
+    source_event_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PlayerHabitSettingsView:
     observation_days: int
     minimum_occurrences: int
     minimum_distinct_days: int
     preferences: tuple[PlayerHabitPreferenceView, ...]
+    observations: tuple[PlayerHabitObservationView, ...] = ()
 
 
 class PlayerHabitPreferenceService:
@@ -62,6 +75,16 @@ class PlayerHabitPreferenceService:
         canonical = json.dumps(
             [kind.value, subject.strip(), list(values)],
             ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _observation_id(observation: PlayerHabitObservation) -> str:
+        canonical = json.dumps(
+            observation.to_dict(),
+            ensure_ascii=False,
+            sort_keys=True,
             separators=(",", ":"),
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -99,6 +122,7 @@ class PlayerHabitPreferenceService:
         observed_at: datetime,
         *,
         is_exception: bool = False,
+        source_event_id: str | None = None,
     ) -> PlayerHabitObservation:
         value = observed_at.strftime("%H:%M")
         return self._record(
@@ -108,6 +132,11 @@ class PlayerHabitPreferenceService:
                 subject=activity_id,
                 values=(value,),
                 is_exception=is_exception,
+                source_event_ids=(
+                    (source_event_id.strip(),)
+                    if source_event_id is not None
+                    else ()
+                ),
             )
         )
 
@@ -118,6 +147,7 @@ class PlayerHabitPreferenceService:
         observed_at: datetime,
         *,
         is_exception: bool = False,
+        source_event_id: str | None = None,
     ) -> PlayerHabitObservation:
         return self._record(
             PlayerHabitObservation(
@@ -126,8 +156,83 @@ class PlayerHabitPreferenceService:
                 subject=context_id,
                 values=character_ids,
                 is_exception=is_exception,
+                source_event_ids=(
+                    (source_event_id.strip(),)
+                    if source_event_id is not None
+                    else ()
+                ),
             )
         )
+
+    def record_activity_completion(
+        self,
+        activity_id: str,
+        subject_id: str,
+        observed_at: datetime,
+        *,
+        source_event_id: str,
+        activity_name: str | None = None,
+    ) -> tuple[PlayerHabitObservation, ...]:
+        source_event_id = source_event_id.strip()
+        if not source_event_id:
+            raise ValueError("source_event_id must not be empty.")
+        activity_label = (
+            activity_name.strip()
+            if activity_name is not None
+            else activity_id.strip()
+        )
+        if not activity_label:
+            raise ValueError("activity_name must not be empty.")
+        if any(
+            source_event_id in item.source_event_ids
+            for item in self._memory.observations
+        ):
+            return ()
+
+        activity_time = PlayerHabitObservation(
+            observed_at=observed_at,
+            kind=HabitKind.ACTIVITY_TIME,
+            subject=activity_label,
+            values=(observed_at.strftime("%H:%M"),),
+            source_event_ids=(source_event_id,),
+        )
+        local_day = observed_at.date()
+        current_order = next(
+            (
+                item
+                for item in self._memory.observations
+                if item.kind is HabitKind.CHARACTER_ORDER
+                and item.subject == subject_id.strip()
+                and item.observed_at.date() == local_day
+            ),
+            None,
+        )
+        if current_order is None:
+            order_values = (activity_label,)
+            source_event_ids = (source_event_id,)
+        else:
+            order_values = current_order.values
+            if activity_label not in order_values:
+                order_values += (activity_label,)
+            source_event_ids = current_order.source_event_ids + (
+                source_event_id,
+            )
+        daily_order = PlayerHabitObservation(
+            observed_at=observed_at,
+            kind=HabitKind.CHARACTER_ORDER,
+            subject=subject_id,
+            values=order_values,
+            source_event_ids=source_event_ids,
+        )
+        retained = tuple(
+            item
+            for item in self._memory.observations
+            if item is not current_order
+        )
+        self._save(
+            observations=retained + (activity_time, daily_order)
+        )
+        return activity_time, daily_order
 
     def _record(
         self,
@@ -141,6 +246,7 @@ class PlayerHabitPreferenceService:
     def candidates(self, as_of: datetime) -> tuple[PlayerHabitCandidate, ...]:
         if as_of.tzinfo is None or as_of.utcoffset() is None:
             raise ValueError("as_of must be timezone-aware.")
+        self.cleanup_expired(as_of)
         grouped: dict[
             tuple[HabitKind, str, tuple[str, ...]],
             list[PlayerHabitObservation],
@@ -319,6 +425,71 @@ class PlayerHabitPreferenceService:
             self._save(preferences=())
         return count
 
+    def remove_observation(self, observation_id: str) -> bool:
+        observation_id = observation_id.strip()
+        if not observation_id:
+            raise ValueError("observation_id must not be empty.")
+        observations = tuple(
+            item
+            for item in self._memory.observations
+            if self._observation_id(item) != observation_id
+        )
+        if observations == self._memory.observations:
+            return False
+        self._save(observations=observations)
+        return True
+
+    def clear_all(self) -> int:
+        count = len(self._memory.preferences) + len(
+            self._memory.observations
+        )
+        if count:
+            self._save(observations=(), preferences=())
+        return count
+
+    def cleanup_expired(self, as_of: datetime) -> int:
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware.")
+        cutoff = as_of.date() - timedelta(days=OBSERVATION_RETENTION_DAYS)
+        observations = tuple(
+            item
+            for item in self._memory.observations
+            if item.observed_at.date() > cutoff
+        )
+        preferences = tuple(
+            item
+            for item in self._memory.preferences
+            if (
+                item.decision is HabitDecision.ADOPTED
+                or (
+                    item.decision is HabitDecision.NEVER_ASK
+                    and item.decided_at.date() > cutoff
+                )
+                or (
+                    item.decision is HabitDecision.TODAY_ONLY
+                    and item.applies_on is not None
+                    and item.applies_on >= as_of.date()
+                )
+                or (
+                    item.decision is HabitDecision.SNOOZED
+                    and item.remind_after is not None
+                    and item.remind_after > as_of
+                )
+            )
+        )
+        removed = (
+            len(self._memory.observations)
+            - len(observations)
+            + len(self._memory.preferences)
+            - len(preferences)
+        )
+        if removed:
+            self._save(
+                observations=observations,
+                preferences=preferences,
+            )
+        return removed
+
     def settings_view(self) -> PlayerHabitSettingsView:
         views = tuple(
             PlayerHabitPreferenceView(
@@ -334,9 +505,22 @@ class PlayerHabitPreferenceService:
             )
             for item in self._memory.preferences
         )
+        observations = tuple(
+            PlayerHabitObservationView(
+                observation_id=self._observation_id(item),
+                observed_at=item.observed_at,
+                kind=item.kind.value,
+                subject=item.subject,
+                values=item.values,
+                is_exception=item.is_exception,
+                source_event_ids=item.source_event_ids,
+            )
+            for item in reversed(self._memory.observations)
+        )
         return PlayerHabitSettingsView(
             observation_days=self._memory.settings.observation_days,
             minimum_occurrences=MINIMUM_OCCURRENCES,
             minimum_distinct_days=MINIMUM_DISTINCT_DAYS,
             preferences=views,
+            observations=observations,
         )

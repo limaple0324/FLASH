@@ -24,32 +24,30 @@ def _record_confirmed_activity_pattern(
     service: PlayerHabitPreferenceService,
     start: datetime,
 ) -> None:
-    for day in range(8):
+    for day in range(7):
         service.record_activity_time(
             "神秘考官",
             start + timedelta(days=day),
         )
-    service.record_activity_time("神秘考官", start + timedelta(days=6))
-    service.record_activity_time("神秘考官", start + timedelta(days=7))
 
 
-def test_default_rule_requires_14_days_10_occurrences_and_8_distinct_days(
+def test_default_rule_observes_seven_days_and_reviews_on_day_eight(
     tmp_path,
 ) -> None:
     service = _service(tmp_path)
     start = datetime(2026, 7, 1, 19, 50, tzinfo=TAIPEI)
     _record_confirmed_activity_pattern(service, start)
 
-    assert service.candidates(start + timedelta(days=13)) == ()
+    assert service.candidates(start + timedelta(days=6)) == ()
 
-    candidates = service.candidates(start + timedelta(days=14))
+    candidates = service.candidates(start + timedelta(days=7))
 
     assert len(candidates) == 1
     assert candidates[0].kind is HabitKind.ACTIVITY_TIME
     assert candidates[0].subject == "神秘考官"
     assert candidates[0].values == ("19:50",)
-    assert candidates[0].occurrence_count == 10
-    assert candidates[0].distinct_days == 8
+    assert candidates[0].occurrence_count == 7
+    assert candidates[0].distinct_days == 7
 
 
 def test_exception_observations_do_not_count_and_observation_days_are_adjustable(
@@ -58,26 +56,25 @@ def test_exception_observations_do_not_count_and_observation_days_are_adjustable
     service = _service(tmp_path)
     service.set_observation_days(10)
     start = datetime(2026, 7, 1, 19, 50, tzinfo=TAIPEI)
-    for day in range(8):
+    for day in range(6):
         service.record_activity_time(
             "神秘考官",
             start + timedelta(days=day),
         )
     service.record_activity_time(
         "神秘考官",
-        start + timedelta(days=7, minutes=1),
+        start + timedelta(days=6, minutes=1),
         is_exception=True,
     )
     service.record_activity_time(
         "神秘考官",
-        start + timedelta(days=7, minutes=2),
+        start + timedelta(days=6, minutes=2),
         is_exception=True,
     )
 
     assert service.candidates(start + timedelta(days=10)) == ()
 
     service.record_activity_time("神秘考官", start + timedelta(days=7))
-    service.record_activity_time("神秘考官", start + timedelta(days=8))
     assert len(service.candidates(start + timedelta(days=10))) == 1
 
 
@@ -85,9 +82,9 @@ def test_two_fully_qualified_opposite_patterns_are_not_suggested(
     tmp_path,
 ) -> None:
     service = _service(tmp_path)
-    service.set_observation_days(8)
+    service.set_observation_days(7)
     start = datetime(2026, 7, 1, 12, 0, tzinfo=TAIPEI)
-    for day in range(8):
+    for day in range(7):
         service.record_character_order(
             "每日活動",
             ("主號", "分號"),
@@ -98,19 +95,7 @@ def test_two_fully_qualified_opposite_patterns_are_not_suggested(
             ("分號", "主號"),
             start + timedelta(days=day, minutes=1),
         )
-    for minute in (2, 3):
-        service.record_character_order(
-            "每日活動",
-            ("主號", "分號"),
-            start + timedelta(days=7, minutes=minute),
-        )
-        service.record_character_order(
-            "每日活動",
-            ("分號", "主號"),
-            start + timedelta(days=7, minutes=minute + 2),
-        )
-
-    assert service.candidates(start + timedelta(days=8)) == ()
+    assert service.candidates(start + timedelta(days=7)) == ()
 
 
 def test_four_confirmed_player_choices_are_persistent_and_filter_reminders(
@@ -195,9 +180,73 @@ def test_settings_view_states_fixed_and_adjustable_rules(tmp_path) -> None:
     view = service.settings_view()
 
     assert view.observation_days == 21
-    assert view.minimum_occurrences == 10
-    assert view.minimum_distinct_days == 8
+    assert view.minimum_occurrences == 7
+    assert view.minimum_distinct_days == 7
     assert view.preferences == ()
+
+
+def test_true_observations_are_traceable_and_visible_in_settings(tmp_path) -> None:
+    service = _service(tmp_path)
+    observed_at = datetime(2026, 7, 20, 19, 50, tzinfo=TAIPEI)
+
+    service.record_activity_completion(
+        "神秘考官",
+        "主號",
+        observed_at,
+        source_event_id="event-1",
+    )
+
+    observations = service.settings_view().observations
+    assert len(observations) == 2
+    assert all(item.source_event_ids == ("event-1",) for item in observations)
+    assert service.remove_observation(observations[0].observation_id) is True
+    assert service.remove_observation(observations[0].observation_id) is False
+    assert len(service.settings_view().observations) == 1
+
+
+def test_expired_raw_observations_and_temporary_decisions_are_cleaned(
+    tmp_path,
+) -> None:
+    service = _service(tmp_path)
+    old = datetime(2026, 6, 1, 19, 50, tzinfo=TAIPEI)
+    now = datetime(2026, 7, 20, 19, 50, tzinfo=TAIPEI)
+    service.record_activity_time("神秘考官", old)
+    candidate = PlayerHabitCandidate(
+        "old-rejection",
+        HabitKind.ACTIVITY_TIME,
+        "神秘考官",
+        ("19:50",),
+        7,
+        7,
+        old.date(),
+        old.date(),
+    )
+    service.choose(candidate, HabitDecision.NEVER_ASK, old)
+
+    assert service.cleanup_expired(now) == 2
+    assert service.snapshot().observations == ()
+    assert service.snapshot().preferences == ()
+
+
+def test_clear_all_removes_observations_and_saved_preferences(tmp_path) -> None:
+    service = _service(tmp_path)
+    now = datetime(2026, 7, 20, 19, 50, tzinfo=TAIPEI)
+    service.record_activity_time("神秘考官", now)
+    candidate = PlayerHabitCandidate(
+        "saved",
+        HabitKind.ACTIVITY_TIME,
+        "神秘考官",
+        ("19:50",),
+        7,
+        7,
+        now.date(),
+        now.date(),
+    )
+    service.choose(candidate, HabitDecision.ADOPTED, now)
+
+    assert service.clear_all() == 2
+    assert service.snapshot().observations == ()
+    assert service.snapshot().preferences == ()
 
 
 def test_settings_view_exposes_editable_preference_values(tmp_path) -> None:

@@ -31,6 +31,7 @@ from habit.preference_models import (
 from habit.preference_service import (
     PlayerHabitPreferenceService,
     PlayerHabitPreferenceView,
+    PlayerHabitObservationView,
     PlayerHabitSettingsView,
 )
 from habit.preference_store import PlayerHabitStore
@@ -44,6 +45,7 @@ __all__ = [
     "PlayerHabitPreference",
     "PlayerHabitPreferenceService",
     "PlayerHabitPreferenceView",
+    "PlayerHabitObservationView",
     "PlayerHabitSettings",
     "PlayerHabitSettingsView",
     "PlayerHabitStore",

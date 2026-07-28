@@ -24,19 +24,11 @@ def _ready_habits(tmp_path) -> tuple[PlayerHabitPreferenceService, datetime]:
     service = PlayerHabitPreferenceService(
         PlayerHabitStore(tmp_path / "player_habits.json")
     )
-    service.set_observation_days(8)
+    service.set_observation_days(7)
     start = datetime(2026, 7, 1, 19, 50, tzinfo=TAIPEI)
-    for day in range(8):
+    for day in range(7):
         service.record_activity_time("神秘考官", start + timedelta(days=day))
-    service.record_activity_time(
-        "神秘考官",
-        start + timedelta(days=6),
-    )
-    service.record_activity_time(
-        "神秘考官",
-        start + timedelta(days=7),
-    )
-    return service, start + timedelta(days=8)
+    return service, start + timedelta(days=7)
 
 
 def _reminders(tmp_path):

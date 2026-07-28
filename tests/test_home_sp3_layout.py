@@ -243,13 +243,18 @@ def test_player_habit_settings_use_confirmed_thresholds_and_clear_confirmation()
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
     assert 'text="玩家習慣"' in source
-    assert "只觀察活動時間與角色操作順序" in source
+    assert "前七個有效日只觀察活動時間與角色操作順序" in source
+    assert "第八天才提出建議" in source
     assert "同一習慣至少" in source
-    assert "全部清除已保存偏好" in source
-    assert "確定清除全部已保存偏好" in source
+    assert "全部清除玩家習慣" in source
+    assert "確定清除全部玩家習慣" in source
+    assert "最近可信觀察" in source
+    assert "活動完成事件" in source
     assert "on_habit_observation_days_update" in source
     assert "on_modify_habit_preference" in source
+    assert "on_remove_habit_observation" in source
     assert "儲存修改" in source
+    assert "刪除紀錄" in source
 
 
 def test_background_contain_geometry_never_crops_or_upscales() -> None:

@@ -705,6 +705,9 @@ class HomeView:
         on_remove_habit_preference: (
             Callable[[str], PlayerHabitSettingsView] | None
         ) = None,
+        on_remove_habit_observation: (
+            Callable[[str], PlayerHabitSettingsView] | None
+        ) = None,
         on_clear_habit_preferences: (
             Callable[[], PlayerHabitSettingsView] | None
         ) = None,
@@ -1004,6 +1007,7 @@ class HomeView:
         )
         self.on_modify_habit_preference = on_modify_habit_preference
         self.on_remove_habit_preference = on_remove_habit_preference
+        self.on_remove_habit_observation = on_remove_habit_observation
         self.on_clear_habit_preferences = on_clear_habit_preferences
         self.theme_name = (
             theme_name
@@ -5118,8 +5122,8 @@ class HomeView:
         Label(
             habit_card,
             text=(
-                "只觀察活動時間與角色操作順序並提出建議；"
-                "不會直接操作遊戲。"
+                "前七個有效日只觀察活動時間與角色操作順序，"
+                "第八天才提出建議；不會直接操作遊戲。"
             ),
             font=("Microsoft JhengHei UI", 10),
             bg=SURFACE,
@@ -5131,11 +5135,11 @@ class HomeView:
             habit_settings = (
                 self.habit_settings_provider()
                 if self.habit_settings_provider is not None
-                else PlayerHabitSettingsView(14, 10, 8, ())
+                else PlayerHabitSettingsView(7, 7, 7, ())
             )
         except Exception as error:
             self._report_refresh_error(error)
-            habit_settings = PlayerHabitSettingsView(14, 10, 8, ())
+            habit_settings = PlayerHabitSettingsView(7, 7, 7, ())
         habit_row = Frame(habit_card, bg=SURFACE)
         habit_row.pack(fill=X)
         Label(
@@ -5194,7 +5198,7 @@ class HomeView:
         self._render_habit_preferences(habit_settings)
         self._button(
             habit_card,
-            "全部清除已保存偏好",
+            "全部清除玩家習慣",
             self._clear_habit_preferences,
         ).pack(anchor="w", pady=(10, 0))
 
@@ -6614,9 +6618,8 @@ class HomeView:
         if self._habit_status_label is not None:
             self._habit_status_label.configure(
                 text=(
-                    f"已保存 {len(settings.preferences)} 筆偏好。"
-                    if settings.preferences
-                    else "尚未有玩家確認的偏好。"
+                    f"可信觀察 {len(settings.observations)} 筆｜"
+                    f"已保存偏好 {len(settings.preferences)} 筆。"
                 )
             )
         for preference in settings.preferences:
@@ -6663,6 +6666,48 @@ class HomeView:
                     self._remove_habit_preference(preference_id)
                 ),
             ).pack(side=LEFT, padx=(8, 0))
+        if settings.observations:
+            Label(
+                frame,
+                text="最近可信觀察",
+                font=("Microsoft JhengHei UI", 9, "bold"),
+                bg=SURFACE,
+                fg=TEXT,
+                anchor="w",
+            ).pack(fill=X, pady=(8, 2))
+        for observation in settings.observations:
+            source_text = (
+                f"活動完成事件 {len(observation.source_event_ids)} 筆"
+                if observation.source_event_ids
+                else "既有紀錄"
+            )
+            observation_row = Frame(
+                frame,
+                bg=BACKGROUND,
+                padx=10,
+                pady=7,
+            )
+            observation_row.pack(fill=X, pady=2)
+            Label(
+                observation_row,
+                text=(
+                    f"{observation.observed_at:%Y-%m-%d %H:%M}｜"
+                    f"{observation.kind}｜{observation.subject}｜"
+                    f"{' → '.join(observation.values)}｜來源：{source_text}"
+                ),
+                font=("Microsoft JhengHei UI", 9),
+                bg=BACKGROUND,
+                fg=TEXT,
+                anchor="w",
+                justify="left",
+            ).pack(side=LEFT, fill=X, expand=True)
+            self._button(
+                observation_row,
+                "刪除紀錄",
+                lambda observation_id=observation.observation_id: (
+                    self._remove_habit_observation(observation_id)
+                ),
+            ).pack(side=RIGHT, padx=(8, 0))
 
     def _save_habit_observation_days(self) -> None:
         if (
@@ -6690,6 +6735,18 @@ class HomeView:
             return
         try:
             settings = self.on_remove_habit_preference(preference_id)
+            if not isinstance(settings, PlayerHabitSettingsView):
+                raise TypeError("habit callback must return settings view.")
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        self._render_habit_preferences(settings)
+
+    def _remove_habit_observation(self, observation_id: str) -> None:
+        if self.on_remove_habit_observation is None:
+            return
+        try:
+            settings = self.on_remove_habit_observation(observation_id)
             if not isinstance(settings, PlayerHabitSettingsView):
                 raise TypeError("habit callback must return settings view.")
         except Exception as error:
@@ -6726,7 +6783,7 @@ class HomeView:
             return
         if not messagebox.askyesno(
             "輔｜清除玩家習慣",
-            "確定清除全部已保存偏好？\n觀察紀錄會保留。",
+            "確定清除全部玩家習慣？\n觀察紀錄與已保存偏好都會清除。",
             parent=self.parent,
         ):
             return

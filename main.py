@@ -122,6 +122,9 @@ from services.player_habit_reminder_monitor import (
 from services.player_habit_reminder_service import (
     PlayerHabitReminderService,
 )
+from services.player_habit_activity_observer import (
+    PlayerHabitActivityObserver,
+)
 from services.character_detail_view_service import CharacterDetailViewService
 from services.character_game_data_view_service import (
     CharacterGameDataViewService,
@@ -1390,6 +1393,17 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         FeatureCardLayoutService
     )
     player_habit_service = AppContext.get(PlayerHabitPreferenceService)
+    player_habit_activity_observer = (
+        PlayerHabitActivityObserver(
+            player_habit_service,
+            activity_name_provider=lambda activity_id: (
+                activity_progress_service.definition(activity_id).name
+            ),
+        )
+        if player_habit_service is not None
+        and activity_progress_service is not None
+        else None
+    )
     home_view: HomeView | None = None
     tray_controller: SystemTrayController | None = None
 
@@ -3183,15 +3197,27 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         return player_habit_service.settings_view()
 
-    def clear_habit_preferences():
+    def remove_habit_observation(observation_id: str):
         if player_habit_service is None:
             raise RuntimeError("player habit service is unavailable")
-        removed = player_habit_service.clear_preferences()
+        removed = player_habit_service.remove_observation(observation_id)
         if removed and operation_record_store is not None:
             operation_record_store.append(
                 "玩家習慣",
                 "系統",
-                f"已清除 {removed} 筆玩家確認的偏好",
+                "已刪除一筆玩家習慣觀察紀錄",
+            )
+        return player_habit_service.settings_view()
+
+    def clear_habit_preferences():
+        if player_habit_service is None:
+            raise RuntimeError("player habit service is unavailable")
+        removed = player_habit_service.clear_all()
+        if removed and operation_record_store is not None:
+            operation_record_store.append(
+                "玩家習慣",
+                "系統",
+                f"已清除 {removed} 筆玩家習慣資料",
             )
         return player_habit_service.settings_view()
 
@@ -3942,6 +3968,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_habit_observation_days_update=update_habit_observation_days,
         on_modify_habit_preference=modify_habit_preference,
         on_remove_habit_preference=remove_habit_preference,
+        on_remove_habit_observation=remove_habit_observation,
         on_clear_habit_preferences=clear_habit_preferences,
         theme_name=configured_theme,
         on_theme_change=change_ui_theme,
@@ -4036,6 +4063,21 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 and isinstance(change, ActivityProgressChange)
             ):
                 true_event_card_service.handle_activity_progress(change)
+            if (
+                player_habit_activity_observer is not None
+                and isinstance(change, ActivityProgressChange)
+            ):
+                try:
+                    recorded = player_habit_activity_observer.handle(change)
+                except Exception as error:
+                    if logger is not None:
+                        logger.error(
+                            "Player habit activity observation failed and "
+                            f"was isolated: {error}"
+                        )
+                else:
+                    if recorded:
+                        home_view.refresh_habit_settings()
 
         dispatch_to_main_window(apply_change)
 
