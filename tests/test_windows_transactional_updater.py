@@ -81,7 +81,7 @@ def _copy_payload_sources(release_root: Path) -> None:
 def _create_release(
     root: Path,
     *,
-    milestone: str = "SP1",
+    milestone: str | None = None,
     missing_path: str | None = None,
     corrupt_path: str | None = None,
     latest_commit: str = SOURCE_COMMIT,
@@ -91,6 +91,8 @@ def _create_release(
     source_branch: str = "main",
     publish_target: str = "release/latest",
 ) -> Path:
+    if milestone is None:
+        milestone = "SP3" if build_kind == "main_release" else "SP1"
     release_root = root / "release"
     (release_root / "輔系統").mkdir(parents=True)
     (release_root / "FLASH.exe").write_bytes(b"new FLASH SP1 executable")
@@ -335,12 +337,10 @@ def test_rollback_failure_preserves_recovery_backups(tmp_path: Path):
     assert "更新成功" not in log
 
 
-@pytest.mark.parametrize("milestone", ["SP2", "SP3"])
-def test_full_release_accepts_cumulative_milestones(
+def test_full_release_accepts_complete_cumulative_milestone(
     tmp_path: Path,
-    milestone: str,
 ):
-    release_root = _create_release(tmp_path, milestone=milestone)
+    release_root = _create_release(tmp_path, milestone="SP3")
     install_root = _create_existing_install(tmp_path)
 
     result = _run_updater(install_root, release_root)
@@ -349,6 +349,18 @@ def test_full_release_accepts_cumulative_milestones(
     assert (install_root / "FLASH.exe").read_bytes() == (
         release_root / "FLASH.exe"
     ).read_bytes()
+
+
+def test_full_release_rejects_incomplete_sp2_milestone(tmp_path: Path):
+    release_root = _create_release(tmp_path, milestone="SP2")
+    install_root = _create_existing_install(tmp_path)
+    before = _installed_payload_snapshot(install_root)
+
+    result = _run_updater(install_root, release_root)
+
+    assert result.returncode != 0
+    assert _installed_payload_snapshot(install_root) == before
+    assert "完整累積版發布必須使用 SP3 里程碑" in _log(install_root)
 
 
 def test_updater_rejects_latest_and_build_info_commit_mismatch(tmp_path: Path):

@@ -192,9 +192,12 @@ jobs:
           if ($buildKind -eq 'sp3_snapshot' -and $metadata.milestone -ne 'SP3') {
             throw "SP3 delivery branch must use milestone=SP3."
           }
+          if ($buildKind -eq 'main_release' -and $metadata.milestone -ne 'SP3') {
+            throw "The complete cumulative release must use milestone=SP3."
+          }
 
           $shortCommit = $env:GITHUB_SHA.Substring(0, 7)
-          if ($buildKind -eq 'sp3_snapshot') {
+          if ($buildKind -in @('main_release', 'sp3_snapshot')) {
             $artifactPrefix = 'FLASH-SP1+SP2+SP3-Windows'
           }
           elseif ($buildKind -eq 'sp2_snapshot') {
@@ -302,7 +305,7 @@ jobs:
               '這是 SP1 獨立工程驗證快照，不是正式發布版。'
               '請放在獨立資料夾中驗證，不要覆蓋目前正式安裝。'
               '本快照不包含「更新輔」，不會追蹤 release/latest。'
-              '因此不會在日後更新成 SP2、SP3 或完整整合版。'
+              '因此不會在日後更新成 SP2、SP3 或完整累積版。'
               '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
             ) | Set-Content 'release/SP1快照說明.txt' -Encoding utf8
           }
@@ -499,11 +502,117 @@ jobs:
         run: |
           & 'release/輔系統/verify_windows_release.ps1' -NoLaunch
 
+      - name: Create and verify Windows ZIP
+        shell: pwsh
+        run: |
+          $zipPath = Join-Path 'dist' "$env:FLASH_ARTIFACT_NAME.zip"
+          Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+          tar.exe -a -c -f $zipPath -C release .
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+            throw 'Windows ZIP was not created.'
+          }
+
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'flash-zip-verification'
+          Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot
+          & (Join-Path $extractRoot '輔系統/verify_windows_release.ps1') -NoLaunch
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Extracted Windows ZIP verification failed.'
+          }
+
+          $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$zipHash  $([IO.Path]::GetFileName($zipPath))" |
+            Set-Content -LiteralPath "$zipPath.sha256.txt" -Encoding ascii
+          Write-Host "ZIP: $zipPath"
+          Write-Host "ZIP SHA-256: $zipHash"
+
+      - name: Verify live install update rollback and desktop entries
+        if: env.FLASH_BUILD_KIND == 'main_release' || env.FLASH_BUILD_KIND == 'sp1_release'
+        shell: pwsh
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP 'flash-live-install'
+          $desktopRoot = Join-Path $env:RUNNER_TEMP 'flash-live-desktop'
+          Remove-Item -LiteralPath $installRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $desktopRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $desktopRoot | Out-Null
+
+          & 'release/輔系統/安裝輔.ps1' `
+            -SourceDirectory (Resolve-Path 'release').Path `
+            -InstallDirectory $installRoot `
+            -DesktopDirectory $desktopRoot
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Live release installer verification failed.'
+          }
+
+          $shortcutNames = @(
+            Get-ChildItem -LiteralPath $desktopRoot -Filter '*.lnk' |
+              Sort-Object Name |
+              ForEach-Object Name
+          )
+          if (
+            $shortcutNames.Count -ne 2 -or
+            $shortcutNames -notcontains '輔.lnk' -or
+            $shortcutNames -notcontains '更新輔.lnk'
+          ) {
+            throw "Desktop shortcuts are invalid: $($shortcutNames -join ', ')"
+          }
+
+          $shell = New-Object -ComObject WScript.Shell
+          try {
+            $mainShortcut = $shell.CreateShortcut((Join-Path $desktopRoot '輔.lnk'))
+            $updateShortcut = $shell.CreateShortcut((Join-Path $desktopRoot '更新輔.lnk'))
+            if ($mainShortcut.TargetPath -ne (Join-Path $installRoot 'FLASH.exe')) {
+              throw 'The 輔 desktop shortcut target is invalid.'
+            }
+            if ($updateShortcut.TargetPath -ne (Join-Path $installRoot '更新輔.cmd')) {
+              throw 'The 更新輔 desktop shortcut target is invalid.'
+            }
+          }
+          finally {
+            if ($mainShortcut) {
+              [Runtime.InteropServices.Marshal]::FinalReleaseComObject($mainShortcut) | Out-Null
+            }
+            if ($updateShortcut) {
+              [Runtime.InteropServices.Marshal]::FinalReleaseComObject($updateShortcut) | Out-Null
+            }
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null
+          }
+
+          $beforeHash = (Get-FileHash -LiteralPath (Join-Path $installRoot 'FLASH.exe') -Algorithm SHA256).Hash
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File 'release/輔系統/輔更新核心.ps1' `
+            -InstallDirectory $installRoot `
+            -ReleaseSourceDirectory (Resolve-Path 'release').Path `
+            -ResolvedReleaseCommit $env:GITHUB_SHA `
+            -TestFailAfterReplacement 1
+          if ($LASTEXITCODE -eq 0) {
+            throw 'The rollback verification did not trigger the requested failure.'
+          }
+          $afterRollbackHash = (Get-FileHash -LiteralPath (Join-Path $installRoot 'FLASH.exe') -Algorithm SHA256).Hash
+          if ($afterRollbackHash -ne $beforeHash) {
+            throw 'The updater rollback did not restore the installed executable.'
+          }
+          $updateLog = Get-Content -LiteralPath (Join-Path $installRoot '更新紀錄.txt') -Raw
+          if ($updateLog -notmatch '回復完成；正式安裝內容已還原') {
+            throw 'The updater rollback log is incomplete.'
+          }
+
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File 'release/輔系統/輔更新核心.ps1' `
+            -InstallDirectory $installRoot `
+            -ReleaseSourceDirectory (Resolve-Path 'release').Path `
+            -ResolvedReleaseCommit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw 'The installed release could not complete a verified update.'
+          }
+
       - name: Upload Windows release bundle
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.FLASH_ARTIFACT_NAME }}
-          path: release/*
+          path: |
+            release/*
+            dist/*.zip*
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 30

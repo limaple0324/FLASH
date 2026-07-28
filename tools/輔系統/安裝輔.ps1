@@ -1,5 +1,5 @@
-﻿# 輔 SP1 完整首次安裝器
-# 先驗證整包，再以同磁碟暫存與備份完成可回復安裝。
+﻿# 輔正式版完整首次安裝器
+# 正式版先驗證整包，再以同磁碟暫存與備份完成可回復安裝。
 
 param(
     [string]$SourceDirectory = "",
@@ -7,7 +7,9 @@ param(
     [string]$DesktopDirectory = "",
     [switch]$NoShortcut,
     [ValidateRange(0, 1)]
-    [int]$TestFailAfterSwap = 0
+    [int]$TestFailAfterSwap = 0,
+    [ValidateRange(0, 2)]
+    [int]$TestFailAfterShortcut = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,10 +42,44 @@ function Copy-DirectoryContents([string]$Source, [string]$Destination) {
     }
 }
 
+function Read-KeyValueFile([string]$Path, [string]$Description) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "$Description 不存在：$Path"
+    }
+    $values = @{}
+    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith("#")) {
+            continue
+        }
+        $separator = $line.IndexOf("=")
+        if ($separator -le 0) {
+            throw "$Description 格式錯誤。"
+        }
+        $key = $line.Substring(0, $separator).Trim()
+        $value = $line.Substring($separator + 1).Trim()
+        if ([string]::IsNullOrWhiteSpace($key) -or $values.ContainsKey($key)) {
+            throw "$Description 包含無效或重複欄位。"
+        }
+        $values[$key] = $value
+    }
+    return $values
+}
+
+function Write-InstallLog([string]$Path, [string]$Message) {
+    $line = "[{0}] {1}" -f [DateTime]::Now.ToString("yyyy-MM-dd HH:mm:ss"), $Message
+    try {
+        Add-Content -LiteralPath $Path -Value $line -Encoding UTF8
+    }
+    catch {
+        Write-Host "安裝紀錄無法寫入：$Path" -ForegroundColor Yellow
+    }
+}
+
 function New-DesktopShortcut(
     [string]$ShortcutPath,
     [string]$ExecutablePath,
-    [string]$WorkingDirectory
+    [string]$WorkingDirectory,
+    [string]$Description
 ) {
     $shell = New-Object -ComObject WScript.Shell
     try {
@@ -55,7 +91,7 @@ function New-DesktopShortcut(
         $shortcut.TargetPath = $ExecutablePath
         $shortcut.WorkingDirectory = $WorkingDirectory
         $shortcut.IconLocation = "$iconPath,0"
-        $shortcut.Description = "輔"
+        $shortcut.Description = $Description
         $shortcut.Save()
     }
     finally {
@@ -66,48 +102,43 @@ function New-DesktopShortcut(
     }
 }
 
-function Get-DesktopShortcutPath([string]$DesktopDirectory) {
-    $defaultShortcut = Join-Path $DesktopDirectory "輔.lnk"
-    $alternateShortcut = Join-Path $DesktopDirectory "啟動輔.lnk"
-    $visibleNameConflict = Join-Path $DesktopDirectory "輔"
-
-    # Preserve the name selected by an earlier installation. When this is the
-    # first installation and Explorer already shows a file, directory, or
-    # junction named "輔", avoid creating a visually indistinguishable second
-    # item while file-name extensions are hidden.
-    if (Test-Path -LiteralPath $defaultShortcut -PathType Leaf) {
-        return $defaultShortcut
-    }
-    if (Test-Path -LiteralPath $alternateShortcut -PathType Leaf) {
-        return $alternateShortcut
-    }
-    if (Test-Path -LiteralPath $visibleNameConflict) {
-        return $alternateShortcut
-    }
-    return $defaultShortcut
-}
-
 if ([string]::IsNullOrWhiteSpace($SourceDirectory)) {
     $scriptSystemDir = Split-Path -Parent $MyInvocation.MyCommand.Path
     $SourceDirectory = Split-Path -Parent $scriptSystemDir
+}
+$SourceDir = Get-NormalizedDirectory $SourceDirectory
+if (-not (Test-Path -LiteralPath $SourceDir -PathType Container)) {
+    throw "找不到完整安裝包：$SourceDir"
+}
+$buildInfo = Read-KeyValueFile `
+    -Path (Join-Path $SourceDir "輔系統\BUILD_INFO.txt") `
+    -Description "成品身分資料"
+$buildKind = [string]$buildInfo["build_kind"]
+$milestone = [string]$buildInfo["milestone"]
+if ($buildKind -eq "sp1_release" -and $milestone -eq "SP1") {
+    $installFlavor = "SP1"
+    $installLabel = "SP1 獨立版"
+}
+elseif ($buildKind -eq "main_release" -and $milestone -eq "SP3") {
+    $installFlavor = "完整累積版"
+    $installLabel = "完整累積版"
+}
+else {
+    throw "這個安裝包不是可安裝的 SP1 獨立版或完整累積版。"
 }
 if ([string]::IsNullOrWhiteSpace($InstallDirectory)) {
     if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
         throw "找不到 LOCALAPPDATA，無法決定安全的使用者安裝位置。"
     }
-    $InstallDirectory = Join-Path $env:LOCALAPPDATA "Programs\輔\SP1"
+    $InstallDirectory = Join-Path $env:LOCALAPPDATA "Programs\輔\$installFlavor"
 }
 if ([string]::IsNullOrWhiteSpace($DesktopDirectory)) {
     $DesktopDirectory = [Environment]::GetFolderPath("Desktop")
 }
 
-$SourceDir = Get-NormalizedDirectory $SourceDirectory
 $InstallDir = Get-NormalizedDirectory $InstallDirectory
 $DesktopDir = Get-NormalizedDirectory $DesktopDirectory
 
-if (-not (Test-Path -LiteralPath $SourceDir -PathType Container)) {
-    throw "找不到完整安裝包：$SourceDir"
-}
 if ($InstallDir -eq $SourceDir) {
     throw "安裝位置不能與安裝包來源相同。"
 }
@@ -122,28 +153,46 @@ if (-not $NoShortcut -and [string]::IsNullOrWhiteSpace($DesktopDir)) {
     throw "找不到桌面資料夾。"
 }
 
+$installParent = Split-Path -Parent $InstallDir
+New-Item -ItemType Directory -Force -Path $installParent | Out-Null
+$persistentInstallLog = Join-Path $installParent "輔-安裝紀錄.txt"
+Write-InstallLog -Path $persistentInstallLog -Message "開始安裝：$installLabel"
+
 $running = Get-Process -Name "FLASH" -ErrorAction SilentlyContinue
 if ($running) {
+    Write-InstallLog `
+        -Path $persistentInstallLog `
+        -Message "安裝失敗：輔正在執行，請先關閉後再安裝。"
     throw "輔正在執行，請先關閉後再安裝。"
 }
 
-Invoke-BundleVerifier -Root $SourceDir -Description "來源安裝包驗證"
-
-$installParent = Split-Path -Parent $InstallDir
-New-Item -ItemType Directory -Force -Path $installParent | Out-Null
+try {
+    Invoke-BundleVerifier -Root $SourceDir -Description "來源安裝包驗證"
+}
+catch {
+    Write-InstallLog `
+        -Path $persistentInstallLog `
+        -Message "安裝失敗：$($_.Exception.Message)"
+    throw
+}
 
 $transactionId = [Guid]::NewGuid().ToString("N")
-$stageDir = Join-Path $installParent ".輔-SP1-stage-$transactionId"
-$backupDir = Join-Path $installParent ".輔-SP1-backup-$transactionId"
-$failedDir = Join-Path $installParent ".輔-SP1-failed-$transactionId"
-$shortcutPath = Get-DesktopShortcutPath -DesktopDirectory $DesktopDir
-$shortcutTemp = Join-Path $DesktopDir ".FLASH-SP1-$transactionId.lnk"
-$shortcutBackup = Join-Path $installParent ".FLASH-SP1-shortcut-$transactionId.lnk"
+$stageDir = Join-Path $installParent ".輔-stage-$transactionId"
+$backupDir = Join-Path $installParent ".輔-backup-$transactionId"
+$failedDir = Join-Path $installParent ".輔-failed-$transactionId"
+$shortcutPath = Join-Path $DesktopDir "輔.lnk"
+$updateShortcutPath = Join-Path $DesktopDir "更新輔.lnk"
+$shortcutTemp = Join-Path $DesktopDir ".FLASH-$transactionId.lnk"
+$updateShortcutTemp = Join-Path $DesktopDir ".FLASH-Update-$transactionId.lnk"
+$shortcutBackup = Join-Path $installParent ".FLASH-shortcut-$transactionId.lnk"
+$updateShortcutBackup = Join-Path $installParent ".FLASH-update-shortcut-$transactionId.lnk"
 
 $installSwapped = $false
 $installBackedUp = $false
 $shortcutInstalled = $false
 $shortcutBackedUp = $false
+$updateShortcutInstalled = $false
+$updateShortcutBackedUp = $false
 $success = $false
 
 try {
@@ -171,7 +220,13 @@ try {
         New-DesktopShortcut `
             -ShortcutPath $shortcutTemp `
             -ExecutablePath $installedExe `
-            -WorkingDirectory $InstallDir
+            -WorkingDirectory $InstallDir `
+            -Description "輔"
+        New-DesktopShortcut `
+            -ShortcutPath $updateShortcutTemp `
+            -ExecutablePath (Join-Path $InstallDir "更新輔.cmd") `
+            -WorkingDirectory $InstallDir `
+            -Description "更新輔"
 
         if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
             Move-Item -LiteralPath $shortcutPath -Destination $shortcutBackup
@@ -179,6 +234,22 @@ try {
         }
         Move-Item -LiteralPath $shortcutTemp -Destination $shortcutPath
         $shortcutInstalled = $true
+        if ($TestFailAfterShortcut -eq 1) {
+            throw "測試指定在建立第一個桌面捷徑後中斷。"
+        }
+        if (Test-Path -LiteralPath $updateShortcutPath -PathType Leaf) {
+            Move-Item `
+                -LiteralPath $updateShortcutPath `
+                -Destination $updateShortcutBackup
+            $updateShortcutBackedUp = $true
+        }
+        Move-Item `
+            -LiteralPath $updateShortcutTemp `
+            -Destination $updateShortcutPath
+        $updateShortcutInstalled = $true
+        if ($TestFailAfterShortcut -eq 2) {
+            throw "測試指定在建立第二個桌面捷徑後中斷。"
+        }
     }
 
     @(
@@ -187,19 +258,23 @@ try {
         "source_directory=$SourceDir"
         "shortcut=$(-not $NoShortcut)"
         "shortcut_path=$(if ($NoShortcut) { '' } else { $shortcutPath })"
+        "update_shortcut_path=$(if ($NoShortcut) { '' } else { $updateShortcutPath })"
     ) | Set-Content (Join-Path $InstallDir "安裝紀錄.txt") -Encoding UTF8
 
+    Write-InstallLog -Path $persistentInstallLog -Message "安裝成功：$installLabel"
     $success = $true
     Write-Host ""
-    Write-Host "輔 SP1 安裝完成。" -ForegroundColor Green
+    Write-Host "輔 $installLabel 安裝完成。" -ForegroundColor Green
     Write-Host "安裝位置：$InstallDir"
     if (-not $NoShortcut) {
         Write-Host "桌面捷徑：$shortcutPath"
+        Write-Host "更新捷徑：$updateShortcutPath"
     }
 }
 catch {
     $failureMessage = $_.Exception.Message
     Write-Host "安裝失敗：$failureMessage" -ForegroundColor Red
+    Write-InstallLog -Path $persistentInstallLog -Message "安裝失敗：$failureMessage"
 
     if ($shortcutInstalled -and (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {
         Remove-Item -LiteralPath $shortcutPath -Force
@@ -209,6 +284,23 @@ catch {
     }
     if (Test-Path -LiteralPath $shortcutTemp -PathType Leaf) {
         Remove-Item -LiteralPath $shortcutTemp -Force
+    }
+    if (
+        $updateShortcutInstalled -and
+        (Test-Path -LiteralPath $updateShortcutPath -PathType Leaf)
+    ) {
+        Remove-Item -LiteralPath $updateShortcutPath -Force
+    }
+    if (
+        $updateShortcutBackedUp -and
+        (Test-Path -LiteralPath $updateShortcutBackup -PathType Leaf)
+    ) {
+        Move-Item `
+            -LiteralPath $updateShortcutBackup `
+            -Destination $updateShortcutPath
+    }
+    if (Test-Path -LiteralPath $updateShortcutTemp -PathType Leaf) {
+        Remove-Item -LiteralPath $updateShortcutTemp -Force
     }
 
     if ($installSwapped -and (Test-Path -LiteralPath $InstallDir)) {
@@ -231,5 +323,11 @@ finally {
     }
     if ($success -and (Test-Path -LiteralPath $shortcutBackup -PathType Leaf)) {
         Remove-Item -LiteralPath $shortcutBackup -Force
+    }
+    if (
+        $success -and
+        (Test-Path -LiteralPath $updateShortcutBackup -PathType Leaf)
+    ) {
+        Remove-Item -LiteralPath $updateShortcutBackup -Force
     }
 }

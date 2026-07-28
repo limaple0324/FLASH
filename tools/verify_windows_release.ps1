@@ -206,6 +206,12 @@ if (
 ) {
     throw "An SP3 delivery must use milestone=SP3."
 }
+if (
+    $buildKind -eq "main_release" -and
+    $buildInfo["milestone"] -ne "SP3"
+) {
+    throw "The complete cumulative release must use milestone=SP3."
+}
 
 if ($buildKind -in @("main_release", "sp1_release")) {
     $expectedManifestPaths = $LiveReleaseManifestPaths

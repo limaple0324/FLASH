@@ -56,36 +56,10 @@ def _output(result: subprocess.CompletedProcess[bytes]) -> str:
     return (result.stdout + result.stderr).decode("utf-8", errors="replace")
 
 
-def test_complete_installer_verifies_copies_and_creates_one_shortcut(tmp_path: Path):
-    release_root = _create_release(
-        tmp_path,
-        build_kind="sp1_release",
-        event_name="push",
-        source_ref="refs/heads/sp1/completion-2026-07-25",
-        source_branch="sp1/completion-2026-07-25",
-        publish_target="release/sp1",
-    )
-    install_root = tmp_path / "installed" / "SP1"
-    desktop_root = tmp_path / "desktop"
-    desktop_root.mkdir()
-
-    result = _run_installer(release_root, install_root, desktop_root)
-
-    assert result.returncode == 0, _output(result)
-    for relative_path in (*PAYLOAD_PATHS, MANIFEST_PATH):
-        assert _path(install_root, relative_path).read_bytes() == _path(
-            release_root,
-            relative_path,
-        ).read_bytes()
-    assert (install_root / "安裝紀錄.txt").is_file()
-
-    shortcut_path = desktop_root / "輔.lnk"
-    assert shortcut_path.is_file()
-    assert tuple(desktop_root.glob("*.lnk")) == (shortcut_path,)
-    inspected_shortcut = desktop_root / "shortcut-under-test.lnk"
-    shutil.copy2(shortcut_path, inspected_shortcut)
+def _inspect_shortcut(shortcut_path: Path, inspected_path: Path) -> tuple[str, ...]:
+    shutil.copy2(shortcut_path, inspected_path)
     env = os.environ.copy()
-    env["FLASH_TEST_SHORTCUT"] = str(inspected_shortcut)
+    env["FLASH_TEST_SHORTCUT"] = str(inspected_path)
     inspected = subprocess.run(
         [
             str(POWERSHELL),
@@ -109,10 +83,45 @@ def test_complete_installer_verifies_copies_and_creates_one_shortcut(tmp_path: P
         encoding="utf-8",
         errors="replace",
     )
-    inspected_lines = tuple(
+    return tuple(
         base64.b64decode(line.strip()).decode("utf-8")
         for line in inspected.stdout.splitlines()
         if line.strip()
+    )
+
+
+def test_complete_installer_creates_only_main_and_update_shortcuts(tmp_path: Path):
+    release_root = _create_release(
+        tmp_path,
+        build_kind="sp1_release",
+        event_name="push",
+        source_ref="refs/heads/sp1/completion-2026-07-25",
+        source_branch="sp1/completion-2026-07-25",
+        publish_target="release/sp1",
+    )
+    install_root = tmp_path / "installed" / "SP1"
+    desktop_root = tmp_path / "desktop"
+    desktop_root.mkdir()
+
+    result = _run_installer(release_root, install_root, desktop_root)
+
+    assert result.returncode == 0, _output(result)
+    for relative_path in (*PAYLOAD_PATHS, MANIFEST_PATH):
+        assert _path(install_root, relative_path).read_bytes() == _path(
+            release_root,
+            relative_path,
+        ).read_bytes()
+    assert (install_root / "安裝紀錄.txt").is_file()
+
+    shortcut_path = desktop_root / "輔.lnk"
+    update_shortcut_path = desktop_root / "更新輔.lnk"
+    assert set(desktop_root.glob("*.lnk")) == {
+        shortcut_path,
+        update_shortcut_path,
+    }
+    inspected_lines = _inspect_shortcut(
+        shortcut_path,
+        tmp_path / "main-shortcut-under-test.lnk",
     )
     assert str(install_root / "FLASH.exe") in inspected_lines
     assert str(install_root) in inspected_lines
@@ -120,9 +129,16 @@ def test_complete_installer_verifies_copies_and_creates_one_shortcut(tmp_path: P
         f"{install_root / 'sync_plus_icon.ico'},0"
         in inspected_lines
     )
+    update_lines = _inspect_shortcut(
+        update_shortcut_path,
+        tmp_path / "update-shortcut-under-test.lnk",
+    )
+    assert str(install_root / "更新輔.cmd") in update_lines
+    assert str(install_root) in update_lines
+    assert f"{install_root / 'sync_plus_icon.ico'},0" in update_lines
 
 
-def test_first_install_uses_distinct_shortcut_name_when_desktop_has_fu_directory(
+def test_first_install_keeps_fixed_shortcut_names_when_desktop_has_fu_directory(
     tmp_path: Path,
 ):
     release_root = _create_release(
@@ -143,13 +159,17 @@ def test_first_install_uses_distinct_shortcut_name_when_desktop_has_fu_directory
     result = _run_installer(release_root, install_root, desktop_root)
 
     assert result.returncode == 0, _output(result)
-    shortcut_path = desktop_root / "啟動輔.lnk"
-    assert shortcut_path.is_file()
-    assert not (desktop_root / "輔.lnk").exists()
-    assert tuple(desktop_root.glob("*.lnk")) == (shortcut_path,)
+    shortcut_path = desktop_root / "輔.lnk"
+    update_shortcut_path = desktop_root / "更新輔.lnk"
+    assert set(desktop_root.glob("*.lnk")) == {
+        shortcut_path,
+        update_shortcut_path,
+    }
+    assert not (desktop_root / "啟動輔.lnk").exists()
     assert sentinel.read_bytes() == b"preserve desktop directory"
     install_record = (install_root / "安裝紀錄.txt").read_text(encoding="utf-8-sig")
     assert f"shortcut_path={shortcut_path}" in install_record
+    assert f"update_shortcut_path={update_shortcut_path}" in install_record
 
 
 def test_reinstall_preserves_existing_shortcut_name_despite_visible_name_conflict(
@@ -175,7 +195,10 @@ def test_reinstall_preserves_existing_shortcut_name_despite_visible_name_conflic
     assert existing_shortcut.is_file()
     assert existing_shortcut.read_bytes() != b"replace this prior shortcut"
     assert not (desktop_root / "啟動輔.lnk").exists()
-    assert tuple(desktop_root.glob("*.lnk")) == (existing_shortcut,)
+    assert set(desktop_root.glob("*.lnk")) == {
+        existing_shortcut,
+        desktop_root / "更新輔.lnk",
+    }
 
 
 def test_install_failure_restores_existing_install_and_shortcut(tmp_path: Path):
@@ -195,17 +218,56 @@ def test_install_failure_restores_existing_install_and_shortcut(tmp_path: Path):
     desktop_root.mkdir()
     shortcut_path = desktop_root / "輔.lnk"
     shortcut_path.write_bytes(b"preserve existing shortcut")
+    update_shortcut_path = desktop_root / "更新輔.lnk"
+    update_shortcut_path.write_bytes(b"preserve existing update shortcut")
 
     result = _run_installer(
         release_root,
         install_root,
         desktop_root,
-        "-TestFailAfterSwap",
+        "-TestFailAfterShortcut",
         "1",
     )
 
     assert result.returncode != 0
-    assert "測試指定在安裝內容交換後中斷" in _output(result)
+    assert "測試指定在建立第一個桌面捷徑後中斷" in _output(result)
     assert sentinel.read_bytes() == b"preserve existing install"
     assert shortcut_path.read_bytes() == b"preserve existing shortcut"
-    assert not tuple((tmp_path / "installed").glob(".輔-SP1-*"))
+    assert (
+        update_shortcut_path.read_bytes()
+        == b"preserve existing update shortcut"
+    )
+    assert not tuple((tmp_path / "installed").glob(".輔-*"))
+    persistent_log = tmp_path / "installed" / "輔-安裝紀錄.txt"
+    assert "安裝失敗" in persistent_log.read_text(
+        encoding="utf-8-sig",
+        errors="replace",
+    )
+
+
+def test_complete_cumulative_release_installs_without_sp1_identity_rejection(
+    tmp_path: Path,
+):
+    release_root = _create_release(
+        tmp_path,
+        milestone="SP3",
+        build_kind="main_release",
+        event_name="push",
+        source_ref="refs/heads/main",
+        source_branch="main",
+        publish_target="release/latest",
+    )
+    install_root = tmp_path / "installed" / "完整累積版"
+    desktop_root = tmp_path / "desktop"
+    desktop_root.mkdir()
+
+    result = _run_installer(release_root, install_root, desktop_root)
+
+    assert result.returncode == 0, _output(result)
+    assert (install_root / "FLASH.exe").read_bytes() == (
+        release_root / "FLASH.exe"
+    ).read_bytes()
+    assert set(desktop_root.glob("*.lnk")) == {
+        desktop_root / "輔.lnk",
+        desktop_root / "更新輔.lnk",
+    }

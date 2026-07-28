@@ -22,13 +22,15 @@ def _create_bundle(
     *,
     build_kind: str = "sp1_snapshot",
     source_branch: str = "sp1/completion-2026-07-25",
-    milestone: str = "SP1",
+    milestone: str | None = None,
     version: str = "0.1.3",
     publish_target: str = "none",
     event_name: str | None = None,
     source_ref: str | None = None,
     include_live_updater: bool | None = None,
 ) -> Path:
+    if milestone is None:
+        milestone = "SP3" if build_kind == "main_release" else "SP1"
     release_dir = tmp_path / "輔"
     system_dir = release_dir / "輔系統"
     system_dir.mkdir(parents=True)
@@ -325,6 +327,23 @@ def test_no_launch_accepts_a_main_release(tmp_path: Path):
     result = _run_verifier(verifier_path)
 
     assert result.returncode == 0, _output(result)
+
+
+def test_main_release_rejects_an_sp1_only_milestone(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="main_release",
+        milestone="SP1",
+        source_branch="main",
+        publish_target="release/latest",
+    )
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode != 0
+    assert "complete cumulative release must use milestone=SP3" in _output(
+        result
+    )
 
 
 def test_no_launch_accepts_an_sp1_only_release(tmp_path: Path):

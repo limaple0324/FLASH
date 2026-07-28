@@ -53,3 +53,36 @@ def test_sp3_snapshot_preserves_every_independent_delivery():
     )
     assert "A snapshot must not contain a live updater" in verify_layout
     assert "SP1+SP2+SP3 cumulative snapshot notice is missing." in verify_layout
+
+
+def test_main_release_is_the_complete_cumulative_identity():
+    workflow = _workflow()
+    metadata_step = _step(
+        workflow,
+        "Read delivery metadata",
+        "Build windowed executable",
+    )
+
+    assert "$buildKind = 'main_release'" in metadata_step
+    assert "$metadata.milestone -ne 'SP3'" in metadata_step
+    assert (
+        "$buildKind -in @('main_release', 'sp3_snapshot')"
+        in metadata_step
+    )
+    assert "$artifactPrefix = 'FLASH-SP1+SP2+SP3-Windows'" in metadata_step
+    assert "$publishTarget = 'release/latest'" in metadata_step
+
+
+def test_complete_release_gate_verifies_zip_install_update_and_rollback():
+    workflow = _workflow()
+
+    assert "- name: Create and verify Windows ZIP" in workflow
+    assert "tar.exe -a -c -f $zipPath -C release ." in workflow
+    assert "Expand-Archive -LiteralPath $zipPath" in workflow
+    assert "- name: Verify live install update rollback and desktop entries" in workflow
+    assert "$shortcutNames -notcontains '輔.lnk'" in workflow
+    assert "$shortcutNames -notcontains '更新輔.lnk'" in workflow
+    assert "-TestFailAfterReplacement 1" in workflow
+    assert "回復完成；正式安裝內容已還原" in workflow
+    assert '"$zipPath.sha256.txt"' in workflow
+    assert "dist/*.zip*" in workflow

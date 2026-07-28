@@ -313,7 +313,7 @@ function Read-InstalledUpdateChannel {
 
 function Resolve-TargetUpdateChannel([hashtable]$InstalledChannel) {
     if ($InstalledChannel["release_branch"] -eq "release/sp1") {
-        Write-Step "偵測到 SP1 獨立版；本次將安全升級為完整整合版。"
+        Write-Step "偵測到 SP1 獨立版；本次將安全升級為完整累積版。"
         return @{
             release_branch = "release/latest"
             source_branch = "main"
@@ -412,6 +412,12 @@ function Assert-ReleaseIdentity(
         $buildInfo["milestone"] -ne "SP1"
     ) {
         throw "SP1 獨立版發布必須使用 SP1 里程碑。"
+    }
+    if (
+        $ExpectedChannel["build_kind"] -eq "main_release" -and
+        $buildInfo["milestone"] -ne "SP3"
+    ) {
+        throw "完整累積版發布必須使用 SP3 里程碑。"
     }
     foreach ($key in @("source_branch", "build_kind", "publish_target")) {
         Require-MetadataValue $buildInfo $key $ExpectedChannel[$key] "BUILD_INFO.txt"
@@ -516,7 +522,7 @@ function Resolve-ReleaseCommit {
     Write-Step "解析 $ReleaseBranch 的固定發布版本。"
     $headers = @{
         "Accept" = "application/vnd.github+json"
-        "User-Agent" = "FLASH-SP1-Windows-Updater"
+        "User-Agent" = "FLASH-Windows-Updater"
     }
     $apiUrl = "https://api.github.com/repos/$Repo/commits/$ReleaseBranch"
     $response = Invoke-WithNetworkRetry "解析固定發布版本" {
@@ -765,7 +771,7 @@ try {
     Write-Step "發布 commit：$releaseCommit"
     Write-Step "已保留原本桌面捷徑的名稱與圖示。"
     Write-Host ""
-    Write-Host "更新完成，可以直接使用原本桌面的輔啟動捷徑。" -ForegroundColor Green
+    Write-Host "更新完成，可以直接使用桌面的「輔」或「更新輔」。" -ForegroundColor Green
 }
 catch {
     $failureMessage = $_.Exception.Message

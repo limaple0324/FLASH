@@ -29,7 +29,7 @@ def test_updater_preserves_the_existing_desktop_shortcut():
     assert "IconLocation" not in updater
     assert 'Join-Path $Desktop "輔.lnk"' not in updater
     assert "已保留原本桌面捷徑的名稱與圖示" in updater
-    assert "可以直接使用原本桌面的輔啟動捷徑" in updater
+    assert "可以直接使用桌面的「輔」或「更新輔」" in updater
     assert "輔 V0.2" not in updater
 
 
@@ -44,19 +44,21 @@ def test_updater_runs_a_temporary_core_with_one_fixed_cmd_bootstrap():
     assert updater.count("更新成功；全部檔案已套用並通過再次驗證") == 1
 
 
-def test_installer_uses_a_safe_source_path_and_one_confirmed_shortcut():
+def test_installer_uses_safe_paths_and_two_confirmed_shortcuts():
     launcher = Path("tools/安裝輔.cmd").read_text(encoding="utf-8")
     installer = Path("tools/輔系統/安裝輔.ps1").read_text(encoding="utf-8")
 
     assert '-SourceDirectory "%~dp0."' in launcher
-    assert 'Join-Path $env:LOCALAPPDATA "Programs\\輔\\SP1"' in installer
-    assert 'Join-Path $DesktopDirectory "輔.lnk"' in installer
-    assert 'Join-Path $DesktopDirectory "啟動輔.lnk"' in installer
-    assert 'Join-Path $DesktopDirectory "輔"' in installer
+    assert 'Join-Path $env:LOCALAPPDATA "Programs\\輔\\$installFlavor"' in installer
+    assert 'Join-Path $DesktopDir "輔.lnk"' in installer
+    assert 'Join-Path $DesktopDir "更新輔.lnk"' in installer
+    assert "啟動輔.lnk" not in installer
     assert '$shortcut.TargetPath = $ExecutablePath' in installer
     assert 'Join-Path $WorkingDirectory "sync_plus_icon.ico"' in installer
     assert '$shortcut.IconLocation = "$iconPath,0"' in installer
-    assert '$shortcut.Description = "輔"' in installer
+    assert '$shortcut.Description = $Description' in installer
+    assert '-Description "輔"' in installer
+    assert '-Description "更新輔"' in installer
     assert '$shortcut.Description = "輔 SP1"' not in installer
 
 
