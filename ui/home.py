@@ -6590,6 +6590,7 @@ class HomeView:
             self._set_card_preview_status()
         except Exception as error:
             self._report_refresh_error(error)
+            self._set_card_preview_status()
 
     def _clear_card_preview_choice(self) -> None:
         if self.on_card_preview_clear is None:
@@ -6599,6 +6600,7 @@ class HomeView:
             self._set_card_preview_status()
         except Exception as error:
             self._report_refresh_error(error)
+            self._set_card_preview_status()
 
     def _render_habit_preferences(
         self,

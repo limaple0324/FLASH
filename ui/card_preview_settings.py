@@ -57,6 +57,11 @@ class CardPreviewCatalog:
         identifiers = tuple(profile.profile_id for profile in profiles)
         if len(set(identifiers)) != len(identifiers):
             raise ValueError("profile_id must be unique within a preview catalog.")
+        display_names = tuple(profile.display_name for profile in profiles)
+        if len(set(display_names)) != len(display_names):
+            raise ValueError(
+                "display_name must be unique within a preview catalog."
+            )
         object.__setattr__(self, "profiles", profiles)
 
     def select(self, profile_id: str) -> CardPreviewProfile:

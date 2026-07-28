@@ -78,3 +78,40 @@ def test_clearing_a_card_style_persists_the_disabled_state() -> None:
 
     assert selected["value"] is None
     assert view._card_preview_status_label.text == "提醒浮層目前已停用。"
+
+
+def test_failed_card_style_change_restores_the_visible_original_choice() -> None:
+    view, selected = _view()
+    view._card_preview_variable.set("寬鬆方案")
+    errors = []
+
+    def fail_selection(_profile_id: str) -> CardPreviewSelectionState:
+        raise RuntimeError("套用失敗")
+
+    view.on_card_preview_select = fail_selection
+    view._report_refresh_error = errors.append
+
+    view._apply_card_preview_choice()
+
+    assert selected["value"] == "compact"
+    assert view._card_preview_variable.get() == "精簡方案"
+    assert view._card_preview_status_label.text == "目前樣式：精簡方案"
+    assert len(errors) == 1
+
+
+def test_failed_card_style_clear_restores_the_visible_original_choice() -> None:
+    view, selected = _view()
+    errors = []
+
+    def fail_clear() -> CardPreviewSelectionState:
+        raise RuntimeError("停用失敗")
+
+    view.on_card_preview_clear = fail_clear
+    view._report_refresh_error = errors.append
+
+    view._clear_card_preview_choice()
+
+    assert selected["value"] == "compact"
+    assert view._card_preview_variable.get() == "精簡方案"
+    assert view._card_preview_status_label.text == "目前樣式：精簡方案"
+    assert len(errors) == 1

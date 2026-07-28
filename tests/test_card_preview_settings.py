@@ -107,6 +107,16 @@ def test_catalog_rejects_duplicate_identifiers() -> None:
         CardPreviewCatalog((_profile(), _profile(display_name="另一個名稱")))
 
 
+def test_catalog_rejects_duplicate_player_facing_names() -> None:
+    with pytest.raises(ValueError, match="display_name"):
+        CardPreviewCatalog(
+            (
+                _profile(),
+                _profile("roomy", display_name="精簡預覽"),
+            )
+        )
+
+
 def test_catalog_is_immutable_snapshot() -> None:
     source = [_profile()]
     catalog = CardPreviewCatalog(source)
