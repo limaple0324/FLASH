@@ -66,9 +66,14 @@ def _inspect_shortcut(shortcut_path: Path, inspected_path: Path) -> tuple[str, .
             "-NoProfile",
             "-Command",
             (
-                "$shell=New-Object -ComObject WScript.Shell; "
-                "$shortcut=$shell.CreateShortcut($env:FLASH_TEST_SHORTCUT); "
-                "$values=@($shortcut.TargetPath,$shortcut.WorkingDirectory,"
+                "$shortcutPath=$env:FLASH_TEST_SHORTCUT; "
+                "$shellApp=New-Object -ComObject Shell.Application; "
+                "$folder=$shellApp.NameSpace((Split-Path -Parent $shortcutPath)); "
+                "$item=$folder.ParseName((Split-Path -Leaf $shortcutPath)); "
+                "$unicodeLink=$item.GetLink; "
+                "$wscript=New-Object -ComObject WScript.Shell; "
+                "$shortcut=$wscript.CreateShortcut($shortcutPath); "
+                "$values=@($unicodeLink.Path,$shortcut.WorkingDirectory,"
                 "$shortcut.IconLocation); "
                 "foreach($value in $values){ "
                 "[Convert]::ToBase64String("
