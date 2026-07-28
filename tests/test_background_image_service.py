@@ -8,6 +8,7 @@ from PIL import Image
 
 from config.config_manager import ConfigManager
 from services.background_image_service import (
+    BACKGROUND_CARD_CONFIG_KEY,
     BACKGROUND_FILL_CONFIG_KEY,
     BACKGROUND_GLOBAL_CONFIG_KEY,
     BACKGROUND_IMAGE_CONFIG_KEY,
@@ -409,14 +410,21 @@ def test_export_and_import_restores_images_scope_and_display_settings(
     source_service, _source_config = _service(tmp_path / "source")
     global_source = tmp_path / "global.png"
     page_source = tmp_path / "page.png"
+    card_source = tmp_path / "card.png"
     Image.new("RGB", (22, 14), "#123456").save(global_source)
     Image.new("RGB", (18, 30), "#ABCDEF").save(page_source)
+    Image.new("RGB", (9, 7), "#654321").save(card_source)
     source_service.select(global_source)
     page_preview = source_service.prepare(page_source)
     source_service.commit_prepared(
         page_preview.managed_path,
         apply_all=False,
         pages=("characters", "records"),
+    )
+    card_preview = source_service.prepare(card_source)
+    source_service.commit_prepared_to_card(
+        card_preview.managed_path,
+        "sync.reconnect",
     )
     source_service.update_display_settings(
         fill_color="#102030",
@@ -434,6 +442,7 @@ def test_export_and_import_restores_images_scope_and_display_settings(
     assert settings.global_path is not None
     assert settings.for_page("characters") is not None
     assert settings.for_page("records") == settings.for_page("characters")
+    assert settings.for_card("sync.reconnect") is not None
     assert settings.fill_color == "#102030"
     assert settings.sidebar_opacity == 12
     assert settings.panel_opacity == 34
@@ -442,6 +451,44 @@ def test_export_and_import_restores_images_scope_and_display_settings(
         assert restored_global.size == (22, 14)
     with Image.open(settings.for_page("characters")) as restored_page:
         assert restored_page.size == (18, 30)
+    with Image.open(settings.for_card("sync.reconnect")) as restored_card:
+        assert restored_card.size == (9, 7)
+
+
+def test_card_background_replacement_and_clear_are_scoped(tmp_path) -> None:
+    service, config = _service(tmp_path)
+    first_source = tmp_path / "first.png"
+    second_source = tmp_path / "second.png"
+    Image.new("RGB", (6, 5), "#112233").save(first_source)
+    Image.new("RGB", (8, 7), "#445566").save(second_source)
+    first = service.prepare(first_source)
+    second = service.prepare(second_source)
+
+    first_result = service.commit_prepared_to_card(
+        first.managed_path,
+        "home.workspace",
+    )
+    second_result = service.commit_prepared_to_card(
+        second.managed_path,
+        "home.target",
+    )
+
+    assert first_result.succeeded is True
+    assert second_result.succeeded is True
+    assert service.current_card_background("home.workspace") == first.managed_path
+    assert service.current_card_background("home.target") == second.managed_path
+    assert config.get(BACKGROUND_CARD_CONFIG_KEY) == {
+        "home.workspace": str(first.managed_path),
+        "home.target": str(second.managed_path),
+    }
+
+    result = service.clear_card("home.workspace")
+
+    assert result.succeeded is True
+    assert service.current_card_background("home.workspace") is None
+    assert service.current_card_background("home.target") == second.managed_path
+    assert first.managed_path is not None
+    assert not first.managed_path.exists()
 
 
 def test_invalid_import_keeps_existing_background(tmp_path) -> None:

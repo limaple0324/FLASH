@@ -188,6 +188,30 @@ def test_background_controls_and_cached_canvas_rendering_are_wired() -> None:
     ):source.index("def dispose")]
 
 
+def test_feature_cards_share_persistent_collapse_drag_and_customization() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+
+    assert "feature_card_preference_provider" in source
+    assert "feature_card_order_provider" in source
+    assert "on_feature_card_collapsed_change" in source
+    assert "on_feature_card_order_change" in source
+    assert "_start_feature_card_drag" in source
+    assert "_finish_feature_card_drag" in source
+    assert "儲存卡片設定" in source
+    assert "選擇卡片背景" in source
+    assert "移除卡片背景" in source
+    assert "卡片背景已預覽" in source
+    for card_id in (
+        "home.workspace",
+        "groups.roles",
+        "sync.input",
+        "characters.list",
+        "records.search",
+        "settings.background",
+    ):
+        assert f'card_id="{card_id}"' in source
+
+
 def test_player_habit_settings_use_confirmed_thresholds_and_clear_confirmation() -> None:
     source = Path("ui/home.py").read_text(encoding="utf-8")
 

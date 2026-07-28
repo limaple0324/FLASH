@@ -23,6 +23,7 @@ from config.config_manager import ConfigManager
 BACKGROUND_IMAGE_CONFIG_KEY = "background_image_path"
 BACKGROUND_GLOBAL_CONFIG_KEY = "background_global_path"
 BACKGROUND_PAGE_CONFIG_KEY = "background_page_paths"
+BACKGROUND_CARD_CONFIG_KEY = "background_card_paths"
 BACKGROUND_FILL_CONFIG_KEY = "background_fill_color"
 BACKGROUND_OPACITY_CONFIG_KEY = "background_region_opacity"
 BACKGROUND_METADATA_CONFIG_KEY = "background_metadata"
@@ -84,6 +85,7 @@ class BackgroundImageResult:
 class BackgroundSettings:
     global_path: Path | None
     page_paths: tuple[tuple[str, Path], ...]
+    card_paths: tuple[tuple[str, Path], ...]
     fill_color: str
     sidebar_opacity: int
     panel_opacity: int
@@ -91,6 +93,9 @@ class BackgroundSettings:
 
     def for_page(self, page: str) -> Path | None:
         return dict(self.page_paths).get(page, self.global_path)
+
+    def for_card(self, card_id: str) -> Path | None:
+        return dict(self.card_paths).get(card_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +149,14 @@ class BackgroundImageService:
             or self._config.get(BACKGROUND_IMAGE_CONFIG_KEY)
         )
 
+    def current_card_background(self, card_id: str) -> Path | None:
+        if not isinstance(card_id, str) or not card_id.strip():
+            return None
+        raw_cards = self._config.get(BACKGROUND_CARD_CONFIG_KEY, {})
+        if not isinstance(raw_cards, Mapping):
+            return None
+        return self._managed_path(raw_cards.get(card_id.strip()))
+
     def settings(self) -> BackgroundSettings:
         raw_pages = self._config.get(BACKGROUND_PAGE_CONFIG_KEY, {})
         page_paths: list[tuple[str, Path]] = []
@@ -152,6 +165,17 @@ class BackgroundImageService:
                 path = self._managed_path(raw_path)
                 if isinstance(page, str) and page.strip() and path is not None:
                     page_paths.append((page.strip(), path))
+        raw_cards = self._config.get(BACKGROUND_CARD_CONFIG_KEY, {})
+        card_paths: list[tuple[str, Path]] = []
+        if isinstance(raw_cards, Mapping):
+            for card_id, raw_path in raw_cards.items():
+                path = self._managed_path(raw_path)
+                if (
+                    isinstance(card_id, str)
+                    and card_id.strip()
+                    and path is not None
+                ):
+                    card_paths.append((card_id.strip(), path))
         fill_color = self._normalize_color(
             self._config.get(
                 BACKGROUND_FILL_CONFIG_KEY,
@@ -172,6 +196,7 @@ class BackgroundImageService:
         return BackgroundSettings(
             global_path=self.current_background(),
             page_paths=tuple(page_paths),
+            card_paths=tuple(card_paths),
             fill_color=fill_color,
             sidebar_opacity=opacity["sidebar"],
             panel_opacity=opacity["panel"],
@@ -379,6 +404,57 @@ class BackgroundImageService:
             except (ValueError, OSError):
                 pass
 
+    def commit_prepared_to_card(
+        self,
+        managed_path: Path,
+        card_id: str,
+    ) -> BackgroundImageResult:
+        candidate = self._managed_path(str(managed_path))
+        if candidate is None:
+            return self._failure("預覽背景已失效，原本卡片背景已保留。")
+        if not isinstance(card_id, str) or not card_id.strip():
+            return self._failure("卡片識別無效，原本卡片背景已保留。")
+        clean_card_id = card_id.strip()
+        card_map = self._raw_card_map()
+        card_map[clean_card_id] = str(candidate)
+        metadata = self._raw_metadata()
+        candidate_metadata = self._prepared_metadata.get(candidate)
+        values: dict[str, object] = {
+            BACKGROUND_CARD_CONFIG_KEY: card_map,
+        }
+        if candidate_metadata is not None:
+            metadata[str(candidate)] = candidate_metadata
+            values[BACKGROUND_METADATA_CONFIG_KEY] = metadata
+        previous_data = dict(self._config.data)
+        try:
+            self._config.update_values(values)
+        except Exception:
+            self._config.data.clear()
+            self._config.data.update(previous_data)
+            return self._failure("卡片背景無法保存，原本卡片背景已保留。")
+        self._prepared_metadata.pop(candidate, None)
+        self._cleanup_unreferenced()
+        return BackgroundImageResult(
+            succeeded=True,
+            message="卡片背景已儲存並套用。",
+            managed_path=candidate,
+            original_name=(
+                str(candidate_metadata["original_name"])
+                if candidate_metadata is not None
+                else None
+            ),
+            original_size=(
+                tuple(candidate_metadata["original_size"])  # type: ignore[arg-type]
+                if candidate_metadata is not None
+                else None
+            ),
+            updated_at=(
+                str(candidate_metadata["updated_at"])
+                if candidate_metadata is not None
+                else None
+            ),
+        )
+
     def select(self, source: Path) -> BackgroundImageResult:
         """Decode and atomically publish ``source``; retain the old setting on failure."""
         prepared = self.prepare(source)
@@ -438,6 +514,22 @@ class BackgroundImageService:
             managed_path=self.current_background(page),
         )
 
+    def clear_card(self, card_id: str) -> BackgroundImageResult:
+        if not isinstance(card_id, str) or not card_id.strip():
+            return self._failure("卡片識別無效，原本卡片背景已保留。")
+        card_map = self._raw_card_map()
+        card_map.pop(card_id.strip(), None)
+        try:
+            self._config.set(BACKGROUND_CARD_CONFIG_KEY, card_map)
+        except Exception:
+            return self._failure("卡片背景無法清除，原本卡片背景已保留。")
+        self._cleanup_unreferenced()
+        return BackgroundImageResult(
+            succeeded=True,
+            message="卡片背景已移除。",
+            managed_path=None,
+        )
+
     def clear_all(self) -> BackgroundImageResult:
         """Remove global and page assignments while keeping source files untouched."""
         previous_data = dict(self._config.data)
@@ -447,6 +539,7 @@ class BackgroundImageService:
                     BACKGROUND_IMAGE_CONFIG_KEY: "",
                     BACKGROUND_GLOBAL_CONFIG_KEY: "",
                     BACKGROUND_PAGE_CONFIG_KEY: {},
+                    BACKGROUND_CARD_CONFIG_KEY: {},
                 }
             )
         except Exception:
@@ -490,7 +583,7 @@ class BackgroundImageService:
                     "updated_at": metadata.updated_at,
                 }
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "global_image": (
                 path_ids.get(settings.global_path)
                 if settings.global_path is not None
@@ -499,6 +592,10 @@ class BackgroundImageService:
             "page_images": {
                 page: path_ids[path]
                 for page, path in settings.page_paths
+            },
+            "card_images": {
+                card_id: path_ids[path]
+                for card_id, path in settings.card_paths
             },
             "fill_color": settings.fill_color,
             "opacity": {
@@ -551,7 +648,7 @@ class BackgroundImageService:
                 )
                 if (
                     not isinstance(payload, Mapping)
-                    or payload.get("schema_version") != 1
+                    or payload.get("schema_version") not in {1, 2}
                     or not isinstance(payload.get("page_images"), Mapping)
                     or not isinstance(payload.get("opacity"), Mapping)
                     or not isinstance(payload.get("metadata"), Mapping)
@@ -571,7 +668,20 @@ class BackgroundImageService:
                     and isinstance(image_id, str)
                     and image_id
                 }
-                image_ids = set(page_images.values())
+                raw_card_images = payload.get("card_images", {})
+                if not isinstance(raw_card_images, Mapping):
+                    raise ValueError("invalid card images")
+                card_images = {
+                    str(card_id): str(image_id)
+                    for card_id, image_id in raw_card_images.items()
+                    if isinstance(card_id, str)
+                    and card_id.strip()
+                    and isinstance(image_id, str)
+                    and image_id
+                }
+                image_ids = set(page_images.values()) | set(
+                    card_images.values()
+                )
                 if global_image is not None:
                     image_ids.add(global_image)
                 self._managed_dir.mkdir(parents=True, exist_ok=True)
@@ -647,6 +757,10 @@ class BackgroundImageService:
                             page: str(staged_paths[image_id])
                             for page, image_id in page_images.items()
                         },
+                        BACKGROUND_CARD_CONFIG_KEY: {
+                            card_id: str(staged_paths[image_id])
+                            for card_id, image_id in card_images.items()
+                        },
                         BACKGROUND_FILL_CONFIG_KEY: fill_color,
                         BACKGROUND_OPACITY_CONFIG_KEY: opacity_values,
                         BACKGROUND_METADATA_CONFIG_KEY: metadata_payload,
@@ -677,6 +791,16 @@ class BackgroundImageService:
             and isinstance(path, str)
         } if isinstance(raw, Mapping) else {}
 
+    def _raw_card_map(self) -> dict[str, str]:
+        raw = self._config.get(BACKGROUND_CARD_CONFIG_KEY, {})
+        return {
+            str(card_id): str(path)
+            for card_id, path in raw.items()
+            if isinstance(raw, Mapping)
+            and isinstance(card_id, str)
+            and isinstance(path, str)
+        } if isinstance(raw, Mapping) else {}
+
     def _raw_metadata(self) -> dict[str, object]:
         raw = self._config.get(BACKGROUND_METADATA_CONFIG_KEY, {})
         return dict(raw) if isinstance(raw, Mapping) else {}
@@ -690,6 +814,12 @@ class BackgroundImageService:
         raw_pages = self._config.get(BACKGROUND_PAGE_CONFIG_KEY, {})
         if isinstance(raw_pages, Mapping):
             for raw_path in raw_pages.values():
+                path = self._managed_path(raw_path)
+                if path is not None:
+                    paths.add(path)
+        raw_cards = self._config.get(BACKGROUND_CARD_CONFIG_KEY, {})
+        if isinstance(raw_cards, Mapping):
+            for raw_path in raw_cards.values():
                 path = self._managed_path(raw_path)
                 if path is not None:
                     paths.add(path)

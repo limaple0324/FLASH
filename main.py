@@ -94,6 +94,7 @@ from services.feature_hotkey_monitor import (
     GroupLaunchHotkeyMonitor,
     normalize_feature_hotkey,
 )
+from services.feature_card_layout_service import FeatureCardLayoutService
 from services.background_image_service import BackgroundImageService
 from services.card_coordinator import CardCoordinator
 from services.card_display_settings_service import CardDisplaySettingsService
@@ -337,6 +338,7 @@ def build_services(
         config,
         paths.data_dir(),
     )
+    feature_card_layout_service = FeatureCardLayoutService(config)
     config.ensure_defaults(
         {
             INPUT_POLICY_KEY: WindowInputPolicy.ALL.value,
@@ -569,6 +571,10 @@ def build_services(
         data_contract_migration_service,
     )
     AppContext.register(BackgroundImageService, background_image_service)
+    AppContext.register(
+        FeatureCardLayoutService,
+        feature_card_layout_service,
+    )
     AppContext.register(
         CardDisplaySettings,
         card_display_settings_resolution.settings,
@@ -1325,6 +1331,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         GroupCharacterRegistrationService
     )
     background_image_service = AppContext.get(BackgroundImageService)
+    feature_card_layout_service = AppContext.get(
+        FeatureCardLayoutService
+    )
     player_habit_service = AppContext.get(PlayerHabitPreferenceService)
     home_view: HomeView | None = None
     tray_controller: SystemTrayController | None = None
@@ -1831,6 +1840,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             pages=pages,
         )
 
+    def save_card_background(managed_path: Path, card_id: str):
+        if background_image_service is None:
+            raise RuntimeError("background image service is unavailable")
+        return background_image_service.commit_prepared_to_card(
+            managed_path,
+            card_id,
+        )
+
     def discard_background_image(managed_path: Path | None) -> None:
         if background_image_service is not None:
             background_image_service.discard_prepared(managed_path)
@@ -1844,6 +1861,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if background_image_service is None:
             raise RuntimeError("background image service is unavailable")
         return background_image_service.clear_page(page)
+
+    def clear_card_background(card_id: str):
+        if background_image_service is None:
+            raise RuntimeError("background image service is unavailable")
+        return background_image_service.clear_card(card_id)
 
     def clear_all_backgrounds():
         if background_image_service is None:
@@ -3799,6 +3821,43 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_clear_habit_preferences=clear_habit_preferences,
         theme_name=configured_theme,
         on_theme_change=change_ui_theme,
+        feature_card_preference_provider=(
+            feature_card_layout_service.preference
+            if feature_card_layout_service is not None
+            else None
+        ),
+        feature_card_order_provider=(
+            feature_card_layout_service.order_for
+            if feature_card_layout_service is not None
+            else None
+        ),
+        on_feature_card_collapsed_change=(
+            feature_card_layout_service.set_collapsed
+            if feature_card_layout_service is not None
+            else None
+        ),
+        on_feature_card_order_change=(
+            feature_card_layout_service.reorder
+            if feature_card_layout_service is not None
+            else None
+        ),
+        on_feature_card_title_change=(
+            feature_card_layout_service.set_title
+            if feature_card_layout_service is not None
+            else None
+        ),
+        on_feature_card_title_reset=(
+            feature_card_layout_service.reset_title
+            if feature_card_layout_service is not None
+            else None
+        ),
+        card_background_provider=(
+            background_image_service.current_card_background
+            if background_image_service is not None
+            else None
+        ),
+        on_save_card_background=save_card_background,
+        on_clear_card_background=clear_card_background,
         background_image_path=(
             background_image_service.current_background()
             if background_image_service is not None
