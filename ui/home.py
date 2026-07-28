@@ -284,6 +284,28 @@ def _contain_geometry(
     return resized_width, resized_height, offset_x, offset_y
 
 
+def _reordered_entry_ids(
+    entry_ids: tuple[str, ...],
+    source_id: str,
+    target_id: str,
+) -> tuple[str, ...]:
+    if (
+        len(entry_ids) != len(set(entry_ids))
+        or source_id not in entry_ids
+        or target_id not in entry_ids
+        or source_id == target_id
+    ):
+        return entry_ids
+    reordered = list(entry_ids)
+    source_index = reordered.index(source_id)
+    target_index = reordered.index(target_id)
+    reordered.pop(source_index)
+    if source_index < target_index:
+        target_index -= 1
+    reordered.insert(target_index, source_id)
+    return tuple(reordered)
+
+
 @dataclass(frozen=True, slots=True)
 class GroupManagementViewResult:
     success: bool
@@ -466,6 +488,9 @@ class HomeView:
         ) = None,
         group_entries_provider: (
             Callable[[str], tuple[GroupConfigurationEntry, ...]] | None
+        ) = None,
+        on_reorder_group_entries: (
+            Callable[[str, tuple[str, ...]], object] | None
         ) = None,
         group_master_locked_provider: (
             Callable[[str], bool] | None
@@ -722,6 +747,7 @@ class HomeView:
             on_group_launch_hotkey_change
         )
         self.group_entries_provider = group_entries_provider
+        self.on_reorder_group_entries = on_reorder_group_entries
         self.group_master_locked_provider = (
             group_master_locked_provider
         )
@@ -924,6 +950,14 @@ class HomeView:
         self._group_launch_button: Button | None = None
         self._group_restore_button: Button | None = None
         self._group_record_button: Button | None = None
+        self._group_reorder_button: Button | None = None
+        self._group_reorder_finish_button: Button | None = None
+        self._group_reorder_cancel_button: Button | None = None
+        self._group_reorder_mode = False
+        self._group_reorder_original: tuple[str, ...] = ()
+        self._group_reorder_working: list[str] = []
+        self._group_drag_entry_id: str | None = None
+        self._group_launch_running = False
         self._group_launch_status_label: Label | None = None
         self._group_launch_hotkey_variable: StringVar | None = None
         self._window_size_width_entry: Entry | None = None
@@ -2422,6 +2456,30 @@ class HomeView:
             primary=True,
         )
         self._group_add_button.pack(side=RIGHT)
+        self._group_reorder_button = None
+        self._group_reorder_finish_button = None
+        self._group_reorder_cancel_button = None
+        if self._group_reorder_mode:
+            self._group_reorder_finish_button = self._button(
+                entry_header,
+                "完成排序",
+                self._finish_group_entry_reorder,
+                primary=True,
+            )
+            self._group_reorder_finish_button.pack(side=RIGHT, padx=(0, 8))
+            self._group_reorder_cancel_button = self._button(
+                entry_header,
+                "取消",
+                self._cancel_group_entry_reorder,
+            )
+            self._group_reorder_cancel_button.pack(side=RIGHT, padx=(0, 8))
+        else:
+            self._group_reorder_button = self._button(
+                entry_header,
+                "調整順序",
+                self._start_group_entry_reorder,
+            )
+            self._group_reorder_button.pack(side=RIGHT, padx=(0, 8))
         self._group_clear_button = self._button(
             entry_header,
             "清空角色",
@@ -5133,6 +5191,13 @@ class HomeView:
             self.parent.after_idle(self._sync_page_scroll_region)
 
     def _select_group(self, name: str) -> None:
+        if getattr(self, "_group_reorder_mode", False):
+            self._show_group_setting_message(
+                "請先完成或取消目前的角色排序。"
+            )
+            if self._group_variable is not None:
+                self._group_variable.set(self.current_group_name or "")
+            return
         if name not in {choice.name for choice in self.group_choices}:
             return
         previous_name = self.current_group_name
@@ -5397,6 +5462,7 @@ class HomeView:
         running: bool,
         message: str,
     ) -> None:
+        self._group_launch_running = bool(running)
         for button in (
             self._group_launch_button,
             self._group_restore_button,
@@ -5406,8 +5472,7 @@ class HomeView:
                 button.configure(
                     state=DISABLED if running else NORMAL
                 )
-        if not running:
-            self._refresh_group_edit_controls()
+        self._refresh_group_edit_controls()
         if self._group_launch_status_label is not None:
             self._group_launch_status_label.configure(
                 text=message.strip(),
@@ -5446,7 +5511,17 @@ class HomeView:
         self.build()
         self._show_group_setting_message(result.message)
 
+    def _group_reorder_blocks_action(self) -> bool:
+        if not getattr(self, "_group_reorder_mode", False):
+            return False
+        self._show_group_setting_message(
+            "請先完成或取消目前的角色排序。"
+        )
+        return True
+
     def _create_group(self) -> None:
+        if self._group_reorder_blocks_action():
+            return
         if self._group_name_entry is None or self.on_create_group is None:
             return
         name = self._group_name_entry.get().strip()
@@ -5461,6 +5536,8 @@ class HomeView:
             self._report_refresh_error(error)
 
     def _rename_current_group(self) -> None:
+        if self._group_reorder_blocks_action():
+            return
         if (
             self.current_group_name is None
             or self._group_name_entry is None
@@ -5482,6 +5559,8 @@ class HomeView:
             self._report_refresh_error(error)
 
     def _delete_current_group(self) -> None:
+        if self._group_reorder_blocks_action():
+            return
         if (
             self.current_group_name is None
             or self.on_delete_group is None
@@ -5503,6 +5582,8 @@ class HomeView:
             self._report_refresh_error(error)
 
     def _move_current_group(self, direction: int) -> None:
+        if self._group_reorder_blocks_action():
+            return
         if (
             self.current_group_name is None
             or self.on_move_group is None
@@ -5519,6 +5600,8 @@ class HomeView:
             self._report_refresh_error(error)
 
     def _export_group_configuration(self) -> None:
+        if self._group_reorder_blocks_action():
+            return
         if self.on_export_group_configuration is None:
             return
         try:
@@ -5537,6 +5620,8 @@ class HomeView:
         self._show_group_setting_message(result)
 
     def _import_group_configuration(self) -> None:
+        if self._group_reorder_blocks_action():
+            return
         if self.on_import_group_configuration is None:
             return
         try:
@@ -5555,6 +5640,8 @@ class HomeView:
         self._show_group_setting_message(result)
 
     def _change_group_launch_hotkey(self, value: str) -> None:
+        if self._group_reorder_blocks_action():
+            return
         if (
             self.current_group_name is None
             or self.on_group_launch_hotkey_change is None
@@ -5602,6 +5689,8 @@ class HomeView:
         )
 
     def _add_shortcuts_to_current_group(self) -> None:
+        if self._group_reorder_blocks_action():
+            return
         if (
             self.current_group_name is None
             or self.on_add_group_shortcuts is None
@@ -5624,6 +5713,142 @@ class HomeView:
             if label.winfo_manager():
                 label.pack_forget()
 
+    def _start_group_entry_reorder(self) -> None:
+        if (
+            self.current_group_name is None
+            or self.group_entries_provider is None
+            or self.on_reorder_group_entries is None
+        ):
+            return
+        if self._current_group_master_locked():
+            self._show_group_setting_message(
+                "主窗上鎖中，請先解鎖後再調整順序。"
+            )
+            return
+        entries = self.group_entries_provider(self.current_group_name)
+        if len(entries) < 2:
+            self._show_group_setting_message(
+                "目前至少需要兩個角色才能調整順序。"
+            )
+            return
+        self._group_reorder_original = tuple(
+            entry.entry_id for entry in entries
+        )
+        self._group_reorder_working = list(
+            self._group_reorder_original
+        )
+        self._group_reorder_mode = True
+        self._group_drag_entry_id = None
+        self.build()
+        self._show_group_setting_message(
+            "請拖曳角色調整順序；完成前不會保存。"
+        )
+
+    def _cancel_group_entry_reorder(self) -> None:
+        self._group_reorder_mode = False
+        self._group_reorder_original = ()
+        self._group_reorder_working = []
+        self._group_drag_entry_id = None
+        self.build()
+        self._show_group_setting_message("已取消，原順序保持不變。")
+
+    def _finish_group_entry_reorder(self) -> None:
+        if (
+            not self._group_reorder_mode
+            or self.current_group_name is None
+            or self.on_reorder_group_entries is None
+        ):
+            return
+        proposed = tuple(self._group_reorder_working)
+        if proposed == self._group_reorder_original:
+            self._cancel_group_entry_reorder()
+            return
+        try:
+            result = self.on_reorder_group_entries(
+                self.current_group_name,
+                proposed,
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        if result is False or (
+            isinstance(result, str) and result.strip()
+        ):
+            self._show_group_setting_message(
+                result if isinstance(result, str) else "角色順序沒有保存。"
+            )
+            return
+        self._group_reorder_mode = False
+        self._group_reorder_original = ()
+        self._group_reorder_working = []
+        self._group_drag_entry_id = None
+        self.build()
+        self._show_group_setting_message("角色啟動順序已保存。")
+
+    def _start_group_entry_drag(self, entry_id: str) -> None:
+        if self._group_reorder_mode:
+            self._group_drag_entry_id = entry_id
+
+    def _bind_group_entry_drag_tree(
+        self,
+        widget,
+        entry_id: str,
+    ) -> None:
+        widget._group_entry_id = entry_id
+        try:
+            widget.configure(cursor="fleur")
+        except Exception:
+            pass
+        widget.bind(
+            "<ButtonPress-1>",
+            lambda _event, value=entry_id: self._start_group_entry_drag(
+                value
+            ),
+        )
+        widget.bind(
+            "<ButtonRelease-1>",
+            self._finish_group_entry_drag,
+        )
+        for child in widget.winfo_children():
+            self._bind_group_entry_drag_tree(child, entry_id)
+
+    def _finish_group_entry_drag(self, event) -> None:
+        source_id = self._group_drag_entry_id
+        self._group_drag_entry_id = None
+        if not self._group_reorder_mode or source_id is None:
+            return
+        try:
+            widget = self.parent.winfo_containing(
+                event.x_root,
+                event.y_root,
+            )
+        except Exception:
+            return
+        target_id = None
+        while widget is not None:
+            target_id = getattr(widget, "_group_entry_id", None)
+            if target_id is not None:
+                break
+            widget = getattr(widget, "master", None)
+        if (
+            target_id is None
+            or target_id == source_id
+            or source_id not in self._group_reorder_working
+            or target_id not in self._group_reorder_working
+        ):
+            return
+        self._group_reorder_working = list(
+            _reordered_entry_ids(
+                tuple(self._group_reorder_working),
+                source_id,
+                target_id,
+            )
+        )
+        self.refresh_group_entries()
+        self._show_group_setting_message(
+            "順序已調整，按「完成排序」才會保存。"
+        )
+
     def _current_group_master_locked(self) -> bool:
         if (
             self.current_group_name is None
@@ -5642,7 +5867,13 @@ class HomeView:
     def _refresh_group_edit_controls(self) -> bool:
         locked = self._current_group_master_locked()
         has_group = self.current_group_name is not None
-        state = NORMAL if has_group and not locked else DISABLED
+        editable = (
+            has_group
+            and not locked
+            and not self._group_reorder_mode
+            and not self._group_launch_running
+        )
+        state = NORMAL if editable else DISABLED
         for button in (
             self._group_add_button,
             self._group_clear_button,
@@ -5650,6 +5881,42 @@ class HomeView:
         ):
             if button is not None:
                 button.configure(state=state)
+        if self._group_reorder_button is not None:
+            self._group_reorder_button.configure(
+                state=(
+                    NORMAL
+                    if (
+                        has_group
+                        and not locked
+                        and not self._group_launch_running
+                        and self.on_reorder_group_entries is not None
+                    )
+                    else DISABLED
+                )
+            )
+        for button in (
+            self._group_reorder_finish_button,
+            self._group_reorder_cancel_button,
+        ):
+            if button is not None:
+                button.configure(
+                    state=(
+                        NORMAL
+                        if (
+                            self._group_reorder_mode
+                            and not self._group_launch_running
+                        )
+                        else DISABLED
+                    )
+                )
+        if self._group_reorder_mode:
+            for button in (
+                self._group_launch_button,
+                self._group_restore_button,
+                self._group_record_button,
+            ):
+                if button is not None:
+                    button.configure(state=DISABLED)
         if self._group_master_lock_button is not None:
             self._group_master_lock_button.configure(
                 text=(
@@ -5662,6 +5929,8 @@ class HomeView:
                     if (
                         has_group
                         and self.on_group_master_locked_change is not None
+                        and not self._group_reorder_mode
+                        and not self._group_launch_running
                     )
                     else DISABLED
                 ),
@@ -5727,6 +5996,15 @@ class HomeView:
                 raise TypeError(
                     "group entries provider returned invalid values."
                 )
+        if self._group_reorder_mode:
+            entry_by_id = {
+                entry.entry_id: entry for entry in entries
+            }
+            if set(self._group_reorder_working) == set(entry_by_id):
+                entries = tuple(
+                    entry_by_id[entry_id]
+                    for entry_id in self._group_reorder_working
+                )
         locked = self._refresh_group_edit_controls()
         if not entries:
             Label(
@@ -5738,14 +6016,16 @@ class HomeView:
                 anchor="w",
             ).pack(fill=X, pady=4)
             return ()
-        for entry in entries:
+        for display_order, entry in enumerate(entries, start=1):
             row = Frame(frame, bg=BACKGROUND, padx=10, pady=7)
+            row._group_entry_id = entry.entry_id
             row.pack(fill=X, pady=3)
             top_row = Frame(row, bg=BACKGROUND)
+            top_row._group_entry_id = entry.entry_id
             top_row.pack(fill=X)
             Label(
                 top_row,
-                text=f"{entry.order}. {entry.display_name}",
+                text=f"{display_order}. {entry.display_name}",
                 font=("Microsoft JhengHei UI", 10, "bold"),
                 bg=BACKGROUND,
                 fg=TEXT,
@@ -5766,7 +6046,7 @@ class HomeView:
                 ),
             )
             remove_button.pack(side=RIGHT)
-            if locked:
+            if locked or self._group_reorder_mode:
                 remove_button.configure(state=DISABLED)
             if entry.role != "主窗口":
                 main_button = self._button(
@@ -5777,8 +6057,22 @@ class HomeView:
                     ),
                 )
                 main_button.pack(side=RIGHT, padx=(0, 6))
-                if locked:
+                if locked or self._group_reorder_mode:
                     main_button.configure(state=DISABLED)
+            if self._group_reorder_mode:
+                Label(
+                    row,
+                    text="拖曳此列到新的位置",
+                    font=("Microsoft JhengHei UI", 9),
+                    bg=BACKGROUND,
+                    fg=MUTED,
+                    anchor="w",
+                ).pack(fill=X, pady=(6, 0))
+                self._bind_group_entry_drag_tree(
+                    row,
+                    entry.entry_id,
+                )
+                continue
             settings_row = Frame(row, bg=BACKGROUND)
             settings_row.pack(fill=X, pady=(7, 0))
             enabled_variable = IntVar(

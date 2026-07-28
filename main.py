@@ -1474,8 +1474,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             else None
         )
         main_shortcut = (
-            group.entries[0].shortcut_path
-            if group is not None and group.entries
+            group.main_entry.shortcut_path
+            if group is not None and group.main_entry is not None
             else None
         )
         return record_window_size_result(
@@ -2222,6 +2222,37 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group = group_configuration_service.group(group_name)
         return group.entries if group is not None else ()
 
+    def reorder_group_entries(
+        group_name: str,
+        entry_ids: tuple[str, ...],
+    ) -> object:
+        if group_configuration_service is None:
+            return "組別設定尚未準備完成。"
+        if (
+            group_window_launch_service is not None
+            and group_window_launch_service.running
+        ):
+            return "整組啟動正在進行中，未變更角色順序。"
+        if not stop_group_automation_for_configuration_change():
+            return "自動操作尚未完全停止，未變更角色順序。"
+        try:
+            changed = group_configuration_service.reorder_group_entries(
+                group_name,
+                entry_ids,
+            )
+        except GroupMasterLockedError:
+            return GroupMasterLockedError.player_message
+        if not changed:
+            return "角色順序沒有變更。"
+        result = finish_group_management(group_name)
+        if result.success and operation_record_store is not None:
+            operation_record_store.append(
+                "組別設定",
+                group_name,
+                "角色啟動順序已更新",
+            )
+        return True if result.success else result.message
+
     def group_master_locked(group_name: str) -> bool:
         if group_configuration_service is None:
             return True
@@ -2428,11 +2459,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         ):
             return "主基準點功能尚未準備完成。"
         group = group_configuration_service.group(group_name)
-        if group is None or not group.entries:
+        if group is None or group.main_entry is None:
             return "目前組別沒有可用的主窗口。"
         window_info = unique_window_for_group_entry(
             group_name,
-            group.entries[0].entry_id,
+            group.main_entry.entry_id,
         )
         if window_info is None:
             return "無法唯一確認主窗口，未保存基準點。"
@@ -2591,13 +2622,13 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if group_configuration_service is None:
             return False
         group = group_configuration_service.group(group_name)
-        if group is None or not group.entries:
+        if group is None or group.main_entry is None:
             return False
         if not stop_group_automation_for_configuration_change():
             return "自動操作尚未完全停止，未加入同步關係。"
         try:
             changed = group_configuration_service.add_sync_relation(
-                group.entries[0].entry_id,
+                group.main_entry.entry_id,
                 member_entry_id,
             )
         except SyncCycleError:
@@ -2611,12 +2642,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if group_configuration_service is None:
             return False
         group = group_configuration_service.group(group_name)
-        if group is None or not group.entries:
+        if group is None or group.main_entry is None:
             return False
         if not stop_group_automation_for_configuration_change():
             return False
         return group_configuration_service.remove_sync_relation(
-            group.entries[0].entry_id,
+            group.main_entry.entry_id,
             member_entry_id,
         )
 
@@ -3237,6 +3268,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group_launch_hotkey_provider=group_launch_hotkey,
         on_group_launch_hotkey_change=change_group_launch_hotkey,
         group_entries_provider=group_entries,
+        on_reorder_group_entries=reorder_group_entries,
         group_master_locked_provider=group_master_locked,
         on_group_master_locked_change=change_group_master_locked,
         on_add_group_shortcuts=add_group_shortcuts,

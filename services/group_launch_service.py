@@ -363,29 +363,51 @@ class GroupLaunchService:
             self._cache[cleaned_group] = plan
             return plan
 
-        by_name = {name.casefold(): path for name, path in entries}
         confirmed_order = CONFIRMED_GROUP_ORDERS.get(cleaned_group)
         aliases = CONFIRMED_ENTRY_ALIASES.get(cleaned_group, {})
         if confirmed_order is None:
             ordered_names = tuple(name for name, _path in entries)
+            ordered_paths = tuple(path for _name, path in entries)
         else:
-            ordered_names = confirmed_order
             expected_actual = {
                 aliases.get(display_name, display_name).casefold()
                 for display_name in confirmed_order
             }
-            if expected_actual != set(by_name):
+            actual_names = {
+                name.casefold() for name, _path in entries
+            }
+            if expected_actual != actual_names:
                 plan = GroupLaunchPlan(
                     cleaned_group,
                     failure_codes=("group_fixed_order_mismatch",),
                 )
                 self._cache[cleaned_group] = plan
                 return plan
-
-        ordered_paths = tuple(
-            by_name[aliases.get(display_name, display_name).casefold()]
-            for display_name in ordered_names
-        )
+            display_by_actual = {
+                aliases.get(display_name, display_name).casefold():
+                display_name
+                for display_name in confirmed_order
+            }
+            if matching_groups[0].get("entry_order_customized") is True:
+                ordered_names = tuple(
+                    display_by_actual.get(name.casefold(), name)
+                    for name, _path in entries
+                )
+                ordered_paths = tuple(path for _name, path in entries)
+            else:
+                by_name = {
+                    name.casefold(): path for name, path in entries
+                }
+                ordered_names = confirmed_order
+                ordered_paths = tuple(
+                    by_name[
+                        aliases.get(
+                            display_name,
+                            display_name,
+                        ).casefold()
+                    ]
+                    for display_name in ordered_names
+                )
         placements = self._saved_placements(cleaned_group, payload)
         resolved = self._fingerprint_resolver.resolve(ordered_paths)
         fingerprints = tuple(

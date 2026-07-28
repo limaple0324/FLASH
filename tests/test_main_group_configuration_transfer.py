@@ -22,6 +22,11 @@ def test_group_configuration_transfer_is_wired_to_current_group_page() -> None:
         "on_import_group_configuration=import_group_configuration"
         in source
     )
+    assert "def reorder_group_entries(" in source
+    assert (
+        "on_reorder_group_entries=reorder_group_entries"
+        in source
+    )
     assert "def change_group_launch_hotkey(" in source
     assert "GroupLaunchHotkeyMonitor(" in source
     assert (

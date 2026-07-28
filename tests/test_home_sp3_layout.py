@@ -11,6 +11,7 @@ from ui.home import (
     _blend_hex_color,
     _contrast_ratio,
     _contain_geometry,
+    _reordered_entry_ids,
     _safe_character_lines,
     _workspace_state_text,
     theme_palette,
@@ -105,6 +106,9 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "整組啟動快捷鍵" in source
     assert "group_launch_hotkey_provider" in source
     assert "on_group_launch_hotkey_change" in source
+    assert "調整順序" in source
+    assert "完成排序" in source
+    assert "on_reorder_group_entries" in source
     assert "主窗：已上鎖" in source
     assert "主窗：未上鎖" in source
     assert "group_master_locked_provider" in source
@@ -116,6 +120,24 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "取目標點（3秒）" in source
     assert "校正角色ID" in source
     assert "讀取角色ID" in source
+
+
+def test_group_drag_order_is_preview_only_until_saved() -> None:
+    original = ("甲", "乙", "丙", "丁")
+
+    assert _reordered_entry_ids(original, "丁", "乙") == (
+        "甲",
+        "丁",
+        "乙",
+        "丙",
+    )
+    assert _reordered_entry_ids(original, "甲", "丁") == (
+        "乙",
+        "丙",
+        "甲",
+        "丁",
+    )
+    assert _reordered_entry_ids(original, "甲", "未知") == original
 
 
 def test_background_controls_and_cached_canvas_rendering_are_wired() -> None:

@@ -17,7 +17,11 @@ from domain.sync_target_settings import (
     clamp_sync_offset_px,
 )
 from services.feature_hotkey_monitor import normalize_feature_hotkey
-from services.group_launch_service import SavedWindowPlacement
+from services.group_launch_service import (
+    CONFIRMED_ENTRY_ALIASES,
+    CONFIRMED_GROUP_ORDERS,
+    SavedWindowPlacement,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +44,14 @@ class GroupConfiguration:
     launch_hotkey: str = ""
     master_locked: bool = True
     sync_base_point: tuple[int, int] | None = None
+    entry_order_customized: bool = False
+
+    @property
+    def main_entry(self) -> GroupConfigurationEntry | None:
+        matches = tuple(
+            entry for entry in self.entries if entry.role == "主窗口"
+        )
+        return matches[0] if len(matches) == 1 else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +86,7 @@ class GroupConfigurationService:
             "launch_hotkey",
             "launch_hotkey_display",
             "master_locked",
+            "entry_order_customized",
             "sync_base_x",
             "sync_base_y",
         }
@@ -333,9 +346,22 @@ class GroupConfigurationService:
                 seen_entries.add(str(entry["entry_id"]))
                 entries.append(entry)
             if entries:
-                entries[0]["role"] = "主窗口"
-                for entry in entries[1:]:
-                    entry["role"] = "同步窗口"
+                main_indices = tuple(
+                    index
+                    for index, entry in enumerate(entries)
+                    if entry.get("role") == "主窗口"
+                )
+                main_index = (
+                    main_indices[0]
+                    if len(main_indices) == 1
+                    else 0
+                )
+                for index, entry in enumerate(entries):
+                    entry["role"] = (
+                        "主窗口"
+                        if index == main_index
+                        else "同步窗口"
+                    )
             launch_hotkey = normalize_feature_hotkey(
                 raw_group.get("launch_hotkey")
                 or raw_group.get("launch_hotkey_display")
@@ -366,6 +392,14 @@ class GroupConfigurationService:
                             bool,
                         )
                         else True
+                    ),
+                    "entry_order_customized": (
+                        raw_group.get("entry_order_customized")
+                        if isinstance(
+                            raw_group.get("entry_order_customized"),
+                            bool,
+                        )
+                        else False
                     ),
                     **(
                         {
@@ -641,9 +675,16 @@ class GroupConfigurationService:
             raw_entries = group.get("launch_entries")
             if not isinstance(raw_entries, list) or len(raw_entries) < 2:
                 continue
-            controller = str(raw_entries[0]["entry_id"])
+            controllers = tuple(
+                entry
+                for entry in raw_entries
+                if entry.get("role") == "主窗口"
+            )
+            if len(controllers) != 1:
+                continue
+            controller = str(controllers[0]["entry_id"])
             targets = edges.setdefault(controller, [])
-            for entry in raw_entries[1:]:
+            for entry in raw_entries:
                 member = str(entry["entry_id"])
                 if member != controller and member not in targets:
                     targets.append(member)
@@ -719,6 +760,28 @@ class GroupConfigurationService:
         result: list[GroupConfiguration] = []
         for raw_group in self._groups:
             name = str(raw_group["name"])
+            raw_entries = list(raw_group["launch_entries"])
+            if (
+                not bool(raw_group.get("entry_order_customized", False))
+                and name in CONFIRMED_GROUP_ORDERS
+            ):
+                aliases = CONFIRMED_ENTRY_ALIASES.get(name, {})
+                by_name = {
+                    Path(str(entry["path"])).stem.casefold(): entry
+                    for entry in raw_entries
+                }
+                expected_names = tuple(
+                    aliases.get(display_name, display_name).casefold()
+                    for display_name in CONFIRMED_GROUP_ORDERS[name]
+                )
+                if (
+                    len(by_name) == len(raw_entries)
+                    and set(expected_names) == set(by_name)
+                ):
+                    raw_entries = [
+                        by_name[entry_name]
+                        for entry_name in expected_names
+                    ]
             entries = tuple(
                 GroupConfigurationEntry(
                     entry_id=str(raw_entry["entry_id"]),
@@ -736,7 +799,7 @@ class GroupConfigurationService:
                     ),
                 )
                 for index, raw_entry in enumerate(
-                    raw_group["launch_entries"],
+                    raw_entries,
                     start=1,
                 )
             )
@@ -753,6 +816,9 @@ class GroupConfigurationService:
                     ),
                     sync_base_point=self._clean_sync_base_point(
                         raw_group
+                    ),
+                    entry_order_customized=bool(
+                        raw_group.get("entry_order_customized", False)
                     ),
                 )
             )
@@ -783,6 +849,7 @@ class GroupConfigurationService:
                 "launch_entries": [],
                 "launch_hotkey": "",
                 "master_locked": True,
+                "entry_order_customized": False,
             }
         )
         self._save()
@@ -947,6 +1014,56 @@ class GroupConfigurationService:
             self._groups[target_index],
             self._groups[index],
         )
+        self._save()
+        return True
+
+    def reorder_group_entries(
+        self,
+        group_name: object,
+        entry_ids: object,
+    ) -> bool:
+        cleaned = self._clean_name(group_name)
+        if cleaned is None or not isinstance(entry_ids, tuple):
+            return False
+        if (
+            any(
+                not isinstance(entry_id, str) or not entry_id.strip()
+                for entry_id in entry_ids
+            )
+            or len(entry_ids) != len(set(entry_ids))
+        ):
+            return False
+        raw_group = next(
+            (
+                group
+                for group in self._groups
+                if group["name"] == cleaned
+            ),
+            None,
+        )
+        if raw_group is None:
+            return False
+        self._require_master_unlocked(raw_group)
+        entries = raw_group.get("launch_entries")
+        if not isinstance(entries, list):
+            return False
+        current_ids = tuple(str(entry["entry_id"]) for entry in entries)
+        normalized_ids = tuple(entry_id.strip() for entry_id in entry_ids)
+        if (
+            len(normalized_ids) != len(current_ids)
+            or set(normalized_ids) != set(current_ids)
+            or normalized_ids == current_ids
+        ):
+            return False
+        entry_by_id = {
+            str(entry["entry_id"]): entry
+            for entry in entries
+        }
+        raw_group["launch_entries"] = [
+            entry_by_id[entry_id]
+            for entry_id in normalized_ids
+        ]
+        raw_group["entry_order_customized"] = True
         self._save()
         return True
 
@@ -1328,6 +1445,7 @@ class GroupConfigurationService:
                 "launch_entries": [],
                 "launch_hotkey": "",
                 "master_locked": False,
+                "entry_order_customized": False,
             }
             self._groups.append(raw_group)
         self._require_master_unlocked(raw_group)
@@ -1390,6 +1508,14 @@ class GroupConfigurationService:
         entries = raw_group["launch_entries"]
         if not isinstance(entries, list):
             return False
+        removed_entry = next(
+            (
+                entry
+                for entry in entries
+                if entry.get("entry_id") == entry_id.strip()
+            ),
+            None,
+        )
         remaining = [
             entry
             for entry in entries
@@ -1397,7 +1523,11 @@ class GroupConfigurationService:
         ]
         if len(remaining) == len(entries):
             return False
-        if remaining:
+        if (
+            remaining
+            and removed_entry is not None
+            and removed_entry.get("role") == "主窗口"
+        ):
             remaining[0]["role"] = "主窗口"
             for entry in remaining[1:]:
                 entry["role"] = "同步窗口"
@@ -1450,16 +1580,23 @@ class GroupConfigurationService:
             ),
             None,
         )
-        if index is None or index == 0:
+        if (
+            index is None
+            or entries[index].get("role") == "主窗口"
+        ):
             return False
-        original = list(entries)
-        selected = entries.pop(index)
-        entries.insert(0, selected)
-        entries[0]["role"] = "主窗口"
-        for entry in entries[1:]:
-            entry["role"] = "同步窗口"
+        original_roles = tuple(
+            str(entry.get("role", "")) for entry in entries
+        )
+        for entry_index, entry in enumerate(entries):
+            entry["role"] = (
+                "主窗口"
+                if entry_index == index
+                else "同步窗口"
+            )
         if self._has_cycle(self._combined_sync_edges()):
-            raw_group["launch_entries"] = original
+            for entry, role in zip(entries, original_roles):
+                entry["role"] = role
             raise SyncCycleError(SyncCycleError.player_message)
         self._save()
         return True
@@ -1487,6 +1624,7 @@ class GroupConfigurationService:
             for entry in entries
         }
         raw_group["launch_entries"] = []
+        raw_group["entry_order_customized"] = False
         for entry_id in removed_ids:
             self._sync_edges.pop(entry_id, None)
         for source, targets in tuple(self._sync_edges.items()):
@@ -1589,9 +1727,9 @@ class GroupConfigurationService:
         group_name: object,
     ) -> tuple[GroupSyncMemberChoice, ...]:
         group = self.group(group_name)
-        if group is None or not group.entries:
+        if group is None or group.main_entry is None:
             return ()
-        controller = group.entries[0].entry_id
+        controller = group.main_entry.entry_id
         existing = set(self._sync_edges.get(controller, ()))
         choices: list[GroupSyncMemberChoice] = []
         seen: set[str] = set()
@@ -1617,9 +1755,9 @@ class GroupConfigurationService:
         group_name: object,
     ) -> tuple[GroupSyncMemberChoice, ...]:
         group = self.group(group_name)
-        if group is None or not group.entries:
+        if group is None or group.main_entry is None:
             return ()
-        controller = group.entries[0].entry_id
+        controller = group.main_entry.entry_id
         member_ids = tuple(self._sync_edges.get(controller, ()))
         labels: dict[str, str] = {}
         for candidate_group in self.groups():

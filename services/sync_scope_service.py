@@ -49,7 +49,12 @@ class SyncScopeService:
                 name,
                 failure_codes=("group_entries_unavailable",),
             )
-        controller = selected.entries[0].entry_id
+        if selected.main_entry is None:
+            return SyncScope(
+                name,
+                failure_codes=("group_controller_unavailable",),
+            )
+        controller = selected.main_entry.entry_id
         member_ids = self._configuration.expanded_sync_members(controller)
         ordered_ids = (controller, *member_ids)
         entry_by_id = {}

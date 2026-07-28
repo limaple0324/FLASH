@@ -57,7 +57,12 @@ class Placer:
         return True
 
 
-def launch_service(tmp_path, *, with_layout=True):
+def launch_service(
+    tmp_path,
+    *,
+    with_layout=True,
+    delays=(0, 0),
+):
     entries = []
     for index, name in enumerate(("甲", "乙"), start=1):
         shortcut = tmp_path / f"{name}.lnk"
@@ -70,7 +75,7 @@ def launch_service(tmp_path, *, with_layout=True):
                     "y": index * 10,
                     "width": 916,
                     "height": 629,
-                    "delay_ms": 0,
+                    "delay_ms": delays[index - 1],
                 }
             )
         entries.append(entry)
@@ -126,6 +131,29 @@ def test_launches_only_missing_roles_and_restores_every_saved_position(
     assert [call[0] for call in placer.calls] == [1, 102]
     assert placer.calls[0][1].x == -999
     assert placer.calls[1][1].x == -998
+
+
+def test_launch_uses_saved_order_and_each_role_delay(tmp_path):
+    launch = launch_service(tmp_path, delays=(120, 340))
+    windows = Windows()
+    opener = Opener(windows)
+    delays = []
+    service = GroupWindowLaunchService(
+        launch,
+        windows,
+        shortcut_open_backend=opener,
+        placement_backend=Placer(),
+        sleeper=delays.append,
+    )
+
+    result = service._run("兩支")
+
+    assert result.success is True
+    assert [target.display_name for target in opener.targets] == [
+        "甲",
+        "乙",
+    ]
+    assert delays == [0.12, 0.34]
 
 
 def test_unknown_existing_game_window_stops_before_launch(tmp_path):

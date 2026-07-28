@@ -120,6 +120,30 @@ def test_confirmed_14_group_uses_player_order_and_exact_alias(tmp_path):
     assert len(plan.fingerprints) == 14
 
 
+def test_confirmed_group_uses_saved_custom_order_after_player_reorders(
+    tmp_path,
+):
+    custom_names = (OLD_14[1], OLD_14[0], *OLD_14[2:])
+    path = _config(tmp_path, [("14支", custom_names)])
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["groups"][0]["entry_order_customized"] = True
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    plan = GroupLaunchService(path, _Resolver()).plan("14支")
+
+    assert plan.ready is True
+    assert tuple(target.display_name for target in plan.targets) == tuple(
+        "亞洛" if name == "160福" else name
+        for name in custom_names
+    )
+    assert tuple(target.shortcut_path.stem for target in plan.targets) == (
+        custom_names
+    )
+
+
 def test_other_groups_keep_their_registered_fixed_list_order(tmp_path):
     resolver = _Resolver()
     names = ("120古", "120靈", "120射", "120福", "120獵")

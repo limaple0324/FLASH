@@ -300,7 +300,7 @@ def test_record_current_positions_requires_complete_group_and_saves_all(
     )
 
 
-def test_set_main_entry_reorders_group_and_clear_keeps_empty_group(
+def test_set_main_entry_preserves_launch_order_and_clear_keeps_empty_group(
     tmp_path,
 ):
     legacy, _first, _second = _legacy(tmp_path)
@@ -311,13 +311,52 @@ def test_set_main_entry_reorders_group_and_clear_keeps_empty_group(
     before = service.group("14支").entries
 
     assert service.set_main_entry("14支", before[1].entry_id) is True
-    reordered = service.group("14支").entries
-    assert reordered[0].entry_id == before[1].entry_id
-    assert reordered[0].role == "主窗口"
-    assert reordered[1].role == "同步窗口"
+    updated = service.group("14支").entries
+    assert tuple(entry.entry_id for entry in updated) == tuple(
+        entry.entry_id for entry in before
+    )
+    assert updated[0].role == "同步窗口"
+    assert updated[1].role == "主窗口"
+    assert service.group("14支").main_entry == updated[1]
     assert service.clear_group("14支") is True
     assert service.group("14支").entries == ()
     assert service.clear_group("14支") is False
+
+
+def test_reorder_entries_is_atomic_persistent_and_keeps_main_identity(
+    tmp_path,
+):
+    legacy, _first, _second = _legacy(tmp_path)
+    owned = tmp_path / "groups.json"
+    service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    before = service.group("14支")
+    proposed = tuple(
+        entry.entry_id for entry in reversed(before.entries)
+    )
+    main_id = before.main_entry.entry_id
+
+    assert service.reorder_group_entries("14支", proposed) is True
+    reordered = service.group("14支")
+    reloaded = GroupConfigurationService(owned).group("14支")
+
+    assert tuple(entry.entry_id for entry in reordered.entries) == proposed
+    assert tuple(entry.entry_id for entry in reloaded.entries) == proposed
+    assert reordered.main_entry.entry_id == main_id
+    assert reloaded.main_entry.entry_id == main_id
+    assert reordered.entry_order_customized is True
+    assert service.reorder_group_entries("14支", proposed) is False
+    assert service.reorder_group_entries(
+        "14支",
+        (proposed[0], "unknown"),
+    ) is False
+    assert tuple(
+        entry.entry_id for entry in service.group("14支").entries
+    ) == proposed
+    assert service.remove_shortcut("14支", proposed[0]) is True
+    assert service.group("14支").main_entry.entry_id == main_id
 
 
 def test_master_lock_defaults_safe_and_blocks_group_role_edits(
@@ -367,6 +406,14 @@ def test_master_lock_defaults_safe_and_blocks_group_role_edits(
         service.set_main_entry(
             "上鎖組",
             group.entries[1].entry_id,
+        )
+    with pytest.raises(GroupMasterLockedError):
+        service.reorder_group_entries(
+            "上鎖組",
+            tuple(
+                entry.entry_id
+                for entry in reversed(group.entries)
+            ),
         )
     with pytest.raises(GroupMasterLockedError):
         service.clear_group("上鎖組")
