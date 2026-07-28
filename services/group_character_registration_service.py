@@ -114,7 +114,7 @@ class GroupCharacterRegistrationService:
                     )
                 )
                 existing = existing_records[entry.entry_id]
-                if existing.group != group.name or existing.role != role:
+                if existing.group is None:
                     candidate.set_group_role(
                         entry.entry_id,
                         group=group.name,
@@ -123,6 +123,23 @@ class GroupCharacterRegistrationService:
                     updated_records.append(
                         (entry.entry_id, group.name, role)
                     )
+                elif (
+                    existing.group == group.name
+                    and existing.role != role
+                ):
+                    candidate.set_group_role(
+                        entry.entry_id,
+                        group=group.name,
+                        role=role,
+                    )
+                    updated_records.append(
+                        (entry.entry_id, group.name, role)
+                    )
+                # A shortcut identity can be reused by another group whose
+                # role selection is different. Never move an existing
+                # character record across groups merely because that group
+                # was selected; a confirmed role ID must establish a separate
+                # character identity first.
             if confirmed is not None and entry.entry_id not in profile_by_id:
                 profile_by_id[entry.entry_id] = Character(
                     entry.entry_id,

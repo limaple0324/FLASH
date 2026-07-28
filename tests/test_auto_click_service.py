@@ -6,6 +6,7 @@ from services.auto_click_service import (
     AutoClickService,
     AutoClickSettings,
 )
+from services.game_operation_gate import GameOperationGate
 
 
 class Scheduler:
@@ -100,6 +101,27 @@ def test_delivery_failure_stops_without_rescheduling():
 
     assert service.running is False
     assert scheduler.calls == []
+
+
+def test_physical_auto_click_stops_when_another_game_operation_is_active():
+    scheduler = Scheduler()
+    clicker = Clicker()
+    gate = GameOperationGate()
+    active = gate.acquire("智慧重連")
+    assert active is not None
+    service = AutoClickService(
+        clicker,
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+        operation_gate=gate,
+    )
+
+    service.start(AutoClickSettings())
+
+    assert clicker.buttons == []
+    assert service.running is False
+    assert scheduler.calls == []
+    active.release()
 
 
 def test_f1_toggles_once_per_rising_edge():

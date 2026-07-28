@@ -170,7 +170,14 @@ class GroupSelectionService:
         configured_members: dict[str, tuple[PlayerGroupMember, ...]] = {}
         configured_group_ids: dict[str, str] = {}
         if self._configuration is not None:
-            for group in self._configuration.groups():
+            configured_groups = self._configuration.groups()
+            entry_occurrences: dict[str, int] = {}
+            for configured_group in configured_groups:
+                for entry in configured_group.entries:
+                    entry_occurrences[entry.entry_id] = (
+                        entry_occurrences.get(entry.entry_id, 0) + 1
+                    )
+            for group in configured_groups:
                 configured_group_ids[group.name] = group.group_id
                 members: list[PlayerGroupMember] = []
                 for entry in group.entries:
@@ -188,6 +195,7 @@ class GroupSelectionService:
                                 record.character_id
                                 if record is not None
                                 and record.group == group.name
+                                and entry_occurrences.get(entry.entry_id) == 1
                                 else None
                             ),
                         )

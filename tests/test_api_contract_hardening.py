@@ -24,6 +24,7 @@ from services.data_contract_migration_service import (
 )
 from services.event_bus import EventBus
 from services.group_configuration_service import GroupConfigurationService
+from services.game_operation_gate import GameOperationGate
 from services.group_selection_service import GroupSelectionService
 from services.keyboard_sync_monitor import Win32KeyboardStateBackend
 from services.lifecycle_contract import (
@@ -210,6 +211,122 @@ def test_target_window_enumeration_failure_fails_closed(tmp_path):
     assert "window_enumeration_failed" in snapshot.failure_codes
 
 
+def test_target_contract_prefers_current_group_for_shared_shortcut(tmp_path):
+    shared = tmp_path / "共用角色.lnk"
+    shared.write_bytes(b"shortcut")
+    legacy = tmp_path / "legacy-shared.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "甲組",
+                        "launch_entries": [
+                            {
+                                "path": str(shared),
+                                "role": "主窗口",
+                                "role_id": "甲角色",
+                            }
+                        ],
+                    },
+                    {
+                        "name": "乙組",
+                        "launch_entries": [
+                            {
+                                "path": str(shared),
+                                "role": "主窗口",
+                                "role_id": "乙角色",
+                            }
+                        ],
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    configuration = GroupConfigurationService(
+        tmp_path / "shared-groups.json",
+        legacy_config_path=legacy,
+    )
+    scope_service = SyncScopeService(configuration, _Resolver())
+    fingerprint = scope_service.scope("甲組").fingerprints[0]
+    registry = WindowRegistry()
+    entry = configuration.group("甲組").entries[0]
+    registry.register_character(
+        entry.entry_id,
+        "甲角色",
+        group="甲組",
+        role="主號",
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        registry,
+        _WindowBackend(
+            (
+                WindowInfo(
+                    11,
+                    "Adobe Flash Player 11",
+                    True,
+                    False,
+                    (0, 0, 900, 600),
+                    101,
+                    "Flash",
+                    fingerprint,
+                ),
+            ),
+            foreground=11,
+        ),
+    )
+
+    first = service.snapshot("甲組").targets[0]
+    second = service.snapshot("乙組").targets[0]
+
+    assert first.group_name == "甲組"
+    assert first.role_id == "甲角色"
+    assert first.character_id is None
+    assert second.group_name == "乙組"
+    assert second.role_id == "乙角色"
+    assert second.character_id is None
+    assert first.window_code != second.window_code
+
+
+def test_unidentified_flash_window_blocks_every_mutating_target_set(tmp_path):
+    configuration, scope_service, scope = _configured_group(tmp_path)
+    known = WindowInfo(
+        11,
+        "Adobe Flash Player 11",
+        True,
+        False,
+        (0, 0, 900, 600),
+        101,
+        "Flash",
+        scope.fingerprints[0],
+    )
+    unknown = WindowInfo(
+        12,
+        "Adobe Flash Player 11",
+        True,
+        False,
+        (900, 0, 1800, 600),
+        102,
+        "Flash",
+        None,
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        _WindowBackend((known, unknown), foreground=11),
+    )
+
+    snapshot = service.snapshot("測試組")
+
+    assert "unidentified_candidate_window" in snapshot.failure_codes
+    assert service.windows("測試組") == ()
+
+
 def test_sync_controller_accepts_only_the_shared_target_provider():
     windows = (
         WindowInfo(
@@ -311,6 +428,77 @@ def test_sync_pointer_and_reconnect_receive_the_same_target_set():
         assert keyboard._candidate_windows() == windows
         assert pointer._candidate_windows() == windows
         assert reconnect._candidate_windows() == windows
+    finally:
+        assert keyboard.close() is True
+        assert pointer.close() is True
+
+
+def test_shared_operation_gate_blocks_sync_pointer_and_reconnect_mutations():
+    fingerprint = "1" * 64
+    windows = (
+        WindowInfo(
+            11,
+            "",
+            True,
+            False,
+            (0, 0, 900, 600),
+            101,
+            None,
+            fingerprint,
+        ),
+    )
+    gate = GameOperationGate()
+    assert gate.close_and_wait() is True
+    messages = _MessageBackend()
+    keyboard = WindowsInputSyncController(
+        expected_windows=1,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=_WindowBackend(windows, foreground=11),
+        message_backend=messages,
+        allowed_fingerprints=(fingerprint,),
+        target_windows_provider=lambda: windows,
+        operation_gate=gate,
+    )
+    keyboard.set_controller_fingerprint(fingerprint)
+    pointer = WindowsPointerSyncController(
+        expected_windows=1,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=_WindowBackend(windows, foreground=11),
+        message_backend=object(),
+        target_windows_provider=lambda: windows,
+        operation_gate=gate,
+    )
+    reconnect = WindowsSmartReconnectController(
+        expected_windows=1,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=_WindowBackend(windows, foreground=11),
+        capture_provider=object(),
+        recognizer=object(),
+        mouse_backend=object(),
+        target_windows_provider=lambda: windows,
+        operation_gate=gate,
+        execution_enabled=True,
+    )
+    try:
+        key_result = keyboard.send_approved_key(
+            "B",
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            source_handle=11,
+        )
+        pointer_result = pointer.send_click(
+            source_handle=11,
+            x_ratio=0.5,
+            y_ratio=0.5,
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+        )
+        reconnect_result = reconnect.reconnect()
+
+        assert key_result.failure_codes == ("operation_gate_closed",)
+        assert pointer_result.failure_codes == ("operation_gate_closed",)
+        assert reconnect_result.code == "reconnect.operation_paused"
+        assert messages.sent == []
     finally:
         assert keyboard.close() is True
         assert pointer.close() is True

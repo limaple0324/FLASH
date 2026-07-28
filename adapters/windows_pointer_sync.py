@@ -24,6 +24,7 @@ from services.sync_conflict_arbiter import SyncConflictArbiter
 from services.deferred_sync_operation_service import (
     DeferredSyncOperationService,
 )
+from services.game_operation_gate import GameOperationGate
 from core.reconnect_policy import ReconnectScreenState
 from collections.abc import Callable
 from domain.sync_target_settings import SyncTargetSettings
@@ -248,6 +249,7 @@ class WindowsPointerSyncController:
         target_windows_provider: (
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
+        operation_gate: GameOperationGate | None = None,
     ) -> None:
         self._expected_windows = max(1, int(expected_windows))
         self._keywords = tuple(
@@ -267,6 +269,7 @@ class WindowsPointerSyncController:
         self._role_operation_callback = role_operation_callback
         self._screen_state_provider = screen_state_provider
         self._target_windows_provider = target_windows_provider
+        self._operation_gate = operation_gate
         self._pressed_targets: dict[int, tuple[float, float]] = {}
         self._pressed_targets_lock = Lock()
         self._target_settings: dict[str, SyncTargetSettings] = {}
@@ -296,12 +299,23 @@ class WindowsPointerSyncController:
             or isinstance(y_ratio, bool)
         ):
             return False
-        return self._deliver_deferred_pointer(
-            fingerprint,
-            float(x_ratio),
-            float(y_ratio),
-            event,
+        lease = (
+            self._operation_gate.acquire("pointer-deferred")
+            if self._operation_gate is not None
+            else None
         )
+        if self._operation_gate is not None and lease is None:
+            return False
+        try:
+            return self._deliver_deferred_pointer(
+                fingerprint,
+                float(x_ratio),
+                float(y_ratio),
+                event,
+            )
+        finally:
+            if lease is not None:
+                lease.release()
 
     @classmethod
     def for_real_windows(
@@ -320,6 +334,7 @@ class WindowsPointerSyncController:
         target_windows_provider: (
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
+        operation_gate: GameOperationGate | None = None,
     ) -> "WindowsPointerSyncController":
         return cls(
             expected_windows=14,
@@ -337,6 +352,7 @@ class WindowsPointerSyncController:
             role_operation_callback=role_operation_callback,
             screen_state_provider=screen_state_provider,
             target_windows_provider=target_windows_provider,
+            operation_gate=operation_gate,
         )
 
     def _record_role_operation(
@@ -703,6 +719,36 @@ class WindowsPointerSyncController:
         event: str,
         execution_guard: Callable[[], bool] | None,
     ) -> None:
+        lease = (
+            self._operation_gate.acquire(
+                "pointer-scheduled",
+                execution_guard=execution_guard,
+            )
+            if self._operation_gate is not None
+            else None
+        )
+        if self._operation_gate is not None and lease is None:
+            return
+        try:
+            self._run_scheduled_pointer_without_gate(
+                fingerprint,
+                x_ratio,
+                y_ratio,
+                event,
+                execution_guard,
+            )
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def _run_scheduled_pointer_without_gate(
+        self,
+        fingerprint: str,
+        x_ratio: float,
+        y_ratio: float,
+        event: str,
+        execution_guard: Callable[[], bool] | None,
+    ) -> None:
         if execution_guard is not None:
             try:
                 if not bool(execution_guard()):
@@ -997,7 +1043,8 @@ class WindowsPointerSyncController:
         include_source: bool = False,
         execution_guard: Callable[[], bool] | None = None,
     ) -> PointerSyncResult:
-        return self._send(
+        return self._send_with_operation_gate(
+            operation_name="pointer-sync",
             source_handle=source_handle,
             x_ratio=x_ratio,
             y_ratio=y_ratio,
@@ -1020,7 +1067,8 @@ class WindowsPointerSyncController:
         execution_guard: Callable[[], bool] | None = None,
     ) -> PointerSyncResult:
         """Send one atomic down/up pair per target after a single preflight."""
-        return self._send(
+        return self._send_with_operation_gate(
+            operation_name="pointer-click",
             source_handle=source_handle,
             x_ratio=x_ratio,
             y_ratio=y_ratio,
@@ -1030,6 +1078,63 @@ class WindowsPointerSyncController:
             include_source=include_source,
             execution_guard=execution_guard,
         )
+
+    def _send_with_operation_gate(
+        self,
+        *,
+        operation_name: str,
+        source_handle: int,
+        x_ratio: float,
+        y_ratio: float,
+        event: object,
+        policy: object,
+        execute: bool,
+        include_source: bool,
+        execution_guard: Callable[[], bool] | None,
+    ) -> PointerSyncResult:
+        if not execute or self._operation_gate is None:
+            return self._send(
+                source_handle=source_handle,
+                x_ratio=x_ratio,
+                y_ratio=y_ratio,
+                event=event,
+                policy=policy,
+                execute=execute,
+                include_source=include_source,
+                execution_guard=execution_guard,
+            )
+        lease = self._operation_gate.acquire(
+            operation_name,
+            execution_guard=execution_guard,
+        )
+        if lease is None:
+            started_ns = perf_counter_ns()
+            return self._result(
+                discovered_windows=len(self._windows()),
+                eligible_windows=0,
+                sent_windows=0,
+                event=(
+                    event
+                    if isinstance(event, str)
+                    and event in POINTER_OPERATIONS
+                    else None
+                ),
+                failures=("operation_gate_closed",),
+                controller_started_ns=started_ns,
+            )
+        try:
+            return self._send(
+                source_handle=source_handle,
+                x_ratio=x_ratio,
+                y_ratio=y_ratio,
+                event=event,
+                policy=policy,
+                execute=True,
+                include_source=include_source,
+                execution_guard=execution_guard,
+            )
+        finally:
+            lease.release()
 
     def _send(
         self,

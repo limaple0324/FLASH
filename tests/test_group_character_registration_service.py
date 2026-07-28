@@ -119,6 +119,60 @@ def test_group_registration_is_idempotent_and_preserves_saved_note(tmp_path):
     assert registry.get(character_id).note == "保留備註"
 
 
+def test_shared_shortcut_never_moves_character_identity_to_another_group(
+    tmp_path,
+):
+    shared = tmp_path / "共用角色.lnk"
+    shared.write_bytes(b"shortcut")
+    legacy = tmp_path / "shared-legacy.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "甲組",
+                        "launch_entries": [{"path": str(shared)}],
+                    },
+                    {
+                        "name": "乙組",
+                        "launch_entries": [{"path": str(shared)}],
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    configuration = GroupConfigurationService(
+        tmp_path / "shared-groups.json",
+        legacy_config_path=legacy,
+    )
+    registry = WindowRegistry()
+    registry_store = WindowRegistryStore(tmp_path / "registry.json")
+    character_store = CharacterStore(tmp_path / "characters.json")
+    service = GroupCharacterRegistrationService(
+        registry,
+        registry_store,
+        character_store,
+        configuration,
+    )
+
+    service.ensure_group("甲組", ())
+    entry_id = configuration.group("甲組").entries[0].entry_id
+    registry.set_note(entry_id, "甲組資料")
+    registry_store.save(registry)
+    service.ensure_group("乙組", ())
+
+    assert registry.get(entry_id).group == "甲組"
+    assert registry.get(entry_id).note == "甲組資料"
+    choice = GroupSelectionService(
+        registry,
+        legacy_config_path=configuration.path,
+        configuration=configuration,
+    ).find("乙組")
+    assert choice.members[0].character_id is None
+
+
 def test_existing_ungrouped_records_are_backfilled_without_new_identities(
     tmp_path,
 ):

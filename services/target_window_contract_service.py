@@ -26,11 +26,20 @@ class TargetWindowContractService:
         scope_service: SyncScopeService,
         registry: WindowRegistry,
         window_backend: WindowBackend,
+        *,
+        title_keywords: tuple[str, ...] = ("Adobe Flash Player",),
     ) -> None:
         self._configuration = configuration
         self._scope_service = scope_service
         self._registry = registry
         self._window_backend = window_backend
+        self._title_keywords = tuple(
+            keyword.strip().casefold()
+            for keyword in title_keywords
+            if isinstance(keyword, str) and keyword.strip()
+        )
+        if not self._title_keywords:
+            raise ValueError("title_keywords must not be empty.")
         self._scope_cache: dict[
             str,
             tuple[tuple[int, int] | None, object],
@@ -73,16 +82,19 @@ class TargetWindowContractService:
                 failure_codes=("group_entries_unavailable",),
             )
 
-        entry_by_id = {
-            entry.entry_id: entry
-            for configured_group in self._configuration.groups()
-            for entry in configured_group.entries
+        configured_groups = self._configuration.groups()
+        root_entries = {
+            entry.entry_id: entry for entry in group.entries
         }
-        entry_group = {
-            entry.entry_id: configured_group.name
-            for configured_group in self._configuration.groups()
-            for entry in configured_group.entries
-        }
+        entry_candidates: dict[
+            str,
+            list[tuple[str, GroupConfigurationEntry]],
+        ] = {}
+        for configured_group in configured_groups:
+            for entry in configured_group.entries:
+                entry_candidates.setdefault(entry.entry_id, []).append(
+                    (configured_group.name, entry)
+                )
         scope = self._scope(name)
         if scope.ready:
             fingerprint_by_id = dict(zip(scope.entry_ids, scope.fingerprints))
@@ -107,24 +119,90 @@ class TargetWindowContractService:
                 dict.fromkeys((*snapshot_failures, "window_enumeration_failed"))
             )
 
+        candidate_windows = tuple(
+            window
+            for window in windows
+            if all(
+                keyword in window.title.casefold()
+                for keyword in self._title_keywords
+            )
+        )
+        if any(
+            normalize_launch_fingerprint(window.launch_fingerprint) is None
+            for window in candidate_windows
+        ):
+            snapshot_failures = tuple(
+                dict.fromkeys(
+                    (
+                        *snapshot_failures,
+                        "unidentified_candidate_window",
+                    )
+                )
+            )
+
         windows_by_fingerprint: dict[str, list[WindowInfo]] = {}
-        for window in windows:
+        for window in candidate_windows:
             fingerprint = normalize_launch_fingerprint(
                 window.launch_fingerprint
             )
             if fingerprint is not None:
                 windows_by_fingerprint.setdefault(fingerprint, []).append(window)
 
+        resolved_entries: list[
+            tuple[GroupConfigurationEntry, str, str | None, bool]
+        ] = []
+        for entry_id in selected_ids:
+            root_entry = root_entries.get(entry_id)
+            if root_entry is not None:
+                resolved_entries.append(
+                    (
+                        root_entry,
+                        name,
+                        fingerprint_by_id.get(entry_id),
+                        len(entry_candidates.get(entry_id, ())) > 1,
+                    )
+                )
+                continue
+            candidates = entry_candidates.get(entry_id, ())
+            if len(candidates) == 1:
+                candidate_group, candidate_entry = candidates[0]
+                resolved_entries.append(
+                    (
+                        candidate_entry,
+                        candidate_group,
+                        fingerprint_by_id.get(entry_id),
+                        False,
+                    )
+                )
+                continue
+            snapshot_failures = tuple(
+                dict.fromkeys(
+                    (
+                        *snapshot_failures,
+                        (
+                            "target_entry_group_ambiguous"
+                            if candidates
+                            else "target_entry_unresolved"
+                        ),
+                    )
+                )
+            )
+
         targets = tuple(
             self._resolve_entry(
-                entry_by_id[entry_id],
-                entry_group[entry_id],
-                fingerprint_by_id.get(entry_id),
+                entry,
+                entry_group,
+                fingerprint,
+                character_identity_ambiguous,
                 windows_by_fingerprint,
                 foreground_handle,
             )
-            for entry_id in selected_ids
-            if entry_id in entry_by_id
+            for (
+                entry,
+                entry_group,
+                fingerprint,
+                character_identity_ambiguous,
+            ) in resolved_entries
         )
         if len(targets) != len(selected_ids):
             snapshot_failures = tuple(
@@ -148,6 +226,8 @@ class TargetWindowContractService:
             group_name,
             expanded_sync_scope=expanded_sync_scope,
         )
+        if snapshot.failure_codes:
+            return ()
         return tuple(
             WindowInfo(
                 handle=target.handle,
@@ -169,6 +249,7 @@ class TargetWindowContractService:
         entry: GroupConfigurationEntry,
         group_name: str,
         fingerprint: str | None,
+        character_identity_ambiguous: bool,
         windows_by_fingerprint: dict[str, list[WindowInfo]],
         foreground_handle: int | None,
     ) -> TargetWindowContract:
@@ -177,7 +258,11 @@ class TargetWindowContractService:
             record = self._registry.get(entry.entry_id)
         except KeyError:
             record = None
-        if record is not None and record.group == group_name:
+        if (
+            not character_identity_ambiguous
+            and record is not None
+            and record.group == group_name
+        ):
             character_id = record.character_id
 
         matches = (
@@ -208,7 +293,10 @@ class TargetWindowContractService:
         return TargetWindowContract(
             TargetWindowContract.SCHEMA_VERSION,
             group_name,
-            entry.entry_id,
+            (
+                f"{GroupConfigurationService.group_id_for_name(group_name)}:"
+                f"{entry.entry_id}"
+            ),
             entry.display_name,
             entry.role,
             entry.role_id or None,

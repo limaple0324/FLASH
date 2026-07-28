@@ -17,10 +17,15 @@ from adapters.windows_battle_restart import (
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
 from adapters.windows_window import WindowBackend, WindowInfo
 from core.reconnect_policy import ReconnectScreenState
+from core.target_window_contract import (
+    TargetWindowPhase,
+    TargetWindowSnapshot,
+)
 from services.group_launch_service import (
     GroupLaunchService,
     GroupLaunchTarget,
 )
+from services.game_operation_gate import GameOperationGate
 from services.reconnect_failure_status_service import (
     ReconnectFailureStatusService,
 )
@@ -121,6 +126,10 @@ class GroupRoleStatusService:
         record_callback: (
             Callable[[str, str, str], object] | None
         ) = None,
+        target_snapshot_provider: (
+            Callable[[str], TargetWindowSnapshot] | None
+        ) = None,
+        operation_gate: GameOperationGate | None = None,
     ) -> None:
         self._launch_service = launch_service
         self._window_backend = window_backend
@@ -140,6 +149,8 @@ class GroupRoleStatusService:
         )
         self._monotonic_clock = monotonic_clock
         self._record_callback = record_callback
+        self._target_snapshot_provider = target_snapshot_provider
+        self._operation_gate = operation_gate
         self._lock = threading.RLock()
         self._group_name: str | None = None
         self._rows: tuple[GroupRoleStatus, ...] = ()
@@ -170,6 +181,28 @@ class GroupRoleStatusService:
             and all(keyword in window.title.casefold() for keyword in self._keywords)
         )
 
+    def _target_snapshot(self, group_name: str) -> TargetWindowSnapshot | None:
+        if self._target_snapshot_provider is None:
+            return None
+        try:
+            snapshot = self._target_snapshot_provider(group_name)
+        except Exception:
+            return TargetWindowSnapshot(
+                TargetWindowSnapshot.SCHEMA_VERSION,
+                group_name,
+                failure_codes=("target_snapshot_failed",),
+            )
+        if (
+            not isinstance(snapshot, TargetWindowSnapshot)
+            or snapshot.group_name != group_name
+        ):
+            return TargetWindowSnapshot(
+                TargetWindowSnapshot.SCHEMA_VERSION,
+                group_name,
+                failure_codes=("target_snapshot_invalid",),
+            )
+        return snapshot
+
     @staticmethod
     def _windows_by_fingerprint(
         windows: Iterable[WindowInfo],
@@ -196,8 +229,18 @@ class GroupRoleStatusService:
                 self._rows = ()
             return ()
 
-        windows = self._candidate_windows()
-        by_fingerprint = self._windows_by_fingerprint(windows)
+        central_snapshot = self._target_snapshot(plan.group_name)
+        if central_snapshot is None:
+            windows = self._candidate_windows()
+            by_fingerprint = self._windows_by_fingerprint(windows)
+            contract_by_fingerprint = {}
+        else:
+            by_fingerprint = {}
+            contract_by_fingerprint = {
+                target.fingerprint: target
+                for target in central_snapshot.targets
+                if target.fingerprint is not None
+            }
         states = self._screen_states_provider()
         reconnecting = {
             fingerprint
@@ -216,10 +259,26 @@ class GroupRoleStatusService:
         rows: list[GroupRoleStatus] = []
         for target in plan.targets:
             fingerprint = target.fingerprint
+            contract = contract_by_fingerprint.get(fingerprint)
             matches = by_fingerprint.get(fingerprint, ())
             failure_key = f"role:{fingerprint}"
             state = states.get(fingerprint)
-            if self._failure_service.has(failure_key) or len(matches) > 1:
+            central_failed = (
+                contract is None
+                or any(
+                    code != "unidentified_candidate_window"
+                    for code in central_snapshot.failure_codes
+                )
+                or (
+                    not contract.safe
+                    and contract.phase is not TargetWindowPhase.OFFLINE
+                )
+            ) if central_snapshot is not None else False
+            if (
+                self._failure_service.has(failure_key)
+                or len(matches) > 1
+                or central_failed
+            ):
                 status = ROLE_STATUS_FAILED
             elif fingerprint in reconnecting or fingerprint in launching:
                 status = ROLE_STATUS_RECONNECTING
@@ -227,7 +286,11 @@ class GroupRoleStatusService:
                 status = ROLE_STATUS_DISCONNECTED
             elif state in self._RECONNECTING_STATES:
                 status = ROLE_STATUS_RECONNECTING
-            elif len(matches) == 1:
+            elif (
+                (contract is not None and contract.safe)
+                if central_snapshot is not None
+                else len(matches) == 1
+            ):
                 status = ROLE_STATUS_OPEN
             else:
                 status = ROLE_STATUS_CLOSED
@@ -256,6 +319,33 @@ class GroupRoleStatusService:
         group_name: object,
         action_id: object,
     ) -> GroupRoleActionResult:
+        lease = (
+            self._operation_gate.acquire(
+                "role-activate-or-launch",
+                timeout_seconds=0,
+            )
+            if self._operation_gate is not None
+            else None
+        )
+        if self._operation_gate is not None and lease is None:
+            return GroupRoleActionResult(
+                False,
+                failure_code="operation_gate_closed",
+            )
+        try:
+            return self._activate_or_launch_without_gate(
+                group_name,
+                action_id,
+            )
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def _activate_or_launch_without_gate(
+        self,
+        group_name: object,
+        action_id: object,
+    ) -> GroupRoleActionResult:
         if (
             not isinstance(group_name, str)
             or not group_name.strip()
@@ -275,11 +365,33 @@ class GroupRoleStatusService:
                 failure_code="role_identity_unresolved",
             )
 
-        windows = self._candidate_windows()
-        by_fingerprint = self._windows_by_fingerprint(windows)
-        matches = by_fingerprint.get(target.fingerprint, ())
-        if len(matches) == 1:
-            if self._activation_backend.activate(matches[0].handle):
+        central_snapshot = self._target_snapshot(plan.group_name)
+        if central_snapshot is None:
+            windows = self._candidate_windows()
+            by_fingerprint = self._windows_by_fingerprint(windows)
+            matches = by_fingerprint.get(target.fingerprint, ())
+            contract = None
+            central_failures: tuple[str, ...] = ()
+        else:
+            windows = ()
+            matches = ()
+            contract = next(
+                (
+                    item
+                    for item in central_snapshot.targets
+                    if item.fingerprint == target.fingerprint
+                ),
+                None,
+            )
+            central_failures = central_snapshot.failure_codes
+
+        active_handle = (
+            contract.handle
+            if contract is not None and contract.safe
+            else (matches[0].handle if len(matches) == 1 else None)
+        )
+        if active_handle is not None:
+            if self._activation_backend.activate(active_handle):
                 self._record("角色操作", target.display_name, "切換至前景成功")
                 return GroupRoleActionResult(True, action="activated")
             self._failure_service.report(
@@ -291,7 +403,13 @@ class GroupRoleStatusService:
                 False,
                 failure_code="role_activation_failed",
             )
-        if len(matches) > 1:
+        if (
+            len(matches) > 1
+            or (
+                contract is not None
+                and "window_identity_duplicate" in contract.failure_codes
+            )
+        ):
             self._failure_service.report(
                 f"role:{target.fingerprint}",
                 target.display_name,
@@ -304,9 +422,12 @@ class GroupRoleStatusService:
 
         # An unidentified Flash window could already be this role. Never open
         # another copy until every visible candidate has a unique identity.
-        if any(
-            normalize_launch_fingerprint(window.launch_fingerprint) is None
-            for window in windows
+        if (
+            "unidentified_candidate_window" in central_failures
+            or any(
+                normalize_launch_fingerprint(window.launch_fingerprint) is None
+                for window in windows
+            )
         ):
             self._failure_service.report(
                 f"role:{target.fingerprint}",
@@ -316,6 +437,38 @@ class GroupRoleStatusService:
             return GroupRoleActionResult(
                 False,
                 failure_code="role_existing_window_unknown",
+            )
+        if (
+            central_snapshot is not None
+            and any(
+                code != "unidentified_candidate_window"
+                for code in central_failures
+            )
+        ):
+            self._failure_service.report(
+                f"role:{target.fingerprint}",
+                target.display_name,
+            )
+            self._record("角色操作", target.display_name, "中央目標資料不完整")
+            return GroupRoleActionResult(
+                False,
+                failure_code="role_identity_unresolved",
+            )
+        if (
+            central_snapshot is not None
+            and (
+                contract is None
+                or contract.phase is not TargetWindowPhase.OFFLINE
+            )
+        ):
+            self._failure_service.report(
+                f"role:{target.fingerprint}",
+                target.display_name,
+            )
+            self._record("角色操作", target.display_name, "中央身分無法確認")
+            return GroupRoleActionResult(
+                False,
+                failure_code="role_identity_unresolved",
             )
         if not self._shortcut_open_backend.open_shortcut(target):
             self._failure_service.report(

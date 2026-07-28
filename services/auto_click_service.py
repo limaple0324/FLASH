@@ -11,6 +11,8 @@ from ctypes import wintypes
 from enum import Enum
 from typing import Callable, Protocol
 
+from services.game_operation_gate import GameOperationGate
+
 
 @dataclass(frozen=True, slots=True)
 class AutoClickSettings:
@@ -169,12 +171,14 @@ class AutoClickService:
         *,
         schedule: Callable[[int, Callable[[], None]], object],
         cancel: Callable[[object], None],
+        operation_gate: GameOperationGate | None = None,
     ) -> None:
         if not callable(getattr(backend, "click", None)):
             raise TypeError("backend must provide click(button).")
         self._backend = backend
         self._schedule = schedule
         self._cancel = cancel
+        self._operation_gate = operation_gate
         self._settings = AutoClickSettings()
         self._running = False
         self._sent_count = 0
@@ -471,9 +475,24 @@ class AutoClickService:
             elif disposition is _DirectLeftDisposition.BLOCKED:
                 delivered = False
             else:
-                delivered = bool(
-                    self._backend.click(self._settings.button)
+                lease = (
+                    self._operation_gate.acquire(
+                        "auto-click",
+                        timeout_seconds=0,
+                    )
+                    if self._operation_gate is not None
+                    else None
                 )
+                if self._operation_gate is not None and lease is None:
+                    delivered = False
+                else:
+                    try:
+                        delivered = bool(
+                            self._backend.click(self._settings.button)
+                        )
+                    finally:
+                        if lease is not None:
+                            lease.release()
         except OSError:
             delivered = False
         if not delivered:

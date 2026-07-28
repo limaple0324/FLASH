@@ -28,6 +28,7 @@ from services.sync_dispatch_scheduler import SyncDispatchScheduler
 from services.deferred_sync_operation_service import (
     DeferredSyncOperationService,
 )
+from services.game_operation_gate import GameOperationGate
 from core.reconnect_policy import ReconnectScreenState
 
 
@@ -348,6 +349,7 @@ class WindowsInputSyncController:
         target_windows_provider: (
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
+        operation_gate: GameOperationGate | None = None,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -371,6 +373,7 @@ class WindowsInputSyncController:
         self._role_operation_callback = role_operation_callback
         self._screen_state_provider = screen_state_provider
         self._target_windows_provider = target_windows_provider
+        self._operation_gate = operation_gate
         self._target_settings: dict[str, SyncTargetSettings] = {}
         self._dispatch_scheduler = SyncDispatchScheduler(
             thread_name="flash-key-delay",
@@ -390,11 +393,22 @@ class WindowsInputSyncController:
         key = normalize_approved_key(payload.get("key"))
         if key is None:
             return False
-        return self._deliver_deferred_key(
-            fingerprint,
-            key,
-            VIRTUAL_KEY_SEQUENCES[key],
+        lease = (
+            self._operation_gate.acquire("keyboard-deferred")
+            if self._operation_gate is not None
+            else None
         )
+        if self._operation_gate is not None and lease is None:
+            return False
+        try:
+            return self._deliver_deferred_key(
+                fingerprint,
+                key,
+                VIRTUAL_KEY_SEQUENCES[key],
+            )
+        finally:
+            if lease is not None:
+                lease.release()
     @property
     def expected_windows(self) -> int:
         return self._expected_windows
@@ -517,6 +531,7 @@ class WindowsInputSyncController:
         target_windows_provider: (
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
+        operation_gate: GameOperationGate | None = None,
     ) -> "WindowsInputSyncController":
         return cls(
             expected_windows=expected_windows,
@@ -534,6 +549,7 @@ class WindowsInputSyncController:
             role_operation_callback=role_operation_callback,
             screen_state_provider=screen_state_provider,
             target_windows_provider=target_windows_provider,
+            operation_gate=operation_gate,
         )
 
     def _record_role_operation(
@@ -620,6 +636,34 @@ class WindowsInputSyncController:
                 lease.release()
 
     def _run_scheduled_key(
+        self,
+        fingerprint: str,
+        normalized_key: str,
+        virtual_keys: tuple[int, ...],
+        execution_guard: Callable[[], bool] | None,
+    ) -> None:
+        lease = (
+            self._operation_gate.acquire(
+                "keyboard-scheduled",
+                execution_guard=execution_guard,
+            )
+            if self._operation_gate is not None
+            else None
+        )
+        if self._operation_gate is not None and lease is None:
+            return
+        try:
+            self._run_scheduled_key_without_gate(
+                fingerprint,
+                normalized_key,
+                virtual_keys,
+                execution_guard,
+            )
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def _run_scheduled_key_without_gate(
         self,
         fingerprint: str,
         normalized_key: str,
@@ -877,6 +921,51 @@ class WindowsInputSyncController:
         )
 
     def send_approved_key(
+        self,
+        key: object,
+        *,
+        policy: object,
+        execute: bool = False,
+        exclude_foreground: bool = False,
+        source_handle: int | None = None,
+        execution_guard: Callable[[], bool] | None = None,
+    ) -> InputSyncResult:
+        if not execute or self._operation_gate is None:
+            return self._send_approved_key_without_gate(
+                key,
+                policy=policy,
+                execute=execute,
+                exclude_foreground=exclude_foreground,
+                source_handle=source_handle,
+                execution_guard=execution_guard,
+            )
+        lease = self._operation_gate.acquire(
+            "keyboard-sync",
+            execution_guard=execution_guard,
+        )
+        if lease is None:
+            started_ns = perf_counter_ns()
+            return self._base_result(
+                key=normalize_approved_key(key),
+                policy=normalize_input_policy(policy),
+                windows=self._matching_windows(),
+                execute=True,
+                failures=("operation_gate_closed",),
+                controller_started_ns=started_ns,
+            )
+        try:
+            return self._send_approved_key_without_gate(
+                key,
+                policy=policy,
+                execute=True,
+                exclude_foreground=exclude_foreground,
+                source_handle=source_handle,
+                execution_guard=execution_guard,
+            )
+        finally:
+            lease.release()
+
+    def _send_approved_key_without_gate(
         self,
         key: object,
         *,

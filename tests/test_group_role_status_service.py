@@ -2,6 +2,11 @@ import json
 
 from adapters.windows_window import WindowInfo
 from core.reconnect_policy import ReconnectScreenState
+from core.target_window_contract import (
+    TargetWindowContract,
+    TargetWindowPhase,
+    TargetWindowSnapshot,
+)
 from services.group_launch_service import GroupLaunchService
 from services.group_role_status_service import (
     GroupRoleStatusService,
@@ -36,6 +41,11 @@ class Windows:
 
     def top_window_at(self, _x, _y):
         return None
+
+
+class FailingWindows(Windows):
+    def list_windows(self):
+        raise AssertionError("central snapshot must be the only enumeration")
 
 
 class Activator:
@@ -212,4 +222,63 @@ def test_unknown_existing_window_prevents_duplicate_launch(tmp_path):
     assert result.failure_code == "role_existing_window_unknown"
     assert opener.targets == []
     assert failure.has(f"role:{plan.targets[1].fingerprint}")
+
+
+def test_status_and_single_role_action_use_only_central_snapshot(tmp_path):
+    launch = configuration(tmp_path)
+    plan = launch.plan("兩支")
+    contracts = (
+        TargetWindowContract(
+            1,
+            "兩支",
+            "兩支:甲",
+            "甲",
+            "主窗口",
+            None,
+            "甲",
+            101,
+            plan.targets[0].fingerprint,
+            TargetWindowPhase.FOREGROUND,
+            True,
+            handle=7,
+            rect=(0, 0, 100, 100),
+            visible=True,
+        ),
+        TargetWindowContract(
+            1,
+            "兩支",
+            "兩支:乙",
+            "乙",
+            "同步窗口",
+            None,
+            "乙",
+            None,
+            plan.targets[1].fingerprint,
+            TargetWindowPhase.OFFLINE,
+            False,
+            failure_codes=("window_offline",),
+        ),
+    )
+    snapshot = TargetWindowSnapshot(1, "兩支", contracts)
+    activator = Activator()
+    service = GroupRoleStatusService(
+        launch,
+        FailingWindows(),
+        ReconnectFailureStatusService(),
+        activation_backend=activator,
+        target_snapshot_provider=lambda _name: snapshot,
+    )
+
+    rows = service.refresh("兩支")
+    activated = service.activate_or_launch(
+        "兩支",
+        plan.targets[0].fingerprint,
+    )
+
+    assert [row.status for row in rows] == [
+        ROLE_STATUS_OPEN,
+        ROLE_STATUS_CLOSED,
+    ]
+    assert activated.success is True
+    assert activator.handles == [7]
 

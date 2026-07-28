@@ -6,6 +6,7 @@ from services.game_time_timed_click_service import (
     TimedClickTarget,
     parse_target_time_ms,
 )
+from services.game_operation_gate import GameOperationGate
 
 
 FINGERPRINT = "a" * 64
@@ -144,3 +145,26 @@ def test_stop_cancels_pending_work_and_forgets_captured_target():
     assert scheduler.calls == []
     assert service.snapshot().target is None
     assert backend.presses == []
+
+
+def test_timed_click_fails_without_sending_when_reconnect_owns_gate():
+    scheduler = Scheduler()
+    backend = Backend()
+    gate = GameOperationGate()
+    active = gate.acquire("智慧重連")
+    assert active is not None
+    service = GameTimeTimedClickService(
+        backend,
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+        allowed_fingerprints_provider=lambda: (FINGERPRINT,),
+        wall_clock_ns=lambda: 0,
+        localtime=time.gmtime,
+        operation_gate=gate,
+    )
+    service.capture_target()
+    service._press_once(service.snapshot().target)
+
+    assert backend.presses == []
+    assert "其他遊戲操作" in service.snapshot().status
+    active.release()

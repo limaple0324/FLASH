@@ -36,7 +36,11 @@ from adapters.windows_pointer_sync import (
 from adapters.windows_timed_click import WindowsTimedClickBackend
 from adapters.windows_sync_calibration import Win32SyncCalibrationBackend
 from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
-from adapters.windows_window import Win32WindowBackend, WindowsWindowAdapter
+from adapters.windows_window import (
+    Win32WindowBackend,
+    WindowInfo,
+    WindowsWindowAdapter,
+)
 from adapters.windows_client_size import Win32WindowClientSizeBackend
 from adapters.windows_work_area import WindowsWorkAreaReader
 from adapters.windows_system_tray import (
@@ -159,6 +163,7 @@ from services.keyboard_sync_monitor import (
     KeyboardSyncMonitor,
     Win32KeyboardStateBackend,
 )
+from services.game_operation_gate import GameOperationGate
 from services.logger_service import LoggerService
 from services.lifecycle_contract import start_service, stop_service
 from services.mouse_sync_monitor import (
@@ -402,6 +407,8 @@ def build_services(
     synchronized_window_backend = Win32WindowBackend(
         PowerShellLaunchFingerprintResolver()
     )
+    game_operation_gate = GameOperationGate()
+    AppContext.register(GameOperationGate, game_operation_gate)
     target_window_contract_service = TargetWindowContractService(
         group_configuration_service,
         sync_scope_service,
@@ -631,6 +638,21 @@ def build_services(
     )
 
     def role_name_for_fingerprint(fingerprint: str) -> str:
+        state = workspace_service.snapshot()
+        current_name = (
+            state.current_group.name
+            if state.current_group is not None
+            else None
+        )
+        if current_name is not None:
+            current_plan = group_launch_service.plan(current_name)
+            current_target = (
+                current_plan.target_for_fingerprint(fingerprint)
+                if current_plan.ready
+                else None
+            )
+            if current_target is not None:
+                return current_target.display_name
         matches: list[str] = []
         for group in group_configuration_service.groups():
             plan = group_launch_service.plan(group.name)
@@ -658,6 +680,7 @@ def build_services(
         state_path=paths.data_dir() / RECONNECT_STATE_FILENAME,
         window_backend=synchronized_window_backend,
         target_windows_provider=current_target_windows,
+        operation_gate=game_operation_gate,
         failure_status_service=reconnect_failure_status_service,
         failure_record_callback=lambda role_name, detail: (
             operation_record_store.append(
@@ -703,6 +726,7 @@ def build_services(
         WindowsInputSyncController.for_real_windows(
             window_backend=synchronized_window_backend,
             target_windows_provider=current_target_windows,
+            operation_gate=game_operation_gate,
             conflict_arbiter=sync_conflict_arbiter,
             deferred_service=deferred_sync_service,
             reconnecting_provider=(
@@ -727,6 +751,7 @@ def build_services(
         WindowsPointerSyncController.for_real_windows(
             window_backend=synchronized_window_backend,
             target_windows_provider=current_target_windows,
+            operation_gate=game_operation_gate,
             conflict_arbiter=sync_conflict_arbiter,
             deferred_service=deferred_sync_service,
             reconnecting_provider=(
@@ -762,6 +787,13 @@ def build_services(
                 reconnect_controller.reconnecting_fingerprints
             ),
             record_callback=operation_record_store.append,
+            target_snapshot_provider=lambda group_name: (
+                target_window_contract_service.snapshot(
+                    group_name,
+                    expanded_sync_scope=False,
+                )
+            ),
+            operation_gate=game_operation_gate,
         ),
     )
     AppContext.register(
@@ -1259,6 +1291,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     smart_reconnect_controller = AppContext.get(
         WindowsSmartReconnectController
     )
+    game_operation_gate = AppContext.get(GameOperationGate)
     reconnect_failure_status_service = AppContext.get(
         ReconnectFailureStatusService
     )
@@ -1378,6 +1411,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             cancel=window.after_cancel,
             allowed_fingerprints_provider=current_timed_click_fingerprints,
             result_callback=complete_timed_click_result,
+            operation_gate=game_operation_gate,
         )
         if group_window_backend is not None
         else None
@@ -1399,6 +1433,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         Win32CursorClickBackend(),
         schedule=window.after,
         cancel=window.after_cancel,
+        operation_gate=game_operation_gate,
     )
     auto_click_pointer_source_backend = (
         Win32AutoClickPointerSourceBackend()
@@ -1412,6 +1447,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             "操作未能完成，原本資料保持不變。",
             parent=window,
         )
+
+    group_window_operation_lease = {"value": None}
+
+    def release_group_window_operation(expected_lease=None) -> None:
+        lease = group_window_operation_lease.get("value")
+        if expected_lease is not None and lease is not expected_lease:
+            return
+        group_window_operation_lease["value"] = None
+        if lease is not None:
+            lease.release()
 
     def complete_group_window_launch(
         result: GroupWindowLaunchResult,
@@ -1430,20 +1475,54 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         home_view.set_group_launch_state(False, result.player_message)
         home_view.refresh_group_role_statuses()
 
+    def start_group_window_operation(operation: str, starter) -> bool:
+        if group_window_operation_lease.get("value") is not None:
+            return False
+        lease = (
+            game_operation_gate.acquire(
+                operation,
+                timeout_seconds=0,
+            )
+            if game_operation_gate is not None
+            else None
+        )
+        if game_operation_gate is not None and lease is None:
+            return False
+        group_window_operation_lease["value"] = lease
+
+        def complete(result: GroupWindowLaunchResult) -> None:
+            release_group_window_operation(lease)
+            complete_group_window_launch(result)
+
+        try:
+            started = bool(starter(complete))
+        except Exception:
+            release_group_window_operation()
+            raise
+        if not started:
+            release_group_window_operation()
+        return started
+
     def launch_group_and_restore(group_name: str) -> bool:
         if group_window_launch_service is None:
             return False
-        return group_window_launch_service.start(
-            group_name,
-            complete_group_window_launch,
+        return start_group_window_operation(
+            "group-launch",
+            lambda complete: group_window_launch_service.start(
+                group_name,
+                complete,
+            ),
         )
 
     def restore_group_positions(group_name: str) -> bool:
         if group_window_launch_service is None:
             return False
-        return group_window_launch_service.start_restore(
-            group_name,
-            complete_group_window_launch,
+        return start_group_window_operation(
+            "group-position-restore",
+            lambda complete: group_window_launch_service.start_restore(
+                group_name,
+                complete,
+            ),
         )
 
     def stop_all_managed_games(_group_name: str) -> object:
@@ -1469,8 +1548,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return failure(
                 "整組啟動尚未完全停止，沒有關閉遊戲視窗。"
             )
-        return group_window_launch_service.start_stop_all(
-            complete_group_window_launch,
+        return start_group_window_operation(
+            "group-stop-all",
+            lambda complete: group_window_launch_service.start_stop_all(
+                complete,
+            ),
         )
 
     def record_group_positions(group_name: str) -> bool:
@@ -1795,35 +1877,58 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return None
         return plan
 
+    def scoped_group_entries(group_name: str, entry_ids):
+        if group_configuration_service is None:
+            return None
+        selected = group_configuration_service.group(group_name)
+        if selected is None:
+            return None
+        selected_by_id = {
+            entry.entry_id: entry for entry in selected.entries
+        }
+        candidates: dict[str, list[object]] = {}
+        for configured_group in group_configuration_service.groups():
+            for entry in configured_group.entries:
+                candidates.setdefault(entry.entry_id, []).append(entry)
+        resolved = []
+        for entry_id in entry_ids:
+            entry = selected_by_id.get(entry_id)
+            if entry is None:
+                matches = candidates.get(entry_id, ())
+                if len(matches) != 1:
+                    return None
+                entry = matches[0]
+            resolved.append(entry)
+        return tuple(resolved)
+
     def apply_group_identity(choice) -> GroupLaunchPlan | None:
         plan = selected_group_plan(choice)
         if plan is None:
             return None
-        if input_controller is not None:
-            scope = (
-                sync_scope_service.scope(choice.name)
-                if sync_scope_service is not None
-                else None
+        scope = (
+            sync_scope_service.scope(choice.name)
+            if sync_scope_service is not None
+            else None
+        )
+        if scope is None or not scope.ready:
+            return None
+        scoped_entries = scoped_group_entries(
+            choice.name,
+            scope.entry_ids,
+        )
+        if (
+            scoped_entries is None
+            or len(scoped_entries) != len(scope.fingerprints)
+        ):
+            return None
+        target_settings = {
+            fingerprint: entry.sync_settings
+            for entry, fingerprint in zip(
+                scoped_entries,
+                scope.fingerprints,
             )
-            if scope is None or not scope.ready:
-                return None
-            entry_by_id = {
-                entry.entry_id: entry
-                for configured_group in (
-                    group_configuration_service.groups()
-                    if group_configuration_service is not None
-                    else ()
-                )
-                for entry in configured_group.entries
-            }
-            target_settings = {
-                fingerprint: entry_by_id[entry_id].sync_settings
-                for entry_id, fingerprint in zip(
-                    scope.entry_ids,
-                    scope.fingerprints,
-                )
-                if entry_id in entry_by_id
-            }
+        }
+        if input_controller is not None:
             input_controller.set_expected_windows(len(scope.fingerprints))
             input_controller.set_allowed_fingerprints(scope.fingerprints)
             input_controller.set_target_settings(target_settings)
@@ -1849,6 +1954,49 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
             smart_reconnect_controller.set_group_launch_plan(plan)
         return plan
+
+    def clear_group_identity() -> None:
+        if input_controller is not None:
+            input_controller.set_allowed_fingerprints(None)
+        if pointer_sync_controller is not None:
+            pointer_sync_controller.set_allowed_fingerprints(None)
+        if smart_reconnect_controller is not None:
+            smart_reconnect_controller.set_group_launch_plan(None)
+
+    def close_group_operation_gate() -> bool:
+        return (
+            game_operation_gate is None
+            or game_operation_gate.close_and_wait(5.0)
+        )
+
+    def reopen_group_operation_gate() -> None:
+        if game_operation_gate is not None:
+            game_operation_gate.reopen()
+
+    def restore_group_identity(choice) -> bool:
+        try:
+            if choice is None:
+                clear_group_identity()
+                return True
+            return apply_group_identity(choice) is not None
+        except Exception:
+            return False
+
+    def restore_published_group(
+        previous_group,
+        previous_next_step: str,
+        previous_config_name,
+    ) -> bool:
+        try:
+            config.set(
+                CURRENT_GROUP_NAME_KEY,
+                previous_config_name,
+            )
+            workspace_service.set_current_group(previous_group)
+            workspace_service.set_next_step(previous_next_step)
+            return True
+        except Exception:
+            return False
 
     def change_input_policy(value: str) -> None:
         policy = normalize_input_policy(value)
@@ -1876,17 +2024,19 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         if character_view_service is not None:
             character_view_service.replace_characters(profiles)
+        refreshed_choice = (
+            group_selection_service.find(choice.name)
+            if group_selection_service is not None
+            else None
+        )
         return group_selection_service.workspace_group(
-            choice,
+            refreshed_choice or choice,
             tuple(profiles),
         )
 
     def change_group(name: str) -> GroupManagementViewResult:
-        current_group = (
-            workspace_service.snapshot().current_group
-            if workspace_service is not None
-            else None
-        )
+        current_workspace = workspace_service.snapshot()
+        current_group = current_workspace.current_group
         current_name = (
             current_group.name
             if current_group is not None
@@ -1911,19 +2061,55 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         if choice.name == current_name:
             return GroupManagementViewResult(True, choice.name)
-        if not stop_group_automation_for_configuration_change():
+        if not close_group_operation_gate():
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "目前操作尚未安全停止，未切換組別。",
+            )
+        old_choice = group_selection_service.find(current_name)
+        old_config_name = config.get(
+            CURRENT_GROUP_NAME_KEY,
+            current_name or "",
+        )
+        try:
+            automation_stopped = (
+                stop_group_automation_for_configuration_change()
+            )
+        except Exception:
+            automation_stopped = False
+        if not automation_stopped:
+            if restore_group_identity(old_choice):
+                reopen_group_operation_gate()
             return GroupManagementViewResult(
                 False,
                 current_name,
                 "自動操作尚未完全停止，未切換組別。",
             )
-        selected_workspace_group = workspace_group_for_choice(choice)
-        apply_group_identity(choice)
-        workspace_service.set_current_group(
-            selected_workspace_group
-        )
-        workspace_service.set_next_step("查看目前需要注意的內容")
-        config.set(CURRENT_GROUP_NAME_KEY, choice.name)
+        try:
+            if apply_group_identity(choice) is None:
+                raise RuntimeError("group_identity_unresolved")
+            selected_workspace_group = workspace_group_for_choice(choice)
+            config.set(CURRENT_GROUP_NAME_KEY, choice.name)
+            workspace_service.set_current_group(
+                selected_workspace_group
+            )
+            workspace_service.set_next_step("查看目前需要注意的內容")
+        except Exception:
+            rollback_ready = restore_group_identity(old_choice)
+            publication_restored = restore_published_group(
+                current_group,
+                current_workspace.next_step,
+                old_config_name,
+            )
+            if rollback_ready and publication_restored:
+                reopen_group_operation_gate()
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "組別身分無法完整重新綁定，未切換組別。",
+            )
+        reopen_group_operation_gate()
         if group_role_status_service is not None:
             group_role_status_service.clear_cache()
         refresh_character_data(choice.name)
@@ -2003,22 +2189,58 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if selected_name is not None
             else None
         )
-        workspace_service.set_current_group(
-            workspace_group_for_choice(choice)
-            if choice is not None
-            else None
+        current_workspace = workspace_service.snapshot()
+        current_group = current_workspace.current_group
+        current_name = (
+            current_group.name if current_group is not None else None
         )
-        workspace_service.set_next_step(
-            "查看目前需要注意的內容"
-            if choice is not None
-            else "選擇組別"
-        )
-        config.set(
+        old_choice = group_selection_service.find(current_name)
+        old_config_name = config.get(
             CURRENT_GROUP_NAME_KEY,
-            choice.name if choice is not None else "",
+            current_name or "",
         )
-        if choice is not None:
-            apply_group_identity(choice)
+        if not close_group_operation_gate():
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "目前操作尚未安全停止，組別設定未套用。",
+            )
+        try:
+            if choice is not None:
+                if apply_group_identity(choice) is None:
+                    raise RuntimeError("group_identity_unresolved")
+            else:
+                clear_group_identity()
+            selected_workspace_group = (
+                workspace_group_for_choice(choice)
+                if choice is not None
+                else None
+            )
+            config.set(
+                CURRENT_GROUP_NAME_KEY,
+                choice.name if choice is not None else "",
+            )
+            workspace_service.set_current_group(selected_workspace_group)
+            workspace_service.set_next_step(
+                "查看目前需要注意的內容"
+                if choice is not None
+                else "選擇組別"
+            )
+        except Exception:
+            rollback_ready = restore_group_identity(old_choice)
+            publication_restored = restore_published_group(
+                current_group,
+                current_workspace.next_step,
+                old_config_name,
+            )
+            if rollback_ready and publication_restored:
+                reopen_group_operation_gate()
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "組別身分無法完整重新綁定，設定未套用。",
+            )
+        reopen_group_operation_gate()
         if group_role_status_service is not None:
             group_role_status_service.clear_cache()
         if operation_record_store is not None:
@@ -2465,7 +2687,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if (
             group_configuration_service is None
             or group_launch_service is None
-            or synchronized_window_backend is None
+            or target_window_contract_service is None
         ):
             return None
         group = group_configuration_service.group(group_name)
@@ -2498,20 +2720,51 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         if target is None:
             return None
-        matches = tuple(
-            item
-            for item in synchronized_window_backend.list_windows()
-            if normalize_launch_fingerprint(item.launch_fingerprint)
-            == target.fingerprint
+        snapshot = target_window_contract_service.snapshot(
+            group_name,
+            expanded_sync_scope=False,
         )
-        return matches[0] if len(matches) == 1 else None
+        if snapshot.failure_codes:
+            return None
+        contract = next(
+            (
+                item
+                for item in snapshot.targets
+                if item.fingerprint == target.fingerprint
+                and item.safe
+            ),
+            None,
+        )
+        if (
+            contract is None
+            or contract.handle is None
+            or contract.rect is None
+            or contract.fingerprint is None
+        ):
+            return None
+        return WindowInfo(
+            contract.handle,
+            "",
+            contract.visible,
+            contract.phase.value == "minimized",
+            contract.rect,
+            contract.process_id,
+            None,
+            contract.fingerprint,
+        )
 
     def refresh_group_sync_identity(group_name: str) -> None:
         if group_selection_service is None:
             return
         choice = group_selection_service.find(group_name)
-        if choice is not None:
-            apply_group_identity(choice)
+        if choice is None or not close_group_operation_gate():
+            return
+        try:
+            applied = apply_group_identity(choice) is not None
+        except Exception:
+            applied = False
+        if applied:
+            reopen_group_operation_gate()
 
     def capture_sync_base_point(group_name: str) -> str:
         if (

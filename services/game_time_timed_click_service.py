@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
+from services.game_operation_gate import (
+    GameOperationGate,
+    GameOperationLease,
+)
 
 
 DAY_MS = 86_400_000
@@ -161,6 +165,7 @@ class GameTimeTimedClickService:
         result_callback: Callable[[GameTimeTimedClickResult], object] | None = None,
         wall_clock_ns: Callable[[], int] = time.time_ns,
         localtime: Callable[[float | None], time.struct_time] = time.localtime,
+        operation_gate: GameOperationGate | None = None,
     ) -> None:
         self._backend = backend
         self._schedule = schedule
@@ -169,6 +174,7 @@ class GameTimeTimedClickService:
         self._result_callback = result_callback
         self._wall_clock_ns = wall_clock_ns
         self._localtime = localtime
+        self._operation_gate = operation_gate
         self._offset_ms = 0
         self._auto_update = True
         self._target: TimedClickTarget | None = None
@@ -182,6 +188,7 @@ class GameTimeTimedClickService:
         self._poll_handle: object | None = None
         self._scheduled_handles: list[object] = []
         self._active_receipts: list[TimedClickPressReceipt] = []
+        self._active_operation_leases: dict[int, GameOperationLease] = {}
 
     def set_result_callback(
         self,
@@ -434,6 +441,9 @@ class GameTimeTimedClickService:
                 self._backend.release(receipt)
             except OSError:
                 pass
+            lease = self._active_operation_leases.pop(id(receipt), None)
+            if lease is not None:
+                lease.release()
         self._active_receipts.clear()
         self._status = message
         return self._result(
@@ -526,6 +536,23 @@ class GameTimeTimedClickService:
         return self._result(True, "fire", self._status)
 
     def _press_once(self, target: TimedClickTarget) -> None:
+        lease = (
+            self._operation_gate.acquire(
+                "timed-click",
+                timeout_seconds=0,
+            )
+            if self._operation_gate is not None
+            else None
+        )
+        if self._operation_gate is not None and lease is None:
+            self._status = "定時按下失敗：目前有其他遊戲操作。"
+            self._result(
+                False,
+                "press",
+                self._status,
+                "operation_gate_closed",
+            )
+            return
         try:
             receipt = self._backend.press(
                 target,
@@ -533,7 +560,13 @@ class GameTimeTimedClickService:
             )
         except OSError:
             receipt = None
+        except Exception:
+            if lease is not None:
+                lease.release()
+            raise
         if receipt is None:
+            if lease is not None:
+                lease.release()
             for handle in tuple(self._scheduled_handles):
                 self._cancel_handle(handle)
             self._scheduled_handles.clear()
@@ -546,6 +579,8 @@ class GameTimeTimedClickService:
             )
             return
         self._active_receipts.append(receipt)
+        if lease is not None:
+            self._active_operation_leases[id(receipt)] = lease
         self._sent_count += 1
         self._schedule_tracked(
             TIMED_CLICK_PRESS_MS,
@@ -559,6 +594,10 @@ class GameTimeTimedClickService:
             released = self._backend.release(receipt)
         except OSError:
             released = False
+        finally:
+            lease = self._active_operation_leases.pop(id(receipt), None)
+            if lease is not None:
+                lease.release()
         if receipt in self._active_receipts:
             self._active_receipts.remove(receipt)
         if not released:

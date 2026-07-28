@@ -42,6 +42,7 @@ from core.reconnect_policy import (
 )
 from core.sp1_boundaries import OperationResult, ReconnectState, SmartReconnectBoundary
 from services.group_launch_service import GroupLaunchPlan
+from services.game_operation_gate import GameOperationGate
 from services.reconnect_failure_status_service import (
     ReconnectFailureStatusService,
 )
@@ -463,6 +464,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         target_windows_provider: (
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
+        operation_gate: GameOperationGate | None = None,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -526,6 +528,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._failure_status_service = failure_status_service
         self._failure_record_callback = failure_record_callback
         self._target_windows_provider = target_windows_provider
+        self._operation_gate = operation_gate
         self._last_screen_states: dict[str, ReconnectScreenState] = {}
         self._action_confirmations: dict[
             str,
@@ -550,6 +553,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         target_windows_provider: (
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
+        operation_gate: GameOperationGate | None = None,
     ) -> "WindowsSmartReconnectController":
         window_backend = (
             window_backend
@@ -574,6 +578,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             failure_status_service=failure_status_service,
             failure_record_callback=failure_record_callback,
             target_windows_provider=target_windows_provider,
+            operation_gate=operation_gate,
         )
 
     @property
@@ -1543,7 +1548,29 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
 
     def reconnect(self) -> OperationResult:
-        result = self._scan(execute=True)
+        lease = (
+            self._operation_gate.acquire(
+                "smart-reconnect",
+                execution_guard=self._execution_allowed,
+            )
+            if self._operation_gate is not None
+            else None
+        )
+        if self._operation_gate is not None and lease is None:
+            return OperationResult(
+                False,
+                "reconnect.operation_paused",
+                "Reconnect execution is paused while targets are rebinding.",
+                {
+                    "next_check_seconds": 1,
+                    "failure_codes": ["operation_gate_closed"],
+                },
+            )
+        try:
+            result = self._scan(execute=True)
+        finally:
+            if lease is not None:
+                lease.release()
         if result.all_connected:
             return OperationResult(
                 True,

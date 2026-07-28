@@ -21,6 +21,7 @@ from main import (
 from services.app_context import AppContext
 from services.smart_reconnect_monitor import SmartReconnectMonitor
 from services.group_role_status_service import GroupRoleStatusService
+from services.game_operation_gate import GameOperationGate
 
 
 def test_build_services_registers_input_controller_and_safe_default(tmp_path):
@@ -56,9 +57,18 @@ def test_sync_services_share_one_lifecycle_identity_snapshot(tmp_path):
     keyboard = AppContext.get(WindowsInputSyncController)
     pointer = AppContext.get(WindowsPointerSyncController)
     statuses = AppContext.get(GroupRoleStatusService)
+    reconnect = AppContext.get(WindowsSmartReconnectController)
+    gate = AppContext.get(GameOperationGate)
 
     assert keyboard._window_backend is pointer._window_backend
     assert keyboard._window_backend is statuses._window_backend
+    assert keyboard._target_windows_provider is pointer._target_windows_provider
+    assert keyboard._target_windows_provider is reconnect._target_windows_provider
+    assert statuses._target_snapshot_provider is not None
+    assert keyboard._operation_gate is gate
+    assert pointer._operation_gate is gate
+    assert reconnect._operation_gate is gate
+    assert statuses._operation_gate is gate
 
 
 def test_home_exposes_three_policies_and_complete_confirmed_shortcuts():
@@ -111,19 +121,30 @@ def test_group_change_stops_all_automation_before_publishing_new_group():
         )
     ]
 
+    close_index = change_group.index(
+        "close_group_operation_gate()"
+    )
     stop_index = change_group.index(
         "stop_group_automation_for_configuration_change()"
     )
+    apply_index = change_group.index("apply_group_identity(choice)")
     workspace_index = change_group.index(
         "workspace_service.set_current_group("
     )
     config_index = change_group.index(
         "config.set(CURRENT_GROUP_NAME_KEY"
     )
+    reopen_index = change_group.rindex(
+        "reopen_group_operation_gate()"
+    )
 
-    assert stop_index < workspace_index < config_index
-    assert "if not stop_group_automation_for_configuration_change()" in (
-        change_group
+    assert (
+        close_index
+        < stop_index
+        < apply_index
+        < config_index
+        < workspace_index
+        < reopen_index
     )
 
 
