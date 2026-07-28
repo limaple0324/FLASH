@@ -169,7 +169,9 @@ def test_group_create_rename_move_and_delete_preserve_player_order(
     assert service.create_group("第一組") is True
     assert service.create_group("第二組") is True
     assert service.create_group("第二組") is False
+    fixed_group_id = service.group("第二組").group_id
     assert service.rename_group("第二組", "新名稱") is True
+    assert service.group("新名稱").group_id == fixed_group_id
     assert service.move_group("新名稱", -1) is True
     assert tuple(group.name for group in service.groups()) == (
         "新名稱",
@@ -484,6 +486,10 @@ def test_export_and_import_round_trip_preserves_group_order_and_layout(
     assert restored.group(first_group_name).launch_hotkey == "F3"
     assert restored.group(first_group_name).master_locked is True
     assert (
+        restored.group(first_group_name).group_id
+        == service.group(first_group_name).group_id
+    )
+    assert (
         restored.group("14支").entries[0].shortcut_path
         == service.group("14支").entries[0].shortcut_path
     )
@@ -648,3 +654,231 @@ def test_legacy_launch_delay_seeds_sync_delay_and_clear_resets_only_sync(
     cleared = service.group("14支").entries[1]
     assert cleared.sync_settings.delay_ms == 0
     assert cleared.placement.delay_ms == 8_000
+
+
+def test_v02_migration_preserves_safe_unknown_fields_and_source_hash(
+    tmp_path,
+):
+    shortcut = _shortcut(tmp_path, "中文角色")
+    legacy = tmp_path / "sync_launch_config.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "app_state": {
+                    "machine_id": "保留的舊版機器識別",
+                    "active_group_name": "中文組",
+                    "window_geometry": "900x600+10+20",
+                    "section_visibility": {
+                        "group": True,
+                        "token": "不得搬移",
+                    },
+                },
+                "future_root": {"enabled": True},
+                "groups": [
+                    {
+                        "name": "中文組",
+                        "custom_key_display": "F2",
+                        "sync_keyboard_enabled": True,
+                        "keyboard_key_displays": ["C", "CTRL"],
+                        "future_group": {"mode": "保留"},
+                        "launch_entries": [
+                            {
+                                "path": str(shortcut),
+                                "role": "主窗口",
+                                "x": -1200,
+                                "y": 50,
+                                "width": 916,
+                                "height": 629,
+                                "delay_ms": 250,
+                                "future_entry": {
+                                    "value": 7,
+                                    "password": "不得搬移",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "name": "空白組",
+                        "future_group": "仍保留",
+                        "launch_entries": [],
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    before = legacy.read_bytes()
+    owned = tmp_path / "data" / "group_configuration.json"
+
+    service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    payload = json.loads(owned.read_text(encoding="utf-8"))
+
+    assert legacy.read_bytes() == before
+    assert payload["schema_version"] == 2
+    assert payload["future_root"] == {"enabled": True}
+    assert payload["app_state"]["active_group_name"] == "中文組"
+    assert payload["app_state"]["window_geometry"] == "900x600+10+20"
+    assert payload["app_state"]["section_visibility"] == {"group": True}
+    assert (
+        payload["app_state"]["machine_id"]
+        == "保留的舊版機器識別"
+    )
+    assert tuple(group.name for group in service.groups()) == (
+        "中文組",
+        "空白組",
+    )
+    assert payload["groups"][0]["custom_key_display"] == "F2"
+    assert payload["groups"][0]["sync_keyboard_enabled"] is True
+    assert payload["groups"][0]["keyboard_key_displays"] == ["C", "CTRL"]
+    assert payload["groups"][0]["future_group"] == {"mode": "保留"}
+    assert payload["groups"][0]["launch_entries"][0]["future_entry"] == {
+        "value": 7
+    }
+    assert payload["groups"][1]["future_group"] == "仍保留"
+    assert service.migration_backup_path is not None
+    backup_payload = json.loads(
+        service.migration_backup_path.read_text(encoding="utf-8")
+    )
+    assert backup_payload == payload
+
+
+def test_schema_one_migration_creates_exact_recovery_backup(
+    tmp_path,
+):
+    shortcut = _shortcut(tmp_path, "舊設定角色")
+    owned = tmp_path / "group_configuration.json"
+    owned.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "owned_extra": {"keep": "yes"},
+                "groups": [
+                    {
+                        "name": "舊設定",
+                        "future_group": 8,
+                        "launch_entries": [
+                            {
+                                "path": str(shortcut),
+                                "future_entry": "保留",
+                            }
+                        ],
+                    }
+                ],
+                "sync_edges": {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    before = owned.read_bytes()
+
+    service = GroupConfigurationService(owned)
+    payload = json.loads(owned.read_text(encoding="utf-8"))
+
+    assert service.migration_backup_path is not None
+    assert service.migration_backup_path.read_bytes() == before
+    assert payload["schema_version"] == 2
+    assert payload["owned_extra"] == {"keep": "yes"}
+    assert payload["groups"][0]["future_group"] == 8
+    assert payload["groups"][0]["launch_entries"][0]["future_entry"] == "保留"
+
+
+def test_corrupt_owned_configuration_recovers_from_last_valid_backup(
+    tmp_path,
+):
+    shortcut = _shortcut(tmp_path, "可回復角色")
+    owned = tmp_path / "group_configuration.json"
+    backup = tmp_path / "group_configuration.json.bak"
+    valid = {
+        "schema_version": 2,
+        "groups": [
+            {
+                "name": "可回復組",
+                "launch_entries": [{"path": str(shortcut)}],
+            }
+        ],
+        "sync_edges": {},
+    }
+    backup.write_text(
+        json.dumps(valid, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    owned.write_text("{broken", encoding="utf-8")
+
+    service = GroupConfigurationService(owned)
+
+    assert service.recovered_from_backup is True
+    assert service.corrupt_backup_path is not None
+    assert service.corrupt_backup_path.read_text(encoding="utf-8") == "{broken"
+    assert service.group("可回復組") is not None
+    assert json.loads(owned.read_text(encoding="utf-8"))["schema_version"] == 2
+
+
+def test_failed_schema_migration_keeps_original_and_recovery_copy(
+    tmp_path,
+    monkeypatch,
+):
+    shortcut = _shortcut(tmp_path, "失敗回復角色")
+    owned = tmp_path / "group_configuration.json"
+    owned.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "groups": [
+                    {
+                        "name": "失敗回復組",
+                        "launch_entries": [{"path": str(shortcut)}],
+                    }
+                ],
+                "sync_edges": {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    before = owned.read_bytes()
+    original_writer = GroupConfigurationService._write_json_atomic.__func__
+
+    def fail_owned_write(cls, path, payload):
+        if path == owned:
+            raise OSError("simulated migration failure")
+        return original_writer(cls, path, payload)
+
+    monkeypatch.setattr(
+        GroupConfigurationService,
+        "_write_json_atomic",
+        classmethod(fail_owned_write),
+    )
+
+    with pytest.raises(OSError, match="simulated migration failure"):
+        GroupConfigurationService(owned)
+
+    backups = tuple(tmp_path.glob("group_configuration.json.pre-migration*"))
+    assert owned.read_bytes() == before
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == before
+
+
+def test_export_import_keeps_safe_root_unknown_fields(tmp_path):
+    legacy, _first, _second = _legacy(tmp_path)
+    legacy_payload = json.loads(legacy.read_text(encoding="utf-8"))
+    legacy_payload["future_root"] = {"value": "保留"}
+    legacy.write_text(
+        json.dumps(legacy_payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    source = GroupConfigurationService(
+        tmp_path / "source.json",
+        legacy_config_path=legacy,
+    )
+    exported = source.export_configuration(tmp_path / "exported.json")
+    restored = GroupConfigurationService(tmp_path / "restored.json")
+
+    restored.import_configuration(exported)
+    payload = json.loads(restored.path.read_text(encoding="utf-8"))
+
+    assert payload["future_root"] == {"value": "保留"}

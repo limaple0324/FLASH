@@ -30,7 +30,7 @@ class DataContractMigrationService:
         "habits": 1,
         "cards": 1,
         "reconnect": 4,
-        "legacy_settings": 1,
+        "legacy_settings": 2,
     }
 
     def __init__(self, config: ConfigManager) -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -79,11 +78,19 @@ class PlayerGroupChoice:
 
 
 def default_legacy_group_config_path() -> Path | None:
-    """Return the known old-program config path without scanning user folders."""
+    """Return a known old-program config path without scanning user folders."""
     app_data = os.environ.get("APPDATA")
     if not app_data:
         return None
-    return Path(app_data) / "輔V0.2" / "sync_launch_config_v02.json"
+    directory = Path(app_data) / "輔V0.2"
+    candidates = (
+        directory / "sync_launch_config.json",
+        directory / "sync_launch_config_v02.json",
+    )
+    return next(
+        (candidate for candidate in candidates if candidate.is_file()),
+        candidates[0],
+    )
 
 
 class GroupSelectionService:
@@ -109,8 +116,7 @@ class GroupSelectionService:
 
     @staticmethod
     def _group_id(name: str) -> str:
-        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
-        return f"group-{digest}"
+        return GroupConfigurationService.group_id_for_name(name)
 
     @staticmethod
     def _clean_name(value: object) -> str | None:
@@ -157,8 +163,10 @@ class GroupSelectionService:
     def choices(self) -> tuple[PlayerGroupChoice, ...]:
         counts = self._legacy_groups()
         configured_members: dict[str, tuple[PlayerGroupMember, ...]] = {}
+        configured_group_ids: dict[str, str] = {}
         if self._configuration is not None:
             for group in self._configuration.groups():
+                configured_group_ids[group.name] = group.group_id
                 members: list[PlayerGroupMember] = []
                 for entry in group.entries:
                     try:
@@ -203,7 +211,10 @@ class GroupSelectionService:
 
         return tuple(
             PlayerGroupChoice(
-                group_id=self._group_id(name),
+                group_id=configured_group_ids.get(
+                    name,
+                    self._group_id(name),
+                ),
                 name=name,
                 character_count=(
                     len(configured_members[name])

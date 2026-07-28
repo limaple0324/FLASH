@@ -1,9 +1,11 @@
 import json
 
 from core.window_registry import WindowRegistry
+from services.group_configuration_service import GroupConfigurationService
 from services.group_selection_service import (
     GroupSelectionService,
     PlayerGroupChoice,
+    default_legacy_group_config_path,
 )
 
 
@@ -68,6 +70,20 @@ def test_configured_choice_wins_over_legacy_active_group(tmp_path) -> None:
     assert service.find("不存在") is None
 
 
+def test_configured_group_keeps_fixed_id_after_rename(tmp_path) -> None:
+    configuration = GroupConfigurationService(tmp_path / "groups.json")
+    configuration.create_group("原名稱")
+    fixed_group_id = configuration.group("原名稱").group_id
+    configuration.rename_group("原名稱", "新名稱")
+    service = GroupSelectionService(
+        WindowRegistry(),
+        legacy_config_path=configuration.path,
+        configuration=configuration,
+    )
+
+    assert service.find("新名稱").group_id == fixed_group_id
+
+
 def test_malformed_legacy_config_fails_closed(tmp_path) -> None:
     path = tmp_path / "sync_launch_config_v02.json"
     path.write_text("{broken", encoding="utf-8")
@@ -76,6 +92,34 @@ def test_malformed_legacy_config_fails_closed(tmp_path) -> None:
 
     assert service.choices() == ()
     assert service.initial_choice() is None
+
+
+def test_default_legacy_path_prefers_confirmed_filename(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    directory = tmp_path / "輔V0.2"
+    directory.mkdir()
+    confirmed = directory / "sync_launch_config.json"
+    older_alias = directory / "sync_launch_config_v02.json"
+    confirmed.write_text("{}", encoding="utf-8")
+    older_alias.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+
+    assert default_legacy_group_config_path() == confirmed
+
+
+def test_default_legacy_path_supports_older_filename(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    directory = tmp_path / "輔V0.2"
+    directory.mkdir()
+    older_alias = directory / "sync_launch_config_v02.json"
+    older_alias.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+
+    assert default_legacy_group_config_path() == older_alias
 
 
 def test_workspace_group_uses_safe_choice() -> None:

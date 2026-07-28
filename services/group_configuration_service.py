@@ -34,6 +34,7 @@ class GroupConfigurationEntry:
 
 @dataclass(frozen=True, slots=True)
 class GroupConfiguration:
+    group_id: str
     name: str
     entries: tuple[GroupConfigurationEntry, ...]
     launch_hotkey: str = ""
@@ -62,7 +63,48 @@ class GroupMasterLockedError(ValueError):
 class GroupConfigurationService:
     """Own the new app's copy while treating the old config as read-only."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
+    _SUPPORTED_SCHEMA_VERSIONS = frozenset({1, SCHEMA_VERSION})
+    _ROOT_FIELDS = frozenset({"schema_version", "groups", "sync_edges"})
+    _GROUP_FIELDS = frozenset(
+        {
+            "name",
+            "group_id",
+            "launch_entries",
+            "launch_hotkey",
+            "launch_hotkey_display",
+            "master_locked",
+            "sync_base_x",
+            "sync_base_y",
+        }
+    )
+    _ENTRY_FIELDS = frozenset(
+        {
+            "entry_id",
+            "path",
+            "role",
+            "x",
+            "y",
+            "width",
+            "height",
+            "delay_ms",
+            "sync_offset_enabled",
+            "sync_offset_x",
+            "sync_offset_y",
+            "sync_delay_ms",
+            "role_id",
+        }
+    )
+    _SENSITIVE_FIELDS = frozenset(
+        {
+            "arguments",
+            "command_line",
+            "credential",
+            "launch_arguments",
+            "password",
+            "token",
+        }
+    )
 
     def __init__(
         self,
@@ -78,7 +120,43 @@ class GroupConfigurationService:
         )
         self._groups: list[dict[str, object]] = []
         self._sync_edges: dict[str, list[str]] = {}
+        self._root_extras: dict[str, object] = {}
+        self.migration_backup_path: Path | None = None
+        self.corrupt_backup_path: Path | None = None
+        self.recovered_from_backup = False
         self._load_or_import()
+
+    @classmethod
+    def _safe_extra_value(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return {
+                str(key): cls._safe_extra_value(item)
+                for key, item in value.items()
+                if (
+                    isinstance(key, str)
+                    and key.casefold() not in cls._SENSITIVE_FIELDS
+                )
+            }
+        if isinstance(value, list):
+            return [cls._safe_extra_value(item) for item in value]
+        return deepcopy(value)
+
+    @classmethod
+    def _safe_extras(
+        cls,
+        value: Mapping[str, object],
+        excluded: Iterable[str],
+    ) -> dict[str, object]:
+        excluded_names = {str(name).casefold() for name in excluded}
+        return {
+            str(key): cls._safe_extra_value(item)
+            for key, item in value.items()
+            if (
+                isinstance(key, str)
+                and key.casefold() not in excluded_names
+                and key.casefold() not in cls._SENSITIVE_FIELDS
+            )
+        }
 
     @staticmethod
     def _clean_name(value: object) -> str | None:
@@ -97,6 +175,18 @@ class GroupConfigurationService:
     def _entry_id(path: Path) -> str:
         normalized = os.path.normcase(str(path.resolve(strict=False)))
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def group_id_for_name(name: str) -> str:
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+        return f"group-{digest}"
+
+    @classmethod
+    def _clean_group_id(cls, value: object, name: str) -> str:
+        cleaned = cls._clean_name(value)
+        if cleaned is not None and cleaned.startswith("group-"):
+            return cleaned
+        return cls.group_id_for_name(name)
 
     @staticmethod
     def _clean_placement(
@@ -178,11 +268,14 @@ class GroupConfigurationService:
         if path.suffix.casefold() != ".lnk" or not path.is_file():
             return None
         role = cls._clean_name(value.get("role")) or "同步窗口"
-        entry = {
-            "entry_id": cls._entry_id(path),
-            "path": str(path),
-            "role": role,
-        }
+        entry = cls._safe_extras(value, cls._ENTRY_FIELDS)
+        entry.update(
+            {
+                "entry_id": cls._entry_id(path),
+                "path": str(path),
+                "role": role,
+            }
+        )
         placement = cls._clean_placement(value)
         if placement is not None:
             entry.update(
@@ -218,6 +311,7 @@ class GroupConfigurationService:
             return []
         groups: list[dict[str, object]] = []
         seen_names: set[str] = set()
+        seen_group_ids: set[str] = set()
         seen_launch_hotkeys: set[str] = set()
         for raw_group in raw_groups:
             if not isinstance(raw_group, Mapping):
@@ -251,8 +345,17 @@ class GroupConfigurationService:
             if launch_hotkey:
                 seen_launch_hotkeys.add(launch_hotkey)
             seen_names.add(name.casefold())
-            groups.append(
+            group_id = cls._clean_group_id(
+                raw_group.get("group_id"),
+                name,
+            )
+            if group_id in seen_group_ids:
+                group_id = cls.group_id_for_name(name)
+            seen_group_ids.add(group_id)
+            group = cls._safe_extras(raw_group, cls._GROUP_FIELDS)
+            group.update(
                 {
+                    "group_id": group_id,
                     "name": name,
                     "launch_entries": entries,
                     "launch_hotkey": launch_hotkey,
@@ -278,6 +381,7 @@ class GroupConfigurationService:
                     ),
                 }
             )
+            groups.append(group)
         return groups
 
     @staticmethod
@@ -306,66 +410,219 @@ class GroupConfigurationService:
             return None
         return payload if isinstance(payload, Mapping) else None
 
-    def _load_or_import(self) -> None:
-        current = self._read_json(self.path)
-        if (
-            current is not None
-            and current.get("schema_version") == self.SCHEMA_VERSION
-        ):
-            self._groups = self._clean_groups(current)
-            self._sync_edges = self._clean_sync_edges(
-                current.get("sync_edges")
+    @staticmethod
+    def _next_sidecar_path(path: Path, label: str) -> Path:
+        candidate = path.with_name(path.name + label)
+        index = 1
+        while candidate.exists():
+            candidate = path.with_name(path.name + f"{label}.{index}")
+            index += 1
+        return candidate
+
+    @staticmethod
+    def _write_bytes_atomic(path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        try:
+            with temporary.open("wb") as file:
+                file.write(data)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def _write_json_atomic(
+        cls,
+        path: Path,
+        payload: Mapping[str, object],
+    ) -> None:
+        data = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
             )
-            if self._merge_legacy_placements():
+            + "\n"
+        ).encode("utf-8")
+        cls._write_bytes_atomic(path, data)
+
+    def _preserve_owned_file(self, label: str) -> Path | None:
+        if not self.path.is_file():
+            return None
+        backup = self._next_sidecar_path(self.path, label)
+        self._write_bytes_atomic(backup, self.path.read_bytes())
+        return backup
+
+    @classmethod
+    def _payload_version(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        allow_legacy: bool,
+    ) -> int | None:
+        version = payload.get("schema_version")
+        if version is None and allow_legacy:
+            return 0
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version <= 0
+        ):
+            return None
+        if version > cls.SCHEMA_VERSION:
+            raise ValueError("group configuration is newer than this app.")
+        return version if version in cls._SUPPORTED_SCHEMA_VERSIONS else None
+
+    def _load_payload(self, payload: Mapping[str, object]) -> None:
+        self._root_extras = self._safe_extras(
+            payload,
+            self._ROOT_FIELDS,
+        )
+        self._groups = self._clean_groups(payload)
+        self._sync_edges = self._clean_sync_edges(
+            payload.get("sync_edges")
+        )
+
+    @classmethod
+    def _merge_missing_fields(
+        cls,
+        destination: dict[str, object],
+        source: Mapping[str, object],
+    ) -> bool:
+        changed = False
+        for key, value in source.items():
+            if key not in destination:
+                destination[key] = cls._safe_extra_value(value)
+                changed = True
+                continue
+            current = destination[key]
+            if isinstance(current, dict) and isinstance(value, Mapping):
+                changed = (
+                    cls._merge_missing_fields(current, value)
+                    or changed
+                )
+        return changed
+
+    def _load_or_import(self) -> None:
+        current_exists = self.path.is_file()
+        current = self._read_json(self.path)
+        if current is not None:
+            version = self._payload_version(current, allow_legacy=False)
+            if version is not None:
+                self._load_payload(current)
+                changed = self._merge_legacy_data()
+                if version < self.SCHEMA_VERSION:
+                    self.migration_backup_path = self._preserve_owned_file(
+                        ".pre-migration"
+                    )
+                    changed = True
+                if changed:
+                    self._save()
+                return
+
+        if current_exists:
+            self.corrupt_backup_path = self._next_sidecar_path(
+                self.path,
+                ".corrupt",
+            )
+            os.replace(self.path, self.corrupt_backup_path)
+
+        backup = self._read_json(self.backup_path)
+        if backup is not None:
+            backup_version = self._payload_version(
+                backup,
+                allow_legacy=False,
+            )
+            if backup_version is not None:
+                self._load_payload(backup)
+                self.recovered_from_backup = True
                 self._save()
-            return
+                return
+
         legacy = self._read_json(self._legacy_config_path)
-        self._groups = self._clean_groups(legacy or {})
-        self._sync_edges = {}
+        if legacy is not None:
+            self._load_payload(legacy)
         if self._groups:
+            self.migration_backup_path = self._next_sidecar_path(
+                self.path,
+                ".pre-migration",
+            )
+            self._write_json_atomic(
+                self.migration_backup_path,
+                self._payload(),
+            )
             self._save()
 
-    def _merge_legacy_placements(self) -> bool:
+    def _merge_legacy_data(self) -> bool:
         legacy = self._read_json(self._legacy_config_path)
+        if legacy is None:
+            return False
+        changed = self._merge_missing_fields(
+            self._root_extras,
+            self._safe_extras(legacy, self._ROOT_FIELDS),
+        )
         legacy_groups = self._clean_groups(legacy or {})
-        legacy_by_group: dict[str, dict[str, dict[str, object]]] = {}
+        legacy_by_group: dict[str, dict[str, object]] = {}
         for group in legacy_groups:
             entries = group.get("launch_entries")
             if not isinstance(entries, list):
                 continue
-            legacy_by_group[str(group["name"]).casefold()] = {
-                str(entry["entry_id"]): entry
-                for entry in entries
-                if self._clean_placement(entry) is not None
-            }
-        changed = False
+            legacy_by_group[str(group["name"]).casefold()] = group
         for group in self._groups:
-            legacy_entries = legacy_by_group.get(
+            legacy_group = legacy_by_group.get(
                 str(group["name"]).casefold(),
-                {},
             )
+            if legacy_group is None:
+                continue
+            changed = (
+                self._merge_missing_fields(
+                    group,
+                    self._safe_extras(
+                        legacy_group,
+                        self._GROUP_FIELDS,
+                    ),
+                )
+                or changed
+            )
+            raw_legacy_entries = legacy_group.get("launch_entries")
+            legacy_entries = {
+                str(entry["entry_id"]): entry
+                for entry in raw_legacy_entries
+                if isinstance(entry, Mapping)
+            } if isinstance(raw_legacy_entries, list) else {}
             entries = group.get("launch_entries")
             if not isinstance(entries, list):
                 continue
             for entry in entries:
-                if self._clean_placement(entry) is not None:
-                    continue
                 legacy_entry = legacy_entries.get(str(entry["entry_id"]))
                 if legacy_entry is None:
                     continue
-                placement = self._clean_placement(legacy_entry)
-                if placement is None:
-                    continue
-                entry.update(
-                    {
-                        "x": placement.x,
-                        "y": placement.y,
-                        "width": placement.width,
-                        "height": placement.height,
-                        "delay_ms": placement.delay_ms,
-                    }
+                changed = (
+                    self._merge_missing_fields(
+                        entry,
+                        self._safe_extras(
+                            legacy_entry,
+                            self._ENTRY_FIELDS,
+                        ),
+                    )
+                    or changed
                 )
-                changed = True
+                if self._clean_placement(entry) is not None:
+                    continue
+                placement = self._clean_placement(legacy_entry)
+                if placement is not None:
+                    entry.update(
+                        {
+                            "x": placement.x,
+                            "y": placement.y,
+                            "width": placement.width,
+                            "height": placement.height,
+                            "delay_ms": placement.delay_ms,
+                        }
+                    )
+                    changed = True
         return changed
 
     def _known_entry_ids(self) -> set[str]:
@@ -439,27 +696,24 @@ class GroupConfigurationService:
 
     def _payload(self) -> dict[str, object]:
         return {
+            **deepcopy(self._root_extras),
             "schema_version": self.SCHEMA_VERSION,
             "groups": self._groups,
             "sync_edges": self._sync_edges,
         }
 
+    @property
+    def backup_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".bak")
+
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        try:
-            temp_path.write_text(
-                json.dumps(
-                    self._payload(),
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
+        current = self._read_json(self.path)
+        if current is not None:
+            self._write_bytes_atomic(
+                self.backup_path,
+                self.path.read_bytes(),
             )
-            os.replace(temp_path, self.path)
-        finally:
-            temp_path.unlink(missing_ok=True)
+        self._write_json_atomic(self.path, self._payload())
 
     def groups(self) -> tuple[GroupConfiguration, ...]:
         result: list[GroupConfiguration] = []
@@ -488,6 +742,7 @@ class GroupConfigurationService:
             )
             result.append(
                 GroupConfiguration(
+                    group_id=str(raw_group["group_id"]),
                     name=name,
                     entries=entries,
                     launch_hotkey=normalize_feature_hotkey(
@@ -523,6 +778,7 @@ class GroupConfigurationService:
             return False
         self._groups.append(
             {
+                "group_id": self.group_id_for_name(cleaned),
                 "name": cleaned,
                 "launch_entries": [],
                 "launch_hotkey": "",
@@ -954,7 +1210,13 @@ class GroupConfigurationService:
 
         original_groups = self._groups
         original_edges = self._sync_edges
+        original_root_extras = self._root_extras
         proposed_groups = deepcopy(self._groups)
+        proposed_root_extras = deepcopy(self._root_extras)
+        self._merge_missing_fields(
+            proposed_root_extras,
+            self._safe_extras(payload, self._ROOT_FIELDS),
+        )
         replaced_source_ids: set[str] = set()
         obsolete_target_ids: set[str] = set()
         imported_names: list[str] = []
@@ -1022,6 +1284,7 @@ class GroupConfigurationService:
 
         self._groups = proposed_groups
         self._sync_edges = proposed_edges
+        self._root_extras = proposed_root_extras
         imported_edges = self._clean_sync_edges(payload.get("sync_edges"))
         for source_id, targets in imported_edges.items():
             proposed_edges[source_id] = list(targets)
@@ -1030,6 +1293,7 @@ class GroupConfigurationService:
         ):
             self._groups = original_groups
             self._sync_edges = original_edges
+            self._root_extras = original_root_extras
             raise SyncCycleError(SyncCycleError.player_message)
         self._sync_edges = proposed_edges
         try:
@@ -1037,6 +1301,7 @@ class GroupConfigurationService:
         except Exception:
             self._groups = original_groups
             self._sync_edges = original_edges
+            self._root_extras = original_root_extras
             raise
         return tuple(imported_names)
 
@@ -1058,6 +1323,7 @@ class GroupConfigurationService:
         )
         if raw_group is None:
             raw_group = {
+                "group_id": self.group_id_for_name(cleaned),
                 "name": cleaned,
                 "launch_entries": [],
                 "launch_hotkey": "",
