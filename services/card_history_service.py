@@ -1,4 +1,4 @@
-"""斷線與恢復提醒歷史的應用服務。"""
+"""只新增斷線提醒歷史的應用服務。"""
 
 from datetime import datetime
 

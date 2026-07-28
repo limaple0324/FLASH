@@ -34,9 +34,9 @@ def _card(reason: CardPriorityReason) -> GroupCard:
 
 @pytest.mark.parametrize(
     "reason",
-    [CardPriorityReason.DISCONNECTION, CardPriorityReason.RECOVERY],
+    [CardPriorityReason.DISCONNECTION],
 )
-def test_history_retains_only_confirmed_disconnection_and_recovery(reason):
+def test_history_retains_only_confirmed_disconnection(reason):
     card = _card(reason)
     recorded_at = datetime(2026, 7, 13, 10, 0, tzinfo=timezone.utc)
     history = CardHistory()
@@ -55,6 +55,7 @@ def test_history_retains_only_confirmed_disconnection_and_recovery(reason):
         CardPriorityReason.TIME_LIMIT,
         CardPriorityReason.LOSS_RISK,
         CardPriorityReason.ACTIVITY,
+        CardPriorityReason.RECOVERY,
         CardPriorityReason.GENERAL,
     ],
 )
@@ -99,3 +100,26 @@ def test_history_rejects_invalid_time_and_non_retained_direct_records():
 def test_history_policy_rejects_non_card_values():
     with pytest.raises(TypeError):
         should_retain(object())
+
+
+def test_existing_recovery_record_remains_readable_without_allowing_new_one():
+    payload = CardHistoryRecord(
+        recorded_at=datetime(2026, 7, 13, 10, 0, tzinfo=timezone.utc),
+        card_id="legacy-recovery",
+        priority_reason=CardPriorityReason.RECOVERY,
+        group_id="14-windows",
+        group_name="14支",
+        activity_id="recovery",
+        activity_name="恢復",
+        current_progress="已恢復",
+        affected_character_ids=(),
+        next_step=None,
+    ).to_dict()
+
+    record = CardHistoryRecord.from_dict(payload)
+
+    assert record.priority_reason is CardPriorityReason.RECOVERY
+    assert CardHistory().record(
+        _card(CardPriorityReason.RECOVERY),
+        datetime(2026, 7, 13, 10, 1, tzinfo=timezone.utc),
+    ) is None

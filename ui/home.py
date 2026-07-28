@@ -393,14 +393,17 @@ def _card_text(
     if card_view_state is not None:
         if card_view_state.is_empty:
             return "目前沒有需要提醒的內容"
-        first = card_view_state.cards[0]
-        if first.name_only:
-            return first.activity_name
-        next_step = first.next_step or "尚未提供"
-        return (
-            f"{first.group_name}｜{first.activity_name}\n"
-            f"{first.current_progress}\n下一步：{next_step}"
-        )
+        rendered = []
+        for card in card_view_state.cards:
+            if card.name_only:
+                rendered.append(card.activity_name)
+                continue
+            next_step = card.next_step or "尚未提供"
+            rendered.append(
+                f"{card.group_name}｜{card.activity_name}\n"
+                f"{card.current_progress}\n下一步：{next_step}"
+            )
+        return "\n\n".join(rendered)
     if not bool(status.get("self_check_passed", False)):
         return "提醒卡\n自我檢查發現問題"
     target = status.get("target_window", {})
@@ -642,6 +645,7 @@ class HomeView:
         ) = None,
         card_view_state: CardViewState | None = None,
         card_view_state_provider: Callable[[], CardViewState] | None = None,
+        on_card_action: Callable[[str, str], object] | None = None,
         target_window_state: TargetWindowObservation | None = None,
         target_window_state_provider: (
             Callable[[], TargetWindowObservation] | None
@@ -941,6 +945,7 @@ class HomeView:
         )
         self.card_view_state = card_view_state
         self.card_view_state_provider = card_view_state_provider
+        self.on_card_action = on_card_action
         self.target_window_state = target_window_state
         self.target_window_state_provider = target_window_state_provider
         self.characters = tuple(characters)
@@ -1081,6 +1086,7 @@ class HomeView:
         self._activity_description_status_label: Label | None = None
         self._activity_description_choice_ids: dict[str, str] = {}
         self._card_label: Label | None = None
+        self._card_actions_frame: Frame | None = None
         self._target_label: Label | None = None
         self._group_value_label: Label | None = None
         self._group_variable: StringVar | None = None
@@ -2509,6 +2515,8 @@ class HomeView:
             anchor="w",
         )
         self._card_label.pack(side=LEFT, fill=X, expand=True)
+        self._card_actions_frame = Frame(reminder, bg=SURFACE)
+        self._card_actions_frame.pack(side=RIGHT, padx=(8, 0))
         self._button(
             reminder,
             "重新查看",
@@ -8225,7 +8233,44 @@ class HomeView:
         self.card_view_state = state
         if self._card_label is not None:
             self._card_label.configure(text=text)
+        self._refresh_card_actions(state)
         return text
+
+    def _run_card_action(self, card_id: str, action_id: str) -> None:
+        if self.on_card_action is None:
+            return
+        try:
+            self.on_card_action(card_id, action_id)
+            self.refresh_cards()
+        except Exception as error:
+            self._report_refresh_error(error)
+
+    def _refresh_card_actions(
+        self,
+        state: CardViewState | None,
+    ) -> None:
+        frame = self._card_actions_frame
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        if state is None:
+            return
+        multiple_cards = len(state.cards) > 1
+        for card in state.cards:
+            for action in card.actions:
+                label = (
+                    f"{card.activity_name}：{action.label}"
+                    if multiple_cards
+                    else action.label
+                )
+                self._button(
+                    frame,
+                    label,
+                    lambda card_id=card.card_id, action_id=action.action_id: (
+                        self._run_card_action(card_id, action_id)
+                    ),
+                ).pack(fill=X, pady=2)
 
     def refresh_target_window(self) -> str:
         previous = self.target_window_state

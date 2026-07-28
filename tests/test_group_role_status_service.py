@@ -9,6 +9,8 @@ from core.target_window_contract import (
 )
 from services.group_launch_service import GroupLaunchService
 from services.group_role_status_service import (
+    GROUP_ROLE_STATUS_CHANGED_EVENT,
+    GroupRoleStatusChange,
     GroupRoleStatusService,
     ROLE_STATUS_CLOSED,
     ROLE_STATUS_DISCONNECTED,
@@ -16,6 +18,7 @@ from services.group_role_status_service import (
     ROLE_STATUS_OPEN,
     ROLE_STATUS_RECONNECTING,
 )
+from services.event_bus import EventBus
 from services.reconnect_failure_status_service import (
     ReconnectFailureStatusService,
 )
@@ -132,6 +135,38 @@ def test_ordered_rows_show_open_closed_disconnect_and_reconnect(tmp_path):
     assert service.refresh("兩支")[0].status == ROLE_STATUS_RECONNECTING
     reconnecting.clear()
     assert service.refresh("兩支")[0].status == ROLE_STATUS_OPEN
+
+
+def test_status_change_publishes_one_typed_event_per_real_transition(tmp_path):
+    launch = configuration(tmp_path)
+    plan = launch.plan("兩支")
+    states = {plan.targets[0].fingerprint: ReconnectScreenState.DISCONNECTED}
+    bus = EventBus()
+    changes = []
+    bus.subscribe(GROUP_ROLE_STATUS_CHANGED_EVENT, changes.append)
+    service = GroupRoleStatusService(
+        launch,
+        Windows((window(1, plan.targets[0].fingerprint),)),
+        ReconnectFailureStatusService(),
+        screen_states_provider=lambda: states,
+        event_bus=bus,
+    )
+
+    service.refresh("兩支")
+    service.refresh("兩支")
+    states.clear()
+    service.refresh("兩支")
+
+    first_role_changes = [
+        change
+        for change in changes
+        if change.current.action_id == plan.targets[0].fingerprint
+    ]
+    assert all(isinstance(change, GroupRoleStatusChange) for change in changes)
+    assert [change.current.status for change in first_role_changes] == [
+        ROLE_STATUS_DISCONNECTED,
+        ROLE_STATUS_OPEN,
+    ]
 
 
 def test_failure_status_wins_and_duplicate_window_fails_closed(tmp_path):

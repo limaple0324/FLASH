@@ -81,6 +81,7 @@ from habit.preference_store import PlayerHabitStore
 from services.activity_progress_monitor import ActivityProgressMonitor
 from services.activity_progress_service import (
     ACTIVITY_PROGRESS_CHANGED_EVENT,
+    ActivityProgressChange,
     ActivityProgressService,
 )
 from services.activity_description_service import ActivityDescriptionService
@@ -129,6 +130,14 @@ from services.character_detail_choice_service import CharacterDetailChoiceServic
 from services.character_note_service import CharacterNoteService
 from services.character_view_service import CharacterViewService
 from services.event_bus import EventBus
+from services.farm_timer_monitor import FarmTimerMonitor
+from services.farm_timer_service import (
+    FARM_COMPLETED_EVENT,
+    FARM_PLANTING_CONFIRMED_EVENT,
+    FarmCompleted,
+    FarmPlantingConfirmed,
+    FarmTimerService,
+)
 from services.group_selection_service import (
     GroupSelectionService,
     default_legacy_group_config_path,
@@ -148,7 +157,11 @@ from services.group_launch_service import (
     GroupLaunchService,
 )
 from services.group_role_status_monitor import GroupRoleStatusMonitor
-from services.group_role_status_service import GroupRoleStatusService
+from services.group_role_status_service import (
+    GROUP_ROLE_STATUS_CHANGED_EVENT,
+    GroupRoleStatusChange,
+    GroupRoleStatusService,
+)
 from services.group_window_launch_service import (
     GroupWindowLaunchResult,
     GroupWindowLaunchService,
@@ -204,6 +217,7 @@ from services.data_contract_migration_service import (
 from services.target_window_contract_service import (
     TargetWindowContractService,
 )
+from services.true_event_card_service import TrueEventCardService
 from ui.home import HomeView
 from ui.home import (
     GroupManagementViewResult,
@@ -245,6 +259,8 @@ ACTIVITY_PROGRESS_FILENAME = "activity_progress.json"
 CARD_HISTORY_FILENAME = "card_history.json"
 CARD_PREVIEW_SELECTION_FILENAME = "card_preview_selection.json"
 ACTIVITY_REMINDER_STATE_FILENAME = "activity_reminder_state.json"
+TRUE_EVENT_CARD_STATE_FILENAME = "true_event_card_state.json"
+FARM_TIMER_STATE_FILENAME = "farm_timers.json"
 ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
 PLAYER_HABIT_FILENAME = "player_habits.json"
 SYNC_SELECTED_KEYS_KEY = "sync_selected_keys"
@@ -575,6 +591,18 @@ def build_services(
         paths.data_dir() / OPERATION_RECORD_ARCHIVE_DIRNAME,
         role_names_provider=configured_role_names,
     )
+    true_event_card_service = TrueEventCardService(
+        card_coordinator,
+        workspace_service.snapshot,
+        progress_service.definition,
+        state_path=paths.data_dir() / TRUE_EVENT_CARD_STATE_FILENAME,
+        record_callback=operation_record_store.append,
+    )
+    farm_timer_service = FarmTimerService(
+        card_coordinator,
+        state_path=paths.data_dir() / FARM_TIMER_STATE_FILENAME,
+        record_callback=operation_record_store.append,
+    )
 
     AppContext.register(PathManager, paths)
     AppContext.register(LoggerService, logger)
@@ -667,6 +695,8 @@ def build_services(
         ReconnectFailureStatusService,
         reconnect_failure_status_service,
     )
+    AppContext.register(TrueEventCardService, true_event_card_service)
+    AppContext.register(FarmTimerService, farm_timer_service)
 
     def role_name_for_fingerprint(fingerprint: str) -> str:
         state = workspace_service.snapshot()
@@ -825,6 +855,7 @@ def build_services(
                 )
             ),
             operation_gate=game_operation_gate,
+            event_bus=event_bus,
         ),
     )
     AppContext.register(
@@ -1300,6 +1331,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     card_service = AppContext.get(CardService)
     card_coordinator = AppContext.get(CardCoordinator)
     activity_reminder_service = AppContext.get(ActivityReminderService)
+    true_event_card_service = AppContext.get(TrueEventCardService)
+    farm_timer_service = AppContext.get(FarmTimerService)
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
     card_preview_selection_store = AppContext.get(
         CardPreviewSelectionStore
@@ -1941,6 +1974,18 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             or len(plan.targets) != choice.character_count
         ):
             return None
+
+    def write_clipboard(value: str) -> bool:
+        try:
+            window.clipboard_clear()
+            window.clipboard_append(value)
+            window.update_idletasks()
+            return True
+        except TclError:
+            return False
+
+    if farm_timer_service is not None:
+        farm_timer_service.set_clipboard_writer(write_clipboard)
         return plan
 
     def scoped_group_entries(group_name: str, entry_ids):
@@ -3802,6 +3847,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if card_view_state_service is not None
             else None
         ),
+        on_card_action=(
+            lambda card_id, action_id: handle_card_action(
+                card_id,
+                action_id,
+            )
+        ),
         target_window_state=(
             target_window_state_service.snapshot()
             if target_window_state_service is not None
@@ -3973,13 +4024,56 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     home_view.build()
     refresh_character_data(current_character_group)
-    activity_progress_changed_handler = (
-        lambda _change: home_view.refresh_activity_schedule()
-    )
+    def activity_progress_changed_handler(change: object) -> None:
+        def apply_change() -> None:
+            home_view.refresh_activity_schedule()
+            if (
+                true_event_card_service is not None
+                and isinstance(change, ActivityProgressChange)
+            ):
+                true_event_card_service.handle_activity_progress(change)
+
+        dispatch_to_main_window(apply_change)
+
+    def group_role_status_changed_handler(change: object) -> None:
+        if (
+            true_event_card_service is not None
+            and isinstance(change, GroupRoleStatusChange)
+        ):
+            dispatch_to_main_window(
+                lambda: true_event_card_service.handle_role_status(change)
+            )
+
+    def farm_planting_confirmed_handler(event: object) -> None:
+        if (
+            farm_timer_service is not None
+            and isinstance(event, FarmPlantingConfirmed)
+        ):
+            dispatch_to_main_window(lambda: farm_timer_service.start(event))
+
+    def farm_completed_handler(event: object) -> None:
+        if (
+            farm_timer_service is not None
+            and isinstance(event, FarmCompleted)
+        ):
+            dispatch_to_main_window(lambda: farm_timer_service.complete(event))
+
     if event_bus is not None:
         event_bus.subscribe(
             ACTIVITY_PROGRESS_CHANGED_EVENT,
             activity_progress_changed_handler,
+        )
+        event_bus.subscribe(
+            GROUP_ROLE_STATUS_CHANGED_EVENT,
+            group_role_status_changed_handler,
+        )
+        event_bus.subscribe(
+            FARM_PLANTING_CONFIRMED_EVENT,
+            farm_planting_confirmed_handler,
+        )
+        event_bus.subscribe(
+            FARM_COMPLETED_EVENT,
+            farm_completed_handler,
         )
     auto_click_service.subscribe(
         lambda snapshot: home_view.set_auto_click_running(
@@ -4041,6 +4135,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
 
     def handle_card_action(card_id: str, action_id: str) -> object | None:
+        if farm_timer_service is not None:
+            result = farm_timer_service.handle_action(card_id, action_id)
+            if result is not None:
+                return result
         if player_habit_reminder_service is None:
             return None
         result = player_habit_reminder_service.handle_action(
@@ -4075,6 +4173,17 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     if activity_progress_monitor is not None:
         start_service(activity_progress_monitor)
+    farm_timer_monitor = (
+        FarmTimerMonitor(
+            farm_timer_service,
+            window.after,
+            window.after_cancel,
+        )
+        if farm_timer_service is not None
+        else None
+    )
+    if farm_timer_monitor is not None:
+        start_service(farm_timer_monitor)
 
     reconnect_status_refresh_id: str | None = None
 
@@ -4182,6 +4291,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         stop_named("card_expiry", expiry_monitor)
         stop_named("activity_reminder", activity_reminder_monitor)
         stop_named("activity_progress", activity_progress_monitor)
+        stop_named("farm_timer", farm_timer_monitor)
         stop_named("card_overlay", overlay_runtime)
         stop_named("keyboard_sync", keyboard_sync_monitor)
         stop_named("mouse_sync", mouse_sync_monitor)
@@ -4245,6 +4355,18 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             event_bus.unsubscribe(
                 ACTIVITY_PROGRESS_CHANGED_EVENT,
                 activity_progress_changed_handler,
+            )
+            event_bus.unsubscribe(
+                GROUP_ROLE_STATUS_CHANGED_EVENT,
+                group_role_status_changed_handler,
+            )
+            event_bus.unsubscribe(
+                FARM_PLANTING_CONFIRMED_EVENT,
+                farm_planting_confirmed_handler,
+            )
+            event_bus.unsubscribe(
+                FARM_COMPLETED_EVENT,
+                farm_completed_handler,
             )
         home_view.dispose()
         if window_identity is not None:

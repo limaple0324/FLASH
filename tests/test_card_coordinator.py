@@ -79,7 +79,7 @@ def test_visible_card_update_does_not_duplicate_history(tmp_path):
     assert len(coordinator.history.all()) == 1
 
 
-def test_visible_card_transition_to_recovery_adds_recovery_history(tmp_path):
+def test_visible_card_transition_to_recovery_does_not_add_history(tmp_path):
     coordinator = _coordinator(tmp_path)
     shown_at = datetime(2026, 7, 13, 22, 0, tzinfo=timezone.utc)
     recovered_at = datetime(2026, 7, 13, 22, 0, 10, tzinfo=timezone.utc)
@@ -95,9 +95,7 @@ def test_visible_card_transition_to_recovery_adds_recovery_history(tmp_path):
 
     assert tuple(item.priority_reason for item in coordinator.history.all()) == (
         CardPriorityReason.DISCONNECTION,
-        CardPriorityReason.RECOVERY,
     )
-    assert coordinator.history.all()[1].recorded_at == recovered_at
 
 
 def test_priority_queued_fourth_card_keeps_history_and_three_visible(tmp_path):

@@ -29,6 +29,7 @@ from services.game_operation_gate import GameOperationGate
 from services.reconnect_failure_status_service import (
     ReconnectFailureStatusService,
 )
+from services.event_bus import EventBus
 
 
 ROLE_STATUS_OPEN = "已開啟"
@@ -36,6 +37,7 @@ ROLE_STATUS_CLOSED = "未開啟"
 ROLE_STATUS_DISCONNECTED = "斷線"
 ROLE_STATUS_RECONNECTING = "重連中"
 ROLE_STATUS_FAILED = "重連失敗"
+GROUP_ROLE_STATUS_CHANGED_EVENT = "group_role_status_changed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +48,15 @@ class GroupRoleStatus:
     display_name: str
     status: str
     order: int
+
+
+@dataclass(frozen=True, slots=True)
+class GroupRoleStatusChange:
+    """A real observed role-state transition for downstream reminders."""
+
+    group_name: str
+    previous_status: str | None
+    current: GroupRoleStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +141,7 @@ class GroupRoleStatusService:
             Callable[[str], TargetWindowSnapshot] | None
         ) = None,
         operation_gate: GameOperationGate | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self._launch_service = launch_service
         self._window_backend = window_backend
@@ -151,6 +163,9 @@ class GroupRoleStatusService:
         self._record_callback = record_callback
         self._target_snapshot_provider = target_snapshot_provider
         self._operation_gate = operation_gate
+        if event_bus is not None and not isinstance(event_bus, EventBus):
+            raise TypeError("event_bus must be EventBus.")
+        self._event_bus = event_bus
         self._lock = threading.RLock()
         self._group_name: str | None = None
         self._rows: tuple[GroupRoleStatus, ...] = ()
@@ -310,8 +325,18 @@ class GroupRoleStatusService:
             self._group_name = plan.group_name
             self._rows = result
         for item in result:
-            if previous.get(item.action_id) != item.status:
+            previous_status = previous.get(item.action_id)
+            if previous_status != item.status:
                 self._record("狀態偵測", item.display_name, item.status)
+                if self._event_bus is not None:
+                    self._event_bus.publish(
+                        GROUP_ROLE_STATUS_CHANGED_EVENT,
+                        GroupRoleStatusChange(
+                            group_name=plan.group_name,
+                            previous_status=previous_status,
+                            current=item,
+                        ),
+                    )
         return result
 
     def activate_or_launch(

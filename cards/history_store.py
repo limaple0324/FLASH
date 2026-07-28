@@ -1,4 +1,4 @@
-"""斷線與恢復提醒歷史的原子化 JSON 儲存。"""
+"""斷線提醒歷史的原子化 JSON 儲存，並相容既有紀錄。"""
 
 from __future__ import annotations
 

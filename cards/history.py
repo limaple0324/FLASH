@@ -1,4 +1,4 @@
-"""只保留斷線與必要恢復提醒的精簡歷史。"""
+"""只新增斷線提醒歷史，並相容讀取既有恢復紀錄。"""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,7 +9,8 @@ from cards.models import GroupCard
 from cards.priority import CardPriorityReason
 
 
-_RETAINED_REASONS = frozenset(
+_RETAINED_REASONS = frozenset({CardPriorityReason.DISCONNECTION})
+_STORED_REASONS = frozenset(
     {
         CardPriorityReason.DISCONNECTION,
         CardPriorityReason.RECOVERY,
@@ -49,8 +50,8 @@ class CardHistoryRecord:
         _require_aware(self.recorded_at, "recorded_at")
         if not isinstance(self.priority_reason, CardPriorityReason):
             raise TypeError("priority_reason must be CardPriorityReason.")
-        if self.priority_reason not in _RETAINED_REASONS:
-            raise ValueError("Only disconnection and recovery records may be retained.")
+        if self.priority_reason not in _STORED_REASONS:
+            raise ValueError("Only supported historical records may be loaded.")
         affected_ids = tuple(
             _required_text(item, "affected_character_ids item")
             for item in self.affected_character_ids

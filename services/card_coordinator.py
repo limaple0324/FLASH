@@ -1,4 +1,4 @@
-"""協調可見提醒卡與斷線／恢復歷史。"""
+"""協調可見提醒卡與斷線歷史。"""
 
 from datetime import datetime, timedelta, timezone
 
