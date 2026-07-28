@@ -232,6 +232,7 @@ ACTIVITY_REMINDER_STATE_FILENAME = "activity_reminder_state.json"
 ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
 PLAYER_HABIT_FILENAME = "player_habits.json"
 SYNC_SELECTED_KEYS_KEY = "sync_selected_keys"
+SYNC_KEYS_COLLAPSED_KEY = "sync_keys_collapsed"
 FEATURE_HOTKEYS_KEY = "feature_hotkeys"
 GAME_TIME_OFFSET_MS_KEY = "game_time_offset_ms"
 GAME_TIME_AUTO_UPDATE_KEY = "game_time_auto_update"
@@ -333,6 +334,7 @@ def build_services(
             SMART_RECONNECT_CONSENT_KEY: False,
             UI_THEME_KEY: "clear_blue",
             SYNC_SELECTED_KEYS_KEY: ["ESC"],
+            SYNC_KEYS_COLLAPSED_KEY: True,
             FEATURE_HOTKEYS_KEY: {
                 "sync": "XBUTTON1",
                 "reconnect": "",
@@ -1615,6 +1617,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if isinstance(key, str) and key in known_sync_keys
         )
     )
+    configured_sync_keys_collapsed = (
+        config.get(SYNC_KEYS_COLLAPSED_KEY, True) is not False
+        if config is not None
+        else True
+    )
     raw_feature_hotkeys = (
         config.get(FEATURE_HOTKEYS_KEY, {})
         if config is not None
@@ -1636,6 +1643,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         configured_selected_sync_keys[:] = normalized
         if config is not None:
             config.set(SYNC_SELECTED_KEYS_KEY, normalized)
+        return True
+
+    def change_sync_keys_collapsed(collapsed: bool) -> bool:
+        if config is not None:
+            config.set(SYNC_KEYS_COLLAPSED_KEY, bool(collapsed))
         return True
 
     def change_feature_hotkey(feature: str, hotkey: str) -> bool:
@@ -3291,6 +3303,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_keyboard_sync_change=change_keyboard_sync,
         selected_sync_keys=tuple(configured_selected_sync_keys),
         on_selected_sync_keys_change=change_selected_sync_keys,
+        sync_keys_collapsed=configured_sync_keys_collapsed,
+        on_sync_keys_collapsed_change=change_sync_keys_collapsed,
         feature_hotkeys=configured_feature_hotkeys,
         on_feature_hotkey_change=change_feature_hotkey,
         group_choices=group_choices,

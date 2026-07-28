@@ -13,6 +13,7 @@ from ui.home import (
     _contain_geometry,
     _reordered_entry_ids,
     _safe_character_lines,
+    _selected_sync_key_summary,
     _workspace_state_text,
     theme_palette,
 )
@@ -46,6 +47,21 @@ def test_home_has_real_product_pages_and_group_selection() -> None:
     assert "設定按鈕位置" in source
     assert "啟用定時" in source
     assert "時間來源：系統時間" in source
+
+
+def test_sync_key_section_has_saved_collapsed_summary_and_full_catalog() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+
+    assert 'text="勾選要同步的遊戲按鍵"' in source
+    assert '"展開設定"' in source
+    assert '"收合設定"' in source
+    assert "self.sync_keys_collapsed" in source
+    assert "on_sync_keys_collapsed_change" in source
+    assert "for shortcut in CONFIRMED_GAME_SHORTCUTS:" in source
+    assert _selected_sync_key_summary(("SHIFT", "ESC", "未知", "ESC")) == (
+        "ESC、SHIFT"
+    )
+    assert _selected_sync_key_summary(()) == "未勾選"
 
 
 def test_current_group_page_replaces_sidebar_duplicate() -> None:

@@ -14,6 +14,7 @@ from main import (
     INPUT_POLICY_KEY,
     SMART_RECONNECT_ENABLED_KEY,
     SMART_RECONNECT_CONSENT_KEY,
+    SYNC_KEYS_COLLAPSED_KEY,
     TIMED_CLICK_SETTINGS_KEY,
     build_services,
 )
@@ -36,6 +37,7 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     assert config.get(SMART_RECONNECT_CONSENT_KEY) is False
     assert config.get(GAME_TIME_OFFSET_MS_KEY) == 0
     assert config.get(GAME_TIME_AUTO_UPDATE_KEY) is True
+    assert config.get(SYNC_KEYS_COLLAPSED_KEY) is True
     assert config.get(TIMED_CLICK_SETTINGS_KEY) == {
         "target_time": "",
         "lead_ms": 120,
@@ -69,6 +71,19 @@ def test_home_exposes_three_policies_and_complete_confirmed_shortcuts():
     assert "停止同步視窗" in source
     assert "CONFIRMED_GAME_SHORTCUTS" in source
     assert "測試 B" not in source
+
+
+def test_sync_key_collapsed_state_is_loaded_saved_and_wired_to_home():
+    source = Path("main.py").read_text(encoding="utf-8")
+
+    assert 'SYNC_KEYS_COLLAPSED_KEY = "sync_keys_collapsed"' in source
+    assert "def change_sync_keys_collapsed(" in source
+    assert "config.set(SYNC_KEYS_COLLAPSED_KEY, bool(collapsed))" in source
+    assert "sync_keys_collapsed=configured_sync_keys_collapsed" in source
+    assert (
+        "on_sync_keys_collapsed_change=change_sync_keys_collapsed"
+        in source
+    )
 
 
 def test_group_member_continuous_click_never_falls_back_to_one_window():

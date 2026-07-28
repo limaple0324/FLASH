@@ -436,6 +436,18 @@ def _safe_character_detail_line(detail: PlayerCharacterDetail) -> str:
     return f"{detail.display_name}｜{level}｜{role}{note}"
 
 
+def _selected_sync_key_summary(keys: Iterable[str]) -> str:
+    selected = {
+        key for key in keys if isinstance(key, str)
+    }
+    ordered = tuple(
+        shortcut.key
+        for shortcut in CONFIRMED_GAME_SHORTCUTS
+        if shortcut.key in selected
+    )
+    return "未勾選" if not ordered else "、".join(ordered)
+
+
 class HomeView:
     """Usable SP3 shell that keeps confirmed capabilities in separate pages."""
 
@@ -452,6 +464,10 @@ class HomeView:
         selected_sync_keys: Iterable[str] = ("ESC",),
         on_selected_sync_keys_change: (
             Callable[[tuple[str, ...]], object] | None
+        ) = None,
+        sync_keys_collapsed: bool = True,
+        on_sync_keys_collapsed_change: (
+            Callable[[bool], object] | None
         ) = None,
         feature_hotkeys: Mapping[str, object] | None = None,
         on_feature_hotkey_change: (
@@ -710,6 +726,10 @@ class HomeView:
             )
         )
         self.on_selected_sync_keys_change = on_selected_sync_keys_change
+        self.sync_keys_collapsed = bool(sync_keys_collapsed)
+        self.on_sync_keys_collapsed_change = (
+            on_sync_keys_collapsed_change
+        )
         self.feature_hotkeys = {
             name: normalize_feature_hotkey(
                 (feature_hotkeys or {}).get(name)
@@ -930,6 +950,10 @@ class HomeView:
         self._keyboard_sync_button: Button | None = None
         self._sync_key_variables: dict[str, IntVar] = {}
         self._sync_key_count_label: Label | None = None
+        self._sync_key_summary_label: Label | None = None
+        self._sync_key_toggle_button: Button | None = None
+        self._sync_key_list_frame: Frame | None = None
+        self._sync_key_actions_frame: Frame | None = None
         self._feature_hotkey_variables: dict[str, StringVar] = {}
         self._smart_reconnect_label: Label | None = None
         self._smart_reconnect_button: Button | None = None
@@ -2812,16 +2836,49 @@ class HomeView:
             highlightthickness=0,
         )
         policy_menu.pack(fill=X)
-        Label(
+        shortcut_summary = Frame(
             input_card,
+            bg=SURFACE,
+        )
+        shortcut_summary.pack(fill=X, pady=(12, 0))
+        shortcut_heading = Frame(shortcut_summary, bg=SURFACE)
+        shortcut_heading.pack(fill=X)
+        Label(
+            shortcut_heading,
             text="勾選要同步的遊戲按鍵",
             font=("Microsoft JhengHei UI", 10, "bold"),
             bg=SURFACE,
             fg=TEXT,
             anchor="w",
-        ).pack(fill=X, pady=(12, 4))
+        ).pack(side=LEFT)
+        self._sync_key_toggle_button = self._button(
+            shortcut_heading,
+            "",
+            self._toggle_sync_key_settings,
+        )
+        self._sync_key_toggle_button.pack(side=RIGHT)
+        self._sync_key_count_label = Label(
+            shortcut_summary,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        )
+        self._sync_key_count_label.pack(fill=X, pady=(4, 0))
+        self._sync_key_summary_label = Label(
+            shortcut_summary,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
+            wraplength=720,
+        )
+        self._sync_key_summary_label.pack(fill=X, pady=(2, 0))
         shortcut_list = Frame(input_card, bg=BACKGROUND, padx=10, pady=8)
-        shortcut_list.pack(fill=X)
+        self._sync_key_list_frame = shortcut_list
         self._sync_key_variables = {}
         for shortcut in CONFIRMED_GAME_SHORTCUTS:
             variable = IntVar(
@@ -2844,6 +2901,7 @@ class HomeView:
             ).pack(fill=X, anchor="w")
 
         actions = Frame(input_card, bg=SURFACE)
+        self._sync_key_actions_frame = actions
         actions.pack(fill=X, pady=(10, 0))
         self._keyboard_sync_button = self._button(
             actions,
@@ -2860,19 +2918,12 @@ class HomeView:
             fg=MUTED,
         )
         self._keyboard_sync_label.pack(side=LEFT, padx=12)
-        self._sync_key_count_label = Label(
-            actions,
-            text="",
-            font=("Microsoft JhengHei UI", 9),
-            bg=SURFACE,
-            fg=MUTED,
-        )
-        self._sync_key_count_label.pack(side=RIGHT)
         self._build_feature_hotkey_selector(
             input_card,
             "sync",
             "同步啟閉快捷鍵",
         )
+        self._apply_sync_key_collapsed_state()
         self._refresh_keyboard_sync_controls()
 
         reconnect_card = self._card(page)
@@ -3291,6 +3342,34 @@ class HomeView:
         self.selected_sync_keys = selected
         self._refresh_keyboard_sync_controls()
 
+    def _toggle_sync_key_settings(self) -> None:
+        desired = not self.sync_keys_collapsed
+        if self.on_sync_keys_collapsed_change is not None:
+            accepted = self.on_sync_keys_collapsed_change(desired)
+            if accepted is False:
+                return
+        self.sync_keys_collapsed = desired
+        self._apply_sync_key_collapsed_state()
+
+    def _apply_sync_key_collapsed_state(self) -> None:
+        if self._sync_key_list_frame is not None:
+            if self.sync_keys_collapsed:
+                self._sync_key_list_frame.pack_forget()
+            elif self._sync_key_actions_frame is not None:
+                self._sync_key_list_frame.pack(
+                    fill=X,
+                    pady=(6, 0),
+                    before=self._sync_key_actions_frame,
+                )
+        if self._sync_key_toggle_button is not None:
+            self._sync_key_toggle_button.configure(
+                text=(
+                    "展開設定"
+                    if self.sync_keys_collapsed
+                    else "收合設定"
+                )
+            )
+
     def _toggle_keyboard_sync(self) -> None:
         desired = not self.keyboard_sync_enabled
         if self.on_keyboard_sync_change is None:
@@ -3325,8 +3404,15 @@ class HomeView:
         if self._sync_key_count_label is not None:
             self._sync_key_count_label.configure(
                 text=(
-                    f"已勾選 {len(self.selected_sync_keys)}／"
+                    f"已啟用 {len(self.selected_sync_keys)}／"
                     f"{len(CONFIRMED_GAME_SHORTCUTS)} 個按鍵"
+                )
+            )
+        if self._sync_key_summary_label is not None:
+            self._sync_key_summary_label.configure(
+                text=(
+                    "已勾選："
+                    f"{_selected_sync_key_summary(self.selected_sync_keys)}"
                 )
             )
 
