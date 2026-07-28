@@ -27,6 +27,21 @@ def test_group_configuration_transfer_is_wired_to_current_group_page() -> None:
         "on_reorder_group_entries=reorder_group_entries"
         in source
     )
+    stop_start = source.index("def stop_all_managed_games(")
+    gate_call = source.index(
+        "stop_group_automation_for_configuration_change()",
+        stop_start,
+    )
+    launch_stop = source.index(
+        "group_window_launch_service.stop(",
+        stop_start,
+    )
+    managed_stop = source.index(
+        "group_window_launch_service.start_stop_all(",
+        stop_start,
+    )
+    assert gate_call < launch_stop < managed_stop
+    assert "on_stop_all_managed_games=stop_all_managed_games" in source
     assert "def change_group_launch_hotkey(" in source
     assert "GroupLaunchHotkeyMonitor(" in source
     assert (

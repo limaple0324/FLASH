@@ -3,6 +3,9 @@ import json
 from adapters.windows_window import WindowInfo
 from services.group_launch_service import GroupLaunchService
 from services.group_window_launch_service import GroupWindowLaunchService
+from services.managed_game_process_service import (
+    ManagedGameProcessService,
+)
 
 
 class Resolver:
@@ -54,6 +57,22 @@ class Placer:
 
     def place(self, handle, placement):
         self.calls.append((handle, placement))
+        return True
+
+
+class Closer:
+    def __init__(self, handles):
+        self.handles = set(handles)
+        self.closed = []
+
+    def is_window(self, handle):
+        return handle in self.handles
+
+    def close_window(self, handle):
+        if handle not in self.handles:
+            return False
+        self.closed.append(handle)
+        self.handles.remove(handle)
         return True
 
 
@@ -264,3 +283,41 @@ def test_records_all_current_exact_window_positions_in_one_save(tmp_path):
     assert saved[0][1][plan.targets[0].shortcut_path].x == -2000
     assert saved[0][1][plan.targets[0].shortcut_path].width == 916
     assert saved[0][1][plan.targets[1].shortcut_path].y == 200
+
+
+def test_successful_group_launch_records_exact_ownership_for_safe_stop(
+    tmp_path,
+):
+    launch = launch_service(tmp_path)
+    plan = launch.plan("兩支")
+    windows = Windows(
+        (
+            open_window(1, plan.targets[0].fingerprint),
+            open_window(2, plan.targets[1].fingerprint),
+            open_window(99, "9" * 64),
+        )
+    )
+    closer = Closer((1, 2, 99))
+    managed = ManagedGameProcessService(
+        tmp_path / "managed.json",
+        windows,
+        close_backend=closer,
+    )
+    service = GroupWindowLaunchService(
+        launch,
+        windows,
+        placement_backend=Placer(),
+        managed_process_service=managed,
+    )
+
+    launched = service._run("兩支")
+    assert launched.success is True
+    assert len(managed.records()) == 2
+
+    stopped = service._run_stop_all("全部受管遊戲")
+
+    assert len(managed.records()) == 0
+    assert stopped.success is True
+    assert stopped.stopped_count == 2
+    assert closer.closed == [1, 2]
+    assert 99 in closer.handles

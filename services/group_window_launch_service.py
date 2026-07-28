@@ -23,6 +23,9 @@ from services.group_launch_service import (
     GroupLaunchTarget,
     SavedWindowPlacement,
 )
+from services.managed_game_process_service import (
+    ManagedGameProcessService,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,12 +35,18 @@ class GroupWindowLaunchResult:
     total_count: int = 0
     launched_count: int = 0
     restored_count: int = 0
+    stopped_count: int = 0
     failure_code: str | None = None
     action: str = "launch"
 
     @property
     def player_message(self) -> str:
         if self.success:
+            if self.action == "stop":
+                return (
+                    f"已停止 {self.stopped_count} 個受管遊戲視窗；"
+                    "其他視窗保持不變。"
+                )
             if self.action == "record":
                 return (
                     f"已記錄：{self.group_name} 共 {self.total_count} 個"
@@ -64,6 +73,17 @@ class GroupWindowLaunchResult:
             "group_launch_cancelled": "整組啟動已停止，尚未處理的視窗保持不變。",
             "group_window_missing": "目前組別尚有角色視窗未開啟，沒有變更任何位置。",
             "group_layout_save_failed": "目前位置未能完整保存，原設定保持不變。",
+            "group_process_ownership_unavailable": (
+                "遊戲視窗已處理，但受管程序身分未能完整保存；"
+                "這些視窗不會被「停止全部」操作。"
+            ),
+            "managed_game_stop_partial": (
+                f"已停止 {self.stopped_count} 個受管遊戲視窗；"
+                "未確認的視窗保持不變，請查看紀錄。"
+            ),
+            "managed_game_state_unavailable": (
+                "受管遊戲紀錄無法讀取，沒有關閉任何遊戲視窗。"
+            ),
         }
         return messages.get(
             self.failure_code,
@@ -95,6 +115,7 @@ class GroupWindowLaunchService:
             ]
             | None
         ) = None,
+        managed_process_service: ManagedGameProcessService | None = None,
     ) -> None:
         if launch_timeout_seconds <= 0 or poll_seconds <= 0:
             raise ValueError("launch timing values must be positive.")
@@ -118,6 +139,7 @@ class GroupWindowLaunchService:
         self._completion_dispatch = completion_dispatch or (lambda callback: callback())
         self._record_callback = record_callback
         self._placement_update_callback = placement_update_callback
+        self._managed_process_service = managed_process_service
         self._lock = threading.RLock()
         self._running = False
         self._stop_event = threading.Event()
@@ -208,6 +230,21 @@ class GroupWindowLaunchService:
         self._record(target.display_name, "位置已還原")
         return None
 
+    def _remember_managed_windows(
+        self,
+        group_name: str,
+        values: Iterable[tuple[GroupLaunchTarget, WindowInfo]],
+    ) -> bool:
+        if self._managed_process_service is None:
+            return True
+        saved = self._managed_process_service.remember_group_windows(
+            group_name,
+            tuple(values),
+        )
+        if not saved:
+            self._record(group_name, "受管程序身分保存失敗")
+        return saved
+
     def _run(self, group_name: str) -> GroupWindowLaunchResult:
         plan = self._launch_service.plan(group_name)
         if not plan.ready:
@@ -228,6 +265,7 @@ class GroupWindowLaunchService:
         launched_count = 0
         restored_count = 0
         first_failure: str | None = None
+        managed_windows: list[tuple[GroupLaunchTarget, WindowInfo]] = []
         for target in plan.targets:
             if self._stop_event.is_set():
                 first_failure = first_failure or "group_launch_cancelled"
@@ -254,6 +292,7 @@ class GroupWindowLaunchService:
                         break
                     continue
             place_failure = self._place_target(target, window)
+            managed_windows.append((target, window))
             if place_failure is None:
                 restored_count += 1
             else:
@@ -265,6 +304,13 @@ class GroupWindowLaunchService:
                 first_failure = first_failure or refresh_failure
                 break
 
+        if managed_windows and not self._remember_managed_windows(
+            plan.group_name,
+            managed_windows,
+        ):
+            first_failure = (
+                first_failure or "group_process_ownership_unavailable"
+            )
         success = first_failure is None and restored_count == len(plan.targets)
         return GroupWindowLaunchResult(
             success,
@@ -326,6 +372,16 @@ class GroupWindowLaunchService:
                 restored_count += 1
             else:
                 first_failure = first_failure or place_failure
+        if targets and not self._remember_managed_windows(
+            group_name,
+            (
+                (target, matched[target.fingerprint])
+                for target in targets
+            ),
+        ):
+            first_failure = (
+                first_failure or "group_process_ownership_unavailable"
+            )
         return GroupWindowLaunchResult(
             first_failure is None and restored_count == len(targets),
             group_name,
@@ -388,6 +444,20 @@ class GroupWindowLaunchService:
                 failure_code="group_layout_save_failed",
                 action="record",
             )
+        if not self._remember_managed_windows(
+            group_name,
+            (
+                (target, matched[target.fingerprint])
+                for target in targets
+            ),
+        ):
+            return GroupWindowLaunchResult(
+                False,
+                group_name,
+                total_count=len(targets),
+                failure_code="group_process_ownership_unavailable",
+                action="record",
+            )
         for target in targets:
             self._record(target.display_name, "目前位置已記錄")
         return GroupWindowLaunchResult(
@@ -396,6 +466,24 @@ class GroupWindowLaunchService:
             total_count=len(targets),
             restored_count=len(targets),
             action="record",
+        )
+
+    def _run_stop_all(self, _group_name: str) -> GroupWindowLaunchResult:
+        if self._managed_process_service is None:
+            return GroupWindowLaunchResult(
+                False,
+                "",
+                failure_code="managed_game_state_unavailable",
+                action="stop",
+            )
+        result = self._managed_process_service.stop_all()
+        return GroupWindowLaunchResult(
+            result.success,
+            "",
+            total_count=result.total_count,
+            stopped_count=result.stopped_count,
+            failure_code=result.failure_code,
+            action="stop",
         )
 
     def _start_operation(
@@ -479,6 +567,16 @@ class GroupWindowLaunchService:
         return self._start_operation(
             group_name,
             self._run_record,
+            on_complete,
+        )
+
+    def start_stop_all(
+        self,
+        on_complete: Callable[[GroupWindowLaunchResult], object] | None = None,
+    ) -> bool:
+        return self._start_operation(
+            "全部受管遊戲",
+            self._run_stop_all,
             on_complete,
         )
 

@@ -143,6 +143,9 @@ from services.group_window_launch_service import (
     GroupWindowLaunchResult,
     GroupWindowLaunchService,
 )
+from services.managed_game_process_service import (
+    ManagedGameProcessService,
+)
 from services.window_size_adjustment_service import (
     WindowSizeAdjustmentResult,
     WindowSizeAdjustmentService,
@@ -215,6 +218,7 @@ REGISTRY_FILENAME = "window_registry.json"
 RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
 GROUP_CONFIGURATION_FILENAME = "group_configuration.json"
 OPERATION_RECORD_FILENAME = "operation_records.json"
+MANAGED_GAME_PROCESS_FILENAME = "managed_game_processes.json"
 OPERATION_RECORD_ARCHIVE_DIRNAME = "角色每日紀錄"
 DEFERRED_SYNC_STATE_FILENAME = "deferred_sync_operations.json"
 ROLE_ID_TEMPLATE_FILENAME = "role_id_templates.json"
@@ -1296,6 +1300,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 if group_configuration_service is not None
                 else None
             ),
+            managed_process_service=ManagedGameProcessService(
+                paths.data_dir() / MANAGED_GAME_PROCESS_FILENAME,
+                group_window_backend,
+                record_callback=(
+                    operation_record_store.append
+                    if operation_record_store is not None
+                    else None
+                ),
+            ),
         )
         if group_launch_service is not None
         else None
@@ -1401,6 +1414,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def complete_group_window_launch(
         result: GroupWindowLaunchResult,
     ) -> None:
+        if (
+            result.action == "stop"
+            and operation_record_store is not None
+        ):
+            operation_record_store.append(
+                "停止全部",
+                "全部受管遊戲",
+                result.player_message,
+            )
         if home_view is None:
             return
         home_view.set_group_launch_state(False, result.player_message)
@@ -1419,6 +1441,33 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return False
         return group_window_launch_service.start_restore(
             group_name,
+            complete_group_window_launch,
+        )
+
+    def stop_all_managed_games(_group_name: str) -> object:
+        def failure(message: str) -> str:
+            if operation_record_store is not None:
+                operation_record_store.append(
+                    "停止全部",
+                    "全部受管遊戲",
+                    message,
+                )
+            return message
+
+        if group_window_launch_service is None:
+            return failure("受管遊戲服務尚未準備完成。")
+        if not stop_group_automation_for_configuration_change():
+            return failure(
+                "同步或智慧重連尚未完全停止，沒有關閉遊戲視窗。"
+            )
+        if (
+            group_window_launch_service.running
+            and not group_window_launch_service.stop(timeout_seconds=5.0)
+        ):
+            return failure(
+                "整組啟動尚未完全停止，沒有關閉遊戲視窗。"
+            )
+        return group_window_launch_service.start_stop_all(
             complete_group_window_launch,
         )
 
@@ -3258,6 +3307,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_group_change=change_group,
         on_launch_group=launch_group_and_restore,
         on_restore_group=restore_group_positions,
+        on_stop_all_managed_games=stop_all_managed_games,
         on_record_group_positions=record_group_positions,
         on_create_group=create_group,
         on_rename_group=rename_group,

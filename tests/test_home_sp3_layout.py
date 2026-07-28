@@ -89,7 +89,7 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "yscrollcommand=scrollbar.set" in source
     assert "self._on_page_mousewheel" in source
     assert "一鍵啟動並還原位置" in source
-    assert "只還原位置" in source
+    assert "恢復上次位置" in source
     assert "記錄目前位置" in source
     assert "還原／調整遊戲視窗尺寸" in source
     assert "取主窗尺寸" in source
@@ -104,6 +104,9 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "on_export_group_configuration" in source
     assert "on_import_group_configuration" in source
     assert "整組啟動快捷鍵" in source
+    assert "恢復上次位置" in source
+    assert "停止全部受管遊戲" in source
+    assert "on_stop_all_managed_games" in source
     assert "group_launch_hotkey_provider" in source
     assert "on_group_launch_hotkey_change" in source
     assert "調整順序" in source

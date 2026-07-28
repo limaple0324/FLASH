@@ -465,6 +465,9 @@ class HomeView:
         on_group_change: Callable[[str], object] | None = None,
         on_launch_group: Callable[[str], object] | None = None,
         on_restore_group: Callable[[str], object] | None = None,
+        on_stop_all_managed_games: (
+            Callable[[str], object] | None
+        ) = None,
         on_record_group_positions: Callable[[str], object] | None = None,
         on_create_group: (
             Callable[[str], GroupManagementViewResult] | None
@@ -729,6 +732,7 @@ class HomeView:
         self.on_group_change = on_group_change
         self.on_launch_group = on_launch_group
         self.on_restore_group = on_restore_group
+        self.on_stop_all_managed_games = on_stop_all_managed_games
         self.on_record_group_positions = on_record_group_positions
         self.on_create_group = on_create_group
         self.on_rename_group = on_rename_group
@@ -950,6 +954,7 @@ class HomeView:
         self._group_launch_button: Button | None = None
         self._group_restore_button: Button | None = None
         self._group_record_button: Button | None = None
+        self._group_stop_all_button: Button | None = None
         self._group_reorder_button: Button | None = None
         self._group_reorder_finish_button: Button | None = None
         self._group_reorder_cancel_button: Button | None = None
@@ -2301,7 +2306,7 @@ class HomeView:
             self._group_launch_button.configure(state=DISABLED)
         self._group_restore_button = self._button(
             launch_row,
-            "只還原位置",
+            "恢復上次位置",
             self._restore_current_group,
         )
         self._group_restore_button.pack(side=LEFT, padx=(8, 0))
@@ -2315,6 +2320,20 @@ class HomeView:
         self._group_record_button.pack(side=LEFT, padx=(8, 0))
         if not names or self.on_record_group_positions is None:
             self._group_record_button.configure(state=DISABLED)
+        self._group_stop_all_button = self._button(
+            launch_row,
+            "停止全部受管遊戲",
+            self._stop_all_managed_games,
+        )
+        self._group_stop_all_button.configure(
+            bg=WARNING,
+            fg="#FFFFFF",
+            activebackground=WARNING,
+            activeforeground="#FFFFFF",
+        )
+        self._group_stop_all_button.pack(side=LEFT, padx=(8, 0))
+        if self.on_stop_all_managed_games is None:
+            self._group_stop_all_button.configure(state=DISABLED)
         self._group_launch_status_label = Label(
             launch_row,
             text="",
@@ -5435,16 +5454,27 @@ class HomeView:
             "正在記錄目前組別位置…",
         )
 
+    def _stop_all_managed_games(self) -> None:
+        self._run_group_window_action(
+            self.on_stop_all_managed_games,
+            "正在安全停止全部受管遊戲…",
+            require_group=False,
+        )
+
     def _run_group_window_action(
         self,
         callback: Callable[[str], object] | None,
         progress_message: str,
+        *,
+        require_group: bool = True,
     ) -> None:
-        if self.current_group_name is None or callback is None:
+        if callback is None or (
+            require_group and self.current_group_name is None
+        ):
             return
         self.set_group_launch_state(True, progress_message)
         try:
-            accepted = callback(self.current_group_name)
+            accepted = callback(self.current_group_name or "")
         except Exception as error:
             self.set_group_launch_state(False, "組別視窗操作未完成。")
             self._report_refresh_error(error)
@@ -5467,6 +5497,7 @@ class HomeView:
             self._group_launch_button,
             self._group_restore_button,
             self._group_record_button,
+            self._group_stop_all_button,
         ):
             if button is not None:
                 button.configure(
@@ -5914,6 +5945,7 @@ class HomeView:
                 self._group_launch_button,
                 self._group_restore_button,
                 self._group_record_button,
+                self._group_stop_all_button,
             ):
                 if button is not None:
                     button.configure(state=DISABLED)
