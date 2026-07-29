@@ -160,6 +160,31 @@ def test_character_login_prefers_higher_level_inside_primary_role():
     assert point == CHARACTER_SLOT_CLICK_POINTS[2]
 
 
+def test_character_level_ignores_unrelated_role_text_below_the_digits():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    for level in (100, 120, 160):
+        reference = recognizer._reference(
+            f"character_level_{level}.png"
+        )
+        candidate = Image.new(
+            "RGB",
+            (reference.width, reference.height + 24),
+            (29, 88, 111),
+        )
+        candidate.paste(reference, (0, 0))
+        candidate.paste(
+            (240, 240, 240),
+            (4, reference.height + 8, reference.width - 4, reference.height + 14),
+        )
+        recognized, score = recognizer._recognize_character_level(
+            candidate,
+            (0.0, 0.0, 1.0, 1.0),
+        )
+
+        assert recognized == level
+        assert score == 0.0
+
+
 def test_recognition_survives_proportional_window_scaling():
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
     definition = next(

@@ -575,18 +575,67 @@ class ReferenceScreenRecognizer:
                 for red, green, blue in pixels.get_flattened_data()
             ]
         )
-        bounds = mask.getbbox()
+        row_counts = [
+            sum(
+                1
+                for value in mask.crop(
+                    (0, row, mask.width, row + 1)
+                ).get_flattened_data()
+                if value
+            )
+            for row in range(mask.height)
+        ]
+        bands: list[tuple[int, int, int]] = []
+        band_start: int | None = None
+        last_occupied: int | None = None
+        for row, count in enumerate(row_counts):
+            if count:
+                if band_start is None:
+                    band_start = row
+                last_occupied = row
+                continue
+            if (
+                band_start is not None
+                and last_occupied is not None
+                and row - last_occupied > 2
+            ):
+                bands.append(
+                    (
+                        band_start,
+                        last_occupied + 1,
+                        sum(row_counts[band_start : last_occupied + 1]),
+                    )
+                )
+                band_start = None
+                last_occupied = None
+        if band_start is not None and last_occupied is not None:
+            bands.append(
+                (
+                    band_start,
+                    last_occupied + 1,
+                    sum(row_counts[band_start : last_occupied + 1]),
+                )
+            )
+        meaningful_bands = [
+            band
+            for band in bands
+            if band[1] - band[0] >= 5 and band[2] >= 20
+        ]
+        if not meaningful_bands:
+            return None
+        top, bottom, _pixel_count = meaningful_bands[0]
+        digit_line = mask.crop((0, top, mask.width, bottom))
+        bounds = digit_line.getbbox()
         if bounds is None:
             return None
-        glyphs = mask.crop(bounds)
-        glyphs.thumbnail((62, 30), Image.Resampling.NEAREST)
+        glyphs = digit_line.crop(bounds).resize(
+            (48, 24),
+            Image.Resampling.NEAREST,
+        )
         signature = Image.new("L", (64, 32), 0)
         signature.paste(
             glyphs,
-            (
-                (signature.width - glyphs.width) // 2,
-                (signature.height - glyphs.height) // 2,
-            ),
+            (8, 4),
         )
         return signature
 
