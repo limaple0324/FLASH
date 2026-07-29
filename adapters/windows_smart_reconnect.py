@@ -47,6 +47,7 @@ from services.game_operation_gate import GameOperationGate
 from services.reconnect_failure_status_service import (
     ReconnectFailureStatusService,
 )
+from services.target_window_contract_service import ResolvedTargetWindows
 
 
 ACTIONABLE_RECONNECT_ACTIONS = frozenset(
@@ -464,7 +465,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             Callable[[str, str], object] | None
         ) = None,
         target_windows_provider: (
-            Callable[[], Iterable[WindowInfo]] | None
+            Callable[[], Iterable[WindowInfo] | ResolvedTargetWindows] | None
         ) = None,
         operation_gate: GameOperationGate | None = None,
     ):
@@ -558,7 +559,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             Callable[[str, str], object] | None
         ) = None,
         target_windows_provider: (
-            Callable[[], Iterable[WindowInfo]] | None
+            Callable[[], Iterable[WindowInfo] | ResolvedTargetWindows] | None
         ) = None,
         operation_gate: GameOperationGate | None = None,
     ) -> "WindowsSmartReconnectController":
@@ -779,16 +780,46 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
 
     def _candidate_windows(self) -> tuple[WindowInfo, ...]:
+        return self._candidate_window_set()[0]
+
+    def _candidate_window_set(
+        self,
+    ) -> tuple[
+        tuple[WindowInfo, ...],
+        tuple[str, ...],
+        frozenset[str],
+    ]:
         if self._target_windows_provider is not None:
             try:
-                return tuple(self._target_windows_provider())
+                provided = self._target_windows_provider()
+                if isinstance(provided, ResolvedTargetWindows):
+                    return (
+                        provided.windows,
+                        provided.failure_codes,
+                        provided.blocked_fingerprints,
+                    )
+                return tuple(provided), (), frozenset()
             except Exception:
-                return ()
-        return tuple(
-            window
-            for window in self._window_backend.list_windows()
-            if all(keyword in window.title.casefold() for keyword in self._keywords)
-        )
+                return (
+                    (),
+                    ("target_window_provider_failed",),
+                    frozenset(),
+                )
+        try:
+            return (
+                tuple(
+                    window
+                    for window in self._window_backend.list_windows()
+                    if all(
+                        keyword in window.title.casefold()
+                        for keyword in self._keywords
+                    )
+                ),
+                (),
+                frozenset(),
+            )
+        except Exception:
+            return (), ("window_enumeration_failed",), frozenset()
 
     def _target_for_fingerprint(self, fingerprint: str):
         plan = self._group_launch_plan
@@ -1158,6 +1189,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self,
         *,
         candidate_windows: tuple[WindowInfo, ...],
+        blocked_fingerprints: frozenset[str],
         execute: bool,
         now: float,
     ) -> tuple[int, list[str], int | None]:
@@ -1187,6 +1219,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         next_delays: list[int] = []
         for fingerprint in missing:
             retry_at = self._reopen_retry_after.get(fingerprint, now)
+            if fingerprint in blocked_fingerprints:
+                failures.append("battle_reopen_identity_unsafe")
+                next_delays.append(self._policy.retry_interval_seconds)
+                continue
             if not execute or not self._execution_allowed():
                 next_delays.append(
                     max(1, math.ceil(max(0.0, retry_at - now)))
@@ -1232,7 +1268,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         return reopened, failures, next_delay
 
     def _scan(self, *, execute: bool) -> ReconnectBatchResult:
-        candidate_windows = self._candidate_windows()
+        (
+            candidate_windows,
+            source_failures,
+            blocked_fingerprints,
+        ) = self._candidate_window_set()
         windows = tuple(
             window
             for window in candidate_windows
@@ -1247,12 +1287,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         retried_reopens, retry_failures, pending_reopen_delay = (
             self._retry_pending_reopens(
                 candidate_windows=candidate_windows,
+                blocked_fingerprints=blocked_fingerprints,
                 execute=execute,
                 now=now,
             )
         )
         group_failures = self._group_failures(windows)
-        failures = [*group_failures, *retry_failures]
+        failures = [*group_failures, *source_failures, *retry_failures]
         if group_failures:
             # A partially validated group must never carry a first-frame
             # confirmation into a later, different group or identity set.
@@ -1424,6 +1465,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 # without waiting for the one-minute retry window.
                 self._action_retry_after.pop(fingerprint, None)
             recognized.append((window, fingerprint, recognition))
+
+        missing_session_targets = (
+            self._pending_reconnect_fingerprints
+            | self._pending_reopen_fingerprints
+            | self._active_automation_fingerprints
+        ) - live_fingerprints
+        if missing_session_targets:
+            failures.append("reconnect_target_missing")
 
         state_counts = Counter(
             item.state.value
@@ -1649,6 +1698,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             # state-specific progress interval so the required second frame
             # is confirmed promptly even when other windows are unknown.
             next_check_seconds = min(pending_confirmation_delays)
+        elif pending_reopen_delay is not None:
+            next_check_seconds = pending_reopen_delay
         elif unknown_windows or failures:
             next_check_seconds = self._policy.retry_interval_seconds
         elif decisions:

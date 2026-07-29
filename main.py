@@ -743,7 +743,7 @@ def build_services(
             if state.current_group is not None
             else None
         )
-        return target_window_contract_service.windows(group_name)
+        return target_window_contract_service.reconnect_targets(group_name)
 
     AppContext.register(SyncOperationRecordStore, operation_record_store)
     reconnect_controller = WindowsSmartReconnectController.for_real_windows(

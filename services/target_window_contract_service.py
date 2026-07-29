@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
 from adapters.windows_window import WindowBackend, WindowInfo
 from core.target_window_contract import (
@@ -15,6 +17,15 @@ from services.group_configuration_service import (
     GroupConfigurationService,
 )
 from services.sync_scope_service import SyncScopeService
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedTargetWindows:
+    """Safe open windows plus aggregate isolation evidence."""
+
+    windows: tuple[WindowInfo, ...]
+    failure_codes: tuple[str, ...] = ()
+    blocked_fingerprints: frozenset[str] = frozenset()
 
 
 class TargetWindowContractService:
@@ -228,6 +239,43 @@ class TargetWindowContractService:
         )
         if snapshot.failure_codes:
             return ()
+        return self._safe_windows(snapshot)
+
+    def reconnect_targets(
+        self,
+        group_name: object,
+        *,
+        expanded_sync_scope: bool = True,
+    ) -> ResolvedTargetWindows:
+        """Keep uniquely resolved open roles while isolating unsafe siblings."""
+        snapshot = self.snapshot(
+            group_name,
+            expanded_sync_scope=expanded_sync_scope,
+        )
+        failures = list(snapshot.failure_codes)
+        for target in snapshot.targets:
+            failures.extend(
+                code
+                for code in target.failure_codes
+                if code != "window_offline"
+            )
+        blocked_fingerprints = frozenset(
+            target.fingerprint
+            for target in snapshot.targets
+            if target.fingerprint is not None
+            and target.failure_codes
+            and target.failure_codes != ("window_offline",)
+        )
+        return ResolvedTargetWindows(
+            self._safe_windows(snapshot),
+            tuple(dict.fromkeys(failures)),
+            blocked_fingerprints,
+        )
+
+    @staticmethod
+    def _safe_windows(
+        snapshot: TargetWindowSnapshot,
+    ) -> tuple[WindowInfo, ...]:
         return tuple(
             WindowInfo(
                 handle=target.handle,
