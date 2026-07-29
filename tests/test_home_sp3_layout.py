@@ -117,7 +117,7 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "Scrollbar(" in source
     assert "yscrollcommand=scrollbar.set" in source
     assert "self._on_page_mousewheel" in source
-    assert "一鍵啟動並還原位置" in source
+    assert "啟動本組" in source
     assert "恢復上次位置" in source
     assert "記錄目前位置" in source
     assert "還原／調整遊戲視窗尺寸" in source
@@ -135,6 +135,8 @@ def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     assert "整組啟動快捷鍵" in source
     assert "恢復上次位置" in source
     assert "停止全部受管遊戲" in source
+    assert '"停止同步"' in source
+    assert "self._stop_sync_from_group_page" in source
     assert "on_stop_all_managed_games" in source
     assert "group_launch_hotkey_provider" in source
     assert "on_group_launch_hotkey_change" in source
@@ -228,6 +230,8 @@ def test_feature_cards_share_persistent_collapse_drag_and_customization() -> Non
     assert "選擇卡片背景" in source
     assert "移除卡片背景" in source
     assert "卡片背景已預覽" in source
+    assert "widgets.settings_button.lift()" in source
+    assert "widgets.toggle_button.lift()" in source
     for card_id in (
         "home.workspace",
         "groups.roles",
@@ -293,6 +297,29 @@ def test_four_player_selectable_themes_have_complete_palettes() -> None:
             "success",
             "warning",
         } == set(palette)
+    assert theme_palette(None) == theme_palette("classic_gold")
+    assert theme_palette("classic_gold")["background"] == "#C9A35D"
+    assert theme_palette("classic_gold")["surface"] == "#EAD3A0"
+    assert theme_palette("classic_gold")["border"] == "#80591F"
+
+
+def test_group_page_stop_sync_never_toggles_sync_on() -> None:
+    view = object.__new__(HomeView)
+    calls = []
+    states = []
+    view.keyboard_sync_enabled = True
+    view.on_keyboard_sync_change = lambda enabled: calls.append(enabled) or True
+    view._refresh_keyboard_sync_controls = lambda: states.append("refreshed")
+    view.set_group_launch_state = (
+        lambda running, message: states.append((running, message))
+    )
+    view._report_refresh_error = lambda _error: None
+
+    view._stop_sync_from_group_page()
+
+    assert calls == [False]
+    assert view.keyboard_sync_enabled is False
+    assert states == ["refreshed", (False, "同步已停止。")]
 
 
 def test_character_page_uses_confirmed_note_field() -> None:

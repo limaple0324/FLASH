@@ -107,15 +107,12 @@ class Win32WindowActivationBackend:
 class GroupRoleStatusService:
     """Cache ordered role rows and fail closed on ambiguous identities."""
 
-    _RECONNECTING_STATES = frozenset(
+    _DISCONNECTED_STATES = frozenset(
         {
             ReconnectScreenState.LOGIN_START,
             ReconnectScreenState.FORCE_LOGIN_START,
             ReconnectScreenState.LINE_SELECTION,
             ReconnectScreenState.CHARACTER_SELECTION,
-            ReconnectScreenState.POST_LOGIN_ACTIVITY,
-            ReconnectScreenState.POST_LOGIN_RECOMMENDATION,
-            ReconnectScreenState.POST_LOGIN_AUTO_DUNGEON,
             ReconnectScreenState.RECONNECTING,
         }
     )
@@ -299,8 +296,11 @@ class GroupRoleStatusService:
                 status = ROLE_STATUS_RECONNECTING
             elif state is ReconnectScreenState.DISCONNECTED:
                 status = ROLE_STATUS_DISCONNECTED
-            elif state in self._RECONNECTING_STATES:
-                status = ROLE_STATUS_RECONNECTING
+            elif state in self._DISCONNECTED_STATES:
+                # Login/line/character screens are not proof that this
+                # process started a reconnect session. Only the controller's
+                # explicit reconnect-session set may show "重連中".
+                status = ROLE_STATUS_DISCONNECTED
             elif (
                 (contract is not None and contract.safe)
                 if central_snapshot is not None

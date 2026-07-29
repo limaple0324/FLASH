@@ -19,6 +19,10 @@ def test_character_detail_uses_note_and_confirmed_game_data_sections() -> None:
     assert "Scrollbar" in source
     assert 'window.bind("<MouseWheel>"' in source
     assert "canvas.yview_scroll" in source
+    assert 'BACKGROUND = "#C9A35D"' in source
+    assert 'SURFACE = "#EAD3A0"' in source
+    assert 'PRIMARY = "#8A5A24"' in source
+    assert 'TEXT = "#2B1A0A"' in source
 
 
 def test_character_detail_summary_is_player_facing() -> None:

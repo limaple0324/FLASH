@@ -137,6 +137,89 @@ def test_ordered_rows_show_open_closed_disconnect_and_reconnect(tmp_path):
     assert service.refresh("兩支")[0].status == ROLE_STATUS_OPEN
 
 
+def test_only_an_explicit_reconnect_session_shows_reconnecting(tmp_path):
+    launch = configuration(tmp_path)
+    plan = launch.plan("兩支")
+    fingerprint = plan.targets[0].fingerprint
+    states = {
+        fingerprint: ReconnectScreenState.POST_LOGIN_AUTO_DUNGEON,
+    }
+    reconnecting = set()
+    service = GroupRoleStatusService(
+        launch,
+        Windows((window(1, fingerprint),)),
+        ReconnectFailureStatusService(),
+        screen_states_provider=lambda: states,
+        reconnecting_provider=lambda: reconnecting,
+    )
+
+    assert service.refresh("兩支")[0].status == ROLE_STATUS_OPEN
+
+    states[fingerprint] = ReconnectScreenState.LINE_SELECTION
+    assert service.refresh("兩支")[0].status == ROLE_STATUS_DISCONNECTED
+
+    reconnecting.add(fingerprint)
+    assert service.refresh("兩支")[0].status == ROLE_STATUS_RECONNECTING
+
+
+def test_unidentified_non_group_window_does_not_change_safe_role_status(
+    tmp_path,
+):
+    launch = configuration(tmp_path)
+    plan = launch.plan("兩支")
+    contract = TargetWindowContract(
+        1,
+        "兩支",
+        "兩支:甲",
+        "甲",
+        "主窗口",
+        None,
+        "甲",
+        101,
+        plan.targets[0].fingerprint,
+        TargetWindowPhase.FOREGROUND,
+        True,
+        handle=7,
+        rect=(0, 0, 100, 100),
+        visible=True,
+    )
+    offline = TargetWindowContract(
+        1,
+        "兩支",
+        "兩支:乙",
+        "乙",
+        "同步窗口",
+        None,
+        "乙",
+        None,
+        plan.targets[1].fingerprint,
+        TargetWindowPhase.OFFLINE,
+        False,
+        failure_codes=("window_offline",),
+    )
+    snapshot = TargetWindowSnapshot(
+        1,
+        "兩支",
+        (contract, offline),
+        ("unidentified_candidate_window",),
+    )
+    service = GroupRoleStatusService(
+        launch,
+        FailingWindows(),
+        ReconnectFailureStatusService(),
+        target_snapshot_provider=lambda _name: snapshot,
+        screen_states_provider=lambda: {
+            plan.targets[0].fingerprint:
+                ReconnectScreenState.POST_LOGIN_RECOMMENDATION,
+        },
+    )
+
+    assert [row.status for row in service.refresh("兩支")] == [
+        ROLE_STATUS_OPEN,
+        ROLE_STATUS_CLOSED,
+    ]
+
+
 def test_status_change_publishes_one_typed_event_per_real_transition(tmp_path):
     launch = configuration(tmp_path)
     plan = launch.plan("兩支")

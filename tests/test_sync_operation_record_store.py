@@ -80,3 +80,104 @@ def test_records_leave_in_app_month_but_daily_text_remains_forever(tmp_path):
     assert store.records() == ()
     assert daily_path.is_file()
     assert old.record_id in daily_path.read_text(encoding="utf-8")
+
+
+def test_hot_sync_records_are_coalesced_into_one_persistence_batch(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "services.sync_operation_record_store.DEFERRED_FLUSH_SECONDS",
+        60,
+    )
+    store = SyncOperationRecordStore(
+        tmp_path / "active.json",
+        tmp_path / "daily",
+        role_names_provider=lambda: tuple(
+            f"角色{index}" for index in range(14)
+        ),
+    )
+    daily_batches = []
+    save_calls = []
+    monkeypatch.setattr(
+        store,
+        "_append_daily_records",
+        lambda items: daily_batches.append(items)
+        or (tmp_path / "daily.txt",),
+    )
+    monkeypatch.setattr(
+        store,
+        "_save",
+        lambda: save_calls.append(True),
+    )
+
+    for index in range(14):
+        store.append_deferred(
+            "同步操作",
+            f"角色{index}",
+            "同步左鍵－成功",
+        )
+
+    assert len(store.records()) == 14
+    assert daily_batches == []
+    assert save_calls == []
+    assert store.flush() is True
+    assert len(daily_batches) == 1
+    assert len(daily_batches[0]) == 14
+    assert save_calls == [True]
+    assert store.close() is True
+
+
+def test_close_flushes_deferred_records_without_data_loss(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "services.sync_operation_record_store.DEFERRED_FLUSH_SECONDS",
+        60,
+    )
+    active = tmp_path / "active.json"
+    daily = tmp_path / "daily"
+    store = SyncOperationRecordStore(active, daily)
+
+    record = store.append_deferred("同步操作", "角色甲", "同步左鍵－成功")
+
+    assert store.close() is True
+    reloaded = SyncOperationRecordStore(active, daily)
+    assert [item.record_id for item in reloaded.records()] == [
+        record.record_id
+    ]
+    assert record.record_id in reloaded.daily_files()[0].read_text(
+        encoding="utf-8"
+    )
+    assert reloaded.close() is True
+
+
+def test_pending_journal_recovers_interrupted_deferred_flush(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "services.sync_operation_record_store.DEFERRED_FLUSH_SECONDS",
+        60,
+    )
+    active = tmp_path / "active.json"
+    daily = tmp_path / "daily"
+    interrupted = SyncOperationRecordStore(active, daily)
+
+    record = interrupted.append_deferred(
+        "同步操作",
+        "角色甲",
+        "同步左鍵－成功",
+    )
+    with interrupted._lock:
+        interrupted._cancel_flush_timer_locked()
+        interrupted._closed = True
+
+    recovered = SyncOperationRecordStore(active, daily)
+
+    assert [item.record_id for item in recovered.records()] == [
+        record.record_id
+    ]
+    assert record.record_id in recovered.daily_files()[0].read_text(
+        encoding="utf-8"
+    )
+    assert not recovered.pending_path.exists()
+    assert recovered.close() is True

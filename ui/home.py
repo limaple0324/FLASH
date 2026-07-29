@@ -141,17 +141,17 @@ UI_THEME_PALETTES = {
         "warning": "#A8662B",
     },
     "classic_gold": {
-        "background": "#E3C47F",
-        "surface": "#F4E5B8",
-        "sidebar": "#745323",
-        "sidebar_active": "#A3742E",
-        "sidebar_group": "#89642B",
-        "sidebar_muted": "#F0DFB0",
-        "primary": "#916522",
-        "primary_hover": "#765019",
-        "text": "#3B2A13",
-        "muted": "#725A35",
-        "border": "#B78D47",
+        "background": "#C9A35D",
+        "surface": "#EAD3A0",
+        "sidebar": "#80591F",
+        "sidebar_active": "#8A5A24",
+        "sidebar_group": "#7A5321",
+        "sidebar_muted": "#F8E6B8",
+        "primary": "#8A5A24",
+        "primary_hover": "#7A5321",
+        "text": "#2B1A0A",
+        "muted": "#7A5321",
+        "border": "#80591F",
         "success": "#39704B",
         "warning": "#9B4B1E",
     },
@@ -175,7 +175,7 @@ UI_THEME_PALETTES = {
 
 def theme_palette(name: object) -> dict[str, str]:
     key = name if isinstance(name, str) else ""
-    selected = UI_THEME_PALETTES.get(key, UI_THEME_PALETTES["clear_blue"])
+    selected = UI_THEME_PALETTES.get(key, UI_THEME_PALETTES["classic_gold"])
     return dict(selected)
 
 
@@ -240,7 +240,7 @@ def _apply_theme_palette(name: object) -> str:
     key = (
         name
         if isinstance(name, str) and name in UI_THEME_PALETTES
-        else "clear_blue"
+        else "classic_gold"
     )
     palette = UI_THEME_PALETTES[key]
     global BACKGROUND, SURFACE, SIDEBAR, SIDEBAR_ACTIVE
@@ -262,7 +262,7 @@ def _apply_theme_palette(name: object) -> str:
     return key
 
 
-_apply_theme_palette("clear_blue")
+_apply_theme_palette("classic_gold")
 
 
 def _contain_geometry(
@@ -711,7 +711,7 @@ class HomeView:
         on_clear_habit_preferences: (
             Callable[[], PlayerHabitSettingsView] | None
         ) = None,
-        theme_name: str = "clear_blue",
+        theme_name: str = "classic_gold",
         on_theme_change: Callable[[str], object] | None = None,
         feature_card_preference_provider: (
             Callable[[str, str], FeatureCardPreference] | None
@@ -1012,7 +1012,7 @@ class HomeView:
         self.theme_name = (
             theme_name
             if theme_name in UI_THEME_PALETTES
-            else "clear_blue"
+            else "classic_gold"
         )
         self.on_theme_change = on_theme_change
         self.feature_card_preference_provider = (
@@ -1131,6 +1131,7 @@ class HomeView:
         self._group_launch_button: Button | None = None
         self._group_restore_button: Button | None = None
         self._group_record_button: Button | None = None
+        self._group_stop_sync_button: Button | None = None
         self._group_stop_all_button: Button | None = None
         self._group_reorder_button: Button | None = None
         self._group_reorder_finish_button: Button | None = None
@@ -1231,7 +1232,14 @@ class HomeView:
 
     @staticmethod
     def _button(parent, text: str, command=None, *, primary: bool = False):
-        background = PRIMARY if primary else SURFACE
+        legacy_gold = (
+            BACKGROUND == UI_THEME_PALETTES["classic_gold"]["background"]
+        )
+        background = (
+            PRIMARY
+            if primary
+            else ("#EDD08E" if legacy_gold else SURFACE)
+        )
         foreground = "#FFFFFF" if primary else TEXT
         active_background = PRIMARY_HOVER if primary else BACKGROUND
         return Button(
@@ -1243,10 +1251,12 @@ class HomeView:
             fg=foreground,
             activebackground=active_background,
             activeforeground=foreground,
-            relief="flat",
-            bd=0,
+            relief="raised" if legacy_gold else "flat",
+            bd=1 if legacy_gold else 0,
+            highlightbackground=BORDER,
+            highlightthickness=1 if legacy_gold else 0,
             padx=14,
-            pady=8,
+            pady=6 if legacy_gold else 8,
             cursor="hand2",
         )
 
@@ -1411,6 +1421,10 @@ class HomeView:
                 preference.collapsed,
                 persist=False,
             )
+            # Full-width contents are created after these placed controls.
+            # Raise the controls so later labels cannot cover their text.
+            widgets.settings_button.lift()
+            widgets.toggle_button.lift()
         self._apply_saved_feature_card_order(page)
 
     def _set_feature_card_collapsed(
@@ -2996,7 +3010,7 @@ class HomeView:
         launch_row.pack(fill=X, pady=(12, 0))
         self._group_launch_button = self._button(
             launch_row,
-            "一鍵啟動並還原位置",
+            "啟動本組",
             self._launch_current_group,
             primary=True,
         )
@@ -3019,20 +3033,20 @@ class HomeView:
         self._group_record_button.pack(side=LEFT, padx=(8, 0))
         if not names or self.on_record_group_positions is None:
             self._group_record_button.configure(state=DISABLED)
-        self._group_stop_all_button = self._button(
+        self._group_stop_sync_button = self._button(
             launch_row,
-            "停止全部受管遊戲",
-            self._stop_all_managed_games,
+            "停止同步",
+            self._stop_sync_from_group_page,
         )
-        self._group_stop_all_button.configure(
+        self._group_stop_sync_button.configure(
             bg=WARNING,
             fg="#FFFFFF",
             activebackground=WARNING,
             activeforeground="#FFFFFF",
         )
-        self._group_stop_all_button.pack(side=LEFT, padx=(8, 0))
-        if self.on_stop_all_managed_games is None:
-            self._group_stop_all_button.configure(state=DISABLED)
+        self._group_stop_sync_button.pack(side=LEFT, padx=(8, 0))
+        if self.on_keyboard_sync_change is None:
+            self._group_stop_sync_button.configure(state=DISABLED)
         self._group_launch_status_label = Label(
             launch_row,
             text="",
@@ -3136,6 +3150,14 @@ class HomeView:
             "刪除組",
             self._delete_current_group,
         ).pack(side=LEFT, padx=(8, 0))
+        self._group_stop_all_button = self._button(
+            group_order_row,
+            "停止全部受管遊戲",
+            self._stop_all_managed_games,
+        )
+        self._group_stop_all_button.pack(side=LEFT, padx=(8, 0))
+        if self.on_stop_all_managed_games is None:
+            self._group_stop_all_button.configure(state=DISABLED)
         self._button(
             group_order_row,
             "匯出組別設定",
@@ -7103,6 +7125,25 @@ class HomeView:
             "正在記錄目前組別位置…",
         )
 
+    def _stop_sync_from_group_page(self) -> None:
+        if not self.keyboard_sync_enabled:
+            self.set_group_launch_state(False, "同步目前未啟用。")
+            return
+        if self.on_keyboard_sync_change is None:
+            return
+        try:
+            accepted = self.on_keyboard_sync_change(False)
+        except Exception as error:
+            self.set_group_launch_state(False, "同步未能停止。")
+            self._report_refresh_error(error)
+            return
+        if accepted is False:
+            self.set_group_launch_state(False, "同步未能停止。")
+            return
+        self.keyboard_sync_enabled = False
+        self._refresh_keyboard_sync_controls()
+        self.set_group_launch_state(False, "同步已停止。")
+
     def _stop_all_managed_games(self) -> None:
         self._run_group_window_action(
             self.on_stop_all_managed_games,
@@ -7146,6 +7187,7 @@ class HomeView:
             self._group_launch_button,
             self._group_restore_button,
             self._group_record_button,
+            self._group_stop_sync_button,
             self._group_stop_all_button,
         ):
             if button is not None:
@@ -7594,6 +7636,7 @@ class HomeView:
                 self._group_launch_button,
                 self._group_restore_button,
                 self._group_record_button,
+                self._group_stop_sync_button,
                 self._group_stop_all_button,
             ):
                 if button is not None:

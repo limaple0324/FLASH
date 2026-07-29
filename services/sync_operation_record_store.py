@@ -13,6 +13,7 @@ from typing import Callable, Mapping
 
 
 RETENTION_DAYS = 30
+DEFERRED_FLUSH_SECONDS = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,12 +54,27 @@ class SyncOperationRecordStore:
     ) -> None:
         self.active_path = Path(active_path)
         self.archive_dir = Path(archive_dir)
+        self.pending_path = self.active_path.with_name(
+            f"{self.active_path.name}.pending"
+        )
         self._now_provider = now_provider or (
             lambda: datetime.now(timezone.utc)
         )
         self._role_names_provider = role_names_provider or (lambda: ())
         self._lock = threading.RLock()
-        self._records = list(self._load())
+        active_records = list(self._load())
+        active_ids = {item.record_id for item in active_records}
+        pending_records = [
+            item
+            for item in self._load_pending()
+            if item.record_id not in active_ids
+        ]
+        self._pending_records: list[SyncOperationRecord] = pending_records
+        self._flush_timer: threading.Timer | None = None
+        self._closed = False
+        self._records = active_records + pending_records
+        if not pending_records:
+            self.pending_path.unlink(missing_ok=True)
         self.archive_expired()
         self.ensure_daily_file()
 
@@ -114,6 +130,24 @@ class SyncOperationRecordStore:
             if (record := self._parse_record(value)) is not None
         )
 
+    def _load_pending(self) -> tuple[SyncOperationRecord, ...]:
+        if not self.pending_path.is_file():
+            return ()
+        try:
+            lines = self.pending_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            return ()
+        records: list[SyncOperationRecord] = []
+        for line in lines:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            record = self._parse_record(value)
+            if record is not None:
+                records.append(record)
+        return tuple(records)
+
     def _save(self) -> None:
         self.active_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -141,25 +175,113 @@ class SyncOperationRecordStore:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def append(
+    def _new_record(
         self,
         category: object,
         role_name: object,
         detail: object,
     ) -> SyncOperationRecord:
-        record = SyncOperationRecord(
+        return SyncOperationRecord(
             uuid.uuid4().hex,
             self._now_provider().astimezone(timezone.utc),
             self._clean(category, maximum=40),
             self._clean(role_name, maximum=80),
             self._clean(detail),
         )
+
+    def _cancel_flush_timer_locked(self) -> None:
+        timer = self._flush_timer
+        self._flush_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _flush_pending_locked(self) -> None:
+        pending = tuple(self._pending_records)
+        if not pending:
+            return
+        self._append_daily_records(pending)
+        self._save()
+        del self._pending_records[: len(pending)]
+        self.pending_path.unlink(missing_ok=True)
+
+    def _flush_deferred(self) -> None:
         with self._lock:
-            self._append_daily_record(record)
+            self._flush_timer = None
+            if self._closed:
+                return
+            try:
+                self._flush_pending_locked()
+            except (OSError, UnicodeError):
+                # Keep the pending records in memory. A later append, explicit
+                # flush, or normal shutdown will retry without losing them.
+                return
+
+    def _schedule_flush_locked(self) -> None:
+        if self._flush_timer is not None or self._closed:
+            return
+        timer = threading.Timer(
+            DEFERRED_FLUSH_SECONDS,
+            self._flush_deferred,
+        )
+        timer.daemon = True
+        self._flush_timer = timer
+        timer.start()
+
+    def append(
+        self,
+        category: object,
+        role_name: object,
+        detail: object,
+    ) -> SyncOperationRecord:
+        record = self._new_record(category, role_name, detail)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("operation record store is closed.")
+            self._append_pending_journal(record)
             self._records.append(record)
-            self._save()
+            self._pending_records.append(record)
+            self._cancel_flush_timer_locked()
+            self._flush_pending_locked()
         self.archive_expired()
         return record
+
+    def append_deferred(
+        self,
+        category: object,
+        role_name: object,
+        detail: object,
+    ) -> SyncOperationRecord:
+        """Record hot-path events without blocking synchronized input."""
+        record = self._new_record(category, role_name, detail)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("operation record store is closed.")
+            self._append_pending_journal(record)
+            self._records.append(record)
+            self._pending_records.append(record)
+            self._schedule_flush_locked()
+        return record
+
+    def flush(self) -> bool:
+        with self._lock:
+            self._cancel_flush_timer_locked()
+            try:
+                self._flush_pending_locked()
+            except (OSError, UnicodeError):
+                return False
+        return True
+
+    def close(self) -> bool:
+        with self._lock:
+            if self._closed:
+                return True
+            self._cancel_flush_timer_locked()
+            try:
+                self._flush_pending_locked()
+            except (OSError, UnicodeError):
+                return False
+            self._closed = True
+        return True
 
     def records(self) -> tuple[SyncOperationRecord, ...]:
         with self._lock:
@@ -178,29 +300,26 @@ class SyncOperationRecordStore:
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         return self.archive_dir / f"輔_角色紀錄_{local_day}.txt"
 
-    def _append_daily_record(self, item: SyncOperationRecord) -> Path:
-        day = item.occurred_at.astimezone().strftime("%Y-%m-%d")
-        path = self._daily_archive_path(day)
-        existing_lines: list[str] = []
-        if path.is_file():
-            try:
-                existing_lines = path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
-            except (OSError, UnicodeError):
-                existing_lines = []
-        record_lines = [
-            line
-            for line in existing_lines
-            if len(line.split("｜", 4)) == 5
-            and len(line.split("｜", 1)[0]) == 32
-        ]
-        existing_ids = {
-            line.split("｜", 1)[0] for line in record_lines
-        }
-        if item.record_id in existing_ids:
-            return path
-        record_lines.append(f"{item.record_id}｜{item.player_line}")
+    @staticmethod
+    def _record_lines(path: Path) -> list[str]:
+        if not path.is_file():
+            return []
+        try:
+            return [
+                line
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if len(line.split("｜", 4)) == 5
+                and len(line.split("｜", 1)[0]) == 32
+            ]
+        except (OSError, UnicodeError):
+            return []
+
+    def _write_daily_lines(
+        self,
+        path: Path,
+        day: str,
+        record_lines: list[str],
+    ) -> None:
         by_role: dict[str, list[str]] = {
             role.strip(): []
             for role in self._role_names_provider()
@@ -249,76 +368,70 @@ class SyncOperationRecordStore:
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
-        return path
+
+    @staticmethod
+    def _record_payload(item: SyncOperationRecord) -> dict[str, str]:
+        return {
+            "record_id": item.record_id,
+            "occurred_at": item.occurred_at.isoformat(),
+            "category": item.category,
+            "role_name": item.role_name,
+            "detail": item.detail,
+        }
+
+    def _append_pending_journal(self, item: SyncOperationRecord) -> None:
+        self.pending_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.pending_path.open("a", encoding="utf-8", newline="\n") as file:
+            file.write(
+                json.dumps(
+                    self._record_payload(item),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            file.flush()
+
+    def _append_daily_records(
+        self,
+        items: tuple[SyncOperationRecord, ...],
+    ) -> tuple[Path, ...]:
+        by_day: dict[str, list[SyncOperationRecord]] = {}
+        for item in items:
+            day = item.occurred_at.astimezone().strftime("%Y-%m-%d")
+            by_day.setdefault(day, []).append(item)
+        written: list[Path] = []
+        for day, day_items in by_day.items():
+            path = self._daily_archive_path(day)
+            record_lines = self._record_lines(path)
+            existing_ids = {
+                line.split("｜", 1)[0] for line in record_lines
+            }
+            for item in day_items:
+                if item.record_id in existing_ids:
+                    continue
+                record_lines.append(f"{item.record_id}｜{item.player_line}")
+                existing_ids.add(item.record_id)
+            self._write_daily_lines(path, day, record_lines)
+            written.append(path)
+        return tuple(written)
+
+    def _append_daily_record(self, item: SyncOperationRecord) -> Path:
+        paths = self._append_daily_records((item,))
+        if not paths:
+            raise OSError("daily operation record was not written.")
+        return paths[0]
 
     def ensure_daily_file(self) -> Path:
+        self.flush()
         now = self._now_provider().astimezone()
         day = now.strftime("%Y-%m-%d")
         path = self._daily_archive_path(day)
-        existing_lines: list[str] = []
-        if path.is_file():
-            try:
-                existing_lines = [
-                    line
-                    for line in path.read_text(
-                        encoding="utf-8"
-                    ).splitlines()
-                    if len(line.split("｜", 4)) == 5
-                    and len(line.split("｜", 1)[0]) == 32
-                ]
-            except (OSError, UnicodeError):
-                existing_lines = []
-        by_role: dict[str, list[str]] = {
-            role.strip(): []
-            for role in self._role_names_provider()
-            if isinstance(role, str) and role.strip()
-        }
-        for line in existing_lines:
-            parts = line.split("｜", 4)
-            by_role.setdefault(parts[3].strip(), []).append(line)
-        rendered = [f"輔｜角色每日永久紀錄｜{day}", ""]
-        configured_order = [
-            role.strip()
-            for role in self._role_names_provider()
-            if isinstance(role, str) and role.strip()
-        ]
-        role_order = tuple(
-            dict.fromkeys(
-                configured_order
-                + sorted(
-                    (
-                        role
-                        for role in by_role
-                        if role not in configured_order
-                    ),
-                    key=str.casefold,
-                )
-            )
-        )
-        for role_name in role_order:
-            rendered.append(f"【角色：{role_name}】")
-            rendered.extend(
-                sorted(
-                    by_role[role_name],
-                    key=lambda value: value.split("｜", 4)[1],
-                )
-            )
-            rendered.append("")
-        temporary = path.with_name(
-            f".{path.name}.{uuid.uuid4().hex}.tmp"
-        )
-        try:
-            temporary.write_text(
-                "\n".join(rendered),
-                encoding="utf-8",
-                newline="\n",
-            )
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        self._write_daily_lines(path, day, self._record_lines(path))
         return path
 
     def daily_files(self) -> tuple[Path, ...]:
+        self.flush()
         if not self.archive_dir.is_dir():
             return ()
         return tuple(
@@ -395,21 +508,24 @@ class SyncOperationRecordStore:
         now = self._now_provider().astimezone(timezone.utc)
         cutoff = now - timedelta(days=RETENTION_DAYS)
         with self._lock:
+            self._cancel_flush_timer_locked()
+            self._flush_pending_locked()
             expired = [
                 item for item in self._records if item.occurred_at < cutoff
             ]
             if not expired:
                 return None
-            archived_paths = [
-                self._append_daily_record(item)
-                for item in sorted(
-                    expired,
-                    key=lambda value: (
-                        value.occurred_at,
-                        value.record_id,
-                    ),
+            archived_paths = self._append_daily_records(
+                tuple(
+                    sorted(
+                        expired,
+                        key=lambda value: (
+                            value.occurred_at,
+                            value.record_id,
+                        ),
+                    )
                 )
-            ]
+            )
             expired_ids = {item.record_id for item in expired}
             self._records = [
                 item

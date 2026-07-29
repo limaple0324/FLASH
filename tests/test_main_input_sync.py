@@ -18,6 +18,7 @@ from main import (
     SMART_RECONNECT_INTERVAL_MS_KEY,
     SYNC_KEYS_COLLAPSED_KEY,
     TIMED_CLICK_SETTINGS_KEY,
+    UI_THEME_KEY,
     build_services,
 )
 from services.app_context import AppContext
@@ -42,6 +43,7 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     assert config.get(GAME_TIME_OFFSET_MS_KEY) == 0
     assert config.get(GAME_TIME_AUTO_UPDATE_KEY) is True
     assert config.get(SYNC_KEYS_COLLAPSED_KEY) is True
+    assert config.get(UI_THEME_KEY) == "classic_gold"
     assert config.get(TIMED_CLICK_SETTINGS_KEY) == {
         "target_time": "",
         "lead_ms": 120,
@@ -94,6 +96,18 @@ def test_sync_services_share_lifecycle_backend_with_separate_target_contracts(
     assert pointer._operation_gate is gate
     assert reconnect._operation_gate is gate
     assert statuses._operation_gate is gate
+
+
+def test_main_window_polling_uses_a_throttled_current_group_handle_cache():
+    source = Path("main.py").read_text(encoding="utf-8")
+
+    assert source.count(
+        "target_handles_provider=current_target_handles"
+    ) == 2
+    assert 'sync_source_handle_cache: dict[str, object]' in source
+    assert '"expires_at": now + 0.25' in source
+    assert "target_windows_provider=current_sync_target_windows" in source
+    assert source.count("operation_record_store.append_deferred(") >= 3
 
 
 def test_home_exposes_three_policies_and_complete_confirmed_shortcuts():

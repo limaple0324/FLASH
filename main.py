@@ -8,6 +8,7 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from tkinter import PhotoImage, TclError, Tk, filedialog, messagebox
 
 from adapters.background_capability import BackgroundCapabilityProbe
@@ -379,7 +380,7 @@ def build_services(
             SMART_RECONNECT_INTERVAL_MS_KEY: (
                 DEFAULT_SMART_RECONNECT_INTERVAL_MS
             ),
-            UI_THEME_KEY: "clear_blue",
+            UI_THEME_KEY: "classic_gold",
             SYNC_SELECTED_KEYS_KEY: ["ESC"],
             SYNC_KEYS_COLLAPSED_KEY: True,
             GROUP_ROLE_DETAILS_EXPANDED_KEY: {},
@@ -787,7 +788,7 @@ def build_services(
                 f"active={record.active_operation}; "
                 f"skipped={record.skipped_operation}"
             ),
-            operation_record_store.append(
+            operation_record_store.append_deferred(
                 "同步衝突",
                 role_name_for_fingerprint(record.target_id),
                 (
@@ -811,7 +812,7 @@ def build_services(
                 reconnect_controller.reconnecting_fingerprints
             ),
             role_operation_callback=lambda fingerprint, operation, outcome: (
-                operation_record_store.append(
+                operation_record_store.append_deferred(
                     "同步操作",
                     role_name_for_fingerprint(fingerprint),
                     f"{operation}－{outcome}",
@@ -836,7 +837,7 @@ def build_services(
                 reconnect_controller.reconnecting_fingerprints
             ),
             role_operation_callback=lambda fingerprint, operation, outcome: (
-                operation_record_store.append(
+                operation_record_store.append_deferred(
                     "同步操作",
                     role_name_for_fingerprint(fingerprint),
                     f"{operation}－{outcome}",
@@ -864,7 +865,7 @@ def build_services(
             reconnecting_provider=(
                 reconnect_controller.reconnecting_fingerprints
             ),
-            record_callback=operation_record_store.append,
+            record_callback=operation_record_store.append_deferred,
             target_snapshot_provider=lambda group_name: (
                 target_window_contract_service.snapshot(
                     group_name,
@@ -1794,7 +1795,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         config.get(UI_THEME_KEY)
         if config is not None
         and config.get(UI_THEME_KEY) in UI_THEME_LABELS
-        else "clear_blue"
+        else "classic_gold"
     )
     known_sync_keys = {
         shortcut.key for shortcut in CONFIRMED_GAME_SHORTCUTS
@@ -3306,7 +3307,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             else None
         )
 
+    sync_source_handle_cache: dict[str, object] = {
+        "group_name": None,
+        "expires_at": 0.0,
+        "handles": (),
+    }
+
     def current_target_handles() -> tuple[int, ...]:
+        """Keep hot input polling within the current group without rescanning."""
         if (
             target_window_contract_service is None
             or workspace_service is None
@@ -3318,10 +3326,24 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if workspace.current_group is not None
             else None
         )
-        return tuple(
+        now = monotonic()
+        if (
+            sync_source_handle_cache["group_name"] == group_name
+            and now < float(sync_source_handle_cache["expires_at"])
+        ):
+            return tuple(sync_source_handle_cache["handles"])
+        handles = tuple(
             window.handle
             for window in target_window_contract_service.windows(group_name)
         )
+        sync_source_handle_cache.update(
+            {
+                "group_name": group_name,
+                "expires_at": now + 0.25,
+                "handles": handles,
+            }
+        )
+        return handles
 
     def log_keyboard_sync_result(result) -> None:
         if logger is not None:
@@ -4572,9 +4594,11 @@ def run(
 ) -> int:
     paths: PathManager | None = None
     logger: LoggerService | None = None
+    operation_record_store: SyncOperationRecordStore | None = None
     try:
         configure_process_app_identity()
         paths, logger = build_services(root=root)
+        operation_record_store = AppContext.get(SyncOperationRecordStore)
         if background_image_verify_path is not None:
             exit_code, report_path = verify_background_image_runtime(
                 background_image_verify_path,
@@ -4693,7 +4717,26 @@ def run(
                         try:
                             shutdown_external_adapter(logger)
                         finally:
+                            close_operation_record_store(
+                                operation_record_store,
+                                logger,
+                            )
                             close_logger(logger)
+
+
+def close_operation_record_store(
+    store: SyncOperationRecordStore | None,
+    logger: LoggerService | None,
+) -> None:
+    """Flush queued hot-path records before the process exits."""
+    if store is None:
+        return
+    try:
+        closed = store.close()
+    except Exception:
+        closed = False
+    if not closed and logger is not None:
+        logger.error("Operation record store final flush failed.")
 
 
 def close_logger(logger: LoggerService | None) -> None:

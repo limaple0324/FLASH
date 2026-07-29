@@ -22,12 +22,12 @@ from tkinter import (
 from services.character_detail_view_service import PlayerCharacterDetail
 
 
-BACKGROUND = "#F3F6FA"
-SURFACE = "#FFFFFF"
-PRIMARY = "#2474C6"
-TEXT = "#182433"
-MUTED = "#617083"
-BORDER = "#DCE4ED"
+BACKGROUND = "#C9A35D"
+SURFACE = "#EAD3A0"
+PRIMARY = "#8A5A24"
+TEXT = "#2B1A0A"
+MUTED = "#7A5321"
+BORDER = "#80591F"
 
 
 def _display_value(value: object) -> str:
