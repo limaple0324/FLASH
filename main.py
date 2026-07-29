@@ -251,6 +251,7 @@ SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
 SMART_RECONNECT_CONSENT_KEY = "smart_reconnect_consent_v1"
 SMART_RECONNECT_INTERVAL_MS_KEY = "disconnect_detect_interval_ms"
 UI_THEME_KEY = "ui_theme"
+UI_THEME_CLASSIC_GOLD_MIGRATION_KEY = "ui_theme_classic_gold_migration_v1"
 CURRENT_GROUP_NAME_KEY = "current_group_name"
 REGISTRY_FILENAME = "window_registry.json"
 RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
@@ -296,6 +297,35 @@ BACKGROUND_IMAGE_FILETYPES = (
     ),
     ("所有檔案", "*.*"),
 )
+
+
+def _service_running_state(service: object) -> bool:
+    for name in ("running", "enabled", "started"):
+        value = getattr(service, name, None)
+        if type(value) is bool:
+            return value
+    return False
+
+
+def stop_input_sync_pair(
+    keyboard_monitor: object,
+    mouse_monitor: object,
+) -> bool:
+    """Stop both monitors or restore their exact prior running state."""
+    services = (keyboard_monitor, mouse_monitor)
+    previous = tuple(_service_running_state(service) for service in services)
+    results = tuple(stop_service(service) for service in services)
+    if all(result.success for result in results) and not any(
+        _service_running_state(service) for service in services
+    ):
+        return True
+    for service, was_running in zip(services, previous):
+        running = _service_running_state(service)
+        if was_running and not running:
+            start_service(service)
+        elif not was_running and running:
+            stop_service(service)
+    return False
 
 
 def resource_path(relative_path: Path) -> Path:
@@ -372,6 +402,13 @@ def build_services(
         error_logger=logger.error,
     )
     feature_card_layout_service = FeatureCardLayoutService(config)
+    if config.get(UI_THEME_CLASSIC_GOLD_MIGRATION_KEY) is not True:
+        config.update_values(
+            {
+                UI_THEME_KEY: "classic_gold",
+                UI_THEME_CLASSIC_GOLD_MIGRATION_KEY: True,
+            }
+        )
     config.ensure_defaults(
         {
             INPUT_POLICY_KEY: WindowInputPolicy.ALL.value,
@@ -3473,9 +3510,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return False
         auto_click_service.invalidate_direct_sync()
         if not enabled:
-            keyboard_stopped = stop_service(keyboard_sync_monitor)
-            mouse_stopped = stop_service(mouse_sync_monitor)
-            return keyboard_stopped.success and mouse_stopped.success
+            return stop_input_sync_pair(
+                keyboard_sync_monitor,
+                mouse_sync_monitor,
+            )
 
         state = workspace_service.snapshot() if workspace_service is not None else None
         group_name = (
@@ -4736,7 +4774,10 @@ def close_operation_record_store(
     except Exception:
         closed = False
     if not closed and logger is not None:
-        logger.error("Operation record store final flush failed.")
+        logger.error(
+            "Operation record store final flush failed; "
+            f"code={store.persistence_failure or 'unknown'}"
+        )
 
 
 def close_logger(logger: LoggerService | None) -> None:

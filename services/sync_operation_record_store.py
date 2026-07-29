@@ -62,6 +62,7 @@ class SyncOperationRecordStore:
         )
         self._role_names_provider = role_names_provider or (lambda: ())
         self._lock = threading.RLock()
+        self._flush_io_lock = threading.Lock()
         active_records = list(self._load())
         active_ids = {item.record_id for item in active_records}
         pending_records = [
@@ -72,6 +73,7 @@ class SyncOperationRecordStore:
         self._pending_records: list[SyncOperationRecord] = pending_records
         self._flush_timer: threading.Timer | None = None
         self._closed = False
+        self._persistence_failure: str | None = None
         self._records = active_records + pending_records
         if not pending_records:
             self.pending_path.unlink(missing_ok=True)
@@ -148,7 +150,10 @@ class SyncOperationRecordStore:
                 records.append(record)
         return tuple(records)
 
-    def _save(self) -> None:
+    def _save_records(
+        self,
+        records: tuple[SyncOperationRecord, ...],
+    ) -> None:
         self.active_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": self.SCHEMA_VERSION,
@@ -160,7 +165,7 @@ class SyncOperationRecordStore:
                     "role_name": item.role_name,
                     "detail": item.detail,
                 }
-                for item in self._records
+                for item in records
             ],
         }
         temporary = self.active_path.with_name(
@@ -195,26 +200,55 @@ class SyncOperationRecordStore:
         if timer is not None:
             timer.cancel()
 
-    def _flush_pending_locked(self) -> None:
-        pending = tuple(self._pending_records)
-        if not pending:
-            return
-        self._append_daily_records(pending)
-        self._save()
-        del self._pending_records[: len(pending)]
-        self.pending_path.unlink(missing_ok=True)
+    def _flush_pending_once(self) -> bool:
+        """Persist one snapshot without holding the hot-path state lock."""
+        with self._flush_io_lock:
+            with self._lock:
+                pending = tuple(self._pending_records)
+                records = tuple(self._records)
+            if not pending:
+                return True
+            try:
+                self._append_daily_records(pending)
+                self._save_records(records)
+            except (OSError, UnicodeError):
+                with self._lock:
+                    self._persistence_failure = "record_batch_write_failed"
+                return False
+            processed_ids = {item.record_id for item in pending}
+            with self._lock:
+                remaining = [
+                    item
+                    for item in self._pending_records
+                    if item.record_id not in processed_ids
+                ]
+                try:
+                    self._rewrite_pending_journal(tuple(remaining))
+                except (OSError, UnicodeError):
+                    self._persistence_failure = (
+                        "record_pending_journal_write_failed"
+                    )
+                    return False
+                self._pending_records = remaining
+                self._persistence_failure = None
+            return True
+
+    def _flush_all_pending(self) -> bool:
+        while True:
+            with self._lock:
+                if not self._pending_records:
+                    return True
+            if not self._flush_pending_once():
+                return False
 
     def _flush_deferred(self) -> None:
         with self._lock:
             self._flush_timer = None
             if self._closed:
                 return
-            try:
-                self._flush_pending_locked()
-            except (OSError, UnicodeError):
-                # Keep the pending records in memory. A later append, explicit
-                # flush, or normal shutdown will retry without losing them.
-                return
+        # Disk work is deliberately outside _lock so input delivery can queue
+        # its next role record while the previous batch is persisted.
+        self._flush_pending_once()
 
     def _schedule_flush_locked(self) -> None:
         if self._flush_timer is not None or self._closed:
@@ -237,11 +271,17 @@ class SyncOperationRecordStore:
         with self._lock:
             if self._closed:
                 raise RuntimeError("operation record store is closed.")
-            self._append_pending_journal(record)
             self._records.append(record)
             self._pending_records.append(record)
+            try:
+                self._append_pending_journal(record)
+            except (OSError, UnicodeError):
+                self._persistence_failure = (
+                    "record_pending_journal_write_failed"
+                )
             self._cancel_flush_timer_locked()
-            self._flush_pending_locked()
+        if not self.flush():
+            raise OSError("operation record could not be persisted.")
         self.archive_expired()
         return record
 
@@ -256,32 +296,35 @@ class SyncOperationRecordStore:
         with self._lock:
             if self._closed:
                 raise RuntimeError("operation record store is closed.")
-            self._append_pending_journal(record)
             self._records.append(record)
             self._pending_records.append(record)
+            try:
+                self._append_pending_journal(record)
+            except (OSError, UnicodeError):
+                # Keep the record in memory and let the background batch retry.
+                # Input delivery must not fail because its audit file is busy.
+                self._persistence_failure = (
+                    "record_pending_journal_write_failed"
+                )
             self._schedule_flush_locked()
         return record
 
     def flush(self) -> bool:
         with self._lock:
             self._cancel_flush_timer_locked()
-            try:
-                self._flush_pending_locked()
-            except (OSError, UnicodeError):
-                return False
-        return True
+        return self._flush_all_pending()
 
     def close(self) -> bool:
         with self._lock:
             if self._closed:
                 return True
             self._cancel_flush_timer_locked()
-            try:
-                self._flush_pending_locked()
-            except (OSError, UnicodeError):
-                return False
             self._closed = True
-        return True
+        if self._flush_all_pending():
+            return True
+        with self._lock:
+            self._closed = False
+        return False
 
     def records(self) -> tuple[SyncOperationRecord, ...]:
         with self._lock:
@@ -292,6 +335,11 @@ class SyncOperationRecordStore:
                     reverse=True,
                 )
             )
+
+    @property
+    def persistence_failure(self) -> str | None:
+        with self._lock:
+            return self._persistence_failure
 
     def player_lines(self) -> tuple[str, ...]:
         return tuple(item.player_line for item in self.records())
@@ -391,6 +439,35 @@ class SyncOperationRecordStore:
                 + "\n"
             )
             file.flush()
+
+    def _rewrite_pending_journal(
+        self,
+        items: tuple[SyncOperationRecord, ...],
+    ) -> None:
+        if not items:
+            self.pending_path.unlink(missing_ok=True)
+            return
+        self.pending_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.pending_path.with_name(
+            f".{self.pending_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            temporary.write_text(
+                "".join(
+                    json.dumps(
+                        self._record_payload(item),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                    for item in items
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+            os.replace(temporary, self.pending_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _append_daily_records(
         self,
@@ -507,11 +584,13 @@ class SyncOperationRecordStore:
     def archive_expired(self) -> Path | None:
         now = self._now_provider().astimezone(timezone.utc)
         cutoff = now - timedelta(days=RETENTION_DAYS)
-        with self._lock:
-            self._cancel_flush_timer_locked()
-            self._flush_pending_locked()
+        if not self.flush():
+            return None
+        with self._flush_io_lock:
+            with self._lock:
+                records = tuple(self._records)
             expired = [
-                item for item in self._records if item.occurred_at < cutoff
+                item for item in records if item.occurred_at < cutoff
             ]
             if not expired:
                 return None
@@ -527,10 +606,14 @@ class SyncOperationRecordStore:
                 )
             )
             expired_ids = {item.record_id for item in expired}
-            self._records = [
-                item
-                for item in self._records
-                if item.record_id not in expired_ids
-            ]
-            self._save()
+            retained = tuple(
+                item for item in records if item.record_id not in expired_ids
+            )
+            self._save_records(retained)
+            with self._lock:
+                self._records = [
+                    item
+                    for item in self._records
+                    if item.record_id not in expired_ids
+                ]
             return archived_paths[0] if archived_paths else None

@@ -18,8 +18,10 @@ from main import (
     SMART_RECONNECT_INTERVAL_MS_KEY,
     SYNC_KEYS_COLLAPSED_KEY,
     TIMED_CLICK_SETTINGS_KEY,
+    UI_THEME_CLASSIC_GOLD_MIGRATION_KEY,
     UI_THEME_KEY,
     build_services,
+    stop_input_sync_pair,
 )
 from services.app_context import AppContext
 from services.smart_reconnect_monitor import SmartReconnectMonitor
@@ -44,6 +46,7 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     assert config.get(GAME_TIME_AUTO_UPDATE_KEY) is True
     assert config.get(SYNC_KEYS_COLLAPSED_KEY) is True
     assert config.get(UI_THEME_KEY) == "classic_gold"
+    assert config.get(UI_THEME_CLASSIC_GOLD_MIGRATION_KEY) is True
     assert config.get(TIMED_CLICK_SETTINGS_KEY) == {
         "target_time": "",
         "lead_ms": 120,
@@ -55,6 +58,60 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     assert reconnect_boundary is reconnect
     assert isinstance(reconnect_monitor, SmartReconnectMonitor)
     assert reconnect_monitor.monitor_interval_ms == 1000
+
+
+def test_existing_theme_migrates_to_gold_once_without_overriding_later_choice(
+    tmp_path,
+):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    settings = config_dir / "settings.json"
+    settings.write_text(
+        json.dumps({UI_THEME_KEY: "clear_blue"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    build_services(root=tmp_path)
+
+    config = AppContext.get(ConfigManager)
+    assert config.get(UI_THEME_KEY) == "classic_gold"
+    assert config.get(UI_THEME_CLASSIC_GOLD_MIGRATION_KEY) is True
+
+    config.set(UI_THEME_KEY, "forest_green")
+    build_services(root=tmp_path)
+
+    reloaded = AppContext.get(ConfigManager)
+    assert reloaded.get(UI_THEME_KEY) == "forest_green"
+    assert reloaded.get(UI_THEME_CLASSIC_GOLD_MIGRATION_KEY) is True
+
+
+def test_stop_sync_pair_rolls_back_when_only_one_monitor_stops():
+    class Monitor:
+        def __init__(self, *, fail_stop=False):
+            self.enabled = True
+            self.fail_stop = fail_stop
+
+        def start(self):
+            self.enabled = True
+            return True
+
+        def stop(self):
+            if self.fail_stop:
+                return False
+            self.enabled = False
+            return True
+
+    keyboard = Monitor(fail_stop=True)
+    mouse = Monitor()
+
+    assert stop_input_sync_pair(keyboard, mouse) is False
+    assert keyboard.enabled is True
+    assert mouse.enabled is True
+
+    keyboard.fail_stop = False
+    assert stop_input_sync_pair(keyboard, mouse) is True
+    assert keyboard.enabled is False
+    assert mouse.enabled is False
 
 
 def test_smart_reconnect_monitor_restores_saved_interval(tmp_path):
