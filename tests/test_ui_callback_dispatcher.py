@@ -101,3 +101,40 @@ def test_worker_dispatch_does_not_deadlock_main_thread_callback():
     assert callback_finished.is_set()
     assert calls == ["completed"]
     assert dispatcher.pending_count == 0
+
+
+def test_pause_resume_rejects_dispatch_started_before_pause():
+    schedule_started = threading.Event()
+    allow_schedule_return = threading.Event()
+    scheduled_callback = {}
+    cancelled = []
+
+    def schedule(_delay, callback):
+        scheduled_callback["callback"] = callback
+        schedule_started.set()
+        assert allow_schedule_return.wait(1)
+        return "callback-1"
+
+    dispatcher = UiCallbackDispatcher(schedule, cancelled.append)
+    calls = []
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            dispatcher.dispatch(lambda: calls.append("stale"))
+        )
+    )
+
+    worker.start()
+    assert schedule_started.wait(1)
+    dispatcher.pause()
+    assert dispatcher.resume() is True
+    allow_schedule_return.set()
+    worker.join(1)
+
+    assert worker.is_alive() is False
+    assert result == [None]
+    assert cancelled == ["callback-1"]
+    assert dispatcher.pending_count == 0
+
+    scheduled_callback["callback"]()
+    assert calls == []

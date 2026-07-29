@@ -19,6 +19,7 @@ class UiCallbackDispatcher:
         self._pending: set[object] = set()
         self._active = True
         self._closed = False
+        self._pause_generation = 0
         self._lock = threading.RLock()
 
     @property
@@ -37,9 +38,11 @@ class UiCallbackDispatcher:
         with self._lock:
             if not self._active or self._closed:
                 return None
+            dispatch_generation = self._pause_generation
         holder: dict[str, object] = {
             "token": None,
             "completed": False,
+            "allowed": False,
         }
 
         def guarded() -> None:
@@ -48,7 +51,12 @@ class UiCallbackDispatcher:
                 token = holder.get("token")
                 if token is not None:
                     self._pending.discard(token)
-                allowed = self._active and not self._closed
+                allowed = (
+                    self._active
+                    and not self._closed
+                    and self._pause_generation == dispatch_generation
+                )
+                holder["allowed"] = allowed
             if allowed:
                 callback()
 
@@ -64,8 +72,12 @@ class UiCallbackDispatcher:
         with self._lock:
             holder["token"] = token
             if bool(holder["completed"]):
-                return token
-            if not self._active or self._closed:
+                return token if bool(holder["allowed"]) else None
+            if (
+                not self._active
+                or self._closed
+                or self._pause_generation != dispatch_generation
+            ):
                 cancel_token = True
             else:
                 self._pending.add(token)
@@ -80,6 +92,7 @@ class UiCallbackDispatcher:
     def pause(self) -> None:
         with self._lock:
             self._active = False
+            self._pause_generation += 1
             pending = tuple(self._pending)
             self._pending.clear()
         for token in pending:
