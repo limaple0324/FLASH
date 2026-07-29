@@ -14,6 +14,7 @@ from typing import Callable, Mapping
 
 RETENTION_DAYS = 30
 DEFERRED_FLUSH_SECONDS = 0.05
+PERSISTENCE_RETRY_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +210,7 @@ class SyncOperationRecordStore:
             if not pending:
                 return True
             try:
+                self._rewrite_pending_journal(pending)
                 self._append_daily_records(pending)
                 self._save_records(records)
             except (OSError, UnicodeError):
@@ -248,13 +250,23 @@ class SyncOperationRecordStore:
                 return
         # Disk work is deliberately outside _lock so input delivery can queue
         # its next role record while the previous batch is persisted.
-        self._flush_pending_once()
+        succeeded = self._flush_pending_once()
+        with self._lock:
+            if self._pending_records and self._flush_timer is None:
+                self._schedule_flush_locked(
+                    DEFERRED_FLUSH_SECONDS
+                    if succeeded
+                    else PERSISTENCE_RETRY_SECONDS
+                )
 
-    def _schedule_flush_locked(self) -> None:
+    def _schedule_flush_locked(
+        self,
+        delay_seconds: float = DEFERRED_FLUSH_SECONDS,
+    ) -> None:
         if self._flush_timer is not None or self._closed:
             return
         timer = threading.Timer(
-            DEFERRED_FLUSH_SECONDS,
+            max(0.01, float(delay_seconds)),
             self._flush_deferred,
         )
         timer.daemon = True
@@ -298,14 +310,6 @@ class SyncOperationRecordStore:
                 raise RuntimeError("operation record store is closed.")
             self._records.append(record)
             self._pending_records.append(record)
-            try:
-                self._append_pending_journal(record)
-            except (OSError, UnicodeError):
-                # Keep the record in memory and let the background batch retry.
-                # Input delivery must not fail because its audit file is busy.
-                self._persistence_failure = (
-                    "record_pending_journal_write_failed"
-                )
             self._schedule_flush_locked()
         return record
 

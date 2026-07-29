@@ -174,6 +174,12 @@ def test_pending_journal_recovers_interrupted_deferred_flush(
         "角色甲",
         "同步左鍵－成功",
     )
+    monkeypatch.setattr(
+        interrupted,
+        "_append_daily_records",
+        lambda _items: (_ for _ in ()).throw(OSError("interrupted")),
+    )
+    assert interrupted.flush() is False
     with interrupted._lock:
         interrupted._cancel_flush_timer_locked()
         interrupted._closed = True
@@ -389,11 +395,11 @@ def test_busy_pending_journal_keeps_record_in_memory_and_retries(
     active = tmp_path / "active.json"
     daily = tmp_path / "daily"
     store = SyncOperationRecordStore(active, daily)
-    original_journal_append = store._append_pending_journal
+    original_journal_write = store._rewrite_pending_journal
     monkeypatch.setattr(
         store,
-        "_append_pending_journal",
-        lambda _item: (_ for _ in ()).throw(OSError("busy")),
+        "_rewrite_pending_journal",
+        lambda _items: (_ for _ in ()).throw(OSError("busy")),
     )
 
     record = store.append_deferred(
@@ -403,12 +409,14 @@ def test_busy_pending_journal_keeps_record_in_memory_and_retries(
     )
 
     assert [item.record_id for item in store.records()] == [record.record_id]
-    assert store.persistence_failure == "record_pending_journal_write_failed"
+    assert store.persistence_failure is None
+    assert store.flush() is False
+    assert store.persistence_failure == "record_batch_write_failed"
 
     monkeypatch.setattr(
         store,
-        "_append_pending_journal",
-        original_journal_append,
+        "_rewrite_pending_journal",
+        original_journal_write,
     )
     assert store.flush() is True
     assert store.persistence_failure is None
@@ -417,3 +425,76 @@ def test_busy_pending_journal_keeps_record_in_memory_and_retries(
         encoding="utf-8"
     )
     assert store.close() is True
+
+
+def test_deferred_append_never_touches_any_file_on_the_sync_path(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "services.sync_operation_record_store.DEFERRED_FLUSH_SECONDS",
+        60,
+    )
+    store = SyncOperationRecordStore(
+        tmp_path / "active.json",
+        tmp_path / "daily",
+    )
+    monkeypatch.setattr(
+        store,
+        "_append_pending_journal",
+        lambda _item: (_ for _ in ()).throw(
+            AssertionError("hot path touched the journal")
+        ),
+    )
+    monkeypatch.setattr(
+        store,
+        "_rewrite_pending_journal",
+        lambda _items: (_ for _ in ()).throw(
+            AssertionError("hot path rewrote the journal")
+        ),
+    )
+
+    record = store.append_deferred(
+        "同步操作",
+        "角色甲",
+        "同步左鍵－成功",
+    )
+
+    assert [item.record_id for item in store.records()] == [record.record_id]
+    with store._lock:
+        store._cancel_flush_timer_locked()
+        store._closed = True
+
+
+def test_failed_background_batch_schedules_an_automatic_retry(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "services.sync_operation_record_store.DEFERRED_FLUSH_SECONDS",
+        60,
+    )
+    monkeypatch.setattr(
+        "services.sync_operation_record_store.PERSISTENCE_RETRY_SECONDS",
+        60,
+    )
+    store = SyncOperationRecordStore(
+        tmp_path / "active.json",
+        tmp_path / "daily",
+    )
+    store.append_deferred("同步操作", "角色甲", "第一次")
+    with store._lock:
+        store._cancel_flush_timer_locked()
+    monkeypatch.setattr(
+        store,
+        "_rewrite_pending_journal",
+        lambda _items: (_ for _ in ()).throw(OSError("busy")),
+    )
+
+    store._flush_deferred()
+
+    assert store.persistence_failure == "record_batch_write_failed"
+    assert store._flush_timer is not None
+    with store._lock:
+        store._cancel_flush_timer_locked()
+        store._closed = True
