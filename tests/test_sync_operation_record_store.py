@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from threading import Event, Thread
 
+import pytest
+
 from adapters.windows_input_sync import (
     WindowInputPolicy,
     WindowsInputSyncController,
@@ -8,6 +10,7 @@ from adapters.windows_input_sync import (
 from adapters.windows_pointer_sync import WindowsPointerSyncController
 from adapters.windows_window import WindowInfo
 from services.sync_operation_record_store import (
+    MAX_JOURNAL_SNAPSHOT_ATTEMPTS,
     SyncOperationRecordStore,
 )
 
@@ -384,7 +387,7 @@ def test_background_persistence_never_holds_the_hot_path_state_lock(
     assert store.close() is True
 
 
-def test_background_journal_cleanup_never_holds_the_hot_path_state_lock(
+def test_background_journal_cleanup_publishes_only_validated_snapshot(
     tmp_path,
     monkeypatch,
 ):
@@ -396,51 +399,59 @@ def test_background_journal_cleanup_never_holds_the_hot_path_state_lock(
         tmp_path / "active.json",
         tmp_path / "daily",
     )
-    cleanup_started = Event()
-    release_cleanup = Event()
-    journal_calls = []
-    original_journal_write = store._rewrite_pending_journal
+    cleanup_prepared = Event()
+    second_queued = Event()
+    prepare_calls = []
+    publish_calls = []
+    original_prepare = store._prepare_pending_journal
+    original_publish = store._publish_pending_journal
 
-    def blocked_cleanup(items):
-        journal_calls.append(items)
-        if len(journal_calls) == 2:
-            cleanup_started.set()
-            assert release_cleanup.wait(1)
-        original_journal_write(items)
+    class SimulatedCrash(RuntimeError):
+        pass
 
-    monkeypatch.setattr(store, "_rewrite_pending_journal", blocked_cleanup)
+    def blocked_prepare(items):
+        temporary = original_prepare(items)
+        prepare_calls.append(items)
+        if len(prepare_calls) == 2:
+            cleanup_prepared.set()
+            assert second_queued.wait(1)
+        return temporary
+
+    def crash_after_latest_publish(temporary, *, has_items):
+        original_publish(temporary, has_items=has_items)
+        publish_calls.append(has_items)
+        if len(publish_calls) == 2:
+            raise SimulatedCrash
+
+    monkeypatch.setattr(store, "_prepare_pending_journal", blocked_prepare)
+    monkeypatch.setattr(
+        store,
+        "_publish_pending_journal",
+        crash_after_latest_publish,
+    )
     monkeypatch.setattr(
         store,
         "_append_daily_records",
         lambda _items: (tmp_path / "daily.txt",),
     )
     store.append_deferred("同步操作", "角色甲", "第一次")
-    background = Thread(target=store._flush_pending_once)
-    background.start()
-    assert cleanup_started.wait(0.5)
-
-    queued = Event()
 
     def queue_next_record():
+        assert cleanup_prepared.wait(1)
         store.append_deferred("同步操作", "角色乙", "第二次")
-        queued.set()
+        second_queued.set()
 
     hot_path = Thread(target=queue_next_record)
     hot_path.start()
     try:
-        assert queued.wait(0.25)
+        with pytest.raises(SimulatedCrash):
+            store._flush_pending_once()
     finally:
-        release_cleanup.set()
         hot_path.join(1)
-        background.join(1)
 
     assert len(store.records()) == 2
-    assert len(journal_calls) == 3
-    second_record = store.records()[0]
-    assert second_record.detail == "第二次"
-    assert second_record.record_id in store.pending_path.read_text(
-        encoding="utf-8"
-    )
+    assert len(prepare_calls) == 3
+    assert publish_calls == [True, True]
     with store._lock:
         store._cancel_flush_timer_locked()
         store._closed = True
@@ -454,6 +465,46 @@ def test_background_journal_cleanup_never_holds_the_hot_path_state_lock(
         "第二次",
     }
     assert recovered.close() is True
+
+
+def test_background_journal_cleanup_has_bounded_snapshot_retries(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "services.sync_operation_record_store.DEFERRED_FLUSH_SECONDS",
+        60,
+    )
+    store = SyncOperationRecordStore(
+        tmp_path / "active.json",
+        tmp_path / "daily",
+    )
+    original_prepare = store._prepare_pending_journal
+    prepare_calls = []
+
+    def append_during_each_lock_free_attempt(items):
+        temporary = original_prepare(items)
+        prepare_calls.append(items)
+        call_number = len(prepare_calls)
+        if 2 <= call_number <= 1 + MAX_JOURNAL_SNAPSHOT_ATTEMPTS:
+            store.append_deferred(
+                "同步操作",
+                f"角色{call_number}",
+                f"併發{call_number}",
+            )
+        return temporary
+
+    monkeypatch.setattr(
+        store,
+        "_prepare_pending_journal",
+        append_during_each_lock_free_attempt,
+    )
+    store.append_deferred("同步操作", "角色甲", "第一次")
+
+    assert store._flush_pending_once() is True
+    assert len(prepare_calls) == MAX_JOURNAL_SNAPSHOT_ATTEMPTS + 2
+    assert len(store._pending_records) == MAX_JOURNAL_SNAPSHOT_ATTEMPTS
+    assert store.close() is True
 
 
 def test_busy_pending_journal_keeps_record_in_memory_and_retries(

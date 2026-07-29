@@ -15,6 +15,7 @@ from typing import Callable, Mapping
 RETENTION_DAYS = 30
 DEFERRED_FLUSH_SECONDS = 0.05
 PERSISTENCE_RETRY_SECONDS = 0.25
+MAX_JOURNAL_SNAPSHOT_ATTEMPTS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +219,7 @@ class SyncOperationRecordStore:
                     self._persistence_failure = "record_batch_write_failed"
                 return False
             processed_ids = {item.record_id for item in pending}
-            while True:
+            for _attempt in range(MAX_JOURNAL_SNAPSHOT_ATTEMPTS):
                 with self._lock:
                     state_snapshot = tuple(self._pending_records)
                     remaining_snapshot = tuple(
@@ -226,17 +227,47 @@ class SyncOperationRecordStore:
                         for item in state_snapshot
                         if item.record_id not in processed_ids
                     )
+                temporary: Path | None = None
                 try:
-                    self._rewrite_pending_journal(remaining_snapshot)
+                    temporary = self._prepare_pending_journal(
+                        remaining_snapshot
+                    )
+                    with self._lock:
+                        if tuple(self._pending_records) != state_snapshot:
+                            continue
+                        self._publish_pending_journal(
+                            temporary,
+                            has_items=bool(remaining_snapshot),
+                        )
+                        self._pending_records = list(remaining_snapshot)
+                        self._persistence_failure = None
+                        return True
                 except (OSError, UnicodeError):
                     with self._lock:
                         self._persistence_failure = (
                             "record_pending_journal_write_failed"
                         )
                     return False
-                with self._lock:
-                    if tuple(self._pending_records) != state_snapshot:
-                        continue
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+            # Under sustained input, finish one bounded fallback while new
+            # appends briefly wait on the state lock. This is reached only
+            # after every lock-free snapshot attempt was invalidated.
+            with self._lock:
+                remaining_snapshot = tuple(
+                    item
+                    for item in self._pending_records
+                    if item.record_id not in processed_ids
+                )
+                try:
+                    self._rewrite_pending_journal(remaining_snapshot)
+                except (OSError, UnicodeError):
+                    self._persistence_failure = (
+                        "record_pending_journal_write_failed"
+                    )
+                    return False
+                else:
                     self._pending_records = list(remaining_snapshot)
                     self._persistence_failure = None
                     return True
@@ -454,9 +485,22 @@ class SyncOperationRecordStore:
         self,
         items: tuple[SyncOperationRecord, ...],
     ) -> None:
+        temporary = self._prepare_pending_journal(items)
+        try:
+            self._publish_pending_journal(
+                temporary,
+                has_items=bool(items),
+            )
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _prepare_pending_journal(
+        self,
+        items: tuple[SyncOperationRecord, ...],
+    ) -> Path | None:
         if not items:
-            self.pending_path.unlink(missing_ok=True)
-            return
+            return None
         self.pending_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.pending_path.with_name(
             f".{self.pending_path.name}.{uuid.uuid4().hex}.tmp"
@@ -475,9 +519,23 @@ class SyncOperationRecordStore:
                 encoding="utf-8",
                 newline="\n",
             )
-            os.replace(temporary, self.pending_path)
-        finally:
+            return temporary
+        except Exception:
             temporary.unlink(missing_ok=True)
+            raise
+
+    def _publish_pending_journal(
+        self,
+        temporary: Path | None,
+        *,
+        has_items: bool,
+    ) -> None:
+        if not has_items:
+            self.pending_path.unlink(missing_ok=True)
+            return
+        if temporary is None:
+            raise OSError("pending journal candidate is missing.")
+        os.replace(temporary, self.pending_path)
 
     def _append_daily_records(
         self,
