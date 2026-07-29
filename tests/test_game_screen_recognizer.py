@@ -185,6 +185,86 @@ def test_character_level_ignores_unrelated_role_text_below_the_digits():
         assert score == 0.0
 
 
+def test_character_level_uses_middle_digit_when_outer_glyph_style_differs(
+    monkeypatch,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    signatures = {
+        level: recognizer._level_signature(
+            recognizer._reference(f"character_level_{level}.png")
+        )
+        for level in (100, 120, 160)
+    }
+    assert all(signature is not None for signature in signatures.values())
+    middle_zero = recognizer._level_glyph_signatures(signatures[100])[1]
+    candidate = Image.new("L", (64, 32), 0)
+    candidate.paste(Image.new("L", (12, 20), 255), (10, 6))
+    candidate.paste(middle_zero.crop((2, 2, 14, 22)), (26, 6))
+    candidate.paste(Image.new("L", (12, 20), 255), (42, 6))
+    sequence = iter(
+        (
+            candidate,
+            signatures[100],
+            signatures[120],
+            signatures[160],
+        )
+    )
+    monkeypatch.setattr(
+        recognizer,
+        "_level_signature",
+        lambda _image: next(sequence),
+    )
+
+    recognized, score = recognizer._recognize_character_level(
+        Image.new("RGB", (64, 32)),
+        (0.0, 0.0, 1.0, 1.0),
+    )
+
+    assert recognized == 100
+    assert score is not None
+
+
+def test_character_selection_match_without_level_card_yields_to_gameplay(
+    monkeypatch,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "06_connected_gameplay.png") as source:
+        candidate = source.convert("RGB")
+    reference_states = {
+        id(recognizer._reference(definition.filename)): definition.state
+        for definition in DEFAULT_SCREEN_TEMPLATES
+    }
+
+    monkeypatch.setattr(
+        recognizer,
+        "_disconnect_overlay_score",
+        lambda *_args: 255.0,
+    )
+    monkeypatch.setattr(
+        recognizer,
+        "_popup_title_score",
+        lambda *_args: 255.0,
+    )
+    monkeypatch.setattr(
+        recognizer,
+        "_region_score",
+        lambda _candidate, reference, _region: {
+            ReconnectScreenState.CHARACTER_SELECTION: 1.0,
+            ReconnectScreenState.CONNECTED: 2.0,
+        }.get(reference_states[id(reference)], 255.0),
+    )
+    monkeypatch.setattr(
+        recognizer,
+        "_character_selection_candidates",
+        lambda _candidate: (),
+    )
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.CONNECTED
+    assert result.click_point is None
+
+
 def test_recognition_survives_proportional_window_scaling():
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
     definition = next(

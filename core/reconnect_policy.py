@@ -46,6 +46,7 @@ class ReconnectPolicy:
 
     retry_interval_seconds: int = 60
     progress_interval_seconds: int = 2
+    disconnect_confirmation_wait_seconds: int = 5
     force_login_wait_seconds: int = 10
     line_transition_wait_seconds: int = 3
     entry_transition_wait_seconds: int = 10
@@ -60,6 +61,10 @@ class ReconnectPolicy:
             raise ValueError("retry_interval_seconds must be positive")
         if self.progress_interval_seconds <= 0:
             raise ValueError("progress_interval_seconds must be positive")
+        if self.disconnect_confirmation_wait_seconds <= 0:
+            raise ValueError(
+                "disconnect_confirmation_wait_seconds must be positive"
+            )
         if self.force_login_wait_seconds <= 0:
             raise ValueError("force_login_wait_seconds must be positive")
         if self.line_transition_wait_seconds <= 0:
@@ -85,7 +90,7 @@ class ReconnectPolicy:
         if state is ReconnectScreenState.DISCONNECTED:
             return ReconnectDecision(
                 action=ReconnectAction.CONFIRM_DISCONNECT,
-                delay_seconds=self.progress_interval_seconds,
+                delay_seconds=self.disconnect_confirmation_wait_seconds,
                 attempt_limit=self.maximum_attempts,
             )
         if state is ReconnectScreenState.LOGIN_START:

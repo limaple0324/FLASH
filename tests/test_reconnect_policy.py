@@ -12,6 +12,7 @@ def test_confirmed_policy_uses_one_minute_unlimited_retry_without_button():
 
     assert policy.retry_interval_seconds == 60
     assert policy.progress_interval_seconds == 2
+    assert policy.disconnect_confirmation_wait_seconds == 5
     assert policy.force_login_wait_seconds == 10
     assert policy.line_transition_wait_seconds == 3
     assert policy.entry_transition_wait_seconds == 10
@@ -49,7 +50,7 @@ def test_known_reconnect_screen_advances_after_short_progress_delay(state, actio
 
     assert decision.action is action
     expected_delay = {
-        ReconnectScreenState.DISCONNECTED: 2,
+        ReconnectScreenState.DISCONNECTED: 5,
         ReconnectScreenState.LOGIN_START: 10,
         ReconnectScreenState.FORCE_LOGIN_START: 10,
         ReconnectScreenState.LINE_SELECTION: 3,
@@ -108,6 +109,8 @@ def test_policy_rejects_invalid_retry_values():
         ReconnectPolicy(retry_interval_seconds=0)
     with pytest.raises(ValueError):
         ReconnectPolicy(progress_interval_seconds=0)
+    with pytest.raises(ValueError):
+        ReconnectPolicy(disconnect_confirmation_wait_seconds=0)
     with pytest.raises(ValueError):
         ReconnectPolicy(force_login_wait_seconds=0)
     with pytest.raises(ValueError):

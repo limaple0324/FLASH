@@ -639,6 +639,40 @@ class ReferenceScreenRecognizer:
         )
         return signature
 
+    @staticmethod
+    def _level_glyph_signatures(
+        signature: Image.Image,
+    ) -> tuple[Image.Image, ...]:
+        """Normalize each level digit independently across window scales."""
+        content = signature.convert("L").crop((8, 4, 56, 28))
+        occupied_columns = [
+            any(content.getpixel((column, row)) for row in range(content.height))
+            for column in range(content.width)
+        ]
+        spans: list[tuple[int, int]] = []
+        start: int | None = None
+        for column, occupied in enumerate(occupied_columns + [False]):
+            if occupied and start is None:
+                start = column
+            elif not occupied and start is not None:
+                if column - start >= 2:
+                    spans.append((start, column))
+                start = None
+        glyphs: list[Image.Image] = []
+        for left, right in spans:
+            glyph = content.crop((left, 0, right, content.height))
+            bounds = glyph.getbbox()
+            if bounds is None:
+                continue
+            normalized = glyph.crop(bounds).resize(
+                (12, 20),
+                Image.Resampling.NEAREST,
+            )
+            canvas = Image.new("L", (16, 24), 0)
+            canvas.paste(normalized, (2, 2))
+            glyphs.append(canvas)
+        return tuple(glyphs)
+
     def _recognize_character_level(
         self,
         image: Image.Image,
@@ -647,12 +681,23 @@ class ReferenceScreenRecognizer:
         candidate = self._level_signature(self._crop(image, region))
         if candidate is None:
             return None, None
+        candidate_glyphs = self._level_glyph_signatures(candidate)
         scores: list[tuple[float, int]] = []
         for level, filename in CHARACTER_LEVEL_TEMPLATE_FILES.items():
             reference = self._level_signature(self._reference(filename))
             if reference is None:
                 continue
-            difference = ImageChops.difference(candidate, reference)
+            reference_glyphs = self._level_glyph_signatures(reference)
+            # All supported levels are three digits and differ at the middle
+            # digit. Comparing that digit independently avoids treating
+            # different Flash window scales/fonts as a different level.
+            if len(candidate_glyphs) == len(reference_glyphs) == 3:
+                difference = ImageChops.difference(
+                    candidate_glyphs[1],
+                    reference_glyphs[1],
+                )
+            else:
+                difference = ImageChops.difference(candidate, reference)
             scores.append(
                 (float(ImageStat.Stat(difference).mean[0]), level)
             )
@@ -945,6 +990,25 @@ class ReferenceScreenRecognizer:
             for item in scored
             if item[0] <= item[1].maximum_score
         ]
+        character_candidates: tuple[CharacterSelectionCandidate, ...] = ()
+        if any(
+            item[1].state is ReconnectScreenState.CHARACTER_SELECTION
+            for item in valid_scored
+        ):
+            character_candidates = self._character_selection_candidates(
+                candidate
+            )
+            if not character_candidates:
+                # Normal gameplay can share broad background colors with the
+                # role-selection template. A role-selection state is valid
+                # only when at least one supported level card is actually
+                # present; otherwise allow the connected template to win.
+                valid_scored = [
+                    item
+                    for item in valid_scored
+                    if item[1].state
+                    is not ReconnectScreenState.CHARACTER_SELECTION
+                ]
         if not valid_scored:
             return ScreenRecognition(
                 state=ReconnectScreenState.UNKNOWN,
@@ -979,7 +1043,6 @@ class ReferenceScreenRecognizer:
         character_importance = None
         character_slot_index = None
         character_slot_selected = None
-        character_candidates: tuple[CharacterSelectionCandidate, ...] = ()
         click_point = definition.click_point
         if definition.state is ReconnectScreenState.LINE_SELECTION:
             line_number, _route_score = self._recognize_route_number(candidate)
@@ -987,9 +1050,6 @@ class ReferenceScreenRecognizer:
                 line_number = DEFAULT_LINE_NUMBER
             click_point = LINE_ROUTE_CLICK_POINTS[line_number]
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
-            character_candidates = self._character_selection_candidates(
-                candidate
-            )
             (
                 click_point,
                 character_level,

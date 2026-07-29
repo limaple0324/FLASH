@@ -152,6 +152,13 @@ def make_controller(
     failure_status_service=None,
     failure_record_callback=None,
 ):
+    if clock is None:
+        default_time = [-5.0]
+
+        def clock():
+            default_time[0] += 5.0
+            return default_time[0]
+
     windows = windows or [make_window(1), make_window(2)]
     capture = FakeCaptureProvider(
         {window.handle: marker for window, marker in zip(windows, screen_states)}
@@ -187,7 +194,7 @@ def make_controller(
             capture_provider=capture,
             recognizer=recognizer,
             mouse_backend=mouse,
-            monotonic_clock=clock or (lambda: 0.0),
+            monotonic_clock=clock,
             state_path=state_path,
             execution_enabled=True,
             battle_restarter=battle_restarter,
@@ -303,7 +310,7 @@ def test_reconnect_does_not_advance_a_login_state_without_disconnect_session():
         (1, (0.5, 0.5)),
     ]
     assert result.details["clicked_windows"] == 1
-    assert result.details["next_check_seconds"] == 2
+    assert result.details["next_check_seconds"] == 5
 
 
 def test_disconnect_context_uses_force_login_instead_of_start_game():
@@ -600,19 +607,66 @@ def test_same_screen_action_is_not_repeated_before_one_minute_retry():
     fixture = make_controller([2, 1], clock=lambda: now[0])
 
     observed = fixture.controller.reconnect()
+    confirmed = fixture.controller.reconnect()
+    now[0] = 5.0
     first = fixture.controller.reconnect()
-    now[0] = 59.0
+    now[0] = 64.0
     before_deadline = fixture.controller.reconnect()
-    now[0] = 60.0
+    now[0] = 65.0
     second = fixture.controller.reconnect()
 
     assert observed.details["clicked_windows"] == 0
+    assert confirmed.details["clicked_windows"] == 0
     assert first.details["clicked_windows"] == 1
     assert before_deadline.details["clicked_windows"] == 0
     assert second.details["clicked_windows"] == 1
     assert fixture.mouse.clicks == [
         (1, (0.5, 0.5)),
         (1, (0.5, 0.5)),
+    ]
+
+
+def test_confirm_force_login_and_followup_obey_five_ten_ten_waits():
+    now = [100.0]
+    fixture = make_controller([2, 1], clock=lambda: now[0])
+
+    first_disconnect = fixture.controller.reconnect()
+    confirmed_disconnect = fixture.controller.reconnect()
+    now[0] = 104.0
+    before_confirm = fixture.controller.reconnect()
+    now[0] = 105.0
+    confirm = fixture.controller.reconnect()
+
+    fixture.capture.states[1] = 3
+    now[0] = 110.0
+    first_force = fixture.controller.reconnect()
+    now[0] = 112.0
+    confirmed_force = fixture.controller.reconnect()
+    now[0] = 114.0
+    before_force = fixture.controller.reconnect()
+    now[0] = 115.0
+    force = fixture.controller.reconnect()
+
+    fixture.capture.states[1] = 4
+    now[0] = 124.0
+    before_followup = fixture.controller.reconnect()
+    now[0] = 125.0
+    followup = fixture.controller.reconnect()
+
+    assert first_disconnect.details["clicked_windows"] == 0
+    assert confirmed_disconnect.details["clicked_windows"] == 0
+    assert before_confirm.details["clicked_windows"] == 0
+    assert confirm.details["clicked_windows"] == 1
+    assert first_force.details["clicked_windows"] == 0
+    assert confirmed_force.details["clicked_windows"] == 0
+    assert before_force.details["clicked_windows"] == 0
+    assert force.details["clicked_windows"] == 1
+    assert before_followup.details["clicked_windows"] == 0
+    assert followup.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [
+        (1, (0.5, 0.5)),
+        (1, (0.505, 0.856)),
+        (1, (0.5, 0.3)),
     ]
 
 
@@ -1078,7 +1132,7 @@ def test_unknown_peer_is_never_operated_during_a_known_reconnect_session():
         "unknown": 1,
     }
     assert result.details["actionable_windows"] == 0
-    assert result.details["next_check_seconds"] == 10
+    assert result.details["next_check_seconds"] == 2
     assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
 
 
