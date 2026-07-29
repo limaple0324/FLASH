@@ -74,7 +74,9 @@ def test_smart_reconnect_monitor_restores_saved_interval(tmp_path):
     assert monitor.monitor_interval_ms == 2750
 
 
-def test_sync_services_share_one_lifecycle_identity_snapshot(tmp_path):
+def test_sync_services_share_lifecycle_backend_with_separate_target_contracts(
+    tmp_path,
+):
     build_services(root=tmp_path)
 
     keyboard = AppContext.get(WindowsInputSyncController)
@@ -86,7 +88,7 @@ def test_sync_services_share_one_lifecycle_identity_snapshot(tmp_path):
     assert keyboard._window_backend is pointer._window_backend
     assert keyboard._window_backend is statuses._window_backend
     assert keyboard._target_windows_provider is pointer._target_windows_provider
-    assert keyboard._target_windows_provider is reconnect._target_windows_provider
+    assert keyboard._target_windows_provider is not reconnect._target_windows_provider
     assert statuses._target_snapshot_provider is not None
     assert keyboard._operation_gate is gate
     assert pointer._operation_gate is gate
