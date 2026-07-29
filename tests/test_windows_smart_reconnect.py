@@ -1798,9 +1798,11 @@ def test_duplicate_identity_never_triggers_missing_role_reopen(tmp_path):
     fixture.controller._reopen_retry_after[blocked] = 0.0
 
     result = fixture.controller.reconnect()
+    fixture.controller._report_reconnect_failure(blocked)
 
     assert result.code == "reconnect.waiting"
     assert "battle_reopen_identity_unsafe" in result.details["failure_codes"]
+    assert restarter.calls == []
     assert restarter.reopen_calls == []
     assert fixture.mouse.clicks == []
 

@@ -1055,7 +1055,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 False,
                 "reconnect_restart_identity_unresolved",
             )
-        candidates = self._candidate_windows()
+        candidates, _source_failures, blocked_fingerprints = (
+            self._candidate_window_set()
+        )
+        if fingerprint in blocked_fingerprints:
+            self._clear_action_confirmation(fingerprint)
+            return BattleRestartResult(
+                False,
+                "reconnect_restart_identity_unsafe",
+            )
         matches = tuple(
             window
             for window in candidates
