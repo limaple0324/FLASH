@@ -296,3 +296,22 @@ def test_key_keeps_the_source_handle_captured_at_press_time():
 
     assert controller.calls[0][1]["source_handle"] == 101
     monitor.stop()
+
+
+def test_shared_session_gate_blocks_queued_keyboard_execution():
+    session_enabled = [True]
+    monitor = KeyboardSyncMonitor(
+        FakeController(),
+        policy_provider=lambda: "all",
+        schedule=lambda _delay, _callback: object(),
+        cancel=lambda _token: None,
+        state_backend=FakeKeyboardState(),
+        execution_enabled_provider=lambda: session_enabled[0],
+    )
+    monitor.start()
+    generation = monitor._generation
+
+    assert monitor._execution_allowed(generation) is True
+    session_enabled[0] = False
+    assert monitor._execution_allowed(generation) is False
+    monitor.stop()

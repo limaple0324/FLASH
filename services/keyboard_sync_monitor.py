@@ -156,6 +156,7 @@ class KeyboardSyncMonitor:
         state_backend: KeyboardStateBackend | None = None,
         selected_keys_provider: Callable[[], object] | None = None,
         result_callback: Callable[[InputSyncResult], None] | None = None,
+        execution_enabled_provider: Callable[[], bool] | None = None,
         interval_ms: int = 5,
     ) -> None:
         self._controller = controller
@@ -165,6 +166,9 @@ class KeyboardSyncMonitor:
         self._state_backend = state_backend or Win32KeyboardStateBackend()
         self._selected_keys_provider = selected_keys_provider
         self._result_callback = result_callback
+        self._execution_enabled_provider = (
+            execution_enabled_provider or (lambda: True)
+        )
         self._interval_ms = max(2, int(interval_ms))
         self._enabled = False
         self._after_id: object | None = None
@@ -382,5 +386,11 @@ class KeyboardSyncMonitor:
                 continue
 
     def _execution_allowed(self, generation: int) -> bool:
+        try:
+            externally_enabled = bool(self._execution_enabled_provider())
+        except Exception:
+            externally_enabled = False
+        if not externally_enabled:
+            return False
         with self._queue_lock:
             return self._enabled and self._generation == generation

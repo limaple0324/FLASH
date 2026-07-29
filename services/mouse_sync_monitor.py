@@ -119,6 +119,7 @@ class MouseSyncMonitor:
         cancel: Callable[[object], None],
         state_backend: MouseStateBackend | None = None,
         result_callback: Callable[[PointerSyncResult], None] | None = None,
+        execution_enabled_provider: Callable[[], bool] | None = None,
         interval_ms: int = 2,
     ) -> None:
         self._controller = controller
@@ -127,6 +128,9 @@ class MouseSyncMonitor:
         self._cancel = cancel
         self._state_backend = state_backend or Win32MouseStateBackend()
         self._result_callback = result_callback
+        self._execution_enabled_provider = (
+            execution_enabled_provider or (lambda: True)
+        )
         self._interval_ms = max(1, int(interval_ms))
         self._enabled = False
         self._after_id: object | None = None
@@ -371,6 +375,12 @@ class MouseSyncMonitor:
                         self._release_pending_generation = None
 
     def _execution_allowed(self, generation: int) -> bool:
+        try:
+            externally_enabled = bool(self._execution_enabled_provider())
+        except Exception:
+            externally_enabled = False
+        if not externally_enabled:
+            return False
         with self._queue_lock:
             return self._enabled and self._generation == generation
 
@@ -379,6 +389,12 @@ class MouseSyncMonitor:
         generation: int,
         event: str,
     ) -> bool:
+        try:
+            externally_enabled = bool(self._execution_enabled_provider())
+        except Exception:
+            externally_enabled = False
+        if not externally_enabled:
+            return False
         with self._queue_lock:
             return (
                 self._enabled

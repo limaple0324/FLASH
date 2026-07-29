@@ -265,3 +265,24 @@ def test_release_is_not_blocked_by_an_already_running_move():
     assert controller.release_calls == 1
     finish_move.set()
     monitor.stop()
+
+
+def test_shared_session_gate_blocks_queued_mouse_execution():
+    session_enabled = [True]
+    monitor = MouseSyncMonitor(
+        Controller(),
+        policy_provider=lambda: "all",
+        schedule=lambda _delay, _callback: object(),
+        cancel=lambda _token: None,
+        state_backend=Mouse([]),
+        execution_enabled_provider=lambda: session_enabled[0],
+    )
+    monitor.start()
+    generation = monitor._generation
+
+    assert monitor._execution_allowed(generation) is True
+    assert monitor._event_execution_allowed(generation, "left_down") is True
+    session_enabled[0] = False
+    assert monitor._execution_allowed(generation) is False
+    assert monitor._event_execution_allowed(generation, "left_down") is False
+    monitor.stop()

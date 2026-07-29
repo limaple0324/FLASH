@@ -311,21 +311,12 @@ def stop_input_sync_pair(
     keyboard_monitor: object,
     mouse_monitor: object,
 ) -> bool:
-    """Stop both monitors or restore their exact prior running state."""
+    """Attempt cleanup of both monitors and report their actual final state."""
     services = (keyboard_monitor, mouse_monitor)
-    previous = tuple(_service_running_state(service) for service in services)
     results = tuple(stop_service(service) for service in services)
-    if all(result.success for result in results) and not any(
+    return all(result.success for result in results) and not any(
         _service_running_state(service) for service in services
-    ):
-        return True
-    for service, was_running in zip(services, previous):
-        running = _service_running_state(service)
-        if was_running and not running:
-            start_service(service)
-        elif not was_running and running:
-            stop_service(service)
-    return False
+    )
 
 
 def resource_path(relative_path: Path) -> Path:
@@ -1430,6 +1421,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     group_role_status_service = AppContext.get(GroupRoleStatusService)
     operation_record_store = AppContext.get(SyncOperationRecordStore)
+    sync_session_state = {"enabled": False}
     deferred_sync_monitor = AppContext.get(DeferredSyncOperationMonitor)
     character_view_service = AppContext.get(CharacterViewService)
     character_detail_view_service = AppContext.get(CharacterDetailViewService)
@@ -2295,6 +2287,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         return GroupManagementViewResult(True, choice.name)
 
     def stop_group_automation_for_configuration_change() -> bool:
+        sync_session_state["enabled"] = False
         auto_click_service.stop()
         if input_controller is not None:
             input_controller.invalidate_scheduled()
@@ -3409,6 +3402,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 configured_selected_sync_keys
             ),
             result_callback=log_keyboard_sync_result,
+            execution_enabled_provider=lambda: bool(
+                sync_session_state["enabled"]
+            ),
         )
         if input_controller is not None
         else None
@@ -3427,6 +3423,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 ),
                 target_handles_provider=current_target_handles,
             ),
+            execution_enabled_provider=lambda: bool(
+                sync_session_state["enabled"]
+            ),
         )
         if pointer_sync_controller is not None
         else None
@@ -3434,6 +3433,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     def direct_auto_click_enabled() -> bool:
         return (
+            bool(sync_session_state["enabled"])
+            and
             mouse_sync_monitor is not None
             and mouse_sync_monitor.enabled
             and current_input_policy() is not None
@@ -3510,10 +3511,19 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return False
         auto_click_service.invalidate_direct_sync()
         if not enabled:
-            return stop_input_sync_pair(
+            sync_session_state["enabled"] = False
+            cleanup_stopped = stop_input_sync_pair(
                 keyboard_sync_monitor,
                 mouse_sync_monitor,
             )
+            if logger is not None and not cleanup_stopped:
+                logger.warning(
+                    "Synchronized input delivery was disabled, but one "
+                    "monitor did not finish cleanup."
+                )
+            # The shared execution gate is already closed, so no queued or
+            # still-polling monitor can deliver another game input.
+            return True
 
         state = workspace_service.snapshot() if workspace_service is not None else None
         group_name = (
@@ -3551,9 +3561,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         keyboard_started = start_service(keyboard_sync_monitor)
         mouse_started = start_service(mouse_sync_monitor)
         if not keyboard_started.success or not mouse_started.success:
+            sync_session_state["enabled"] = False
             stop_service(keyboard_sync_monitor)
             stop_service(mouse_sync_monitor)
             return False
+        sync_session_state["enabled"] = True
         if logger is not None:
             logger.info(
                 "Keyboard synchronization enabled; "
@@ -4381,6 +4393,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         return stopped
 
     def stop_complete_background_services() -> tuple[str, ...]:
+        sync_session_state["enabled"] = False
         failures: list[str] = []
 
         def stop_named(name: str, service, **kwargs) -> None:

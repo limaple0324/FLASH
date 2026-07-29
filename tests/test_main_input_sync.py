@@ -85,7 +85,7 @@ def test_existing_theme_migrates_to_gold_once_without_overriding_later_choice(
     assert reloaded.get(UI_THEME_CLASSIC_GOLD_MIGRATION_KEY) is True
 
 
-def test_stop_sync_pair_rolls_back_when_only_one_monitor_stops():
+def test_stop_sync_pair_reports_actual_partial_cleanup_without_false_success():
     class Monitor:
         def __init__(self, *, fail_stop=False):
             self.enabled = True
@@ -106,9 +106,10 @@ def test_stop_sync_pair_rolls_back_when_only_one_monitor_stops():
 
     assert stop_input_sync_pair(keyboard, mouse) is False
     assert keyboard.enabled is True
-    assert mouse.enabled is True
+    assert mouse.enabled is False
 
     keyboard.fail_stop = False
+    mouse.start()
     assert stop_input_sync_pair(keyboard, mouse) is True
     assert keyboard.enabled is False
     assert mouse.enabled is False
@@ -161,6 +162,10 @@ def test_main_window_polling_uses_a_throttled_current_group_handle_cache():
     assert source.count(
         "target_handles_provider=current_target_handles"
     ) == 2
+    assert source.count(
+        'execution_enabled_provider=lambda: bool('
+    ) == 2
+    assert 'sync_session_state["enabled"] = False' in source
     assert 'sync_source_handle_cache: dict[str, object]' in source
     assert '"expires_at": now + 0.25' in source
     assert "target_windows_provider=current_sync_target_windows" in source
