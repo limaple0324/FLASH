@@ -37,24 +37,45 @@ class UiCallbackDispatcher:
         with self._lock:
             if not self._active or self._closed:
                 return None
-            holder: dict[str, object] = {}
+        holder: dict[str, object] = {
+            "token": None,
+            "completed": False,
+        }
 
-            def guarded() -> None:
+        def guarded() -> None:
+            with self._lock:
+                holder["completed"] = True
                 token = holder.get("token")
-                with self._lock:
-                    if token is not None:
-                        self._pending.discard(token)
-                    allowed = self._active and not self._closed
-                if allowed:
-                    callback()
+                if token is not None:
+                    self._pending.discard(token)
+                allowed = self._active and not self._closed
+            if allowed:
+                callback()
 
-            try:
-                token = self._schedule(0, guarded)
-            except Exception:
-                return None
+        # Tk may synchronously wait for its main thread when `after()` is
+        # requested by a worker. Never hold our lock across that call: the
+        # main-thread callback also needs the same lock before it may run.
+        try:
+            token = self._schedule(0, guarded)
+        except Exception:
+            return None
+
+        cancel_token = False
+        with self._lock:
             holder["token"] = token
-            self._pending.add(token)
-            return token
+            if bool(holder["completed"]):
+                return token
+            if not self._active or self._closed:
+                cancel_token = True
+            else:
+                self._pending.add(token)
+        if cancel_token:
+            try:
+                self._cancel(token)
+            except Exception:
+                pass
+            return None
+        return token
 
     def pause(self) -> None:
         with self._lock:

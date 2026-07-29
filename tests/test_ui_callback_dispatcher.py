@@ -1,3 +1,5 @@
+import threading
+
 from services.ui_callback_dispatcher import UiCallbackDispatcher
 
 
@@ -69,4 +71,33 @@ def test_scheduler_failure_is_isolated_without_a_pending_token():
     )
 
     assert dispatcher.dispatch(lambda: None) is None
+    assert dispatcher.pending_count == 0
+
+
+def test_worker_dispatch_does_not_deadlock_main_thread_callback():
+    callback_finished = threading.Event()
+    callback_finished_before_schedule_returned = False
+
+    def schedule(_delay, callback):
+        nonlocal callback_finished_before_schedule_returned
+
+        def run_callback():
+            callback()
+            callback_finished.set()
+
+        thread = threading.Thread(target=run_callback)
+        thread.start()
+        callback_finished_before_schedule_returned = callback_finished.wait(1)
+        thread.join(1)
+        return "callback-1"
+
+    dispatcher = UiCallbackDispatcher(schedule, lambda _token: None)
+    calls = []
+
+    token = dispatcher.dispatch(lambda: calls.append("completed"))
+
+    assert token == "callback-1"
+    assert callback_finished_before_schedule_returned is True
+    assert callback_finished.is_set()
+    assert calls == ["completed"]
     assert dispatcher.pending_count == 0
