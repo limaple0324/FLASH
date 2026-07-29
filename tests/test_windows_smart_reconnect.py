@@ -1716,6 +1716,51 @@ def test_switching_group_revokes_old_sessions_and_monitors_open_new_role(
     assert fixture.mouse.clicks == [(3, (0.5, 0.5))]
 
 
+def test_switching_group_with_same_roles_revokes_old_reconnect_authority(
+    tmp_path,
+):
+    windows = [make_window(1), make_window(2)]
+
+    def plan(group_name):
+        return GroupLaunchPlan(
+            group_name,
+            targets=tuple(
+                GroupLaunchTarget(
+                    index,
+                    f"{group_name}-{index}",
+                    tmp_path / f"{group_name}-{index}.lnk",
+                    window.launch_fingerprint,
+                )
+                for index, window in enumerate(windows, start=1)
+            ),
+        )
+
+    fixture = make_controller(
+        [3, 1],
+        windows=windows,
+        expected_windows=2,
+        group_launch_plan=plan("first"),
+    )
+    fingerprint = windows[0].launch_fingerprint
+    fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
+    fixture.controller._active_automation_fingerprints.add(fingerprint)
+    fixture.controller._pending_reopen_fingerprints.add(fingerprint)
+    fixture.controller._action_confirmations[fingerprint] = (
+        ("old-group",),
+        1,
+    )
+
+    fixture.controller.set_group_launch_plan(plan("second"))
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.code == "reconnect.waiting"
+    assert result.details["actionable_windows"] == 0
+    assert fixture.controller.reconnecting_fingerprints() == frozenset()
+    assert fixture.controller._action_confirmations == {}
+    assert fixture.mouse.clicks == []
+
+
 def test_window_preflight_failure_clears_double_frame_confirmation():
     mouse = FakeMouseBackend(invalid={1})
     fixture = make_controller([2, 1], mouse=mouse)

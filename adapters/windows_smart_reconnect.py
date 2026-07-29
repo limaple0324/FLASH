@@ -696,18 +696,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._allowed_fingerprints = frozenset(normalized)
 
     def set_group_launch_plan(self, plan: GroupLaunchPlan | None) -> None:
+        previous_plan = self._group_launch_plan
         previous_scope = self._allowed_fingerprints
         if plan is None:
             self._group_launch_plan = None
             self.set_allowed_fingerprints(None)
-            if previous_scope is not None:
+            if previous_plan is not None or previous_scope is not None:
                 self._retain_runtime_scope(frozenset())
             return
         if not isinstance(plan, GroupLaunchPlan) or not plan.ready:
             raise ValueError("plan must be a ready GroupLaunchPlan.")
         self._group_launch_plan = plan
         self.set_allowed_fingerprints(plan.fingerprints)
-        if previous_scope != self._allowed_fingerprints:
+        if (
+            previous_plan is not None
+            and previous_plan.group_name != plan.group_name
+        ):
+            # A group switch is a new reconnect context even when the two
+            # groups share one role or the entire fingerprint set.
+            self._retain_runtime_scope(frozenset())
+        elif previous_scope != self._allowed_fingerprints:
             self._retain_runtime_scope(self._allowed_fingerprints)
 
     def _retain_runtime_scope(self, fingerprints: frozenset[str]) -> None:
