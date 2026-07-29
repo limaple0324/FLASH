@@ -399,12 +399,14 @@ def test_background_journal_cleanup_never_holds_the_hot_path_state_lock(
     cleanup_started = Event()
     release_cleanup = Event()
     journal_calls = []
+    original_journal_write = store._rewrite_pending_journal
 
     def blocked_cleanup(items):
         journal_calls.append(items)
         if len(journal_calls) == 2:
             cleanup_started.set()
             assert release_cleanup.wait(1)
+        original_journal_write(items)
 
     monkeypatch.setattr(store, "_rewrite_pending_journal", blocked_cleanup)
     monkeypatch.setattr(
@@ -412,7 +414,6 @@ def test_background_journal_cleanup_never_holds_the_hot_path_state_lock(
         "_append_daily_records",
         lambda _items: (tmp_path / "daily.txt",),
     )
-    monkeypatch.setattr(store, "_save_records", lambda _items: None)
     store.append_deferred("同步操作", "角色甲", "第一次")
     background = Thread(target=store._flush_pending_once)
     background.start()
@@ -434,7 +435,25 @@ def test_background_journal_cleanup_never_holds_the_hot_path_state_lock(
         background.join(1)
 
     assert len(store.records()) == 2
-    assert store.close() is True
+    assert len(journal_calls) == 3
+    second_record = store.records()[0]
+    assert second_record.detail == "第二次"
+    assert second_record.record_id in store.pending_path.read_text(
+        encoding="utf-8"
+    )
+    with store._lock:
+        store._cancel_flush_timer_locked()
+        store._closed = True
+
+    recovered = SyncOperationRecordStore(
+        tmp_path / "active.json",
+        tmp_path / "daily",
+    )
+    assert {item.detail for item in recovered.records()} == {
+        "第一次",
+        "第二次",
+    }
+    assert recovered.close() is True
 
 
 def test_busy_pending_journal_keeps_record_in_memory_and_retries(

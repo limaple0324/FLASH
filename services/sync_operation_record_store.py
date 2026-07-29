@@ -218,28 +218,28 @@ class SyncOperationRecordStore:
                     self._persistence_failure = "record_batch_write_failed"
                 return False
             processed_ids = {item.record_id for item in pending}
-            with self._lock:
-                remaining_snapshot = tuple(
-                    item
-                    for item in self._pending_records
-                    if item.record_id not in processed_ids
-                )
-            try:
-                self._rewrite_pending_journal(remaining_snapshot)
-            except (OSError, UnicodeError):
+            while True:
                 with self._lock:
-                    self._persistence_failure = (
-                        "record_pending_journal_write_failed"
+                    state_snapshot = tuple(self._pending_records)
+                    remaining_snapshot = tuple(
+                        item
+                        for item in state_snapshot
+                        if item.record_id not in processed_ids
                     )
-                return False
-            with self._lock:
-                self._pending_records = [
-                    item
-                    for item in self._pending_records
-                    if item.record_id not in processed_ids
-                ]
-                self._persistence_failure = None
-            return True
+                try:
+                    self._rewrite_pending_journal(remaining_snapshot)
+                except (OSError, UnicodeError):
+                    with self._lock:
+                        self._persistence_failure = (
+                            "record_pending_journal_write_failed"
+                        )
+                    return False
+                with self._lock:
+                    if tuple(self._pending_records) != state_snapshot:
+                        continue
+                    self._pending_records = list(remaining_snapshot)
+                    self._persistence_failure = None
+                    return True
 
     def _flush_all_pending(self) -> bool:
         while True:
