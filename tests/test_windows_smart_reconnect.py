@@ -326,6 +326,34 @@ def test_isolated_target_source_failure_prevents_false_connected_result():
     assert fixture.mouse.clicks == []
 
 
+def test_offline_target_source_failure_prevents_false_connected_result():
+    windows = [make_window(1)]
+    fixture = make_controller(
+        [1],
+        windows=windows,
+        expected_windows=2,
+        target_windows_provider=lambda: ResolvedTargetWindows(
+            tuple(windows),
+            ("window_offline",),
+        ),
+    )
+    fixture.controller.set_allowed_fingerprints(
+        {
+            windows[0].launch_fingerprint,
+            "f" * 64,
+        }
+    )
+
+    result = fixture.controller.reconnect()
+
+    assert result.success is False
+    assert result.code == "reconnect.waiting"
+    assert result.details["all_connected"] is False
+    assert result.details["connected_windows"] == 1
+    assert "window_offline" in result.details["failure_codes"]
+    assert fixture.mouse.clicks == []
+
+
 def test_isolated_target_source_failure_does_not_block_safe_disconnected_role():
     windows = [make_window(1), make_window(2)]
     selected = {

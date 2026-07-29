@@ -254,11 +254,7 @@ class TargetWindowContractService:
         )
         failures = list(snapshot.failure_codes)
         for target in snapshot.targets:
-            failures.extend(
-                code
-                for code in target.failure_codes
-                if code != "window_offline"
-            )
+            failures.extend(target.failure_codes)
         blocked_fingerprints = frozenset(
             target.fingerprint
             for target in snapshot.targets

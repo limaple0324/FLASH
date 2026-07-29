@@ -364,7 +364,37 @@ def test_reconnect_targets_keep_safe_role_when_other_window_is_unidentified(
     assert tuple(window.handle for window in reconnect_targets.windows) == (11,)
     assert reconnect_targets.failure_codes == (
         "unidentified_candidate_window",
+        "window_offline",
     )
+
+
+def test_reconnect_targets_keep_offline_evidence_without_blocking_safe_sibling(
+    tmp_path,
+):
+    configuration, scope_service, scope = _configured_group(tmp_path)
+    group_name = configuration.groups()[0].name
+    known = WindowInfo(
+        11,
+        "Adobe Flash Player 11",
+        True,
+        False,
+        (0, 0, 900, 600),
+        101,
+        "Flash",
+        scope.fingerprints[0],
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        _WindowBackend((known,), foreground=11),
+    )
+
+    reconnect_targets = service.reconnect_targets(group_name)
+
+    assert tuple(window.handle for window in reconnect_targets.windows) == (11,)
+    assert reconnect_targets.failure_codes == ("window_offline",)
+    assert reconnect_targets.blocked_fingerprints == frozenset()
 
 
 def test_reconnect_targets_isolate_duplicate_role_without_hiding_safe_sibling(
