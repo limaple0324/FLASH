@@ -384,6 +384,59 @@ def test_background_persistence_never_holds_the_hot_path_state_lock(
     assert store.close() is True
 
 
+def test_background_journal_cleanup_never_holds_the_hot_path_state_lock(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "services.sync_operation_record_store.DEFERRED_FLUSH_SECONDS",
+        60,
+    )
+    store = SyncOperationRecordStore(
+        tmp_path / "active.json",
+        tmp_path / "daily",
+    )
+    cleanup_started = Event()
+    release_cleanup = Event()
+    journal_calls = []
+
+    def blocked_cleanup(items):
+        journal_calls.append(items)
+        if len(journal_calls) == 2:
+            cleanup_started.set()
+            assert release_cleanup.wait(1)
+
+    monkeypatch.setattr(store, "_rewrite_pending_journal", blocked_cleanup)
+    monkeypatch.setattr(
+        store,
+        "_append_daily_records",
+        lambda _items: (tmp_path / "daily.txt",),
+    )
+    monkeypatch.setattr(store, "_save_records", lambda _items: None)
+    store.append_deferred("同步操作", "角色甲", "第一次")
+    background = Thread(target=store._flush_pending_once)
+    background.start()
+    assert cleanup_started.wait(0.5)
+
+    queued = Event()
+
+    def queue_next_record():
+        store.append_deferred("同步操作", "角色乙", "第二次")
+        queued.set()
+
+    hot_path = Thread(target=queue_next_record)
+    hot_path.start()
+    try:
+        assert queued.wait(0.25)
+    finally:
+        release_cleanup.set()
+        hot_path.join(1)
+        background.join(1)
+
+    assert len(store.records()) == 2
+    assert store.close() is True
+
+
 def test_busy_pending_journal_keeps_record_in_memory_and_retries(
     tmp_path,
     monkeypatch,

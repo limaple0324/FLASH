@@ -219,19 +219,25 @@ class SyncOperationRecordStore:
                 return False
             processed_ids = {item.record_id for item in pending}
             with self._lock:
-                remaining = [
+                remaining_snapshot = tuple(
+                    item
+                    for item in self._pending_records
+                    if item.record_id not in processed_ids
+                )
+            try:
+                self._rewrite_pending_journal(remaining_snapshot)
+            except (OSError, UnicodeError):
+                with self._lock:
+                    self._persistence_failure = (
+                        "record_pending_journal_write_failed"
+                    )
+                return False
+            with self._lock:
+                self._pending_records = [
                     item
                     for item in self._pending_records
                     if item.record_id not in processed_ids
                 ]
-                try:
-                    self._rewrite_pending_journal(tuple(remaining))
-                except (OSError, UnicodeError):
-                    self._persistence_failure = (
-                        "record_pending_journal_write_failed"
-                    )
-                    return False
-                self._pending_records = remaining
                 self._persistence_failure = None
             return True
 
