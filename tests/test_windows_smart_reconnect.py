@@ -252,7 +252,7 @@ def test_selected_group_identity_excludes_other_open_flash_windows():
     ]
 
 
-def test_selected_group_missing_one_identity_fails_before_capture():
+def test_selected_group_missing_identity_does_not_block_confirmed_open_role():
     windows = [make_window(1), make_window(2)]
     fixture = make_controller([2, 1], windows=windows)
     fixture.controller.set_allowed_fingerprints(
@@ -262,11 +262,48 @@ def test_selected_group_missing_one_identity_fails_before_capture():
         }
     )
 
+    first = fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert first.code == "reconnect.waiting"
+    assert result.success is True
+    assert result.code == "reconnect.progressed"
+    assert result.details["expected_windows"] == 2
+    assert result.details["discovered_windows"] == 1
+    assert result.details["failure_codes"] == []
+    assert fixture.capture.calls == [1, 1]
+    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
+
+
+def test_selected_group_only_requires_current_open_roles_to_be_connected():
+    windows = [make_window(1), make_window(2)]
+    fixture = make_controller([1, 2], windows=windows)
+    fixture.controller.set_allowed_fingerprints(
+        {
+            windows[0].launch_fingerprint,
+            "f" * 64,
+        }
+    )
+
+    result = fixture.controller.reconnect()
+
+    assert result.success is True
+    assert result.code == "reconnect.connected"
+    assert result.details["all_connected"] is True
+    assert result.details["expected_windows"] == 2
+    assert result.details["discovered_windows"] == 1
+    assert fixture.capture.calls == [1]
+    assert fixture.mouse.clicks == []
+
+
+def test_unscoped_incomplete_window_set_still_fails_before_capture():
+    windows = [make_window(1)]
+    fixture = make_controller([2], windows=windows, expected_windows=2)
+
     result = fixture.controller.reconnect()
 
     assert result.success is False
     assert "window_count_mismatch" in result.details["failure_codes"]
-    assert "group_identity_set_mismatch" in result.details["failure_codes"]
     assert fixture.capture.calls == []
     assert fixture.mouse.clicks == []
 
@@ -1555,20 +1592,128 @@ def test_stop_gate_is_rechecked_immediately_before_missing_role_reopen(
     assert restarter.reopen_calls == []
 
 
-def test_group_validation_failure_clears_first_frame_confirmation():
+def test_temporarily_missing_role_clears_only_its_first_frame_confirmation():
     windows = [make_window(1), make_window(2)]
     fixture = make_controller([2, 1], windows=windows)
+    fixture.controller.set_allowed_fingerprints(
+        {window.launch_fingerprint for window in windows}
+    )
 
     first = fixture.controller.reconnect()
     assert first.details["actionable_windows"] == 0
-    fixture.controller._window_backend.windows = [windows[0]]
-    failed = fixture.controller.reconnect()
-    assert "window_count_mismatch" in failed.details["failure_codes"]
+    fixture.controller._window_backend.windows = [windows[1]]
+    missing = fixture.controller.reconnect()
+    assert missing.code == "reconnect.connected"
     fixture.controller._window_backend.windows = windows
     restored = fixture.controller.reconnect()
 
     assert restored.details["actionable_windows"] == 0
     assert fixture.mouse.clicks == []
+    confirmed = fixture.controller.reconnect()
+    assert confirmed.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
+
+
+def test_failed_missing_role_reopen_does_not_block_open_disconnected_role(
+    tmp_path,
+):
+    windows = [make_window(1), make_window(2)]
+    plan = GroupLaunchPlan(
+        "120",
+        targets=(
+            GroupLaunchTarget(
+                1,
+                "120-first",
+                tmp_path / "first.lnk",
+                windows[0].launch_fingerprint,
+            ),
+            GroupLaunchTarget(
+                2,
+                "120-second",
+                tmp_path / "second.lnk",
+                windows[1].launch_fingerprint,
+            ),
+        ),
+    )
+    restarter = FakeBattleRestarter(succeeds=False)
+    fixture = make_controller(
+        [2],
+        windows=[windows[1]],
+        expected_windows=2,
+        battle_restarter=restarter,
+        group_launch_plan=plan,
+    )
+    fixture.controller._pending_reopen_fingerprints.add(
+        windows[0].launch_fingerprint
+    )
+    fixture.controller._reopen_retry_after[windows[0].launch_fingerprint] = 0.0
+
+    first = fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert first.code == "reconnect.waiting"
+    assert result.success is True
+    assert result.code == "reconnect.progressed_with_isolation"
+    assert "battle_restart_failed" in result.details["failure_codes"]
+    assert fixture.capture.calls == [2, 2]
+    assert fixture.mouse.clicks == [(2, (0.5, 0.5))]
+
+
+def test_switching_group_revokes_old_sessions_and_monitors_open_new_role(
+    tmp_path,
+):
+    first_group = [make_window(1), make_window(2)]
+    second_group = [make_window(3), make_window(4)]
+    first_plan = GroupLaunchPlan(
+        "first",
+        targets=tuple(
+            GroupLaunchTarget(
+                index,
+                f"first-{index}",
+                tmp_path / f"first-{index}.lnk",
+                window.launch_fingerprint,
+            )
+            for index, window in enumerate(first_group, start=1)
+        ),
+    )
+    second_plan = GroupLaunchPlan(
+        "second",
+        targets=tuple(
+            GroupLaunchTarget(
+                index,
+                f"second-{index}",
+                tmp_path / f"second-{index}.lnk",
+                window.launch_fingerprint,
+            )
+            for index, window in enumerate(second_group, start=1)
+        ),
+    )
+    fixture = make_controller(
+        [2, 1],
+        windows=first_group,
+        expected_windows=2,
+        group_launch_plan=first_plan,
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        first_group[0].launch_fingerprint
+    )
+    fixture.controller._active_automation_fingerprints.add(
+        first_group[0].launch_fingerprint
+    )
+    fixture.controller._window_backend.windows = [second_group[0]]
+    fixture.capture.states[second_group[0].handle] = 2
+
+    fixture.controller.set_group_launch_plan(second_plan)
+    first = fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert first.code == "reconnect.waiting"
+    assert result.code == "reconnect.progressed"
+    assert fixture.controller.reconnecting_fingerprints() == frozenset(
+        {second_group[0].launch_fingerprint}
+    )
+    assert fixture.capture.calls == [3, 3]
+    assert fixture.mouse.clicks == [(3, (0.5, 0.5))]
 
 
 def test_window_preflight_failure_clears_double_frame_confirmation():

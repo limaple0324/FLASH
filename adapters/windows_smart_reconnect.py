@@ -233,8 +233,9 @@ class ReconnectBatchResult:
     @property
     def all_connected(self) -> bool:
         return (
-            self.validated_windows == self.expected_windows
-            and self.connected_windows == self.expected_windows
+            self.discovered_windows > 0
+            and self.validated_windows == self.discovered_windows
+            and self.connected_windows == self.discovered_windows
             and self.unknown_windows == 0
             and not self.failure_codes
         )
@@ -695,14 +696,57 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._allowed_fingerprints = frozenset(normalized)
 
     def set_group_launch_plan(self, plan: GroupLaunchPlan | None) -> None:
+        previous_scope = self._allowed_fingerprints
         if plan is None:
             self._group_launch_plan = None
             self.set_allowed_fingerprints(None)
+            if previous_scope is not None:
+                self._retain_runtime_scope(frozenset())
             return
         if not isinstance(plan, GroupLaunchPlan) or not plan.ready:
             raise ValueError("plan must be a ready GroupLaunchPlan.")
         self._group_launch_plan = plan
         self.set_allowed_fingerprints(plan.fingerprints)
+        if previous_scope != self._allowed_fingerprints:
+            self._retain_runtime_scope(self._allowed_fingerprints)
+
+    def _retain_runtime_scope(self, fingerprints: frozenset[str]) -> None:
+        """Revoke reconnect authority that belongs to a previous group."""
+        with self._screen_state_lock:
+            tracked = (
+                self._pending_reconnect_fingerprints
+                | self._active_automation_fingerprints
+                | self._pending_reopen_fingerprints
+                | self._character_selection_pending
+                | set(self._active_automation_until)
+                | set(self._action_retry_after)
+                | set(self._reopen_retry_after)
+                | set(self._action_state_since)
+                | set(self._flow_pause_until)
+                | set(self._action_confirmations)
+                | set(self._last_screen_states)
+            )
+            removed = tracked - fingerprints
+            if not removed:
+                return
+            self._pending_reconnect_fingerprints.intersection_update(fingerprints)
+            self._active_automation_fingerprints.intersection_update(fingerprints)
+            self._pending_reopen_fingerprints.intersection_update(fingerprints)
+            self._character_selection_pending.intersection_update(fingerprints)
+            for mapping in (
+                self._active_automation_until,
+                self._action_retry_after,
+                self._reopen_retry_after,
+                self._action_state_since,
+                self._flow_pause_until,
+                self._action_confirmations,
+                self._last_screen_states,
+            ):
+                for fingerprint in removed:
+                    mapping.pop(fingerprint, None)
+        for fingerprint in removed:
+            self._clear_reconnect_failure(fingerprint)
+        self._persist_runtime_state()
 
     def set_execution_enabled(self, enabled: bool) -> None:
         """Allow an active scan to stop before its next game-changing click."""
@@ -1025,7 +1069,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
     def _group_failures(self, windows: tuple[WindowInfo, ...]) -> list[str]:
         failures: list[str] = []
-        if len(windows) != self._expected_windows:
+        # Without an explicit group identity scope, completeness remains the
+        # safety boundary.  With a ready group plan, reconnect monitors only
+        # the uniquely resolved windows that are currently open.  A role that
+        # is deliberately closed or belongs to another group must not block a
+        # safe open sibling.
+        if (
+            self._allowed_fingerprints is None
+            and len(windows) != self._expected_windows
+        ):
             failures.append("window_count_mismatch")
         handles = [window.handle for window in windows if window.handle]
         if len(handles) != len(windows) or len(set(handles)) != len(handles):
@@ -1049,10 +1101,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or len(set(fingerprints)) != len(fingerprints)
         ):
             failures.append("fingerprint_missing_or_duplicate")
-        if (
-            self._allowed_fingerprints is not None
-            and set(fingerprints) != set(self._allowed_fingerprints)
-        ):
+        if self._allowed_fingerprints is not None and not set(
+            fingerprints
+        ).issubset(self._allowed_fingerprints):
             failures.append("group_identity_set_mismatch")
         return failures
 
@@ -1192,9 +1243,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 now=now,
             )
         )
-        failures = self._group_failures(windows)
-        failures.extend(retry_failures)
-        if failures:
+        group_failures = self._group_failures(windows)
+        failures = [*group_failures, *retry_failures]
+        if group_failures:
             # A partially validated group must never carry a first-frame
             # confirmation into a later, different group or identity set.
             self._clear_action_confirmation()
@@ -1245,6 +1296,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 )
             )
             is not None
+        }
+        self._action_confirmations = {
+            fingerprint: confirmation
+            for fingerprint, confirmation in self._action_confirmations.items()
+            if fingerprint in live_fingerprints
         }
         self._action_retry_after = {
             fingerprint: retry
@@ -1655,7 +1711,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         return OperationResult(
             False,
             "reconnect.waiting",
-            "Reconnect is waiting for a known screen or a complete window group.",
+            "Reconnect is waiting for a known screen or a selected open target.",
             result.to_dict(),
         )
 
