@@ -736,21 +736,28 @@ def build_services(
                 matches.append(target.display_name)
         return matches[0] if len(matches) == 1 else "未知角色"
 
-    def current_target_windows():
+    def current_group_name() -> str | None:
         state = workspace_service.snapshot()
-        group_name = (
+        return (
             state.current_group.name
             if state.current_group is not None
             else None
         )
-        return target_window_contract_service.reconnect_targets(group_name)
+
+    def current_reconnect_targets():
+        return target_window_contract_service.reconnect_targets(
+            current_group_name()
+        )
+
+    def current_sync_target_windows():
+        return target_window_contract_service.windows(current_group_name())
 
     AppContext.register(SyncOperationRecordStore, operation_record_store)
     reconnect_controller = WindowsSmartReconnectController.for_real_windows(
         reference_dir=resource_path(RECONNECT_REFERENCE_DIR),
         state_path=paths.data_dir() / RECONNECT_STATE_FILENAME,
         window_backend=synchronized_window_backend,
-        target_windows_provider=current_target_windows,
+        target_windows_provider=current_reconnect_targets,
         operation_gate=game_operation_gate,
         failure_status_service=reconnect_failure_status_service,
         failure_record_callback=lambda role_name, detail: (
@@ -796,7 +803,7 @@ def build_services(
         WindowsInputSyncController,
         WindowsInputSyncController.for_real_windows(
             window_backend=synchronized_window_backend,
-            target_windows_provider=current_target_windows,
+            target_windows_provider=current_sync_target_windows,
             operation_gate=game_operation_gate,
             conflict_arbiter=sync_conflict_arbiter,
             deferred_service=deferred_sync_service,
@@ -821,7 +828,7 @@ def build_services(
         WindowsPointerSyncController,
         WindowsPointerSyncController.for_real_windows(
             window_backend=synchronized_window_backend,
-            target_windows_provider=current_target_windows,
+            target_windows_provider=current_sync_target_windows,
             operation_gate=game_operation_gate,
             conflict_arbiter=sync_conflict_arbiter,
             deferred_service=deferred_sync_service,

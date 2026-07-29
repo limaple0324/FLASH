@@ -15,6 +15,10 @@ from services.app_context import AppContext
 from services.background_image_service import BackgroundImageService
 from services.event_bus import EventBus
 from services.target_window_state_service import TargetWindowStateService
+from services.target_window_contract_service import (
+    ResolvedTargetWindows,
+    TargetWindowContractService,
+)
 
 
 class RecordingAdapter:
@@ -234,6 +238,33 @@ def test_run_shuts_down_adapter_after_normal_window_close(monkeypatch, tmp_path)
 
     assert main_module.run(root=tmp_path) == 0
     assert adapter.shutdown_calls == 1
+
+
+def test_build_services_keeps_reconnect_and_sync_target_providers_separate(
+    monkeypatch,
+    tmp_path,
+):
+    main_module.build_services(root=tmp_path)
+    contract = AppContext.get(TargetWindowContractService)
+    reconnect = AppContext.get(main_module.WindowsSmartReconnectController)
+    keyboard = AppContext.get(main_module.WindowsInputSyncController)
+    pointer = AppContext.get(main_module.WindowsPointerSyncController)
+    strict_targets = ("strict-target",)
+    reconnect_targets = ResolvedTargetWindows(
+        windows=("safe-reconnect-target",),
+        failure_codes=("unidentified_candidate_window",),
+    )
+
+    monkeypatch.setattr(contract, "windows", lambda _group_name: strict_targets)
+    monkeypatch.setattr(
+        contract,
+        "reconnect_targets",
+        lambda _group_name: reconnect_targets,
+    )
+
+    assert reconnect._target_windows_provider() is reconnect_targets
+    assert keyboard._target_windows_provider() == strict_targets
+    assert pointer._target_windows_provider() == strict_targets
 
 
 def test_run_shuts_down_adapter_after_startup_failure(monkeypatch, tmp_path):
