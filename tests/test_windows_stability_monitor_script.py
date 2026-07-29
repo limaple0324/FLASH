@@ -56,3 +56,16 @@ def test_monitor_supervises_product_runtime_and_reconnect_state() -> None:
     assert "smart_reconnect_state.json" in source
     assert "operation_records.json" in source
     assert "daily_record_last_write" in source
+
+
+def test_monitor_reports_disconnect_without_reconnect_progress() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "reconnect_disconnect_events" in source
+    assert "reconnect_progress_events" in source
+    assert "reconnect_unresolved" in source
+    assert "reconnect_unresolved_alerts" in source
+    assert (
+        "did not start an action within one monitor interval"
+        in source
+    )

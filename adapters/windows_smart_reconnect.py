@@ -1323,14 +1323,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             failures.append("capture_failed")
         if unknown_windows:
             failures.append("screen_unknown")
-        batch_action_safe = not failures
-        if not batch_action_safe:
-            # One unknown or failed capture invalidates the complete frame set.
-            # No recognized sibling window may inherit confirmation or receive
-            # input from a partially trustworthy batch.
-            confirmed_action_fingerprints.clear()
-            self._clear_action_confirmation()
-        elif execute:
+        # Identity and group completeness were already validated before any
+        # capture.  A capture or recognition failure is local to that exact
+        # window: it must never receive input, but it must not prevent another
+        # uniquely identified window with two matching disconnected frames
+        # from being recovered.
+        if execute:
             self._pending_reconnect_fingerprints.update(
                 fingerprint
                 for _window, fingerprint, item in recognized
@@ -1345,7 +1343,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             in ACTIONABLE_RECONNECT_ACTIONS
             and item.click_point is not None
             and fingerprint in confirmed_action_fingerprints
-            and batch_action_safe
             and (
                 item.state is ReconnectScreenState.DISCONNECTED
                 or self._has_reconnect_session(fingerprint)
@@ -1370,7 +1367,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if item.state is ReconnectScreenState.DISCONNECTED
             and item.battle_context
             and fingerprint in confirmed_action_fingerprints
-            and batch_action_safe
         ]
         clicked_windows = 0
         restarted_windows = retried_reopens

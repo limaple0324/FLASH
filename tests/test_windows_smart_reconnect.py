@@ -141,6 +141,7 @@ def make_controller(
     screen_states,
     *,
     windows=None,
+    expected_windows=2,
     points=None,
     mouse=None,
     clock=None,
@@ -180,7 +181,7 @@ def make_controller(
     )
     mouse = mouse or FakeMouseBackend()
     controller = WindowsSmartReconnectController(
-            expected_windows=2,
+            expected_windows=expected_windows,
             title_keywords=("Adobe Flash Player",),
             window_backend=FakeWindowBackend(windows),
             capture_provider=capture,
@@ -1064,7 +1065,7 @@ def test_unknown_peer_blocks_disconnected_batch_without_clicking():
     assert fixture.mouse.clicks == []
 
 
-def test_unknown_peer_never_creates_a_force_login_session():
+def test_unknown_peer_is_never_operated_during_a_known_reconnect_session():
     fixture = make_controller([2, 255])
     fixture.controller.reconnect()
     fixture.controller.reconnect()
@@ -1073,12 +1074,12 @@ def test_unknown_peer_never_creates_a_force_login_session():
     result = fixture.controller.reconnect()
 
     assert result.details["state_counts"] == {
-        "login_start": 1,
+        "force_login_start": 1,
         "unknown": 1,
     }
     assert result.details["actionable_windows"] == 0
-    assert result.details["next_check_seconds"] == 60
-    assert fixture.mouse.clicks == []
+    assert result.details["next_check_seconds"] == 10
+    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
 
 
 def test_changed_action_target_requires_two_new_matching_frames():
@@ -1543,31 +1544,77 @@ def test_unknown_screen_never_clicks_and_uses_one_minute_retry():
     assert "screen_unknown" in result.details["failure_codes"]
 
 
-def test_unknown_sibling_aborts_the_complete_disconnected_batch():
+def test_unknown_sibling_does_not_block_confirmed_disconnected_window():
     fixture = make_controller([2, 255])
 
     first = fixture.controller.reconnect()
     second = fixture.controller.reconnect()
 
     assert first.code == "reconnect.waiting"
-    assert second.code == "reconnect.waiting"
-    assert fixture.mouse.clicks == []
-    assert second.details["actionable_windows"] == 0
+    assert second.code == "reconnect.progressed_with_isolation"
+    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
+    assert second.details["actionable_windows"] == 1
     assert "screen_unknown" in second.details["failure_codes"]
-    assert fixture.controller.reconnecting_fingerprints() == frozenset()
+    assert fixture.controller.reconnecting_fingerprints() == frozenset(
+        {make_window(1).launch_fingerprint}
+    )
 
 
-def test_failed_capture_aborts_the_complete_disconnected_batch():
+def test_failed_sibling_capture_does_not_block_confirmed_disconnected_window():
     fixture = make_controller([2, 1])
     fixture.capture.states[2] = None
 
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert fixture.mouse.clicks == []
-    assert result.details["actionable_windows"] == 0
+    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
+    assert result.details["actionable_windows"] == 1
     assert "capture_failed" in result.details["failure_codes"]
-    assert fixture.controller.reconnecting_fingerprints() == frozenset()
+    assert fixture.controller.reconnecting_fingerprints() == frozenset(
+        {make_window(1).launch_fingerprint}
+    )
+
+
+def test_real_mixed_fourteen_window_shape_only_recovers_confirmed_disconnects():
+    windows = [make_window(handle) for handle in range(1, 15)]
+    fixture = make_controller(
+        [
+            2,
+            2,
+            3,
+            3,
+            1,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+        ],
+        windows=windows,
+        expected_windows=14,
+    )
+
+    first = fixture.controller.reconnect()
+    second = fixture.controller.reconnect()
+
+    assert first.details["actionable_windows"] == 0
+    assert second.code == "reconnect.progressed_with_isolation"
+    assert second.details["state_counts"] == {
+        "connected": 1,
+        "disconnected": 2,
+        "login_start": 2,
+        "unknown": 9,
+    }
+    assert second.details["actionable_windows"] == 2
+    assert second.details["clicked_windows"] == 2
+    assert fixture.mouse.clicks == [
+        (1, (0.5, 0.5)),
+        (2, (0.5, 0.5)),
+    ]
 
 
 def test_minimized_disconnected_window_is_still_monitored():

@@ -67,6 +67,11 @@ $smartReconnectDisabledSamples = 0
 $settingsReadFailures = 0
 $newProductLogBytes = 0L
 $newProductErrorMarkers = 0
+$reconnectDisconnectEvents = 0
+$reconnectProgressEvents = 0
+$unresolvedReconnectAlerts = 0
+$pendingReconnectDetectedAt = $null
+$pendingReconnectAlerted = $false
 $productLogOffset = if ([IO.File]::Exists($productLogPath)) {
     [IO.FileInfo]::new($productLogPath).Length
 }
@@ -197,6 +202,9 @@ function Read-NewProductLogSummary {
     $result = [ordered]@{
         bytes = 0L
         error_markers = 0
+        reconnect_disconnect_events = 0
+        reconnect_progress_events = 0
+        reconnect_terminal_events = 0
     }
     try {
         if (-not [IO.File]::Exists($productLogPath)) {
@@ -244,6 +252,26 @@ function Read-NewProductLogSummary {
                 "(?im)^.*(?:ERROR|CRITICAL|Traceback).*$"
             )
         ).Count
+        foreach ($line in ($newText -split "\r?\n")) {
+            if ($line -notmatch "Smart reconnect state changed;") {
+                continue
+            }
+            if (
+                $line -match "states=[^;]*disconnected:[1-9][0-9]*" -and
+                $line -notmatch "(?:clicked|restarted)=[1-9][0-9]*"
+            ) {
+                $result.reconnect_disconnect_events++
+            }
+            if (
+                $line -match "(?:clicked|restarted)=[1-9][0-9]*" -or
+                $line -match "code=reconnect\.progressed"
+            ) {
+                $result.reconnect_progress_events++
+            }
+            if ($line -match "code=reconnect\.connected") {
+                $result.reconnect_terminal_events++
+            }
+        }
         $script:productLogOffset = $length
     }
     catch {
@@ -355,6 +383,31 @@ try {
         }
         $newProductLogBytes += [int64]$newLog.bytes
         $newProductErrorMarkers += [int]$newLog.error_markers
+        $reconnectDisconnectEvents += [int]$newLog.reconnect_disconnect_events
+        $reconnectProgressEvents += [int]$newLog.reconnect_progress_events
+        if ($newLog.reconnect_disconnect_events -gt 0) {
+            $pendingReconnectDetectedAt = $sampledAt
+            $pendingReconnectAlerted = $false
+        }
+        if (
+            $newLog.reconnect_progress_events -gt 0 -or
+            $newLog.reconnect_terminal_events -gt 0
+        ) {
+            $pendingReconnectDetectedAt = $null
+            $pendingReconnectAlerted = $false
+        }
+        if (
+            $null -ne $pendingReconnectDetectedAt -and
+            -not $pendingReconnectAlerted -and
+            ($sampledAt - $pendingReconnectDetectedAt).TotalSeconds -ge
+                $IntervalSeconds
+        ) {
+            $unresolvedReconnectAlerts++
+            $pendingReconnectAlerted = $true
+            Add-StabilityEvent (
+                "ERROR Smart reconnect detected a disconnected window but did not start an action within one monitor interval."
+            )
+        }
 
         if ($null -ne $lastGameCount -and $lastGameCount -ne $gameCount) {
             Add-StabilityEvent (
@@ -397,6 +450,12 @@ try {
                 product_log_last_write = $productLogState.last_write
                 product_log_new_bytes = $newLog.bytes
                 product_log_new_error_markers = $newLog.error_markers
+                reconnect_disconnect_events = $newLog.reconnect_disconnect_events
+                reconnect_progress_events = $newLog.reconnect_progress_events
+                reconnect_unresolved = (
+                    $null -ne $pendingReconnectDetectedAt
+                )
+                reconnect_unresolved_alerts = $unresolvedReconnectAlerts
                 reconnect_state_exists = $reconnectState.exists
                 reconnect_state_size_bytes = $reconnectState.length
                 reconnect_state_last_write = $reconnectState.last_write
@@ -470,6 +529,9 @@ finally {
         settings_read_failures = $settingsReadFailures
         product_log_new_bytes = $newProductLogBytes
         product_log_new_error_markers = $newProductErrorMarkers
+        reconnect_disconnect_events = $reconnectDisconnectEvents
+        reconnect_progress_events = $reconnectProgressEvents
+        reconnect_unresolved_alerts = $unresolvedReconnectAlerts
         distinct_game_process_starts = $seenGameProcessStarts.Count
         distinct_product_process_starts = $seenProductProcessStarts.Count
         samples_file = [IO.Path]::GetFileName($samplesPath)
