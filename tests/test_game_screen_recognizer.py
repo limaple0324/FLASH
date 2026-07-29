@@ -7,6 +7,7 @@ from adapters.game_screen_recognizer import (
     CHARACTER_ENTER_CLICK_POINT,
     CHARACTER_LEVEL_REGIONS,
     CHARACTER_SLOT_CLICK_POINTS,
+    DEFAULT_LINE_NUMBER,
     DEFAULT_SCREEN_TEMPLATES,
     ROUTE_DIGIT_REFERENCE_REGION,
     ROUTE_PREFIX_SEARCH_REGION,
@@ -352,6 +353,23 @@ def test_route_number_is_not_used_without_a_reliable_route_prefix():
 
     assert line_number is None
     assert score is None
+
+
+def test_line_selection_defaults_to_line_one_when_original_line_is_unreadable(
+    monkeypatch,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    monkeypatch.setattr(
+        recognizer,
+        "_recognize_route_number",
+        lambda _candidate: (None, 23.242),
+    )
+    with Image.open(REFERENCE_DIR / "03_line_selection_dialog.png") as source:
+        result = recognizer.recognize_image(source.convert("RGB"))
+
+    assert result.state is ReconnectScreenState.LINE_SELECTION
+    assert result.line_number == DEFAULT_LINE_NUMBER == 1
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[1]
 
 
 def test_popup_title_guard_rejects_a_similar_generic_window_frame():

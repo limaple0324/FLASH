@@ -42,6 +42,7 @@ ROUTE_DIGIT_TEMPLATES = {
     7: "10_route_digit_7.png",
     8: "11_route_digit_8.png",
 }
+DEFAULT_LINE_NUMBER = 1
 LINE_ROUTE_CLICK_POINTS: dict[int, NormalizedPoint] = {
     1: (0.500, 0.327),
     2: (0.500, 0.385),
@@ -933,11 +934,9 @@ class ReferenceScreenRecognizer:
         click_point = definition.click_point
         if definition.state is ReconnectScreenState.LINE_SELECTION:
             line_number, _route_score = self._recognize_route_number(candidate)
-            click_point = (
-                LINE_ROUTE_CLICK_POINTS.get(line_number)
-                if line_number is not None
-                else None
-            )
+            if line_number is None:
+                line_number = DEFAULT_LINE_NUMBER
+            click_point = LINE_ROUTE_CLICK_POINTS[line_number]
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
             character_candidates = self._character_selection_candidates(
                 candidate
