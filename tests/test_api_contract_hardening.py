@@ -1,5 +1,6 @@
 import hashlib
 import json
+from dataclasses import replace
 
 from adapters.windows_input_sync import (
     WindowInputPolicy,
@@ -48,8 +49,32 @@ class _Resolver:
 
 
 class _WindowBackend:
-    def __init__(self, windows=(), foreground=None, *, fail=False):
-        self.windows = tuple(windows)
+    def __init__(
+        self,
+        windows=(),
+        foreground=None,
+        *,
+        fail=False,
+        complete_instances=True,
+    ):
+        self.windows = tuple(
+            replace(
+                window,
+                thread_id=(
+                    window.thread_id
+                    if window.thread_id is not None
+                    else window.handle + 1000
+                ),
+                process_lifecycle_token=(
+                    window.process_lifecycle_token
+                    if window.process_lifecycle_token is not None
+                    else (window.process_id or 0) + 100000
+                ),
+            )
+            if complete_instances
+            else window
+            for window in windows
+        )
         self.foreground = foreground
         self.fail = fail
 
@@ -395,6 +420,50 @@ def test_reconnect_targets_keep_offline_evidence_without_blocking_safe_sibling(
     assert tuple(window.handle for window in reconnect_targets.windows) == (11,)
     assert reconnect_targets.failure_codes == ("window_offline",)
     assert reconnect_targets.blocked_fingerprints == frozenset()
+
+
+def test_reconnect_targets_reject_incomplete_instance_before_capture(tmp_path):
+    configuration, scope_service, scope = _configured_group(tmp_path)
+    group_name = configuration.groups()[0].name
+    complete = WindowInfo(
+        11,
+        "Adobe Flash Player 11",
+        True,
+        False,
+        (0, 0, 900, 600),
+        101,
+        "Flash",
+        scope.fingerprints[0],
+        1001,
+        100001,
+    )
+    incomplete_windows = (
+        replace(complete, thread_id=None),
+        replace(complete, window_class=None),
+        replace(complete, process_lifecycle_token=None),
+    )
+
+    for incomplete in incomplete_windows:
+        service = TargetWindowContractService(
+            configuration,
+            scope_service,
+            WindowRegistry(),
+            _WindowBackend(
+                (incomplete,),
+                foreground=11,
+                complete_instances=False,
+            ),
+        )
+
+        reconnect_targets = service.reconnect_targets(group_name)
+
+        assert reconnect_targets.windows == ()
+        assert "window_instance_incomplete" in (
+            reconnect_targets.failure_codes
+        )
+        assert reconnect_targets.blocked_fingerprints == frozenset(
+            {scope.fingerprints[0]}
+        )
 
 
 def test_reconnect_targets_isolate_duplicate_role_without_hiding_safe_sibling(

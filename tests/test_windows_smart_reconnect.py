@@ -1433,6 +1433,7 @@ def test_selected_group_missing_identity_does_not_block_confirmed_open_role():
     assert result.code == "reconnect.progressed"
     assert result.details["expected_windows"] == 2
     assert result.details["discovered_windows"] == 1
+    assert result.details["all_connected"] is False
     assert result.details["failure_codes"] == []
     assert fixture.capture.calls == [1, 1, 1]
     assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
@@ -1442,7 +1443,7 @@ def test_selected_group_missing_identity_does_not_block_confirmed_open_role():
     ]
 
 
-def test_selected_group_only_requires_current_open_roles_to_be_connected():
+def test_selected_group_missing_identity_prevents_false_connected_result():
     windows = [make_window(1), make_window(2)]
     fixture = make_controller([1, 2], windows=windows)
     fixture.controller.set_allowed_fingerprints(
@@ -1454,11 +1455,12 @@ def test_selected_group_only_requires_current_open_roles_to_be_connected():
 
     result = fixture.controller.reconnect()
 
-    assert result.success is True
-    assert result.code == "reconnect.connected"
-    assert result.details["all_connected"] is True
+    assert result.success is False
+    assert result.code == "reconnect.waiting"
+    assert result.details["all_connected"] is False
     assert result.details["expected_windows"] == 2
     assert result.details["discovered_windows"] == 1
+    assert result.details["source_missing_windows"] == 1
     assert fixture.capture.calls == [1]
     assert fixture.mouse.clicks == []
 
@@ -1562,6 +1564,43 @@ def test_scoped_source_failure_revokes_only_affected_connected_evidence(
     assert fixture.controller.role_screen_states() == {
         windows[0].launch_fingerprint: ReconnectScreenState.CONNECTED,
         affected: ReconnectScreenState.UNKNOWN,
+    }
+    assert set(fixture.controller._trusted_connected_evidence) == {
+        windows[0].launch_fingerprint
+    }
+    assert fixture.mouse.clicks == []
+
+
+def test_scoped_source_subset_without_failure_revokes_missing_evidence():
+    windows = [make_window(1), make_window(2)]
+    selected = frozenset(
+        window.launch_fingerprint
+        for window in windows
+    )
+    provider_state = {
+        "value": ResolvedTargetWindows(tuple(windows)),
+    }
+    fixture = make_controller(
+        [1, 1],
+        windows=windows,
+        expected_windows=2,
+        target_windows_provider=lambda: provider_state["value"],
+    )
+    fixture.controller.set_allowed_fingerprints(selected)
+    connected = fixture.controller.reconnect()
+    assert connected.code == "reconnect.connected"
+    assert set(fixture.controller._trusted_connected_evidence) == selected
+
+    missing = windows[1].launch_fingerprint
+    provider_state["value"] = ResolvedTargetWindows((windows[0],))
+
+    result = fixture.controller.reconnect()
+
+    assert result.details["all_connected"] is False
+    assert result.details["source_missing_windows"] == 1
+    assert fixture.controller.role_screen_states() == {
+        windows[0].launch_fingerprint: ReconnectScreenState.CONNECTED,
+        missing: ReconnectScreenState.UNKNOWN,
     }
     assert set(fixture.controller._trusted_connected_evidence) == {
         windows[0].launch_fingerprint
@@ -3909,7 +3948,9 @@ def test_temporarily_missing_role_clears_only_its_first_frame_confirmation():
     assert first.details["actionable_windows"] == 0
     fixture.controller._window_backend.windows = [windows[1]]
     missing = fixture.controller.reconnect()
-    assert missing.code == "reconnect.connected"
+    assert missing.code == "reconnect.waiting"
+    assert missing.details["all_connected"] is False
+    assert missing.details["source_missing_windows"] == 1
     fixture.controller._window_backend.windows = windows
     restored = fixture.controller.reconnect()
 
@@ -4417,9 +4458,10 @@ def test_click_preflight_requires_complete_instance_token(window):
     result = fixture.controller.reconnect()
 
     assert result.details["clicked_windows"] == 0
-    assert "input_target_changed_before_delivery" in (
+    assert "window_instance_incomplete" in (
         result.details["failure_codes"]
     )
+    assert fixture.capture.calls == []
     assert fixture.mouse.clicks == []
 
 

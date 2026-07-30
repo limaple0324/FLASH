@@ -269,10 +269,36 @@ class TargetWindowContractService:
         )
 
     @staticmethod
+    def _has_complete_window_instance(window: WindowInfo) -> bool:
+        return (
+            isinstance(window.handle, int)
+            and not isinstance(window.handle, bool)
+            and window.handle > 0
+            and isinstance(window.process_id, int)
+            and not isinstance(window.process_id, bool)
+            and window.process_id > 0
+            and isinstance(window.thread_id, int)
+            and not isinstance(window.thread_id, bool)
+            and window.thread_id > 0
+            and isinstance(window.window_class, str)
+            and bool(window.window_class.strip())
+            and isinstance(window.process_lifecycle_token, int)
+            and not isinstance(window.process_lifecycle_token, bool)
+            and window.process_lifecycle_token > 0
+            and isinstance(window.rect, tuple)
+            and len(window.rect) == 4
+            and all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in window.rect
+            )
+            and type(window.minimized) is bool
+        )
+
+    @staticmethod
     def _safe_windows(
         snapshot: TargetWindowSnapshot,
     ) -> tuple[WindowInfo, ...]:
-        return tuple(
+        windows = tuple(
             WindowInfo(
                 handle=target.handle,
                 title="",
@@ -291,6 +317,13 @@ class TargetWindowContractService:
             if target.handle is not None
             and target.rect is not None
             and target.fingerprint is not None
+        )
+        return tuple(
+            window
+            for window in windows
+            if TargetWindowContractService._has_complete_window_instance(
+                window
+            )
         )
 
     def _resolve_entry(
@@ -332,7 +365,10 @@ class TargetWindowContractService:
             phase = TargetWindowPhase.UNKNOWN
         else:
             window = matches[0]
-            if window.minimized:
+            if not self._has_complete_window_instance(window):
+                failures = ("window_instance_incomplete",)
+                phase = TargetWindowPhase.UNKNOWN
+            elif window.minimized:
                 phase = TargetWindowPhase.MINIMIZED
             elif window.handle == foreground_handle:
                 phase = TargetWindowPhase.FOREGROUND

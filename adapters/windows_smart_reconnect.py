@@ -1250,6 +1250,7 @@ class ReconnectBatchResult:
     clicked_windows: int
     restarted_windows: int
     unknown_windows: int
+    source_missing_windows: int
     execution_requested: bool
     next_check_seconds: int
     state_counts: tuple[tuple[str, int], ...]
@@ -1262,6 +1263,7 @@ class ReconnectBatchResult:
             and self.validated_windows == self.discovered_windows
             and self.connected_windows == self.discovered_windows
             and self.unknown_windows == 0
+            and self.source_missing_windows == 0
             and not self.failure_codes
         )
 
@@ -1286,6 +1288,7 @@ class ReconnectBatchResult:
             "clicked_windows": self.clicked_windows,
             "restarted_windows": self.restarted_windows,
             "unknown_windows": self.unknown_windows,
+            "source_missing_windows": self.source_missing_windows,
             "execution_requested": self.execution_requested,
             "next_check_seconds": self.next_check_seconds,
             "state_counts": dict(self.state_counts),
@@ -3214,6 +3217,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or len(set(process_ids)) != len(process_ids)
         ):
             failures.append("process_identity_missing_or_duplicate")
+        if any(
+            WindowInstanceToken.from_window(window) is None
+            for window in windows
+        ):
+            failures.append("window_instance_incomplete")
         fingerprints = [
             normalize_launch_fingerprint(window.launch_fingerprint)
             for window in windows
@@ -3286,7 +3294,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             is not None
         }
         allowed = self._allowed_fingerprints
-        if allowed is None or not (source_failures or affected):
+        if allowed is None:
             return frozenset(affected)
         live_counts = Counter(
             fingerprint
@@ -3532,10 +3540,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         retried_reopens, retry_failures, pending_reopen_delay = (
             self._retry_pending_reopens(
                 candidate_windows=candidate_windows,
-                blocked_fingerprints=frozenset(
-                    set(blocked_fingerprints)
-                    | set(source_failure_affected_fingerprints)
-                ),
+                blocked_fingerprints=blocked_fingerprints,
                 execute=execute,
                 now=now,
                 expected_capture_settings_revision=(
@@ -3573,6 +3578,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 clicked_windows=0,
                 restarted_windows=retried_reopens,
                 unknown_windows=0,
+                source_missing_windows=len(
+                    source_failure_affected_fingerprints
+                ),
                 execution_requested=execute,
                 next_check_seconds=(
                     2
@@ -4390,6 +4398,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             clicked_windows=clicked_windows,
             restarted_windows=restarted_windows,
             unknown_windows=unknown_windows,
+            source_missing_windows=len(source_failure_affected_fingerprints),
             execution_requested=execute,
             next_check_seconds=next_check_seconds,
             state_counts=tuple(sorted(state_counts.items())),
