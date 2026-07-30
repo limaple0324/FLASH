@@ -1,84 +1,45 @@
-# FLASH
+# 輔
 
-FLASH（輔）是以穩定、可驗證與可擴充為核心的桌面輔助程式。
+「輔」是正式產品名稱；`FLASH` 是倉庫與技術名稱。
 
-## 「輔」專案總入口
+玩家是主角。「輔」的產品方向是安靜、可靠、自然、值得託付；技術實作必須可驗證、可恢復，且不能用猜測代替證據。
 
-完整產品核心、SP1／SP2／SP3 決策、玩家流程、提醒卡規格、實作現況、待驗證項目及未來討論順序，統一以以下文件為基準：
+## 專案入口
 
-- [「輔」專案完整總整理與未來路線圖](docs/00_輔_專案完整總整理與未來路線圖.md)
+- `AGENTS.md`：Codex（程式代理）開始工作時的唯一讀取入口。
+- `CODEX_MASTER_INSTRUCTIONS.md`：只保存長期有效的永久施工規則。
+- `PROJECT_CONTEXT.md`：只控制目前是否存在明確可接續的任務。
+- `docs/`：正式需求、設計決策、功能保留表與查證證據。
+- `tests/`：自動測試與回歸證據。
+- 合併請求與工作流程：當下施工、審查、建置與交付狀態的即時來源。
 
-後續進度必須分開標示：**已討論完成、已寫入倉庫、已完成程式實作、已通過雲端測試、已通過 Windows 實機驗證**。
+## 現況判定
 
-## Current milestone
+本文件刻意不保存目前分支、合併請求編號、提交編號、測試數量、成品編號、本機路徑、目前進度或完成比例，因為這些內容會快速過期。
 
-目前版本：**SP1 0.1.2 engineering verification build**
+需要判定目前狀況時，必須即時查詢：
 
-SP1 目前已包含：
+1. 目前工作分支與最新提交。
+2. 開啟中的合併請求與未解審查。
+3. 最新工作流程、測試與建置結果。
+4. 本次任務直接相關的正式需求、程式碼與證據。
 
-- application bootstrap
-- centralized persistent paths
-- JSON configuration
-- service registry
-- event bus and logging
-- Recovery / Smart Reconnect / External Adapter contracts
-- structured self-check system
-- Windows desktop verification window
-- Windows desktop auto-sync scripts
-- PyInstaller build specification
-- GitHub Actions test-and-build workflow
-- release bundle metadata and SHA-256 verification
+不得以舊摘要、舊驗收文件、舊測試數量或舊完成宣告代替即時查證。
 
-> 注意：目前是工程驗證版本。Recovery、Smart Reconnect 與遊戲視窗操作的介面已固定，但真正的遊戲／視窗適配器仍需接入並完成 Windows 實機驗收。
+## 狀態標示
 
-## Run from source
+所有功能與交付狀態必須明確區分：
 
-```powershell
-python main.py
-```
+- 已確認需求。
+- 已寫入程式碼。
+- 已通過受影響測試。
+- 已通過整合或完整回歸。
+- 已建立可核對成品。
+- 已通過必要實機驗證。
+- 已正式發布。
 
-啟動後會顯示 SP1 自我檢查結果與紀錄檔位置。
+前一階段完成，不代表後一階段也已完成。
 
-## Test
+## 施工原則
 
-```powershell
-python -m pytest -q
-```
-
-## Windows setup and verification
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\windows_setup_sp1.ps1
-```
-
-此腳本會檢查 Python、安裝必要套件、執行測試與無視窗自我檢查，最後啟動 FLASH。
-
-## Desktop synchronization
-
-手動同步：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\sync_desktop_from_github.ps1
-```
-
-註冊每 15 分鐘自動同步：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\register_flash_auto_sync_task.ps1
-```
-
-同步腳本追蹤 `origin/main`，若本機存在未提交修改會停止，避免覆蓋桌面內容。
-
-## Verify a downloaded Windows build
-
-下載並解壓 GitHub Actions Artifact 後執行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\verify_windows_release.ps1
-```
-
-驗收腳本會核對 `FLASH.exe`、SHA-256 與建置資訊，通過後啟動程式。
-
-## Delivery status
-
-正式交付標準請見 `SP1_VERIFICATION.md`。只有 GitHub Actions 建置、Windows 成品驗證、桌面同步與目標電腦實機驗收全部通過，才視為 SP1 完成。
+沒有明確當前任務時，不得因「繼續」、歷史待辦、舊分支或舊審查而自動展開全面掃描或施工。每次只處理使用者最新交辦的單一範圍，並以當下證據驗證結果。
