@@ -23,3 +23,13 @@
 - 已通過組別相關測試：`tests/test_main_group_configuration_transfer.py`、`tests/test_main_group_selection_registration.py`、`tests/test_group_configuration_service.py`、`tests/test_sync_scope_service.py`，共 32 項。
 - `git diff --check` 通過，僅有既有換行格式提醒。
 - 尚未提交、推送、送審、雲端建置或桌面同步。
+
+## Codex 審查回覆修正
+
+- 修正 `main.py`：切換組別失敗回復時，若舊組別身分無法重新綁定，會清空操作授權後重新開啟操作閘門，避免同步與智慧重連後續取不到閘門。
+- 修正 `ui/home.py`：切換到身分尚未完整的組別時，成功結果中的警告訊息會顯示在組別頁訊息列。
+- 新增回歸測試：`tests/test_main_input_sync.py`、`tests/test_home_sp3_layout.py`。
+- 已通過受影響測試：`tests/test_home_sp3_layout.py`、`tests/test_main_input_sync.py`、`tests/test_main_window_layout.py`，共 69 項。
+- 已通過組別相關測試：`tests/test_main_group_configuration_transfer.py`、`tests/test_main_group_selection_registration.py`、`tests/test_group_configuration_service.py`、`tests/test_sync_scope_service.py`，共 32 項。
+- `git diff --check` 通過，僅有既有換行格式提醒。
+- 尚未推送重新送審、雲端建置或桌面同步。

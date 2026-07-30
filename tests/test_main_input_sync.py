@@ -373,6 +373,36 @@ def test_group_change_allows_selection_but_clears_identity_when_unresolved():
     assert "同步與智慧重連已保持停用" in change_group
 
 
+def test_failed_group_change_clears_unbound_identity_before_reopening_gate():
+    source = Path("main.py").read_text(encoding="utf-8")
+    change_group = source[
+        source.index("    def change_group("):
+        source.index(
+            "    def stop_group_automation_for_configuration_change(",
+        )
+    ]
+    rollback_start = change_group.index(
+        "        except Exception:",
+        change_group.index("selected_workspace_group = "),
+    )
+    rollback_end = change_group.index(
+        "        reopen_group_operation_gate()",
+        rollback_start,
+    ) + len("        reopen_group_operation_gate()")
+    rollback = change_group[
+        rollback_start:
+        rollback_end
+    ]
+
+    restore_index = rollback.index("restore_group_identity(old_choice)")
+    clear_index = rollback.index("clear_group_identity()")
+    publish_index = rollback.index("restore_published_group(")
+    reopen_index = rollback.index("reopen_group_operation_gate()")
+
+    assert restore_index < clear_index < publish_index < reopen_index
+    assert "if rollback_ready and publication_restored:" in rollback
+
+
 def test_role_identity_refresh_only_rebinds_current_group_and_reopens_gate():
     source = Path("main.py").read_text(encoding="utf-8")
     refresh = source[

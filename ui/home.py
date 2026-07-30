@@ -8718,6 +8718,7 @@ class HomeView:
             return
         previous_name = self.current_group_name
         result = None
+        success_message = ""
         if self.on_group_change is not None:
             result = self.on_group_change(name)
         if isinstance(result, GroupManagementViewResult):
@@ -8729,6 +8730,7 @@ class HomeView:
                 )
                 return
             selected_name = result.current_group_name
+            success_message = result.message.strip()
         elif result is False:
             if self._group_variable is not None:
                 self._group_variable.set(previous_name or "")
@@ -8757,6 +8759,8 @@ class HomeView:
         self.refresh_group_sync_relations()
         self.refresh_group_role_statuses()
         self.refresh_operation_records()
+        if success_message:
+            self._show_group_setting_message(success_message)
 
     @staticmethod
     def _normalized_window_size_value(

@@ -182,6 +182,42 @@ def test_failed_group_change_keeps_previous_group_selected() -> None:
     assert messages == ["自動操作尚未完全停止，未切換組別。"]
 
 
+def test_successful_group_change_shows_warning_message() -> None:
+    view = object.__new__(HomeView)
+    view.group_choices = (
+        PlayerGroupChoice("group-a", "甲組", 0),
+        PlayerGroupChoice("group-b", "乙組", 0),
+    )
+    view.current_group_name = "甲組"
+    view._group_variable = _ValueStub("乙組")
+    view._group_value_label = _ConfigureStub()
+    view._group_name_entry = _EntryStub("甲組")
+    messages: list[str] = []
+    view._show_group_setting_message = messages.append
+    view.on_group_change = lambda _name: GroupManagementViewResult(
+        True,
+        "乙組",
+        "已切換目前組別；此組視窗身分尚未完整，"
+        "同步與智慧重連已保持停用。",
+    )
+    view.refresh_workspace = lambda: None
+    view.refresh_current_group_summary = lambda: None
+    view.refresh_group_entries = lambda: None
+    view.refresh_group_sync_relations = lambda: None
+    view.refresh_group_role_statuses = lambda: None
+    view.refresh_operation_records = lambda: None
+
+    view._select_group("乙組")
+
+    assert view.current_group_name == "乙組"
+    assert view._group_variable.value == "乙組"
+    assert view._group_name_entry.value == "乙組"
+    assert messages == [
+        "已切換目前組別；此組視窗身分尚未完整，"
+        "同步與智慧重連已保持停用。"
+    ]
+
+
 def test_smart_reconnect_stop_timeout_never_displays_safe_stop() -> None:
     view = object.__new__(HomeView)
     view.smart_reconnect_enabled = True

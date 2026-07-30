@@ -2373,6 +2373,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             workspace_service.set_next_step("查看目前需要注意的內容")
         except Exception:
             rollback_ready = restore_group_identity(old_choice)
+            if not rollback_ready:
+                try:
+                    clear_group_identity()
+                    rollback_ready = True
+                except Exception:
+                    rollback_ready = False
             publication_restored = restore_published_group(
                 current_group,
                 current_workspace.next_step,
