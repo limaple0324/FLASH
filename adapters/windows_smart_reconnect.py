@@ -3400,7 +3400,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         now: float,
         expected_capture_settings_revision: int,
     ) -> tuple[int, list[str], int | None]:
-        live_fingerprints: set[str] = set()
+        live_counts: Counter[str] = Counter()
         unsafe_live_fingerprints: set[str] = set()
         for window in candidate_windows:
             fingerprint = normalize_launch_fingerprint(
@@ -3414,9 +3414,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             ):
                 unsafe_live_fingerprints.add(fingerprint)
             else:
-                live_fingerprints.add(fingerprint)
+                live_counts[fingerprint] += 1
+        duplicate_live_fingerprints = {
+            fingerprint
+            for fingerprint, count in live_counts.items()
+            if count > 1
+        }
+        clearable_live_fingerprints = {
+            fingerprint
+            for fingerprint, count in live_counts.items()
+            if (
+                count == 1
+                and fingerprint not in unsafe_live_fingerprints
+            )
+        }
         appeared = (
-            self._pending_reopen_fingerprints & live_fingerprints
+            self._pending_reopen_fingerprints & clearable_live_fingerprints
         )
         self._pending_reopen_fingerprints.difference_update(appeared)
         for fingerprint in appeared:
@@ -3446,6 +3459,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 continue
             if fingerprint in unsafe_live_fingerprints:
                 failures.append("window_instance_incomplete")
+                next_delays.append(self._policy.retry_interval_seconds)
+                continue
+            if fingerprint in duplicate_live_fingerprints:
+                failures.append("fingerprint_missing_or_duplicate")
                 next_delays.append(self._policy.retry_interval_seconds)
                 continue
             if not execute or not self._execution_allowed():

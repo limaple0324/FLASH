@@ -4181,6 +4181,60 @@ def test_pending_reopen_keeps_incomplete_appeared_instance(tmp_path):
     assert fixture.mouse.clicks == []
 
 
+def test_pending_reopen_requires_unique_complete_instance_to_clear(tmp_path):
+    windows = [make_window(1), make_window(2)]
+    incomplete_same_identity = replace(windows[0], handle=3, thread_id=0)
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [1, 1, 1],
+        windows=[windows[0], incomplete_same_identity, windows[1]],
+        expected_windows=2,
+        battle_restarter=restarter,
+        group_launch_plan=make_group_plan(tmp_path, windows, "120"),
+    )
+    missing = windows[0].launch_fingerprint
+    fixture.controller._pending_reopen_fingerprints.add(missing)
+    fixture.controller._reopen_retry_after[missing] = 0.0
+
+    result = fixture.controller.reconnect()
+
+    assert result.code == "reconnect.waiting"
+    assert "window_instance_incomplete" in result.details["failure_codes"]
+    assert missing in fixture.controller._pending_reopen_fingerprints
+    assert fixture.controller._reopen_retry_after[missing] == 0.0
+    assert restarter.reopen_calls == []
+    assert fixture.mouse.clicks == []
+
+
+def test_pending_reopen_requires_non_duplicate_complete_instance_to_clear(
+    tmp_path,
+):
+    windows = [make_window(1), make_window(2)]
+    duplicate_same_identity = replace(windows[0], handle=3, process_id=103)
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [1, 1, 1],
+        windows=[windows[0], duplicate_same_identity, windows[1]],
+        expected_windows=2,
+        battle_restarter=restarter,
+        group_launch_plan=make_group_plan(tmp_path, windows, "120"),
+    )
+    missing = windows[0].launch_fingerprint
+    fixture.controller._pending_reopen_fingerprints.add(missing)
+    fixture.controller._reopen_retry_after[missing] = 0.0
+
+    result = fixture.controller.reconnect()
+
+    assert result.code == "reconnect.waiting"
+    assert "fingerprint_missing_or_duplicate" in (
+        result.details["failure_codes"]
+    )
+    assert missing in fixture.controller._pending_reopen_fingerprints
+    assert fixture.controller._reopen_retry_after[missing] == 0.0
+    assert restarter.reopen_calls == []
+    assert fixture.mouse.clicks == []
+
+
 def test_duplicate_identity_never_triggers_missing_role_reopen(tmp_path):
     now = [0.0]
     windows = [make_window(1), make_window(2)]
