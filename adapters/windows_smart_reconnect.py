@@ -1696,6 +1696,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             str,
             _TrustedConnectedEvidence,
         ] = {}
+        self._source_state_generation = 0
         self._action_confirmations: dict[
             str,
             tuple[tuple[object, ...], int],
@@ -2227,6 +2228,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         }
         if not requested:
             return {}
+        with self._screen_state_lock:
+            observation_source_generation = self._source_state_generation
         _settings, observation_revision = self._capture_settings_snapshot()
         candidates = self._candidate_windows()
         by_fingerprint: dict[str, list[WindowInfo]] = {}
@@ -2286,6 +2289,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             else:
                 observed[fingerprint] = ReconnectScreenState.UNKNOWN
         with self._screen_state_lock:
+            source_generation_changed = (
+                self._source_state_generation
+                != observation_source_generation
+            )
             with self._capture_settings_lock:
                 if self._capture_settings_revision != observation_revision:
                     observed = {
@@ -2296,6 +2303,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         for fingerprint in observed
                     }
                     for fingerprint in fresh_instances:
+                        self._trusted_connected_evidence.pop(
+                            fingerprint,
+                            None,
+                        )
+                elif source_generation_changed:
+                    for fingerprint, state in tuple(observed.items()):
+                        if state is ReconnectScreenState.CONNECTED:
+                            observed[fingerprint] = (
+                                ReconnectScreenState.UNKNOWN
+                            )
                         self._trusted_connected_evidence.pop(
                             fingerprint,
                             None,
@@ -3323,6 +3340,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if not fingerprints:
             return
         with self._screen_state_lock:
+            self._source_state_generation += 1
             self._mark_fingerprints_unknown_locked(fingerprints)
 
     def _runtime_state(self) -> ReconnectRuntimeState:
@@ -3382,16 +3400,21 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         now: float,
         expected_capture_settings_revision: int,
     ) -> tuple[int, list[str], int | None]:
-        live_fingerprints = {
-            fingerprint
-            for window in candidate_windows
-            if (
-                fingerprint := normalize_launch_fingerprint(
-                    window.launch_fingerprint
-                )
+        live_fingerprints: set[str] = set()
+        unsafe_live_fingerprints: set[str] = set()
+        for window in candidate_windows:
+            fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
             )
-            is not None
-        }
+            if fingerprint is None:
+                continue
+            if (
+                fingerprint in blocked_fingerprints
+                or WindowInstanceToken.from_window(window) is None
+            ):
+                unsafe_live_fingerprints.add(fingerprint)
+            else:
+                live_fingerprints.add(fingerprint)
         appeared = (
             self._pending_reopen_fingerprints & live_fingerprints
         )
@@ -3419,6 +3442,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             retry_at = self._reopen_retry_after.get(fingerprint, now)
             if fingerprint in blocked_fingerprints:
                 failures.append("battle_reopen_identity_unsafe")
+                next_delays.append(self._policy.retry_interval_seconds)
+                continue
+            if fingerprint in unsafe_live_fingerprints:
+                failures.append("window_instance_incomplete")
                 next_delays.append(self._policy.retry_interval_seconds)
                 continue
             if not execute or not self._execution_allowed():
@@ -4434,6 +4461,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 }
             )
             self._last_screen_states = published_states
+            if source_failure_affected_fingerprints:
+                self._source_state_generation += 1
             evidence_observed_at = time.monotonic()
             for _window, fingerprint, item in recognized:
                 fresh_instance = fresh_capture_instances.get(fingerprint)
@@ -4456,6 +4485,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         fingerprint,
                         None,
                     )
+            for fingerprint in source_failure_affected_fingerprints:
+                self._trusted_connected_evidence.pop(fingerprint, None)
         if result.all_connected:
             self._clear_unknown_reconnect_failure()
         self._last_result = result

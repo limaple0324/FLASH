@@ -1608,6 +1608,85 @@ def test_scoped_source_subset_without_failure_revokes_missing_evidence():
     assert fixture.mouse.clicks == []
 
 
+def test_source_subset_final_publish_removes_late_connected_evidence(
+    monkeypatch,
+):
+    windows = [make_window(1), make_window(2)]
+    selected = frozenset(
+        window.launch_fingerprint
+        for window in windows
+    )
+    provider_state = {
+        "value": ResolvedTargetWindows(tuple(windows)),
+    }
+    fixture = make_controller(
+        [1, 1],
+        windows=windows,
+        expected_windows=2,
+        target_windows_provider=lambda: provider_state["value"],
+    )
+    fixture.controller.set_allowed_fingerprints(selected)
+    connected = fixture.controller.reconnect()
+    assert connected.code == "reconnect.connected"
+
+    missing = windows[1].launch_fingerprint
+    stale_evidence = fixture.controller._trusted_connected_evidence[missing]
+    original_revoke = fixture.controller._revoke_source_failure_evidence
+
+    def revoke_then_restore(fingerprints):
+        original_revoke(fingerprints)
+        if missing in fingerprints:
+            with fixture.controller._screen_state_lock:
+                fixture.controller._trusted_connected_evidence[missing] = (
+                    stale_evidence
+                )
+
+    monkeypatch.setattr(
+        fixture.controller,
+        "_revoke_source_failure_evidence",
+        revoke_then_restore,
+    )
+    provider_state["value"] = ResolvedTargetWindows((windows[0],))
+
+    result = fixture.controller.reconnect()
+
+    assert result.details["all_connected"] is False
+    assert result.details["source_missing_windows"] == 1
+    assert missing not in fixture.controller._trusted_connected_evidence
+    assert fixture.controller.role_screen_states()[missing] == (
+        ReconnectScreenState.UNKNOWN
+    )
+
+
+def test_observation_rejects_connected_state_after_source_generation_change(
+    monkeypatch,
+):
+    window = make_window(1)
+    fixture = make_controller([1], windows=[window], expected_windows=1)
+    fingerprint = window.launch_fingerprint
+    original_capture = fixture.controller._capture_and_recognize
+
+    def capture_then_revoke(window_arg, fingerprint_arg):
+        result = original_capture(window_arg, fingerprint_arg)
+        fixture.controller._revoke_source_failure_evidence(
+            frozenset({fingerprint_arg})
+        )
+        return result
+
+    monkeypatch.setattr(
+        fixture.controller,
+        "_capture_and_recognize",
+        capture_then_revoke,
+    )
+
+    observed = fixture.controller.observe_screen_states({fingerprint})
+
+    assert observed == {
+        fingerprint: ReconnectScreenState.UNKNOWN,
+    }
+    assert fingerprint not in fixture.controller._trusted_connected_evidence
+
+
 def test_isolated_target_source_failure_does_not_block_safe_disconnected_role():
     windows = [make_window(1), make_window(2)]
     selected = {
@@ -4073,6 +4152,32 @@ def test_pending_missing_reopen_target_never_reports_all_connected(tmp_path):
     assert result.details["connected_windows"] == 1
     assert result.details["next_check_seconds"] == 30
     assert "reconnect_target_missing" in result.details["failure_codes"]
+    assert fixture.mouse.clicks == []
+
+
+def test_pending_reopen_keeps_incomplete_appeared_instance(tmp_path):
+    windows = [make_window(1), make_window(2)]
+    incomplete = replace(windows[0], thread_id=0)
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [1, 1],
+        windows=[incomplete, windows[1]],
+        expected_windows=2,
+        battle_restarter=restarter,
+        group_launch_plan=make_group_plan(tmp_path, windows, "120"),
+    )
+    missing = windows[0].launch_fingerprint
+    fixture.controller._pending_reopen_fingerprints.add(missing)
+    fixture.controller._reopen_retry_after[missing] = 0.0
+
+    result = fixture.controller.reconnect()
+
+    assert result.code == "reconnect.waiting"
+    assert "window_instance_incomplete" in result.details["failure_codes"]
+    assert missing in fixture.controller._pending_reopen_fingerprints
+    assert fixture.controller._reopen_retry_after[missing] == 0.0
+    assert restarter.reopen_calls == []
+    assert fixture.capture.calls == []
     assert fixture.mouse.clicks == []
 
 
