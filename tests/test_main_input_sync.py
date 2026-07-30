@@ -351,6 +351,28 @@ def test_group_change_stops_all_automation_before_publishing_new_group():
     )
 
 
+def test_group_change_allows_selection_but_clears_identity_when_unresolved():
+    source = Path("main.py").read_text(encoding="utf-8")
+    change_group = source[
+        source.index("    def change_group("):
+        source.index(
+            "    def stop_group_automation_for_configuration_change(",
+        )
+    ]
+
+    apply_index = change_group.index("apply_group_identity(choice)")
+    clear_index = change_group.index("clear_group_identity()")
+    config_index = change_group.index("config.set(CURRENT_GROUP_NAME_KEY")
+    workspace_index = change_group.index(
+        "workspace_service.set_current_group("
+    )
+
+    assert "identity_ready = apply_group_identity(choice) is not None" in change_group
+    assert "if not identity_ready:" in change_group
+    assert apply_index < clear_index < config_index < workspace_index
+    assert "同步與智慧重連已保持停用" in change_group
+
+
 def test_role_identity_refresh_only_rebinds_current_group_and_reopens_gate():
     source = Path("main.py").read_text(encoding="utf-8")
     refresh = source[

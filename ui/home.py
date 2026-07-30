@@ -306,6 +306,23 @@ def _feature_card_control_offsets(
     return -inset, -(inset + gap + width)
 
 
+def _feature_card_content_pady(
+    current_pady: int,
+    controls_required_height: int,
+    *,
+    control_top: int = 6,
+    content_gap: int = 8,
+) -> int:
+    """Keep card content below the right-side settings/collapse controls."""
+    current = max(0, int(current_pady))
+    controls_bottom = (
+        max(0, int(control_top))
+        + max(1, int(controls_required_height))
+        + max(0, int(content_gap))
+    )
+    return max(current, controls_bottom)
+
+
 def _collapsed_card_title_pady(
     title_required_height: int,
     current_pady: int,
@@ -1512,6 +1529,15 @@ class HomeView:
             x=settings_offset,
             y=6,
             anchor="ne",
+        )
+        frame.configure(
+            pady=_feature_card_content_pady(
+                pady,
+                max(
+                    int(settings_button.winfo_reqheight()),
+                    int(toggle_button.winfo_reqheight()),
+                ),
+            )
         )
         widgets = _FeatureCardWidgets(
             card_id=clean_id,

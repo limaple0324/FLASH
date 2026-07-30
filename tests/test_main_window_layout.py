@@ -107,6 +107,18 @@ def test_selected_group_plan_returns_scoped_registered_role_metadata():
     )
 
 
+def test_role_id_read_uses_the_entry_safe_window_not_groupwide_failure():
+    source = Path("main.py").read_text(encoding="utf-8")
+    function_source = source[
+        source.index("    def unique_window_for_group_entry("):
+        source.index("    def refresh_group_sync_identity(")
+    ]
+
+    assert "target_window_contract_service.snapshot(" in function_source
+    assert "and item.safe" in function_source
+    assert "if snapshot.failure_codes:" not in function_source
+
+
 def test_startup_error_uses_product_name():
     source = Path("main.py").read_text(encoding="utf-8")
 

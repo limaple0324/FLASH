@@ -2363,8 +2363,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         try:
             selected_workspace_group = workspace_group_for_choice(choice)
-            if apply_group_identity(choice) is None:
-                raise RuntimeError("group_identity_unresolved")
+            identity_ready = apply_group_identity(choice) is not None
+            if not identity_ready:
+                clear_group_identity()
             config.set(CURRENT_GROUP_NAME_KEY, choice.name)
             workspace_service.set_current_group(
                 selected_workspace_group
@@ -2388,6 +2389,13 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if group_role_status_service is not None:
             group_role_status_service.clear_cache()
         refresh_character_data(choice.name)
+        if not identity_ready:
+            return GroupManagementViewResult(
+                True,
+                choice.name,
+                "已切換目前組別；此組視窗身分尚未完整，"
+                "同步與智慧重連已保持停用。",
+            )
         return GroupManagementViewResult(True, choice.name)
 
     def stop_group_automation_for_configuration_change() -> bool:
@@ -3059,8 +3067,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             group_name,
             expanded_sync_scope=False,
         )
-        if snapshot.failure_codes:
-            return None
         contract = next(
             (
                 item

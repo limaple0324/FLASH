@@ -24,6 +24,7 @@ from ui.home import (
     _collapsed_card_title_pady,
     _contrast_ratio,
     _contain_geometry,
+    _feature_card_content_pady,
     _feature_card_control_offsets,
     _reordered_entry_ids,
     _safe_character_lines,
@@ -776,6 +777,8 @@ def test_feature_card_buttons_and_collapsed_title_keep_safe_spacing() -> None:
     assert toggle_offset == -8
     assert settings_offset == -76
     assert abs(settings_offset) - abs(toggle_offset) - 62 == 6
+    assert _feature_card_content_pady(12, 37) >= 6 + 37 + 8
+    assert _feature_card_content_pady(80, 37) == 80
     required_pady = _collapsed_card_title_pady(24, 2, 31)
     collapsed_height = 24 - 4 + required_pady * 2
     assert collapsed_height >= 31 + 12
