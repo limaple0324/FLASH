@@ -11,6 +11,7 @@ class ReconnectScreenState(str, Enum):
     DISCONNECTED = "disconnected"
     LOGIN_START = "login_start"
     FORCE_LOGIN_START = "force_login_start"
+    FORCE_LOGIN_TIMEOUT = "force_login_timeout"
     LINE_SELECTION = "line_selection"
     CHARACTER_SELECTION = "character_selection"
     POST_LOGIN_ACTIVITY = "post_login_activity"
@@ -18,6 +19,7 @@ class ReconnectScreenState(str, Enum):
     POST_LOGIN_AUTO_DUNGEON = "post_login_auto_dungeon"
     RECONNECTING = "reconnecting"
     FAILED = "failed"
+    CHECK_DISABLED = "check_disabled"
     UNKNOWN = "unknown"
 
 
@@ -26,6 +28,7 @@ class ReconnectAction(str, Enum):
     CONFIRM_DISCONNECT = "confirm_disconnect"
     START_GAME = "start_game"
     FORCE_LOGIN = "force_login"
+    CONFIRM_FORCE_LOGIN_TIMEOUT = "confirm_force_login_timeout"
     SELECT_DEFAULT_LINE = "select_default_line"
     ENTER_GAME = "enter_game"
     WAIT_AND_RECHECK = "wait_and_recheck"
@@ -103,6 +106,12 @@ class ReconnectPolicy:
             return ReconnectDecision(
                 action=ReconnectAction.FORCE_LOGIN,
                 delay_seconds=self.force_login_wait_seconds,
+                attempt_limit=self.maximum_attempts,
+            )
+        if state is ReconnectScreenState.FORCE_LOGIN_TIMEOUT:
+            return ReconnectDecision(
+                action=ReconnectAction.CONFIRM_FORCE_LOGIN_TIMEOUT,
+                delay_seconds=self.retry_interval_seconds,
                 attempt_limit=self.maximum_attempts,
             )
         if state is ReconnectScreenState.LINE_SELECTION:

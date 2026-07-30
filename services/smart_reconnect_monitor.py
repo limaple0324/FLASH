@@ -8,7 +8,9 @@ from core.sp1_boundaries import OperationResult, SmartReconnectBoundary
 from services.logger_service import LoggerService
 
 
-DEFAULT_SMART_RECONNECT_INTERVAL_MS = 1000
+DEFAULT_SMART_RECONNECT_INTERVAL_MS = 2000
+MINIMUM_SMART_RECONNECT_INTERVAL_MS = 500
+MAXIMUM_SMART_RECONNECT_INTERVAL_MS = 60_000
 
 
 def normalize_smart_reconnect_interval_ms(
@@ -23,7 +25,13 @@ def normalize_smart_reconnect_interval_ms(
         normalized = int(value)
     except (TypeError, ValueError):
         return default
-    return normalized if normalized > 0 else default
+    if not (
+        MINIMUM_SMART_RECONNECT_INTERVAL_MS
+        <= normalized
+        <= MAXIMUM_SMART_RECONNECT_INTERVAL_MS
+    ):
+        return default
+    return normalized
 
 
 class SmartReconnectMonitor:
@@ -98,15 +106,54 @@ class SmartReconnectMonitor:
             details.get("restarted_windows"),
         )
 
+    @staticmethod
+    def _is_fully_connected_healthy(result: OperationResult) -> bool:
+        """Only a complete, failure-free scan may use the short monitor cadence."""
+        if not result.success or result.code != "reconnect.connected":
+            return False
+        details = result.details
+        if details is None or details.get("all_connected") is not True:
+            return False
+        discovered = details.get("discovered_windows")
+        if (
+            isinstance(discovered, bool)
+            or not isinstance(discovered, int)
+            or discovered <= 0
+        ):
+            return False
+        for name in (
+            "validated_windows",
+            "captured_windows",
+            "recognized_windows",
+            "connected_windows",
+        ):
+            value = details.get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value != discovered
+            ):
+                return False
+        for name in (
+            "actionable_windows",
+            "clicked_windows",
+            "restarted_windows",
+            "unknown_windows",
+        ):
+            value = details.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+                return False
+        failure_codes = details.get("failure_codes")
+        return (
+            isinstance(failure_codes, (list, tuple))
+            and not failure_codes
+        )
+
     def run_once(self) -> tuple[OperationResult, float]:
         result = self._boundary.reconnect()
         delay = self._safe_delay(result, self._fallback_delay_seconds)
         details = result.details or {}
-        if (
-            result.code in {"reconnect.connected", "reconnect.waiting"}
-            and not details.get("clicked_windows", 0)
-            and not details.get("restarted_windows", 0)
-        ):
+        if self._is_fully_connected_healthy(result):
             delay = max(0.001, self.monitor_interval_ms / 1000.0)
         signature = self._signature(result)
         if self._logger is not None and signature != self._last_signature:

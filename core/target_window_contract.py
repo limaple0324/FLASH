@@ -38,6 +38,9 @@ class TargetWindowContract:
     handle: int | None = None
     rect: tuple[int, int, int, int] | None = None
     visible: bool = False
+    thread_id: int | None = None
+    window_class: str | None = None
+    process_lifecycle_token: int | None = None
 
     SCHEMA_VERSION = 1
 

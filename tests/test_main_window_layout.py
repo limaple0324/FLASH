@@ -43,6 +43,12 @@ def test_main_window_uses_home_view():
     assert "feature_card_layout_service.set_collapsed" in source
     assert "feature_card_layout_service.reorder" in source
     assert "feature_card_layout_service.set_title" in source
+    assert "FeatureCardSettingsBatchService(" in source
+    assert "feature_card_settings_batch_service.save(" in source
+    assert (
+        "on_save_feature_card_settings=save_feature_card_settings"
+        in source
+    )
     assert "current_card_background" in source
     assert "on_save_card_background=save_card_background" in source
     assert "on_clear_card_background=clear_card_background" in source
@@ -70,7 +76,7 @@ def test_main_window_title_is_player_facing():
     assert 'APP_TITLE = "輔｜FLASH SP1"' not in source
 
 
-def test_selected_group_plan_returns_its_local_plan_without_startup_leak():
+def test_selected_group_plan_returns_scoped_registered_role_metadata():
     source = Path("main.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     build_window = next(
@@ -86,12 +92,13 @@ def test_selected_group_plan_returns_its_local_plan_without_startup_leak():
         and node.name == "selected_group_plan"
     )
 
-    assert any(
-        isinstance(node, ast.Return)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "plan"
-        for node in selected_group_plan.body
-    )
+    selected_source = ast.get_source_segment(source, selected_group_plan)
+    assert selected_source is not None
+    assert "member.character_id" in selected_source
+    assert "profiles.get(character_id)" in selected_source
+    assert "profiles.get(target.entry_id)" not in selected_source
+    assert "registered_level" in selected_source
+    assert "importance" in selected_source
     assert not any(
         isinstance(node, ast.Return)
         and isinstance(node.value, ast.Name)

@@ -61,6 +61,24 @@ class BlockingBoundary(FakeBoundary):
         )
 
 
+def healthy_connected_details(*, next_check_seconds=5, windows=2):
+    return {
+        "all_connected": True,
+        "discovered_windows": windows,
+        "validated_windows": windows,
+        "captured_windows": windows,
+        "recognized_windows": windows,
+        "connected_windows": windows,
+        "actionable_windows": 0,
+        "clicked_windows": 0,
+        "restarted_windows": 0,
+        "unknown_windows": 0,
+        "next_check_seconds": next_check_seconds,
+        "state_counts": {"connected": windows},
+        "failure_codes": [],
+    }
+
+
 def test_run_once_uses_result_delay_and_logs_only_aggregate_state():
     boundary = FakeBoundary(
         [
@@ -99,15 +117,7 @@ def test_repeated_identical_state_does_not_spam_log():
     result = OperationResult(
         True,
         "reconnect.connected",
-        details={
-            "connected_windows": 2,
-            "actionable_windows": 0,
-            "clicked_windows": 0,
-            "unknown_windows": 0,
-            "next_check_seconds": 5,
-            "state_counts": {"connected": 2},
-            "failure_codes": [],
-        },
+        details=healthy_connected_details(),
     )
     logger = RecordingLogger()
     monitor = SmartReconnectMonitor(
@@ -121,7 +131,24 @@ def test_repeated_identical_state_does_not_spam_log():
     assert len(logger.info_messages) == 1
 
 
-def test_passive_waiting_uses_saved_monitoring_interval():
+def test_only_complete_healthy_connected_scan_uses_saved_monitoring_interval():
+    monitor = SmartReconnectMonitor(
+        FakeBoundary(
+            [
+                OperationResult(
+                    True,
+                    "reconnect.connected",
+                    details=healthy_connected_details(next_check_seconds=45),
+                )
+            ]
+        ),
+        monitor_interval_ms=1500,
+    )
+
+    assert monitor.run_once()[1] == 1.5
+
+
+def test_passive_waiting_respects_controller_delay_or_safe_fallback():
     monitor = SmartReconnectMonitor(
         FakeBoundary(
             [
@@ -129,25 +156,97 @@ def test_passive_waiting_uses_saved_monitoring_interval():
                 OperationResult(
                     False,
                     "reconnect.waiting",
-                    details={"next_check_seconds": 0},
+                    details={"next_check_seconds": 17},
                 ),
+            ]
+        ),
+        fallback_delay_seconds=60,
+        monitor_interval_ms=1500,
+    )
+
+    assert monitor.run_once()[1] == 60
+    assert monitor.run_once()[1] == 17
+
+
+def test_unknown_or_capture_failure_respects_controller_delay():
+    monitor = SmartReconnectMonitor(
+        FakeBoundary(
+            [
+                OperationResult(
+                    False,
+                    "reconnect.waiting",
+                    details={
+                        "all_connected": False,
+                        "discovered_windows": 14,
+                        "validated_windows": 14,
+                        "captured_windows": 13,
+                        "recognized_windows": 13,
+                        "connected_windows": 5,
+                        "actionable_windows": 0,
+                        "clicked_windows": 0,
+                        "restarted_windows": 0,
+                        "unknown_windows": 1,
+                        "next_check_seconds": 30,
+                        "state_counts": {"connected": 5, "unknown": 1},
+                        "failure_codes": ["capture_failed"],
+                    },
+                )
             ]
         ),
         monitor_interval_ms=1500,
     )
 
-    assert monitor.run_once()[1] == 1.5
-    assert monitor.run_once()[1] == 1.5
+    assert monitor.run_once()[1] == 30
+
+
+def test_connected_code_without_complete_health_evidence_keeps_controller_delay():
+    incomplete_or_failed = [
+        {"next_check_seconds": 21},
+        {
+            **healthy_connected_details(next_check_seconds=22),
+            "unknown_windows": 1,
+        },
+        {
+            **healthy_connected_details(next_check_seconds=23),
+            "failure_codes": ["capture_failed"],
+        },
+        {
+            **healthy_connected_details(next_check_seconds=24),
+            "captured_windows": 1,
+        },
+    ]
+    monitor = SmartReconnectMonitor(
+        FakeBoundary(
+            [
+                OperationResult(
+                    True,
+                    "reconnect.connected",
+                    details=details,
+                )
+                for details in incomplete_or_failed
+            ]
+        ),
+        monitor_interval_ms=1500,
+    )
+
+    assert [monitor.run_once()[1] for _ in incomplete_or_failed] == [
+        21,
+        22,
+        23,
+        24,
+    ]
 
 
 def test_monitoring_interval_can_change_without_restarting_monitor():
     monitor = SmartReconnectMonitor(FakeBoundary([]))
 
-    assert monitor.monitor_interval_ms == 1000
+    assert monitor.monitor_interval_ms == 2000
     assert monitor.set_monitor_interval_ms(2500) is True
     assert monitor.monitor_interval_ms == 2500
     assert monitor.set_monitor_interval_ms(0) is False
     assert monitor.monitor_interval_ms == 2500
+    assert monitor.set_monitor_interval_ms(499) is False
+    assert monitor.set_monitor_interval_ms(60001) is False
 
 
 def test_start_and_stop_are_idempotent():

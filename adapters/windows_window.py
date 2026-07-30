@@ -71,6 +71,8 @@ class WindowInfo:
     process_id: int | None = None
     window_class: str | None = None
     launch_fingerprint: str | None = None
+    thread_id: int | None = None
+    process_lifecycle_token: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +282,7 @@ class Win32WindowBackend:
                 return True
 
             process_id = None
+            window_thread_id = None
             try:
                 process_id_value = wintypes.DWORD()
                 thread_id = user32.GetWindowThreadProcessId(
@@ -288,6 +291,7 @@ class Win32WindowBackend:
                 )
                 if thread_id and process_id_value.value:
                     process_id = int(process_id_value.value)
+                    window_thread_id = int(thread_id)
             except OSError:
                 pass
 
@@ -313,22 +317,64 @@ class Win32WindowBackend:
                     rect=(rect.left, rect.top, rect.right, rect.bottom),
                     process_id=process_id,
                     window_class=window_class,
+                    thread_id=window_thread_id,
                 )
             )
             return True
 
         if not user32.EnumWindows(enum_proc_type(callback), 0):
             return []
+        lifecycle_tokens: dict[int, int] = {}
         if self._fingerprint_resolver is not None:
             fingerprints = self._resolve_cached_fingerprints(
                 window.process_id
                 for window in windows
                 if window.process_id is not None
             )
+            with self._fingerprint_cache_lock:
+                lifecycle_tokens = {
+                    process_id: lifecycle
+                    for process_id in {
+                        window.process_id
+                        for window in windows
+                        if window.process_id is not None
+                    }
+                    if (
+                        (cached := self._fingerprint_cache.get(process_id))
+                        is not None
+                        and (lifecycle := cached[0]) is not None
+                    )
+                }
             windows = [
                 replace(
                     window,
                     launch_fingerprint=fingerprints.get(window.process_id),
+                    process_lifecycle_token=lifecycle_tokens.get(
+                        window.process_id
+                    ),
+                )
+                for window in windows
+            ]
+        else:
+            for process_id in {
+                window.process_id
+                for window in windows
+                if window.process_id is not None
+            }:
+                try:
+                    lifecycle = self._process_lifecycle_provider(
+                        process_id
+                    )
+                except Exception:
+                    lifecycle = None
+                if lifecycle is not None:
+                    lifecycle_tokens[process_id] = lifecycle
+            windows = [
+                replace(
+                    window,
+                    process_lifecycle_token=lifecycle_tokens.get(
+                        window.process_id
+                    ),
                 )
                 for window in windows
             ]

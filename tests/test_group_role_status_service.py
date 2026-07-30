@@ -13,6 +13,7 @@ from services.group_role_status_service import (
     GroupRoleStatusChange,
     GroupRoleStatusService,
     ROLE_STATUS_CLOSED,
+    ROLE_STATUS_CHECK_DISABLED,
     ROLE_STATUS_DISCONNECTED,
     ROLE_STATUS_FAILED,
     ROLE_STATUS_OPEN,
@@ -160,6 +161,28 @@ def test_only_an_explicit_reconnect_session_shows_reconnecting(tmp_path):
 
     reconnecting.add(fingerprint)
     assert service.refresh("兩支")[0].status == ROLE_STATUS_RECONNECTING
+
+
+def test_disabled_screen_check_never_falls_through_to_open_role(tmp_path):
+    launch = configuration(tmp_path)
+    plan = launch.plan("兩支")
+    fingerprint = plan.targets[0].fingerprint
+    failures = ReconnectFailureStatusService()
+    failures.report(f"role:{fingerprint}", "甲")
+    service = GroupRoleStatusService(
+        launch,
+        Windows((window(1, fingerprint),)),
+        failures,
+        screen_states_provider=lambda: {
+            fingerprint: ReconnectScreenState.CHECK_DISABLED
+        },
+        reconnecting_provider=lambda: (fingerprint,),
+    )
+
+    assert (
+        service.refresh("兩支")[0].status
+        == ROLE_STATUS_CHECK_DISABLED
+    )
 
 
 def test_unidentified_non_group_window_does_not_change_safe_role_status(

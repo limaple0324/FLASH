@@ -1,14 +1,19 @@
 import hashlib
 from pathlib import Path
+from time import perf_counter
 
 from PIL import Image, ImageEnhance
 
 from adapters.game_screen_recognizer import (
+    BATTLE_CONTEXT_REGION,
+    BATTLE_REFERENCE_FILE,
+    BATTLE_SCREEN_EVIDENCE_REGION,
     CHARACTER_ENTER_CLICK_POINT,
     CHARACTER_LEVEL_REGIONS,
-    CHARACTER_SLOT_CLICK_POINTS,
     DEFAULT_LINE_NUMBER,
     DEFAULT_SCREEN_TEMPLATES,
+    DISCONNECT_OVERLAY_REGION,
+    FORCE_LOGIN_TIMEOUT_CLICK_POINT,
     ROUTE_DIGIT_REFERENCE_REGION,
     ROUTE_PREFIX_SEARCH_REGION,
     LINE_ROUTE_CLICK_POINTS,
@@ -16,10 +21,10 @@ from adapters.game_screen_recognizer import (
 )
 from adapters.windows_background_capture import CaptureSample
 from core.reconnect_policy import ReconnectScreenState
-from domain.character import CharacterImportance
 
 
 REFERENCE_DIR = Path("assets") / "reconnect_reference"
+FOURTEEN_WINDOW_RECOGNITION_LIMIT_SECONDS = 4.5
 
 
 def test_all_confirmed_full_window_references_are_present_and_unique():
@@ -27,9 +32,9 @@ def test_all_confirmed_full_window_references_are_present_and_unique():
 
     assert recognizer.ready is True
     assert recognizer.missing_references == ()
-    assert len(DEFAULT_SCREEN_TEMPLATES) == 9
-    assert len({item.filename for item in DEFAULT_SCREEN_TEMPLATES}) == 9
-    assert len({item.state for item in DEFAULT_SCREEN_TEMPLATES}) == 9
+    assert len(DEFAULT_SCREEN_TEMPLATES) == 10
+    assert len({item.filename for item in DEFAULT_SCREEN_TEMPLATES}) == 10
+    assert len({item.state for item in DEFAULT_SCREEN_TEMPLATES}) == 10
 
 
 def test_all_user_reference_images_match_the_fixed_sha256_manifest():
@@ -42,7 +47,7 @@ def test_all_user_reference_images_match_the_fixed_sha256_manifest():
 
     images = sorted(REFERENCE_DIR.glob("*.png"))
 
-    assert len(images) == 16
+    assert len(images) == 19
     assert set(manifest) == {image.name for image in images}
     for image in images:
         assert hashlib.sha256(image.read_bytes()).hexdigest() == manifest[image.name]
@@ -62,7 +67,7 @@ def test_each_confirmed_reference_classifies_to_its_declared_state():
             assert result.click_point == LINE_ROUTE_CLICK_POINTS[8]
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
             assert result.character_level == 100
-            assert result.character_importance is CharacterImportance.SECONDARY
+            assert result.character_importance is None
             assert result.character_slot_index == 0
             assert result.character_slot_selected is True
             assert result.click_point == CHARACTER_ENTER_CLICK_POINT
@@ -70,6 +75,26 @@ def test_each_confirmed_reference_classifies_to_its_declared_state():
             assert result.character_candidates[0].level == 100
         else:
             assert result.click_point == definition.click_point
+
+
+def test_fourteen_connected_window_references_finish_within_time_limit():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "06_connected_gameplay.png") as source:
+        candidate = source.convert("RGB")
+
+    recognizer.recognize_image(candidate)
+    started = perf_counter()
+    results = tuple(
+        recognizer.recognize_image(candidate)
+        for _index in range(14)
+    )
+    elapsed = perf_counter() - started
+
+    assert all(
+        result.state is ReconnectScreenState.CONNECTED
+        for result in results
+    )
+    assert elapsed < FOURTEEN_WINDOW_RECOGNITION_LIMIT_SECONDS
 
 
 def test_disconnect_overlay_accepts_confirmed_darker_game_rendering():
@@ -110,7 +135,7 @@ def _paste_level_reference(
     )
 
 
-def test_character_login_prefers_confirmed_primary_role_over_leftmost_secondary():
+def test_character_selection_target_only_uses_the_confirmed_selected_border():
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
     with Image.open(REFERENCE_DIR / "05_character_selection.png") as source:
         candidate = source.convert("RGB")
@@ -125,39 +150,99 @@ def test_character_login_prefers_confirmed_primary_role_over_leftmost_secondary(
         recognizer._character_selection_target(candidate)
     )
 
-    assert level == 120
-    assert importance is CharacterImportance.PRIMARY
-    assert slot_index == 1
-    assert selected is False
-    assert point == CHARACTER_SLOT_CLICK_POINTS[1]
+    assert level == 100
+    assert importance is None
+    assert slot_index == 0
+    assert selected is True
+    assert point == CHARACTER_ENTER_CLICK_POINT
 
 
-def test_character_login_prefers_higher_level_inside_primary_role():
+def test_character_selection_target_does_not_guess_when_no_border_is_unique(
+    monkeypatch,
+):
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
     with Image.open(REFERENCE_DIR / "05_character_selection.png") as source:
         candidate = source.convert("RGB")
-    _paste_level_reference(
+    monkeypatch.setattr(
         recognizer,
-        candidate,
-        slot_index=1,
-        level=120,
-    )
-    _paste_level_reference(
-        recognizer,
-        candidate,
-        slot_index=2,
-        level=160,
+        "_selected_character_slot_index",
+        lambda _image: None,
     )
 
     point, level, importance, slot_index, selected = (
         recognizer._character_selection_target(candidate)
     )
 
-    assert level == 160
-    assert importance is CharacterImportance.PRIMARY
-    assert slot_index == 2
-    assert selected is False
-    assert point == CHARACTER_SLOT_CLICK_POINTS[2]
+    assert (point, level, importance, slot_index, selected) == (
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def test_user_reported_character_selection_keeps_real_levels_and_border():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(
+        REFERENCE_DIR / "16_character_selection_report.png"
+    ) as source:
+        split = source.width // 2
+        left = source.crop((0, 0, split, source.height))
+        right = source.crop((split, 0, source.width, source.height))
+
+    left_result = recognizer.recognize_image(left)
+    right_result = recognizer.recognize_image(right)
+
+    assert left_result.state is ReconnectScreenState.CHARACTER_SELECTION
+    assert [
+        (item.level, item.digit_count, item.slot_index, item.selected)
+        for item in left_result.character_candidates
+    ] == [
+        (None, 2, 0, True),
+        (100, 3, 1, False),
+        (None, 2, 2, False),
+    ]
+    assert right_result.state is ReconnectScreenState.CHARACTER_SELECTION
+    assert [
+        (item.level, item.digit_count, item.slot_index, item.selected)
+        for item in right_result.character_candidates
+    ] == [
+        (120, 3, 0, False),
+        (None, 2, 1, False),
+        (120, 3, 2, True),
+    ]
+    assert right_result.character_slot_index == 2
+    assert right_result.character_slot_selected is True
+    assert right_result.click_point == CHARACTER_ENTER_CLICK_POINT
+
+
+def test_user_reported_timeout_and_disconnect_are_actionable():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(
+        REFERENCE_DIR / "14_force_login_timeout.png"
+    ) as source:
+        timeout = recognizer.recognize_image(source)
+    with Image.open(
+        REFERENCE_DIR / "15_disconnected_card_popup.png"
+    ) as source:
+        disconnected = recognizer.recognize_image(source)
+
+    assert timeout.state is ReconnectScreenState.FORCE_LOGIN_TIMEOUT
+    assert timeout.click_point == FORCE_LOGIN_TIMEOUT_CLICK_POINT
+    assert disconnected.state is ReconnectScreenState.DISCONNECTED
+    assert disconnected.click_point == (0.5, 0.536)
+
+
+def test_force_login_timeout_click_point_lands_inside_confirm_button():
+    reference_height = 928
+    client_top = 45
+    client_height = reference_height - client_top
+    click_y = client_top + round(
+        (client_height - 1) * FORCE_LOGIN_TIMEOUT_CLICK_POINT[1]
+    )
+
+    assert 514 <= click_y <= 542
 
 
 def test_character_level_ignores_unrelated_role_text_below_the_digits():
@@ -242,6 +327,11 @@ def test_character_selection_match_without_level_card_yields_to_gameplay(
     )
     monkeypatch.setattr(
         recognizer,
+        "_battle_context_score",
+        lambda *_args: 255.0,
+    )
+    monkeypatch.setattr(
+        recognizer,
         "_popup_title_score",
         lambda *_args: 255.0,
     )
@@ -318,7 +408,163 @@ def test_battle_disconnect_is_distinguished_from_normal_disconnect():
     assert normal_result.state is ReconnectScreenState.DISCONNECTED
     assert normal_result.battle_context is False
     assert battle_result.state is ReconnectScreenState.DISCONNECTED
+    assert battle_result.click_point == (0.5, 0.536)
     assert battle_result.battle_context is True
+
+
+def test_battle_disconnect_remains_priority_after_bounded_capture_drift():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(
+        REFERENCE_DIR / "01_disconnected_dialog.png"
+    ) as source:
+        disconnected = source.convert("RGB")
+    with Image.open(REFERENCE_DIR / BATTLE_REFERENCE_FILE) as source:
+        battle = source.convert("RGB")
+
+    base = Image.new("RGB", disconnected.size, "black")
+    client_top = round(base.height * 0.05)
+    client_bottom = round(base.height * 0.985)
+    base.paste(
+        battle.resize(
+            (base.width, client_bottom - client_top),
+            Image.Resampling.BILINEAR,
+        ),
+        (0, client_top),
+    )
+    left, top, right, bottom = DISCONNECT_OVERLAY_REGION
+    overlay_box = (
+        round(disconnected.width * left),
+        round(disconnected.height * top),
+        round(disconnected.width * right),
+        round(disconnected.height * bottom),
+    )
+    overlay = disconnected.crop(overlay_box)
+
+    for delta_y, scale in ((20, 1.0), (0, 0.90)):
+        candidate = base.copy()
+        scaled = overlay.resize(
+            (
+                round(overlay.width * scale),
+                round(overlay.height * scale),
+            ),
+            Image.Resampling.BILINEAR,
+        )
+        position = (
+            overlay_box[0] + (overlay.width - scaled.width) // 2,
+            overlay_box[1]
+            + delta_y
+            + (overlay.height - scaled.height) // 2,
+        )
+        candidate.paste(scaled, position)
+
+        result = recognizer.recognize_image(candidate)
+
+        assert result.state is ReconnectScreenState.DISCONNECTED
+        assert result.click_point == (0.5, 0.536)
+
+
+def test_confirmed_battle_gameplay_is_connected_without_any_action():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / BATTLE_REFERENCE_FILE) as source:
+        battle = source.convert("RGB")
+
+    result = recognizer.recognize_image(battle)
+
+    assert result.state is ReconnectScreenState.CONNECTED
+    assert result.reference_name == BATTLE_REFERENCE_FILE
+    assert result.click_point is None
+    assert result.battle_context is True
+
+
+def test_confirmed_battle_layout_allows_bounded_scene_variation():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / BATTLE_REFERENCE_FILE) as source:
+        candidate = source.convert("RGB")
+    left, top, right, bottom = BATTLE_SCREEN_EVIDENCE_REGION
+    box = (
+        round(candidate.width * left),
+        round(candidate.height * top),
+        round(candidate.width * right),
+        round(candidate.height * bottom),
+    )
+    scene = candidate.crop(box)
+    scene = ImageEnhance.Brightness(scene).enhance(1.28)
+    candidate.paste(scene, box[:2])
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.CONNECTED
+    assert result.reference_name == BATTLE_REFERENCE_FILE
+    assert result.click_point is None
+    assert result.battle_context is True
+
+
+def test_battle_gameplay_requires_the_stable_auto_battle_panel():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / BATTLE_REFERENCE_FILE) as source:
+        candidate = source.convert("RGB")
+    left, top, right, bottom = BATTLE_CONTEXT_REGION
+    box = (
+        round(candidate.width * left),
+        round(candidate.height * top),
+        round(candidate.width * right),
+        round(candidate.height * bottom),
+    )
+    candidate.paste(
+        Image.new(
+            "RGB",
+            (box[2] - box[0], box[3] - box[1]),
+            "black",
+        ),
+        box[:2],
+    )
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.reference_name != BATTLE_REFERENCE_FILE
+    assert result.battle_context is False
+
+
+def test_battle_panel_alone_or_under_unknown_modal_is_not_online():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / BATTLE_REFERENCE_FILE) as source:
+        battle = source.convert("RGB")
+    left, top, right, bottom = BATTLE_CONTEXT_REGION
+    panel_box = (
+        round(battle.width * left),
+        round(battle.height * top),
+        round(battle.width * right),
+        round(battle.height * bottom),
+    )
+
+    panel_only = Image.new("RGB", battle.size, "black")
+    panel_only.paste(battle.crop(panel_box), panel_box[:2])
+    unknown_modal = battle.copy()
+    modal_box = (
+        round(battle.width * 0.25),
+        round(battle.height * 0.25),
+        round(battle.width * 0.75),
+        round(battle.height * 0.75),
+    )
+    unknown_modal.paste(
+        Image.new(
+            "RGB",
+            (
+                modal_box[2] - modal_box[0],
+                modal_box[3] - modal_box[1],
+            ),
+            (90, 120, 130),
+        ),
+        modal_box[:2],
+    )
+
+    panel_only_result = recognizer.recognize_image(panel_only)
+    modal_result = recognizer.recognize_image(unknown_modal)
+
+    assert panel_only_result.state is ReconnectScreenState.UNKNOWN
+    assert panel_only_result.click_point is None
+    assert modal_result.state is ReconnectScreenState.UNKNOWN
+    assert modal_result.click_point is None
 
 
 def test_blank_or_wrong_aspect_image_is_unknown_and_has_no_click_target():

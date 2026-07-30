@@ -1,9 +1,19 @@
+import pytest
+
 from adapters.windows_battle_restart import WindowsBattleWindowRestarter
 from adapters.windows_window import WindowInfo
 from services.group_launch_service import GroupLaunchTarget
 
 
-def _window(handle=11, process_id=101, fingerprint="a" * 64):
+def _window(
+    handle=11,
+    process_id=101,
+    fingerprint="a" * 64,
+    *,
+    thread_id=501,
+    process_lifecycle_token=1001,
+    window_class="ShockwaveFlash",
+):
     return WindowInfo(
         handle=handle,
         title="Adobe Flash Player 11",
@@ -11,23 +21,39 @@ def _window(handle=11, process_id=101, fingerprint="a" * 64):
         minimized=False,
         rect=(0, 0, 900, 600),
         process_id=process_id,
-        window_class="ShockwaveFlash",
+        window_class=window_class,
         launch_fingerprint=fingerprint,
+        thread_id=thread_id,
+        process_lifecycle_token=process_lifecycle_token,
     )
 
 
 class _Windows:
     def __init__(self, windows):
         self.windows = list(windows)
+        self.calls = 0
 
     def list_windows(self):
+        self.calls += 1
         return list(self.windows)
 
 
+class _FailingWindows:
+    def list_windows(self):
+        raise RuntimeError("enumeration failed")
+
+
 class _Closer:
-    def __init__(self, *, close=True, remains=0):
+    def __init__(
+        self,
+        *,
+        close=True,
+        remains=0,
+        before_close_boundary=None,
+    ):
         self.close = close
         self.remains = remains
+        self.before_close_boundary = before_close_boundary
         self.closed = []
         self.checks = 0
 
@@ -40,19 +66,43 @@ class _Closer:
             return True
         return False
 
-    def close_window(self, handle):
+    def close_window_if_instance_matches(
+        self,
+        handle,
+        expected_identity,
+        current_identity,
+    ):
+        if self.before_close_boundary is not None:
+            self.before_close_boundary()
+        if current_identity(handle) != expected_identity:
+            return False, "battle_window_identity_changed"
         self.closed.append(handle)
-        return self.close
+        return (
+            (True, None)
+            if self.close
+            else (False, "battle_window_close_failed")
+        )
 
 
 class _Opener:
-    def __init__(self, *, succeeds=True):
+    def __init__(self, *, succeeds=True, before_open_boundary=None):
         self.succeeds = succeeds
+        self.before_open_boundary = before_open_boundary
         self.targets = []
 
     def open_shortcut(self, target):
         self.targets.append(target)
         return self.succeeds
+
+    def open_shortcut_if_target_absent(self, target, absence_check):
+        if self.before_open_boundary is not None:
+            self.before_open_boundary()
+        failure_code = absence_check()
+        if failure_code is not None:
+            return False, failure_code
+        if not self.open_shortcut(target):
+            return False, "battle_shortcut_open_failed"
+        return True, None
 
 
 def _target(tmp_path, fingerprint="a" * 64):
@@ -107,6 +157,120 @@ def test_changed_identity_never_closes_or_opens_any_window(tmp_path):
     assert opener.targets == []
 
 
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    (
+        ("thread_id", 999),
+        ("process_lifecycle_token", 2002),
+        ("window_class", "ReplacementFlash"),
+    ),
+)
+def test_reused_handle_with_changed_instance_never_closes_replacement(
+    tmp_path,
+    changed_field,
+    changed_value,
+):
+    original = _window()
+    replacement_values = {
+        "thread_id": original.thread_id,
+        "process_lifecycle_token": original.process_lifecycle_token,
+        "window_class": original.window_class,
+    }
+    replacement_values[changed_field] = changed_value
+    replacement = _window(**replacement_values)
+    closer = _Closer()
+    opener = _Opener()
+    restarter = WindowsBattleWindowRestarter(
+        _Windows([replacement]),
+        closer,
+        opener,
+    )
+
+    result = restarter.restart(original, _target(tmp_path))
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_identity_changed"
+    assert closer.closed == []
+    assert opener.targets == []
+
+
+def test_instance_is_rechecked_after_is_window_and_before_close(tmp_path):
+    original = _window()
+    replacement = _window(
+        process_id=999,
+        thread_id=999,
+        process_lifecycle_token=9999,
+        window_class="ReplacementFlash",
+    )
+    windows = _Windows([original])
+    opener = _Opener()
+
+    class _ReplaceDuringFinalProbe:
+        def __init__(self):
+            self.closed = []
+
+        def is_window(self, _handle):
+            windows.windows = [replacement]
+            return True
+
+        def close_window_if_instance_matches(
+            self,
+            handle,
+            expected_identity,
+            current_identity,
+        ):
+            if current_identity(handle) != expected_identity:
+                return False, "battle_window_identity_changed"
+            self.closed.append(handle)
+            return True, None
+
+    closer = _ReplaceDuringFinalProbe()
+    restarter = WindowsBattleWindowRestarter(
+        windows,
+        closer,
+        opener,
+    )
+
+    result = restarter.restart(original, _target(tmp_path))
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_identity_changed"
+    assert closer.closed == []
+    assert opener.targets == []
+    assert windows.calls == 2
+
+
+def test_instance_is_rechecked_inside_close_delivery_boundary(tmp_path):
+    original = _window()
+    replacement = _window(
+        process_id=999,
+        thread_id=999,
+        process_lifecycle_token=9999,
+        window_class="ReplacementFlash",
+    )
+    windows = _Windows([original])
+    closer = _Closer(
+        before_close_boundary=lambda: setattr(
+            windows,
+            "windows",
+            [replacement],
+        )
+    )
+    opener = _Opener()
+    restarter = WindowsBattleWindowRestarter(
+        windows,
+        closer,
+        opener,
+    )
+
+    result = restarter.restart(original, _target(tmp_path))
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_identity_changed"
+    assert closer.closed == []
+    assert opener.targets == []
+
+
 def test_close_timeout_never_opens_a_duplicate_window(tmp_path):
     window = _window()
     closer = _Closer(remains=100)
@@ -131,6 +295,134 @@ def test_close_timeout_never_opens_a_duplicate_window(tmp_path):
     assert result.success is False
     assert result.failure_code == "battle_window_close_timeout"
     assert closer.closed == [window.handle]
+    assert opener.targets == []
+
+
+def test_self_reopened_role_is_rechecked_before_shortcut_open(tmp_path):
+    original = _window()
+    reopened = _window(
+        handle=22,
+        process_id=202,
+        thread_id=502,
+        process_lifecycle_token=2002,
+    )
+    windows = _Windows([original])
+    opener = _Opener()
+
+    class _CloseThenSelfReopen:
+        def __init__(self):
+            self.closed = []
+
+        def is_window(self, _handle):
+            if self.closed:
+                windows.windows = [reopened]
+                return False
+            return True
+
+        def close_window_if_instance_matches(
+            self,
+            handle,
+            expected_identity,
+            current_identity,
+        ):
+            if current_identity(handle) != expected_identity:
+                return False, "battle_window_identity_changed"
+            self.closed.append(handle)
+            return True, None
+
+    closer = _CloseThenSelfReopen()
+    restarter = WindowsBattleWindowRestarter(
+        windows,
+        closer,
+        opener,
+    )
+
+    result = restarter.restart(original, _target(tmp_path))
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_already_exists"
+    assert result.window_closed is True
+    assert closer.closed == [original.handle]
+    assert opener.targets == []
+    assert windows.calls == 4
+
+
+def test_delayed_self_reopen_during_stable_absence_never_opens_shortcut(
+    tmp_path,
+):
+    original = _window()
+    reopened = _window(
+        handle=22,
+        process_id=202,
+        thread_id=502,
+        process_lifecycle_token=2002,
+    )
+    windows = _Windows([original])
+    closer = _Closer()
+    opener = _Opener()
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+        windows.windows = [reopened]
+
+    restarter = WindowsBattleWindowRestarter(
+        windows,
+        closer,
+        opener,
+        absence_stability_seconds=0.2,
+        monotonic_clock=lambda: now[0],
+        sleeper=sleep,
+    )
+
+    result = restarter.restart(original, _target(tmp_path))
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_already_exists"
+    assert result.window_closed is True
+    assert closer.closed == [original.handle]
+    assert opener.targets == []
+
+
+def test_self_reopen_inside_shortcut_boundary_never_opens_duplicate(
+    tmp_path,
+):
+    original = _window()
+    reopened = _window(
+        handle=22,
+        process_id=202,
+        thread_id=502,
+        process_lifecycle_token=2002,
+    )
+    windows = _Windows([original])
+    closer = _Closer()
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    opener = _Opener(
+        before_open_boundary=lambda: setattr(
+            windows,
+            "windows",
+            [reopened],
+        )
+    )
+    restarter = WindowsBattleWindowRestarter(
+        windows,
+        closer,
+        opener,
+        absence_stability_seconds=0.2,
+        monotonic_clock=lambda: now[0],
+        sleeper=sleep,
+    )
+
+    result = restarter.restart(original, _target(tmp_path))
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_already_exists"
+    assert result.window_closed is True
+    assert closer.closed == [original.handle]
     assert opener.targets == []
 
 
@@ -188,6 +480,129 @@ def test_missing_retry_refuses_unknown_existing_window(tmp_path):
     assert result.success is False
     assert result.failure_code == "battle_window_existing_state_unknown"
     assert opener.targets == []
+
+
+def test_missing_retry_rechecks_live_windows_before_opening(tmp_path):
+    target = _target(tmp_path)
+    windows = _Windows(
+        [_window(fingerprint=target.fingerprint)],
+    )
+    opener = _Opener()
+    restarter = WindowsBattleWindowRestarter(
+        windows,
+        _Closer(),
+        opener,
+    )
+
+    result = restarter.reopen_missing(target, [])
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_already_exists"
+    assert windows.calls == 1
+    assert opener.targets == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("handle", 0),
+        ("process_id", 0),
+        ("thread_id", 0),
+        ("window_class", ""),
+        ("process_lifecycle_token", False),
+        ("fingerprint", None),
+    ),
+)
+def test_missing_retry_refuses_incomplete_live_window_instance(
+    tmp_path,
+    field,
+    value,
+):
+    invalid_window = _window(**{field: value})
+    opener = _Opener()
+    restarter = WindowsBattleWindowRestarter(
+        _Windows([invalid_window]),
+        _Closer(),
+        opener,
+    )
+
+    result = restarter.reopen_missing(_target(tmp_path), [])
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_existing_state_unknown"
+    assert opener.targets == []
+
+
+def test_missing_retry_refuses_live_duplicate_identity(tmp_path):
+    duplicate = "b" * 64
+    opener = _Opener()
+    restarter = WindowsBattleWindowRestarter(
+        _Windows(
+            [
+                _window(
+                    handle=21,
+                    process_id=201,
+                    fingerprint=duplicate,
+                ),
+                _window(
+                    handle=22,
+                    process_id=202,
+                    fingerprint=duplicate,
+                ),
+            ]
+        ),
+        _Closer(),
+        opener,
+    )
+
+    result = restarter.reopen_missing(_target(tmp_path), [])
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_identity_duplicate"
+    assert opener.targets == []
+
+
+def test_missing_retry_refuses_when_live_enumeration_fails(tmp_path):
+    opener = _Opener()
+    restarter = WindowsBattleWindowRestarter(
+        _FailingWindows(),
+        _Closer(),
+        opener,
+    )
+
+    result = restarter.reopen_missing(_target(tmp_path), [])
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_enumeration_failed"
+    assert opener.targets == []
+
+
+def test_missing_retry_ignores_unknown_non_game_window(tmp_path):
+    unrelated = _window(fingerprint=None)
+    unrelated = WindowInfo(
+        handle=unrelated.handle,
+        title="記事本",
+        visible=unrelated.visible,
+        minimized=unrelated.minimized,
+        rect=unrelated.rect,
+        process_id=unrelated.process_id,
+        window_class="Notepad",
+        launch_fingerprint=None,
+        thread_id=unrelated.thread_id,
+        process_lifecycle_token=unrelated.process_lifecycle_token,
+    )
+    opener = _Opener()
+    restarter = WindowsBattleWindowRestarter(
+        _Windows([unrelated]),
+        _Closer(),
+        opener,
+    )
+    target = _target(tmp_path)
+
+    result = restarter.reopen_missing(target, [])
+
+    assert result.success is True
+    assert opener.targets == [target]
 
 
 def test_missing_retry_opens_only_exact_absent_target(tmp_path):

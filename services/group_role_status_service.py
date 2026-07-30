@@ -37,6 +37,7 @@ ROLE_STATUS_CLOSED = "未開啟"
 ROLE_STATUS_DISCONNECTED = "斷線"
 ROLE_STATUS_RECONNECTING = "重連中"
 ROLE_STATUS_FAILED = "重連失敗"
+ROLE_STATUS_CHECK_DISABLED = "檢查已關閉"
 GROUP_ROLE_STATUS_CHANGED_EVENT = "group_role_status_changed"
 
 
@@ -111,6 +112,7 @@ class GroupRoleStatusService:
         {
             ReconnectScreenState.LOGIN_START,
             ReconnectScreenState.FORCE_LOGIN_START,
+            ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
             ReconnectScreenState.LINE_SELECTION,
             ReconnectScreenState.CHARACTER_SELECTION,
             ReconnectScreenState.RECONNECTING,
@@ -286,7 +288,9 @@ class GroupRoleStatusService:
                     and contract.phase is not TargetWindowPhase.OFFLINE
                 )
             ) if central_snapshot is not None else False
-            if (
+            if state is ReconnectScreenState.CHECK_DISABLED:
+                status = ROLE_STATUS_CHECK_DISABLED
+            elif (
                 self._failure_service.has(failure_key)
                 or len(matches) > 1
                 or central_failed

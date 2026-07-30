@@ -158,6 +158,27 @@ def test_other_groups_keep_their_registered_fixed_list_order(tmp_path):
     assert tuple(target.display_name for target in plan.targets) == names
 
 
+def test_plan_preserves_registered_entry_and_role_identity(tmp_path):
+    path = _config(tmp_path, [("120", ("120古",))])
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["groups"][0]["launch_entries"][0].update(
+        {
+            "entry_id": "entry-120-ancient",
+            "role_id": "role-120-ancient",
+        }
+    )
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    plan = GroupLaunchService(path, _Resolver()).plan("120")
+
+    assert plan.ready is True
+    assert plan.targets[0].entry_id == "entry-120-ancient"
+    assert plan.targets[0].role_id == "role-120-ancient"
+
+
 def test_changed_14_registration_fails_closed_instead_of_guessing(tmp_path):
     service = GroupLaunchService(
         _config(tmp_path, [("14支", (*OLD_14[:-1], "未知角色"))]),

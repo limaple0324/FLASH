@@ -1,19 +1,34 @@
+import ast
+import inspect
 from pathlib import Path
+from types import SimpleNamespace
+
+from PIL import Image
 
 from core.target_window_observation import TargetWindowObservation
 from services.character_view_service import PlayerCharacterView
 from services.group_selection_service import PlayerGroupChoice
 from services.group_role_status_service import GroupRoleStatus
+from services.feature_card_layout_service import FeatureCardPreference
+from services.smart_reconnect_monitor import (
+    DEFAULT_SMART_RECONNECT_INTERVAL_MS,
+)
 from ui.home import (
+    FeatureCardSettingsSaveResult,
     GroupManagementViewResult,
     UI_THEME_LABELS,
     HomeView,
+    _background_crop_boxes,
+    _background_region,
     _blend_hex_color,
+    _collapsed_card_title_pady,
     _contrast_ratio,
     _contain_geometry,
+    _feature_card_control_offsets,
     _reordered_entry_ids,
     _safe_character_lines,
     _selected_sync_key_summary,
+    _should_reset_feature_card_title,
     _workspace_state_text,
     theme_palette,
 )
@@ -26,6 +41,75 @@ class _ValueStub:
 
     def set(self, value: str) -> None:
         self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+
+class _EntryStub:
+    def __init__(self, value: str):
+        self.value = value
+
+    def delete(self, _start, _end) -> None:
+        self.value = ""
+
+    def insert(self, _index, value: str) -> None:
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+
+class _MenuStub:
+    def __init__(self):
+        self.commands: list[tuple[str, object]] = []
+
+    def delete(self, _start, _end) -> None:
+        self.commands.clear()
+
+    def add_command(self, *, label: str, command) -> None:
+        self.commands.append((label, command))
+
+
+class _SelectorStub:
+    def __init__(self):
+        self.menu = _MenuStub()
+        self.values: dict[str, object] = {}
+
+    def __getitem__(self, key: str):
+        if key != "menu":
+            raise KeyError(key)
+        return self.menu
+
+    def configure(self, **values) -> None:
+        self.values.update(values)
+
+
+class _IntStub:
+    def __init__(self, value: int):
+        self.value = value
+
+    def get(self) -> int:
+        return self.value
+
+    def set(self, value: int) -> None:
+        self.value = value
+
+
+class _ConfigureStub:
+    def __init__(self):
+        self.values: dict[str, object] = {}
+
+    def configure(self, **values) -> None:
+        self.values.update(values)
+
+
+def test_home_uses_the_same_smart_reconnect_interval_default() -> None:
+    parameter = inspect.signature(HomeView.__init__).parameters[
+        "smart_reconnect_interval_ms"
+    ]
+
+    assert parameter.default == DEFAULT_SMART_RECONNECT_INTERVAL_MS
 
 
 def test_home_has_real_product_pages_and_group_selection() -> None:
@@ -110,6 +194,79 @@ def test_smart_reconnect_stop_timeout_never_displays_safe_stop() -> None:
     assert refreshes == []
 
 
+def test_smart_reconnect_capture_modes_are_checkbox_settings_with_clear_status():
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+
+    for text in (
+        "勾選要啟用的斷線檢查方式",
+        "前景／完整可見",
+        "被其他視窗遮擋",
+        "已最小化",
+        "已開啟",
+        "已關閉",
+    ):
+        assert text in source
+    assert "on_smart_reconnect_capture_modes_change" in source
+
+
+def test_capture_mode_change_saves_all_three_choices_as_one_setting():
+    view = object.__new__(HomeView)
+    view.smart_reconnect_capture_modes = {
+        "visible": True,
+        "obscured": True,
+        "minimized": True,
+    }
+    view._smart_reconnect_capture_mode_variables = {
+        "visible": _IntStub(1),
+        "obscured": _IntStub(0),
+        "minimized": _IntStub(1),
+    }
+    view._smart_reconnect_capture_mode_status_label = _ConfigureStub()
+    saved: list[dict[str, bool]] = []
+    view.on_smart_reconnect_capture_modes_change = (
+        lambda modes: saved.append(dict(modes)) or True
+    )
+
+    view._save_smart_reconnect_capture_modes()
+
+    assert saved == [
+        {
+            "visible": True,
+            "obscured": False,
+            "minimized": True,
+        }
+    ]
+    assert view.smart_reconnect_capture_modes == saved[0]
+    assert (
+        "被其他視窗遮擋－已關閉"
+        in view._smart_reconnect_capture_mode_status_label.values["text"]
+    )
+
+
+def test_rejected_capture_mode_change_restores_previous_checkboxes():
+    view = object.__new__(HomeView)
+    view.smart_reconnect_capture_modes = {
+        "visible": True,
+        "obscured": True,
+        "minimized": True,
+    }
+    view._smart_reconnect_capture_mode_variables = {
+        "visible": _IntStub(0),
+        "obscured": _IntStub(0),
+        "minimized": _IntStub(0),
+    }
+    view._smart_reconnect_capture_mode_status_label = _ConfigureStub()
+    view.on_smart_reconnect_capture_modes_change = lambda _modes: False
+
+    view._save_smart_reconnect_capture_modes()
+
+    assert all(
+        variable.get() == 1
+        for variable in view._smart_reconnect_capture_mode_variables.values()
+    )
+    assert all(view.smart_reconnect_capture_modes.values())
+
+
 def test_all_pages_share_vertical_scroll_and_group_launch_action() -> None:
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
@@ -172,6 +329,18 @@ def test_group_drag_order_is_preview_only_until_saved() -> None:
         "丁",
     )
     assert _reordered_entry_ids(original, "甲", "未知") == original
+    assert _reordered_entry_ids(
+        original,
+        "甲",
+        "乙",
+        after=True,
+    ) == ("乙", "甲", "丙", "丁")
+    assert _reordered_entry_ids(
+        original,
+        "乙",
+        "甲",
+        after=False,
+    ) == ("乙", "甲", "丙", "丁")
 
 
 def test_role_rows_are_compact_by_default_and_keep_role_id_actions_visible() -> None:
@@ -212,6 +381,11 @@ def test_background_controls_and_cached_canvas_rendering_are_wired() -> None:
     assert "self._background_source_image" in source
     assert "self._background_resize_id" in source
     assert "canvas.tag_lower(item)" in source
+    assert "def _position_background_layers" in source
+    assert "document_top" in source
+    assert "_render_background_widget_tree" in source
+    assert "_background_widget_render_keys" in source
+    assert "_background_widget_rendering" in source
     assert "messagebox.show" not in source[source.index(
         "def _choose_background_image"
     ):source.index("def dispose")]
@@ -232,6 +406,13 @@ def test_feature_cards_share_persistent_collapse_drag_and_customization() -> Non
     assert "卡片背景已預覽" in source
     assert "widgets.settings_button.lift()" in source
     assert "widgets.toggle_button.lift()" in source
+    assert "dialog.grab_set()" in source
+    assert "card_id=card_id" in source
+    assert 'card_id == "groups.current"' in source
+    assert "_should_reset_feature_card_title" in source
+    assert "_feature_card_control_offsets" in source
+    assert "on_save_feature_card_settings" in source
+    assert "clear_background=bool(clear_background)" in source
     for card_id in (
         "home.workspace",
         "groups.roles",
@@ -241,6 +422,171 @@ def test_feature_cards_share_persistent_collapse_drag_and_customization() -> Non
         "settings.background",
     ):
         assert f'card_id="{card_id}"' in source
+
+
+def test_home_feature_cards_use_draggable_sections_in_one_stack() -> None:
+    tree = ast.parse(Path("ui/home.py").read_text(encoding="utf-8"))
+    home_sections: dict[str, tuple[str, str]] = {}
+    other_parents: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_card"
+        ):
+            card_id = next(
+                (
+                    keyword.value.value
+                    for keyword in node.keywords
+                    if keyword.arg == "card_id"
+                    and isinstance(keyword.value, ast.Constant)
+                    and isinstance(keyword.value.value, str)
+                ),
+                None,
+            )
+            if card_id is None:
+                continue
+            order_frame = next(
+                (
+                    ast.unparse(keyword.value)
+                    for keyword in node.keywords
+                    if keyword.arg == "order_frame"
+                ),
+                "",
+            )
+            if card_id.startswith("home."):
+                home_sections[card_id] = (
+                    ast.unparse(node.args[0]),
+                    order_frame,
+                )
+            else:
+                other_parents.append(ast.unparse(node.args[0]))
+
+    assert home_sections == {
+        "home.workspace": ("workspace_section", "workspace_section"),
+        "home.group": ("target_section", "target_section"),
+        "home.roles": ("role_section", "role_section"),
+        "home.schedule": ("schedule_section", "schedule_section"),
+        "home.reminders": ("reminder_section", "reminder_section"),
+    }
+    assert set(other_parents) == {"page"}
+
+
+def test_drag_moves_the_whole_feature_section_and_keeps_its_heading() -> None:
+    class Parent:
+        def __init__(self) -> None:
+            self.children = []
+
+    class Section:
+        def __init__(self, parent, name: str, heading: str) -> None:
+            self.master = parent
+            self.name = name
+            self.heading = heading
+            parent.children.append(self)
+
+        def winfo_manager(self) -> str:
+            return "pack"
+
+        def winfo_rootx(self) -> int:
+            return 0
+
+        def winfo_rooty(self) -> int:
+            return self.master.children.index(self) * 100
+
+        def winfo_width(self) -> int:
+            return 500
+
+        def winfo_height(self) -> int:
+            return 80
+
+        def pack_configure(self, *, before=None, after=None) -> None:
+            self.master.children.remove(self)
+            target = before if before is not None else after
+            index = self.master.children.index(target)
+            if after is not None:
+                index += 1
+            self.master.children.insert(index, self)
+
+    parent = Parent()
+    first_section = Section(parent, "first", "第一段標題")
+    second_section = Section(parent, "second", "第二段標題")
+    view = object.__new__(HomeView)
+    view._feature_card_drag_id = "home.first"
+    view._feature_cards_by_page = {
+        "home": ["home.first", "home.second"],
+    }
+    view._feature_cards = {
+        "home.first": SimpleNamespace(
+            card_id="home.first",
+            page="home",
+            frame=SimpleNamespace(master=object()),
+            order_frame=first_section,
+        ),
+        "home.second": SimpleNamespace(
+            card_id="home.second",
+            page="home",
+            frame=SimpleNamespace(master=object()),
+            order_frame=second_section,
+        ),
+    }
+    saved_orders: list[tuple[str, ...]] = []
+    view.on_feature_card_order_change = (
+        lambda _page, order, _available: saved_orders.append(order)
+    )
+    view._sync_page_scroll_region = lambda: None
+    view._report_refresh_error = lambda _error: None
+
+    view._finish_feature_card_drag(
+        "home.first",
+        SimpleNamespace(x_root=10, y_root=190),
+    )
+
+    assert parent.children == [second_section, first_section]
+    assert saved_orders == [("home.second", "home.first")]
+    assert first_section.heading == "第一段標題"
+    assert second_section.heading == "第二段標題"
+
+
+def test_card_selector_rebuilds_real_menu_and_keeps_duplicate_titles_unique():
+    view = object.__new__(HomeView)
+    view._feature_cards = {
+        "sync.first": SimpleNamespace(
+            default_title="第一張",
+            page="sync",
+        ),
+        "sync.second": SimpleNamespace(
+            default_title="第二張",
+            page="sync",
+        ),
+    }
+    view.feature_card_preference_provider = (
+        lambda card_id, _default: FeatureCardPreference(
+            card_id,
+            "相同名稱",
+            False,
+        )
+    )
+    view._feature_card_choice_ids = {}
+    view._feature_card_variable = _ValueStub("")
+    view._feature_card_selector = _SelectorStub()
+    view._refresh_feature_card_settings = lambda: None
+
+    view._rebuild_feature_card_selector("sync.second")
+
+    labels = tuple(view._feature_card_choice_ids)
+    assert labels == (
+        "同步與重連｜相同名稱",
+        "同步與重連｜相同名稱（2）",
+    )
+    assert tuple(
+        label
+        for label, _command in view._feature_card_selector.menu.commands
+    ) == labels
+    assert view._feature_card_variable.get() == labels[1]
+    assert view._feature_card_choice_ids[labels[0]] == "sync.first"
+    assert view._feature_card_choice_ids[labels[1]] == "sync.second"
+    view._feature_card_selector.menu.commands[0][1]()
+    assert view._feature_card_variable.get() == labels[0]
 
 
 def test_player_habit_settings_use_confirmed_thresholds_and_clear_confirmation() -> None:
@@ -271,6 +617,440 @@ def test_background_region_opacity_blends_legacy_color_over_image() -> None:
     assert _contrast_ratio("#000000", "#FFFFFF") == 21
     assert _contain_geometry((100, 200), (100, 100)) == (50, 100, 25, 0)
     assert _contain_geometry((80, 60), (320, 240)) == (80, 60, 120, 90)
+
+
+def test_background_region_preserves_real_image_details_and_alignment() -> None:
+    source = Image.new("RGB", (4, 2))
+    source.putdata(
+        [
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (255, 255, 0),
+            (10, 20, 30),
+            (40, 50, 60),
+            (70, 80, 90),
+            (100, 110, 120),
+        ]
+    )
+
+    region = _background_region(
+        source,
+        (1, 0, 3, 2),
+        fill="#000000",
+    )
+
+    assert list(region.get_flattened_data()) == [
+        (0, 255, 0),
+        (0, 0, 255),
+        (40, 50, 60),
+        (70, 80, 90),
+    ]
+
+
+def test_background_crop_uses_actual_content_and_sidebar_coordinates() -> None:
+    content, sidebar = _background_crop_boxes(
+        (1040, 749),
+        content_box=(198, 20, 803, 709),
+        sidebar_box=(0, 0, 176, 749),
+    )
+
+    assert content == (198, 20, 1001, 729)
+    assert sidebar == (0, 0, 176, 749)
+
+
+def test_role_row_region_follows_widget_ancestor_direction() -> None:
+    view = object.__new__(HomeView)
+    role_frame = SimpleNamespace(master=None)
+    role_label = SimpleNamespace(master=role_frame)
+    nested_label = SimpleNamespace(master=role_label)
+    outsider = SimpleNamespace(master=None)
+    view._home_role_rows_frame = role_frame
+
+    assert view._background_widget_region_name(nested_label) == "role_row"
+    assert view._background_widget_region_name(outsider) == "panel"
+
+
+def test_background_render_schedule_keeps_only_one_pending_job() -> None:
+    class ParentStub:
+        def __init__(self) -> None:
+            self.next_id = 0
+            self.pending: dict[str, object] = {}
+
+        def after(self, _delay: int, callback) -> str:
+            self.next_id += 1
+            job_id = f"job-{self.next_id}"
+            self.pending[job_id] = callback
+            return job_id
+
+        def after_cancel(self, job_id: str) -> None:
+            self.pending.pop(job_id, None)
+
+    parent = ParentStub()
+    view = object.__new__(HomeView)
+    view.parent = parent
+    view._background_panel_display_image = object()
+    view._background_widget_render_id = None
+    view._render_background_widget_images = lambda: None
+
+    for _ in range(10):
+        view._schedule_background_widget_images(delay_ms=60)
+
+    assert len(parent.pending) == 1
+    assert view._background_widget_render_id in parent.pending
+
+
+def test_independent_card_children_use_their_own_background_source() -> None:
+    class WidgetStub:
+        @staticmethod
+        def winfo_ismapped() -> bool:
+            return True
+
+        @staticmethod
+        def winfo_rootx() -> int:
+            return 20
+
+        @staticmethod
+        def winfo_rooty() -> int:
+            return 30
+
+    class CanvasStub:
+        @staticmethod
+        def winfo_rootx() -> int:
+            return 10
+
+        @staticmethod
+        def winfo_rooty() -> int:
+            return 10
+
+    panel = Image.new("RGB", (100, 100), "#101010")
+    card_source = Image.new("RGB", (60, 40), "#E0E0E0")
+    view = object.__new__(HomeView)
+    view._background_panel_display_image = panel
+    view._background_panel_source_image = panel
+    view._background_sidebar_source_image = None
+    view._page_canvas = CanvasStub()
+    view._active_page = "home"
+    frame = WidgetStub()
+    card = SimpleNamespace(
+        frame=frame,
+        background_label=None,
+        background_source=card_source,
+        background_render_source=card_source,
+        background_generation=7,
+    )
+    view._feature_cards = {"home.card": card}
+    view._feature_cards_by_page = {"home": ["home.card"]}
+    page = WidgetStub()
+    view._pages = {"home": page}
+    view._background_sidebar_label = None
+    view._background_widget_render_keys = {}
+    calls: list[tuple[object, dict[str, object]]] = []
+    view._render_background_widget_tree = (
+        lambda widget, **kwargs: calls.append((widget, kwargs))
+    )
+
+    try:
+        view._render_background_widget_images_now()
+    finally:
+        panel.close()
+        card_source.close()
+
+    card_call = next(kwargs for widget, kwargs in calls if widget is frame)
+    assert card_call["panel_source"] is card_source
+    assert card_call["source_name"] == "card:home.card:7"
+    assert card_call["allow_independent_root"] is True
+    page_call = next(kwargs for widget, kwargs in calls if widget is page)
+    assert page_call["source_name"] == "panel"
+
+
+def test_card_title_reset_only_survives_when_default_text_is_unchanged() -> None:
+    assert _should_reset_feature_card_title(True, "原名稱", "原名稱")
+    assert not _should_reset_feature_card_title(True, "新名稱", "原名稱")
+    assert not _should_reset_feature_card_title(False, "原名稱", "原名稱")
+
+
+def test_feature_card_buttons_and_collapsed_title_keep_safe_spacing() -> None:
+    toggle_offset, settings_offset = _feature_card_control_offsets(62)
+
+    assert toggle_offset == -8
+    assert settings_offset == -76
+    assert abs(settings_offset) - abs(toggle_offset) - 62 == 6
+    required_pady = _collapsed_card_title_pady(24, 2, 31)
+    collapsed_height = 24 - 4 + required_pady * 2
+    assert collapsed_height >= 31 + 12
+
+
+def test_batch_card_settings_commit_once_and_updates_only_after_success() -> None:
+    view = object.__new__(HomeView)
+    title_updates: list[str] = []
+    loads: list[str] = []
+    callback_calls: list[dict[str, object]] = []
+    widgets = SimpleNamespace(
+        default_title="預設名稱",
+        collapsed=False,
+        title_label=SimpleNamespace(
+            configure=lambda **values: title_updates.append(values["text"])
+        ),
+        page="settings",
+    )
+    view._feature_cards = {"settings.card": widgets}
+    view._feature_card_title_entry = _EntryStub("舊名稱")
+    view._feature_card_save_error = ""
+    view._pending_card_background_path = Path("preview.png")
+    view._pending_card_background_id = "settings.card"
+    view._pending_card_background_clear_id = None
+    view._feature_card_status_label = None
+    view._feature_card_choice_ids = {
+        "設定｜舊名稱": "settings.card",
+    }
+    view._feature_card_variable = _ValueStub("設定｜舊名稱")
+    view._feature_card_selector = None
+    view.feature_card_preference_provider = (
+        lambda card_id, _default: FeatureCardPreference(
+            card_id,
+            "新名稱",
+            False,
+        )
+    )
+    view.feature_hotkeys = {"sync": "F1"}
+    view._feature_hotkey_variables = {}
+    view._group_launch_hotkey_variable = None
+    view._load_feature_card_background = loads.append
+    view._report_refresh_error = lambda _error: None
+
+    def save_batch(**values):
+        callback_calls.append(values)
+        return FeatureCardSettingsSaveResult(
+            True,
+            "全部儲存。",
+            preference=FeatureCardPreference(
+                "settings.card",
+                "新名稱",
+                False,
+            ),
+            background_path=Path("saved.png"),
+            hotkey="F2",
+        )
+
+    view.on_save_feature_card_settings = save_batch
+
+    assert view._save_feature_card_settings(
+        card_id="settings.card",
+        title="新名稱",
+        hotkey_feature="sync",
+        hotkey="F2",
+    )
+    assert len(callback_calls) == 1
+    assert callback_calls[0]["pending_background_path"] == Path(
+        "preview.png"
+    )
+    assert callback_calls[0]["clear_background"] is False
+    assert view._pending_card_background_path is None
+    assert view._pending_card_background_id is None
+    assert view.feature_hotkeys["sync"] == "F2"
+    assert title_updates == ["新名稱"]
+    assert loads == ["settings.card"]
+    assert view._feature_card_title_entry.get() == "新名稱"
+    assert view._feature_card_changes_dirty() is False
+
+
+def test_failed_batch_card_settings_keeps_valid_pending_and_visible_state(
+    tmp_path,
+) -> None:
+    view = object.__new__(HomeView)
+    title_updates: list[str] = []
+    loads: list[str] = []
+    widgets = SimpleNamespace(
+        default_title="預設名稱",
+        collapsed=False,
+        title_label=SimpleNamespace(
+            configure=lambda **values: title_updates.append(values["text"])
+        ),
+        page="settings",
+    )
+    view._feature_cards = {"settings.card": widgets}
+    view._feature_card_title_entry = None
+    view._feature_card_save_error = ""
+    preview_path = tmp_path / "preview.png"
+    preview_path.write_bytes(b"preview")
+    view._pending_card_background_path = preview_path
+    view._pending_card_background_id = "settings.card"
+    view._pending_card_background_clear_id = None
+    view._feature_card_status_label = None
+    view._feature_card_choice_ids = {
+        "設定｜預設名稱": "settings.card",
+    }
+    view._feature_card_variable = None
+    view.feature_hotkeys = {"sync": "F1"}
+    view._feature_hotkey_variables = {}
+    view._group_launch_hotkey_variable = None
+    view._load_feature_card_background = loads.append
+    view._report_refresh_error = lambda _error: None
+    calls: list[bool] = []
+    view.on_save_feature_card_settings = lambda **_values: (
+        calls.append(True)
+        or FeatureCardSettingsSaveResult(
+            False,
+            "背景無法儲存，全部設定均未變更。",
+        )
+    )
+
+    assert not view._save_feature_card_settings(
+        card_id="settings.card",
+        title="新名稱",
+        hotkey_feature="sync",
+        hotkey="F2",
+    )
+    assert calls == [True]
+    assert view._pending_card_background_path == preview_path
+    assert view._pending_card_background_id == "settings.card"
+    assert view.feature_hotkeys["sync"] == "F1"
+    assert title_updates == []
+    assert loads == []
+    assert "全部設定均未變更" in view._feature_card_save_error
+
+
+def test_failed_batch_clears_deleted_pending_background_and_reloads_saved(
+    tmp_path,
+):
+    view = object.__new__(HomeView)
+    deleted_preview = tmp_path / "deleted-preview.png"
+    loads: list[str] = []
+    view._pending_card_background_path = deleted_preview
+    view._pending_card_background_id = "settings.card"
+    view._feature_card_save_error = ""
+    view._load_feature_card_background = loads.append
+    view.on_save_feature_card_settings = lambda **_values: (
+        FeatureCardSettingsSaveResult(
+            False,
+            "整組快捷鍵儲存失敗；全部設定均未變更。",
+        )
+    )
+
+    saved = view._save_feature_card_settings_batch(
+        selected_card_id="settings.card",
+        widgets=SimpleNamespace(default_title="預設名稱"),
+        clean_title="新名稱",
+        reset_title=False,
+        hotkey_feature="group_launch",
+        hotkey="F9",
+        group_name="14支",
+        clear_background=False,
+    )
+
+    assert saved is False
+    assert view._pending_card_background_path is None
+    assert view._pending_card_background_id is None
+    assert loads == ["settings.card"]
+    assert "背景預覽已失效，已恢復原本背景" in (
+        view._feature_card_save_error
+    )
+
+
+def test_settings_card_reset_title_waits_for_batch_save() -> None:
+    view = object.__new__(HomeView)
+    calls: list[str] = []
+    view._feature_card_choice_ids = {
+        "設定｜自訂名稱": "settings.card",
+    }
+    view._feature_card_variable = _ValueStub("設定｜自訂名稱")
+    view._feature_cards = {
+        "settings.card": SimpleNamespace(
+            default_title="預設名稱",
+            title_label=_ConfigureStub(),
+        )
+    }
+    view._feature_card_title_entry = _EntryStub("自訂名稱")
+    view._feature_card_status_label = _ConfigureStub()
+    view._pending_card_title_reset_id = None
+    view.on_feature_card_title_reset = calls.append
+
+    view._reset_feature_card_title()
+
+    assert calls == []
+    assert view._pending_card_title_reset_id == "settings.card"
+    assert view._feature_card_title_entry.get() == "預設名稱"
+    assert view._feature_cards["settings.card"].title_label.values == {}
+    assert "按「儲存卡片設定」" in (
+        view._feature_card_status_label.values["text"]
+    )
+
+
+def test_settings_card_clear_background_waits_for_batch_save(
+    monkeypatch,
+) -> None:
+    view = object.__new__(HomeView)
+    clear_calls: list[str] = []
+    view.parent = None
+    view._feature_card_choice_ids = {
+        "設定｜卡片": "settings.card",
+    }
+    view._feature_card_variable = _ValueStub("設定｜卡片")
+    view._feature_cards = {
+        "settings.card": SimpleNamespace(
+            title_label=SimpleNamespace(cget=lambda _name: "卡片"),
+        )
+    }
+    view._pending_card_background_path = None
+    view._pending_card_background_id = None
+    view._pending_card_background_clear_id = None
+    view.on_save_feature_card_settings = lambda **_values: None
+    view.on_clear_card_background = clear_calls.append
+    view.on_discard_background_image = None
+    view._load_feature_card_background = lambda _card_id: None
+    view._feature_card_status_label = _ConfigureStub()
+    monkeypatch.setattr(
+        "ui.home.messagebox.askyesno",
+        lambda *_args, **_kwargs: True,
+    )
+
+    view._clear_feature_card_background()
+
+    assert clear_calls == []
+    assert view._pending_card_background_clear_id == "settings.card"
+    assert "按「儲存卡片設定」" in (
+        view._feature_card_status_label.values["text"]
+    )
+
+
+def test_direct_card_clear_is_pending_until_batch_save_or_cancel() -> None:
+    view = object.__new__(HomeView)
+    discarded: list[Path] = []
+    loads: list[str] = []
+    clear_calls: list[str] = []
+    view._pending_card_background_path = Path("preview.png")
+    view._pending_card_background_id = "settings.card"
+    view._pending_card_background_clear_id = None
+    view.on_discard_background_image = discarded.append
+    view.on_clear_card_background = clear_calls.append
+    view._load_feature_card_background = loads.append
+
+    view._mark_feature_card_background_clear("settings.card")
+
+    assert discarded == [Path("preview.png")]
+    assert clear_calls == []
+    assert loads == ["settings.card"]
+    assert view._pending_card_background_path is None
+    assert view._pending_card_background_id is None
+    assert view._pending_card_background_clear_id == "settings.card"
+
+
+def test_direct_card_background_error_message_is_not_hidden() -> None:
+    view = object.__new__(HomeView)
+    view._card_background_prepare_running = False
+    view._pending_card_background_id = "settings.card"
+    view._pending_card_background_path = None
+    view._pending_card_background_clear_id = None
+    view._card_background_prepare_message = "RAW 圖片轉換失敗。"
+
+    text, warning, keep_polling = (
+        view._direct_feature_card_background_status("settings.card")
+    )
+
+    assert text == "RAW 圖片轉換失敗。"
+    assert warning is True
+    assert keep_polling is False
 
 
 def test_four_player_selectable_themes_have_complete_palettes() -> None:

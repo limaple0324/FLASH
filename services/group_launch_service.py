@@ -11,6 +11,7 @@ from adapters.windows_launch_fingerprint import (
     ShortcutFingerprintResolver,
     normalize_launch_fingerprint,
 )
+from domain.character import CharacterImportance
 
 
 CONFIRMED_GROUP_ORDERS: dict[str, tuple[str, ...]] = {
@@ -66,6 +67,10 @@ class GroupLaunchTarget:
     shortcut_path: Path
     fingerprint: str
     placement: SavedWindowPlacement | None = None
+    entry_id: str = ""
+    role_id: str = ""
+    registered_level: int | None = None
+    importance: CharacterImportance | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -86,6 +91,26 @@ class GroupLaunchTarget:
         object.__setattr__(self, "display_name", display_name)
         object.__setattr__(self, "shortcut_path", shortcut_path)
         object.__setattr__(self, "fingerprint", fingerprint)
+        entry_id = self.entry_id.strip()
+        role_id = self.role_id.strip()
+        if len(entry_id) > 160 or len(role_id) > 160:
+            raise ValueError("registered role identity is too long.")
+        object.__setattr__(self, "entry_id", entry_id)
+        object.__setattr__(self, "role_id", role_id)
+        if (
+            self.registered_level is not None
+            and (
+                isinstance(self.registered_level, bool)
+                or not isinstance(self.registered_level, int)
+                or self.registered_level <= 0
+            )
+        ):
+            raise ValueError("registered_level must be positive or None.")
+        if self.importance is not None and not isinstance(
+            self.importance,
+            CharacterImportance,
+        ):
+            raise TypeError("importance must be CharacterImportance or None.")
         if self.placement is not None and not isinstance(
             self.placement,
             SavedWindowPlacement,
@@ -330,6 +355,7 @@ class GroupLaunchService:
             return plan
 
         entries: list[tuple[str, Path]] = []
+        metadata_by_path: dict[str, tuple[str, str]] = {}
         failures: list[str] = []
         for raw_entry in raw_entries:
             if not isinstance(raw_entry, Mapping):
@@ -349,6 +375,18 @@ class GroupLaunchService:
                 failures.append("group_launch_entry_invalid")
                 continue
             entries.append((name, path))
+            metadata_by_path[str(path.resolve(strict=False)).casefold()] = (
+                (
+                    raw_entry.get("entry_id", "").strip()
+                    if isinstance(raw_entry.get("entry_id"), str)
+                    else ""
+                ),
+                (
+                    raw_entry.get("role_id", "").strip()
+                    if isinstance(raw_entry.get("role_id"), str)
+                    else ""
+                ),
+            )
         names = [name.casefold() for name, _path in entries]
         paths = [str(path).casefold() for _name, path in entries]
         if len(entries) != len(raw_entries):
@@ -438,6 +476,14 @@ class GroupLaunchService:
                 placement=placements.get(
                     str(path.resolve(strict=False)).casefold()
                 ),
+                entry_id=metadata_by_path.get(
+                    str(path.resolve(strict=False)).casefold(),
+                    ("", ""),
+                )[0],
+                role_id=metadata_by_path.get(
+                    str(path.resolve(strict=False)).casefold(),
+                    ("", ""),
+                )[1],
             )
             for index, (display_name, path, fingerprint) in enumerate(
                 zip(ordered_names, ordered_paths, fingerprints),

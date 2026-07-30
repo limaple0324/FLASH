@@ -36,6 +36,10 @@ def test_confirmed_policy_uses_one_minute_unlimited_retry_without_button():
             ReconnectAction.FORCE_LOGIN,
         ),
         (
+            ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+            ReconnectAction.CONFIRM_FORCE_LOGIN_TIMEOUT,
+        ),
+        (
             ReconnectScreenState.LINE_SELECTION,
             ReconnectAction.SELECT_DEFAULT_LINE,
         ),
@@ -53,6 +57,7 @@ def test_known_reconnect_screen_advances_after_short_progress_delay(state, actio
         ReconnectScreenState.DISCONNECTED: 5,
         ReconnectScreenState.LOGIN_START: 10,
         ReconnectScreenState.FORCE_LOGIN_START: 10,
+        ReconnectScreenState.FORCE_LOGIN_TIMEOUT: 60,
         ReconnectScreenState.LINE_SELECTION: 3,
         ReconnectScreenState.CHARACTER_SELECTION: 10,
     }[state]
@@ -99,6 +104,15 @@ def test_known_post_login_windows_allow_only_the_confirmed_close_action(state):
 
 def test_unknown_screen_does_not_guess_or_click():
     decision = ReconnectPolicy().decide(ReconnectScreenState.UNKNOWN)
+
+    assert decision.action is ReconnectAction.OBSERVE_ONLY
+    assert decision.delay_seconds == 60
+
+
+def test_disabled_screen_check_is_observe_only_and_never_clicks():
+    decision = ReconnectPolicy().decide(
+        ReconnectScreenState.CHECK_DISABLED
+    )
 
     assert decision.action is ReconnectAction.OBSERVE_ONLY
     assert decision.delay_seconds == 60

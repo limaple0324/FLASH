@@ -27,6 +27,7 @@ from tkinter import (
     HORIZONTAL,
     IntVar,
     StringVar,
+    Toplevel,
 )
 from tkinter import colorchooser, messagebox
 from tkinter.ttk import Progressbar
@@ -84,6 +85,15 @@ from services.game_time_timed_click_service import (
     MIN_TIME_OFFSET_MS,
     clamp_time_offset_ms,
 )
+from services.smart_reconnect_monitor import (
+    DEFAULT_SMART_RECONNECT_INTERVAL_MS,
+)
+from services.smart_reconnect_capture_settings_service import (
+    MINIMIZED_CAPTURE_MODE,
+    OBSCURED_CAPTURE_MODE,
+    VISIBLE_CAPTURE_MODE,
+    SmartReconnectCaptureSettings,
+)
 from workspace.models import WorkspaceState
 
 
@@ -107,6 +117,12 @@ UI_THEME_LABELS = {
     "soft_violet": "柔和紫",
     "classic_gold": "舊版金色",
     "minimal_mono": "極簡黑白",
+}
+
+FEATURE_CARD_HOTKEY_TARGETS = {
+    "sync.input": "sync",
+    "sync.reconnect": "reconnect",
+    "sync.auto_click": "auto_click",
 }
 
 UI_THEME_PALETTES = {
@@ -211,6 +227,114 @@ def _average_image_color(image: Image.Image) -> str:
     )
 
 
+def _background_region(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    *,
+    fill: str,
+) -> Image.Image:
+    """Return a spatially aligned crop without repeating or stretching it."""
+    left, top, right, bottom = box
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    result = Image.new("RGB", (width, height), fill)
+    source_box = (
+        max(0, left),
+        max(0, top),
+        min(image.width, right),
+        min(image.height, bottom),
+    )
+    if source_box[0] < source_box[2] and source_box[1] < source_box[3]:
+        crop = image.crop(source_box)
+        try:
+            result.paste(
+                crop,
+                (
+                    source_box[0] - left,
+                    source_box[1] - top,
+                ),
+            )
+        finally:
+            crop.close()
+    return result
+
+
+def _background_crop_boxes(
+    root_size: tuple[int, int],
+    *,
+    content_box: tuple[int, int, int, int],
+    sidebar_box: tuple[int, int, int, int],
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """Return root-aligned content and sidebar crop boxes."""
+    root_width, root_height = root_size
+    content_x, content_y, content_width, content_height = content_box
+    sidebar_x, sidebar_y, sidebar_width, sidebar_height = sidebar_box
+    if min(
+        root_width,
+        root_height,
+        content_width,
+        content_height,
+        sidebar_width,
+        sidebar_height,
+    ) < 1:
+        raise ValueError("background crop dimensions must be positive")
+    content = (
+        content_x,
+        content_y,
+        content_x + content_width,
+        content_y + content_height,
+    )
+    sidebar = (
+        sidebar_x,
+        sidebar_y,
+        sidebar_x + sidebar_width,
+        sidebar_y + sidebar_height,
+    )
+    return content, sidebar
+
+
+def _feature_card_control_offsets(
+    toggle_width: int,
+    *,
+    edge_inset: int = 8,
+    control_gap: int = 6,
+) -> tuple[int, int]:
+    """Return right-aligned offsets for toggle and settings controls."""
+    width = max(1, int(toggle_width))
+    inset = max(0, int(edge_inset))
+    gap = max(0, int(control_gap))
+    return -inset, -(inset + gap + width)
+
+
+def _collapsed_card_title_pady(
+    title_required_height: int,
+    current_pady: int,
+    controls_required_height: int,
+) -> int:
+    current = max(0, int(current_pady))
+    title_height = max(
+        1,
+        int(title_required_height) - 2 * current,
+    )
+    controls_height = max(1, int(controls_required_height)) + 12
+    return max(
+        current,
+        (controls_height - title_height + 1) // 2,
+    )
+
+
+def _should_reset_feature_card_title(
+    requested: bool,
+    value: str,
+    default_title: str,
+) -> bool:
+    return bool(
+        requested
+        and isinstance(value, str)
+        and value.strip() == default_title
+    )
+
+
 def _contrast_ratio(first: str, second: str) -> float:
     def luminance(value: str) -> float:
         channels = [
@@ -290,6 +414,8 @@ def _reordered_entry_ids(
     entry_ids: tuple[str, ...],
     source_id: str,
     target_id: str,
+    *,
+    after: bool = False,
 ) -> tuple[str, ...]:
     if (
         len(entry_ids) != len(set(entry_ids))
@@ -304,6 +430,8 @@ def _reordered_entry_ids(
     reordered.pop(source_index)
     if source_index < target_index:
         target_index -= 1
+    if after:
+        target_index += 1
     reordered.insert(target_index, source_id)
     return tuple(reordered)
 
@@ -315,18 +443,31 @@ class GroupManagementViewResult:
     message: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class FeatureCardSettingsSaveResult:
+    succeeded: bool
+    message: str
+    preference: FeatureCardPreference | None = None
+    background_path: Path | None = None
+    hotkey: str = ""
+
+
 @dataclass(slots=True)
 class _FeatureCardWidgets:
     card_id: str
     page: str
     default_title: str
     frame: Frame
+    order_frame: Frame
     toggle_button: Button
     settings_button: Button
     title_label: Label | None = None
+    title_original_pady: object | None = None
     collapsed: bool = False
     background_label: Label | None = None
     background_source: Image.Image | None = None
+    background_render_source: Image.Image | None = None
+    background_generation: int = 0
     background_photo: object | None = None
     background_after_id: str | None = None
     hidden_layouts: list[
@@ -654,9 +795,13 @@ class HomeView:
         character_choices: Iterable[PlayerCharacterDetailChoice] = (),
         smart_reconnect_enabled: bool = False,
         on_smart_reconnect_change: Callable[[bool], object] | None = None,
-        smart_reconnect_interval_ms: int = 1000,
+        smart_reconnect_interval_ms: int = DEFAULT_SMART_RECONNECT_INTERVAL_MS,
         on_smart_reconnect_interval_change: (
             Callable[[int], object] | None
+        ) = None,
+        smart_reconnect_capture_modes: Mapping[str, bool] | None = None,
+        on_smart_reconnect_capture_modes_change: (
+            Callable[[Mapping[str, bool]], object] | None
         ) = None,
         reconnect_failure_messages_provider: (
             Callable[[], tuple[str, ...]] | None
@@ -733,6 +878,9 @@ class HomeView:
             Callable[[str, str], FeatureCardPreference] | None
         ) = None,
         on_feature_card_title_reset: Callable[[str], object] | None = None,
+        on_save_feature_card_settings: (
+            Callable[..., FeatureCardSettingsSaveResult] | None
+        ) = None,
         card_background_provider: Callable[[str], Path | None] | None = None,
         on_save_card_background: (
             Callable[[Path, str], BackgroundImageResult] | None
@@ -977,6 +1125,14 @@ class HomeView:
         self.on_smart_reconnect_interval_change = (
             on_smart_reconnect_interval_change
         )
+        self.smart_reconnect_capture_modes = (
+            SmartReconnectCaptureSettings.from_value(
+                smart_reconnect_capture_modes
+            ).to_dict()
+        )
+        self.on_smart_reconnect_capture_modes_change = (
+            on_smart_reconnect_capture_modes_change
+        )
         self.reconnect_failure_messages_provider = (
             reconnect_failure_messages_provider
         )
@@ -1025,6 +1181,7 @@ class HomeView:
         self.on_feature_card_order_change = on_feature_card_order_change
         self.on_feature_card_title_change = on_feature_card_title_change
         self.on_feature_card_title_reset = on_feature_card_title_reset
+        self.on_save_feature_card_settings = on_save_feature_card_settings
         self.card_background_provider = card_background_provider
         self.on_save_card_background = on_save_card_background
         self.on_clear_card_background = on_clear_card_background
@@ -1067,18 +1224,24 @@ class HomeView:
         self._building_page_name: str | None = None
         self._feature_card_drag_id: str | None = None
         self._feature_card_variable: StringVar | None = None
+        self._feature_card_selector: OptionMenu | None = None
         self._feature_card_choice_ids: dict[str, str] = {}
         self._feature_card_selected_id: str | None = None
+        self._feature_card_settings_dialog: Toplevel | None = None
         self._feature_card_title_entry: Entry | None = None
         self._feature_card_status_label: Label | None = None
+        self._pending_card_title_reset_id: str | None = None
         self._pending_card_background_path: Path | None = None
         self._pending_card_background_id: str | None = None
+        self._pending_card_background_clear_id: str | None = None
         self._card_background_prepare_cancel = Event()
         self._card_background_prepare_results: Queue[
             BackgroundImageResult | Exception
         ] = Queue()
         self._card_background_prepare_running = False
         self._card_background_prepare_poll_id: str | None = None
+        self._card_background_prepare_message = ""
+        self._feature_card_save_error = ""
         self._card_background_choose_button: Button | None = None
         self._card_background_cancel_button: Button | None = None
         self._card_background_progress_bar: Progressbar | None = None
@@ -1110,6 +1273,8 @@ class HomeView:
         self._smart_reconnect_label: Label | None = None
         self._smart_reconnect_button: Button | None = None
         self._smart_reconnect_interval_entry: Entry | None = None
+        self._smart_reconnect_capture_mode_variables: dict[str, IntVar] = {}
+        self._smart_reconnect_capture_mode_status_label: Label | None = None
         self._reconnect_failure_card: Frame | None = None
         self._reconnect_failure_label: Label | None = None
         self._home_role_rows_frame: Frame | None = None
@@ -1182,6 +1347,28 @@ class HomeView:
             object,
             tuple[int, str],
         ] = {}
+        self._background_widget_original_images: dict[
+            object,
+            tuple[str, str],
+        ] = {}
+        self._background_widget_photos: dict[object, object] = {}
+        self._background_widget_render_keys: dict[
+            object,
+            tuple[object, ...],
+        ] = {}
+        self._background_widget_render_id: str | None = None
+        self._background_widget_rendering = False
+        self._background_panel_display_image: Image.Image | None = None
+        self._background_role_display_image: Image.Image | None = None
+        self._background_sidebar_display_image: Image.Image | None = None
+        self._background_panel_source_image: Image.Image | None = None
+        self._background_sidebar_source_image: Image.Image | None = None
+        self._background_tinted_widget_sources: dict[
+            tuple[int, str, str, int],
+            Image.Image,
+        ] = {}
+        self._background_display_generation = 0
+        self._background_render_opacity = dict(DEFAULT_BACKGROUND_OPACITY)
         self._background_choose_button: Button | None = None
         self._background_cancel_button: Button | None = None
         self._background_progress_bar: Progressbar | None = None
@@ -1268,6 +1455,7 @@ class HomeView:
         pady: int = 16,
         card_id: str | None = None,
         title: str | None = None,
+        order_frame: Frame | None = None,
     ) -> Frame:
         frame = Frame(
             parent,
@@ -1303,7 +1491,15 @@ class HomeView:
             "收合",
             lambda selected=clean_id: self._toggle_feature_card(selected),
         )
-        toggle_button.place(relx=1.0, x=-8, y=8, anchor="ne")
+        toggle_offset, settings_offset = _feature_card_control_offsets(
+            toggle_button.winfo_reqwidth()
+        )
+        toggle_button.place(
+            relx=1.0,
+            x=toggle_offset,
+            y=6,
+            anchor="ne",
+        )
         settings_button = self._button(
             frame,
             "設定",
@@ -1311,12 +1507,18 @@ class HomeView:
                 selected
             ),
         )
-        settings_button.place(relx=1.0, x=-72, y=8, anchor="ne")
+        settings_button.place(
+            relx=1.0,
+            x=settings_offset,
+            y=6,
+            anchor="ne",
+        )
         widgets = _FeatureCardWidgets(
             card_id=clean_id,
             page=page,
             default_title=clean_title,
             frame=frame,
+            order_frame=order_frame or frame,
             toggle_button=toggle_button,
             settings_button=settings_button,
             collapsed=False,
@@ -1397,6 +1599,7 @@ class HomeView:
                 title_label = next(iter(labels), None)
             widgets.title_label = title_label
             if title_label is not None:
+                widgets.title_original_pady = title_label.cget("pady")
                 title_label.configure(
                     text=preference.title,
                     cursor="fleur",
@@ -1448,6 +1651,28 @@ class HomeView:
             ):
                 title_container = title_container.master
             keep.add(title_container)
+            if widgets.title_label is not None:
+                try:
+                    current_pady = max(
+                        0,
+                        int(
+                            widgets.title_label.winfo_pixels(
+                                widgets.title_label.cget("pady")
+                            )
+                        ),
+                    )
+                    controls_height = max(
+                        int(widgets.settings_button.winfo_reqheight()),
+                        int(widgets.toggle_button.winfo_reqheight()),
+                    )
+                    required_pady = _collapsed_card_title_pady(
+                        widgets.title_label.winfo_reqheight(),
+                        current_pady,
+                        controls_height,
+                    )
+                    widgets.title_label.configure(pady=required_pady)
+                except Exception:
+                    pass
             for child in widgets.frame.winfo_children():
                 if child in keep:
                     continue
@@ -1478,6 +1703,16 @@ class HomeView:
                 elif manager == "place":
                     child.place(**clean_info)
             widgets.hidden_layouts.clear()
+            if (
+                widgets.title_label is not None
+                and widgets.title_original_pady is not None
+            ):
+                try:
+                    widgets.title_label.configure(
+                        pady=widgets.title_original_pady
+                    )
+                except Exception:
+                    pass
         widgets.collapsed = bool(collapsed)
         widgets.toggle_button.configure(
             text="展開" if widgets.collapsed else "收合"
@@ -1512,14 +1747,21 @@ class HomeView:
         if source_id != card_id:
             return
         source = self._feature_cards.get(card_id)
-        if source is None or str(source.frame.winfo_manager()) != "pack":
+        if (
+            source is None
+            or str(source.order_frame.winfo_manager()) != "pack"
+        ):
             return
         siblings = [
             self._feature_cards[value]
             for value in self._feature_cards_by_page.get(source.page, ())
             if value != source.card_id
-            and self._feature_cards[value].frame.master is source.frame.master
-            and str(self._feature_cards[value].frame.winfo_manager()) == "pack"
+            and self._feature_cards[value].order_frame.master
+            is source.order_frame.master
+            and str(
+                self._feature_cards[value].order_frame.winfo_manager()
+            )
+            == "pack"
         ]
         if not siblings:
             return
@@ -1531,31 +1773,34 @@ class HomeView:
                 abs(
                     pointer_y
                     - (
-                        int(item.frame.winfo_rooty())
-                        + int(item.frame.winfo_height()) // 2
+                        int(item.order_frame.winfo_rooty())
+                        + int(item.order_frame.winfo_height()) // 2
                     )
                 )
                 + abs(
                     pointer_x
                     - (
-                        int(item.frame.winfo_rootx())
-                        + int(item.frame.winfo_width()) // 2
+                        int(item.order_frame.winfo_rootx())
+                        + int(item.order_frame.winfo_width()) // 2
                     )
                 )
             ),
         )
-        try:
-            source.frame.pack_configure(before=target.frame)
-        except Exception as exc:
-            self._report_refresh_error(exc)
-            return
-        available = tuple(self._feature_cards_by_page.get(source.page, ()))
+        target_midpoint = (
+            int(target.order_frame.winfo_rooty())
+            + int(target.order_frame.winfo_height()) // 2
+        )
+        place_after = pointer_y >= target_midpoint
         current = self._current_feature_card_order(source.page)
         reordered = _reordered_entry_ids(
             current,
             source.card_id,
             target.card_id,
+            after=place_after,
         )
+        if reordered == current:
+            return
+        available = tuple(self._feature_cards_by_page.get(source.page, ()))
         if self.on_feature_card_order_change is not None:
             try:
                 self.on_feature_card_order_change(
@@ -1565,6 +1810,28 @@ class HomeView:
                 )
             except Exception as exc:
                 self._report_refresh_error(exc)
+                return
+        try:
+            if place_after:
+                source.order_frame.pack_configure(
+                    after=target.order_frame
+                )
+            else:
+                source.order_frame.pack_configure(
+                    before=target.order_frame
+                )
+        except Exception as exc:
+            if self.on_feature_card_order_change is not None:
+                try:
+                    self.on_feature_card_order_change(
+                        source.page,
+                        current,
+                        available,
+                    )
+                except Exception as rollback_exc:
+                    self._report_refresh_error(rollback_exc)
+            self._report_refresh_error(exc)
+            return
         self._sync_page_scroll_region()
 
     def _current_feature_card_order(self, page: str) -> tuple[str, ...]:
@@ -1573,8 +1840,16 @@ class HomeView:
             sorted(
                 card_ids,
                 key=lambda card_id: (
-                    int(self._feature_cards[card_id].frame.winfo_rooty()),
-                    int(self._feature_cards[card_id].frame.winfo_rootx()),
+                    int(
+                        self._feature_cards[
+                            card_id
+                        ].order_frame.winfo_rooty()
+                    ),
+                    int(
+                        self._feature_cards[
+                            card_id
+                        ].order_frame.winfo_rootx()
+                    ),
                 ),
             )
         )
@@ -1600,40 +1875,53 @@ class HomeView:
                 self._report_refresh_error(exc)
         parents: list[object] = []
         for card_id in order:
-            parent = self._feature_cards[card_id].frame.master
+            parent = self._feature_cards[card_id].order_frame.master
             if parent not in parents:
                 parents.append(parent)
         for parent in parents:
             cards = [
                 self._feature_cards[card_id]
                 for card_id in order
-                if self._feature_cards[card_id].frame.master is parent
+                if self._feature_cards[card_id].order_frame.master is parent
                 and str(
-                    self._feature_cards[card_id].frame.winfo_manager()
+                    self._feature_cards[
+                        card_id
+                    ].order_frame.winfo_manager()
                 ) == "pack"
             ]
-            layouts = [
-                (card, dict(card.frame.pack_info()))
-                for card in cards
-            ]
-            for card, _info in layouts:
-                card.frame.pack_forget()
-            for card, info in layouts:
-                card.frame.pack(
-                    **{
-                        key: value
-                        for key, value in info.items()
-                        if key != "in"
-                    }
+            for index in range(len(cards) - 2, -1, -1):
+                cards[index].order_frame.pack_configure(
+                    before=cards[index + 1].order_frame
                 )
+
+    def _discard_feature_card_background_cache(self, card_id: str) -> None:
+        prefix = f"card:{card_id}:"
+        for key, image in tuple(
+            self._background_tinted_widget_sources.items()
+        ):
+            if str(key[1]).startswith(prefix):
+                image.close()
+                self._background_tinted_widget_sources.pop(key, None)
+        for widget, render_key in tuple(
+            self._background_widget_render_keys.items()
+        ):
+            if (
+                len(render_key) > 1
+                and str(render_key[1]).startswith(prefix)
+            ):
+                self._background_widget_render_keys.pop(widget, None)
 
     def _load_feature_card_background(self, card_id: str) -> None:
         widgets = self._feature_cards.get(card_id)
         if widgets is None:
             return
+        self._discard_feature_card_background_cache(card_id)
         if widgets.background_source is not None:
             widgets.background_source.close()
+        if widgets.background_render_source is not None:
+            widgets.background_render_source.close()
         widgets.background_source = None
+        widgets.background_render_source = None
         widgets.background_photo = None
         path = (
             self.card_background_provider(card_id)
@@ -1659,6 +1947,7 @@ class HomeView:
             if widgets is not None and widgets.background_label is not None:
                 widgets.background_label.configure(image="")
                 widgets.background_photo = None
+                self._schedule_background_widget_images()
             return
         if widgets.background_after_id is not None:
             return
@@ -1685,6 +1974,8 @@ class HomeView:
         height = max(1, int(widgets.frame.winfo_height()))
         if width < 2 or height < 2:
             return
+        display: Image.Image | None = None
+        resized: Image.Image | None = None
         try:
             resized_width, resized_height, offset_x, offset_y = (
                 _contain_geometry(source.size, (width, height))
@@ -1694,27 +1985,43 @@ class HomeView:
                 Image.Resampling.LANCZOS,
             )
             display = Image.new("RGB", (width, height), SURFACE)
-            try:
-                display.paste(
-                    resized,
-                    (offset_x, offset_y),
-                    resized if resized.mode == "RGBA" else None,
-                )
-                photo = ImageTk.PhotoImage(display, master=self.parent)
-            finally:
-                display.close()
-                resized.close()
+            display.paste(
+                resized,
+                (offset_x, offset_y),
+                resized if resized.mode == "RGBA" else None,
+            )
+            photo = ImageTk.PhotoImage(display, master=self.parent)
+            self._discard_feature_card_background_cache(card_id)
+            if widgets.background_render_source is not None:
+                widgets.background_render_source.close()
+            widgets.background_render_source = display
+            display = None
+            widgets.background_generation += 1
             label.configure(image=photo)
             label.lower()
             widgets.background_photo = photo
+            self._schedule_background_widget_images()
         except Exception as exc:
             label.configure(image="")
             widgets.background_photo = None
             self._report_refresh_error(exc)
+        finally:
+            if display is not None:
+                display.close()
+            if resized is not None:
+                resized.close()
 
     def build(self):
         active_page = self._active_page
+        if self._feature_card_settings_dialog is not None:
+            try:
+                self._feature_card_settings_dialog.grab_release()
+                self._feature_card_settings_dialog.destroy()
+            except Exception:
+                pass
+            self._feature_card_settings_dialog = None
         self._cancel_background_resize()
+        self._clear_background_display_images(restore_widgets=False)
         self._cancel_window_size_poll()
         self._cancel_game_time_tick()
         self._cancel_timed_click_capture()
@@ -1740,6 +2047,8 @@ class HomeView:
                     pass
             if widgets.background_source is not None:
                 widgets.background_source.close()
+            if widgets.background_render_source is not None:
+                widgets.background_render_source.close()
         self._pages.clear()
         self._feature_cards.clear()
         self._feature_cards_by_page.clear()
@@ -1748,6 +2057,9 @@ class HomeView:
         self._background_page_labels.clear()
         self._background_widget_colors.clear()
         self._background_widget_highlights.clear()
+        self._background_widget_original_images.clear()
+        self._background_widget_photos.clear()
+        self._background_widget_render_keys.clear()
         self._last_group_role_statuses = None
         self.theme_name = _apply_theme_palette(self.theme_name)
         root = Frame(self.parent, bg=BACKGROUND)
@@ -1785,7 +2097,7 @@ class HomeView:
             yscrollcommand=scrollbar.set,
         )
         canvas.pack(side=LEFT, fill=BOTH, expand=True)
-        scrollbar.configure(command=canvas.yview)
+        scrollbar.configure(command=self._scroll_page)
         self._background_canvas_item = canvas.create_image(
             0,
             0,
@@ -1876,6 +2188,51 @@ class HomeView:
         canvas = self._page_canvas
         if canvas is not None:
             canvas.configure(scrollregion=canvas.bbox("all"))
+            self._position_background_layers()
+            if not self._background_widget_rendering:
+                self._schedule_background_widget_images()
+
+    def _scroll_page(self, *arguments: object) -> None:
+        canvas = self._page_canvas
+        if canvas is None:
+            return
+        canvas.yview(*arguments)
+        self._position_background_layers()
+        self._schedule_background_widget_images(delay_ms=60)
+
+    def _position_background_layers(self) -> None:
+        canvas = self._page_canvas
+        if canvas is None:
+            return
+        try:
+            document_top = max(0, round(float(canvas.canvasy(0))))
+            width = max(1, int(canvas.winfo_width()))
+            height = max(1, int(canvas.winfo_height()))
+        except Exception:
+            return
+        if self._background_canvas_item is not None:
+            try:
+                canvas.coords(
+                    self._background_canvas_item,
+                    0,
+                    document_top,
+                )
+            except Exception:
+                pass
+        label = self._background_page_labels.get(self._active_page)
+        if label is not None:
+            try:
+                label.place_configure(
+                    x=0,
+                    y=document_top,
+                    width=width,
+                    height=height,
+                    relwidth=0,
+                    relheight=0,
+                )
+                label.lower()
+            except Exception:
+                pass
 
     def _resize_page_content(self, event) -> None:
         canvas = self._page_canvas
@@ -1933,14 +2290,59 @@ class HomeView:
         if canvas is None or item is None or source is None:
             return
         width, height = viewport_size
+        snapshots_to_close: list[Image.Image] = []
         try:
+            root = self._root
+            sidebar_root = (
+                self._background_sidebar_label.master
+                if self._background_sidebar_label is not None
+                else None
+            )
+            root_origin_x = int(root.winfo_rootx()) if root is not None else 0
+            root_origin_y = int(root.winfo_rooty()) if root is not None else 0
+            content_x = int(canvas.winfo_rootx()) - root_origin_x
+            content_y = int(canvas.winfo_rooty()) - root_origin_y
+            sidebar_x = (
+                int(sidebar_root.winfo_rootx()) - root_origin_x
+                if sidebar_root is not None
+                else 0
+            )
+            sidebar_y = (
+                int(sidebar_root.winfo_rooty()) - root_origin_y
+                if sidebar_root is not None
+                else 0
+            )
+            sidebar_width = max(
+                1,
+                int(sidebar_root.winfo_width())
+                if sidebar_root is not None
+                else 176,
+            )
+            sidebar_height = max(
+                1,
+                int(sidebar_root.winfo_height())
+                if sidebar_root is not None
+                else height,
+            )
             root_width = max(
-                width + 176,
-                int(self._root.winfo_width()) if self._root is not None else 0,
+                content_x + width,
+                sidebar_x + sidebar_width,
+                int(root.winfo_width()) if root is not None else 0,
             )
             root_height = max(
-                height,
-                int(self._root.winfo_height()) if self._root is not None else 0,
+                content_y + height,
+                sidebar_y + sidebar_height,
+                int(root.winfo_height()) if root is not None else 0,
+            )
+            content_crop, sidebar_crop = _background_crop_boxes(
+                (root_width, root_height),
+                content_box=(content_x, content_y, width, height),
+                sidebar_box=(
+                    sidebar_x,
+                    sidebar_y,
+                    sidebar_width,
+                    sidebar_height,
+                ),
             )
             resized_width, resized_height, offset_x, offset_y = _contain_geometry(
                 source.size,
@@ -1962,18 +2364,15 @@ class HomeView:
                         (offset_x, offset_y),
                         resized if resized.mode == "RGBA" else None,
                     )
-                    sidebar_width = min(176, root_width)
-                    content_left = max(0, root_width - width)
-                    sidebar_image = display.crop(
-                        (0, 0, sidebar_width, root_height)
+                    sidebar_image = _background_region(
+                        display,
+                        sidebar_crop,
+                        fill=self.background_fill_color,
                     )
-                    content_image = display.crop(
-                        (
-                            content_left,
-                            0,
-                            min(root_width, content_left + width),
-                            min(root_height, height),
-                        )
+                    content_image = _background_region(
+                        display,
+                        content_crop,
+                        fill=self.background_fill_color,
                     )
                     try:
                         try:
@@ -2001,7 +2400,20 @@ class HomeView:
                                 panel_tint,
                                 int(values["panel"]) / 100,
                             )
+                            role_display = Image.blend(
+                                content_image,
+                                panel_tint,
+                                int(values["role_row"]) / 100,
+                            )
                             try:
+                                panel_source_snapshot = content_image.copy()
+                                sidebar_source_snapshot = sidebar_image.copy()
+                                snapshots_to_close.extend(
+                                    (
+                                        panel_source_snapshot,
+                                        sidebar_source_snapshot,
+                                    )
+                                )
                                 photo = ImageTk.PhotoImage(
                                     panel_display,
                                     master=self.parent,
@@ -2010,15 +2422,13 @@ class HomeView:
                                     sidebar_display,
                                     master=self.parent,
                                 )
-                                panel_average = _average_image_color(
-                                    content_image
-                                )
-                                sidebar_average = _average_image_color(
-                                    sidebar_image
-                                )
+                                panel_snapshot = panel_display.copy()
+                                role_snapshot = role_display.copy()
+                                sidebar_snapshot = sidebar_display.copy()
                             finally:
                                 sidebar_display.close()
                                 panel_display.close()
+                                role_display.close()
                         finally:
                             sidebar_tint.close()
                             panel_tint.close()
@@ -2043,21 +2453,27 @@ class HomeView:
             self._background_photo = photo
             self._background_sidebar_photo = sidebar_photo
             self._background_render_size = viewport_size
-            self._apply_background_widget_colors(
-                sidebar_average,
-                panel_average,
-                int(values["sidebar"]),
-                int(values["panel"]),
-                int(values["role_row"]),
+            self._replace_background_display_images(
+                panel_snapshot,
+                role_snapshot,
+                sidebar_snapshot,
+                panel_source_snapshot,
+                sidebar_source_snapshot,
+                values,
             )
+            snapshots_to_close.clear()
+            self._position_background_layers()
+            self._schedule_background_widget_images()
         except Exception:
+            for snapshot in snapshots_to_close:
+                snapshot.close()
             canvas.itemconfigure(item, image="", state="hidden")
             if self._background_sidebar_label is not None:
                 self._background_sidebar_label.configure(image="")
             self._background_photo = None
             self._background_sidebar_photo = None
             self._background_render_size = None
-            self._restore_background_widget_colors()
+            self._clear_background_display_images(restore_widgets=True)
             self._refresh_background_status(
                 "受管背景副本目前無法顯示，請重新選擇圖片。"
             )
@@ -2097,7 +2513,7 @@ class HomeView:
                 label.configure(image="")
             if self._background_sidebar_label is not None:
                 self._background_sidebar_label.configure(image="")
-            self._restore_background_widget_colors()
+            self._clear_background_display_images(restore_widgets=True)
             return True
         try:
             with Image.open(normalized) as opened:
@@ -2112,7 +2528,7 @@ class HomeView:
                 label.configure(image="")
             if self._background_sidebar_label is not None:
                 self._background_sidebar_label.configure(image="")
-            self._restore_background_widget_colors()
+            self._clear_background_display_images(restore_widgets=True)
             return False
         self._background_loaded_path = normalized
         if canvas is not None:
@@ -2122,110 +2538,584 @@ class HomeView:
             )
         return True
 
-    def _remember_and_blend_widget_tree(
+    def _replace_background_display_images(
         self,
-        widget,
-        backdrop: str,
-        opacity: int,
+        panel: Image.Image,
+        role_rows: Image.Image,
+        sidebar: Image.Image,
+        panel_source: Image.Image,
+        sidebar_source: Image.Image,
+        values: Mapping[str, object],
     ) -> None:
-        try:
-            current = str(widget.cget("background"))
-        except Exception:
-            current = ""
-        if (
-            len(current) == 7
-            and current.startswith("#")
+        for current in (
+            self._background_panel_display_image,
+            self._background_role_display_image,
+            self._background_sidebar_display_image,
+            self._background_panel_source_image,
+            self._background_sidebar_source_image,
         ):
-            base = self._background_widget_colors.setdefault(
-                widget,
-                current,
-            )
+            if current is not None:
+                current.close()
+        for current in self._background_tinted_widget_sources.values():
+            current.close()
+        self._background_tinted_widget_sources.clear()
+        self._background_display_generation += 1
+        self._background_widget_render_keys.clear()
+        self._background_panel_display_image = panel
+        self._background_role_display_image = role_rows
+        self._background_sidebar_display_image = sidebar
+        self._background_panel_source_image = panel_source
+        self._background_sidebar_source_image = sidebar_source
+        self._background_render_opacity = {
+            name: max(0, min(100, int(values[name])))
+            for name in ("sidebar", "panel", "role_row")
+        }
+
+    def _clear_background_display_images(
+        self,
+        *,
+        restore_widgets: bool,
+    ) -> None:
+        if self._background_widget_render_id is not None:
             try:
-                blended = _blend_hex_color(
-                    base,
-                    backdrop,
-                    opacity,
+                self.parent.after_cancel(
+                    self._background_widget_render_id
                 )
-                widget.configure(background=blended)
-                try:
-                    foreground = str(widget.cget("foreground"))
-                    widget_class = str(widget.winfo_class())
-                except Exception:
-                    foreground = ""
-                    widget_class = ""
-                if (
-                    widget_class == "Label"
-                    and len(foreground) == 7
-                    and foreground.startswith("#")
-                ):
-                    original_highlight = (
-                        int(widget.cget("highlightthickness")),
-                        str(widget.cget("highlightbackground")),
-                    )
-                    self._background_widget_highlights.setdefault(
-                        widget,
-                        original_highlight,
-                    )
-                    if _contrast_ratio(foreground, blended) < 3:
-                        widget.configure(
-                            highlightthickness=1,
-                            highlightbackground=(
-                                "#FFFFFF"
-                                if _contrast_ratio(
-                                    foreground,
-                                    "#FFFFFF",
-                                )
-                                > _contrast_ratio(
-                                    foreground,
-                                    "#000000",
-                                )
-                                else "#000000"
-                            ),
-                        )
-                    else:
-                        widget.configure(
-                            highlightthickness=original_highlight[0],
-                            highlightbackground=original_highlight[1],
-                        )
             except Exception:
                 pass
+            self._background_widget_render_id = None
+        if restore_widgets:
+            self._restore_background_widget_colors()
+        self._background_widget_photos.clear()
+        self._background_widget_render_keys.clear()
+        for image in self._background_tinted_widget_sources.values():
+            image.close()
+        self._background_tinted_widget_sources.clear()
+        for image in (
+            self._background_panel_display_image,
+            self._background_role_display_image,
+            self._background_sidebar_display_image,
+            self._background_panel_source_image,
+            self._background_sidebar_source_image,
+        ):
+            if image is not None:
+                image.close()
+        self._background_panel_display_image = None
+        self._background_role_display_image = None
+        self._background_sidebar_display_image = None
+        self._background_panel_source_image = None
+        self._background_sidebar_source_image = None
+
+    def _schedule_background_widget_images(
+        self,
+        *,
+        delay_ms: int = 0,
+    ) -> None:
+        if self._background_panel_display_image is None:
+            return
+        if self._background_widget_render_id is not None:
+            if delay_ms <= 0:
+                return
+            try:
+                self.parent.after_cancel(self._background_widget_render_id)
+            except Exception:
+                pass
+            self._background_widget_render_id = None
         try:
-            children = widget.winfo_children()
+            self._background_widget_render_id = self.parent.after(
+                max(0, int(delay_ms)),
+                self._render_background_widget_images,
+            )
+        except Exception:
+            self._background_widget_render_id = None
+
+    @staticmethod
+    def _widget_is_inside(widget, ancestor) -> bool:
+        current = widget
+        while current is not None:
+            if current is ancestor:
+                return True
+            current = getattr(current, "master", None)
+        return False
+
+    def _background_widget_region_name(self, widget) -> str:
+        if (
+            self._home_role_rows_frame is not None
+            and self._widget_is_inside(
+                widget,
+                self._home_role_rows_frame,
+            )
+        ):
+            return "role_row"
+        return "panel"
+
+    def _widget_starts_independent_card(self, widget) -> bool:
+        return any(
+            widget is card.frame and card.background_source is not None
+            for card in self._feature_cards.values()
+        )
+
+    def _tinted_background_widget_source(
+        self,
+        *,
+        source: Image.Image,
+        source_name: str,
+        color: str,
+        opacity: int,
+    ) -> Image.Image:
+        key = (
+            self._background_display_generation,
+            source_name,
+            color,
+            opacity,
+        )
+        cached = self._background_tinted_widget_sources.get(key)
+        if cached is not None:
+            return cached
+        tint = Image.new("RGB", source.size, color)
+        try:
+            blended = Image.blend(source, tint, opacity / 100)
+        finally:
+            tint.close()
+        self._background_tinted_widget_sources[key] = blended
+        return blended
+
+    def _background_widget_photo(
+        self,
+        widget,
+        image: Image.Image,
+    ) -> tuple[object, bool]:
+        current = self._background_widget_photos.get(widget)
+        if current is not None:
+            try:
+                if (
+                    int(current.width()) == image.width
+                    and int(current.height()) == image.height
+                ):
+                    current.paste(image)
+                    return current, False
+            except Exception:
+                pass
+        return ImageTk.PhotoImage(image, master=self.parent), True
+
+    def _render_background_widget_tree(
+        self,
+        widget,
+        *,
+        panel_source: Image.Image,
+        sidebar_source: Image.Image | None,
+        origin_x: int,
+        origin_y: int,
+        source_name: str,
+        allow_independent_root: bool = False,
+    ) -> None:
+        if (
+            self._widget_starts_independent_card(widget)
+            and not allow_independent_root
+        ):
+            return
+        try:
+            mapped = bool(widget.winfo_ismapped())
+            width = int(widget.winfo_width())
+            height = int(widget.winfo_height())
+        except Exception:
+            mapped = False
+            width = height = 0
+        excluded = (
+            widget is self._background_sidebar_label
+            or widget in self._background_page_labels.values()
+            or any(
+                widget is card.background_label
+                for card in self._feature_cards.values()
+            )
+        )
+        widget_class = ""
+        try:
+            widget_class = str(widget.winfo_class())
+        except Exception:
+            pass
+        supports_photo = (
+            isinstance(widget, Label)
+            and width * height >= 4000
+        )
+        supports_color = (
+            isinstance(widget, (Frame, Label, Button))
+            or widget_class
+            in {
+                "Checkbutton",
+                "Entry",
+                "Frame",
+                "Labelframe",
+                "Menubutton",
+                "Scale",
+            }
+        )
+        if (
+            mapped
+            and width >= 2
+            and height >= 2
+            and not excluded
+            and supports_color
+        ):
+            left = int(widget.winfo_rootx()) - origin_x
+            top = int(widget.winfo_rooty()) - origin_y
+            active_source_name = source_name
+            active_source = sidebar_source or panel_source
+            if (
+                sidebar_source is None
+                and not source_name.startswith("card:")
+            ):
+                active_source_name = self._background_widget_region_name(
+                    widget
+                )
+                active_source = panel_source
+            right = left + width
+            bottom = top + height
+            if not (
+                right <= 0
+                or bottom <= 0
+                or left >= active_source.width
+                or top >= active_source.height
+            ):
+                try:
+                    current_color = str(widget.cget("background"))
+                except Exception:
+                    current_color = ""
+                original_color = self._background_widget_colors.get(widget)
+                if original_color is None:
+                    if (
+                        len(current_color) == 7
+                        and current_color.startswith("#")
+                    ):
+                        original_color = current_color
+                        self._background_widget_colors[widget] = current_color
+                    else:
+                        original_color = (
+                            SIDEBAR
+                            if active_source_name == "sidebar"
+                            else BACKGROUND
+                        )
+                opacity_name = (
+                    active_source_name
+                    if active_source_name
+                    in self._background_render_opacity
+                    else "panel"
+                )
+                opacity = self._background_render_opacity.get(
+                    opacity_name,
+                    DEFAULT_BACKGROUND_OPACITY.get(
+                        opacity_name,
+                        DEFAULT_BACKGROUND_OPACITY["panel"],
+                    ),
+                )
+                tinted_source = self._tinted_background_widget_source(
+                    source=active_source,
+                    source_name=active_source_name,
+                    color=original_color,
+                    opacity=opacity,
+                )
+                render_key = (
+                    self._background_display_generation,
+                    active_source_name,
+                    original_color,
+                    opacity,
+                    left if supports_photo else None,
+                    top if supports_photo else None,
+                    width,
+                    height,
+                )
+                if self._background_widget_render_keys.get(widget) != render_key:
+                    region = _background_region(
+                        tinted_source,
+                        (left, top, right, bottom),
+                        fill=self.background_fill_color,
+                    )
+                    try:
+                        local_color = _average_image_color(region)
+                        widget.configure(background=local_color)
+                        if supports_photo:
+                            self._background_widget_original_images.setdefault(
+                                widget,
+                                (
+                                    str(widget.cget("image")),
+                                    str(widget.cget("compound")),
+                                ),
+                            )
+                            inset_x = inset_y = 0
+                            for option, axis in (
+                                ("borderwidth", "both"),
+                                ("highlightthickness", "both"),
+                                ("padx", "x"),
+                                ("pady", "y"),
+                            ):
+                                try:
+                                    pixels = max(
+                                        0,
+                                        int(
+                                            widget.winfo_pixels(
+                                                widget.cget(option)
+                                            )
+                                        ),
+                                    )
+                                except Exception:
+                                    pixels = 0
+                                if axis in {"both", "x"}:
+                                    inset_x += pixels
+                                if axis in {"both", "y"}:
+                                    inset_y += pixels
+                            image_region = _background_region(
+                                tinted_source,
+                                (
+                                    left + inset_x,
+                                    top + inset_y,
+                                    max(left + inset_x + 1, right - inset_x),
+                                    max(top + inset_y + 1, bottom - inset_y),
+                                ),
+                                fill=self.background_fill_color,
+                            )
+                            try:
+                                photo, replace_photo = (
+                                    self._background_widget_photo(
+                                        widget,
+                                        image_region,
+                                    )
+                                )
+                            finally:
+                                image_region.close()
+                            if replace_photo:
+                                widget.configure(
+                                    image=photo,
+                                    compound="center",
+                                )
+                            self._background_widget_photos[widget] = photo
+                            if isinstance(widget, Label):
+                                try:
+                                    foreground = str(
+                                        widget.cget("foreground")
+                                    )
+                                    original_highlight = (
+                                        int(
+                                            widget.cget(
+                                                "highlightthickness"
+                                            )
+                                        ),
+                                        str(
+                                            widget.cget(
+                                                "highlightbackground"
+                                            )
+                                        ),
+                                    )
+                                    saved_highlight = (
+                                        self._background_widget_highlights.setdefault(
+                                            widget,
+                                            original_highlight,
+                                        )
+                                    )
+                                    if (
+                                        len(foreground) == 7
+                                        and foreground.startswith("#")
+                                        and _contrast_ratio(
+                                            foreground,
+                                            local_color,
+                                        )
+                                        < 3
+                                    ):
+                                        widget.configure(
+                                            highlightthickness=1,
+                                            highlightbackground=(
+                                                "#FFFFFF"
+                                                if _contrast_ratio(
+                                                    foreground,
+                                                    "#FFFFFF",
+                                                )
+                                                > _contrast_ratio(
+                                                    foreground,
+                                                    "#000000",
+                                                )
+                                                else "#000000"
+                                            ),
+                                        )
+                                    else:
+                                        widget.configure(
+                                            highlightthickness=(
+                                                saved_highlight[0]
+                                            ),
+                                            highlightbackground=(
+                                                saved_highlight[1]
+                                            ),
+                                        )
+                                except Exception:
+                                    pass
+                        self._background_widget_render_keys[widget] = (
+                            render_key
+                        )
+                    except Exception:
+                        pass
+                    finally:
+                        region.close()
+        try:
+            children = tuple(widget.winfo_children())
         except Exception:
             children = ()
         for child in children:
-            self._remember_and_blend_widget_tree(
+            self._render_background_widget_tree(
                 child,
-                backdrop,
-                opacity,
+                panel_source=panel_source,
+                sidebar_source=sidebar_source,
+                origin_x=origin_x,
+                origin_y=origin_y,
+                source_name=source_name,
             )
 
-    def _apply_background_widget_colors(
-        self,
-        sidebar_backdrop: str,
-        panel_backdrop: str,
-        sidebar_opacity: int,
-        panel_opacity: int,
-        role_row_opacity: int,
-    ) -> None:
-        if self._background_sidebar_label is not None:
-            sidebar = self._background_sidebar_label.master
-            self._remember_and_blend_widget_tree(
-                sidebar,
-                sidebar_backdrop,
-                sidebar_opacity,
+    def _render_background_widget_images(self) -> None:
+        self._background_widget_render_id = None
+        if self._background_widget_rendering:
+            return
+        self._background_widget_rendering = True
+        try:
+            self._render_background_widget_images_now()
+        finally:
+            self._background_widget_rendering = False
+
+    def _render_background_widget_images_now(self) -> None:
+        panel = self._background_panel_display_image
+        panel_source = self._background_panel_source_image
+        sidebar_source = self._background_sidebar_source_image
+        canvas = self._page_canvas
+        if panel is None or panel_source is None or canvas is None:
+            return
+        try:
+            panel_origin_x = int(canvas.winfo_rootx())
+            panel_origin_y = int(canvas.winfo_rooty())
+        except Exception:
+            return
+        for card_id in self._feature_cards_by_page.get(
+            self._active_page,
+            (),
+        ):
+            card = self._feature_cards.get(card_id)
+            if (
+                card is None
+                or card.background_label is None
+                or card.background_source is not None
+            ):
+                continue
+            try:
+                if not card.frame.winfo_ismapped():
+                    continue
+                width = int(card.frame.winfo_width())
+                height = int(card.frame.winfo_height())
+                left = int(card.frame.winfo_rootx()) - panel_origin_x
+                top = int(card.frame.winfo_rooty()) - panel_origin_y
+            except Exception:
+                continue
+            if width < 2 or height < 2:
+                continue
+            if (
+                left + width <= 0
+                or top + height <= 0
+                or left >= panel.width
+                or top >= panel.height
+            ):
+                continue
+            render_key = (
+                self._background_display_generation,
+                "card",
+                left,
+                top,
+                width,
+                height,
             )
-        for page in self._pages.values():
-            self._remember_and_blend_widget_tree(
-                page,
-                panel_backdrop,
-                panel_opacity,
+            if (
+                self._background_widget_render_keys.get(
+                    card.background_label
+                )
+                == render_key
+                and card.background_photo is not None
+            ):
+                continue
+            region = _background_region(
+                panel,
+                (left, top, left + width, top + height),
+                fill=self.background_fill_color,
             )
-        if self._home_role_rows_frame is not None:
-            self._remember_and_blend_widget_tree(
-                self._home_role_rows_frame,
-                panel_backdrop,
-                role_row_opacity,
+            try:
+                photo, replace_photo = self._background_widget_photo(
+                    card.background_label,
+                    region,
+                )
+            except Exception as exc:
+                self._report_refresh_error(exc)
+                continue
+            finally:
+                region.close()
+            if replace_photo:
+                card.background_label.configure(image=photo)
+            self._background_widget_photos[
+                card.background_label
+            ] = photo
+            card.background_label.lower()
+            card.background_photo = photo
+            self._background_widget_render_keys[
+                card.background_label
+            ] = render_key
+        for card_id in self._feature_cards_by_page.get(
+            self._active_page,
+            (),
+        ):
+            card = self._feature_cards.get(card_id)
+            card_source = (
+                card.background_render_source
+                if card is not None
+                else None
+            )
+            if card is None or card_source is None:
+                continue
+            try:
+                if not card.frame.winfo_ismapped():
+                    continue
+                card_origin_x = int(card.frame.winfo_rootx())
+                card_origin_y = int(card.frame.winfo_rooty())
+            except Exception:
+                continue
+            self._render_background_widget_tree(
+                card.frame,
+                panel_source=card_source,
+                sidebar_source=None,
+                origin_x=card_origin_x,
+                origin_y=card_origin_y,
+                source_name=(
+                    f"card:{card_id}:{card.background_generation}"
+                ),
+                allow_independent_root=True,
+            )
+        active_page = self._pages.get(self._active_page)
+        if active_page is not None:
+            self._render_background_widget_tree(
+                active_page,
+                panel_source=panel_source,
+                sidebar_source=None,
+                origin_x=panel_origin_x,
+                origin_y=panel_origin_y,
+                source_name="panel",
+            )
+        if (
+            sidebar_source is not None
+            and self._background_sidebar_label is not None
+        ):
+            sidebar_root = self._background_sidebar_label.master
+            try:
+                sidebar_origin_x = int(sidebar_root.winfo_rootx())
+                sidebar_origin_y = int(sidebar_root.winfo_rooty())
+            except Exception:
+                return
+            self._render_background_widget_tree(
+                sidebar_root,
+                panel_source=sidebar_source,
+                sidebar_source=sidebar_source,
+                origin_x=sidebar_origin_x,
+                origin_y=sidebar_origin_y,
+                source_name="sidebar",
             )
 
     def _restore_background_widget_colors(self) -> None:
@@ -2244,6 +3134,31 @@ class HomeView:
                 )
             except Exception:
                 pass
+        for widget, (image_name, compound) in tuple(
+            self._background_widget_original_images.items()
+        ):
+            try:
+                widget.configure(
+                    image=image_name,
+                    compound=compound,
+                )
+            except Exception:
+                pass
+        self._background_widget_photos.clear()
+        self._background_widget_render_keys.clear()
+        self._background_widget_colors.clear()
+        self._background_widget_highlights.clear()
+        self._background_widget_original_images.clear()
+        for card in self._feature_cards.values():
+            if (
+                card.background_source is None
+                and card.background_label is not None
+            ):
+                try:
+                    card.background_label.configure(image="")
+                except Exception:
+                    pass
+                card.background_photo = None
 
     def _background_status_text(self, message: str = "") -> str:
         pending = self._pending_background_result
@@ -2314,6 +3229,8 @@ class HomeView:
             return None
         units = -1 if delta > 0 else 1
         canvas.yview_scroll(units, "units")
+        self._position_background_layers()
+        self._schedule_background_widget_images(delay_ms=60)
         return "break"
 
     def _build_group_summary(self, parent) -> None:
@@ -2373,14 +3290,22 @@ class HomeView:
         page = Frame(parent, bg=BACKGROUND)
         self._page_heading(page, "今天要做什麼", "只顯示現在需要注意的內容")
 
-        summary_row = Frame(page, bg=BACKGROUND)
-        summary_row.pack(fill=X)
+        card_stack = Frame(page, bg=BACKGROUND)
+        card_stack.pack(fill=X)
+
+        def card_section(top_padding: int = 0) -> Frame:
+            section = Frame(card_stack, bg=BACKGROUND)
+            section.pack(fill=X, pady=(top_padding, 0))
+            return section
+
+        workspace_section = card_section()
         workspace_card = self._card(
-            summary_row,
+            workspace_section,
             card_id="home.workspace",
             title="目前工作區",
+            order_frame=workspace_section,
         )
-        workspace_card.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 8))
+        workspace_card.pack(fill=X)
         Label(
             workspace_card,
             text="目前工作區",
@@ -2400,12 +3325,14 @@ class HomeView:
         )
         self._workspace_label.pack(fill=X, pady=(8, 0))
 
+        target_section = card_section(8)
         target_card = self._card(
-            summary_row,
+            target_section,
             card_id="home.group",
             title="目前組別",
+            order_frame=target_section,
         )
-        target_card.pack(side=LEFT, fill=BOTH, expand=True, padx=(8, 0))
+        target_card.pack(fill=X)
         Label(
             target_card,
             text="目前組別",
@@ -2424,20 +3351,22 @@ class HomeView:
         )
         self._target_label.pack(fill=X, pady=(8, 0))
 
+        role_section = card_section(20)
         Label(
-            page,
+            role_section,
             text="目前組別角色",
             font=("Microsoft JhengHei UI", 13, "bold"),
             bg=BACKGROUND,
             fg=TEXT,
             anchor="w",
-        ).pack(fill=X, pady=(20, 8))
+        ).pack(fill=X, pady=(0, 8))
         role_card = self._card(
-            page,
+            role_section,
             padx=10,
             pady=10,
             card_id="home.roles",
             title="角色狀態",
+            order_frame=role_section,
         )
         role_card.pack(fill=X)
         Label(
@@ -2452,7 +3381,10 @@ class HomeView:
         self._home_role_rows_frame.pack(fill=X)
         self.refresh_group_role_statuses()
 
-        self._reconnect_failure_card = self._card(page, pady=10)
+        self._reconnect_failure_card = self._card(
+            role_section,
+            pady=10,
+        )
         self._reconnect_failure_label = Label(
             self._reconnect_failure_card,
             text="",
@@ -2464,20 +3396,22 @@ class HomeView:
         )
         self._reconnect_failure_label.pack(fill=X)
 
+        schedule_section = card_section(20)
         self._home_activity_heading = Label(
-            page,
+            schedule_section,
             text="今日已登記活動",
             font=("Microsoft JhengHei UI", 13, "bold"),
             bg=BACKGROUND,
             fg=TEXT,
             anchor="w",
         )
-        self._home_activity_heading.pack(fill=X, pady=(20, 8))
+        self._home_activity_heading.pack(fill=X, pady=(0, 8))
         schedule_card = self._card(
-            page,
+            schedule_section,
             pady=12,
             card_id="home.schedule",
             title="今日活動",
+            order_frame=schedule_section,
         )
         schedule_card.pack(fill=X)
         Label(
@@ -2501,18 +3435,20 @@ class HomeView:
         self._activity_schedule_label.pack(fill=X)
         self._build_activity_description_editor(schedule_card)
 
+        reminder_section = card_section(20)
         Label(
-            page,
+            reminder_section,
             text="需要注意",
             font=("Microsoft JhengHei UI", 13, "bold"),
             bg=BACKGROUND,
             fg=TEXT,
             anchor="w",
-        ).pack(fill=X, pady=(20, 8))
+        ).pack(fill=X, pady=(0, 8))
         reminder = self._card(
-            page,
+            reminder_section,
             card_id="home.reminders",
             title="目前提醒",
+            order_frame=reminder_section,
         )
         reminder.pack(fill=X)
         Label(
@@ -2850,6 +3786,7 @@ class HomeView:
                 fg=MUTED,
                 anchor="w",
             ).pack(fill=X, pady=4)
+            self._schedule_background_widget_images()
             return ()
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_columnconfigure(1, weight=1)
@@ -2882,7 +3819,7 @@ class HomeView:
                 SUCCESS
                 if item.status == "已開啟"
                 else WARNING
-                if item.status in {"斷線", "重連失敗"}
+                if item.status in {"斷線", "重連失敗", "檢查已關閉"}
                 else PRIMARY
                 if item.status == "重連中"
                 else MUTED
@@ -2902,6 +3839,7 @@ class HomeView:
             row.bind("<Button-1>", activate)
             name_label.bind("<Button-1>", activate)
             status_label.bind("<Button-1>", activate)
+        self._schedule_background_widget_images()
         return rows
 
     @staticmethod
@@ -2945,13 +3883,7 @@ class HomeView:
                 text="\n".join(f"● {message}" for message in messages)
             )
             if not card.winfo_manager():
-                options: dict[str, object] = {
-                    "fill": X,
-                    "pady": (12, 0),
-                }
-                if self._home_activity_heading is not None:
-                    options["before"] = self._home_activity_heading
-                card.pack(**options)
+                card.pack(fill=X, pady=(12, 0))
         else:
             label.configure(text="")
             if card.winfo_manager():
@@ -3687,6 +4619,62 @@ class HomeView:
             primary=True,
         )
         self._smart_reconnect_button.pack(anchor="w", pady=(10, 0))
+        capture_mode_frame = Frame(
+            reconnect_card,
+            bg=BACKGROUND,
+            padx=10,
+            pady=8,
+        )
+        capture_mode_frame.pack(fill=X, pady=(10, 0))
+        Label(
+            capture_mode_frame,
+            text="勾選要啟用的斷線檢查方式",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=BACKGROUND,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        self._smart_reconnect_capture_mode_variables = {}
+        for mode, label in (
+            (VISIBLE_CAPTURE_MODE, "前景／完整可見"),
+            (OBSCURED_CAPTURE_MODE, "被其他視窗遮擋"),
+            (MINIMIZED_CAPTURE_MODE, "已最小化"),
+        ):
+            variable = IntVar(
+                master=self.parent,
+                value=(
+                    1
+                    if self.smart_reconnect_capture_modes.get(mode, True)
+                    else 0
+                ),
+            )
+            self._smart_reconnect_capture_mode_variables[mode] = variable
+            Checkbutton(
+                capture_mode_frame,
+                text=label,
+                variable=variable,
+                command=self._save_smart_reconnect_capture_modes,
+                font=("Microsoft JhengHei UI", 9),
+                bg=BACKGROUND,
+                fg=TEXT,
+                activebackground=BACKGROUND,
+                selectcolor=SURFACE,
+                anchor="w",
+            ).pack(side=LEFT, padx=(0, 14), pady=(6, 0))
+        self._smart_reconnect_capture_mode_status_label = Label(
+            reconnect_card,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
+            wraplength=720,
+        )
+        self._smart_reconnect_capture_mode_status_label.pack(
+            fill=X,
+            pady=(6, 0),
+        )
         interval_row = Frame(reconnect_card, bg=SURFACE)
         interval_row.pack(fill=X, pady=(10, 0))
         Label(
@@ -4208,6 +5196,63 @@ class HomeView:
     def toggle_smart_reconnect_from_hotkey(self) -> None:
         self._toggle_smart_reconnect()
 
+    def set_smart_reconnect_capture_modes(
+        self,
+        modes: Mapping[str, bool],
+    ) -> None:
+        normalized = SmartReconnectCaptureSettings.from_value(
+            modes
+        ).to_dict()
+        self.smart_reconnect_capture_modes = normalized
+        for mode, variable in (
+            self._smart_reconnect_capture_mode_variables.items()
+        ):
+            variable.set(1 if normalized.get(mode, True) else 0)
+        self._refresh_smart_reconnect_capture_mode_status()
+
+    def _save_smart_reconnect_capture_modes(self) -> None:
+        previous = dict(self.smart_reconnect_capture_modes)
+        requested = {
+            mode: bool(variable.get())
+            for mode, variable in (
+                self._smart_reconnect_capture_mode_variables.items()
+            )
+        }
+        callback = self.on_smart_reconnect_capture_modes_change
+        if callback is None or callback(requested) is False:
+            self.set_smart_reconnect_capture_modes(previous)
+            return
+        self.set_smart_reconnect_capture_modes(requested)
+
+    def _refresh_smart_reconnect_capture_mode_status(self) -> None:
+        label = self._smart_reconnect_capture_mode_status_label
+        if label is None:
+            return
+        names = (
+            (VISIBLE_CAPTURE_MODE, "前景／完整可見"),
+            (OBSCURED_CAPTURE_MODE, "被其他視窗遮擋"),
+            (MINIMIZED_CAPTURE_MODE, "已最小化"),
+        )
+        states = tuple(
+            (
+                name,
+                bool(self.smart_reconnect_capture_modes.get(mode, True)),
+            )
+            for mode, name in names
+        )
+        label.configure(
+            text="檢查狀態："
+            + "｜".join(
+                f"{name}－{'已開啟' if enabled else '已關閉'}"
+                for name, enabled in states
+            ),
+            fg=(
+                SUCCESS
+                if all(enabled for _name, enabled in states)
+                else WARNING
+            ),
+        )
+
     def _save_smart_reconnect_interval(self) -> None:
         entry = self._smart_reconnect_interval_entry
         if entry is None:
@@ -4242,6 +5287,7 @@ class HomeView:
         self._refresh_smart_reconnect_controls()
 
     def _refresh_smart_reconnect_controls(self) -> None:
+        self._refresh_smart_reconnect_capture_mode_status()
         if self._smart_reconnect_button is not None:
             self._smart_reconnect_button.configure(
                 text=(
@@ -5447,24 +6493,11 @@ class HomeView:
             justify=LEFT,
             wraplength=680,
         ).pack(fill=X, pady=(6, 12))
-        choices: list[str] = []
-        self._feature_card_choice_ids = {}
-        for card_id, widgets in self._feature_cards.items():
-            if card_id == "settings.card_layout":
-                continue
-            preference = self._feature_card_preference(
-                card_id,
-                widgets.default_title,
-            )
-            page_label = BACKGROUND_PAGE_LABELS.get(
-                widgets.page,
-                widgets.page,
-            )
-            label = f"{page_label}｜{preference.title}"
-            if label in self._feature_card_choice_ids:
-                label = f"{label}（{len(choices) + 1}）"
-            choices.append(label)
-            self._feature_card_choice_ids[label] = card_id
+        choice_items = self._feature_card_choice_items()
+        choices = [label for label, _card_id in choice_items]
+        self._feature_card_choice_ids = {
+            label: card_id for label, card_id in choice_items
+        }
         initial_label = choices[0] if choices else "目前沒有可設定的卡片"
         self._feature_card_variable = StringVar(
             master=self.parent,
@@ -5478,9 +6511,10 @@ class HomeView:
         selector = OptionMenu(
             selector_row,
             self._feature_card_variable,
-            *choices,
-            command=lambda _value: self._refresh_feature_card_settings(),
+            *(choices or [initial_label]),
+            command=self._select_feature_card_choice,
         )
+        self._feature_card_selector = selector
         selector.configure(
             font=("Microsoft JhengHei UI", 10),
             bg=BACKGROUND,
@@ -5573,6 +6607,87 @@ class HomeView:
         self._feature_card_status_label.pack(fill=X, pady=(8, 0))
         self._refresh_feature_card_settings()
 
+    def _feature_card_choice_items(
+        self,
+        preference_overrides: Mapping[str, FeatureCardPreference] | None = None,
+    ) -> tuple[tuple[str, str], ...]:
+        items: list[tuple[str, str]] = []
+        used_labels: set[str] = set()
+        for card_id, widgets in self._feature_cards.items():
+            if card_id == "settings.card_layout":
+                continue
+            preference = (
+                preference_overrides.get(card_id)
+                if preference_overrides is not None
+                else None
+            )
+            if preference is None:
+                preference = self._feature_card_preference(
+                    card_id,
+                    widgets.default_title,
+                )
+            page_label = BACKGROUND_PAGE_LABELS.get(
+                widgets.page,
+                widgets.page,
+            )
+            base_label = f"{page_label}｜{preference.title}"
+            label = base_label
+            suffix = 2
+            while label in used_labels:
+                label = f"{base_label}（{suffix}）"
+                suffix += 1
+            used_labels.add(label)
+            items.append((label, card_id))
+        return tuple(items)
+
+    def _rebuild_feature_card_selector(
+        self,
+        selected_card_id: str,
+        saved_preference: FeatureCardPreference | None = None,
+    ) -> None:
+        items = self._feature_card_choice_items(
+            {
+                selected_card_id: saved_preference,
+            }
+            if saved_preference is not None
+            else None
+        )
+        self._feature_card_choice_ids = {
+            label: card_id for label, card_id in items
+        }
+        variable = self._feature_card_variable
+        selector = getattr(self, "_feature_card_selector", None)
+        if selector is not None:
+            menu = selector["menu"]
+            menu.delete(0, "end")
+            for label, _card_id in items:
+                menu.add_command(
+                    label=label,
+                    command=lambda value=label: (
+                        self._select_feature_card_choice(value)
+                    ),
+                )
+            selector.configure(state=NORMAL if items else DISABLED)
+        selected_label = next(
+            (
+                label
+                for label, card_id in items
+                if card_id == selected_card_id
+            ),
+            None,
+        )
+        if variable is not None:
+            variable.set(
+                selected_label or "目前沒有可設定的卡片"
+            )
+
+    def _select_feature_card_choice(self, label: str) -> None:
+        if label not in self._feature_card_choice_ids:
+            return
+        if self._feature_card_variable is not None:
+            self._feature_card_variable.set(label)
+        self._refresh_feature_card_settings()
+
     def _selected_feature_card_id(self) -> str | None:
         if self._feature_card_variable is None:
             return None
@@ -5597,6 +6712,16 @@ class HomeView:
             self._pending_card_background_path = None
             self._pending_card_background_id = None
             self._load_feature_card_background(previous_id)
+        if (
+            self._pending_card_background_clear_id is not None
+            and self._pending_card_background_clear_id != card_id
+        ):
+            self._pending_card_background_clear_id = None
+        if (
+            getattr(self, "_pending_card_title_reset_id", None) is not None
+            and self._pending_card_title_reset_id != card_id
+        ):
+            self._pending_card_title_reset_id = None
         self._feature_card_selected_id = card_id
         widgets = self._feature_cards.get(card_id)
         entry = self._feature_card_title_entry
@@ -5631,92 +6756,719 @@ class HomeView:
             None,
         )
 
+    def _direct_feature_card_background_status(
+        self,
+        card_id: str,
+    ) -> tuple[str, bool, bool]:
+        if (
+            self._card_background_prepare_running
+            and self._pending_card_background_id == card_id
+        ):
+            return "正在準備卡片背景預覽。", False, True
+        if self._pending_card_background_clear_id == card_id:
+            return "已標記移除背景；按「儲存」後才會套用。", False, False
+        if (
+            self._pending_card_background_id == card_id
+            and self._pending_card_background_path is not None
+        ):
+            return (
+                "卡片背景已預覽；按「儲存」才會正式取代。",
+                False,
+                False,
+            )
+        if self._card_background_prepare_message:
+            return self._card_background_prepare_message, True, False
+        return "此處只修改這張卡片。", False, False
+
     def _open_feature_card_settings(self, card_id: str) -> None:
+        existing_dialog = self._feature_card_settings_dialog
+        if existing_dialog is not None:
+            try:
+                if existing_dialog.winfo_exists():
+                    existing_dialog.lift()
+                    existing_dialog.focus_force()
+                    return
+            except Exception:
+                pass
+            self._feature_card_settings_dialog = None
         widgets = self._feature_cards.get(card_id)
         if widgets is None:
             return
-        self.show_page("settings")
         label = self._feature_card_choice_label(card_id)
-        if self._feature_card_variable is not None and label is not None:
+        if label is None:
+            label = f"直接設定｜{card_id}"
+            self._feature_card_choice_ids[label] = card_id
+        if self._feature_card_variable is not None:
             self._feature_card_variable.set(label)
         self._refresh_feature_card_settings()
 
-    def _save_feature_card_settings(self) -> bool:
-        card_id = self._selected_feature_card_id()
-        widgets = self._feature_cards.get(card_id or "")
-        entry = self._feature_card_title_entry
-        if card_id is None or widgets is None or entry is None:
-            return False
-        title = entry.get().strip()
-        try:
-            preference = (
-                self.on_feature_card_title_change(card_id, title)
-                if self.on_feature_card_title_change is not None
-                else FeatureCardPreference(
-                    card_id=card_id,
-                    title=title,
-                    collapsed=widgets.collapsed,
-                )
+        dialog = Toplevel(self.parent)
+        dialog.title(f"輔｜{widgets.default_title}設定")
+        dialog.transient(self.parent)
+        dialog.resizable(False, False)
+        dialog.configure(bg=SURFACE, padx=16, pady=14)
+        self._feature_card_settings_dialog = dialog
+        dialog.grab_set()
+
+        preference = self._feature_card_preference(
+            card_id,
+            widgets.default_title,
+        )
+        Label(
+            dialog,
+            text="顯示名稱",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        title_entry = Entry(
+            dialog,
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+        )
+        title_entry.pack(fill=X, pady=(6, 10), ipady=6)
+        title_entry.insert(0, preference.title)
+
+        reset_title_requested = {"value": False}
+        hotkey_feature = FEATURE_CARD_HOTKEY_TARGETS.get(card_id)
+        group_hotkey = (
+            card_id == "groups.current"
+            and self.current_group_name is not None
+            and self.on_group_launch_hotkey_change is not None
+        )
+        hotkey_variable: StringVar | None = None
+        if hotkey_feature is not None or group_hotkey:
+            hotkey_row = Frame(dialog, bg=SURFACE)
+            hotkey_row.pack(fill=X, pady=(0, 10))
+            Label(
+                hotkey_row,
+                text="快捷鍵",
+                font=("Microsoft JhengHei UI", 10),
+                bg=SURFACE,
+                fg=TEXT,
+            ).pack(side=LEFT)
+            hotkey_variable = StringVar(
+                master=self.parent,
+                value=(
+                    (
+                        self.feature_hotkeys.get(hotkey_feature, "")
+                        if hotkey_feature is not None
+                        else self.group_launch_hotkey_provider(
+                            self.current_group_name
+                        )
+                        if (
+                            self.group_launch_hotkey_provider is not None
+                            and self.current_group_name is not None
+                        )
+                        else ""
+                    )
+                    or "未設定"
+                ),
             )
+            hotkey_menu = OptionMenu(
+                hotkey_row,
+                hotkey_variable,
+                "未設定",
+                *(value for value in FEATURE_HOTKEYS if value),
+            )
+            hotkey_menu.configure(
+                font=("Microsoft JhengHei UI", 9),
+                bg=BACKGROUND,
+                fg=TEXT,
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+            )
+            hotkey_menu.pack(side=LEFT, padx=(8, 0))
+
+        background_row = Frame(dialog, bg=SURFACE)
+        background_row.pack(fill=X)
+        status_label = Label(
+            dialog,
+            text="此處只修改這張卡片。",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
+        )
+
+        def poll_background_status() -> None:
+            try:
+                exists = bool(dialog.winfo_exists())
+            except Exception:
+                exists = False
+            if not exists:
+                return
+            text, warning, keep_polling = (
+                self._direct_feature_card_background_status(card_id)
+            )
+            status_label.configure(
+                text=text,
+                fg=WARNING if warning else MUTED,
+            )
+            if keep_polling:
+                dialog.after(100, poll_background_status)
+
+        def choose_background() -> None:
+            self._choose_feature_card_background()
+            poll_background_status()
+
+        def clear_background() -> None:
+            self._mark_feature_card_background_clear(card_id)
+            status_label.configure(
+                text="已標記移除背景；按「儲存」後才會套用。",
+                fg=MUTED,
+            )
+
+        self._button(
+            background_row,
+            "選擇背景",
+            choose_background,
+        ).pack(side=LEFT)
+        self._button(
+            background_row,
+            "移除背景",
+            clear_background,
+        ).pack(side=LEFT, padx=(8, 0))
+        def request_default_title() -> None:
+            reset_title_requested["value"] = True
+            title_entry.delete(0, "end")
+            title_entry.insert(0, widgets.default_title)
+
+        self._button(
+            background_row,
+            "恢復預設名稱",
+            request_default_title,
+        ).pack(side=LEFT, padx=(8, 0))
+        status_label.pack(fill=X, pady=(10, 0))
+
+        actions = Frame(dialog, bg=SURFACE)
+        actions.pack(fill=X, pady=(12, 0))
+
+        def close_dialog() -> None:
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            if self._feature_card_settings_dialog is dialog:
+                self._feature_card_settings_dialog = None
+            dialog.destroy()
+
+        def cancel() -> None:
+            if (
+                self._card_background_prepare_running
+                and self._pending_card_background_id == card_id
+            ):
+                self._cancel_feature_card_background_prepare()
+            if (
+                self._pending_card_background_id == card_id
+                and self._pending_card_background_path is not None
+            ):
+                if self.on_discard_background_image is not None:
+                    self.on_discard_background_image(
+                        self._pending_card_background_path
+                    )
+                self._pending_card_background_path = None
+                self._pending_card_background_id = None
+                self._load_feature_card_background(card_id)
+            if self._pending_card_background_clear_id == card_id:
+                self._pending_card_background_clear_id = None
+            close_dialog()
+
+        def save() -> None:
+            if (
+                self._card_background_prepare_running
+                and self._pending_card_background_id == card_id
+            ):
+                status_label.configure(
+                    text="背景仍在準備，完成後再儲存。",
+                    fg=WARNING,
+                )
+                return
+            normalized_hotkey = ""
+            if hotkey_variable is not None:
+                normalized_hotkey = normalize_feature_hotkey(
+                    ""
+                    if hotkey_variable.get() == "未設定"
+                    else hotkey_variable.get()
+                )
+                if (
+                    hotkey_feature is not None
+                    and normalized_hotkey
+                    and any(
+                        value == normalized_hotkey
+                        for name, value in self.feature_hotkeys.items()
+                        if name != hotkey_feature
+                    )
+                ):
+                    status_label.configure(
+                        text="快捷鍵已被其他功能使用，原設定已保留。",
+                        fg=WARNING,
+                    )
+                    return
+            if self.on_save_feature_card_settings is not None:
+                batch_hotkey_feature = (
+                    hotkey_feature
+                    if hotkey_feature is not None
+                    else "group_launch"
+                    if group_hotkey
+                    else None
+                )
+                if not self._save_feature_card_settings(
+                    card_id=card_id,
+                    title=title_entry.get().strip(),
+                    reset_title=_should_reset_feature_card_title(
+                        reset_title_requested["value"],
+                        title_entry.get(),
+                        widgets.default_title,
+                    ),
+                    hotkey_feature=batch_hotkey_feature,
+                    hotkey=normalized_hotkey,
+                    group_name=(
+                        self.current_group_name
+                        if group_hotkey
+                        else None
+                    ),
+                    clear_background=(
+                        self._pending_card_background_clear_id
+                        == card_id
+                    ),
+                ):
+                    status_label.configure(
+                        text=(
+                            self._feature_card_save_error
+                            or "卡片設定無法儲存，全部設定均未變更。"
+                        ),
+                        fg=WARNING,
+                    )
+                    return
+                close_dialog()
+                return
+            previous_hotkey = ""
+            if hotkey_feature is not None:
+                previous_hotkey = self.feature_hotkeys.get(
+                    hotkey_feature,
+                    "",
+                )
+                accepted = (
+                    self.on_feature_hotkey_change(
+                        hotkey_feature,
+                        normalized_hotkey,
+                    )
+                    if self.on_feature_hotkey_change is not None
+                    else True
+                )
+                if accepted is False:
+                    status_label.configure(
+                        text=(
+                            "快捷鍵未通過衝突檢查；"
+                            "名稱與背景尚未儲存。"
+                        ),
+                        fg=WARNING,
+                    )
+                    return
+                self.feature_hotkeys[hotkey_feature] = normalized_hotkey
+                existing_variable = self._feature_hotkey_variables.get(
+                    hotkey_feature
+                )
+                if existing_variable is not None:
+                    existing_variable.set(
+                        normalized_hotkey or "未設定"
+                    )
+            elif group_hotkey and self.current_group_name is not None:
+                previous_hotkey = (
+                    self.group_launch_hotkey_provider(
+                        self.current_group_name
+                    )
+                    if self.group_launch_hotkey_provider is not None
+                    else ""
+                )
+                try:
+                    accepted = self.on_group_launch_hotkey_change(
+                        self.current_group_name,
+                        normalized_hotkey,
+                    )
+                except Exception as exc:
+                    self._report_refresh_error(exc)
+                    accepted = False
+                if accepted is False or (
+                    isinstance(accepted, str) and accepted.strip()
+                ):
+                    status_label.configure(
+                        text=(
+                            accepted
+                            if isinstance(accepted, str)
+                            else "整組啟動快捷鍵未通過檢查。"
+                        ),
+                        fg=WARNING,
+                    )
+                    return
+                if self._group_launch_hotkey_variable is not None:
+                    self._group_launch_hotkey_variable.set(
+                        normalized_hotkey or "未設定"
+                    )
+            if not self._save_feature_card_settings(
+                card_id=card_id,
+                title=title_entry.get().strip(),
+                reset_title=_should_reset_feature_card_title(
+                    reset_title_requested["value"],
+                    title_entry.get(),
+                    widgets.default_title,
+                ),
+            ):
+                try:
+                    if hotkey_feature is not None:
+                        if self.on_feature_hotkey_change is not None:
+                            self.on_feature_hotkey_change(
+                                hotkey_feature,
+                                previous_hotkey,
+                            )
+                        self.feature_hotkeys[hotkey_feature] = (
+                            previous_hotkey
+                        )
+                        existing_variable = (
+                            self._feature_hotkey_variables.get(
+                                hotkey_feature
+                            )
+                        )
+                        if existing_variable is not None:
+                            existing_variable.set(
+                                previous_hotkey or "未設定"
+                            )
+                    elif (
+                        group_hotkey
+                        and self.current_group_name is not None
+                        and self.on_group_launch_hotkey_change is not None
+                    ):
+                        self.on_group_launch_hotkey_change(
+                            self.current_group_name,
+                            previous_hotkey,
+                        )
+                        if self._group_launch_hotkey_variable is not None:
+                            self._group_launch_hotkey_variable.set(
+                                previous_hotkey or "未設定"
+                            )
+                except Exception as exc:
+                    self._report_refresh_error(exc)
+                status_label.configure(
+                    text=(
+                        self._feature_card_save_error
+                        or "卡片名稱或背景無法儲存，原設定已保留。"
+                    ),
+                    fg=WARNING,
+                )
+                return
+            close_dialog()
+
+        self._button(actions, "取消", cancel).pack(side=RIGHT)
+        self._button(
+            actions,
+            "儲存",
+            save,
+            primary=True,
+        ).pack(side=RIGHT, padx=(0, 8))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        title_entry.focus_set()
+
+    def _save_feature_card_settings(
+        self,
+        *,
+        card_id: str | None = None,
+        title: str | None = None,
+        reset_title: bool = False,
+        hotkey_feature: str | None = None,
+        hotkey: str = "",
+        group_name: str | None = None,
+        clear_background: bool = False,
+    ) -> bool:
+        self._feature_card_save_error = ""
+        selected_card_id = card_id or self._selected_feature_card_id()
+        widgets = self._feature_cards.get(selected_card_id or "")
+        entry = self._feature_card_title_entry
+        if (
+            selected_card_id is None
+            or widgets is None
+            or (title is None and entry is None)
+        ):
+            return False
+        clean_title = (
+            title.strip()
+            if title is not None
+            else entry.get().strip()
+        )
+        reset_title = _should_reset_feature_card_title(
+            bool(
+                reset_title
+                or getattr(self, "_pending_card_title_reset_id", None)
+                == selected_card_id
+            ),
+            clean_title,
+            widgets.default_title,
+        )
+        clear_background = bool(
+            clear_background
+            or self._pending_card_background_clear_id
+            == selected_card_id
+        )
+        if self.on_save_feature_card_settings is not None:
+            return self._save_feature_card_settings_batch(
+                selected_card_id=selected_card_id,
+                widgets=widgets,
+                clean_title=clean_title,
+                reset_title=reset_title,
+                hotkey_feature=hotkey_feature,
+                hotkey=hotkey,
+                group_name=group_name,
+                clear_background=clear_background,
+            )
+        previous_preference = self._feature_card_preference(
+            selected_card_id,
+            widgets.default_title,
+        )
+        preference = previous_preference
+        title_persisted = False
+        try:
+            if reset_title:
+                if self.on_feature_card_title_reset is not None:
+                    self.on_feature_card_title_reset(selected_card_id)
+                    title_persisted = True
+                preference = self._feature_card_preference(
+                    selected_card_id,
+                    widgets.default_title,
+                )
+            else:
+                preference = (
+                    self.on_feature_card_title_change(
+                        selected_card_id,
+                        clean_title,
+                    )
+                    if self.on_feature_card_title_change is not None
+                    else FeatureCardPreference(
+                        card_id=selected_card_id,
+                        title=clean_title,
+                        collapsed=widgets.collapsed,
+                    )
+                )
+                title_persisted = (
+                    self.on_feature_card_title_change is not None
+                )
             if (
                 self._pending_card_background_path is not None
-                and self._pending_card_background_id == card_id
+                and self._pending_card_background_id == selected_card_id
             ):
                 if self.on_save_card_background is None:
                     raise RuntimeError("card background save is unavailable")
                 result = self.on_save_card_background(
                     self._pending_card_background_path,
-                    card_id,
+                    selected_card_id,
                 )
                 if not result.succeeded:
                     raise RuntimeError(result.message)
                 self._pending_card_background_path = None
                 self._pending_card_background_id = None
-            if widgets.title_label is not None:
-                widgets.title_label.configure(text=preference.title)
-            old_label = self._feature_card_choice_label(card_id)
-            page_label = BACKGROUND_PAGE_LABELS.get(
-                widgets.page,
-                widgets.page,
-            )
-            new_label = f"{page_label}｜{preference.title}"
-            if old_label is not None:
-                self._feature_card_choice_ids.pop(old_label, None)
-                self._feature_card_choice_ids[new_label] = card_id
-                if self._feature_card_variable is not None:
-                    self._feature_card_variable.set(new_label)
-            self._load_feature_card_background(card_id)
+            elif (
+                self._pending_card_background_clear_id
+                == selected_card_id
+            ):
+                if self.on_clear_card_background is None:
+                    raise RuntimeError(
+                        "card background clear is unavailable"
+                    )
+                result = self.on_clear_card_background(selected_card_id)
+                if not result.succeeded:
+                    raise RuntimeError(result.message)
+                self._pending_card_background_clear_id = None
         except Exception as exc:
+            rollback_error: Exception | None = None
+            if title_persisted:
+                try:
+                    if (
+                        previous_preference.title
+                        == widgets.default_title
+                        and self.on_feature_card_title_reset is not None
+                    ):
+                        self.on_feature_card_title_reset(selected_card_id)
+                    elif self.on_feature_card_title_change is not None:
+                        self.on_feature_card_title_change(
+                            selected_card_id,
+                            previous_preference.title,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "card title rollback is unavailable"
+                        )
+                except Exception as rollback_exc:
+                    rollback_error = rollback_exc
+            base_message = str(exc) or "卡片設定無法儲存。"
+            self._feature_card_save_error = (
+                f"{base_message}；卡片名稱還原失敗，請重新開啟確認。"
+                if rollback_error is not None
+                else f"{base_message}；原本卡片設定已保留。"
+            )
             if self._feature_card_status_label is not None:
                 self._feature_card_status_label.configure(
-                    text=str(exc) or "卡片設定無法儲存，原設定已保留。"
+                    text=self._feature_card_save_error
                 )
+            if rollback_error is not None:
+                self._report_refresh_error(rollback_error)
             return False
+        if (
+            getattr(self, "_pending_card_title_reset_id", None)
+            == selected_card_id
+        ):
+            self._pending_card_title_reset_id = None
+        self._apply_saved_feature_card_settings(
+            selected_card_id,
+            widgets,
+            preference,
+        )
         if self._feature_card_status_label is not None:
             self._feature_card_status_label.configure(
                 text="卡片顯示文字與背景設定已儲存。"
             )
         return True
 
+    def _save_feature_card_settings_batch(
+        self,
+        *,
+        selected_card_id: str,
+        widgets: _FeatureCardWidgets,
+        clean_title: str,
+        reset_title: bool,
+        hotkey_feature: str | None,
+        hotkey: str,
+        group_name: str | None,
+        clear_background: bool,
+    ) -> bool:
+        pending_background_path = (
+            self._pending_card_background_path
+            if (
+                not clear_background
+                and self._pending_card_background_id == selected_card_id
+            )
+            else None
+        )
+        try:
+            result = self.on_save_feature_card_settings(
+                card_id=selected_card_id,
+                title=clean_title,
+                reset_title=bool(reset_title),
+                pending_background_path=pending_background_path,
+                hotkey_feature=hotkey_feature,
+                hotkey=hotkey,
+                group_name=group_name,
+                clear_background=bool(clear_background),
+            )
+        except Exception as exc:
+            self._feature_card_save_error = (
+                str(exc) or "卡片設定無法儲存，全部設定均未變更。"
+            )
+            self._report_refresh_error(exc)
+            return False
+        if (
+            not isinstance(result, FeatureCardSettingsSaveResult)
+            or not result.succeeded
+        ):
+            self._feature_card_save_error = (
+                result.message
+                if isinstance(result, FeatureCardSettingsSaveResult)
+                and result.message
+                else "卡片設定無法儲存，全部設定均未變更。"
+            )
+            if (
+                pending_background_path is not None
+                and not pending_background_path.is_file()
+                and self._pending_card_background_path
+                == pending_background_path
+                and self._pending_card_background_id == selected_card_id
+            ):
+                self._pending_card_background_path = None
+                self._pending_card_background_id = None
+                self._load_feature_card_background(selected_card_id)
+                self._card_background_prepare_message = (
+                    "背景預覽已失效，已恢復原本背景。"
+                )
+                self._feature_card_save_error = (
+                    self._feature_card_save_error.rstrip("。")
+                    + "；背景預覽已失效，已恢復原本背景。"
+                )
+            return False
+        preference = result.preference
+        if preference is None:
+            preference = self._feature_card_preference(
+                selected_card_id,
+                widgets.default_title,
+            )
+        if pending_background_path is not None:
+            self._pending_card_background_path = None
+            self._pending_card_background_id = None
+        if clear_background:
+            self._pending_card_background_clear_id = None
+        if (
+            getattr(self, "_pending_card_title_reset_id", None)
+            == selected_card_id
+        ):
+            self._pending_card_title_reset_id = None
+        if hotkey_feature in FEATURE_CARD_HOTKEY_TARGETS.values():
+            saved_hotkey = normalize_feature_hotkey(result.hotkey)
+            self.feature_hotkeys[hotkey_feature] = saved_hotkey
+            variable = self._feature_hotkey_variables.get(hotkey_feature)
+            if variable is not None:
+                variable.set(saved_hotkey or "未設定")
+        elif hotkey_feature == "group_launch":
+            if self._group_launch_hotkey_variable is not None:
+                self._group_launch_hotkey_variable.set(
+                    normalize_feature_hotkey(result.hotkey) or "未設定"
+                )
+        self._apply_saved_feature_card_settings(
+            selected_card_id,
+            widgets,
+            preference,
+        )
+        if self._feature_card_status_label is not None:
+            self._feature_card_status_label.configure(
+                text=result.message or "卡片設定已全部儲存。"
+            )
+        return True
+
+    def _apply_saved_feature_card_settings(
+        self,
+        card_id: str,
+        widgets: _FeatureCardWidgets,
+        preference: FeatureCardPreference,
+    ) -> None:
+        try:
+            self._feature_card_selected_id = card_id
+            if self._feature_card_title_entry is not None:
+                self._feature_card_title_entry.delete(0, "end")
+                self._feature_card_title_entry.insert(
+                    0,
+                    preference.title,
+                )
+            if widgets.title_label is not None:
+                widgets.title_label.configure(text=preference.title)
+            self._rebuild_feature_card_selector(card_id, preference)
+            self._load_feature_card_background(card_id)
+        except Exception as exc:
+            self._report_refresh_error(exc)
+
     def _reset_feature_card_title(self) -> None:
         card_id = self._selected_feature_card_id()
         widgets = self._feature_cards.get(card_id or "")
         if card_id is None or widgets is None:
             return
-        try:
-            if self.on_feature_card_title_reset is not None:
-                self.on_feature_card_title_reset(card_id)
-        except Exception as exc:
-            self._report_refresh_error(exc)
-            return
+        self._pending_card_title_reset_id = card_id
         if self._feature_card_title_entry is not None:
             self._feature_card_title_entry.delete(0, "end")
             self._feature_card_title_entry.insert(0, widgets.default_title)
-        if widgets.title_label is not None:
-            widgets.title_label.configure(text=widgets.default_title)
         if self._feature_card_status_label is not None:
             self._feature_card_status_label.configure(
-                text="卡片顯示文字已恢復預設。"
+                text="已標記恢復預設文字；按「儲存卡片設定」後才會套用。"
             )
 
     def _choose_feature_card_background(self) -> None:
@@ -5738,7 +7490,9 @@ class HomeView:
         self._card_background_prepare_cancel = Event()
         self._card_background_prepare_results = Queue()
         self._card_background_prepare_running = True
+        self._card_background_prepare_message = ""
         self._pending_card_background_id = card_id
+        self._pending_card_background_clear_id = None
         if self._card_background_choose_button is not None:
             self._card_background_choose_button.configure(state=DISABLED)
         if self._card_background_cancel_button is not None:
@@ -5810,8 +7564,12 @@ class HomeView:
             if card_id is not None:
                 widgets = self._feature_cards.get(card_id)
                 if widgets is not None:
+                    self._discard_feature_card_background_cache(card_id)
                     if widgets.background_source is not None:
                         widgets.background_source.close()
+                    if widgets.background_render_source is not None:
+                        widgets.background_render_source.close()
+                        widgets.background_render_source = None
                     with Image.open(outcome.managed_path) as opened:
                         opened.load()
                         widgets.background_source = opened.convert(
@@ -5821,6 +7579,7 @@ class HomeView:
                         )
                     self._schedule_feature_card_background(card_id)
             message = "卡片背景已預覽；按「儲存卡片設定」才會正式取代。"
+        self._card_background_prepare_message = message
         if self._feature_card_status_label is not None:
             self._feature_card_status_label.configure(text=message)
 
@@ -5831,9 +7590,29 @@ class HomeView:
         if self._card_background_cancel_button is not None:
             self._card_background_cancel_button.configure(state=DISABLED)
 
+    def _mark_feature_card_background_clear(self, card_id: str) -> None:
+        if (
+            self._pending_card_background_id == card_id
+            and self._pending_card_background_path is not None
+        ):
+            if self.on_discard_background_image is not None:
+                self.on_discard_background_image(
+                    self._pending_card_background_path
+                )
+            self._pending_card_background_path = None
+            self._pending_card_background_id = None
+            self._load_feature_card_background(card_id)
+        self._pending_card_background_clear_id = card_id
+
     def _clear_feature_card_background(self) -> None:
         card_id = self._selected_feature_card_id()
-        if card_id is None or self.on_clear_card_background is None:
+        if (
+            card_id is None
+            or (
+                self.on_save_feature_card_settings is None
+                and self.on_clear_card_background is None
+            )
+        ):
             return
         widgets = self._feature_cards.get(card_id)
         title = (
@@ -5847,24 +7626,14 @@ class HomeView:
             parent=self.parent,
         ):
             return
-        try:
-            result = self.on_clear_card_background(card_id)
-        except Exception:
-            return
-        if result.succeeded:
-            if (
-                self._pending_card_background_id == card_id
-                and self._pending_card_background_path is not None
-                and self.on_discard_background_image is not None
-            ):
-                self.on_discard_background_image(
-                    self._pending_card_background_path
-                )
-            self._pending_card_background_id = None
-            self._pending_card_background_path = None
-            self._load_feature_card_background(card_id)
+        self._mark_feature_card_background_clear(card_id)
         if self._feature_card_status_label is not None:
-            self._feature_card_status_label.configure(text=result.message)
+            self._feature_card_status_label.configure(
+                text=(
+                    "已標記移除卡片背景；"
+                    "按「儲存卡片設定」後才會套用。"
+                )
+            )
 
     def _apply_selected_theme(self) -> None:
         if self._theme_variable is None:
@@ -6226,6 +7995,8 @@ class HomeView:
         previous_card_id = self._pending_card_background_id
         self._pending_card_background_path = None
         self._pending_card_background_id = None
+        self._pending_card_background_clear_id = None
+        self._pending_card_title_reset_id = None
         if previous_card_id is not None:
             self._load_feature_card_background(previous_card_id)
         self._refresh_feature_card_settings()
@@ -6263,6 +8034,8 @@ class HomeView:
             )
         self._pending_card_background_path = None
         self._pending_card_background_id = None
+        self._pending_card_background_clear_id = None
+        self._pending_card_title_reset_id = None
         if self.on_clear_all_backgrounds is not None:
             try:
                 result = self.on_clear_all_backgrounds()
@@ -6378,6 +8151,8 @@ class HomeView:
         if (
             self._pending_background_path is not None
             or self._pending_card_background_path is not None
+            or self._pending_card_background_clear_id is not None
+            or getattr(self, "_pending_card_title_reset_id", None) is not None
             or self._feature_card_changes_dirty()
         ):
             return True
@@ -6410,7 +8185,16 @@ class HomeView:
         widgets = self._feature_cards.get(card_id or "")
         entry = self._feature_card_title_entry
         if card_id is None or widgets is None or entry is None:
-            return self._pending_card_background_path is not None
+            return bool(
+                self._pending_card_background_path is not None
+                or self._pending_card_background_clear_id is not None
+                or getattr(
+                    self,
+                    "_pending_card_title_reset_id",
+                    None,
+                )
+                is not None
+            )
         preference = self._feature_card_preference(
             card_id,
             widgets.default_title,
@@ -6418,6 +8202,9 @@ class HomeView:
         return (
             entry.get().strip() != preference.title
             or self._pending_card_background_path is not None
+            or self._pending_card_background_clear_id is not None
+            or getattr(self, "_pending_card_title_reset_id", None)
+            is not None
         )
 
     def prepare_close(self) -> bool:
@@ -6501,6 +8288,13 @@ class HomeView:
 
     def dispose(self) -> None:
         """Release background image resources before the Tk window closes."""
+        if self._feature_card_settings_dialog is not None:
+            try:
+                self._feature_card_settings_dialog.grab_release()
+                self._feature_card_settings_dialog.destroy()
+            except Exception:
+                pass
+            self._feature_card_settings_dialog = None
         self._cancel_game_time_tick()
         self._cancel_timed_click_capture()
         self._background_prepare_cancel.set()
@@ -6524,6 +8318,7 @@ class HomeView:
         if self._background_progress_bar is not None:
             self._background_progress_bar.stop()
         self._cancel_background_resize()
+        self._clear_background_display_images(restore_widgets=False)
         if self._background_source_image is not None:
             self._background_source_image.close()
         self._background_source_image = None
@@ -6539,6 +8334,9 @@ class HomeView:
             if widgets.background_source is not None:
                 widgets.background_source.close()
                 widgets.background_source = None
+            if widgets.background_render_source is not None:
+                widgets.background_render_source.close()
+                widgets.background_render_source = None
             widgets.background_photo = None
 
     def _save_card_display_seconds(self) -> None:
@@ -6878,7 +8676,9 @@ class HomeView:
             self._apply_saved_background_for_page(name)
         if self._page_canvas is not None:
             self._page_canvas.yview_moveto(0.0)
+            self._position_background_layers()
             self.parent.after_idle(self._sync_page_scroll_region)
+            self._schedule_background_widget_images()
 
     def _select_group(self, name: str) -> None:
         if getattr(self, "_group_reorder_mode", False):

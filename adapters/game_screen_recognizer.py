@@ -15,12 +15,16 @@ from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat
 
 from adapters.windows_background_capture import CaptureSample
 from core.reconnect_policy import ReconnectScreenState
-from domain.character import CharacterImportance, character_importance_rank
+from domain.character import CharacterImportance
 
 
 NormalizedRect = tuple[float, float, float, float]
 NormalizedPoint = tuple[float, float]
 FORCE_LOGIN_CLICK_POINT: NormalizedPoint = (0.505, 0.856)
+# Mouse delivery is relative to the Flash client area, while reference
+# screenshots include the 45-pixel Windows title bar. This targets the centre
+# of the confirmed "是" button in 14_force_login_timeout.png.
+FORCE_LOGIN_TIMEOUT_CLICK_POINT: NormalizedPoint = (0.500, 0.547)
 # Legacy fixed digit area retained only as a fail-closed fallback.  The route
 # status line is centered as a whole, so different character-name lengths move
 # the number horizontally.
@@ -92,19 +96,26 @@ CHARACTER_SLOT_CLICK_POINTS: tuple[NormalizedPoint, ...] = (
     (0.500, 0.706),
     (0.651, 0.706),
 )
-# Confirmed by the player's supplied role templates. The project-wide order is
-# still applied by CharacterImportance rather than by numeric level alone.
-CONFIRMED_LEVEL_IMPORTANCE = {
-    100: CharacterImportance.SECONDARY,
-    120: CharacterImportance.PRIMARY,
-    160: CharacterImportance.PRIMARY,
-}
 CHARACTER_LEVEL_MAXIMUM_SCORE = 48.0
 CHARACTER_LEVEL_MINIMUM_MARGIN = 0.75
-CHARACTER_SELECTED_CYAN_FRACTION = 0.25
+CHARACTER_SELECTED_MINIMUM_SCORE = 100.0
+CHARACTER_SELECTED_MINIMUM_MARGIN = 60.0
+CHARACTER_SELECTED_BORDER_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.285789474, 0.665, 0.422210526, 0.677872727),
+    (0.433631579, 0.665, 0.564368421, 0.677872727),
+    (0.585631579, 0.665, 0.716368421, 0.677872727),
+)
 BATTLE_REFERENCE_FILE = "13_battle_gameplay.png"
 BATTLE_CONTEXT_REGION: NormalizedRect = (0.73, 0.0, 1.0, 0.22)
 BATTLE_CONTEXT_MAXIMUM_SCORE = 28.0
+BATTLE_SCREEN_EVIDENCE_REGION: NormalizedRect = (0.08, 0.08, 0.92, 0.92)
+BATTLE_SCREEN_EVIDENCE_MAXIMUM_SCORE = 23.0
+BATTLE_SCREEN_STRUCTURE_REGION: NormalizedRect = (0.25, 0.25, 0.75, 0.75)
+BATTLE_SCREEN_MINIMUM_STDDEV = 30.0
+BATTLE_SCREEN_MINIMUM_EDGE_MEAN = 12.0
+DISCONNECT_OVERLAY_REGION: NormalizedRect = (0.323, 0.477, 0.677, 0.607)
+DISCONNECT_OVERLAY_SIGNATURE_SIZE = (162, 41)
+DISCONNECT_OVERLAY_MINIMUM_MASKED_STDDEV = 12.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +177,16 @@ DEFAULT_SCREEN_TEMPLATES: tuple[ScreenTemplateDefinition, ...] = (
         ),
         maximum_score=25.0,
         click_point=None,
+    ),
+    ScreenTemplateDefinition(
+        state=ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+        filename="14_force_login_timeout.png",
+        regions=(
+            (0.329, 0.475, 0.676, 0.617),
+            (0.455, 0.548, 0.545, 0.598),
+        ),
+        maximum_score=15.0,
+        click_point=FORCE_LOGIN_TIMEOUT_CLICK_POINT,
     ),
     ScreenTemplateDefinition(
         state=ReconnectScreenState.LINE_SELECTION,
@@ -231,11 +252,13 @@ DEFAULT_SCREEN_TEMPLATES: tuple[ScreenTemplateDefinition, ...] = (
 
 @dataclass(frozen=True, slots=True)
 class CharacterSelectionCandidate:
-    level: int
-    importance: CharacterImportance
+    level: int | None
+    importance: CharacterImportance | None
     slot_index: int
     selected: bool
     click_point: NormalizedPoint
+    digit_count: int | None = None
+    identity: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +301,9 @@ class ReferenceScreenRecognizer:
         if len(states) != len(set(states)):
             raise ValueError("Screen template states must be unique")
         self._references: dict[str, Image.Image] = {}
+        self._disconnect_overlay_reference: (
+            tuple[Image.Image, Image.Image, Image.Image] | None
+        ) = None
 
     @property
     def missing_references(self) -> tuple[str, ...]:
@@ -575,6 +601,54 @@ class ReferenceScreenRecognizer:
                 for red, green, blue in pixels.get_flattened_data()
             ]
         )
+        # A selected role card draws a bright vertical border through this
+        # narrow crop. Remove only full-height edge components so the border
+        # cannot be mistaken for another level digit.
+        width, height = mask.size
+        data = bytearray(mask.tobytes())
+        seen: set[int] = set()
+        for start, value in enumerate(data):
+            if not value or start in seen:
+                continue
+            stack = [start]
+            seen.add(start)
+            component: list[int] = []
+            while stack:
+                current = stack.pop()
+                component.append(current)
+                x = current % width
+                y = current // width
+                for delta_x, delta_y in (
+                    (1, 0),
+                    (-1, 0),
+                    (0, 1),
+                    (0, -1),
+                    (1, 1),
+                    (-1, -1),
+                    (1, -1),
+                    (-1, 1),
+                ):
+                    neighbour_x = x + delta_x
+                    neighbour_y = y + delta_y
+                    if not (
+                        0 <= neighbour_x < width
+                        and 0 <= neighbour_y < height
+                    ):
+                        continue
+                    neighbour = neighbour_y * width + neighbour_x
+                    if data[neighbour] and neighbour not in seen:
+                        seen.add(neighbour)
+                        stack.append(neighbour)
+            component_x = tuple(item % width for item in component)
+            component_y = tuple(item // width for item in component)
+            touches_side = (
+                min(component_x) == 0 or max(component_x) == width - 1
+            )
+            component_height = max(component_y) - min(component_y) + 1
+            if touches_side and component_height >= round(height * 0.6):
+                for item in component:
+                    data[item] = 0
+        mask = Image.frombytes("L", mask.size, bytes(data))
         row_counts = [
             sum(
                 1
@@ -621,6 +695,13 @@ class ReferenceScreenRecognizer:
             for band in bands
             if band[1] - band[0] >= 5 and band[2] >= 20
         ]
+        interior_bands = [
+            band
+            for band in meaningful_bands
+            if band[0] >= 4 and band[1] <= mask.height - 3
+        ]
+        if interior_bands:
+            meaningful_bands = interior_bands
         if not meaningful_bands:
             return None
         top, bottom, _pixel_count = meaningful_bands[0]
@@ -682,6 +763,8 @@ class ReferenceScreenRecognizer:
         if candidate is None:
             return None, None
         candidate_glyphs = self._level_glyph_signatures(candidate)
+        if len(candidate_glyphs) != 3:
+            return None, None
         scores: list[tuple[float, int]] = []
         for level, filename in CHARACTER_LEVEL_TEMPLATE_FILES.items():
             reference = self._level_signature(self._reference(filename))
@@ -691,13 +774,12 @@ class ReferenceScreenRecognizer:
             # All supported levels are three digits and differ at the middle
             # digit. Comparing that digit independently avoids treating
             # different Flash window scales/fonts as a different level.
-            if len(candidate_glyphs) == len(reference_glyphs) == 3:
-                difference = ImageChops.difference(
-                    candidate_glyphs[1],
-                    reference_glyphs[1],
-                )
-            else:
-                difference = ImageChops.difference(candidate, reference)
+            if len(reference_glyphs) != 3:
+                continue
+            difference = ImageChops.difference(
+                candidate_glyphs[1],
+                reference_glyphs[1],
+            )
             scores.append(
                 (float(ImageStat.Stat(difference).mean[0]), level)
             )
@@ -714,80 +796,66 @@ class ReferenceScreenRecognizer:
         return level, round(score, 3)
 
     @classmethod
-    def _character_slot_is_selected(
+    def _selected_character_slot_index(
         cls,
         image: Image.Image,
-        region: NormalizedRect,
-    ) -> bool:
-        crop = cls._crop(image, region).convert("RGB")
-        pixels = crop.get_flattened_data()
-        total = crop.width * crop.height
-        if total <= 0:
-            return False
-        cyan_pixels = sum(
-            1
-            for red, green, blue in pixels
-            if green >= 100
-            and blue >= 100
-            and green > red * 1.2
-            and blue > red * 1.2
-            and green + blue >= 280
-        )
-        return (
-            cyan_pixels / total
-            >= CHARACTER_SELECTED_CYAN_FRACTION
-        )
+    ) -> int | None:
+        scores: list[tuple[float, int]] = []
+        for index, region in enumerate(
+            CHARACTER_SELECTED_BORDER_REGIONS
+        ):
+            crop = cls._crop(image, region).convert("RGB")
+            pixels = tuple(crop.get_flattened_data())
+            if not pixels:
+                return None
+            score = sum(
+                min(red, green, blue)
+                for red, green, blue in pixels
+            ) / len(pixels)
+            scores.append((score, index))
+        scores.sort(reverse=True)
+        winner_score, winner_index = scores[0]
+        runner_up_score = scores[1][0]
+        if (
+            winner_score < CHARACTER_SELECTED_MINIMUM_SCORE
+            or winner_score - runner_up_score
+            < CHARACTER_SELECTED_MINIMUM_MARGIN
+        ):
+            return None
+        return winner_index
 
     def _character_selection_candidates(
         self,
         image: Image.Image,
     ) -> tuple[CharacterSelectionCandidate, ...]:
-        choices: list[
-            tuple[int, int, int, CharacterImportance, bool]
-        ] = []
-        for index, (level_region, slot_region) in enumerate(
-            zip(CHARACTER_LEVEL_REGIONS, CHARACTER_SLOT_REGIONS)
-        ):
+        selected_slot = self._selected_character_slot_index(image)
+        choices: list[CharacterSelectionCandidate] = []
+        for index, level_region in enumerate(CHARACTER_LEVEL_REGIONS):
+            signature = self._level_signature(
+                self._crop(image, level_region)
+            )
+            if signature is None:
+                continue
+            digit_count = len(self._level_glyph_signatures(signature))
             level, _score = self._recognize_character_level(
                 image,
                 level_region,
             )
-            if level is None:
-                continue
-            importance = CONFIRMED_LEVEL_IMPORTANCE.get(level)
-            if importance is None:
-                continue
-            selected = self._character_slot_is_selected(image, slot_region)
             choices.append(
-                (
-                    character_importance_rank(importance),
-                    -level,
-                    index,
-                    importance,
-                    selected,
+                CharacterSelectionCandidate(
+                    level=level,
+                    importance=None,
+                    slot_index=index,
+                    selected=index == selected_slot,
+                    click_point=(
+                        CHARACTER_ENTER_CLICK_POINT
+                        if index == selected_slot
+                        else CHARACTER_SLOT_CLICK_POINTS[index]
+                    ),
+                    digit_count=digit_count,
                 )
             )
-        ordered = sorted(choices)
-        return tuple(
-            CharacterSelectionCandidate(
-                level=-negative_level,
-                importance=importance,
-                slot_index=index,
-                selected=selected,
-                click_point=(
-                    CHARACTER_ENTER_CLICK_POINT
-                    if selected
-                    else CHARACTER_SLOT_CLICK_POINTS[index]
-                ),
-            )
-            for (
-                _importance_rank,
-                negative_level,
-                index,
-                importance,
-                selected,
-            ) in ordered
-        )
+        return tuple(choices)
 
     def _character_selection_target(
         self,
@@ -802,7 +870,12 @@ class ReferenceScreenRecognizer:
         candidates = self._character_selection_candidates(image)
         if not candidates:
             return None, None, None, None, None
-        selected_candidate = candidates[0]
+        selected_candidates = tuple(
+            candidate for candidate in candidates if candidate.selected
+        )
+        if len(selected_candidates) != 1:
+            return None, None, None, None, None
+        selected_candidate = selected_candidates[0]
         return (
             selected_candidate.click_point,
             selected_candidate.level,
@@ -823,8 +896,8 @@ class ReferenceScreenRecognizer:
         difference = ImageChops.difference(candidate_signature, reference_signature)
         return float(ImageStat.Stat(difference).mean[0])
 
-    def _is_battle_context(self, candidate: Image.Image) -> bool:
-        """Match the stable top-right auto-battle panel outside the dialog."""
+    def _battle_context_score(self, candidate: Image.Image) -> float:
+        """Score the stable top-right auto-battle panel outside any dialog."""
         reference = self._reference(BATTLE_REFERENCE_FILE)
         variants = [candidate]
         if candidate.height >= 100:
@@ -846,7 +919,74 @@ class ReferenceScreenRecognizer:
             )
             for variant in variants
         )
-        return score <= BATTLE_CONTEXT_MAXIMUM_SCORE
+        return score
+
+    def _battle_screen_evidence_score(self, candidate: Image.Image) -> float:
+        """Require broad gameplay evidence before reporting battle as online."""
+        reference = self._reference(BATTLE_REFERENCE_FILE)
+        variants = [candidate]
+        if candidate.height >= 100:
+            variants.append(
+                candidate.crop(
+                    (
+                        0,
+                        round(candidate.height * 0.05),
+                        candidate.width,
+                        round(candidate.height * 0.985),
+                    )
+                )
+            )
+        reference_signature = ImageOps.fit(
+            self._crop(
+                reference,
+                BATTLE_SCREEN_EVIDENCE_REGION,
+            ).filter(ImageFilter.GaussianBlur(radius=2.0)),
+            self.SIGNATURE_SIZE,
+            method=Image.Resampling.BILINEAR,
+        )
+        return min(
+            sum(
+                ImageStat.Stat(
+                    ImageChops.difference(
+                        ImageOps.fit(
+                            self._crop(
+                                variant,
+                                BATTLE_SCREEN_EVIDENCE_REGION,
+                            ).filter(
+                                ImageFilter.GaussianBlur(radius=2.0)
+                            ),
+                            self.SIGNATURE_SIZE,
+                            method=Image.Resampling.BILINEAR,
+                        ),
+                        reference_signature,
+                    )
+                ).mean
+            )
+            / 3.0
+            for variant in variants
+        )
+
+    @classmethod
+    def _battle_screen_has_structure(cls, candidate: Image.Image) -> bool:
+        """Reject a stable battle panel shown above a large unknown overlay."""
+        centre = cls._crop(
+            candidate,
+            BATTLE_SCREEN_STRUCTURE_REGION,
+        ).convert("L")
+        structure = ImageStat.Stat(centre)
+        edge_mean = ImageStat.Stat(
+            centre.filter(ImageFilter.FIND_EDGES)
+        ).mean[0]
+        return (
+            structure.stddev[0] >= BATTLE_SCREEN_MINIMUM_STDDEV
+            and edge_mean >= BATTLE_SCREEN_MINIMUM_EDGE_MEAN
+        )
+
+    def _is_battle_context(self, candidate: Image.Image) -> bool:
+        return (
+            self._battle_context_score(candidate)
+            <= BATTLE_CONTEXT_MAXIMUM_SCORE
+        )
 
     @staticmethod
     def _flat_pixels(image: Image.Image) -> list[tuple[int, int, int]]:
@@ -855,33 +995,48 @@ class ReferenceScreenRecognizer:
             return list(getter())
         return list(image.getdata())
 
-    @classmethod
-    def _disconnect_overlay_score(
-        cls,
-        candidate: Image.Image,
+    def _prepared_disconnect_overlay_reference(
+        self,
         reference: Image.Image,
-    ) -> float:
-        """Compare only the stable cyan/text pixels of the centered dialog."""
-        region = (0.323, 0.477, 0.677, 0.607)
-        signature_size = (162, 41)
-        reference_crop = cls._crop(reference, region).resize(
-            signature_size,
+    ) -> tuple[Image.Image, Image.Image] | None:
+        prepared = self._disconnect_overlay_reference
+        if prepared is not None and prepared[0] is reference:
+            return prepared[1], prepared[2]
+
+        reference_crop = self._crop(
+            reference,
+            DISCONNECT_OVERLAY_REGION,
+        ).resize(
+            DISCONNECT_OVERLAY_SIGNATURE_SIZE,
             Image.Resampling.BILINEAR,
         )
-        reference_pixels = cls._flat_pixels(reference_crop)
-        mask = [
-            index
-            for index, (red, green, blue) in enumerate(reference_pixels)
-            if (
-                (green > 115 and blue > 115 and blue > red * 1.03)
-                or (red > 175 and green > 175 and blue > 175)
-                or (red > 170 and green > 145 and blue < 125)
-            )
-        ]
-        if not mask:
-            return 255.0
+        mask = Image.new("L", reference_crop.size, 0)
+        mask.putdata(
+            [
+                255
+                if (
+                    (green > 115 and blue > 115 and blue > red * 1.03)
+                    or (red > 175 and green > 175 and blue > 175)
+                    or (red > 170 and green > 145 and blue < 125)
+                )
+                else 0
+                for red, green, blue in self._flat_pixels(reference_crop)
+            ]
+        )
+        if mask.getbbox() is None:
+            return None
+        self._disconnect_overlay_reference = (
+            reference,
+            reference_crop,
+            mask,
+        )
+        return reference_crop, mask
 
-        left, top, right, bottom = region
+    @staticmethod
+    def _disconnect_overlay_candidate_boxes(
+        candidate: Image.Image,
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        left, top, right, bottom = DISCONNECT_OVERLAY_REGION
         width, height = candidate.size
         base_box = (
             round(width * left),
@@ -889,39 +1044,123 @@ class ReferenceScreenRecognizer:
             round(width * right),
             round(height * bottom),
         )
+        base_width = base_box[2] - base_box[0]
+        base_height = base_box[3] - base_box[1]
+        center_x = (base_box[0] + base_box[2]) / 2.0
+        center_y = (base_box[1] + base_box[3]) / 2.0
         offset_x = max(2, round(width * 0.007))
         offset_y = max(2, round(height * 0.010))
-        best = 255.0
-        y_offsets = sorted(
+        boxes: list[tuple[int, int, int, int]] = []
+
+        # Preserve the original fine translation search for normal title-bar
+        # and capture-border differences.
+        for delta_y in sorted(
             set(range(-offset_y, offset_y + 1, 2)) | {0}
-        )
-        x_offsets = sorted(
-            set(range(-offset_x, offset_x + 1, 2)) | {0}
-        )
-        for delta_y in y_offsets:
-            for delta_x in x_offsets:
-                box = (
-                    base_box[0] + delta_x,
-                    base_box[1] + delta_y,
-                    base_box[2] + delta_x,
-                    base_box[3] + delta_y,
+        ):
+            for delta_x in sorted(
+                set(range(-offset_x, offset_x + 1, 2)) | {0}
+            ):
+                boxes.append(
+                    (
+                        base_box[0] + delta_x,
+                        base_box[1] + delta_y,
+                        base_box[2] + delta_x,
+                        base_box[3] + delta_y,
+                    )
                 )
-                candidate_crop = candidate.crop(box).resize(
-                    signature_size,
-                    Image.Resampling.BILINEAR,
-                )
-                candidate_pixels = cls._flat_pixels(candidate_crop)
-                total = 0.0
-                for index in mask:
-                    reference_pixel = reference_pixels[index]
-                    candidate_pixel = candidate_pixels[index]
-                    total += (
-                        abs(reference_pixel[0] - candidate_pixel[0])
-                        + abs(reference_pixel[1] - candidate_pixel[1])
-                        + abs(reference_pixel[2] - candidate_pixel[2])
-                    ) / 3.0
-                best = min(best, total / len(mask))
-        return best
+
+        # A Flash client captured through another route can move the modal by
+        # roughly one title-bar height or scale it independently of the outer
+        # window. Search a bounded coarse grid before battle-online evidence is
+        # allowed to win.
+        for scale in (0.90, 0.95, 1.0, 1.05, 1.10):
+            scaled_width = max(1, round(base_width * scale))
+            scaled_height = max(1, round(base_height * scale))
+            for y_multiplier in (-2, -1, 0, 1, 2):
+                for x_multiplier in (-2, -1, 0, 1, 2):
+                    shifted_x = center_x + x_multiplier * offset_x
+                    shifted_y = center_y + y_multiplier * offset_y
+                    crop_left = round(shifted_x - scaled_width / 2.0)
+                    crop_top = round(shifted_y - scaled_height / 2.0)
+                    boxes.append(
+                        (
+                            crop_left,
+                            crop_top,
+                            crop_left + scaled_width,
+                            crop_top + scaled_height,
+                        )
+                    )
+        return tuple(dict.fromkeys(boxes))
+
+    def _best_disconnect_overlay_match(
+        self,
+        candidate: Image.Image,
+        reference: Image.Image,
+    ) -> tuple[float, Image.Image | None]:
+        """Return the best bounded position/scale match and its exact crop."""
+        prepared = self._prepared_disconnect_overlay_reference(reference)
+        if prepared is None:
+            return 255.0, None
+        reference_crop, mask = prepared
+
+        best = 255.0
+        best_crop = None
+        for box in self._disconnect_overlay_candidate_boxes(candidate):
+            candidate_crop = candidate.crop(box).resize(
+                DISCONNECT_OVERLAY_SIGNATURE_SIZE,
+                Image.Resampling.BILINEAR,
+            )
+            difference = ImageChops.difference(
+                candidate_crop,
+                reference_crop,
+            )
+            channel_means = ImageStat.Stat(
+                difference,
+                mask=mask,
+            ).mean
+            score = sum(channel_means) / len(channel_means)
+            if score < best:
+                best = score
+                best_crop = candidate_crop
+            if best == 0.0:
+                break
+        return best, best_crop
+
+    def _disconnect_overlay_score(
+        self,
+        candidate: Image.Image,
+        reference: Image.Image,
+    ) -> float:
+        """Compare stable dialog pixels across bounded position/scale drift."""
+        score, _crop = self._best_disconnect_overlay_match(
+            candidate,
+            reference,
+        )
+        return score
+
+    def _disconnect_overlay_has_structure(
+        self,
+        candidate: Image.Image,
+        reference: Image.Image,
+    ) -> bool:
+        prepared = self._prepared_disconnect_overlay_reference(reference)
+        if prepared is None:
+            return False
+        _reference_crop, mask = prepared
+        _score, candidate_crop = self._best_disconnect_overlay_match(
+            candidate,
+            reference,
+        )
+        if candidate_crop is None:
+            return False
+        channel_stddev = ImageStat.Stat(
+            candidate_crop,
+            mask=mask,
+        ).stddev
+        return (
+            sum(channel_stddev) / len(channel_stddev)
+            >= DISCONNECT_OVERLAY_MINIMUM_MASKED_STDDEV
+        )
 
     def recognize_image(self, image: Image.Image) -> ScreenRecognition:
         candidate = image.convert("RGB")
@@ -950,6 +1189,10 @@ class ReferenceScreenRecognizer:
         if (
             abs(candidate_ratio - disconnected_ratio) <= 0.12
             and disconnected_score <= disconnected.maximum_score
+            and self._disconnect_overlay_has_structure(
+                candidate,
+                disconnected_reference,
+            )
         ):
             return ScreenRecognition(
                 state=ReconnectScreenState.DISCONNECTED,
@@ -957,6 +1200,47 @@ class ReferenceScreenRecognizer:
                 click_point=disconnected.click_point,
                 reference_name=disconnected.filename,
                 battle_context=self._is_battle_context(candidate),
+            )
+
+        # A normal auto-battle screen uses a dedicated full-window reference
+        # because its right-side layout differs from ordinary gameplay.  The
+        # disconnect overlay above always wins first; this branch is therefore
+        # read-only evidence that the game remains connected and never exposes
+        # a click target.
+        battle_reference = self._reference(BATTLE_REFERENCE_FILE)
+        battle_ratio = battle_reference.width / battle_reference.height
+        battle_score = self._battle_context_score(candidate)
+        if (
+            abs(candidate_ratio - battle_ratio) <= 0.12
+            and battle_score <= BATTLE_CONTEXT_MAXIMUM_SCORE
+        ):
+            battle_evidence_score = self._battle_screen_evidence_score(
+                candidate
+            )
+            if (
+                battle_evidence_score
+                <= BATTLE_SCREEN_EVIDENCE_MAXIMUM_SCORE
+                and self._battle_screen_has_structure(candidate)
+            ):
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=round(
+                        max(battle_score, battle_evidence_score),
+                        3,
+                    ),
+                    click_point=None,
+                    reference_name=BATTLE_REFERENCE_FILE,
+                    battle_context=True,
+                )
+            # The stable auto-battle panel may remain visible underneath an
+            # unrecognized modal. Do not let another broad gameplay template
+            # turn that incomplete evidence into a false online result.
+            return ScreenRecognition(
+                state=ReconnectScreenState.UNKNOWN,
+                score=round(battle_evidence_score, 3),
+                click_point=None,
+                reference_name=None,
+                battle_context=False,
             )
 
         scored: list[tuple[float, ScreenTemplateDefinition]] = []
@@ -1025,17 +1309,21 @@ class ReferenceScreenRecognizer:
         # Its background therefore remains an excellent LOGIN_START match.
         # Prefer the confirmed modal whenever its own score is inside the
         # validated threshold, even when the underlying screen scores lower.
-        line_selection_match = next(
+        modal_match = next(
             (
                 item
                 for item in valid_scored
-                if item[1].state is ReconnectScreenState.LINE_SELECTION
+                if item[1].state
+                in {
+                    ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+                    ReconnectScreenState.LINE_SELECTION,
+                }
             ),
             None,
         )
         score, definition = (
-            line_selection_match
-            if line_selection_match is not None
+            modal_match
+            if modal_match is not None
             else min(valid_scored, key=lambda item: item[0])
         )
         line_number = None
@@ -1056,17 +1344,7 @@ class ReferenceScreenRecognizer:
                 character_importance,
                 character_slot_index,
                 character_slot_selected,
-            ) = (
-                (
-                    character_candidates[0].click_point,
-                    character_candidates[0].level,
-                    character_candidates[0].importance,
-                    character_candidates[0].slot_index,
-                    character_candidates[0].selected,
-                )
-                if character_candidates
-                else (None, None, None, None, None)
-            )
+            ) = self._character_selection_target(candidate)
         return ScreenRecognition(
             state=definition.state,
             score=round(score, 3),

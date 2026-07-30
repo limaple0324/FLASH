@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 import traceback
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
@@ -103,6 +104,9 @@ from services.feature_hotkey_monitor import (
     normalize_feature_hotkey,
 )
 from services.feature_card_layout_service import FeatureCardLayoutService
+from services.feature_card_settings_batch_service import (
+    FeatureCardSettingsBatchService,
+)
 from services.background_image_service import BackgroundImageService
 from services.card_coordinator import CardCoordinator
 from services.card_display_settings_service import CardDisplaySettingsService
@@ -204,6 +208,11 @@ from services.smart_reconnect_monitor import (
     SmartReconnectMonitor,
     normalize_smart_reconnect_interval_ms,
 )
+from services.smart_reconnect_capture_settings_service import (
+    SMART_RECONNECT_CAPTURE_MODES_KEY,
+    SmartReconnectCaptureSettings,
+    SmartReconnectCaptureSettingsService,
+)
 from services.sync_scope_service import SyncScopeService
 from services.sync_conflict_arbiter import SyncConflictArbiter
 from services.deferred_sync_operation_service import (
@@ -227,6 +236,7 @@ from services.true_event_card_service import TrueEventCardService
 from services.ui_callback_dispatcher import UiCallbackDispatcher
 from ui.home import HomeView
 from ui.home import (
+    FeatureCardSettingsSaveResult,
     GroupManagementViewResult,
     UI_THEME_LABELS,
     theme_palette,
@@ -250,6 +260,9 @@ INPUT_POLICY_KEY = "input_policy"
 SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
 SMART_RECONNECT_CONSENT_KEY = "smart_reconnect_consent_v1"
 SMART_RECONNECT_INTERVAL_MS_KEY = "disconnect_detect_interval_ms"
+SMART_RECONNECT_INTERVAL_MIGRATION_KEY = (
+    "disconnect_detect_interval_default_v2"
+)
 UI_THEME_KEY = "ui_theme"
 UI_THEME_CLASSIC_GOLD_MIGRATION_KEY = "ui_theme_classic_gold_migration_v1"
 CURRENT_GROUP_NAME_KEY = "current_group_name"
@@ -400,6 +413,17 @@ def build_services(
                 UI_THEME_CLASSIC_GOLD_MIGRATION_KEY: True,
             }
         )
+    if config.get(SMART_RECONNECT_INTERVAL_MIGRATION_KEY) is not True:
+        current_interval = config.get(SMART_RECONNECT_INTERVAL_MS_KEY)
+        values = {SMART_RECONNECT_INTERVAL_MIGRATION_KEY: True}
+        if (
+            current_interval is None
+            or str(current_interval).strip() == "1000"
+        ):
+            values[SMART_RECONNECT_INTERVAL_MS_KEY] = (
+                DEFAULT_SMART_RECONNECT_INTERVAL_MS
+            )
+        config.update_values(values)
     config.ensure_defaults(
         {
             INPUT_POLICY_KEY: WindowInputPolicy.ALL.value,
@@ -408,6 +432,7 @@ def build_services(
             SMART_RECONNECT_INTERVAL_MS_KEY: (
                 DEFAULT_SMART_RECONNECT_INTERVAL_MS
             ),
+            SMART_RECONNECT_INTERVAL_MIGRATION_KEY: True,
             UI_THEME_KEY: "classic_gold",
             SYNC_SELECTED_KEYS_KEY: ["ESC"],
             SYNC_KEYS_COLLAPSED_KEY: True,
@@ -426,6 +451,9 @@ def build_services(
                 "repeat_interval_ms": 250,
             },
         }
+    )
+    smart_reconnect_capture_settings_service = (
+        SmartReconnectCaptureSettingsService(config)
     )
     data_contract_migration_service = DataContractMigrationService(config)
     data_contract_migration_service.verify_supported_versions(
@@ -647,6 +675,10 @@ def build_services(
     AppContext.register(LoggerService, logger)
     AppContext.register(ConfigManager, config)
     AppContext.register(
+        SmartReconnectCaptureSettingsService,
+        smart_reconnect_capture_settings_service,
+    )
+    AppContext.register(
         DataContractMigrationService,
         data_contract_migration_service,
     )
@@ -786,6 +818,9 @@ def build_services(
         reference_dir=resource_path(RECONNECT_REFERENCE_DIR),
         state_path=paths.data_dir() / RECONNECT_STATE_FILENAME,
         window_backend=synchronized_window_backend,
+        capture_settings=(
+            smart_reconnect_capture_settings_service.snapshot()
+        ),
         target_windows_provider=current_reconnect_targets,
         operation_gate=game_operation_gate,
         failure_status_service=reconnect_failure_status_service,
@@ -1415,6 +1450,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     smart_reconnect_controller = AppContext.get(
         WindowsSmartReconnectController
     )
+    smart_reconnect_capture_settings_service = AppContext.get(
+        SmartReconnectCaptureSettingsService
+    )
     game_operation_gate = AppContext.get(GameOperationGate)
     reconnect_failure_status_service = AppContext.get(
         ReconnectFailureStatusService
@@ -1863,6 +1901,23 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         for name in ("sync", "reconnect", "auto_click")
     }
+    feature_card_settings_batch_service = (
+        FeatureCardSettingsBatchService(
+            config=config,
+            feature_card_layout_service=feature_card_layout_service,
+            background_image_service=background_image_service,
+            configured_feature_hotkeys=configured_feature_hotkeys,
+            feature_hotkeys_config_key=FEATURE_HOTKEYS_KEY,
+            group_configuration_service=group_configuration_service,
+            error_logger=logger.error,
+        )
+        if (
+            config is not None
+            and feature_card_layout_service is not None
+            and background_image_service is not None
+        )
+        else None
+    )
 
     def change_selected_sync_keys(keys: tuple[str, ...]) -> bool:
         normalized = list(
@@ -2034,7 +2089,56 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             or len(plan.targets) != choice.character_count
         ):
             return None
-        return plan
+        profiles = {
+            character.character_id: character
+            for character in (
+                character_store.load()
+                if character_store is not None
+                else ()
+            )
+        }
+        members = {
+            member.entry_id: member
+            for member in choice.members
+        }
+
+        def registered_profile(target):
+            member = members.get(target.entry_id)
+            character_id = (
+                member.character_id
+                if member is not None
+                else None
+            )
+            return (
+                profiles.get(character_id)
+                if character_id is not None
+                else None
+            )
+
+        def with_registered_profile(target):
+            profile = registered_profile(target)
+            return replace(
+                target,
+                registered_level=(
+                    profile.level
+                    if profile is not None
+                    else None
+                ),
+                importance=(
+                    profile.importance
+                    if profile is not None
+                    else None
+                ),
+            )
+
+        return GroupLaunchPlan(
+            group_name=plan.group_name,
+            targets=tuple(
+                with_registered_profile(target)
+                for target in plan.targets
+            ),
+            failure_codes=plan.failure_codes,
+        )
 
     def write_clipboard(value: str) -> bool:
         try:
@@ -2258,9 +2362,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "自動操作尚未完全停止，未切換組別。",
             )
         try:
+            selected_workspace_group = workspace_group_for_choice(choice)
             if apply_group_identity(choice) is None:
                 raise RuntimeError("group_identity_unresolved")
-            selected_workspace_group = workspace_group_for_choice(choice)
             config.set(CURRENT_GROUP_NAME_KEY, choice.name)
             workspace_service.set_current_group(
                 selected_workspace_group
@@ -2379,15 +2483,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         try:
             if choice is not None:
+                selected_workspace_group = workspace_group_for_choice(choice)
                 if apply_group_identity(choice) is None:
                     raise RuntimeError("group_identity_unresolved")
             else:
                 clear_group_identity()
-            selected_workspace_group = (
-                workspace_group_for_choice(choice)
-                if choice is not None
-                else None
-            )
+                selected_workspace_group = None
             config.set(
                 CURRENT_GROUP_NAME_KEY,
                 choice.name if choice is not None else "",
@@ -2671,6 +2772,40 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return GroupHotkeyConflictError.player_message
         return None
 
+    def save_feature_card_settings(
+        *,
+        card_id: str,
+        title: str,
+        reset_title: bool,
+        pending_background_path: Path | None,
+        clear_background: bool,
+        hotkey_feature: str | None,
+        hotkey: str,
+        group_name: str | None,
+    ) -> FeatureCardSettingsSaveResult:
+        if feature_card_settings_batch_service is None:
+            return FeatureCardSettingsSaveResult(
+                False,
+                "卡片設定服務尚未準備完成，全部設定均未變更。",
+            )
+        result = feature_card_settings_batch_service.save(
+            card_id=card_id,
+            title=title,
+            reset_title=reset_title,
+            pending_background_path=pending_background_path,
+            clear_background=clear_background,
+            hotkey_feature=hotkey_feature,
+            hotkey=hotkey,
+            group_name=group_name,
+        )
+        return FeatureCardSettingsSaveResult(
+            succeeded=result.succeeded,
+            message=result.message,
+            preference=result.preference,
+            background_path=result.background_path,
+            hotkey=result.hotkey,
+        )
+
     def group_entries(group_name: str):
         if group_configuration_service is None:
             return ()
@@ -2953,17 +3088,21 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             contract.fingerprint,
         )
 
-    def refresh_group_sync_identity(group_name: str) -> None:
-        if group_selection_service is None:
-            return
+    def refresh_group_sync_identity(group_name: str) -> bool:
+        if (
+            group_selection_service is None
+            or config is None
+            or config.get(CURRENT_GROUP_NAME_KEY, "") != group_name
+        ):
+            return False
         choice = group_selection_service.find(group_name)
         if choice is None or not close_group_operation_gate():
-            return
+            return False
         try:
-            applied = apply_group_identity(choice) is not None
+            return apply_group_identity(choice) is not None
         except Exception:
-            applied = False
-        if applied:
+            return False
+        finally:
             reopen_group_operation_gate()
 
     def capture_sync_base_point(group_name: str) -> str:
@@ -3108,6 +3247,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 entry_id,
                 result.role_id,
             )
+            refresh_group_sync_identity(group_name)
         return result.message
 
     def read_role_id(group_name: str, entry_id: str) -> str:
@@ -3126,6 +3266,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 entry_id,
                 result.role_id,
             )
+            refresh_group_sync_identity(group_name)
             return f"已讀取角色ID：{result.role_id}"
         return result.message
 
@@ -3669,6 +3810,33 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         return True
 
+    def change_smart_reconnect_capture_modes(modes: object) -> bool:
+        if (
+            smart_reconnect_capture_settings_service is None
+            or smart_reconnect_controller is None
+        ):
+            return False
+        try:
+            settings = (
+                smart_reconnect_capture_settings_service.update(modes)
+            )
+            smart_reconnect_controller.set_capture_settings(settings)
+        except Exception as error:
+            if logger is not None:
+                logger.error(
+                    "Smart reconnect capture modes were not changed; "
+                    f"error_type={type(error).__name__}"
+                )
+            return False
+        if logger is not None:
+            logger.info(
+                "Smart reconnect capture modes changed; "
+                f"visible={settings.visible}; "
+                f"obscured={settings.obscured}; "
+                f"minimized={settings.minimized}"
+            )
+        return True
+
     def change_auto_click(
         enabled: bool,
         interval_ms: int,
@@ -3995,6 +4163,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_smart_reconnect_interval_change=(
             change_smart_reconnect_interval
         ),
+        smart_reconnect_capture_modes=(
+            smart_reconnect_capture_settings_service.snapshot().to_dict()
+            if smart_reconnect_capture_settings_service is not None
+            else SmartReconnectCaptureSettings().to_dict()
+        ),
+        on_smart_reconnect_capture_modes_change=(
+            change_smart_reconnect_capture_modes
+        ),
         reconnect_failure_messages_provider=(
             lambda: tuple(
                 item.message
@@ -4086,6 +4262,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if feature_card_layout_service is not None
             else None
         ),
+        on_save_feature_card_settings=save_feature_card_settings,
         card_background_provider=(
             background_image_service.current_card_background
             if background_image_service is not None

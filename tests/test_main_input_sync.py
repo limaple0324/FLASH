@@ -16,6 +16,7 @@ from main import (
     SMART_RECONNECT_ENABLED_KEY,
     SMART_RECONNECT_CONSENT_KEY,
     SMART_RECONNECT_INTERVAL_MS_KEY,
+    SMART_RECONNECT_INTERVAL_MIGRATION_KEY,
     SYNC_KEYS_COLLAPSED_KEY,
     TIMED_CLICK_SETTINGS_KEY,
     UI_THEME_CLASSIC_GOLD_MIGRATION_KEY,
@@ -25,6 +26,11 @@ from main import (
 )
 from services.app_context import AppContext
 from services.smart_reconnect_monitor import SmartReconnectMonitor
+from services.smart_reconnect_capture_settings_service import (
+    SMART_RECONNECT_CAPTURE_MODES_KEY,
+    SmartReconnectCaptureSettings,
+    SmartReconnectCaptureSettingsService,
+)
 from services.group_role_status_service import GroupRoleStatusService
 from services.game_operation_gate import GameOperationGate
 
@@ -37,11 +43,20 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     reconnect = AppContext.get(WindowsSmartReconnectController)
     reconnect_boundary = AppContext.get(SmartReconnectBoundary)
     reconnect_monitor = AppContext.get(SmartReconnectMonitor)
+    capture_settings_service = AppContext.get(
+        SmartReconnectCaptureSettingsService
+    )
 
     assert config.get(INPUT_POLICY_KEY) == WindowInputPolicy.ALL.value
     assert config.get(SMART_RECONNECT_ENABLED_KEY) is False
     assert config.get(SMART_RECONNECT_CONSENT_KEY) is False
-    assert config.get(SMART_RECONNECT_INTERVAL_MS_KEY) == 1000
+    assert config.get(SMART_RECONNECT_INTERVAL_MS_KEY) == 2000
+    assert config.get(SMART_RECONNECT_INTERVAL_MIGRATION_KEY) is True
+    assert config.get(SMART_RECONNECT_CAPTURE_MODES_KEY) == {
+        "visible": True,
+        "obscured": True,
+        "minimized": True,
+    }
     assert config.get(GAME_TIME_OFFSET_MS_KEY) == 0
     assert config.get(GAME_TIME_AUTO_UPDATE_KEY) is True
     assert config.get(SYNC_KEYS_COLLAPSED_KEY) is True
@@ -57,7 +72,12 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     assert isinstance(reconnect, WindowsSmartReconnectController)
     assert reconnect_boundary is reconnect
     assert isinstance(reconnect_monitor, SmartReconnectMonitor)
-    assert reconnect_monitor.monitor_interval_ms == 1000
+    assert reconnect_monitor.monitor_interval_ms == 2000
+    assert (
+        capture_settings_service.snapshot()
+        == SmartReconnectCaptureSettings()
+    )
+    assert reconnect.capture_settings == SmartReconnectCaptureSettings()
 
 
 def test_existing_theme_migrates_to_gold_once_without_overriding_later_choice(
@@ -131,7 +151,56 @@ def test_smart_reconnect_monitor_restores_saved_interval(tmp_path):
     config = AppContext.get(ConfigManager)
     monitor = AppContext.get(SmartReconnectMonitor)
     assert config.get(SMART_RECONNECT_INTERVAL_MS_KEY) == 2750
+    assert config.get(SMART_RECONNECT_INTERVAL_MIGRATION_KEY) is True
     assert monitor.monitor_interval_ms == 2750
+
+
+def test_smart_reconnect_controller_restores_saved_capture_modes(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    expected = {
+        "visible": True,
+        "obscured": False,
+        "minimized": True,
+    }
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {SMART_RECONNECT_CAPTURE_MODES_KEY: expected},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    build_services(root=tmp_path)
+
+    config = AppContext.get(ConfigManager)
+    service = AppContext.get(SmartReconnectCaptureSettingsService)
+    controller = AppContext.get(WindowsSmartReconnectController)
+    assert config.get(SMART_RECONNECT_CAPTURE_MODES_KEY) == expected
+    assert service.snapshot().to_dict() == expected
+    assert controller.capture_settings.to_dict() == expected
+
+
+def test_old_default_reconnect_interval_migrates_once_to_balanced_default(
+    tmp_path,
+):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {SMART_RECONNECT_INTERVAL_MS_KEY: 1000},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    build_services(root=tmp_path)
+
+    config = AppContext.get(ConfigManager)
+    monitor = AppContext.get(SmartReconnectMonitor)
+    assert config.get(SMART_RECONNECT_INTERVAL_MS_KEY) == 2000
+    assert config.get(SMART_RECONNECT_INTERVAL_MIGRATION_KEY) is True
+    assert monitor.monitor_interval_ms == 2000
 
 
 def test_sync_services_share_lifecycle_backend_with_separate_target_contracts(
@@ -216,6 +285,20 @@ def test_smart_reconnect_interval_uses_legacy_key_and_is_saved():
     )
 
 
+def test_smart_reconnect_capture_modes_use_one_formal_persistent_entrypoint():
+    source = Path("main.py").read_text(encoding="utf-8")
+
+    assert "SmartReconnectCaptureSettingsService(config)" in source
+    assert "def change_smart_reconnect_capture_modes(" in source
+    assert (
+        "smart_reconnect_capture_settings_service.update(modes)"
+        in source
+    )
+    assert "smart_reconnect_controller.set_capture_settings(settings)" in source
+    assert "smart_reconnect_capture_modes=(" in source
+    assert "on_smart_reconnect_capture_modes_change=(" in source
+
+
 def test_group_member_continuous_click_never_falls_back_to_one_window():
     source = Path("main.py").read_text(encoding="utf-8")
 
@@ -266,6 +349,20 @@ def test_group_change_stops_all_automation_before_publishing_new_group():
         < workspace_index
         < reopen_index
     )
+
+
+def test_role_identity_refresh_only_rebinds_current_group_and_reopens_gate():
+    source = Path("main.py").read_text(encoding="utf-8")
+    refresh = source[
+        source.index("    def refresh_group_sync_identity("):
+        source.index("    def capture_sync_base_point(")
+    ]
+
+    assert "config.get(CURRENT_GROUP_NAME_KEY" in refresh
+    assert "!= group_name" in refresh
+    assert "close_group_operation_gate()" in refresh
+    assert "finally:" in refresh
+    assert "reopen_group_operation_gate()" in refresh
 
 
 def test_input_verifier_has_a_bounded_delay_for_real_foreground_testing():

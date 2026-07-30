@@ -281,6 +281,11 @@ class TargetWindowContractService:
                 rect=target.rect,
                 process_id=target.process_id,
                 launch_fingerprint=target.fingerprint,
+                thread_id=target.thread_id,
+                window_class=target.window_class,
+                process_lifecycle_token=(
+                    target.process_lifecycle_token
+                ),
             )
             for target in snapshot.safe_targets
             if target.handle is not None
@@ -353,4 +358,13 @@ class TargetWindowContractService:
             handle=window.handle if window is not None else None,
             rect=window.rect if window is not None else None,
             visible=bool(window.visible) if window is not None else False,
+            thread_id=window.thread_id if window is not None else None,
+            window_class=(
+                window.window_class if window is not None else None
+            ),
+            process_lifecycle_token=(
+                window.process_lifecycle_token
+                if window is not None
+                else None
+            ),
         )
