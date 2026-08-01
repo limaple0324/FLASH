@@ -234,10 +234,23 @@ def test_isolation_environment_is_pinned_and_has_no_unsafe_fallback(monkeypatch)
     monkeypatch.setattr(git_ops.shutil, "which", lambda _: "bwrap")
     monkeypatch.setattr(git_ops.os, "name", "posix")
     from automation.codex_queue_runner.git_ops import _sandbox
-    command = _sandbox(Path("/work"), ["true"])
+    workspace = Path("/tmp/source")
+    command = _sandbox(workspace, ["true"])
     for value in ("--uid", "0", "--gid", "--cap-drop", "ALL", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-net", "--unshare-uts", "--unshare-cgroup-try", "--new-session", "--die-with-parent"):
         assert value in command
     assert "--disable-userns" not in command
+    assert "/work" not in command
+    ro_bind = command.index("--ro-bind")
+    tmpfs = command.index("--tmpfs")
+    work_dir = command.index("--dir")
+    bind = command.index("--bind")
+    chdir = command.index("--chdir")
+    assert command[ro_bind : ro_bind + 3] == ["--ro-bind", "/", "/"]
+    assert command[tmpfs : tmpfs + 2] == ["--tmpfs", "/tmp"]
+    assert command[work_dir : work_dir + 2] == ["--dir", "/tmp/work"]
+    assert command[bind : bind + 3] == ["--bind", str(workspace), "/tmp/work"]
+    assert command[chdir : chdir + 2] == ["--chdir", "/tmp/work"]
+    assert ro_bind < tmpfs < work_dir < bind < chdir
     workflow = Path(".github/workflows/codex-queue-runner.yml").read_text(encoding="utf-8")
     for job in ("pr_isolation_dry_run", "validate"):
         section = workflow.split(f"  {job}:", 1)[1]
