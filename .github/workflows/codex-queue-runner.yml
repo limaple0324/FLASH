@@ -64,7 +64,7 @@ jobs:
 
   pr_isolation_dry_run:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -87,6 +87,12 @@ jobs:
             exit 1
           fi
           if [ -f target-repo/requirements.txt ]; then python -m pip install -r target-repo/requirements.txt; fi
+          env -u GITHUB_TOKEN -u OPENAI_API_KEY PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli isolation-probe
+          probe_code=$?
+          if [ "$probe_code" -ne 0 ]; then
+            printf '%s\n' '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"reason":"bubblewrap isolation probe failed before candidate pytest"}' > "$report"
+            exit 1
+          fi
           printf '%s' '{"event_name":"pull_request"}' > event.json
           env -u GITHUB_TOKEN -u OPENAI_API_KEY PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli select-claim --event event.json --output-dir isolation-input --repository "$GITHUB_REPOSITORY" --mode dry-run --allow-writeback false --fixture "$GITHUB_WORKSPACE/runner-src/tests/fixtures/codex_queue_isolation_task.txt"
           env -u GITHUB_TOKEN -u OPENAI_API_KEY PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli dry-agent-output --task isolation-input/task.json --github-output "$GITHUB_OUTPUT"
@@ -250,7 +256,7 @@ jobs:
   validate:
     needs: [select_claim, agent]
     if: always() && needs.select_claim.outputs.selected == 'true' && needs.agent.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -272,6 +278,14 @@ jobs:
         with:
           name: queue-context
           path: validate-input
+      - name: Prepare trusted candidate isolation
+        if: needs.select_claim.outputs.role == 'WORKER_A' || needs.select_claim.outputs.role == 'TEST_VALIDATION'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap
+          test -x /usr/bin/bwrap
+          if [ -f "$GITHUB_WORKSPACE/target-repo/requirements.txt" ]; then python -m pip install -r "$GITHUB_WORKSPACE/target-repo/requirements.txt"; fi
+          env -u GITHUB_TOKEN -u OPENAI_API_KEY PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli isolation-probe
       - name: 驗證結構化輸出與實際差異
         env:
           AGENT_FINAL_MESSAGE: ${{ needs.agent.outputs.final_message }}

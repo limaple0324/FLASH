@@ -227,3 +227,20 @@ def test_workflow_supply_chain_permissions_and_agent_last_step():
     assert "GITHUB_TOKEN" not in agent and "OPENAI_API_KEY" not in workflow.split("  push_writeback:", 1)[1]
     assert "unset GITHUB_TOKEN" in workflow and "--force" not in workflow and "--ff-only" not in workflow
     assert "QUEUE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'live' }}" in workflow
+
+
+def test_isolation_environment_is_pinned_and_has_no_unsafe_fallback(monkeypatch):
+    import automation.codex_queue_runner.git_ops as git_ops
+    monkeypatch.setattr(git_ops.shutil, "which", lambda _: "bwrap")
+    monkeypatch.setattr(git_ops.os, "name", "posix")
+    from automation.codex_queue_runner.git_ops import _sandbox
+    command = _sandbox(Path("/work"), ["true"])
+    for value in ("--uid", "0", "--gid", "--disable-userns", "--cap-drop", "ALL", "--unshare-net"):
+        assert value in command
+    workflow = Path(".github/workflows/codex-queue-runner.yml").read_text(encoding="utf-8")
+    for job in ("pr_isolation_dry_run", "validate"):
+        section = workflow.split(f"  {job}:", 1)[1]
+        assert "runs-on: ubuntu-22.04" in section
+    validate = workflow.split("  validate:", 1)[1].split("  push_writeback:", 1)[0]
+    assert "Prepare trusted candidate isolation" in validate and "bubblewrap" in validate and "isolation-probe" in validate
+    assert "env -u GITHUB_TOKEN -u OPENAI_API_KEY" in workflow and "--unshare-net" in Path("automation/codex_queue_runner/git_ops.py").read_text(encoding="utf-8")

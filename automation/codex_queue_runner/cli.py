@@ -145,6 +145,11 @@ def command_dry_agent(args: argparse.Namespace) -> int:
     value = dry_agent_result(_task(Path(args.task))); Path(args.github_output).open("a", encoding="utf-8").write(f"final-message={value}\n"); return 0
 
 
+def command_isolation_probe(_args: argparse.Namespace) -> int:
+    from .git_ops import isolation_probe
+    isolation_probe(); return 0
+
+
 def command_validate(args: argparse.Namespace) -> int:
     task = _task(Path(args.task)); raw = args.agent_output or dry_agent_result(task)
     result = parse_agent_result(raw, task) if task.role.requires_codex() else AgentResult(task.role, "pass", "test validation")
@@ -193,9 +198,10 @@ def main() -> int:
     render = commands.add_parser("render-prompt"); render.add_argument("--task", required=True); render.add_argument("--context", required=True); render.add_argument("--output", required=True)
     schema = commands.add_parser("write-schema"); schema.add_argument("--task", required=True); schema.add_argument("--output", required=True)
     dry = commands.add_parser("dry-agent-output"); dry.add_argument("--task", required=True); dry.add_argument("--github-output", required=True)
+    commands.add_parser("isolation-probe")
     validate = commands.add_parser("validate"); validate.add_argument("--task", required=True); validate.add_argument("--target-repo", required=True); validate.add_argument("--agent-output", default=""); validate.add_argument("--output-dir", required=True)
     writeback = commands.add_parser("writeback"); writeback.add_argument("--task", required=True); writeback.add_argument("--validated-dir", required=True); writeback.add_argument("--target-repo", required=True); writeback.add_argument("--repository", required=True); writeback.add_argument("--mode", choices=["dry-run", "live"], required=True); writeback.add_argument("--report", required=True)
-    args = parser.parse_args(); return {"select-claim": command_select, "render-prompt": command_render, "write-schema": command_schema, "dry-agent-output": command_dry_agent, "validate": command_validate, "writeback": command_writeback}[args.command](args)
+    args = parser.parse_args(); return {"select-claim": command_select, "render-prompt": command_render, "write-schema": command_schema, "dry-agent-output": command_dry_agent, "isolation-probe": command_isolation_probe, "validate": command_validate, "writeback": command_writeback}[args.command](args)
 
 
 if __name__ == "__main__": raise SystemExit(main())

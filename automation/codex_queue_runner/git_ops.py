@@ -60,7 +60,17 @@ def _sandbox(workspace: Path, argv: list[str]) -> list[str]:
     bwrap = shutil.which("bwrap")
     if os.name == "nt" or not bwrap:
         raise QueueRunError("BLOCKED: filesystem and network isolation is unavailable")
-    return [bwrap, "--die-with-parent", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-net", "--unshare-uts", "--unshare-cgroup-try", "--new-session", "--ro-bind", "/", "/", "--dir", "/work", "--bind", str(workspace), "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/work", "--", *argv]
+    return [bwrap, "--die-with-parent", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-net", "--unshare-uts", "--unshare-cgroup-try", "--uid", "0", "--gid", "0", "--disable-userns", "--cap-drop", "ALL", "--new-session", "--ro-bind", "/", "/", "--dir", "/work", "--bind", str(workspace), "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/work", "--", *argv]
+
+
+def isolation_probe() -> None:
+    with tempfile.TemporaryDirectory(prefix="codex-queue-probe-") as temporary:
+        workspace = Path(temporary) / "work"
+        workspace.mkdir()
+        script = "test ! -e .git; test -z \"${GITHUB_TOKEN-}\"; test -z \"${OPENAI_API_KEY-}\"; test -w /work; test -w /tmp; ! touch /etc/codex-queue-probe; grep -q '^CapEff:[[:space:]]*0000000000000000$' /proc/self/status; ! python -c 'import socket; socket.create_connection((\"1.1.1.1\",53),1)'"
+        result = subprocess.run(_sandbox(workspace, ["/bin/sh", "-ceu", script]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env={"PATH": os.environ.get("PATH", ""), "HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1"}, check=False)
+        if result.returncode:
+            raise QueueRunError(f"isolation probe failed: {result.stdout[-12000:]}")
 
 
 def _test(workspace: Path, argv: list[str], runner: Callable[[Path, list[str]], tuple[int, str]] | None) -> str:
