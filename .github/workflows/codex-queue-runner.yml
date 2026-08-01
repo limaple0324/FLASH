@@ -95,7 +95,7 @@ jobs:
           if [ "$test_code" -eq 0 ]; then
             printf '%s\n' '{"status":"success","isolation_available":true,"candidate_tests_executed":true,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":true,"reason":"bubblewrap isolated TEST_VALIDATION completed"}' > "$report"
           else
-            printf '%s\n' '{"status":"blocked","isolation_available":true,"candidate_tests_executed":true,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":true,"reason":"isolated candidate validation failed"}' > "$report"
+            printf '%s\n' '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"reason":"bubblewrap namespace setup or isolated validation failed before candidate pytest"}' > "$report"
           fi
           exit "$test_code"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
