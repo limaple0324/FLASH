@@ -1,22 +1,26 @@
 from __future__ import annotations
 
+import argparse
+import json
 import subprocess
 import textwrap
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from automation.codex_queue_runner.cli import RunnerConfig, select_and_claim, validate_remote_source
-from automation.codex_queue_runner.git_ops import create_and_push, validate_patch
-from automation.codex_queue_runner.models import QueueRunError, TaskStatus
+from automation.codex_queue_runner.cli import RunnerConfig, command_validate, command_writeback, select_and_claim, validate_remote_source
+from automation.codex_queue_runner.git_ops import create_and_push, find_reconciled_commit, validate_patch
+from automation.codex_queue_runner.github_client import GitHubRestClient
+from automation.codex_queue_runner.models import QueueRunError, Role, TaskStatus, task_from_mapping
 from automation.codex_queue_runner.parser import parse_task_comment
+from automation.codex_queue_runner.role_output import dry_agent_result, output_schema, parse_agent_result
 from automation.codex_queue_runner.scope_guard import parse_raw_changes, validate_git_changes
-from automation.codex_queue_runner.selector import claim_belongs_to_run, collect_candidates, select_task
-from automation.codex_queue_runner.status_writer import build_blocked_comment, build_waiting_review_comment
+from automation.codex_queue_runner.selector import claim_belongs_to_run, collect_candidates, select_task, stale_claims
 from automation.codex_queue_runner.test_command_guard import pytest_argv, validate_test_commands
 
 
-def comment(queue_id="Q-1", status="READY", role="WORKER_A", author="limaple0324", number=1, created="2026-08-01T01:00:00Z", source_pr="#21", branch="automation/task", base="a" * 40, owned="tests/test_fixture.py", forbidden="automation/", selectors="tests/test_fixture.py"):
+def comment(queue_id="Q-1", status="READY", role="WORKER_A", author="limaple0324", number=1, created="2026-08-01T01:00:00Z", source_pr="#21", branch="automation/task", base="a" * 40, owned="tests/test_fixture.py", forbidden="automation/", selectors="tests/test_fixture.py", full="NO", windows="NO"):
     return {"id": number, "created_at": created, "user": {"login": author}, "body": textwrap.dedent(f"""
         ```
         QUEUE_ID: {queue_id}
@@ -31,140 +35,172 @@ def comment(queue_id="Q-1", status="READY", role="WORKER_A", author="limaple0324
         FORBIDDEN: {forbidden}
         ACCEPTANCE: pass
         MINIMUM_TESTS: {selectors}
+        FULL_REGRESSION: {full}
+        WINDOWS_BUILD: {windows}
         BLOCKER_INBOX: #18
-        NEXT_ROLE: CODE_REVIEW
         ```
     """).strip()}
 
 
-def status(queue_id, value, number, created, run=""):
-    fields = [f"QUEUE_ID: {queue_id}", f"STATUS: {value}"]
+def state(queue_id, value, number, created, run="", source=1, role="", base="", writer=True, author="github-actions[bot]"):
+    fields = [f"QUEUE_ID: {queue_id}", f"STATUS: {value}", f"SOURCE_COMMENT_ID: {source}"]
     if run: fields.append(f"WORKFLOW_RUN_ID: {run}")
-    return {"id": number, "created_at": created, "user": {"login": "github-actions[bot]"}, "body": "\n".join(fields)}
+    if role: fields.append(f"ROLE: {role}")
+    if base: fields.append(f"BASE_COMMIT: {base}")
+    if writer: fields.append("STATE_WRITER: CODEX_QUEUE_RUNNER")
+    return {"id": number, "created_at": created, "user": {"login": author}, "body": "\n".join(fields)}
 
 
 class FakeClient:
-    def __init__(self, comments, head="a" * 40, pr=True):
-        self.comments, self.head, self.pr, self.posts, self.dispatches = comments, head, pr, [], []
+    def __init__(self, comments, head="a" * 40, run=None):
+        self.comments, self.head, self.run, self.posts, self.dispatches = comments, head, run or {"status": "completed"}, [], []
     def list_issue_comments(self, _): return self.comments
+    def list_pull_request_files(self, _): return [{"filename": "tests/test_fixture.py"}]
     def post_issue_comment(self, issue, body):
-        self.posts.append((issue, body)); value = {"id": 1000 + len(self.posts), "created_at": "2026-08-01T02:00:00Z", "user": {"login": "github-actions[bot]"}, "body": body}; self.comments.append(value); return value
-    def get_issue(self, _): return {"state": "open"}
-    def get_pull_request(self, _): return {"state": "open", "head": {"ref": "automation/task", "sha": self.head}} if self.pr else {"state": "closed", "head": {}}
+        self.posts.append((issue, body)); value = {"id": 1000 + len(self.posts), "created_at": "2026-08-01T03:00:00Z", "user": {"login": "github-actions[bot]"}, "body": body}; self.comments.append(value); return value
+    def get_issue(self, _): return {"title": "issue", "body": "issue body"}
+    def get_pull_request(self, _): return {"state": "open", "base": {"sha": "base"}, "head": {"ref": "automation/task", "sha": self.head}}
     def get_branch_sha(self, _): return self.head
+    def get_workflow_run(self, _): return self.run
+    def get_commit(self, _): return {"parents": [], "commit": {"message": "other"}}
     def write_blocker(self, body): self.posts.append((18, body))
+    def write_source_pr(self, number, body): self.posts.append((number, body))
     def dispatch_next(self, queue): self.dispatches.append(queue)
 
 
-def test_only_issue_19_is_accepted():
+def test_only_issue_19_owner_and_trusted_state_are_accepted():
     result = select_and_claim(FakeClient([comment()]), {"event_name": "issue_comment", "issue": {"number": 20}}, RunnerConfig())
     assert result["selected"] is False
+    assert collect_candidates([comment(author="other")]) == []
+    values = [comment(), state("Q-1", "CLOSED", 2, "2026-08-01T01:02:00Z", writer=False)]
+    assert select_task(collect_candidates(values)).task.status is TaskStatus.READY
 
 
-def test_rejects_non_owner_and_missing_fields():
-    assert collect_candidates([comment(author="other")], "limaple0324") == []
-    with pytest.raises(QueueRunError): parse_task_comment("QUEUE_ID: Q\nSTATUS: READY")
+def test_latest_state_claim_binding_and_needs_fix_reclaim():
+    values = [comment(), state("Q-1", "CLAIMED", 2, "2026-08-01T01:01:00Z", "run-a")]
+    assert claim_belongs_to_run(values, "Q-1", "run-a", 1)
+    with pytest.raises(QueueRunError): select_task(collect_candidates(values))
+    values.append(state("Q-1", "NEEDS_FIX", 3, "2026-08-01T01:02:00Z", role="WORKER_A"))
+    task = select_task(collect_candidates(values)).task
+    assert task.status is TaskStatus.NEEDS_FIX and task.role is Role.WORKER_A
+
+
+def test_chinese_semicolon_and_multiline_lists_are_parsed():
+    body = comment(owned="a.py；b.py;c.py,\n- d.py", forbidden="x/；y/")["body"]
+    task = parse_task_comment(body)
+    assert task.owned_files == ["a.py", "b.py", "c.py", "d.py"] and task.forbidden == ["x/", "y/"]
 
 
 @pytest.mark.parametrize("branch", ["main", "release/latest", "release/sp1", "release/other"])
-def test_rejects_protected_branches(branch):
+def test_protected_branches_manual_gates_and_flags_block(branch):
     with pytest.raises(QueueRunError): validate_remote_source(FakeClient([comment(branch=branch)]), parse_task_comment(comment(branch=branch)["body"]))
+    with pytest.raises(QueueRunError): validate_remote_source(FakeClient([comment(role="BATCH_CONTROL")]), parse_task_comment(comment(role="BATCH_CONTROL")["body"]))
+    with pytest.raises(QueueRunError): validate_remote_source(FakeClient([comment(full="YES")]), parse_task_comment(comment(full="YES")["body"]))
+    with pytest.raises(QueueRunError): validate_remote_source(FakeClient([comment(windows="YES")]), parse_task_comment(comment(windows="YES")["body"]))
 
 
-def test_latest_state_overrides_ready_and_needs_fix_reclaims():
-    values = [comment(number=1), status("Q-1", "CLAIMED", 2, "2026-08-01T01:01:00Z", "r1")]
-    with pytest.raises(QueueRunError): select_task(collect_candidates(values, "limaple0324"))
-    values.append(status("Q-1", "NEEDS_FIX", 3, "2026-08-01T01:02:00Z"))
-    assert select_task(collect_candidates(values, "limaple0324")).task.status == TaskStatus.NEEDS_FIX
+def test_source_pr_none_and_live_without_writeback_block():
+    task = parse_task_comment(comment(source_pr="NONE")["body"]); validate_remote_source(FakeClient([comment(source_pr="NONE")]), task)
+    with pytest.raises(QueueRunError): select_and_claim(FakeClient([comment()]), {"event_name": "schedule"}, RunnerConfig(mode="live", allow_writeback=False))
 
 
-def test_claim_is_single_and_belongs_to_one_run():
-    client = FakeClient([comment()]); config = RunnerConfig(dry_run=False, allow_writeback=True, workflow_run_id="run-a")
-    assert select_and_claim(client, {"event_name": "schedule"}, config)["selected"]
-    assert claim_belongs_to_run(client.comments, "Q-1", "run-a")
-    with pytest.raises(QueueRunError): select_and_claim(client, {"event_name": "schedule"}, config)
+def test_live_claim_and_context_snapshot_have_no_token(monkeypatch):
+    monkeypatch.setenv("OPENAI_SECRET_AVAILABLE", "true")
+    client = FakeClient([comment()]); result = select_and_claim(client, {"event_name": "schedule"}, RunnerConfig(mode="live", allow_writeback=True, workflow_run_id="run-a"))
+    assert result["selected"] and claim_belongs_to_run(client.comments, "Q-1", "run-a", 1)
+    assert result["context"]["changed_files"] == ["tests/test_fixture.py"]
+    assert "token" not in json.dumps(result["context"]).lower()
 
 
-def test_source_pr_none_and_remote_mismatch_blocked():
-    task = parse_task_comment(comment(source_pr="NONE")["body"])
-    validate_remote_source(FakeClient([comment(source_pr="NONE")]), task)
-    with pytest.raises(QueueRunError): validate_remote_source(FakeClient([comment()], head="b" * 40), parse_task_comment(comment()["body"]))
-
-
-def test_missing_openai_secret_blocks_before_agent():
-    with pytest.raises(QueueRunError): select_and_claim(FakeClient([comment()]), {"event_name": "schedule"}, RunnerConfig(dry_run=False), openai_secret_available=False)
+def test_stale_claim_recovers_only_completed_run():
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    values = [comment(created=old), state("Q-1", "CLAIMED", 2, old, "dead")]
+    candidates = collect_candidates(values)
+    assert stale_claims(candidates, datetime.now(timezone.utc), 60, lambda _: {"status": "completed"})
+    assert not stale_claims(candidates, datetime.now(timezone.utc), 60, lambda _: {"status": "in_progress"})
 
 
 @pytest.mark.parametrize("selector", ["tests/test_x.py\nwhoami", "tests/test_x.py;whoami", "tests/test_x.py -p evil", "tests/test_x.py::test_x$(x)"])
-def test_rejects_shell_and_pytest_injection(selector):
-    ok, issues = validate_test_commands([selector])
-    assert not ok and issues
-
-
-def test_builds_fixed_pytest_argv():
+def test_shell_and_pytest_injection_are_rejected(selector):
+    ok, issues = validate_test_commands([selector]); assert not ok and issues
     assert pytest_argv(["tests/test_x.py::test_ok"]) == ["python", "-m", "pytest", "-q", "tests/test_x.py::test_ok"]
 
 
-def test_raw_git_guard_rejects_rename_symlink_submodule_and_workflow():
+def test_real_git_guard_rejects_rename_symlink_submodule_and_workflow():
     raw = b":100644 100644 a b R100\0tests/old.py\0.github/workflows/x.yml\0:100644 120000 a b M\0tests/link.py\0:160000 160000 a b M\0tests/sub\0"
     ok, errors = validate_git_changes(parse_raw_changes(raw), ["tests/"], [])
-    assert not ok and any("OWNED_FILES" in item for item in errors)
-    assert any("符號連結" in item for item in errors) and any("子模組" in item for item in errors)
+    assert not ok and any("OWNED_FILES" in item for item in errors) and any("符號連結" in item for item in errors) and any("子模組" in item for item in errors)
 
 
-def git(repo, *args):
-    return subprocess.run(["git", *args], cwd=repo, check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+def test_structured_worker_audit_review_outputs_and_role_transition():
+    worker = parse_task_comment(comment(role="WORKER_A")["body"])
+    audit = parse_task_comment(comment(role="REQUIREMENTS_AUDIT")["body"])
+    review = parse_task_comment(comment(role="CODE_REVIEW")["body"])
+    assert "patch" in output_schema(Role.WORKER_A)["properties"]
+    assert parse_agent_result('{"role":"WORKER_A","result":"pass","summary":"x","patch":"","evidence":[]}', worker).result == "pass"
+    assert parse_agent_result('{"role":"REQUIREMENTS_AUDIT","result":"fail","summary":"x","reasons":["bad"],"evidence":["e"]}', audit).result == "fail"
+    value = parse_agent_result('{"role":"CODE_REVIEW","result":"pass","summary":"x","severity":"none","findings":[],"evidence":[]}', review)
+    assert value.severity == "none"
+    with pytest.raises(QueueRunError): parse_agent_result('{"role":"CODE_REVIEW","result":"pass","summary":"x","evidence":[]}', review)
+
+
+class PagedClient(GitHubRestClient):
+    def __init__(self): super().__init__("owner/repo", "token"); self.calls = []
+    def _request(self, method, path, body=None):
+        self.calls.append(path)
+        if "page=2" in path: return [{"id": 101}], {}
+        return [{"id": item} for item in range(100)], {"Link": '<https://api.github.com/repos/owner/repo/issues/19/comments?per_page=100&page=2>; rel="next"'}
+
+
+def test_issue_comments_paginate_past_101():
+    client = PagedClient(); assert len(client.list_issue_comments(19)) == 101 and len(client.calls) == 2
+
+
+def git(repo, *args): return subprocess.run(["git", *args], cwd=repo, check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
 
 
 @pytest.fixture
 def git_fixture(tmp_path):
-    remote, repo = tmp_path / "remote.git", tmp_path / "repo"
-    git(tmp_path, "init", "--bare", str(remote)); git(tmp_path, "clone", str(remote), str(repo))
+    remote, repo = tmp_path / "remote.git", tmp_path / "repo"; git(tmp_path, "init", "--bare", str(remote)); git(tmp_path, "clone", str(remote), str(repo))
     git(repo, "config", "user.email", "fixture@example.test"); git(repo, "config", "user.name", "fixture")
     (repo / "tests").mkdir(); (repo / "tests" / "test_fixture.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8"); (repo / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n", encoding="utf-8")
-    git(repo, "add", "."); git(repo, "commit", "-m", "base"); git(repo, "branch", "-M", "automation/task"); git(repo, "push", "-u", "origin", "automation/task")
-    git(tmp_path, "--git-dir", str(remote), "symbolic-ref", "HEAD", "refs/heads/automation/task")
+    git(repo, "add", "."); git(repo, "commit", "-m", "base"); git(repo, "branch", "-M", "automation/task"); git(repo, "push", "-u", "origin", "automation/task"); git(tmp_path, "--git-dir", str(remote), "symbolic-ref", "HEAD", "refs/heads/automation/task")
     return repo
 
 
-def candidate_patch(repo, path):
+def worker_patch(repo):
     target = repo / "tests" / "test_fixture.py"; target.write_text("def test_ok():\n    assert 1 == 1\n", encoding="utf-8")
-    patch = subprocess.run(["git", "diff", "--binary"], cwd=repo, check=True, stdout=subprocess.PIPE).stdout
-    path.write_bytes(patch); git(repo, "checkout", "--", "tests/test_fixture.py")
+    patch = subprocess.run(["git", "diff", "--binary"], cwd=repo, check=True, stdout=subprocess.PIPE).stdout; git(repo, "checkout", "--", "tests/test_fixture.py"); return patch
 
 
-def test_agent_patch_to_clean_validate_to_commit_tree(git_fixture, tmp_path):
+def test_runner_can_validate_target_without_automation_and_reconcile_once(git_fixture, tmp_path):
     repo, base = git_fixture, git(git_fixture, "rev-parse", "HEAD")
-    task = parse_task_comment(comment(base=base, source_pr="NONE")["body"]); patch, output = tmp_path / "candidate.patch", tmp_path / "validated"
-    candidate_patch(repo, patch); result = validate_patch(repo, task, patch, output)
-    assert result.has_patch and result.changed_files == ["tests/test_fixture.py"]
-    git(repo, "reset", "--hard", base)
-    commit, files, command = create_and_push(repo, task, output / "validated.patch", output / "manifest.sha256", "fixture")
-    assert git(repo, "rev-parse", f"{commit}^") == base and files == ["tests/test_fixture.py"]
-    assert "--force" not in command and "--ff-only" not in command and "-f" not in command
+    assert not (repo / "automation").exists()
+    task = parse_task_comment(comment(base=base, source_pr="NONE")["body"]); output = tmp_path / "validated"; checked = validate_patch(repo, task, worker_patch(repo), output)
+    assert checked.has_patch and checked.changed_files == ["tests/test_fixture.py"]
+    git(repo, "reset", "--hard", base); commit, _, command = create_and_push(repo, task, output / "validated.patch", output / "manifest.sha256")
+    assert commit == find_reconciled_commit(repo, task) and "--force" not in command and "--ff-only" not in command and "-f" not in command
+    repeat, _, second = create_and_push(repo, task, output / "validated.patch", output / "manifest.sha256")
+    assert repeat == commit and second == []
 
 
-def test_remote_head_change_rejects_push(git_fixture, tmp_path):
-    repo, base = git_fixture, git(git_fixture, "rev-parse", "HEAD")
-    task = parse_task_comment(comment(base=base, source_pr="NONE")["body"]); patch, output = tmp_path / "candidate.patch", tmp_path / "validated"
-    candidate_patch(repo, patch); validate_patch(repo, task, patch, output); git(repo, "reset", "--hard", base)
-    other = tmp_path / "other"; git(tmp_path, "clone", str(repo.parent / "remote.git"), str(other)); git(other, "config", "user.email", "x@y.z"); git(other, "config", "user.name", "x")
-    (other / "x").write_text("x", encoding="utf-8"); git(other, "add", "."); git(other, "commit", "-m", "advance"); git(other, "push")
-    with pytest.raises(QueueRunError): create_and_push(repo, task, output / "validated.patch", output / "manifest.sha256", "fixture")
+def test_manual_dry_run_e2e_has_no_external_write(tmp_path):
+    fixture = Path("tests/fixtures/codex_queue_dry_task.txt"); selected = select_and_claim(None, {"event_name": "workflow_dispatch"}, RunnerConfig(mode="dry-run"), fixture=fixture)
+    task = task_from_mapping(selected["task"]); raw = dry_agent_result(task); parse_agent_result(raw, task)
+    task_path, output = tmp_path / "task.json", tmp_path / "validated"; task_path.write_text(json.dumps({"task": selected["task"]}), encoding="utf-8")
+    assert command_validate(argparse.Namespace(task=str(task_path), target_repo=str(tmp_path), agent_output=raw, output_dir=str(output))) == 0
+    report = tmp_path / "report.json"
+    assert command_writeback(argparse.Namespace(task=str(task_path), validated_dir=str(output), target_repo=str(tmp_path), repository="owner/repo", mode="dry-run", report=str(report))) == 0
+    assert json.loads(report.read_text(encoding="utf-8"))["external_writes"] == 0
 
 
-def test_status_formats_are_waiting_review_and_issue_18_blocker():
-    task = parse_task_comment(comment()["body"])
-    assert "STATUS: WAITING_REVIEW" in build_waiting_review_comment(task, "abc", [], "PASS")
-    blocker = build_blocked_comment(task, "bad", "error", "test", "ROLE", "step")
-    assert "STATUS: OPEN" in blocker and "SECRETS_INCLUDED: NO" in blocker
-
-
-def test_workflow_has_four_isolated_jobs_and_no_release_or_merge():
+def test_workflow_supply_chain_permissions_and_agent_last_step():
     workflow = Path(".github/workflows/codex-queue-runner.yml").read_text(encoding="utf-8")
-    for name in ("select_claim:", "agent:", "validate:", "push_writeback:", "codex-queue-runner-global", "repository_dispatch:", "CODEX_QUEUE_ENABLED", "openai/codex-action@b11346a6fa031e2e164ab4b7c7ea201afffd7d59"):
+    for name in ("select_claim:", "agent:", "validate:", "push_writeback:", "runner-src", "target-repo", "PYTHONPATH", "output-schema-file", "codex-version: \"0.146.0\"", "CODEX_QUEUE_ENABLED"):
         assert name in workflow
-    assert "persist-credentials: false" in workflow and "safety-strategy: drop-sudo" in workflow
-    assert "danger-full-access" not in workflow and "full-auto" not in workflow
-    assert "git merge" not in workflow.lower() and "gh pr merge" not in workflow.lower()
-    assert "OPENAI_API_KEY" not in workflow.split("push_writeback:", 1)[1]
+    assert "uses: actions/checkout@v5" not in workflow and "uses: actions/setup-python@v5" not in workflow and "uses: actions/upload-artifact@v4" not in workflow and "uses: actions/download-artifact@v4" not in workflow
+    agent = workflow.split("  validate:", 1)[0].split("  agent:", 1)[1]
+    assert agent.rstrip().endswith("working-directory: ${{ github.workspace }}/target-repo")
+    assert "GITHUB_TOKEN" not in agent and "OPENAI_API_KEY" not in workflow.split("  push_writeback:", 1)[1]
+    assert "unset GITHUB_TOKEN" in workflow and "--force" not in workflow and "--ff-only" not in workflow
+    assert "QUEUE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'live' }}" in workflow

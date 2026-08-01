@@ -1,0 +1,15 @@
+```
+QUEUE_ID: DRY-RUN-001
+STATUS: READY
+ROLE: REQUIREMENTS_AUDIT
+SOURCE_ISSUE: #20
+SOURCE_PR: NONE
+BASE_COMMIT: 0000000000000000000000000000000000000000
+TARGET_BRANCH: automation/dry-run-fixture
+SCOPE: 執行本機乾跑驗證
+OWNED_FILES: tests/test_codex_queue_runner.py；automation/codex_queue_runner/
+FORBIDDEN: .github/workflows/
+ACCEPTANCE: 完整乾跑報告
+MINIMUM_TESTS: tests/test_codex_queue_runner.py
+BLOCKER_INBOX: #18
+```

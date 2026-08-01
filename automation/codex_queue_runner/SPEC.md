@@ -1,18 +1,19 @@
-# Codex Queue Runner 第二版安全契約
+# Codex Queue Runner 第三版安全契約
 
-## 工作階段
+## 信任邊界
 
-1. `select_claim` 只讀取 Issue #19、核對來源與分支，以全域工作流程鎖寫入 `CLAIMED`。
-2. `agent` 只有 `contents: read` 與 OpenAI 金鑰；使用釘選的官方 Codex 動作，輸出 patch、最終回報、事件與任務資料。
-3. `validate` 從乾淨 `BASE_COMMIT` 套用 patch，以 NUL 分隔 Git 真實差異檢查範圍，再用固定 pytest argv 執行最小測試。
-4. `push_writeback` 不持有 OpenAI 金鑰、不執行候選程式；它驗證雜湊與父提交，以 Git plumbing 建立單一提交並用一般 push 回寫。
+- `runner-src` 永遠 checkout `main`，只執行受信任 Runner；`target-repo` 永遠 checkout 任務 `BASE_COMMIT`。
+- Agent 使用 `target-repo` 作為工作目錄，且其最後一步必須是釘選官方 Codex Action。跨 job 只傳遞選取 context 與受控 JSON 最終輸出。
+- 自動事件在 `CODEX_QUEUE_ENABLED == 'true'` 時固定 live 且回寫；手動預設 dry-run，不使用 Secret、不寫 GitHub、不推送。
 
-## 固定禁止事項
+## 狀態與交棒
 
-- 不得修改或合併 `main`，不得操作任何 `release/` 分支、正式發布或自動合併。
-- 不得使用 force push、`--ff-only`、`shell=True`、自由測試命令、未受控 MCP、`danger-full-access`、`full-auto` 或使用者 Codex 設定。
-- 代理產物的符號連結、子模組、可執行檔模式、路徑穿越、絕對路徑與 `FORBIDDEN` 變更一律阻擋。
+- 任務原始定義僅接受 `limaple0324`；狀態僅接受該擁有者或帶 `STATE_WRITER: CODEX_QUEUE_RUNNER` 的 `github-actions[bot]`。
+- `CLAIMED` 必須同時綁定 workflow run id 與原始任務 comment id，並有租約與已完成 run 回收機制。
+- 固定交棒：WORKER_A → REQUIREMENTS_AUDIT → CODE_REVIEW → TEST_VALIDATION → WAITING_REVIEW；稽核或審查 fail 回到 NEEDS_FIX／WORKER_A。BATCH_CONTROL 與 INTEGRATION 為 manual gate。
 
-## 啟用
+## 推送與範圍
 
-自動事件僅在 `CODEX_QUEUE_ENABLED == 'true'` 時執行。`workflow_dispatch` 預設乾跑且不回寫。PR #21 合併與安全審查通過前，不得執行 live 模式、使用 OpenAI 金鑰或推送任務分支。
+- validate 從乾淨基準套用 Agent JSON patch，以 NUL Git 差異檢查所有路徑、模式、符號連結與子模組，再以固定 pytest argv 測試。
+- push 僅使用一次性憑證、固定父 `git commit-tree` 和一般 push；不得 force、`--ff-only` 或重複建立已安全辨識的提交。
+- push 後留言失敗時，後續租約回收可依 queue id、提交訊息、父提交與分支 head 補寫，不能再次推送。

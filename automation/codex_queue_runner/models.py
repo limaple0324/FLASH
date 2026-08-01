@@ -28,11 +28,21 @@ class Role(str, Enum):
     INTEGRATION = "INTEGRATION"
 
     def requires_codex(self) -> bool:
-        return self in {self.WORKER_A, self.REQUIREMENTS_AUDIT, self.CODE_REVIEW}
+        return self in {Role.WORKER_A, Role.REQUIREMENTS_AUDIT, Role.CODE_REVIEW}
 
     def sandbox(self) -> str:
-        return "workspace-write" if self == self.WORKER_A else "read-only"
+        return "workspace-write" if self is Role.WORKER_A else "read-only"
 
+    def is_manual_gate(self) -> bool:
+        return self in {Role.BATCH_CONTROL, Role.INTEGRATION}
+
+
+ROLE_TRANSITIONS: dict[Role, Optional[Role]] = {
+    Role.WORKER_A: Role.REQUIREMENTS_AUDIT,
+    Role.REQUIREMENTS_AUDIT: Role.CODE_REVIEW,
+    Role.CODE_REVIEW: Role.TEST_VALIDATION,
+    Role.TEST_VALIDATION: None,
+}
 
 ALLOWED_ROLES = frozenset(role.value for role in Role)
 
@@ -79,6 +89,21 @@ class QueueState:
     created_at: str
     workflow_run_id: Optional[str] = None
     source_comment_id: Optional[int] = None
+    role: Optional[Role] = None
+    base_commit: Optional[str] = None
+    evidence: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class AgentResult:
+    role: Role
+    result: str
+    summary: str
+    patch: str = ""
+    reasons: tuple[str, ...] = ()
+    evidence: tuple[str, ...] = ()
+    severity: str = "none"
+    findings: tuple[str, ...] = ()
 
 
 class QueueRunError(ValueError):
