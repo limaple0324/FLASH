@@ -1,0 +1,49 @@
+﻿name: Codex Queue Runner
+
+on:
+  issue_comment:
+    types: [created]
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: codex-queue-runner-${{ github.event_name }}-${{ github.event.issue.number || 'scheduled' }}-${{ github.event.comment.id || 'manual' }}
+  cancel-in-progress: false
+
+jobs:
+  run-queue-task:
+    if: github.event_name != 'issue_comment' || github.event.issue.number == 19
+    name: Select and execute one queue task
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CODEX_QUEUE_DRY_RUN: "1"
+      PYTHONUNBUFFERED: "1"
+      GITHUB_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Select and run queue task
+        run: |
+          python -m automation.codex_queue_runner.cli --event "$GITHUB_EVENT_PATH"
+
