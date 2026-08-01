@@ -57,9 +57,12 @@ def test_validation_workflow_is_read_only_and_has_no_release_push():
 
 def test_formal_workflow_is_the_only_write_workflow_and_never_rebuilds():
     workflow = FORMAL_WORKFLOW.read_text(encoding="utf-8")
+    permissions = workflow.split("permissions:", 1)[1].split("concurrency:", 1)[0]
 
     assert "workflow_dispatch:" in workflow
+    assert "actions: read" in permissions
     assert "contents: write" in workflow
+    assert permissions.split() == ["actions:", "read", "contents:", "write"]
     assert "github.ref == 'refs/heads/main'" in workflow
     assert "github.actor == 'limaple0324'" in workflow
     assert "inputs.confirm_release" in workflow

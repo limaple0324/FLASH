@@ -17,8 +17,11 @@ def test_validation_workflow_cannot_publish_a_formal_channel():
 
 def test_formal_release_requires_manual_main_approval_and_history_check():
     workflow = FORMAL_WORKFLOW.read_text(encoding="utf-8")
+    permissions = workflow.split("permissions:", 1)[1].split("concurrency:", 1)[0]
 
     assert "workflow_dispatch:" in workflow
+    assert "actions: read" in permissions
+    assert "contents: write" in permissions
     assert "github.ref == 'refs/heads/main'" in workflow
     assert "github.actor == 'limaple0324'" in workflow
     assert "inputs.confirm_release" in workflow
