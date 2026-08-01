@@ -78,19 +78,21 @@ jobs:
       - name: Install trusted base dependencies and run isolated pytest
         run: |
           report=pr-isolation-dry-run-report.json
-          printf '%s\n' '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"reason":"isolation setup not started"}' > "$report"
+          printf '%s\n' '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"bubblewrap_version":"unknown","reason":"isolation setup not started"}' > "$report"
           set +e
           sudo apt-get update && sudo apt-get install --no-install-recommends -y bubblewrap
           install_code=$?
+          version="unknown"
+          if command -v bwrap >/dev/null 2>&1; then version="$(bwrap --version | awk '{print $NF}')"; fi
           if [ "$install_code" -ne 0 ] || ! command -v bwrap >/dev/null 2>&1; then
-            printf '%s\n' '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"reason":"Ubuntu bubblewrap installation or executable check failed"}' > "$report"
+            printf '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"bubblewrap_version":"%s","reason":"Ubuntu bubblewrap installation or executable check failed"}\n' "$version" > "$report"
             exit 1
           fi
           if [ -f target-repo/requirements.txt ]; then python -m pip install -r target-repo/requirements.txt; fi
           env -u GITHUB_TOKEN -u OPENAI_API_KEY PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli isolation-probe
           probe_code=$?
           if [ "$probe_code" -ne 0 ]; then
-            printf '%s\n' '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"reason":"bubblewrap isolation probe failed before candidate pytest"}' > "$report"
+            printf '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"bubblewrap_version":"%s","reason":"bubblewrap isolation probe failed before candidate pytest"}\n' "$version" > "$report"
             exit 1
           fi
           printf '%s' '{"event_name":"pull_request"}' > event.json
@@ -99,9 +101,9 @@ jobs:
           env -u GITHUB_TOKEN -u OPENAI_API_KEY PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli validate --task isolation-input/task.json --target-repo "$GITHUB_WORKSPACE/target-repo" --agent-output "$(tail -n 1 "$GITHUB_OUTPUT" | sed 's/^final-message=//')" --output-dir isolation-output
           test_code=$?
           if [ "$test_code" -eq 0 ]; then
-            printf '%s\n' '{"status":"success","isolation_available":true,"candidate_tests_executed":true,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":true,"reason":"bubblewrap isolated TEST_VALIDATION completed"}' > "$report"
+            printf '{"status":"success","isolation_available":true,"candidate_tests_executed":true,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":true,"bubblewrap_version":"%s","reason":"bubblewrap isolated TEST_VALIDATION completed"}\n' "$version" > "$report"
           else
-            printf '%s\n' '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"reason":"bubblewrap namespace setup or isolated validation failed before candidate pytest"}' > "$report"
+            printf '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"bubblewrap_version":"%s","reason":"bubblewrap namespace setup or isolated validation failed before candidate pytest"}\n' "$version" > "$report"
           fi
           exit "$test_code"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

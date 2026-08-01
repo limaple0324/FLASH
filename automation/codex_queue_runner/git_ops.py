@@ -60,7 +60,7 @@ def _sandbox(workspace: Path, argv: list[str]) -> list[str]:
     bwrap = shutil.which("bwrap")
     if os.name == "nt" or not bwrap:
         raise QueueRunError("BLOCKED: filesystem and network isolation is unavailable")
-    return [bwrap, "--die-with-parent", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-net", "--unshare-uts", "--unshare-cgroup-try", "--uid", "0", "--gid", "0", "--disable-userns", "--cap-drop", "ALL", "--new-session", "--ro-bind", "/", "/", "--dir", "/work", "--bind", str(workspace), "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/work", "--", *argv]
+    return [bwrap, "--die-with-parent", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-net", "--unshare-uts", "--unshare-cgroup-try", "--uid", "0", "--gid", "0", "--cap-drop", "ALL", "--new-session", "--ro-bind", "/", "/", "--dir", "/work", "--bind", str(workspace), "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/work", "--", *argv]
 
 
 def isolation_probe() -> None:

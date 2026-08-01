@@ -235,8 +235,9 @@ def test_isolation_environment_is_pinned_and_has_no_unsafe_fallback(monkeypatch)
     monkeypatch.setattr(git_ops.os, "name", "posix")
     from automation.codex_queue_runner.git_ops import _sandbox
     command = _sandbox(Path("/work"), ["true"])
-    for value in ("--uid", "0", "--gid", "--disable-userns", "--cap-drop", "ALL", "--unshare-net"):
+    for value in ("--uid", "0", "--gid", "--cap-drop", "ALL", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-net", "--unshare-uts", "--unshare-cgroup-try", "--new-session", "--die-with-parent"):
         assert value in command
+    assert "--disable-userns" not in command
     workflow = Path(".github/workflows/codex-queue-runner.yml").read_text(encoding="utf-8")
     for job in ("pr_isolation_dry_run", "validate"):
         section = workflow.split(f"  {job}:", 1)[1]
