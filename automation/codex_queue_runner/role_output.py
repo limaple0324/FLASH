@@ -20,7 +20,12 @@ def _list(minimum: int = 0) -> dict:
 
 
 def output_schema(role: Role) -> dict:
-    properties = {"role": {"const": role.value}, "result": {"enum": ["pass", "fail"]}, "summary": _text(MAX_TEXT_LENGTH), "evidence": _list(1)}
+    properties = {
+        "role": {"type": "string", "const": role.value},
+        "result": {"type": "string", "enum": ["pass", "fail"]},
+        "summary": _text(MAX_TEXT_LENGTH),
+        "evidence": _list(1),
+    }
     required = ["role", "result", "summary", "evidence"]
     if role is Role.WORKER_A:
         properties["patch"] = _text(MAX_PATCH_BYTES, 0)
@@ -29,7 +34,15 @@ def output_schema(role: Role) -> dict:
         properties["reasons"] = _list()
         required.append("reasons")
     elif role is Role.CODE_REVIEW:
-        properties.update({"severity": {"enum": ["none", "low", "medium", "high", "critical"]}, "findings": _list()})
+        properties.update(
+            {
+                "severity": {
+                    "type": "string",
+                    "enum": ["none", "low", "medium", "high", "critical"],
+                },
+                "findings": _list(),
+            }
+        )
         required.extend(["severity", "findings"])
     return {"type": "object", "additionalProperties": False, "properties": properties, "required": required}
 
