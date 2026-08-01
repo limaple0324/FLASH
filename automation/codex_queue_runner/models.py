@@ -19,10 +19,6 @@ class TaskStatus(str, Enum):
     def claimable(cls) -> frozenset["TaskStatus"]:
         return frozenset({cls.READY, cls.NEEDS_FIX})
 
-    @classmethod
-    def completed(cls) -> frozenset["TaskStatus"]:
-        return frozenset({cls.VERIFIED, cls.CLOSED})
-
 
 class Role(str, Enum):
     WORKER_A = "WORKER_A"
@@ -33,25 +29,20 @@ class Role(str, Enum):
     INTEGRATION = "INTEGRATION"
 
     def requires_codex(self) -> bool:
-        return self in {
-            Role.WORKER_A,
-            Role.REQUIREMENTS_AUDIT,
-            Role.CODE_REVIEW,
-            Role.INTEGRATION,
-        }
+        return self in {Role.WORKER_A, Role.REQUIREMENTS_AUDIT, Role.CODE_REVIEW}
 
     def sandbox(self) -> str:
-        return "workspace-write" if self in {Role.WORKER_A, Role.INTEGRATION} else "read-only"
+        return "workspace-write" if self is Role.WORKER_A else "read-only"
 
     def is_manual_gate(self) -> bool:
-        return self is Role.BATCH_CONTROL
+        return self in {Role.BATCH_CONTROL, Role.INTEGRATION}
 
 
 ROLE_TRANSITIONS: dict[Role, Optional[Role]] = {
-    Role.REQUIREMENTS_AUDIT: Role.INTEGRATION,
-    Role.WORKER_A: Role.TEST_VALIDATION,
-    Role.TEST_VALIDATION: Role.CODE_REVIEW,
-    Role.CODE_REVIEW: Role.BATCH_CONTROL,
+    Role.WORKER_A: Role.REQUIREMENTS_AUDIT,
+    Role.REQUIREMENTS_AUDIT: Role.CODE_REVIEW,
+    Role.CODE_REVIEW: Role.TEST_VALIDATION,
+    Role.TEST_VALIDATION: None,
 }
 
 ALLOWED_ROLES = frozenset(role.value for role in Role)
@@ -92,7 +83,22 @@ class Task:
 
     @property
     def is_batch_item(self) -> bool:
-        return bool(self.plan_id and self.item_id and self.item_index)
+        if not self.plan_id or not self.item_id or not self.item_title:
+            return False
+        values = (
+            self.item_index,
+            self.group_index,
+            self.group_size,
+            self.total_items,
+            self.total_groups,
+        )
+        if any(value <= 0 for value in values) or self.group_size != 3:
+            return False
+        if self.item_index > self.total_items or self.group_index > self.total_groups:
+            return False
+        if self.total_groups != (self.total_items + self.group_size - 1) // self.group_size:
+            return False
+        return ((self.item_index - 1) // self.group_size) + 1 == self.group_index
 
 
 @dataclass
@@ -126,7 +132,6 @@ class AgentResult:
     evidence: tuple[str, ...] = ()
     severity: str = "none"
     findings: tuple[str, ...] = ()
-    route: str = ""
 
 
 class QueueRunError(ValueError):

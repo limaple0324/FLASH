@@ -60,7 +60,25 @@ def collect_candidates(raw_comments: Sequence[dict], require_owner: str = OWNER)
             task.base_commit = state.base_commit
         candidate.created_at = state.created_at
         candidates.append(candidate)
+    _validate_batch_uniqueness(candidates)
     return sorted(candidates, key=lambda item: _key({"created_at": item.created_at, "id": item.comment_id}))
+
+
+def _validate_batch_uniqueness(candidates: Sequence[TaskCandidate]) -> None:
+    item_ids: set[tuple[str, str]] = set()
+    item_indexes: set[tuple[str, int]] = set()
+    for candidate in candidates:
+        task = candidate.task
+        if not task.is_batch_item:
+            continue
+        item_id_key = (task.plan_id, task.item_id)
+        item_index_key = (task.plan_id, task.item_index)
+        if item_id_key in item_ids:
+            raise QueueRunError("duplicate ITEM_ID in PLAN_ID")
+        if item_index_key in item_indexes:
+            raise QueueRunError("duplicate ITEM_INDEX in PLAN_ID")
+        item_ids.add(item_id_key)
+        item_indexes.add(item_index_key)
 
 
 def select_task(candidates: Sequence[TaskCandidate], queue_id: str | None = None) -> TaskCandidate:
