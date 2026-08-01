@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 
 class TaskStatus(str, Enum):
+    PENDING = "PENDING"
     READY = "READY"
     CLAIMED = "CLAIMED"
     WAITING_REVIEW = "WAITING_REVIEW"
@@ -18,6 +19,10 @@ class TaskStatus(str, Enum):
     def claimable(cls) -> frozenset["TaskStatus"]:
         return frozenset({cls.READY, cls.NEEDS_FIX})
 
+    @classmethod
+    def completed(cls) -> frozenset["TaskStatus"]:
+        return frozenset({cls.VERIFIED, cls.CLOSED})
+
 
 class Role(str, Enum):
     WORKER_A = "WORKER_A"
@@ -28,20 +33,25 @@ class Role(str, Enum):
     INTEGRATION = "INTEGRATION"
 
     def requires_codex(self) -> bool:
-        return self in {Role.WORKER_A, Role.REQUIREMENTS_AUDIT, Role.CODE_REVIEW}
+        return self in {
+            Role.WORKER_A,
+            Role.REQUIREMENTS_AUDIT,
+            Role.CODE_REVIEW,
+            Role.INTEGRATION,
+        }
 
     def sandbox(self) -> str:
-        return "workspace-write" if self is Role.WORKER_A else "read-only"
+        return "workspace-write" if self in {Role.WORKER_A, Role.INTEGRATION} else "read-only"
 
     def is_manual_gate(self) -> bool:
-        return self in {Role.BATCH_CONTROL, Role.INTEGRATION}
+        return self is Role.BATCH_CONTROL
 
 
 ROLE_TRANSITIONS: dict[Role, Optional[Role]] = {
-    Role.WORKER_A: Role.REQUIREMENTS_AUDIT,
-    Role.REQUIREMENTS_AUDIT: Role.CODE_REVIEW,
-    Role.CODE_REVIEW: Role.TEST_VALIDATION,
-    Role.TEST_VALIDATION: None,
+    Role.REQUIREMENTS_AUDIT: Role.INTEGRATION,
+    Role.WORKER_A: Role.TEST_VALIDATION,
+    Role.TEST_VALIDATION: Role.CODE_REVIEW,
+    Role.CODE_REVIEW: Role.BATCH_CONTROL,
 }
 
 ALLOWED_ROLES = frozenset(role.value for role in Role)
@@ -65,12 +75,24 @@ class Task:
     windows_build: bool = False
     next_role: Optional[str] = None
     blocker_inbox: str = "#18"
+    plan_id: str = ""
+    item_id: str = ""
+    item_title: str = ""
+    item_index: int = 0
+    group_index: int = 0
+    group_size: int = 3
+    total_items: int = 0
+    total_groups: int = 0
     comment_id: Optional[int] = None
     comment_author: Optional[str] = None
     comment_created_at: Optional[str] = None
     state_comment_id: Optional[int] = None
     workflow_run_id: Optional[str] = None
     raw: Optional[str] = None
+
+    @property
+    def is_batch_item(self) -> bool:
+        return bool(self.plan_id and self.item_id and self.item_index)
 
 
 @dataclass
@@ -104,6 +126,7 @@ class AgentResult:
     evidence: tuple[str, ...] = ()
     severity: str = "none"
     findings: tuple[str, ...] = ()
+    route: str = ""
 
 
 class QueueRunError(ValueError):
