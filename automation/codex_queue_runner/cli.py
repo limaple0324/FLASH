@@ -165,14 +165,18 @@ def command_writeback(args: argparse.Namespace) -> int:
         _write(Path(args.report), {"mode": "dry-run", "queue_id": task.queue_id, "selected": True, "agent_result": value["agent_result"], "writeback": "simulated", "external_writes": 0, "pushes": 0}); return 0
     client = _client(args.repository)
     try:
+        structured = value["result"]
+        evidence = json.dumps(structured, ensure_ascii=False, separators=(",", ":"))[:8000]
         if value["agent_result"] != "pass":
-            client.post_issue_comment(19, build_needs_fix(task, "; ".join(value.get("evidence", [])) or value["summary"])); client.dispatch_next(task.queue_id); return 0
+            client.post_issue_comment(19, build_needs_fix(task, evidence))
+            if task.source_pr != "NONE": client.write_source_pr(_number(task.source_pr, "SOURCE_PR"), f"QUEUE_ID: {task.queue_id}\nROLE: {structured['role']}\nRESULT: fail\nSUMMARY: {structured['summary']}\nREASONS: {json.dumps(structured['reasons'])}\nEVIDENCE: {json.dumps(structured['evidence'])}\nSEVERITY: {structured['severity']}\nFINDINGS: {json.dumps(structured['findings'])}\nRESULT_COMMIT: NONE\nCHANGED_FILES: NONE\nTEST_RESULT: {value.get('test_result', 'not-run')}")
+            return 0
         commit = task.base_commit; files = value.get("changed_files", [])
         if value.get("has_patch"): commit, files, _ = create_and_push(Path(args.target_repo), task, Path(args.validated_dir) / "validated.patch", Path(args.validated_dir) / "manifest.sha256")
         next_role = ROLE_TRANSITIONS.get(task.role)
-        if next_role: client.post_issue_comment(19, build_ready_handoff(task, next_role, commit, f"files={','.join(files) or 'NONE'}"))
-        else: client.post_issue_comment(19, build_waiting_review(task, commit, f"files={','.join(files) or 'NONE'}"))
-        if task.source_pr != "NONE": client.write_source_pr(_number(task.source_pr, "SOURCE_PR"), f"QUEUE_ID: {task.queue_id}\nRESULT_COMMIT: {commit}\nFILES: {','.join(files) or 'NONE'}")
+        if next_role: client.post_issue_comment(19, build_ready_handoff(task, next_role, commit, evidence))
+        else: client.post_issue_comment(19, build_waiting_review(task, commit, evidence))
+        if task.source_pr != "NONE": client.write_source_pr(_number(task.source_pr, "SOURCE_PR"), f"QUEUE_ID: {task.queue_id}\nROLE: {structured['role']}\nRESULT: pass\nSUMMARY: {structured['summary']}\nREASONS: {json.dumps(structured['reasons'])}\nEVIDENCE: {json.dumps(structured['evidence'])}\nSEVERITY: {structured['severity']}\nFINDINGS: {json.dumps(structured['findings'])}\nRESULT_COMMIT: {commit}\nCHANGED_FILES: {','.join(files) or 'NONE'}\nTEST_RESULT: {value.get('test_result', 'not-run')}")
         client.dispatch_next(task.queue_id)
     except Exception as exc:
         client.post_issue_comment(19, build_blocked_status(task, "Queue Runner 阻擋")); client.write_blocker(build_blocked_comment(task, "Queue Runner 阻擋", str(exc), "push_writeback", "QUEUE_RUNNER", "push_writeback")); return 1

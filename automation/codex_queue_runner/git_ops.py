@@ -121,9 +121,13 @@ def commit_message(task: Task) -> str:
 
 def find_reconciled_commit(repo: Path, task: Task) -> str | None:
     head = remote_head(repo, task.target_branch)
+    if head == task.base_commit:
+        return None
+    _git(repo, "fetch", "--no-tags", "origin", head)
     message = _git(repo, "show", "-s", "--format=%s", head).decode().strip()
     parents = _git(repo, "show", "-s", "--format=%P", head).decode().split()
-    return head if message == commit_message(task) and parents == [task.base_commit] else None
+    if message == commit_message(task) and parents == [task.base_commit]: return head
+    raise QueueRunError("remote branch head is not the expected reconciled commit")
 
 
 def create_and_push(repo: Path, task: Task, validated_patch: Path, manifest: Path) -> tuple[str, list[str], list[str]]:

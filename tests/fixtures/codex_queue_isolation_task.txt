@@ -1,0 +1,15 @@
+```
+QUEUE_ID: ISOLATION-DRY-RUN-001
+STATUS: READY
+ROLE: TEST_VALIDATION
+SOURCE_ISSUE: #20
+SOURCE_PR: NONE
+BASE_COMMIT: c1f250f42e13fa0857b40245509f708ff4811dd1
+TARGET_BRANCH: automation/isolation-dry-run-fixture
+SCOPE: isolation fixture
+OWNED_FILES: tests/
+FORBIDDEN: .github/workflows/
+ACCEPTANCE: controlled pytest
+MINIMUM_TESTS: tests/test_codex_queue_runner.py::test_only_issue_19_owner_and_trusted_state_are_accepted
+BLOCKER_INBOX: #18
+```
