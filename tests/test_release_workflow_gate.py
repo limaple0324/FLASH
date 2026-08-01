@@ -1,25 +1,25 @@
 from pathlib import Path
 
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "build-windows.yml"
+WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+VALIDATION_WORKFLOW = WORKFLOWS / "build-windows.yml"
+FORMAL_WORKFLOW = WORKFLOWS / "publish-windows-release.yml"
 
 
-def test_latest_release_requires_manual_approval_and_reuse_check():
-    workflow = WORKFLOW.read_text(encoding="utf-8")
+def test_validation_workflow_cannot_publish_a_formal_channel():
+    workflow = VALIDATION_WORKFLOW.read_text(encoding="utf-8")
 
-    assert "approve_latest:" in workflow
-    assert (
-        "if: github.event_name == 'workflow_dispatch' && "
-        "github.ref == 'refs/heads/main' && inputs.approve_latest"
-    ) in workflow
-    assert "reject_reused_release_version" in workflow
-    assert "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" not in workflow
+    assert "contents: read" in workflow
+    assert "persist-credentials: false" in workflow
+    assert "contents: write" not in workflow
+    assert "git push origin release/" not in workflow
 
 
-def test_sp1_release_also_requires_manual_approval():
-    workflow = WORKFLOW.read_text(encoding="utf-8")
+def test_formal_release_requires_manual_main_approval_and_history_check():
+    workflow = FORMAL_WORKFLOW.read_text(encoding="utf-8")
 
-    assert (
-        "if: github.event_name == 'workflow_dispatch' && "
-        "github.ref == 'refs/heads/sp1/completion-2026-07-25' && inputs.publish_sp1"
-    ) in workflow
+    assert "workflow_dispatch:" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "github.actor == 'limaple0324'" in workflow
+    assert "inputs.confirm_release" in workflow
+    assert "reject_reused_release_history_version" in workflow

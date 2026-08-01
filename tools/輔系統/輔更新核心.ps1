@@ -494,6 +494,16 @@ function Assert-ReleaseIdentity(
     if ($buildInfo["short_commit"] -ne $buildInfo["commit"].Substring(0, 7)) {
         throw "BUILD_INFO.txt 的 short_commit 與 commit 不一致。"
     }
+    $artifactPrefix = switch ($buildInfo["milestone"]) {
+        "SP1" { "FLASH-SP1-Windows" }
+        "SP2" { "FLASH-SP1+SP2-Windows" }
+        "SP3" { "FLASH-SP1+SP2+SP3-Windows" }
+        default { throw "BUILD_INFO.txt 的 milestone 不受支援。" }
+    }
+    $expectedArtifactName = "$artifactPrefix-$($buildInfo['version'])-$($buildInfo['short_commit'].ToLowerInvariant())-$($buildInfo['artifact_kind'])"
+    if ($buildInfo["artifact_name"] -cne $expectedArtifactName) {
+        throw "BUILD_INFO.txt 的 artifact_name 與版本、短提交碼或成品類型不一致。"
+    }
     foreach ($key in @(
         "version",
         "short_commit",

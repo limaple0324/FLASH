@@ -23,7 +23,7 @@ def _info(**overrides: str) -> dict[str, str]:
         "commit": "a" * 40,
         "short_commit": "aaaaaaa",
         "run_id": "123",
-        "artifact_name": "FLASH-0.3.0-aaaaaaa-validation",
+        "artifact_name": "FLASH-SP1+SP2+SP3-Windows-0.3.0-aaaaaaa-validation",
     }
     info.update(overrides)
     return info
@@ -41,7 +41,7 @@ def test_main_push_is_validation_only():
     assert result["approval_status"] == "not_approved"
 
 
-def test_main_release_requires_manual_approval_input():
+def test_validation_workflow_cannot_classify_a_manual_request_as_formal_release():
     result = classify_build(
         event_name="workflow_dispatch",
         ref="refs/heads/main",
@@ -49,13 +49,9 @@ def test_main_release_requires_manual_approval_input():
         approve_latest=True,
     )
 
-    assert result == {
-        "build_kind": "main_release",
-        "publish_target": "release/latest",
-        "artifact_kind": "release",
-        "approval_status": "approved",
-        "approval_method": "workflow_dispatch_input",
-    }
+    assert result["build_kind"] == "validation_build"
+    assert result["publish_target"] == "none"
+    assert result["approval_status"] == "not_approved"
 
 
 def test_sp1_push_is_snapshot_even_when_the_branch_is_a_delivery_branch():
@@ -89,7 +85,7 @@ def test_packaged_identity_accepts_an_approved_release():
             approval_run_id="123",
             approval_event="workflow_dispatch",
             publish_target="release/latest",
-            artifact_name="FLASH-0.3.0-aaaaaaa-release",
+            artifact_name="FLASH-SP1+SP2+SP3-Windows-0.3.0-aaaaaaa-release",
         ),
         expected_version="0.3.0",
         expected_milestone="SP3",
@@ -105,9 +101,10 @@ def test_changed_source_cannot_reuse_a_formal_version():
         )
 
 
-def test_same_source_can_retry_the_same_formal_version():
-    reject_reused_release_version(
-        current_version="0.3.0",
-        current_commit="a" * 40,
-        previous={"version": "0.3.0", "commit": "a" * 40},
-    )
+def test_same_source_cannot_create_an_unconditional_duplicate_formal_version():
+    with pytest.raises(ReleaseIdentityError, match="already recorded"):
+        reject_reused_release_version(
+            current_version="0.3.0",
+            current_commit="a" * 40,
+            previous={"version": "0.3.0", "commit": "a" * 40},
+        )

@@ -10,20 +10,9 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      approve_latest:
-        description: Explicit user approval to publish the complete release channel
-        required: true
-        type: boolean
-        default: false
-      publish_sp1:
-        description: Publish the verified SP1-only updater channel
-        required: true
-        type: boolean
-        default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: windows-build-${{ github.ref }}
@@ -37,6 +26,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -107,8 +98,6 @@ jobs:
           BUILD_EVENT_NAME: ${{ github.event_name }}
           BUILD_REF: ${{ github.ref }}
           BUILD_SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
-          BUILD_APPROVE_LATEST: ${{ inputs.approve_latest }}
-          BUILD_PUBLISH_SP1: ${{ inputs.publish_sp1 }}
         run: |
           $metadataJson = python -c "import json; from core.version import PRODUCT_NAME, TECHNICAL_NAME, VERSION, MILESTONE; print(json.dumps({'product': PRODUCT_NAME, 'technical_name': TECHNICAL_NAME, 'version': VERSION, 'milestone': MILESTONE}))"
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($metadataJson)) {
@@ -130,8 +119,6 @@ jobs:
               event_name=os.environ["BUILD_EVENT_NAME"],
               ref=os.environ["BUILD_REF"],
               source_branch=os.environ["BUILD_SOURCE_BRANCH"],
-              approve_latest=os.environ.get("BUILD_APPROVE_LATEST", "").lower() == "true",
-              approve_sp1=os.environ.get("BUILD_PUBLISH_SP1", "").lower() == "true",
           ), ensure_ascii=False))
           '@ | python -
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($classificationJson)) {
@@ -648,152 +635,3 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Release bundle identity verification failed."
           }
-
-      - name: Publish latest desktop updater files
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.approve_latest
-        shell: pwsh
-        run: |
-          $publishRoot = Join-Path $env:RUNNER_TEMP 'flash-latest-release'
-          Remove-Item -Recurse -Force $publishRoot -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $publishRoot | Out-Null
-
-          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" $publishRoot
-          Set-Location $publishRoot
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          $branchExists = $true
-          git fetch origin release/latest
-          if ($LASTEXITCODE -ne 0) {
-            $branchExists = $false
-          }
-
-          if ($branchExists) {
-            git checkout release/latest
-          }
-          else {
-            git checkout --orphan release/latest
-          }
-
-          if ($branchExists) {
-            $existingInfoPath = Join-Path $publishRoot '輔系統\BUILD_INFO.txt'
-            if (-not (Test-Path -LiteralPath $existingInfoPath -PathType Leaf)) {
-              throw "Existing release/latest has no traceable BUILD_INFO.txt."
-            }
-            $existingInfo = @{}
-            Get-Content -LiteralPath $existingInfoPath | ForEach-Object {
-              $parts = $_ -split '=', 2
-              if ($parts.Count -eq 2) {
-                $existingInfo[$parts[0]] = $parts[1]
-              }
-            }
-            $env:PREVIOUS_RELEASE_VERSION = [string]$existingInfo['version']
-            $env:PREVIOUS_RELEASE_COMMIT = [string]$existingInfo['commit']
-            $env:PYTHONPATH = $env:GITHUB_WORKSPACE
-            @'
-            import os
-            from core.release_identity import reject_reused_release_version
-
-            reject_reused_release_version(
-                current_version=os.environ["FLASH_VERSION"],
-                current_commit=os.environ["GITHUB_SHA"],
-                previous={
-                    "version": os.environ.get("PREVIOUS_RELEASE_VERSION", ""),
-                    "commit": os.environ.get("PREVIOUS_RELEASE_COMMIT", ""),
-                },
-            )
-            '@ | python -
-            if ($LASTEXITCODE -ne 0) {
-              throw "Formal version reuse check failed."
-            }
-          }
-
-          Get-ChildItem -Force |
-            Where-Object { $_.Name -ne '.git' } |
-            Remove-Item -Recurse -Force
-
-          Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\.gitattributes" ".\.gitattributes"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\LATEST.txt" ".\LATEST.txt"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\安裝輔.cmd" ".\安裝輔.cmd"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\更新輔.cmd" ".\更新輔.cmd"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\輔系統" ".\輔系統" -Recurse -Force
-
-          # 同時登記刪除舊版發布分支殘留的原始碼與過期檔案。
-          git add -A
-          git commit -m "Update latest Windows FLASH build"
-          git push origin release/latest --force
-
-      - name: Publish SP1-only desktop updater files
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/sp1/completion-2026-07-25' && inputs.publish_sp1
-        shell: pwsh
-        run: |
-          $publishRoot = Join-Path $env:RUNNER_TEMP 'flash-sp1-release'
-          Remove-Item -Recurse -Force $publishRoot -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $publishRoot | Out-Null
-
-          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" $publishRoot
-          Set-Location $publishRoot
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          $branchExists = $true
-          git fetch origin release/sp1
-          if ($LASTEXITCODE -ne 0) {
-            $branchExists = $false
-          }
-
-          if ($branchExists) {
-            git checkout release/sp1
-          }
-          else {
-            git checkout --orphan release/sp1
-          }
-
-          if ($branchExists) {
-            $existingInfoPath = Join-Path $publishRoot '輔系統\BUILD_INFO.txt'
-            if (-not (Test-Path -LiteralPath $existingInfoPath -PathType Leaf)) {
-              throw "Existing release/sp1 has no traceable BUILD_INFO.txt."
-            }
-            $existingInfo = @{}
-            Get-Content -LiteralPath $existingInfoPath | ForEach-Object {
-              $parts = $_ -split '=', 2
-              if ($parts.Count -eq 2) {
-                $existingInfo[$parts[0]] = $parts[1]
-              }
-            }
-            $env:PREVIOUS_RELEASE_VERSION = [string]$existingInfo['version']
-            $env:PREVIOUS_RELEASE_COMMIT = [string]$existingInfo['commit']
-            $env:PYTHONPATH = $env:GITHUB_WORKSPACE
-            @'
-            import os
-            from core.release_identity import reject_reused_release_version
-
-            reject_reused_release_version(
-                current_version=os.environ["FLASH_VERSION"],
-                current_commit=os.environ["GITHUB_SHA"],
-                previous={
-                    "version": os.environ.get("PREVIOUS_RELEASE_VERSION", ""),
-                    "commit": os.environ.get("PREVIOUS_RELEASE_COMMIT", ""),
-                },
-            )
-            '@ | python -
-            if ($LASTEXITCODE -ne 0) {
-              throw "Formal version reuse check failed."
-            }
-          }
-
-          Get-ChildItem -Force |
-            Where-Object { $_.Name -ne '.git' } |
-            Remove-Item -Recurse -Force
-
-          Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\.gitattributes" ".\.gitattributes"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\LATEST.txt" ".\LATEST.txt"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\安裝輔.cmd" ".\安裝輔.cmd"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\更新輔.cmd" ".\更新輔.cmd"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\輔系統" ".\輔系統" -Recurse -Force
-
-          git add -A
-          git commit -m "Update SP1-only Windows FLASH build"
-          git push origin release/sp1 --force

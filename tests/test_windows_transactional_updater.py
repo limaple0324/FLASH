@@ -139,9 +139,12 @@ def _create_release(
         "short_commit": SOURCE_COMMIT[:7],
         "run_id": "123456789",
         "built_utc": "2026-07-25T00:00:00Z",
-        "artifact_name": "FLASH-SP1+SP2+SP3-Windows-0.1.2-release",
+        "artifact_name": f"FLASH-SP1+SP2+SP3-Windows-0.1.2-{SOURCE_COMMIT[:7]}-release",
         "python": "Python 3.12",
         "sha256": executable_hash,
+        "verification_run_id": "987654321",
+        "verification_artifact_name": f"FLASH-SP1+SP2+SP3-Windows-0.1.2-{SOURCE_COMMIT[:7]}-validation",
+        "verification_artifact_sha256": "c" * 64,
     }
     _path(release_root, "輔系統/BUILD_INFO.txt").write_text(
         "".join(f"{key}={value}\n" for key, value in build_info.items()),
@@ -155,7 +158,7 @@ def _create_release(
                 f"commit={latest_commit}",
                 f"short_commit={latest_commit[:7]}",
                 "run_id=123456789",
-                "artifact_name=FLASH-SP1+SP2+SP3-Windows-0.1.2-release",
+                f"artifact_name=FLASH-SP1+SP2+SP3-Windows-0.1.2-{SOURCE_COMMIT[:7]}-release",
                 f"approval_status={approval_status}",
                 f"approval_method={approval_method}",
                 f"approval_actor={approval_actor}",
