@@ -80,7 +80,7 @@ def build_context_snapshot(client: Any, task: Task, comments: list[dict]) -> dic
     issue = client.get_issue(_number(task.source_issue, "SOURCE_ISSUE")); pr: dict = {}; files: list[str] = []
     if task.source_pr != "NONE":
         pr = client.get_pull_request(_number(task.source_pr, "SOURCE_PR")); files = [str(item.get("filename", "")) for item in client.list_pull_request_files(_number(task.source_pr, "SOURCE_PR"))]
-    evidence = [str(comment.get("body", ""))[:1000] for comment in comments if is_trusted_state(comment) and task.queue_id in str(comment.get("body", "")) and "EVIDENCE:" in str(comment.get("body", ""))]
+    evidence = [str(comment.get("body", "")) for comment in comments if is_trusted_state(comment) and task.queue_id in str(comment.get("body", "")) and "EVIDENCE:" in str(comment.get("body", ""))]
     context = {"queue_id": task.queue_id, "source_issue": {"number": task.source_issue, "title": issue.get("title", ""), "body": issue.get("body", "")}, "source_pr": {"number": task.source_pr, "base": (pr.get("base") or {}).get("sha", ""), "head": (pr.get("head") or {}).get("sha", ""), "branch": (pr.get("head") or {}).get("ref", "")}, "changed_files": files, "prior_evidence": evidence}
     from .prompt_builder import validate_prompt_context
     validate_prompt_context(context)
@@ -206,11 +206,12 @@ def command_writeback(args: argparse.Namespace) -> int:
         commit = task.base_commit; files = value.get("changed_files", [])
         if value.get("has_patch"): commit, files, _ = create_and_push(Path(args.target_repo), task, Path(args.validated_dir) / "validated.patch", Path(args.validated_dir) / "manifest.sha256")
         next_role = ROLE_TRANSITIONS.get(task.role)
+        source_pr_body = f"QUEUE_ID: {task.queue_id}\nROLE: {structured['role']}\nRESULT: pass\nSUMMARY: {structured['summary']}\nREASONS: {json.dumps(structured['reasons'])}\nEVIDENCE: {json.dumps(structured['evidence'])}\nSEVERITY: {structured['severity']}\nFINDINGS: {json.dumps(structured['findings'])}\nRESULT_COMMIT: {commit}\nCHANGED_FILES: {','.join(files) or 'NONE'}\nTEST_RESULT: {value.get('test_result', 'not-run')}"
+        if task.source_pr != "NONE": client.write_source_pr(_number(task.source_pr, "SOURCE_PR"), source_pr_body)
         if next_role:
             client.post_issue_comment(19, build_ready_handoff(task, next_role, commit, evidence))
             client.dispatch_next(task.queue_id)
         else: client.post_issue_comment(19, build_waiting_review(task, commit, evidence))
-        if task.source_pr != "NONE": client.write_source_pr(_number(task.source_pr, "SOURCE_PR"), f"QUEUE_ID: {task.queue_id}\nROLE: {structured['role']}\nRESULT: pass\nSUMMARY: {structured['summary']}\nREASONS: {json.dumps(structured['reasons'])}\nEVIDENCE: {json.dumps(structured['evidence'])}\nSEVERITY: {structured['severity']}\nFINDINGS: {json.dumps(structured['findings'])}\nRESULT_COMMIT: {commit}\nCHANGED_FILES: {','.join(files) or 'NONE'}\nTEST_RESULT: {value.get('test_result', 'not-run')}")
     except Exception as exc:
         client.post_issue_comment(19, build_blocked_status(task, "Queue Runner 阻擋")); client.write_blocker(build_blocked_comment(task, "Queue Runner 阻擋", str(exc), "push_writeback", "QUEUE_RUNNER", "push_writeback")); return 1
     return 0

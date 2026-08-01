@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from automation.codex_queue_runner.cli import RunnerConfig, command_select, command_validate, command_writeback, select_and_claim, validate_remote_source
+from automation.codex_queue_runner.cli import RunnerConfig, build_context_snapshot, command_select, command_validate, command_writeback, select_and_claim, validate_remote_source
 from automation.codex_queue_runner.git_ops import create_and_push, find_reconciled_commit, validate_patch
 from automation.codex_queue_runner.github_client import GitHubRestClient
 from automation.codex_queue_runner.models import QueueRunError, Role, TaskStatus, task_from_mapping, task_to_mapping
@@ -54,19 +54,24 @@ def state(queue_id, value, number, created, run="", source=1, role="", base="", 
 
 class FakeClient:
     def __init__(self, comments, head="a" * 40, run=None):
-        self.comments, self.head, self.run, self.posts, self.dispatches = comments, head, run or {"status": "completed"}, [], []
+        self.comments, self.head, self.run, self.posts, self.dispatches, self.operations = comments, head, run or {"status": "completed"}, [], [], []
+        self.fail_source_pr = False; self.fail_ready = False
     def list_issue_comments(self, _): return self.comments
     def list_pull_request_files(self, _): return [{"filename": "tests/test_fixture.py"}]
     def post_issue_comment(self, issue, body):
+        if self.fail_ready and "STATUS: READY" in body: raise QueueRunError("simulated READY write failure")
+        self.operations.append(("issue", issue, body))
         self.posts.append((issue, body)); value = {"id": 1000 + len(self.posts), "created_at": "2026-08-01T03:00:00Z", "user": {"login": "github-actions[bot]"}, "body": body}; self.comments.append(value); return value
     def get_issue(self, _): return {"title": "issue", "body": "issue body"}
     def get_pull_request(self, _): return {"state": "open", "base": {"sha": "base"}, "head": {"ref": "automation/task", "sha": self.head}}
     def get_branch_sha(self, _): return self.head
     def get_workflow_run(self, _): return self.run
     def get_commit(self, _): return {"parents": [], "commit": {"message": "other"}}
-    def write_blocker(self, body): self.posts.append((18, body))
-    def write_source_pr(self, number, body): self.posts.append((number, body))
-    def dispatch_next(self, queue): self.dispatches.append(queue)
+    def write_blocker(self, body): self.operations.append(("blocker", 18, body)); self.posts.append((18, body))
+    def write_source_pr(self, number, body):
+        if self.fail_source_pr: raise QueueRunError("simulated source PR write failure")
+        self.operations.append(("source_pr", number, body)); self.posts.append((number, body))
+    def dispatch_next(self, queue): self.operations.append(("dispatch", queue)); self.dispatches.append(queue)
 
 
 def test_only_issue_19_owner_and_trusted_state_are_accepted():
@@ -262,23 +267,44 @@ def test_isolation_environment_is_pinned_and_has_no_unsafe_fallback(monkeypatch)
 
 
 def test_handoffs_dispatch_only_the_same_nonterminal_queue(tmp_path, monkeypatch):
+    task = parse_task_comment(comment(role="REQUIREMENTS_AUDIT")["body"]); task_path = tmp_path / "task.json"; output = tmp_path / "validated"; output.mkdir()
+    task_path.write_text(json.dumps({"task": task_to_mapping(task)}), encoding="utf-8")
+    result = {"agent_result": "pass", "result": {"role": "REQUIREMENTS_AUDIT", "result": "pass", "summary": "ok", "patch": "", "reasons": [], "evidence": ["e"], "severity": "none", "findings": []}, "has_patch": False, "changed_files": [], "test_result": "not-run"}
+    (output / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    client = FakeClient([]); monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: client)
+    assert command_writeback(argparse.Namespace(task=str(task_path), validated_dir=str(output), target_repo=str(tmp_path), repository="owner/repo", mode="live", report=str(tmp_path / "report"))) == 0
+    assert client.dispatches == [task.queue_id] and [operation[0] for operation in client.operations] == ["source_pr", "issue", "dispatch"] and "STATUS: READY" in client.operations[1][2]
+
+
+def test_source_pr_none_dispatches_only_after_ready_write(tmp_path, monkeypatch):
     task = parse_task_comment(comment(role="REQUIREMENTS_AUDIT", source_pr="NONE")["body"]); task_path = tmp_path / "task.json"; output = tmp_path / "validated"; output.mkdir()
     task_path.write_text(json.dumps({"task": task_to_mapping(task)}), encoding="utf-8")
     result = {"agent_result": "pass", "result": {"role": "REQUIREMENTS_AUDIT", "result": "pass", "summary": "ok", "patch": "", "reasons": [], "evidence": ["e"], "severity": "none", "findings": []}, "has_patch": False, "changed_files": [], "test_result": "not-run"}
     (output / "result.json").write_text(json.dumps(result), encoding="utf-8")
     client = FakeClient([]); monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: client)
     assert command_writeback(argparse.Namespace(task=str(task_path), validated_dir=str(output), target_repo=str(tmp_path), repository="owner/repo", mode="live", report=str(tmp_path / "report"))) == 0
-    assert client.dispatches == [task.queue_id] and "STATUS: READY" in client.posts[0][1]
+    assert [operation[0] for operation in client.operations] == ["issue", "dispatch"] and client.dispatches == [task.queue_id]
 
 
 def test_terminal_test_validation_waits_without_dispatch(tmp_path, monkeypatch):
-    task = parse_task_comment(comment(role="TEST_VALIDATION", source_pr="NONE")["body"]); task_path = tmp_path / "task.json"; output = tmp_path / "validated"; output.mkdir()
+    task = parse_task_comment(comment(role="TEST_VALIDATION")["body"]); task_path = tmp_path / "task.json"; output = tmp_path / "validated"; output.mkdir()
     task_path.write_text(json.dumps({"task": task_to_mapping(task)}), encoding="utf-8")
     result = {"agent_result": "pass", "result": {"role": "TEST_VALIDATION", "result": "pass", "summary": "ok", "patch": "", "reasons": [], "evidence": ["e"], "severity": "none", "findings": []}, "has_patch": False, "changed_files": [], "test_result": "passed"}
     (output / "result.json").write_text(json.dumps(result), encoding="utf-8")
     client = FakeClient([]); monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: client)
     assert command_writeback(argparse.Namespace(task=str(task_path), validated_dir=str(output), target_repo=str(tmp_path), repository="owner/repo", mode="live", report=str(tmp_path / "report"))) == 0
-    assert not client.dispatches and "STATUS: WAITING_REVIEW" in client.posts[0][1]
+    assert not client.dispatches and [operation[0] for operation in client.operations] == ["source_pr", "issue"] and "STATUS: WAITING_REVIEW" in client.operations[1][2]
+
+
+@pytest.mark.parametrize("failure", ["source_pr", "ready"])
+def test_handoff_failures_block_without_dispatch(tmp_path, monkeypatch, failure):
+    task = parse_task_comment(comment(role="REQUIREMENTS_AUDIT")["body"]); task_path = tmp_path / "task.json"; output = tmp_path / "validated"; output.mkdir()
+    task_path.write_text(json.dumps({"task": task_to_mapping(task)}), encoding="utf-8")
+    result = {"agent_result": "pass", "result": {"role": "REQUIREMENTS_AUDIT", "result": "pass", "summary": "ok", "patch": "", "reasons": [], "evidence": ["e"], "severity": "none", "findings": []}, "has_patch": False, "changed_files": [], "test_result": "not-run"}
+    (output / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    client = FakeClient([]); setattr(client, f"fail_{failure}", True); monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: client)
+    assert command_writeback(argparse.Namespace(task=str(task_path), validated_dir=str(output), target_repo=str(tmp_path), repository="owner/repo", mode="live", report=str(tmp_path / "report"))) == 1
+    assert not client.dispatches and any(target == 19 and "STATUS: BLOCKED" in body for target, body in client.posts) and any(target == 18 for target, _ in client.posts)
 
 
 def test_repository_dispatch_selects_only_authoritative_queue_id(monkeypatch):
@@ -309,6 +335,21 @@ def test_prompt_guard_failure_writes_no_context_or_prompt_file(tmp_path, monkeyp
     output = tmp_path / "selection"
     assert command_select(argparse.Namespace(repository="owner/repo", event=str(event), output_dir=str(output), mode="live", queue_id="", allow_writeback="true", fixture="", lease_seconds=3600)) == 0
     assert not (output / "context.json").exists() and not (output / "task.json").exists()
+
+
+def test_prior_evidence_is_complete_or_blocks_without_silent_truncation(tmp_path, monkeypatch):
+    task = parse_task_comment(comment()["body"]); tail = "EVIDENCE-TAIL"; evidence = state("Q-1", "READY", 2, "2026-08-01T01:02:00Z")
+    evidence["body"] += "\nEVIDENCE: " + "x" * 1_100 + tail
+    context = build_context_snapshot(FakeClient([comment(), evidence]), task, [comment(), evidence])
+    assert context["prior_evidence"][0].endswith(tail) and len(context["prior_evidence"][0]) > 1_000 and tail in render_prompt(task, context)
+    oversized = state("Q-1", "READY", 2, "2026-08-01T01:02:00Z"); oversized["body"] += "\nEVIDENCE: " + "x" * MAX_PROMPT_CONTEXT_BYTES
+    with pytest.raises(QueueRunError) as raised: build_context_snapshot(FakeClient([comment(), oversized]), task, [comment(), oversized])
+    assert str(raised.value) == "prompt context exceeds the fixed size limit" and "x" * 100 not in str(raised.value)
+    client = FakeClient([comment(), oversized]); monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: client); monkeypatch.setenv("GITHUB_RUN_ID", "run-oversized")
+    event = tmp_path / "event.json"; event.write_text(json.dumps({"event_name": "issue_comment", "issue": {"number": 19}}), encoding="utf-8"); output = tmp_path / "selection"
+    assert command_select(argparse.Namespace(repository="owner/repo", event=str(event), output_dir=str(output), mode="live", queue_id="", allow_writeback="true", fixture="", lease_seconds=3600)) == 0
+    assert not (output / "context.json").exists() and not (output / "task.json").exists() and [target for target, _ in client.posts[-2:]] == [19, 18]
+    assert "[:1000]" not in Path("automation/codex_queue_runner/cli.py").read_text(encoding="utf-8")
 
 
 class ClaimVerificationFailureClient(FakeClient):
