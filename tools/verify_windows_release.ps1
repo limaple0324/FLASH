@@ -144,13 +144,21 @@ foreach ($requiredKey in @(
     "version",
     "milestone",
     "build_kind",
+    "artifact_kind",
     "event_name",
     "source_ref",
     "source_branch",
     "publish_target",
+    "approval_status",
+    "approval_method",
+    "approval_actor",
+    "approval_run_id",
+    "approval_event",
     "commit",
+    "short_commit",
     "run_id",
     "built_utc",
+    "artifact_name",
     "sha256"
 )) {
     if (
@@ -173,6 +181,12 @@ if ($buildInfo["version"] -notmatch "^\d+\.\d+\.\d+$") {
 }
 if ($buildInfo["commit"] -notmatch "^[0-9a-fA-F]{40}$") {
     throw "Release commit SHA has an invalid format."
+}
+if ($buildInfo["short_commit"].ToLowerInvariant() -ne $buildInfo["commit"].Substring(0, 7).ToLowerInvariant()) {
+    throw "Release short commit does not match the full source commit."
+}
+if ([string]::IsNullOrWhiteSpace($buildInfo["artifact_name"])) {
+    throw "Release artifact name is missing."
 }
 
 $buildKind = $buildInfo["build_kind"]
@@ -289,28 +303,29 @@ if (
 }
 
 if ($buildKind -in @("main_release", "sp1_release")) {
+    if (
+        $buildInfo["artifact_kind"] -ne "release" -or
+        $buildInfo["approval_status"] -ne "approved" -or
+        $buildInfo["approval_method"] -ne "workflow_dispatch_input" -or
+        $buildInfo["approval_event"] -ne "workflow_dispatch" -or
+        $buildInfo["approval_actor"] -eq "none" -or
+        $buildInfo["approval_run_id"] -ne $buildInfo["run_id"]
+    ) {
+        throw "A formal release requires an auditable workflow approval."
+    }
     if ($buildKind -eq "main_release") {
-        $expectedEventName = "push"
+        $expectedEventName = "workflow_dispatch"
         $expectedSourceRef = "refs/heads/main"
         $expectedSourceBranch = "main"
         $expectedPublishTarget = "release/latest"
     }
     else {
-        $expectedEventName = ""
+        $expectedEventName = "workflow_dispatch"
         $expectedSourceRef = "refs/heads/sp1/completion-2026-07-25"
         $expectedSourceBranch = "sp1/completion-2026-07-25"
         $expectedPublishTarget = "release/sp1"
     }
-    if (
-        $buildKind -eq "sp1_release" -and
-        $buildInfo["event_name"] -notin @("push", "workflow_dispatch")
-    ) {
-        throw "An sp1_release build must use event_name=push or workflow_dispatch."
-    }
-    if (
-        $buildKind -eq "main_release" -and
-        $buildInfo["event_name"] -ne $expectedEventName
-    ) {
+    if ($buildInfo["event_name"] -ne $expectedEventName) {
         throw "A $buildKind build must use event_name=$expectedEventName."
     }
     if ($buildInfo["source_ref"] -ne $expectedSourceRef) {
@@ -342,7 +357,18 @@ if ($buildKind -in @("main_release", "sp1_release")) {
     }
 
     $latest = Read-KeyValueFile -Path $LatestPath -DisplayName "LATEST.txt"
-    foreach ($requiredKey in @("branch", "commit", "run_id", "updated_utc")) {
+    foreach ($requiredKey in @(
+        "branch",
+        "version",
+        "commit",
+        "short_commit",
+        "run_id",
+        "artifact_name",
+        "approval_actor",
+        "approval_run_id",
+        "approved_utc",
+        "updated_utc"
+    )) {
         if (
             -not $latest.ContainsKey($requiredKey) -or
             [string]::IsNullOrWhiteSpace($latest[$requiredKey])
@@ -358,6 +384,26 @@ if ($buildKind -in @("main_release", "sp1_release")) {
     }
     if ($latest["run_id"] -ne $buildInfo["run_id"]) {
         throw "LATEST.txt run_id does not match BUILD_INFO.txt."
+    }
+    foreach ($matchingKey in @("version", "short_commit", "artifact_name", "approval_run_id")) {
+        if ($latest[$matchingKey] -ne $buildInfo[$matchingKey]) {
+            throw "LATEST.txt $matchingKey does not match BUILD_INFO.txt."
+        }
+    }
+    if ($latest["approval_actor"] -ne $buildInfo["approval_actor"]) {
+        throw "LATEST.txt approval_actor does not match BUILD_INFO.txt."
+    }
+}
+else {
+    if (
+        $buildInfo["artifact_kind"] -ne "validation" -or
+        $buildInfo["approval_status"] -ne "not_approved" -or
+        $buildInfo["approval_method"] -ne "none" -or
+        $buildInfo["approval_actor"] -ne "none" -or
+        $buildInfo["approval_run_id"] -ne "none" -or
+        $buildInfo["approval_event"] -ne "none"
+    ) {
+        throw "A validation artifact must not contain formal approval identity."
     }
 }
 

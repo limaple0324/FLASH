@@ -46,7 +46,7 @@ def _create_bundle(
     digest = hashlib.sha256(executable_path.read_bytes()).hexdigest()
 
     if event_name is None:
-        event_name = "push" if build_kind == "main_release" else "workflow_dispatch"
+        event_name = "workflow_dispatch"
     if source_ref is None:
         if build_kind in {"main_release", "validation_build"}:
             source_ref = "refs/heads/main"
@@ -57,19 +57,38 @@ def _create_bundle(
         else:
             source_ref = "refs/heads/sp1/completion-2026-07-25"
 
+    commit = "a" * 40
+    short_commit = commit[:7]
+    is_release = build_kind in {"main_release", "sp1_release"}
+    artifact_kind = "release" if is_release else "validation"
+    approval_status = "approved" if is_release else "not_approved"
+    approval_method = "workflow_dispatch_input" if is_release else "none"
+    approval_actor = "fixture-user" if is_release else "none"
+    approval_run_id = "123456789" if is_release else "none"
+    approval_event = "workflow_dispatch" if is_release else "none"
+    artifact_name = f"fixture-{version}-{short_commit}-{artifact_kind}"
+
     build_info = {
         "product": "輔",
         "technical_name": "FLASH",
         "version": version,
         "milestone": milestone,
         "build_kind": build_kind,
+        "artifact_kind": artifact_kind,
         "event_name": event_name,
         "source_ref": source_ref,
         "source_branch": source_branch,
         "publish_target": publish_target,
-        "commit": "a" * 40,
+        "approval_status": approval_status,
+        "approval_method": approval_method,
+        "approval_actor": approval_actor,
+        "approval_run_id": approval_run_id,
+        "approval_event": approval_event,
+        "commit": commit,
+        "short_commit": short_commit,
         "run_id": "123456789",
         "built_utc": "2026-07-25T00:00:00Z",
+        "artifact_name": artifact_name,
         "python": "Python 3.12",
         "sha256": digest,
     }
@@ -132,8 +151,14 @@ def _create_bundle(
             "\n".join(
                 (
                     f"branch={source_branch}",
+                    f"version={build_info['version']}",
                     f"commit={build_info['commit']}",
+                    f"short_commit={build_info['short_commit']}",
                     f"run_id={build_info['run_id']}",
+                    f"artifact_name={build_info['artifact_name']}",
+                    f"approval_actor={build_info['approval_actor']}",
+                    f"approval_run_id={build_info['approval_run_id']}",
+                    "approved_utc=2026-07-25T00:00:00Z",
                     "updated_utc=2026-07-25T00:00:00Z",
                     "",
                 )
@@ -359,7 +384,7 @@ def test_no_launch_accepts_an_sp1_only_release(tmp_path: Path):
     assert result.returncode == 0, _output(result)
 
 
-def test_no_launch_accepts_an_sp1_only_push_release(tmp_path: Path):
+def test_sp1_release_rejects_an_implicit_push(tmp_path: Path):
     verifier_path = _create_bundle(
         tmp_path,
         build_kind="sp1_release",
@@ -370,7 +395,8 @@ def test_no_launch_accepts_an_sp1_only_push_release(tmp_path: Path):
 
     result = _run_verifier(verifier_path)
 
-    assert result.returncode == 0, _output(result)
+    assert result.returncode != 0
+    assert "workflow_dispatch" in _output(result)
 
 
 def test_no_launch_accepts_a_non_release_validation_build(tmp_path: Path):
