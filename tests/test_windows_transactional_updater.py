@@ -86,10 +86,16 @@ def _create_release(
     corrupt_path: str | None = None,
     latest_commit: str = SOURCE_COMMIT,
     build_kind: str = "main_release",
-    event_name: str = "push",
+    event_name: str = "workflow_dispatch",
     source_ref: str = "refs/heads/main",
     source_branch: str = "main",
     publish_target: str = "release/latest",
+    artifact_kind: str = "release",
+    approval_status: str = "approved",
+    approval_method: str = "workflow_dispatch_input",
+    approval_actor: str = "fixture-approver",
+    approval_run_id: str = "123456789",
+    approval_event: str = "workflow_dispatch",
 ) -> Path:
     if milestone is None:
         milestone = "SP3" if build_kind == "main_release" else "SP1"
@@ -119,13 +125,21 @@ def _create_release(
         "version": "0.1.2",
         "milestone": milestone,
         "build_kind": build_kind,
+        "artifact_kind": artifact_kind,
         "event_name": event_name,
         "source_ref": source_ref,
         "source_branch": source_branch,
         "publish_target": publish_target,
+        "approval_status": approval_status,
+        "approval_method": approval_method,
+        "approval_actor": approval_actor,
+        "approval_run_id": approval_run_id,
+        "approval_event": approval_event,
         "commit": SOURCE_COMMIT,
+        "short_commit": SOURCE_COMMIT[:7],
         "run_id": "123456789",
         "built_utc": "2026-07-25T00:00:00Z",
+        "artifact_name": "FLASH-SP1+SP2+SP3-Windows-0.1.2-release",
         "python": "Python 3.12",
         "sha256": executable_hash,
     }
@@ -137,8 +151,17 @@ def _create_release(
         "\n".join(
             (
                 f"branch={source_branch}",
+                "version=0.1.2",
                 f"commit={latest_commit}",
+                f"short_commit={latest_commit[:7]}",
                 "run_id=123456789",
+                "artifact_name=FLASH-SP1+SP2+SP3-Windows-0.1.2-release",
+                f"approval_status={approval_status}",
+                f"approval_method={approval_method}",
+                f"approval_actor={approval_actor}",
+                f"approval_run_id={approval_run_id}",
+                f"approval_event={approval_event}",
+                "approved_utc=2026-07-25T00:00:00Z",
                 "updated_utc=2026-07-25T00:00:00Z",
                 "",
             )
@@ -346,9 +369,58 @@ def test_full_release_accepts_complete_cumulative_milestone(
     result = _run_updater(install_root, release_root)
 
     assert result.returncode == 0, _output(result)
+
+
+def test_manually_approved_formal_release_is_accepted(tmp_path: Path):
+    release_root = _create_release(tmp_path)
+    install_root = _create_existing_install(tmp_path)
+
+    result = _run_updater(install_root, release_root)
+
+    assert result.returncode == 0, _output(result)
     assert (install_root / "FLASH.exe").read_bytes() == (
         release_root / "FLASH.exe"
     ).read_bytes()
+
+
+def test_validation_artifact_is_rejected_before_install_changes(tmp_path: Path):
+    release_root = _create_release(
+        tmp_path,
+        build_kind="validation_build",
+        event_name="push",
+        publish_target="none",
+        artifact_kind="validation",
+        approval_status="not_approved",
+        approval_method="none",
+        approval_actor="none",
+        approval_run_id="none",
+        approval_event="none",
+    )
+    install_root = _create_existing_install(tmp_path)
+    before = _installed_payload_snapshot(install_root)
+
+    result = _run_updater(install_root, release_root)
+
+    assert result.returncode != 0, _output(result)
+    assert _installed_payload_snapshot(install_root) == before
+
+
+def test_unapproved_formal_artifact_is_rejected_before_install_changes(tmp_path: Path):
+    release_root = _create_release(
+        tmp_path,
+        approval_status="not_approved",
+        approval_method="none",
+        approval_actor="none",
+        approval_run_id="none",
+        approval_event="none",
+    )
+    install_root = _create_existing_install(tmp_path)
+    before = _installed_payload_snapshot(install_root)
+
+    result = _run_updater(install_root, release_root)
+
+    assert result.returncode != 0, _output(result)
+    assert _installed_payload_snapshot(install_root) == before
 
 
 def test_full_release_rejects_incomplete_sp2_milestone(tmp_path: Path):

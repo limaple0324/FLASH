@@ -83,19 +83,12 @@ class SelfCheck:
         }
 
     def _check_packaged_identity(self) -> str:
-        candidates = [
-            Path(sys.executable).resolve().parent / "輔系統" / "BUILD_INFO.txt",
-            Path(__file__).resolve().parents[1]
-            / "release"
-            / "輔系統"
-            / "BUILD_INFO.txt",
-        ]
-        build_info_path = next(
-            (path for path in candidates if path.is_file()),
-            None,
-        )
-        if build_info_path is None:
-            return "Packaged identity metadata is not present in the source run."
+        if not bool(getattr(sys, "frozen", False)):
+            return "Packaged identity metadata is not required in the source run."
+
+        build_info_path = Path(sys.executable).resolve().parent / "輔系統" / "BUILD_INFO.txt"
+        if not build_info_path.is_file():
+            raise RuntimeError("Packaged artifact is missing BUILD_INFO.txt.")
         info = read_key_value_file(build_info_path)
         validate_packaged_identity(
             info,

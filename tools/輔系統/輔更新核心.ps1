@@ -425,14 +425,19 @@ function Assert-ReleaseIdentity(
     }
     Require-MetadataValue $channel "release_branch" $ExpectedChannel["release_branch"] "UPDATE_CHANNEL.txt"
     Require-MetadataValue $latest "branch" $ExpectedChannel["source_branch"] "LATEST.txt"
+    Require-MetadataValue $buildInfo "event_name" "workflow_dispatch" "BUILD_INFO.txt"
+    Require-MetadataValue $buildInfo "artifact_kind" "release" "BUILD_INFO.txt"
+    Require-MetadataValue $buildInfo "approval_status" "approved" "BUILD_INFO.txt"
+    Require-MetadataValue $buildInfo "approval_method" "workflow_dispatch_input" "BUILD_INFO.txt"
+    Require-MetadataValue $buildInfo "approval_event" "workflow_dispatch" "BUILD_INFO.txt"
+    if ([string]::IsNullOrWhiteSpace($buildInfo["approval_actor"]) -or $buildInfo["approval_actor"] -eq "none") {
+        throw "BUILD_INFO.txt 的 approval_actor 必須記錄正式批准者。"
+    }
+
     if ($ExpectedChannel["build_kind"] -eq "main_release") {
-        Require-MetadataValue $buildInfo "event_name" "push" "BUILD_INFO.txt"
         Require-MetadataValue $buildInfo "source_ref" "refs/heads/main" "BUILD_INFO.txt"
     }
     else {
-        if ($buildInfo["event_name"] -notin @("push", "workflow_dispatch")) {
-            throw "BUILD_INFO.txt 的 event_name 必須是 push 或 workflow_dispatch。"
-        }
         Require-MetadataValue `
             $buildInfo `
             "source_ref" `
@@ -440,7 +445,15 @@ function Assert-ReleaseIdentity(
             "BUILD_INFO.txt"
     }
 
-    foreach ($requiredKey in @("commit", "run_id", "sha256")) {
+    foreach ($requiredKey in @(
+        "version",
+        "commit",
+        "short_commit",
+        "run_id",
+        "approval_run_id",
+        "artifact_name",
+        "sha256"
+    )) {
         if (
             -not $buildInfo.ContainsKey($requiredKey) -or
             [string]::IsNullOrWhiteSpace($buildInfo[$requiredKey])
@@ -448,7 +461,19 @@ function Assert-ReleaseIdentity(
             throw "BUILD_INFO.txt 缺少欄位：$requiredKey"
         }
     }
-    foreach ($requiredKey in @("commit", "run_id", "updated_utc")) {
+    foreach ($requiredKey in @(
+        "version",
+        "commit",
+        "short_commit",
+        "run_id",
+        "artifact_name",
+        "approval_status",
+        "approval_method",
+        "approval_actor",
+        "approval_run_id",
+        "approval_event",
+        "updated_utc"
+    )) {
         if (
             -not $latest.ContainsKey($requiredKey) -or
             [string]::IsNullOrWhiteSpace($latest[$requiredKey])
@@ -465,6 +490,26 @@ function Assert-ReleaseIdentity(
     }
     if ($latest["run_id"] -ne $buildInfo["run_id"]) {
         throw "LATEST.txt 與 BUILD_INFO.txt 的 run_id 不一致。"
+    }
+    if ($buildInfo["short_commit"] -ne $buildInfo["commit"].Substring(0, 7)) {
+        throw "BUILD_INFO.txt 的 short_commit 與 commit 不一致。"
+    }
+    foreach ($key in @(
+        "version",
+        "short_commit",
+        "artifact_name",
+        "approval_status",
+        "approval_method",
+        "approval_actor",
+        "approval_run_id",
+        "approval_event"
+    )) {
+        if ($latest[$key] -ne $buildInfo[$key]) {
+            throw "LATEST.txt 與 BUILD_INFO.txt 的 $key 不一致。"
+        }
+    }
+    if ($buildInfo["approval_run_id"] -ne $buildInfo["run_id"]) {
+        throw "BUILD_INFO.txt 的 approval_run_id 與 run_id 不一致。"
     }
     if ($buildInfo["sha256"].ToLowerInvariant() -ne $Manifest["FLASH.exe"]) {
         throw "BUILD_INFO.txt 與完整 manifest 的 FLASH.exe 雜湊不一致。"
