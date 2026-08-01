@@ -9,12 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from automation.codex_queue_runner.cli import RunnerConfig, command_validate, command_writeback, select_and_claim, validate_remote_source
+from automation.codex_queue_runner.cli import RunnerConfig, command_select, command_validate, command_writeback, select_and_claim, validate_remote_source
 from automation.codex_queue_runner.git_ops import create_and_push, find_reconciled_commit, validate_patch
 from automation.codex_queue_runner.github_client import GitHubRestClient
 from automation.codex_queue_runner.models import QueueRunError, Role, TaskStatus, task_from_mapping, task_to_mapping
 from automation.codex_queue_runner.parser import parse_task_comment
 from automation.codex_queue_runner.role_output import dry_agent_result, output_schema, parse_agent_result
+from automation.codex_queue_runner.prompt_builder import MAX_PROMPT_CONTEXT_BYTES, render_prompt, validate_prompt_context
 from automation.codex_queue_runner.scope_guard import parse_raw_changes, validate_git_changes
 from automation.codex_queue_runner.selector import claim_belongs_to_run, collect_candidates, select_task, stale_claims
 from automation.codex_queue_runner.test_command_guard import pytest_argv, validate_test_commands
@@ -203,7 +204,7 @@ def test_audit_and_review_fail_write_needs_fix_with_full_fields(tmp_path, monkey
     client = FakeClient([]); monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: client)
     assert command_writeback(argparse.Namespace(task=str(task_path), validated_dir=str(validated), target_repo=str(tmp_path), repository="owner/repo", mode="live", report=str(tmp_path / "report"))) == 0
     issue_body = client.posts[0][1]; pr_body = client.posts[1][1]
-    assert "STATUS: NEEDS_FIX" in issue_body and "ROLE: WORKER_A" in issue_body and "ROLE: " + role in pr_body and "SUMMARY: blocked finding" in pr_body
+    assert "STATUS: NEEDS_FIX" in issue_body and "ROLE: WORKER_A" in issue_body and "ROLE: " + role in pr_body and "SUMMARY: blocked finding" in pr_body and not client.dispatches
 
 
 def test_manual_dry_run_e2e_has_no_external_write(tmp_path):
@@ -258,3 +259,75 @@ def test_isolation_environment_is_pinned_and_has_no_unsafe_fallback(monkeypatch)
     validate = workflow.split("  validate:", 1)[1].split("  push_writeback:", 1)[0]
     assert "Prepare trusted candidate isolation" in validate and "bubblewrap" in validate and "isolation-probe" in validate
     assert "env -u GITHUB_TOKEN -u OPENAI_API_KEY" in workflow and "--unshare-net" in Path("automation/codex_queue_runner/git_ops.py").read_text(encoding="utf-8")
+
+
+def test_handoffs_dispatch_only_the_same_nonterminal_queue(tmp_path, monkeypatch):
+    task = parse_task_comment(comment(role="REQUIREMENTS_AUDIT", source_pr="NONE")["body"]); task_path = tmp_path / "task.json"; output = tmp_path / "validated"; output.mkdir()
+    task_path.write_text(json.dumps({"task": task_to_mapping(task)}), encoding="utf-8")
+    result = {"agent_result": "pass", "result": {"role": "REQUIREMENTS_AUDIT", "result": "pass", "summary": "ok", "patch": "", "reasons": [], "evidence": ["e"], "severity": "none", "findings": []}, "has_patch": False, "changed_files": [], "test_result": "not-run"}
+    (output / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    client = FakeClient([]); monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: client)
+    assert command_writeback(argparse.Namespace(task=str(task_path), validated_dir=str(output), target_repo=str(tmp_path), repository="owner/repo", mode="live", report=str(tmp_path / "report"))) == 0
+    assert client.dispatches == [task.queue_id] and "STATUS: READY" in client.posts[0][1]
+
+
+def test_terminal_test_validation_waits_without_dispatch(tmp_path, monkeypatch):
+    task = parse_task_comment(comment(role="TEST_VALIDATION", source_pr="NONE")["body"]); task_path = tmp_path / "task.json"; output = tmp_path / "validated"; output.mkdir()
+    task_path.write_text(json.dumps({"task": task_to_mapping(task)}), encoding="utf-8")
+    result = {"agent_result": "pass", "result": {"role": "TEST_VALIDATION", "result": "pass", "summary": "ok", "patch": "", "reasons": [], "evidence": ["e"], "severity": "none", "findings": []}, "has_patch": False, "changed_files": [], "test_result": "passed"}
+    (output / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    client = FakeClient([]); monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: client)
+    assert command_writeback(argparse.Namespace(task=str(task_path), validated_dir=str(output), target_repo=str(tmp_path), repository="owner/repo", mode="live", report=str(tmp_path / "report"))) == 0
+    assert not client.dispatches and "STATUS: WAITING_REVIEW" in client.posts[0][1]
+
+
+def test_repository_dispatch_selects_only_authoritative_queue_id(monkeypatch):
+    monkeypatch.setenv("OPENAI_SECRET_AVAILABLE", "true")
+    client = FakeClient([comment(queue_id="Q-1", number=1), comment(queue_id="Q-2", number=2)])
+    config = RunnerConfig(mode="live", allow_writeback=True, workflow_run_id="run-q")
+    event = {"event_name": "repository_dispatch", "client_payload": {"queue_id": "Q-2"}}
+    assert select_and_claim(client, event, config, "Q-2")["task"]["queue_id"] == "Q-2"
+    with pytest.raises(QueueRunError): select_and_claim(FakeClient([comment(queue_id="Q-1", number=1), comment(queue_id="Q-2", number=2)]), event, config, "Q-1")
+    with pytest.raises(QueueRunError): select_and_claim(FakeClient([comment(), comment(queue_id="Q-2", number=2)]), {"event_name": "repository_dispatch", "client_payload": {"queue_id": " "}}, config)
+
+
+def test_prompt_context_rejects_secrets_limits_and_rechecks_before_render(monkeypatch):
+    task = parse_task_comment(comment()["body"]); secret = "ghp_" + "a" * 36
+    client = FakeClient([comment()]); client.get_issue = lambda _: {"title": "issue", "body": secret}
+    monkeypatch.setenv("OPENAI_SECRET_AVAILABLE", "true")
+    with pytest.raises(QueueRunError) as raised: select_and_claim(client, {"event_name": "issue_comment", "issue": {"number": 19}}, RunnerConfig(mode="live", allow_writeback=True, workflow_run_id="run-secret"))
+    assert secret not in str(raised.value) and [target for target, _ in client.posts] == [19, 18]
+    with pytest.raises(QueueRunError): validate_prompt_context({"nested": ["x" * (MAX_PROMPT_CONTEXT_BYTES + 1)]})
+    with pytest.raises(QueueRunError): render_prompt(task, {"prior_evidence": ["-----BEGIN PRIVATE KEY-----"]})
+    assert "normal" in render_prompt(task, {"source_issue": {"body": "normal"}})
+
+
+def test_prompt_guard_failure_writes_no_context_or_prompt_file(tmp_path, monkeypatch):
+    client = FakeClient([comment()]); client.get_issue = lambda _: {"title": "issue", "body": "OPENAI_API_KEY=simulated"}
+    monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: client); monkeypatch.setenv("GITHUB_RUN_ID", "run-prompt")
+    event = tmp_path / "event.json"; event.write_text(json.dumps({"event_name": "issue_comment", "issue": {"number": 19}}), encoding="utf-8")
+    output = tmp_path / "selection"
+    assert command_select(argparse.Namespace(repository="owner/repo", event=str(event), output_dir=str(output), mode="live", queue_id="", allow_writeback="true", fixture="", lease_seconds=3600)) == 0
+    assert not (output / "context.json").exists() and not (output / "task.json").exists()
+
+
+class ClaimVerificationFailureClient(FakeClient):
+    def __init__(self, comments): super().__init__(comments); self.reads = 0
+    def list_issue_comments(self, issue):
+        self.reads += 1
+        if self.reads == 3: raise QueueRunError("simulated GitHub read failure")
+        return super().list_issue_comments(issue)
+
+
+def test_post_claim_failure_preserves_context_and_routes_to_failure_writeback(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_SECRET_AVAILABLE", "true")
+    client = ClaimVerificationFailureClient([comment()]); event = {"event_name": "issue_comment", "issue": {"number": 19}}
+    result = select_and_claim(client, event, RunnerConfig(mode="live", allow_writeback=True, workflow_run_id="run-claimed"))
+    assert result["selected"] and result["claimed"] and not result["selection_ok"] and result["workflow_run_id"] == "run-claimed" and result["task"] and result["context"] and result["error"] == "claim verification failed"
+    monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: ClaimVerificationFailureClient([comment()]))
+    event_path = tmp_path / "event.json"; event_path.write_text(json.dumps(event), encoding="utf-8"); output = tmp_path / "selection"
+    assert command_select(argparse.Namespace(repository="owner/repo", event=str(event_path), output_dir=str(output), mode="live", queue_id="", allow_writeback="true", fixture="", lease_seconds=3600)) == 0
+    stored = json.loads((output / "selection.json").read_text(encoding="utf-8"))
+    assert stored["selected"] and stored["claimed"] and not stored["selection_ok"] and (output / "task.json").exists() and (output / "context.json").exists()
+    workflow = Path(".github/workflows/codex-queue-runner.yml").read_text(encoding="utf-8")
+    assert "outputs.claimed == 'true'" in workflow and "outputs.selection_ok == 'true'" in workflow and "claim_belongs_to_run(client.list_issue_comments(19)" in workflow and "github.event.client_payload.queue_id" in workflow

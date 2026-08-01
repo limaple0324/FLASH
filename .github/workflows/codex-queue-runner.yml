@@ -159,6 +159,8 @@ jobs:
       actions: read
     outputs:
       selected: ${{ steps.result.outputs.selected }}
+      claimed: ${{ steps.result.outputs.claimed }}
+      selection_ok: ${{ steps.result.outputs.selection_ok }}
       mode: ${{ steps.result.outputs.mode }}
       role: ${{ steps.result.outputs.role }}
       base_commit: ${{ steps.result.outputs.base_commit }}
@@ -180,7 +182,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           OPENAI_SECRET_AVAILABLE: ${{ secrets.OPENAI_API_KEY != '' }}
           QUEUE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'live' }}
-          QUEUE_ID: ${{ inputs.queue_id || '' }}
+          QUEUE_ID: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_id || github.event_name == 'workflow_dispatch' && inputs.queue_id || '' }}
           ALLOW_WRITEBACK: ${{ github.event_name != 'workflow_dispatch' || inputs.allow_writeback }}
         run: |
           fixture=""
@@ -194,7 +196,7 @@ jobs:
           import json, os
           from pathlib import Path
           value = json.loads(Path("select-output/selection.json").read_text(encoding="utf-8"))
-          fields = {"selected": str(bool(value.get("selected"))).lower(), "mode": value.get("mode", ""), "role": value.get("task", {}).get("role", ""), "base_commit": value.get("task", {}).get("base_commit", ""), "allow_writeback": str(bool(value.get("allow_writeback"))).lower()}
+          fields = {"selected": str(bool(value.get("selected"))).lower(), "claimed": str(bool(value.get("claimed"))).lower(), "selection_ok": str(bool(value.get("selection_ok"))).lower(), "mode": value.get("mode", ""), "role": value.get("task", {}).get("role", ""), "base_commit": value.get("task", {}).get("base_commit", ""), "allow_writeback": str(bool(value.get("allow_writeback"))).lower()}
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as out:
               for key, item in fields.items(): out.write(f"{key}={item}\n")
           PY
@@ -206,7 +208,7 @@ jobs:
 
   agent:
     needs: select_claim
-    if: needs.select_claim.outputs.selected == 'true'
+    if: needs.select_claim.outputs.selected == 'true' && needs.select_claim.outputs.claimed == 'true' && needs.select_claim.outputs.selection_ok == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -257,7 +259,7 @@ jobs:
 
   validate:
     needs: [select_claim, agent]
-    if: always() && needs.select_claim.outputs.selected == 'true' && needs.agent.result == 'success'
+    if: always() && needs.select_claim.outputs.selected == 'true' && needs.select_claim.outputs.claimed == 'true' && needs.select_claim.outputs.selection_ok == 'true' && needs.agent.result == 'success'
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     permissions:
@@ -301,7 +303,7 @@ jobs:
   push_writeback:
     needs: [select_claim, validate]
     if: >-
-      always() && needs.select_claim.outputs.selected == 'true' &&
+      always() && needs.select_claim.outputs.selected == 'true' && needs.select_claim.outputs.claimed == 'true' && needs.select_claim.outputs.selection_ok == 'true' &&
       needs.select_claim.outputs.mode == 'live' && needs.select_claim.outputs.allow_writeback == 'true' && needs.validate.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 12
@@ -358,9 +360,9 @@ jobs:
   failure_writeback:
     needs: [select_claim, agent, validate, push_writeback]
     if: >-
-      always() && needs.select_claim.outputs.selected == 'true' &&
+      always() && needs.select_claim.outputs.selected == 'true' && needs.select_claim.outputs.claimed == 'true' &&
       needs.select_claim.outputs.mode == 'live' &&
-      (needs.agent.result != 'success' || needs.validate.result != 'success' || needs.push_writeback.result != 'success')
+      (needs.select_claim.outputs.selection_ok != 'true' || needs.agent.result != 'success' || needs.validate.result != 'success' || needs.push_writeback.result != 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
@@ -388,12 +390,17 @@ jobs:
         run: |
           PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python - <<'PY'
           from automation.codex_queue_runner.cli import _client, _task
+          from automation.codex_queue_runner.selector import claim_belongs_to_run
           from automation.codex_queue_runner.status_writer import build_blocked_comment, build_blocked_status
           from pathlib import Path
-          import os
+          import json, os
           task = _task(Path("failure-input/task.json")); client = _client(os.environ["GITHUB_REPOSITORY"])
+          selection = json.loads(Path("failure-input/selection.json").read_text(encoding="utf-8"))
+          if not task.workflow_run_id or task.comment_id is None or not claim_belongs_to_run(client.list_issue_comments(19), task.queue_id, task.workflow_run_id, task.comment_id):
+              raise SystemExit("claimed task ownership cannot be verified")
+          reason = selection.get("error") or os.environ["FAILURE_PHASE"]
           errors = []
-          for action in (lambda: client.post_issue_comment(19, build_blocked_status(task, os.environ["FAILURE_PHASE"])), lambda: client.write_blocker(build_blocked_comment(task, "queue runner failure", os.environ["FAILURE_PHASE"], "failure_writeback", task.role.value, "FAILURE_WRITEBACK", "NONE"))):
+          for action in (lambda: client.post_issue_comment(19, build_blocked_status(task, reason)), lambda: client.write_blocker(build_blocked_comment(task, "queue runner failure", reason, "failure_writeback", task.role.value, "FAILURE_WRITEBACK", "NONE"))):
               try: action()
               except Exception as exc: errors.append(str(exc))
           if errors: raise SystemExit("; ".join(errors))

@@ -42,6 +42,20 @@ def _number(value: str, name: str) -> int:
     return int(found.group(1))
 
 
+def _valid_queue_id(value: str) -> bool:
+    return bool(value) and len(value) <= 128 and not any(character.isspace() or ord(character) < 32 for character in value)
+
+
+def _repository_dispatch_queue_id(event: dict[str, Any], supplied: str | None) -> str:
+    payload = event.get("client_payload")
+    authoritative = payload.get("queue_id") if isinstance(payload, dict) else None
+    if not isinstance(authoritative, str) or not _valid_queue_id(authoritative):
+        raise QueueRunError("repository_dispatch queue_id is missing or invalid")
+    if supplied and supplied != authoritative:
+        raise QueueRunError("repository_dispatch queue_id does not match the authoritative payload")
+    return authoritative
+
+
 def validate_task_shape(task: Task) -> None:
     if not _SHA.fullmatch(task.base_commit): raise QueueRunError("BASE_COMMIT 必須是完整 40 位元提交")
     if task.target_branch == "main" or task.target_branch.startswith("release/"): raise QueueRunError("TARGET_BRANCH 不得為 main 或 release/")
@@ -67,7 +81,10 @@ def build_context_snapshot(client: Any, task: Task, comments: list[dict]) -> dic
     if task.source_pr != "NONE":
         pr = client.get_pull_request(_number(task.source_pr, "SOURCE_PR")); files = [str(item.get("filename", "")) for item in client.list_pull_request_files(_number(task.source_pr, "SOURCE_PR"))]
     evidence = [str(comment.get("body", ""))[:1000] for comment in comments if is_trusted_state(comment) and task.queue_id in str(comment.get("body", "")) and "EVIDENCE:" in str(comment.get("body", ""))]
-    return {"queue_id": task.queue_id, "source_issue": {"number": task.source_issue, "title": issue.get("title", ""), "body": issue.get("body", "")}, "source_pr": {"number": task.source_pr, "base": (pr.get("base") or {}).get("sha", ""), "head": (pr.get("head") or {}).get("sha", ""), "branch": (pr.get("head") or {}).get("ref", "")}, "changed_files": files, "prior_evidence": evidence}
+    context = {"queue_id": task.queue_id, "source_issue": {"number": task.source_issue, "title": issue.get("title", ""), "body": issue.get("body", "")}, "source_pr": {"number": task.source_pr, "base": (pr.get("base") or {}).get("sha", ""), "head": (pr.get("head") or {}).get("sha", ""), "branch": (pr.get("head") or {}).get("ref", "")}, "changed_files": files, "prior_evidence": evidence}
+    from .prompt_builder import validate_prompt_context
+    validate_prompt_context(context)
+    return context
 
 
 def _reconcile_claim(client: Any, task: Task) -> bool:
@@ -95,7 +112,9 @@ def recover_stale_claims(client: Any, comments: list[dict], config: RunnerConfig
 
 def select_and_claim(client: Any | None, event: dict[str, Any], config: RunnerConfig, queue_id: str | None = None, fixture: Path | None = None) -> dict:
     event_name = event.get("event_name") or os.getenv("GITHUB_EVENT_NAME", "")
-    if event_name == "issue_comment" and int((event.get("issue") or {}).get("number", 0)) != config.target_issue: return {"selected": False, "reason": "非 Issue #19"}
+    if event_name == "issue_comment" and int((event.get("issue") or {}).get("number", 0)) != config.target_issue:
+        return {"selected": False, "claimed": False, "selection_ok": False, "mode": config.mode, "allow_writeback": config.allow_writeback, "workflow_run_id": config.workflow_run_id, "error": "非 Issue #19"}
+    if event_name == "repository_dispatch": queue_id = _repository_dispatch_queue_id(event, queue_id)
     if config.mode == "live" and not config.allow_writeback: raise QueueRunError("live 模式必須 allow_writeback=true，禁止啟動 Agent")
     if fixture:
         task = parse_task_comment(fixture.read_text(encoding="utf-8")); task.comment_id = 1; task.comment_author = config.owner_only
@@ -117,8 +136,12 @@ def select_and_claim(client: Any | None, event: dict[str, Any], config: RunnerCo
         latest = select_task(collect_candidates(client.list_issue_comments(config.target_issue), config.owner_only), task.queue_id)
         if latest.task.state_comment_id != task.state_comment_id: raise QueueRunError("認領前任務狀態已變更")
         client.post_issue_comment(config.target_issue, build_claimed_comment(task, config.workflow_run_id))
-        if not claim_belongs_to_run(client.list_issue_comments(config.target_issue), task.queue_id, config.workflow_run_id, task.comment_id): raise QueueRunError("CLAIMED 不屬於本 workflow run 或 source comment")
-    return {"selected": True, "mode": config.mode, "allow_writeback": config.allow_writeback, "sandbox": task.role.sandbox(), "task": task_to_mapping(task), "context": context, "workflow_run_id": config.workflow_run_id}
+        task.workflow_run_id = config.workflow_run_id
+        try:
+            if not claim_belongs_to_run(client.list_issue_comments(config.target_issue), task.queue_id, config.workflow_run_id, task.comment_id): raise QueueRunError("CLAIMED 不屬於本 workflow run 或 source comment")
+        except Exception:
+            return {"selected": True, "claimed": True, "selection_ok": False, "mode": config.mode, "allow_writeback": config.allow_writeback, "sandbox": task.role.sandbox(), "task": task_to_mapping(task), "context": context, "workflow_run_id": config.workflow_run_id, "error": "claim verification failed"}
+    return {"selected": True, "claimed": config.mode == "live", "selection_ok": True, "mode": config.mode, "allow_writeback": config.allow_writeback, "sandbox": task.role.sandbox(), "task": task_to_mapping(task), "context": context, "workflow_run_id": config.workflow_run_id, "error": ""}
 
 
 def _read(path: Path) -> dict: return json.loads(path.read_text(encoding="utf-8"))
@@ -131,7 +154,7 @@ def _client(repository: str) -> GitHubRestClient: return GitHubRestClient(reposi
 def command_select(args: argparse.Namespace) -> int:
     config = RunnerConfig(args.repository, workflow_run_id=os.getenv("GITHUB_RUN_ID", "manual"), mode=args.mode, allow_writeback=args.allow_writeback.lower() == "true", lease_seconds=args.lease_seconds)
     try: value = select_and_claim(None if args.fixture else _client(args.repository), _read(Path(args.event)), config, args.queue_id, Path(args.fixture) if args.fixture else None)
-    except QueueRunError as exc: value = {"selected": False, "mode": config.mode, "allow_writeback": config.allow_writeback, "error": str(exc)}
+    except QueueRunError as exc: value = {"selected": False, "claimed": False, "selection_ok": False, "mode": config.mode, "allow_writeback": config.allow_writeback, "workflow_run_id": config.workflow_run_id, "error": str(exc)}
     directory = Path(args.output_dir); _write(directory / "selection.json", value)
     if value.get("selected"): _write(directory / "task.json", {"task": value["task"]}); _write(directory / "context.json", value["context"])
     return 0
@@ -183,10 +206,11 @@ def command_writeback(args: argparse.Namespace) -> int:
         commit = task.base_commit; files = value.get("changed_files", [])
         if value.get("has_patch"): commit, files, _ = create_and_push(Path(args.target_repo), task, Path(args.validated_dir) / "validated.patch", Path(args.validated_dir) / "manifest.sha256")
         next_role = ROLE_TRANSITIONS.get(task.role)
-        if next_role: client.post_issue_comment(19, build_ready_handoff(task, next_role, commit, evidence))
+        if next_role:
+            client.post_issue_comment(19, build_ready_handoff(task, next_role, commit, evidence))
+            client.dispatch_next(task.queue_id)
         else: client.post_issue_comment(19, build_waiting_review(task, commit, evidence))
         if task.source_pr != "NONE": client.write_source_pr(_number(task.source_pr, "SOURCE_PR"), f"QUEUE_ID: {task.queue_id}\nROLE: {structured['role']}\nRESULT: pass\nSUMMARY: {structured['summary']}\nREASONS: {json.dumps(structured['reasons'])}\nEVIDENCE: {json.dumps(structured['evidence'])}\nSEVERITY: {structured['severity']}\nFINDINGS: {json.dumps(structured['findings'])}\nRESULT_COMMIT: {commit}\nCHANGED_FILES: {','.join(files) or 'NONE'}\nTEST_RESULT: {value.get('test_result', 'not-run')}")
-        client.dispatch_next(task.queue_id)
     except Exception as exc:
         client.post_issue_comment(19, build_blocked_status(task, "Queue Runner 阻擋")); client.write_blocker(build_blocked_comment(task, "Queue Runner 阻擋", str(exc), "push_writeback", "QUEUE_RUNNER", "push_writeback")); return 1
     return 0
