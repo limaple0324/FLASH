@@ -14,8 +14,8 @@ from .github_client import GitHubRestClient
 from .models import ROLE_TRANSITIONS, AgentResult, QueueRunError, Role, Task, TaskStatus, task_from_mapping, task_to_mapping
 from .parser import parse_task_comment
 from .prompt_builder import render_prompt
-from .role_output import dry_agent_result, output_schema, parse_agent_result
-from .selector import claim_belongs_to_run, collect_candidates, stale_claims, select_task
+from .role_output import dry_agent_result, output_schema, parse_agent_result, result_mapping
+from .selector import claim_belongs_to_run, collect_candidates, is_trusted_state, stale_claims, select_task
 from .status_writer import build_blocked_comment, build_blocked_status, build_claimed_comment, build_needs_fix, build_ready_handoff, build_waiting_review
 from .test_command_guard import pytest_argv
 
@@ -66,7 +66,7 @@ def build_context_snapshot(client: Any, task: Task, comments: list[dict]) -> dic
     issue = client.get_issue(_number(task.source_issue, "SOURCE_ISSUE")); pr: dict = {}; files: list[str] = []
     if task.source_pr != "NONE":
         pr = client.get_pull_request(_number(task.source_pr, "SOURCE_PR")); files = [str(item.get("filename", "")) for item in client.list_pull_request_files(_number(task.source_pr, "SOURCE_PR"))]
-    evidence = [str(comment.get("body", ""))[:1000] for comment in comments if task.queue_id in str(comment.get("body", "")) and "EVIDENCE:" in str(comment.get("body", ""))]
+    evidence = [str(comment.get("body", ""))[:1000] for comment in comments if is_trusted_state(comment) and task.queue_id in str(comment.get("body", "")) and "EVIDENCE:" in str(comment.get("body", ""))]
     return {"queue_id": task.queue_id, "source_issue": {"number": task.source_issue, "title": issue.get("title", ""), "body": issue.get("body", "")}, "source_pr": {"number": task.source_pr, "base": (pr.get("base") or {}).get("sha", ""), "head": (pr.get("head") or {}).get("sha", ""), "branch": (pr.get("head") or {}).get("ref", "")}, "changed_files": files, "prior_evidence": evidence}
 
 
@@ -142,14 +142,14 @@ def command_render(args: argparse.Namespace) -> int:
 def command_schema(args: argparse.Namespace) -> int:
     Path(args.output).write_text(json.dumps(output_schema(_task(Path(args.task)).role), ensure_ascii=False), encoding="utf-8"); return 0
 def command_dry_agent(args: argparse.Namespace) -> int:
-    value = dry_agent_result(_task(Path(args.task))); Path(args.github_output).open("a", encoding="utf-8").write(f"final_message={value}\n"); return 0
+    value = dry_agent_result(_task(Path(args.task))); Path(args.github_output).open("a", encoding="utf-8").write(f"final-message={value}\n"); return 0
 
 
 def command_validate(args: argparse.Namespace) -> int:
     task = _task(Path(args.task)); raw = args.agent_output or dry_agent_result(task)
     result = parse_agent_result(raw, task) if task.role.requires_codex() else AgentResult(task.role, "pass", "test validation")
     directory = Path(args.output_dir); directory.mkdir(parents=True, exist_ok=True)
-    value = {"agent_result": result.result, "role": task.role.value, "summary": result.summary, "evidence": list(result.evidence), "has_patch": False, "changed_files": [], "test_result": "not-run"}
+    value = {"agent_result": result.result, "role": task.role.value, "result": result_mapping(result), "has_patch": False, "changed_files": [], "test_result": "not-run"}
     if result.result == "pass" and task.role is Role.WORKER_A:
         from .git_ops import validate_patch
         checked = validate_patch(Path(args.target_repo), task, result.patch.encode("utf-8"), directory); value.update({"has_patch": checked.has_patch, "changed_files": checked.changed_files, "test_result": checked.test_output})

@@ -7,6 +7,14 @@ on:
     - cron: "*/20 * * * *"
   repository_dispatch:
     types: [codex_queue_next]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/codex-queue-runner.yml"
+      - "automation/codex_queue_runner/**"
+      - "automation/prompts/**"
+      - "tests/test_codex_queue_runner.py"
+      - "tests/fixtures/codex_queue_dry_task.txt"
   workflow_dispatch:
     inputs:
       mode:
@@ -30,9 +38,44 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  pr_dry_run:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          path: runner-src
+          persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: c1f250f42e13fa0857b40245509f708ff4811dd1
+          path: target-repo
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Run read-only fixture
+        run: |
+          printf '%s' '{"event_name":"pull_request"}' > event.json
+          PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli select-claim --event event.json --output-dir dry-input --repository "$GITHUB_REPOSITORY" --mode dry-run --allow-writeback false --fixture "$GITHUB_WORKSPACE/runner-src/tests/fixtures/codex_queue_dry_task.txt"
+          PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli dry-agent-output --task dry-input/task.json --github-output "$GITHUB_OUTPUT"
+          PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli validate --task dry-input/task.json --target-repo "$GITHUB_WORKSPACE/target-repo" --agent-output "$(tail -n 1 "$GITHUB_OUTPUT" | sed 's/^final-message=//')" --output-dir validated-output
+          PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli writeback --task dry-input/task.json --validated-dir validated-output --target-repo "$GITHUB_WORKSPACE/target-repo" --repository "$GITHUB_REPOSITORY" --mode dry-run --report pr-dry-run-report.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: pr-dry-run-report
+          path: pr-dry-run-report.json
+          if-no-files-found: error
+          retention-days: 1
+
   select_claim:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'live') ||
       (vars.CODEX_QUEUE_ENABLED == 'true' &&
        (github.event_name != 'issue_comment' || github.event.issue.number == 19))
     runs-on: ubuntu-latest
@@ -97,7 +140,7 @@ jobs:
     permissions:
       contents: read
     outputs:
-      final_message: ${{ steps.codex.outputs.final-message || steps.fixture.outputs.final_message }}
+      final_message: ${{ steps.codex.outputs['final-message'] || steps.fixture.outputs['final-message'] }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
@@ -127,7 +170,7 @@ jobs:
         if: >-
           needs.select_claim.outputs.mode == 'live' &&
           (needs.select_claim.outputs.role == 'WORKER_A' || needs.select_claim.outputs.role == 'REQUIREMENTS_AUDIT' || needs.select_claim.outputs.role == 'CODE_REVIEW')
-        uses: openai/codex-action@b11346a6fa031e2e164ab4b7c7ea201afffd7d59
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           sandbox: ${{ needs.select_claim.outputs.role == 'WORKER_A' && 'workspace-write' || 'read-only' }}
@@ -137,6 +180,8 @@ jobs:
           prompt-file: ${{ runner.temp }}/codex-prompt.md
           output-schema-file: ${{ runner.temp }}/codex-schema.json
           working-directory: ${{ github.workspace }}/target-repo
+          allow-bots: ${{ github.event_name == 'repository_dispatch' }}
+          allow-bot-users: ${{ github.event_name == 'repository_dispatch' && 'github-actions[bot]' || '' }}
 
   validate:
     needs: [select_claim, agent]
@@ -177,7 +222,7 @@ jobs:
     needs: [select_claim, validate]
     if: >-
       always() && needs.select_claim.outputs.selected == 'true' &&
-      (needs.select_claim.outputs.mode == 'dry-run' || needs.select_claim.outputs.allow_writeback == 'true')
+      needs.select_claim.outputs.mode == 'live' && needs.select_claim.outputs.allow_writeback == 'true' && needs.validate.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
@@ -229,3 +274,47 @@ jobs:
           name: dry-run-report
           path: dry-run-report.json
           retention-days: 1
+
+  failure_writeback:
+    needs: [select_claim, agent, validate, push_writeback]
+    if: >-
+      always() && needs.select_claim.outputs.selected == 'true' &&
+      needs.select_claim.outputs.mode == 'live' &&
+      (needs.agent.result != 'success' || needs.validate.result != 'success' || needs.push_writeback.result != 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: main
+          path: runner-src
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: queue-context
+          path: failure-input
+      - name: Block the claimed task without candidate artifacts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          FAILURE_PHASE: agent=${{ needs.agent.result }} validate=${{ needs.validate.result }} push=${{ needs.push_writeback.result }}
+        run: |
+          PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python - <<'PY'
+          from automation.codex_queue_runner.cli import _client, _task
+          from automation.codex_queue_runner.status_writer import build_blocked_comment, build_blocked_status
+          from pathlib import Path
+          import os
+          task = _task(Path("failure-input/task.json")); client = _client(os.environ["GITHUB_REPOSITORY"])
+          errors = []
+          for action in (lambda: client.post_issue_comment(19, build_blocked_status(task, os.environ["FAILURE_PHASE"])), lambda: client.write_blocker(build_blocked_comment(task, "queue runner failure", os.environ["FAILURE_PHASE"], "failure_writeback", task.role.value, "FAILURE_WRITEBACK", "NONE"))):
+              try: action()
+              except Exception as exc: errors.append(str(exc))
+          if errors: raise SystemExit("; ".join(errors))
+          PY

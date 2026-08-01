@@ -137,9 +137,9 @@ def test_structured_worker_audit_review_outputs_and_role_transition():
     audit = parse_task_comment(comment(role="REQUIREMENTS_AUDIT")["body"])
     review = parse_task_comment(comment(role="CODE_REVIEW")["body"])
     assert "patch" in output_schema(Role.WORKER_A)["properties"]
-    assert parse_agent_result('{"role":"WORKER_A","result":"pass","summary":"x","patch":"","evidence":[]}', worker).result == "pass"
+    with pytest.raises(QueueRunError): parse_agent_result('{"role":"WORKER_A","result":"pass","summary":"x","patch":"","evidence":["e"]}', worker)
     assert parse_agent_result('{"role":"REQUIREMENTS_AUDIT","result":"fail","summary":"x","reasons":["bad"],"evidence":["e"]}', audit).result == "fail"
-    value = parse_agent_result('{"role":"CODE_REVIEW","result":"pass","summary":"x","severity":"none","findings":[],"evidence":[]}', review)
+    value = parse_agent_result('{"role":"CODE_REVIEW","result":"pass","summary":"x","severity":"none","findings":[],"evidence":["e"]}', review)
     assert value.severity == "none"
     with pytest.raises(QueueRunError): parse_agent_result('{"role":"CODE_REVIEW","result":"pass","summary":"x","evidence":[]}', review)
 
@@ -176,7 +176,7 @@ def worker_patch(repo):
 def test_runner_can_validate_target_without_automation_and_reconcile_once(git_fixture, tmp_path):
     repo, base = git_fixture, git(git_fixture, "rev-parse", "HEAD")
     assert not (repo / "automation").exists()
-    task = parse_task_comment(comment(base=base, source_pr="NONE")["body"]); output = tmp_path / "validated"; checked = validate_patch(repo, task, worker_patch(repo), output)
+    task = parse_task_comment(comment(base=base, source_pr="NONE")["body"]); output = tmp_path / "validated"; checked = validate_patch(repo, task, worker_patch(repo), output, run_tests=False)
     assert checked.has_patch and checked.changed_files == ["tests/test_fixture.py"]
     git(repo, "reset", "--hard", base); commit, _, command = create_and_push(repo, task, output / "validated.patch", output / "manifest.sha256")
     assert commit == find_reconciled_commit(repo, task) and "--force" not in command and "--ff-only" not in command and "-f" not in command
@@ -200,7 +200,8 @@ def test_workflow_supply_chain_permissions_and_agent_last_step():
         assert name in workflow
     assert "uses: actions/checkout@v5" not in workflow and "uses: actions/setup-python@v5" not in workflow and "uses: actions/upload-artifact@v4" not in workflow and "uses: actions/download-artifact@v4" not in workflow
     agent = workflow.split("  validate:", 1)[0].split("  agent:", 1)[1]
-    assert agent.rstrip().endswith("working-directory: ${{ github.workspace }}/target-repo")
+    assert "steps.codex.outputs['final-message']" in workflow and "steps.codex.outputs.final-message" not in workflow
+    assert agent.rstrip().endswith("allow-bot-users: ${{ github.event_name == 'repository_dispatch' && 'github-actions[bot]' || '' }}")
     assert "GITHUB_TOKEN" not in agent and "OPENAI_API_KEY" not in workflow.split("  push_writeback:", 1)[1]
     assert "unset GITHUB_TOKEN" in workflow and "--force" not in workflow and "--ff-only" not in workflow
     assert "QUEUE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'live' }}" in workflow
