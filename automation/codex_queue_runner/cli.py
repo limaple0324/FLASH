@@ -166,7 +166,11 @@ def command_writeback(args: argparse.Namespace) -> int:
     client = _client(args.repository)
     try:
         structured = value["result"]
-        evidence = json.dumps(structured, ensure_ascii=False, separators=(",", ":"))[:8000]
+        evidence = json.dumps(structured, ensure_ascii=False, separators=(",", ":"))
+        if len(evidence.encode("utf-8")) > 8000:
+            raise QueueRunError("structured result exceeds the #19 evidence limit")
+        if any(marker in evidence for marker in ("OPENAI_API_KEY", "GITHUB_TOKEN", "ghp_", "sk-")):
+            raise QueueRunError("structured result contains a secret marker")
         if value["agent_result"] != "pass":
             client.post_issue_comment(19, build_needs_fix(task, evidence))
             if task.source_pr != "NONE": client.write_source_pr(_number(task.source_pr, "SOURCE_PR"), f"QUEUE_ID: {task.queue_id}\nROLE: {structured['role']}\nRESULT: fail\nSUMMARY: {structured['summary']}\nREASONS: {json.dumps(structured['reasons'])}\nEVIDENCE: {json.dumps(structured['evidence'])}\nSEVERITY: {structured['severity']}\nFINDINGS: {json.dumps(structured['findings'])}\nRESULT_COMMIT: NONE\nCHANGED_FILES: NONE\nTEST_RESULT: {value.get('test_result', 'not-run')}")

@@ -15,6 +15,7 @@ on:
       - "automation/prompts/**"
       - "tests/test_codex_queue_runner.py"
       - "tests/fixtures/codex_queue_dry_task.txt"
+      - "tests/fixtures/codex_queue_isolation_task.txt"
   workflow_dispatch:
     inputs:
       mode:
@@ -76,13 +77,27 @@ jobs:
         with: {python-version: "3.12"}
       - name: Install trusted base dependencies and run isolated pytest
         run: |
-          test -x "$(command -v bwrap)"
+          report=pr-isolation-dry-run-report.json
+          printf '%s\n' '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"reason":"isolation setup not started"}' > "$report"
+          set +e
+          sudo apt-get update && sudo apt-get install --no-install-recommends -y bubblewrap
+          install_code=$?
+          if [ "$install_code" -ne 0 ] || ! command -v bwrap >/dev/null 2>&1; then
+            printf '%s\n' '{"status":"blocked","isolation_available":false,"candidate_tests_executed":false,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":false,"reason":"Ubuntu bubblewrap installation or executable check failed"}' > "$report"
+            exit 1
+          fi
           if [ -f target-repo/requirements.txt ]; then python -m pip install -r target-repo/requirements.txt; fi
           printf '%s' '{"event_name":"pull_request"}' > event.json
-          PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli select-claim --event event.json --output-dir isolation-input --repository "$GITHUB_REPOSITORY" --mode dry-run --allow-writeback false --fixture "$GITHUB_WORKSPACE/runner-src/tests/fixtures/codex_queue_isolation_task.txt"
-          PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli dry-agent-output --task isolation-input/task.json --github-output "$GITHUB_OUTPUT"
-          PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli validate --task isolation-input/task.json --target-repo "$GITHUB_WORKSPACE/target-repo" --agent-output "$(tail -n 1 "$GITHUB_OUTPUT" | sed 's/^final-message=//')" --output-dir isolation-output
-          printf '%s\n' '{"external_writes":0,"pushes":0,"network_namespace":"bwrap","workspace_git":false}' > pr-isolation-dry-run-report.json
+          env -u GITHUB_TOKEN -u OPENAI_API_KEY PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli select-claim --event event.json --output-dir isolation-input --repository "$GITHUB_REPOSITORY" --mode dry-run --allow-writeback false --fixture "$GITHUB_WORKSPACE/runner-src/tests/fixtures/codex_queue_isolation_task.txt"
+          env -u GITHUB_TOKEN -u OPENAI_API_KEY PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli dry-agent-output --task isolation-input/task.json --github-output "$GITHUB_OUTPUT"
+          env -u GITHUB_TOKEN -u OPENAI_API_KEY PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli validate --task isolation-input/task.json --target-repo "$GITHUB_WORKSPACE/target-repo" --agent-output "$(tail -n 1 "$GITHUB_OUTPUT" | sed 's/^final-message=//')" --output-dir isolation-output
+          test_code=$?
+          if [ "$test_code" -eq 0 ]; then
+            printf '%s\n' '{"status":"success","isolation_available":true,"candidate_tests_executed":true,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":true,"reason":"bubblewrap isolated TEST_VALIDATION completed"}' > "$report"
+          else
+            printf '%s\n' '{"status":"blocked","isolation_available":true,"candidate_tests_executed":true,"external_writes":0,"pushes":0,"workspace_git":false,"network_isolated":true,"reason":"isolated candidate validation failed"}' > "$report"
+          fi
+          exit "$test_code"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with: {name: pr-isolation-dry-run-report, path: pr-isolation-dry-run-report.json, retention-days: 1}

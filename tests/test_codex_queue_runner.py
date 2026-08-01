@@ -12,7 +12,7 @@ import pytest
 from automation.codex_queue_runner.cli import RunnerConfig, command_validate, command_writeback, select_and_claim, validate_remote_source
 from automation.codex_queue_runner.git_ops import create_and_push, find_reconciled_commit, validate_patch
 from automation.codex_queue_runner.github_client import GitHubRestClient
-from automation.codex_queue_runner.models import QueueRunError, Role, TaskStatus, task_from_mapping
+from automation.codex_queue_runner.models import QueueRunError, Role, TaskStatus, task_from_mapping, task_to_mapping
 from automation.codex_queue_runner.parser import parse_task_comment
 from automation.codex_queue_runner.role_output import dry_agent_result, output_schema, parse_agent_result
 from automation.codex_queue_runner.scope_guard import parse_raw_changes, validate_git_changes
@@ -182,6 +182,28 @@ def test_runner_can_validate_target_without_automation_and_reconcile_once(git_fi
     assert commit == find_reconciled_commit(repo, task) and "--force" not in command and "--ff-only" not in command and "-f" not in command
     repeat, _, second = create_and_push(repo, task, output / "validated.patch", output / "manifest.sha256")
     assert repeat == commit and second == []
+
+
+def test_fresh_clone_reconciles_exact_remote_commit_without_second_push(git_fixture, tmp_path):
+    repo, base = git_fixture, git(git_fixture, "rev-parse", "HEAD")
+    task = parse_task_comment(comment(base=base, source_pr="NONE")["body"])
+    output = tmp_path / "validated"; validate_patch(repo, task, worker_patch(repo), output, run_tests=False)
+    git(repo, "reset", "--hard", base); commit, _, _ = create_and_push(repo, task, output / "validated.patch", output / "manifest.sha256")
+    fresh = tmp_path / "fresh"; git(tmp_path, "clone", str(tmp_path / "remote.git"), str(fresh)); git(fresh, "checkout", "--detach", base)
+    repeated, _, command = create_and_push(fresh, task, output / "validated.patch", output / "manifest.sha256")
+    assert repeated == commit and command == []
+
+
+@pytest.mark.parametrize("role", ["REQUIREMENTS_AUDIT", "CODE_REVIEW"])
+def test_audit_and_review_fail_write_needs_fix_with_full_fields(tmp_path, monkeypatch, role):
+    task = parse_task_comment(comment(role=role)["body"]); task_path = tmp_path / "task.json"; validated = tmp_path / "validated"; validated.mkdir()
+    task_path.write_text(json.dumps({"task": task_to_mapping(task)}), encoding="utf-8")
+    result = {"agent_result": "fail", "result": {"role": role, "result": "fail", "summary": "blocked finding", "patch": "", "reasons": ["reason"] if role == "REQUIREMENTS_AUDIT" else [], "evidence": ["evidence"], "severity": "none" if role == "REQUIREMENTS_AUDIT" else "high", "findings": [] if role == "REQUIREMENTS_AUDIT" else ["finding"]}, "test_result": "not-run"}
+    (validated / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    client = FakeClient([]); monkeypatch.setattr("automation.codex_queue_runner.cli._client", lambda _: client)
+    assert command_writeback(argparse.Namespace(task=str(task_path), validated_dir=str(validated), target_repo=str(tmp_path), repository="owner/repo", mode="live", report=str(tmp_path / "report"))) == 0
+    issue_body = client.posts[0][1]; pr_body = client.posts[1][1]
+    assert "STATUS: NEEDS_FIX" in issue_body and "ROLE: WORKER_A" in issue_body and "ROLE: " + role in pr_body and "SUMMARY: blocked finding" in pr_body
 
 
 def test_manual_dry_run_e2e_has_no_external_write(tmp_path):
