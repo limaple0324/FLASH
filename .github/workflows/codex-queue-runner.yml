@@ -250,7 +250,7 @@ jobs:
           sandbox: ${{ needs.select_claim.outputs.role == 'WORKER_A' && 'workspace-write' || 'read-only' }}
           safety-strategy: drop-sudo
           codex-version: "0.146.0"
-          codex-args: '["--ephemeral", "--ignore-user-config"]'
+          codex-args: '["--ephemeral"]'
           prompt-file: ${{ runner.temp }}/codex-prompt.md
           output-schema-file: ${{ runner.temp }}/codex-schema.json
           working-directory: ${{ github.workspace }}/target-repo
