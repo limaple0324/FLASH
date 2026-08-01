@@ -1,8 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Optional
 
 
 class TaskStatus(str, Enum):
@@ -18,16 +18,6 @@ class TaskStatus(str, Enum):
     def claimable(cls) -> frozenset["TaskStatus"]:
         return frozenset({cls.READY, cls.NEEDS_FIX})
 
-    @classmethod
-    def non_claimable(cls) -> frozenset["TaskStatus"]:
-        return frozenset(
-            {cls.CLAIMED, cls.WAITING_REVIEW, cls.VERIFIED, cls.CLOSED, cls.BLOCKED}
-        )
-
-    @classmethod
-    def completed(cls) -> frozenset["TaskStatus"]:
-        return frozenset({cls.WAITING_REVIEW, cls.VERIFIED, cls.CLOSED, cls.BLOCKED})
-
 
 class Role(str, Enum):
     WORKER_A = "WORKER_A"
@@ -37,25 +27,14 @@ class Role(str, Enum):
     BATCH_CONTROL = "BATCH_CONTROL"
     INTEGRATION = "INTEGRATION"
 
-    def needs_patch(self) -> bool:
-        return self == Role.WORKER_A
+    def requires_codex(self) -> bool:
+        return self in {self.WORKER_A, self.REQUIREMENTS_AUDIT, self.CODE_REVIEW}
 
-    def needs_test_execution(self) -> bool:
-        return self == Role.TEST_VALIDATION
-
-    def can_write_github(self) -> bool:
-        return self in {Role.BATCH_CONTROL, Role.INTEGRATION}
-
-    def can_use_openai(self) -> bool:
-        return self in {
-            Role.WORKER_A,
-            Role.REQUIREMENTS_AUDIT,
-            Role.CODE_REVIEW,
-            Role.TEST_VALIDATION,
-        }
+    def sandbox(self) -> str:
+        return "workspace-write" if self == self.WORKER_A else "read-only"
 
 
-ALLOWED_ROLES = frozenset({r.value for r in Role})
+ALLOWED_ROLES = frozenset(role.value for role in Role)
 
 
 @dataclass
@@ -68,10 +47,10 @@ class Task:
     base_commit: str
     target_branch: str
     scope: str
-    owned_files: List[str] = field(default_factory=list)
-    forbidden: List[str] = field(default_factory=list)
+    owned_files: list[str] = field(default_factory=list)
+    forbidden: list[str] = field(default_factory=list)
     acceptance: str = ""
-    minimum_tests: List[str] = field(default_factory=list)
+    minimum_tests: list[str] = field(default_factory=list)
     full_regression: bool = False
     windows_build: bool = False
     next_role: Optional[str] = None
@@ -79,6 +58,8 @@ class Task:
     comment_id: Optional[int] = None
     comment_author: Optional[str] = None
     comment_created_at: Optional[str] = None
+    state_comment_id: Optional[int] = None
+    workflow_run_id: Optional[str] = None
     raw: Optional[str] = None
 
 
@@ -91,16 +72,28 @@ class TaskCandidate:
 
 
 @dataclass
-class RunResult:
+class QueueState:
+    queue_id: str
     status: TaskStatus
-    next_role: Optional[str]
-    status_comment: Optional[str]
-    blocker_comment: Optional[str] = None
-    changed_files: List[str] = field(default_factory=list)
-    test_result: Optional[str] = None
-    branch_update: Optional[str] = None
-    dry_run: bool = True
+    comment_id: int
+    created_at: str
+    workflow_run_id: Optional[str] = None
+    source_comment_id: Optional[int] = None
 
 
 class QueueRunError(ValueError):
     pass
+
+
+def task_to_mapping(task: Task) -> dict[str, Any]:
+    value = asdict(task)
+    value["status"] = task.status.value
+    value["role"] = task.role.value
+    return value
+
+
+def task_from_mapping(value: dict[str, Any]) -> Task:
+    copied = dict(value)
+    copied["status"] = TaskStatus(copied["status"])
+    copied["role"] = Role(copied["role"])
+    return Task(**copied)

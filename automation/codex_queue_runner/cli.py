@@ -1,457 +1,127 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
 import os
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any
 
-from .models import (
-    QueueRunError,
-    RunResult,
-    Role,
-    Task,
-    Task,
-    TaskStatus,
-)
-from .parser import parse_task_comment
+from .git_ops import create_and_push, validate_patch
+from .github_client import GitHubRestClient
+from .models import QueueRunError, Task, task_from_mapping, task_to_mapping
 from .prompt_builder import render_prompt
-from .scope_guard import ensure_scope
-from .selector import DuplicateClaimError, collect_candidates, select_task
-from .status_writer import build_blocked_comment, build_waiting_review_comment
-from .test_command_guard import validate_test_commands
+from .selector import claim_belongs_to_run, collect_candidates, select_task
+from .status_writer import build_blocked_comment, build_blocked_status, build_claimed_comment, build_next_ready, build_waiting_review_comment
+from .test_command_guard import pytest_argv
+
+_SHA = re.compile(r"^[0-9a-f]{40}$"); _NUMBER = re.compile(r"^#?(\d+)$")
 
 
 @dataclass
 class RunnerConfig:
-    repo_root: Path
-    dry_run: bool = True
-    openai_api_key: Optional[str] = None
-    github_token: Optional[str] = None
+    repository: str = "limaple0324/FLASH"
     target_issue: int = 19
     owner_only: str = "limaple0324"
-
-
-class GitHubClient:
-    def list_issue_comments(self, issue_number: int) -> Sequence[dict]:
-        raise NotImplementedError
-
-    def post_issue_comment(self, issue_number: int, body: str) -> None:
-        raise NotImplementedError
-
-    def update_issue_comment(self, comment_id: int, body: str) -> None:
-        raise NotImplementedError
-
-
-def _read_event_payload(path: Optional[str]) -> dict:
-    if not path:
-        return {}
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _parse_task_from_comment(comment: dict) -> Task:
-    body = comment.get("body", "")
-    if not body:
-        raise QueueRunError("comment 缺少 body")
-
-    task = parse_task_comment(body)
-    task.comment_id = int(comment.get("id", 0))
-    task.comment_author = comment.get("user", {}).get("login", "")
-    task.comment_created_at = comment.get("created_at", "")
-    return task
-
-
-def _validate_task(task: Task, owner_only: str) -> tuple[bool, str]:
-    if task.comment_author != owner_only:
-        return False, "只能處理 limaple0324 建立的任務"
-
-    if task.status not in TaskStatus.claimable():
-        return False, f"STATUS 不可認領: {task.status.value}"
-
-    if task.target_branch == "main":
-        return False, "不得以 main 作為 TARGET_BRANCH"
-
-    if task.target_branch.startswith("release/"):
-        return False, "不得使用 release/ 前綴的 TARGET_BRANCH"
-
-    if not re.fullmatch(r"[0-9a-f]{40}", task.base_commit):
-        return False, "BASE_COMMIT 必須是 40 碼 SHA1"
-
-    if not re.fullmatch(r"#?\d+", task.source_issue.strip()):
-        return False, "SOURCE_ISSUE 格式不正確"
-
-    if not re.fullmatch(r"#?\d+", task.source_pr.strip()):
-        return False, "SOURCE_PR 格式不正確"
-
-    if not task.owned_files:
-        return False, "OWNED_FILES 不能是空"
-
-    return True, ""
-
-
-def _run_codex(task: Task, dry_run: bool, openai_key: Optional[str]) -> tuple[bool, str, list[str]]:
-    _ = render_prompt(task)
-
-    if task.role.needs_patch():
-        if dry_run:
-            return True, "DRY-RUN PATCH", task.owned_files.copy()
-
-    if task.role.needs_patch() and not openai_key:
-        return False, "缺少 OPENAI_API_KEY", []
-
-    if task.role.can_use_openai() and not dry_run:
-        # 實際版只做 dry-run，不在本階段發起對外呼叫
-        return False, "非 DRY-RUN 模式未啟用正式 Codex 呼叫", []
-
-    return True, "DRY-RUN NO-CHANGES", []
-
-
-def _run_tests(task: Task, dry_run: bool) -> tuple[bool, str]:
-    ok, issues = validate_test_commands(task.minimum_tests)
-    if not ok:
-        return False, "; ".join(item.reason for item in issues)
-
-    if dry_run:
-        return True, "DRY-RUN TESTS PASS"
-
-    for command in task.minimum_tests:
-        proc = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if proc.returncode != 0:
-            return False, proc.stderr.strip() or proc.stdout.strip() or "測試失敗"
-
-    return True, "TEST PASSED"
-
-
-def _build_push_command(task: Task) -> list[str]:
-    return ["git", "push", "origin", f"HEAD:{task.target_branch}", "--ff-only"]
-
-
-def _is_force_command(command: list[str]) -> bool:
-    return any(item in {"--force", "-f", "--force-with-lease"} for item in command)
-
-
-def _run_without_github_write(task: Task, config: RunnerConfig) -> RunResult:
-    ok, reason = _validate_task(task, config.owner_only)
-    if not ok:
-        return RunResult(
-            status=TaskStatus.BLOCKED,
-            next_role=task.next_role,
-            status_comment=None,
-            blocker_comment=build_blocked_comment(
-                task=task,
-                summary="任務前置驗證失敗",
-                exact_error=reason,
-                evidence="validation",
-                role=task.role.value,
-                step="task_validate",
-            ),
-            dry_run=config.dry_run,
-        )
-
-    if task.role.needs_patch() or task.role in {Role.REQUIREMENTS_AUDIT, Role.CODE_REVIEW}:
-        changed_ok = True
-        changed_files: list[str] = []
-
-        if task.role.needs_patch():
-            codex_ok, codex_result, changed_files = _run_codex(task, config.dry_run, config.openai_api_key)
-            if not codex_ok:
-                return RunResult(
-                    status=TaskStatus.BLOCKED,
-                    next_role=task.next_role,
-                    status_comment=None,
-                    blocker_comment=build_blocked_comment(
-                        task=task,
-                        summary="Codex 執行失敗",
-                        exact_error=codex_result,
-                        evidence="codex",
-                        role=task.role.value,
-                        step="codex_exec",
-                    ),
-                    dry_run=config.dry_run,
-                )
-        else:
-            # 審核與需求核對為只讀角色，不應修改產品程式
-            changed_files = []
-
-        scoped_ok, scope_errors = ensure_scope(
-            changed_files if changed_files else [],
-            task.owned_files,
-            task.forbidden,
-        )
-        if not scoped_ok:
-            return RunResult(
-                status=TaskStatus.BLOCKED,
-                next_role=task.next_role,
-                status_comment=None,
-                blocker_comment=build_blocked_comment(
-                    task=task,
-                    summary="範圍檢查失敗",
-                    exact_error="; ".join(scope_errors),
-                    evidence="scope_guard",
-                    role=task.role.value,
-                    step="scope_guard",
-                ),
-                changed_files=changed_files,
-                dry_run=config.dry_run,
-            )
-
-    if task.role == Role.TEST_VALIDATION:
-        test_ok, test_result = _run_tests(task, config.dry_run)
-        if not test_ok:
-            return RunResult(
-                status=TaskStatus.BLOCKED,
-                next_role=task.next_role,
-                status_comment=None,
-                blocker_comment=build_blocked_comment(
-                    task=task,
-                    summary="測試失敗",
-                    exact_error=test_result,
-                    evidence="test_validation",
-                    role=task.role.value,
-                    step="minimum_tests",
-                ),
-                dry_run=config.dry_run,
-            )
-
-        return RunResult(
-            status=TaskStatus.WAITING_REVIEW,
-            next_role=task.next_role or "BATCH_CONTROL",
-            status_comment=build_waiting_review_comment(task, test_result="dry-run-test"),
-            test_result=test_result,
-            dry_run=config.dry_run,
-        )
-
-    # 讀取階段角色無修改檔案
-    return RunResult(
-        status=TaskStatus.WAITING_REVIEW,
-        next_role=task.next_role or "BATCH_CONTROL",
-        status_comment=build_waiting_review_comment(task),
-        dry_run=config.dry_run,
-    )
-
-
-def _run_with_github_write(task: Task, config: RunnerConfig) -> RunResult:
-    ok, reason = _validate_task(task, config.owner_only)
-    if not ok:
-        return RunResult(
-            status=TaskStatus.BLOCKED,
-            next_role=task.next_role,
-            status_comment=None,
-            blocker_comment=build_blocked_comment(
-                task=task,
-                summary="任務前置驗證失敗",
-                exact_error=reason,
-                evidence="validation",
-                role=task.role.value,
-                step="task_validate",
-            ),
-            dry_run=config.dry_run,
-        )
-
-    if config.openai_api_key:
-        return RunResult(
-            status=TaskStatus.BLOCKED,
-            next_role=task.next_role,
-            status_comment=None,
-            blocker_comment=build_blocked_comment(
-                task=task,
-                summary="環境限制",
-                exact_error="推送階段不得持有 OPENAI_API_KEY",
-                evidence="environment",
-                role=task.role.value,
-                step="env_guard",
-            ),
-            dry_run=config.dry_run,
-        )
-
-    if task.role == Role.INTEGRATION:
-        push = _build_push_command(task)
-    else:
-        push = _build_push_command(task)
-
-    if _is_force_command(push):
-        return RunResult(
-            status=TaskStatus.BLOCKED,
-            next_role=task.next_role,
-            status_comment=None,
-            blocker_comment=build_blocked_comment(
-                task=task,
-                summary="推送命令不安全",
-                exact_error="不允許 force push",
-                evidence=",".join(push),
-                role=task.role.value,
-                step="push_guard",
-            ),
-            branch_update=" ".join(push),
-            dry_run=config.dry_run,
-        )
-
-    if not config.dry_run:
-        proc = subprocess.run(
-            push,
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-        if proc.returncode != 0:
-            return RunResult(
-                status=TaskStatus.BLOCKED,
-                next_role=task.next_role,
-                status_comment=None,
-                blocker_comment=build_blocked_comment(
-                    task=task,
-                    summary="推送失敗",
-                    exact_error=(proc.stderr or proc.stdout or "push failed").strip(),
-                    evidence="git_push",
-                    role=task.role.value,
-                    step="git_push",
-                ),
-                branch_update=" ".join(push),
-                dry_run=config.dry_run,
-            )
-
-    return RunResult(
-        status=TaskStatus.WAITING_REVIEW,
-        next_role=task.next_role or "BATCH_CONTROL",
-        status_comment=build_waiting_review_comment(task),
-        branch_update=" ".join(push),
-        dry_run=config.dry_run,
-    )
-
-
-def run_from_event(
-    event_payload: Optional[dict] = None,
-    github_client: Optional[GitHubClient] = None,
-    config: Optional[RunnerConfig] = None,
-) -> Optional[RunResult]:
-    if event_payload is None:
-        event_payload = _read_event_payload(os.getenv("GITHUB_EVENT_PATH"))
-
-    if config is None:
-        config = RunnerConfig(
-            repo_root=Path("."),
-            dry_run=os.getenv("CODEX_QUEUE_DRY_RUN", "1") == "1",
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-            github_token=os.getenv("GITHUB_TOKEN"),
-        )
-
-    event_name = event_payload.get("action") or event_payload.get("event_name") or ""
-    issue = event_payload.get("issue") or {}
-    issue_number = int(issue.get("number", 0))
-
-    if issue_number and issue_number != config.target_issue:
-        return None
-
-    task: Optional[Task] = None
-    comment_id: Optional[int] = None
-
-    if event_name == "issue_comment" or event_payload.get("comment"):
-        comment = event_payload.get("comment", {})
-        if not comment:
-            return None
-
-        task = _parse_task_from_comment(comment)
-        comment_id = task.comment_id
-    else:
-        if github_client is None:
-            raise QueueRunError("non-issue_comment 需提供 GitHub client")
-
-        raw_comments = github_client.list_issue_comments(config.target_issue)
-        candidates = collect_candidates(raw_comments, require_owner=config.owner_only)
-
-        if not candidates:
-            return None
-
-        try:
-            candidate = select_task(candidates)
-        except DuplicateClaimError as exc:
-            first = candidates[0].task
-            return RunResult(
-                status=TaskStatus.BLOCKED,
-                next_role=first.next_role,
-                status_comment=None,
-                blocker_comment=build_blocked_comment(
-                    task=first,
-                    summary="重複認領",
-                    exact_error=str(exc),
-                    evidence="selector",
-                    role="SCHEDULER",
-                    step="task_selection",
-                ),
-                dry_run=config.dry_run,
-            )
-
-        task = candidate.task
-        comment_id = candidate.comment_id
-
-    if task is None or task.comment_id is None:
-        return None
-
-    task.comment_id = int(comment_id)
-
-    if task.role.can_write_github():
-        result = _run_with_github_write(task, config)
-    else:
-        result = _run_without_github_write(task, config)
-
-    if config.dry_run:
-        return result
-
-    if github_client is None:
-        return result
-
-    # 在非 dry-run 且允許的角色才寫回進度，符合階段權限定義
-    if not task.role.can_write_github():
-        return result
-
-    if result.status_comment:
-        github_client.post_issue_comment(config.target_issue, result.status_comment)
-
-    if result.blocker_comment:
-        github_client.post_issue_comment(18, result.blocker_comment)
-
-    return result
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--event", default=os.getenv("GITHUB_EVENT_PATH"))
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--repo-root", default=".")
-    args = parser.parse_args()
-
-    payload = _read_event_payload(args.event)
-    config = RunnerConfig(
-        repo_root=Path(args.repo_root),
-        dry_run=args.dry_run,
-        openai_api_key=os.getenv("OPENAI_API_KEY"),
-        github_token=os.getenv("GITHUB_TOKEN"),
-    )
-
-    result = run_from_event(payload, config=config)
-    if result is None:
-        print("no-task")
-        return 0
-
-    if result.status_comment:
-        print(result.status_comment)
-    if result.blocker_comment:
-        print(result.blocker_comment)
-    print(f"status={result.status.value}")
-    if result.branch_update:
-        print(f"branch_update={result.branch_update}")
+    workflow_run_id: str = "dry-run"
+    dry_run: bool = True
+    allow_writeback: bool = False
+
+
+def _number(value: str, name: str) -> int:
+    found = _NUMBER.fullmatch(value.strip())
+    if not found: raise QueueRunError(f"{name} 必須是數字")
+    return int(found.group(1))
+
+
+def validate_task_shape(task: Task) -> None:
+    if not _SHA.fullmatch(task.base_commit): raise QueueRunError("BASE_COMMIT 必須是完整 40 位元提交")
+    if task.target_branch == "main" or task.target_branch.startswith("release/"): raise QueueRunError("TARGET_BRANCH 不得為 main 或 release/")
+    _number(task.source_issue, "SOURCE_ISSUE")
+    if task.source_pr != "NONE": _number(task.source_pr, "SOURCE_PR")
+    if not task.owned_files: raise QueueRunError("OWNED_FILES 不可為空")
+    pytest_argv(task.minimum_tests)
+
+
+def validate_remote_source(client: Any, task: Task) -> None:
+    validate_task_shape(task)
+    if not client.get_issue(_number(task.source_issue, "SOURCE_ISSUE")): raise QueueRunError("SOURCE_ISSUE 不存在")
+    if task.source_pr != "NONE":
+        pr = client.get_pull_request(_number(task.source_pr, "SOURCE_PR")); head = pr.get("head") or {}
+        if str(pr.get("state", "")).lower() != "open" or head.get("ref") != task.target_branch or head.get("sha") != task.base_commit: raise QueueRunError("SOURCE_PR head branch 或 SHA 與任務不一致")
+    if client.get_branch_sha(task.target_branch) != task.base_commit: raise QueueRunError("遠端 TARGET_BRANCH head 與 BASE_COMMIT 不一致")
+
+
+def select_and_claim(client: Any, event: dict[str, Any], config: RunnerConfig, queue_id: str | None = None, openai_secret_available: bool = True) -> dict[str, Any]:
+    if (event.get("event_name") or os.getenv("GITHUB_EVENT_NAME")) == "issue_comment" and int((event.get("issue") or {}).get("number", 0)) != config.target_issue: return {"selected": False, "reason": "非 Issue #19"}
+    task = select_task(collect_candidates(client.list_issue_comments(config.target_issue), config.owner_only), queue_id or None).task
+    try:
+        validate_remote_source(client, task)
+        if not config.dry_run and task.role.requires_codex() and not openai_secret_available: raise QueueRunError("缺少 OPENAI_API_KEY，禁止啟動 Agent")
+    except QueueRunError as exc:
+        if not config.dry_run and config.allow_writeback:
+            client.post_issue_comment(config.target_issue, build_blocked_status(task, "選取階段阻擋"))
+            client.write_blocker(build_blocked_comment(task, "選取階段阻擋", str(exc), "select_claim", "SELECT_CLAIM", "select_claim"))
+        raise
+    if not config.dry_run and config.allow_writeback:
+        latest = select_task(collect_candidates(client.list_issue_comments(config.target_issue), config.owner_only), task.queue_id)
+        if latest.task.state_comment_id != task.state_comment_id: raise QueueRunError("認領前任務狀態已變更")
+        client.post_issue_comment(config.target_issue, build_claimed_comment(task, config.workflow_run_id))
+        if not claim_belongs_to_run(client.list_issue_comments(config.target_issue), task.queue_id, config.workflow_run_id): raise QueueRunError("CLAIMED 未屬於本 workflow run")
+    return {"selected": True, "mode": "dry-run" if config.dry_run else "live", "allow_writeback": config.allow_writeback, "sandbox": task.role.sandbox(), "task": task_to_mapping(task), "workflow_run_id": config.workflow_run_id}
+
+
+def _read(path: Path) -> dict[str, Any]: return json.loads(path.read_text(encoding="utf-8"))
+def _write(path: Path, value: dict[str, Any]) -> None: path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+def _task(path: Path) -> Task:
+    value = _read(path); return task_from_mapping(value["task"] if "task" in value else value)
+def _client(repository: str) -> GitHubRestClient: return GitHubRestClient(repository, os.getenv("GITHUB_TOKEN", ""))
+
+
+def command_select(args: argparse.Namespace) -> int:
+    config = RunnerConfig(args.repository, workflow_run_id=os.getenv("GITHUB_RUN_ID", "manual"), dry_run=args.mode == "dry-run", allow_writeback=args.allow_writeback.lower() == "true")
+    try: result = select_and_claim(_client(args.repository), _read(Path(args.event)), config, args.queue_id, args.openai_secret_available.lower() == "true")
+    except QueueRunError as exc: result = {"selected": False, "mode": args.mode, "allow_writeback": config.allow_writeback, "error": str(exc)}
+    _write(Path(args.output), result); return 0
+
+
+def command_render(args: argparse.Namespace) -> int:
+    Path(args.output).write_text(render_prompt(_task(Path(args.task))), encoding="utf-8"); return 0
+
+
+def command_events(args: argparse.Namespace) -> int:
+    task = _task(Path(args.task)); Path(args.output).write_text(json.dumps({"event": "agent_finished", "queue_id": task.queue_id, "role": task.role.value}, ensure_ascii=False) + "\n", encoding="utf-8"); return 0
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    result = validate_patch(Path("."), _task(Path(args.task)), Path(args.patch), Path(args.output_dir)); _write(Path(args.output_dir) / "result.json", {"has_patch": result.has_patch, "changed_files": result.changed_files, "test_result": result.test_output}); return 0
+
+
+def command_push(args: argparse.Namespace) -> int:
+    task, client = _task(Path(args.task)), _client(args.repository)
+    try:
+        if args.validate_result != "success": raise QueueRunError("validate job 失敗")
+        if not claim_belongs_to_run(client.list_issue_comments(19), task.queue_id, os.getenv("GITHUB_RUN_ID", "")): raise QueueRunError("推送前 CLAIMED 已不屬於本 workflow run")
+        directory, result = Path(args.validated_dir), _read(Path(args.validated_dir) / "result.json")
+        commit, files = ("NONE", [])
+        if result["has_patch"]: commit, files, _ = create_and_push(Path("."), task, directory / "validated.patch", directory / "manifest.sha256", f"[自動化] {task.queue_id}")
+        report = (directory / "report.txt").read_text(encoding="utf-8")[:4000]
+        if task.source_pr != "NONE": client.write_source_pr(_number(task.source_pr, "SOURCE_PR"), f"QUEUE_ID: {task.queue_id}\nRESULT_COMMIT: {commit}\nFILES: {','.join(files) or 'NONE'}\nREPORT: {report}")
+        client.post_issue_comment(19, build_waiting_review_comment(task, commit, files, "PASS")); client.post_issue_comment(19, build_next_ready(task, commit if commit != "NONE" else task.base_commit)); client.dispatch_next(task.queue_id)
+    except Exception as exc:
+        client.post_issue_comment(19, build_blocked_status(task, "Queue Runner 阻擋")); client.write_blocker(build_blocked_comment(task, "Queue Runner 阻擋", str(exc), "push_writeback", "QUEUE_RUNNER", "push_writeback")); return 1
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def main() -> int:
+    parser = argparse.ArgumentParser(); commands = parser.add_subparsers(dest="command", required=True)
+    select = commands.add_parser("select-claim"); select.add_argument("--event", required=True); select.add_argument("--output", required=True); select.add_argument("--repository", required=True); select.add_argument("--mode", choices=["dry-run", "live"], default="dry-run"); select.add_argument("--queue-id", default=""); select.add_argument("--allow-writeback", default="false"); select.add_argument("--openai-secret-available", default="false")
+    render = commands.add_parser("render-prompt"); render.add_argument("--task", required=True); render.add_argument("--output", required=True)
+    events = commands.add_parser("write-agent-events"); events.add_argument("--task", required=True); events.add_argument("--output", required=True)
+    validate = commands.add_parser("validate"); validate.add_argument("--task", required=True); validate.add_argument("--patch", required=True); validate.add_argument("--output-dir", required=True)
+    push = commands.add_parser("push-writeback"); push.add_argument("--task", required=True); push.add_argument("--validated-dir", required=True); push.add_argument("--repository", required=True); push.add_argument("--validate-result", required=True)
+    return {"select-claim": command_select, "render-prompt": command_render, "write-agent-events": command_events, "validate": command_validate, "push-writeback": command_push}[parser.parse_args().command](parser.parse_args())
+
+
+if __name__ == "__main__": raise SystemExit(main())

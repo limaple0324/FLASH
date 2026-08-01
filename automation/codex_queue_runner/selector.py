@@ -1,89 +1,67 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import datetime
-from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 
-from .models import QueueRunError, Task, TaskCandidate, TaskStatus
-from .parser import parse_task_comment
+from .models import QueueRunError, QueueState, TaskCandidate, TaskStatus
+from .parser import parse_queue_state, parse_task_comment
 
 
 class DuplicateClaimError(QueueRunError):
-    """同一 QUEUE_ID 有多筆可認領任務。"""
+    pass
 
 
-def _created_timestamp(value: str) -> datetime:
-    if not value:
-        return datetime.min
+def _stamp(value: str) -> tuple[datetime, int]:
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return datetime.fromisoformat(value.replace("Z", "+00:00")), 0
     except ValueError:
-        return datetime.min
+        return datetime.min.replace(tzinfo=None), 0
 
 
-def _parse_task_candidate(raw: dict, require_owner: str | None = None) -> TaskCandidate | None:
-    comment_body = raw.get("body", "")
-    comment_user = raw.get("user", {}) or {}
-    author = comment_user.get("login", "")
-
-    task = parse_task_comment(comment_body)
-    task.comment_id = int(raw.get("id", 0))
-    task.comment_author = author
-    task.comment_created_at = raw.get("created_at", "")
-
-    if require_owner and author != require_owner:
-        return None
-
-    return TaskCandidate(
-        task=task,
-        comment_id=task.comment_id,
-        comment_author=author,
-        created_at=task.comment_created_at or "",
-    )
+def _key(raw: dict) -> tuple[datetime, int]:
+    stamp, _ = _stamp(str(raw.get("created_at", "")))
+    return stamp, int(raw.get("id", 0))
 
 
-def collect_candidates(
-    raw_comments: Sequence[dict],
-    require_owner: str,
-) -> list[TaskCandidate]:
-    candidates: list[TaskCandidate] = []
-    for raw in raw_comments:
+def latest_states(raw_comments: Sequence[dict]) -> dict[str, QueueState]:
+    states: dict[str, QueueState] = {}
+    for raw in sorted(raw_comments, key=_key):
+        state = parse_queue_state(str(raw.get("body", "")), int(raw.get("id", 0)), str(raw.get("created_at", "")))
+        if state:
+            states[state.queue_id] = state
+    return states
+
+
+def collect_candidates(raw_comments: Sequence[dict], require_owner: str) -> list[TaskCandidate]:
+    states, tasks = latest_states(raw_comments), {}
+    for raw in sorted(raw_comments, key=_key):
+        author = str((raw.get("user") or {}).get("login", ""))
+        if author != require_owner:
+            continue
         try:
-            candidate = _parse_task_candidate(raw, require_owner=require_owner)
-        except Exception:
+            task = parse_task_comment(str(raw.get("body", "")))
+        except QueueRunError:
             continue
-        if candidate is not None:
-            candidates.append(candidate)
+        task.comment_id, task.comment_author, task.comment_created_at = int(raw.get("id", 0)), author, str(raw.get("created_at", ""))
+        tasks[task.queue_id] = TaskCandidate(task, task.comment_id, author, task.comment_created_at)
+    candidates: list[TaskCandidate] = []
+    for queue_id, candidate in tasks.items():
+        state = states.get(queue_id)
+        if not state:
+            continue
+        candidate.task.status, candidate.task.state_comment_id, candidate.task.workflow_run_id = state.status, state.comment_id, state.workflow_run_id
+        candidate.created_at = state.created_at
+        candidates.append(candidate)
+    return sorted(candidates, key=lambda item: _key({"created_at": item.created_at, "id": item.comment_id}))
 
-    candidates.sort(key=lambda item: _created_timestamp(item.created_at))
-    return candidates
 
-
-def select_task(candidates: Sequence[TaskCandidate]) -> TaskCandidate:
-    blocked: set[str] = set()
-    ready_by_queue: dict[str, TaskCandidate] = {}
-
+def select_task(candidates: Sequence[TaskCandidate], queue_id: str | None = None) -> TaskCandidate:
     for candidate in candidates:
-        status = candidate.task.status
-        qid = candidate.task.queue_id
+        if (not queue_id or candidate.task.queue_id == queue_id) and candidate.task.status in TaskStatus.claimable():
+            return candidate
+    raise QueueRunError("目前沒有可認領任務")
 
-        if status in TaskStatus.non_claimable():
-            blocked.add(qid)
-            continue
 
-        if status not in TaskStatus.claimable():
-            continue
-
-        if qid in blocked:
-            continue
-
-        if qid in ready_by_queue:
-            raise DuplicateClaimError(f"Queue 重複認領: {qid}")
-
-        ready_by_queue[qid] = candidate
-
-    if not ready_by_queue:
-        raise QueueRunError("目前沒有可認領任務")
-
-    # 確保一次只回傳一筆
-    return next(iter(ready_by_queue.values()))
+def claim_belongs_to_run(raw_comments: Sequence[dict], queue_id: str, workflow_run_id: str) -> bool:
+    state = latest_states(raw_comments).get(queue_id)
+    return bool(state and state.status == TaskStatus.CLAIMED and state.workflow_run_id == workflow_run_id)
