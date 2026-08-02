@@ -11,6 +11,34 @@
   "target_branch": "codex/release-identity-gate-2026-08-01",
   "fixed_base_commit": "5dd2c61aa7fed0b9a8d55247bcdff2621e4110a1",
   "current_commit_at_batch_creation": "5dd2c61aa7fed0b9a8d55247bcdff2621e4110a1",
+  "construction_remediation": {
+    "validation_build_only": true,
+    "formal_release_boundary": "正式發布只能使用指定成功驗證成品，不得由驗證建置重新建置。",
+    "updated_contract_tests": [
+      "tests/test_self_check_contract.py",
+      "tests/test_windows_command_files.py",
+      "tests/test_windows_delivery_metadata.py",
+      "tests/test_windows_installer.py",
+      "tests/test_windows_sp1_delivery.py",
+      "tests/test_windows_sp2_delivery.py",
+      "tests/test_windows_sp3_delivery.py"
+    ],
+    "direct_test": {
+      "selector": "python -m pytest -q tests/test_self_check_contract.py tests/test_windows_command_files.py tests/test_windows_delivery_metadata.py tests/test_windows_installer.py tests/test_windows_sp1_delivery.py tests/test_windows_sp2_delivery.py tests/test_windows_sp3_delivery.py",
+      "result": "26 passed",
+      "exit_code": 0
+    },
+    "cloud_execution": {
+      "previous_run": 30732999807,
+      "previous_result": "FAILED",
+      "final_run": "PENDING_PUSH_TRIGGER"
+    },
+    "delivery_state": {
+      "packaged": false,
+      "merged": false,
+      "formally_released": false
+    }
+  },
   "total_items": 1,
   "items": [
     "依第001號既有成品身分規則，解除雲端建置契約與七份直接失敗測試的受阻；只可修改本批指定檔案。"

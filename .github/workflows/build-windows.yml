@@ -127,48 +127,27 @@ jobs:
           $classification = $classificationJson | ConvertFrom-Json
           $buildKind = [string]$classification.build_kind
           $publishTarget = [string]$classification.publish_target
-          $artifactKind = [string]$classification.artifact_kind
-          $approvalStatus = [string]$classification.approval_status
-          $approvalMethod = [string]$classification.approval_method
-          if ($approvalStatus -eq 'approved') {
-            $approvalActor = $env:GITHUB_ACTOR
-            $approvalRunId = $env:GITHUB_RUN_ID
-            $approvalEvent = $env:BUILD_EVENT_NAME
+           $artifactKind = [string]$classification.artifact_kind
+           $approvalStatus = [string]$classification.approval_status
+           $approvalMethod = [string]$classification.approval_method
+          if (
+            $artifactKind -ne 'validation' -or
+            $publishTarget -ne 'none' -or
+            $approvalStatus -ne 'not_approved' -or
+            $approvalMethod -ne 'none'
+          ) {
+            throw 'The Windows build workflow must produce a validation-only artifact.'
           }
-          else {
-            $approvalActor = 'none'
-            $approvalRunId = 'none'
-            $approvalEvent = 'none'
-          }
-
-          if ($buildKind -in @('sp1_release', 'sp1_snapshot') -and $metadata.milestone -ne 'SP1') {
-            throw "SP1 delivery branch must use milestone=SP1."
-          }
-          if ($buildKind -eq 'sp2_snapshot' -and $metadata.milestone -ne 'SP2') {
-            throw "SP2 delivery branch must use milestone=SP2."
-          }
-          if ($buildKind -eq 'sp3_snapshot' -and $metadata.milestone -ne 'SP3') {
-            throw "SP3 delivery branch must use milestone=SP3."
-          }
-          if ($buildKind -eq 'main_release' -and $metadata.milestone -ne 'SP3') {
-            throw "The complete cumulative release must use milestone=SP3."
-          }
+          $approvalActor = 'none'
+          $approvalRunId = 'none'
+          $approvalEvent = 'none'
 
           $shortCommit = $env:GITHUB_SHA.Substring(0, 7)
-          if (
-            $buildKind -in @('main_release', 'sp3_snapshot') -or
-            ($buildKind -eq 'validation_build' -and $metadata.milestone -eq 'SP3')
-          ) {
-            $artifactPrefix = 'FLASH-SP1+SP2+SP3-Windows'
-          }
-          elseif (
-            $buildKind -eq 'sp2_snapshot' -or
-            ($buildKind -eq 'validation_build' -and $metadata.milestone -eq 'SP2')
-          ) {
-            $artifactPrefix = 'FLASH-SP1+SP2-Windows'
-          }
-          else {
-            $artifactPrefix = 'FLASH-SP1-Windows'
+          $artifactPrefix = switch ([string]$metadata.milestone) {
+            'SP1' { 'FLASH-SP1-Windows' }
+            'SP2' { 'FLASH-SP1+SP2-Windows' }
+            'SP3' { 'FLASH-SP1+SP2+SP3-Windows' }
+            default { throw "Unsupported validation milestone: $($metadata.milestone)" }
           }
           $artifactName = "$artifactPrefix-$($metadata.version)-$shortCommit-$artifactKind"
 
@@ -263,7 +242,7 @@ jobs:
           }
           Write-Host "Packaged FLASH.exe self-check passed for $($report.version)."
 
-      - name: Create release bundle
+      - name: Create validation bundle
         shell: pwsh
         run: |
           if (-not (Test-Path 'dist/FLASH.exe')) {
@@ -277,132 +256,20 @@ jobs:
            Copy-Item 'assets/flash_icon.ico' 'release/sync_plus_icon.ico'
           Copy-Item 'tools/verify_windows_release.ps1' 'release/輔系統/verify_windows_release.ps1'
 
-          if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {
-            @(
-              '* -text'
-              '*.cmd -text'
-              '*.bat -text'
-              '*.ps1 -text'
-              '*.txt -text'
-            ) | Set-Content 'release/.gitattributes' -Encoding ascii
-            Copy-Item 'tools/安裝輔.cmd' 'release/安裝輔.cmd'
-            Copy-Item 'tools/更新輔.cmd' 'release/更新輔.cmd'
-            Copy-Item 'tools/輔系統/安裝輔.ps1' 'release/輔系統/安裝輔.ps1'
-            Copy-Item 'tools/輔系統/輔更新核心.ps1' 'release/輔系統/輔更新核心.ps1'
-            Copy-Item 'tools/檢查輔同步狀態.cmd' 'release/輔系統/檢查輔同步狀態.cmd'
-            Copy-Item 'tools/檢查輔同步狀態.ps1' 'release/輔系統/檢查輔同步狀態.ps1'
+           @(
+             '這是雲端 Windows 驗證成品，不是正式發布版。'
+             '不得以此成品更新既有安裝、建立發布頻道或取代正式成品。'
+             '正式發布只能使用指定成功驗證成品，且不得重新建置。'
+             '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
+           ) | Set-Content 'release/驗證建置說明.txt' -Encoding utf8
 
-            if ($env:FLASH_BUILD_KIND -eq 'main_release') {
-              $releaseBranch = 'release/latest'
-              $sourceBranch = 'main'
-            }
-            else {
-              $releaseBranch = 'release/sp1'
-              $sourceBranch = 'sp1/completion-2026-07-25'
-            }
-            @(
-              "release_branch=$releaseBranch"
-              "source_branch=$sourceBranch"
-              "build_kind=$env:FLASH_BUILD_KIND"
-              "publish_target=$env:FLASH_PUBLISH_TARGET"
-            ) | Set-Content 'release/輔系統/UPDATE_CHANNEL.txt' -Encoding utf8
-          }
-          elseif ($env:FLASH_BUILD_KIND -eq 'sp1_snapshot') {
-            @(
-              '這是 SP1 獨立工程驗證快照，不是正式發布版。'
-              '請放在獨立資料夾中驗證，不要覆蓋目前正式安裝。'
-              '本快照不包含「更新輔」，不會追蹤 release/latest。'
-              '因此不會在日後更新成 SP2、SP3 或完整累積版。'
-              '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
-            ) | Set-Content 'release/SP1快照說明.txt' -Encoding utf8
-          }
-          elseif ($env:FLASH_BUILD_KIND -eq 'sp2_snapshot') {
-            @(
-              '這是 SP1＋SP2 累積工程驗證快照，不是 SP1 單獨成品。'
-              'SP1 獨立成品仍保留，不會被本快照覆蓋。'
-              'SP2 自己的來源範圍、測試與驗收證據位於 deliverables/sp2。'
-              '本快照不包含「更新輔」，不會追蹤 release/latest 或 release/sp1。'
-              '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
-            ) | Set-Content 'release/SP1+SP2累積快照說明.txt' -Encoding utf8
-          }
-          elseif ($env:FLASH_BUILD_KIND -eq 'sp3_snapshot') {
-            @(
-              '這是 SP1＋SP2＋SP3 完整累積工程驗證快照。'
-              'SP1、SP2 與 SP3 各自的交付檔案仍保留，不會被本快照覆蓋。'
-              'SP3 自己的來源範圍、測試與驗收證據位於 deliverables/sp3。'
-              '本快照不包含「更新輔」，不會追蹤任何正式發布頻道。'
-              '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
-            ) | Set-Content 'release/SP1+SP2+SP3完整累積快照說明.txt' -Encoding utf8
-          }
-          else {
-            @(
-              '這是一般分支驗證包，不是 SP1 獨立成品或正式發布版。'
-              '本驗證包不包含「更新輔」，不會追蹤 release/latest。'
-              '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
-            ) | Set-Content 'release/分支驗證說明.txt' -Encoding utf8
-          }
-
-           $shortCommit = $env:GITHUB_SHA.Substring(0, 7)
-           $builtUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-
-           if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {
-            if ($env:FLASH_BUILD_KIND -eq 'main_release') {
-              $latestBranch = 'main'
-            }
-            else {
-              $latestBranch = 'sp1/completion-2026-07-25'
-            }
-            @(
-              "branch=$latestBranch"
-              "version=$env:FLASH_VERSION"
-              "commit=$env:GITHUB_SHA"
-              "short_commit=$shortCommit"
-               "run_id=$env:GITHUB_RUN_ID"
-               "artifact_name=$env:FLASH_ARTIFACT_NAME"
-               "approval_status=$env:FLASH_APPROVAL_STATUS"
-               "approval_method=$env:FLASH_APPROVAL_METHOD"
-               "approval_actor=$env:FLASH_APPROVAL_ACTOR"
-               "approval_run_id=$env:FLASH_APPROVAL_RUN_ID"
-               "approval_event=$env:FLASH_APPROVAL_EVENT"
-               "approved_utc=$builtUtc"
-              "updated_utc=$builtUtc"
-            ) | Set-Content 'release/LATEST.txt' -Encoding utf8
-          }
-
-          $manifestPaths = @(
-            'FLASH.exe'
-            '輔系統/BUILD_INFO.txt'
-            'sync_plus_icon.ico'
-            '輔系統/verify_windows_release.ps1'
-          )
-          if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {
-            $manifestPaths = @(
-              'FLASH.exe'
-              'LATEST.txt'
-              '安裝輔.cmd'
-              '更新輔.cmd'
-              '輔系統/BUILD_INFO.txt'
-              'sync_plus_icon.ico'
-              '輔系統/verify_windows_release.ps1'
-              '輔系統/安裝輔.ps1'
-              '輔系統/輔更新核心.ps1'
-              '輔系統/UPDATE_CHANNEL.txt'
-              '輔系統/檢查輔同步狀態.cmd'
-              '輔系統/檢查輔同步狀態.ps1'
-            )
-          }
-          elseif ($env:FLASH_BUILD_KIND -eq 'sp1_snapshot') {
-            $manifestPaths += 'SP1快照說明.txt'
-          }
-          elseif ($env:FLASH_BUILD_KIND -eq 'sp2_snapshot') {
-            $manifestPaths += 'SP1+SP2累積快照說明.txt'
-          }
-          elseif ($env:FLASH_BUILD_KIND -eq 'sp3_snapshot') {
-            $manifestPaths += 'SP1+SP2+SP3完整累積快照說明.txt'
-          }
-          else {
-            $manifestPaths += '分支驗證說明.txt'
-          }
+           $manifestPaths = @(
+             'FLASH.exe'
+             '輔系統/BUILD_INFO.txt'
+             'sync_plus_icon.ico'
+             '輔系統/verify_windows_release.ps1'
+             '驗證建置說明.txt'
+           )
           @(
             foreach ($relativePath in $manifestPaths) {
               $fileHash = (
@@ -416,7 +283,7 @@ jobs:
           Get-Content 'release/輔系統/BUILD_INFO.txt'
           Get-Content 'release/輔系統/SHA256SUMS.txt'
 
-      - name: Verify release bundle layout
+      - name: Verify validation bundle layout
         shell: pwsh
         run: |
           foreach ($required in @(
@@ -424,80 +291,31 @@ jobs:
             'release/輔系統/SHA256SUMS.txt',
             'release/輔系統/BUILD_INFO.txt',
             'release/sync_plus_icon.ico',
-            'release/輔系統/verify_windows_release.ps1'
+             'release/輔系統/verify_windows_release.ps1',
+             'release/驗證建置說明.txt'
           )) {
             if (-not (Test-Path $required -PathType Leaf)) {
               throw "Release bundle is missing: $required"
             }
           }
 
-          if ($env:FLASH_BUILD_KIND -in @('main_release', 'sp1_release')) {
-            foreach ($required in @(
-              'release/.gitattributes',
-              'release/LATEST.txt',
-              'release/安裝輔.cmd',
-              'release/更新輔.cmd',
-              'release/輔系統/安裝輔.ps1',
-              'release/輔系統/輔更新核心.ps1',
-              'release/輔系統/UPDATE_CHANNEL.txt',
-              'release/輔系統/檢查輔同步狀態.cmd',
-              'release/輔系統/檢查輔同步狀態.ps1'
-            )) {
-              if (-not (Test-Path $required -PathType Leaf)) {
-                throw "Live release bundle is missing: $required"
-              }
-            }
+           foreach ($forbidden in @(
+             'release/.gitattributes',
+             'release/LATEST.txt',
+             'release/安裝輔.cmd',
+             'release/更新輔.cmd',
+             'release/輔系統/安裝輔.ps1',
+             'release/輔系統/輔更新核心.ps1',
+             'release/輔系統/UPDATE_CHANNEL.txt',
+             'release/輔系統/檢查輔同步狀態.cmd',
+             'release/輔系統/檢查輔同步狀態.ps1'
+           )) {
+             if (Test-Path $forbidden) {
+               throw "A validation bundle must not contain a formal delivery file: $forbidden"
+             }
+           }
 
-            foreach ($cmd in @(
-              'release/安裝輔.cmd',
-              'release/更新輔.cmd',
-              'release/輔系統/檢查輔同步狀態.cmd'
-            )) {
-              $content = [IO.File]::ReadAllText($cmd, [Text.Encoding]::UTF8)
-              if ($content -notmatch "`r`n" -or $content -match "(?<!`r)`n") {
-                throw "Windows command file does not use CRLF line endings: $cmd"
-              }
-            }
-          }
-          else {
-            foreach ($forbidden in @(
-              'release/安裝輔.cmd',
-              'release/更新輔.cmd',
-              'release/輔系統/安裝輔.ps1',
-              'release/輔系統/輔更新核心.ps1',
-              'release/輔系統/UPDATE_CHANNEL.txt'
-            )) {
-              if (Test-Path $forbidden) {
-                throw "A snapshot must not contain a live updater: $forbidden"
-              }
-            }
-
-            if ($env:FLASH_BUILD_KIND -eq 'sp1_snapshot') {
-              if (-not (Test-Path 'release/SP1快照說明.txt' -PathType Leaf)) {
-                throw 'SP1 snapshot notice is missing.'
-              }
-            }
-            elseif ($env:FLASH_BUILD_KIND -eq 'sp2_snapshot') {
-              if (-not (Test-Path 'release/SP1+SP2累積快照說明.txt' -PathType Leaf)) {
-                throw 'SP1+SP2 cumulative snapshot notice is missing.'
-              }
-            }
-            elseif ($env:FLASH_BUILD_KIND -eq 'sp3_snapshot') {
-              if (-not (Test-Path 'release/SP1+SP2+SP3完整累積快照說明.txt' -PathType Leaf)) {
-                throw 'SP1+SP2+SP3 cumulative snapshot notice is missing.'
-              }
-            }
-            elseif ($env:FLASH_BUILD_KIND -eq 'validation_build') {
-              if (-not (Test-Path 'release/分支驗證說明.txt' -PathType Leaf)) {
-                throw 'Branch validation notice is missing.'
-              }
-            }
-            else {
-              throw "Unsupported non-release build kind: $env:FLASH_BUILD_KIND"
-            }
-          }
-
-      - name: Verify release bundle metadata and hash
+      - name: Verify validation bundle metadata and hash
         shell: pwsh
         run: |
           & 'release/輔系統/verify_windows_release.ps1' -NoLaunch
@@ -536,87 +354,7 @@ jobs:
           Write-Host "ZIP: $zipPath"
           Write-Host "ZIP SHA-256: $zipHash"
 
-      - name: Verify live install update rollback and desktop entries
-        if: env.FLASH_BUILD_KIND == 'main_release' || env.FLASH_BUILD_KIND == 'sp1_release'
-        shell: pwsh
-        run: |
-          $installRoot = Join-Path $env:RUNNER_TEMP 'flash-live-install'
-          $desktopRoot = Join-Path $env:RUNNER_TEMP 'flash-live-desktop'
-          Remove-Item -LiteralPath $installRoot -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item -LiteralPath $desktopRoot -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $desktopRoot | Out-Null
-
-          & 'release/輔系統/安裝輔.ps1' `
-            -SourceDirectory (Resolve-Path 'release').Path `
-            -InstallDirectory $installRoot `
-            -DesktopDirectory $desktopRoot
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Live release installer verification failed.'
-          }
-
-          $shortcutNames = @(
-            Get-ChildItem -LiteralPath $desktopRoot -Filter '*.lnk' |
-              Sort-Object Name |
-              ForEach-Object Name
-          )
-          if (
-            $shortcutNames.Count -ne 2 -or
-            $shortcutNames -notcontains '輔.lnk' -or
-            $shortcutNames -notcontains '更新輔.lnk'
-          ) {
-            throw "Desktop shortcuts are invalid: $($shortcutNames -join ', ')"
-          }
-
-          $shell = New-Object -ComObject WScript.Shell
-          try {
-            $mainShortcut = $shell.CreateShortcut((Join-Path $desktopRoot '輔.lnk'))
-            $updateShortcut = $shell.CreateShortcut((Join-Path $desktopRoot '更新輔.lnk'))
-            if ($mainShortcut.TargetPath -ne (Join-Path $installRoot 'FLASH.exe')) {
-              throw 'The 輔 desktop shortcut target is invalid.'
-            }
-            if ($updateShortcut.TargetPath -ne (Join-Path $installRoot '更新輔.cmd')) {
-              throw 'The 更新輔 desktop shortcut target is invalid.'
-            }
-          }
-          finally {
-            if ($mainShortcut) {
-              [Runtime.InteropServices.Marshal]::FinalReleaseComObject($mainShortcut) | Out-Null
-            }
-            if ($updateShortcut) {
-              [Runtime.InteropServices.Marshal]::FinalReleaseComObject($updateShortcut) | Out-Null
-            }
-            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null
-          }
-
-          $beforeHash = (Get-FileHash -LiteralPath (Join-Path $installRoot 'FLASH.exe') -Algorithm SHA256).Hash
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File 'release/輔系統/輔更新核心.ps1' `
-            -InstallDirectory $installRoot `
-            -ReleaseSourceDirectory (Resolve-Path 'release').Path `
-            -ResolvedReleaseCommit $env:GITHUB_SHA `
-            -TestFailAfterReplacement 1
-          if ($LASTEXITCODE -eq 0) {
-            throw 'The rollback verification did not trigger the requested failure.'
-          }
-          $afterRollbackHash = (Get-FileHash -LiteralPath (Join-Path $installRoot 'FLASH.exe') -Algorithm SHA256).Hash
-          if ($afterRollbackHash -ne $beforeHash) {
-            throw 'The updater rollback did not restore the installed executable.'
-          }
-          $updateLog = Get-Content -LiteralPath (Join-Path $installRoot '更新紀錄.txt') -Raw
-          if ($updateLog -notmatch '回復完成；正式安裝內容已還原') {
-            throw 'The updater rollback log is incomplete.'
-          }
-
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File 'release/輔系統/輔更新核心.ps1' `
-            -InstallDirectory $installRoot `
-            -ReleaseSourceDirectory (Resolve-Path 'release').Path `
-            -ResolvedReleaseCommit $env:GITHUB_SHA
-          if ($LASTEXITCODE -ne 0) {
-            throw 'The installed release could not complete a verified update.'
-          }
-
-      - name: Upload Windows release bundle
+      - name: Upload Windows validation bundle
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.FLASH_ARTIFACT_NAME }}
@@ -627,7 +365,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Verify release bundle identity
+      - name: Verify validation bundle identity
         shell: pwsh
         run: |
           $verifier = (Resolve-Path 'release/輔系統/verify_windows_release.ps1').Path

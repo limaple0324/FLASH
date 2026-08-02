@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-WORKFLOW_PATH = Path(".github/workflows/build-windows.yml")
+WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "build-windows.yml"
 
 
 def _workflow() -> str:
@@ -14,7 +14,7 @@ def _step(workflow: str, name: str, next_name: str) -> str:
     )[0]
 
 
-def test_sp3_branch_builds_the_complete_cumulative_snapshot():
+def test_sp3_branch_uses_the_complete_validation_identity():
     workflow = _workflow()
     metadata_step = _step(
         workflow,
@@ -23,61 +23,31 @@ def test_sp3_branch_builds_the_complete_cumulative_snapshot():
     )
 
     assert "      - sp3/completion-2026-07-26" in workflow
-    assert "$sp3DeliveryBranch = 'sp3/completion-2026-07-26'" in metadata_step
-    assert "$buildKind = 'sp3_snapshot'" in metadata_step
-    assert "$publishTarget = 'none'" in metadata_step
-    assert "$artifactPrefix = 'FLASH-SP1+SP2+SP3-Windows'" in metadata_step
-    assert "$metadata.milestone -ne 'SP3'" in metadata_step
+    assert "from core.release_identity import classify_build" in metadata_step
+    assert "'SP3' { 'FLASH-SP1+SP2+SP3-Windows' }" in metadata_step
+    assert "$artifactKind -ne 'validation'" in metadata_step
+    assert "$publishTarget -ne 'none'" in metadata_step
+    assert "main_release" not in workflow
+    assert "release/latest" not in workflow
 
 
-def test_sp3_snapshot_preserves_every_independent_delivery():
+def test_validation_builds_never_create_formal_install_or_update_payloads():
     workflow = _workflow()
-    create_bundle = _step(
-        workflow,
-        "Create release bundle",
-        "Verify release bundle layout",
-    )
     verify_layout = _step(
         workflow,
-        "Verify release bundle layout",
-        "Verify release bundle metadata and hash",
+        "Verify validation bundle layout",
+        "Verify validation bundle metadata and hash",
     )
 
-    assert "SP1+SP2+SP3完整累積快照說明.txt" in create_bundle
-    assert "SP1、SP2 與 SP3 各自的交付檔案仍保留" in create_bundle
-    assert "deliverables/sp3" in create_bundle
-    assert "不會追蹤任何正式發布頻道" in create_bundle
-    assert (
-        "$manifestPaths += 'SP1+SP2+SP3完整累積快照說明.txt'"
-        in create_bundle
-    )
-    assert "A snapshot must not contain a live updater" in verify_layout
-    assert "SP1+SP2+SP3 cumulative snapshot notice is missing." in verify_layout
+    assert "release/安裝輔.cmd" in verify_layout
+    assert "release/更新輔.cmd" in verify_layout
+    assert "release/輔系統/安裝輔.ps1" in verify_layout
+    assert "release/輔系統/輔更新核心.ps1" in verify_layout
+    assert "release/輔系統/UPDATE_CHANNEL.txt" in verify_layout
+    assert "A validation bundle must not contain a formal delivery file" in verify_layout
 
 
-def test_main_release_is_the_complete_cumulative_identity():
-    workflow = _workflow()
-    metadata_step = _step(
-        workflow,
-        "Read delivery metadata",
-        "Build windowed executable",
-    )
-
-    assert "$buildKind = 'main_release'" in metadata_step
-    assert "$metadata.milestone -ne 'SP3'" in metadata_step
-    assert (
-        "$buildKind -in @('main_release', 'sp3_snapshot')"
-        in metadata_step
-    )
-    assert (
-        "$buildKind -eq 'validation_build' -and "
-        "$metadata.milestone -eq 'SP3'"
-    ) in metadata_step
-    assert "$artifactPrefix = 'FLASH-SP1+SP2+SP3-Windows'" in metadata_step
-    assert "$publishTarget = 'release/latest'" in metadata_step
-
-
-def test_complete_release_gate_verifies_zip_install_update_and_rollback():
+def test_validation_build_verifies_and_uploads_a_windows_zip_without_publication():
     workflow = _workflow()
 
     assert "- name: Create and verify Windows ZIP" in workflow
@@ -87,10 +57,6 @@ def test_complete_release_gate_verifies_zip_install_update_and_rollback():
     assert "Expand-Archive -LiteralPath $zipPath" in workflow
     assert "$zipVerified = $?" in workflow
     assert "if (-not $zipVerified)" in workflow
-    assert "- name: Verify live install update rollback and desktop entries" in workflow
-    assert "$shortcutNames -notcontains '輔.lnk'" in workflow
-    assert "$shortcutNames -notcontains '更新輔.lnk'" in workflow
-    assert "-TestFailAfterReplacement 1" in workflow
-    assert "回復完成；正式安裝內容已還原" in workflow
-    assert '"$zipPath.sha256.txt"' in workflow
+    assert "- name: Upload Windows validation bundle" in workflow
     assert "dist/*.zip*" in workflow
+    assert "Verify live install update rollback" not in workflow

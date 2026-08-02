@@ -88,43 +88,16 @@ def test_hash_verification_does_not_require_powershell_module_autoload():
         assert "$sha256.ComputeHash($stream)" in script
 
 
-def test_only_main_push_can_publish_over_the_live_release():
-    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
-
-    publish_step = workflow.split("- name: Publish latest desktop updater files", 1)[1]
-    publish_step = publish_step.split("- name: Upload Windows release bundle", 1)[0]
-    condition = next(
-        line.strip()
-        for line in publish_step.splitlines()
-        if line.strip().startswith("if:")
-    )
-
-    assert condition == (
-        "if: github.event_name == 'push' && github.ref == 'refs/heads/main'"
-    )
-    assert "git add -A" in publish_step
-
-
-def test_windows_workflow_keeps_manual_artifact_build():
+def test_windows_build_workflow_is_validation_only_and_never_publishes():
     workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
 
     assert "workflow_dispatch:" in workflow
-    assert "publish_sp1:" in workflow
-    assert "- name: Upload Windows release bundle" in workflow
-
-
-def test_sp1_only_publication_has_a_separate_branch_and_verified_push_gate():
-    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
-    publish_step = workflow.split("- name: Publish SP1-only desktop updater files", 1)[1]
-
-    condition = next(
-        line.strip()
-        for line in publish_step.splitlines()
-        if line.strip().startswith("if:")
-    )
-    assert condition == (
-        "if: github.ref == 'refs/heads/sp1/completion-2026-07-25' && "
-        "(github.event_name == 'push' || "
-        "(github.event_name == 'workflow_dispatch' && inputs.publish_sp1))"
-    )
-    assert "git push origin release/sp1 --force" in publish_step
+    assert "contents: read" in workflow
+    assert "persist-credentials: false" in workflow
+    assert "The Windows build workflow must produce a validation-only artifact." in workflow
+    assert "- name: Upload Windows validation bundle" in workflow
+    assert "git push" not in workflow
+    assert "release/latest" not in workflow
+    assert "release/sp1" not in workflow
+    assert "main_release" not in workflow
+    assert "sp1_release" not in workflow

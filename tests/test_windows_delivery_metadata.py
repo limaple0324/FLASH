@@ -30,13 +30,17 @@ def test_windows_build_info_keeps_product_and_technical_names_separate():
     assert '"milestone=$env:FLASH_MILESTONE"' in workflow
 
 
-def test_snapshot_and_live_release_channels_remain_separate():
+def test_validation_build_has_no_formal_release_channel():
     workflow = _workflow()
 
-    assert "$publishTarget = 'release/latest'" in workflow
-    assert "$publishTarget = 'release/sp1'" in workflow
-    assert "$publishTarget = 'none'" in workflow
-    assert "本快照不包含「更新輔」" in workflow
+    assert "$publishTarget -ne 'none'" in workflow
+    assert "$artifactKind -ne 'validation'" in workflow
+    assert "$approvalStatus -ne 'not_approved'" in workflow
+    assert "$approvalMethod -ne 'none'" in workflow
+    assert "驗證建置說明.txt" in workflow
+    assert "正式發布只能使用指定成功驗證成品，且不得重新建置。" in workflow
+    assert "release/latest" not in workflow
+    assert "release/sp1" not in workflow
 
 
 def test_workflow_uses_the_coordinated_build_output():
