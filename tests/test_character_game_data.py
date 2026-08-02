@@ -42,7 +42,10 @@ def test_character_game_data_round_trip_and_player_summary(tmp_path) -> None:
                 "已開啟至第 4 頁｜尚餘 7 個未點亮節點｜"
                 "最後更新 2026-07-27 12:30"
             ),
-            life_soul="已讀取 1／2 隻培養寵物",
+            life_soul=(
+                "已讀取 1／2 隻培養寵物\n"
+                "刷刷刷刷｜勇氣｜等級 3｜攻擊 +5｜最後更新 2026-07-27 12:35"
+            ),
             artifact="尚未安全讀取",
         )
     )
