@@ -1337,6 +1337,7 @@ class HomeView:
         self._auto_click_toggle_button: Button | None = None
         self._group_entries_frame: Frame | None = None
         self._group_setting_message_label: Label | None = None
+        self._role_id_messages: dict[str, str] = {}
         self._group_master_lock_button: Button | None = None
         self._group_add_button: Button | None = None
         self._group_clear_button: Button | None = None
@@ -1653,9 +1654,12 @@ class HomeView:
                 target_title = title_label
                 if original_manager == "pack":
                     title_label.pack_forget()
-                    title_height = max(1, int(title_label.winfo_reqheight()))
-                    title_pady = max(0, (control_height - title_height + 1) // 2)
-                    header = Frame(widgets.frame, bg=SURFACE)
+                    header = Frame(
+                        widgets.frame,
+                        bg=SURFACE,
+                        height=control_height,
+                    )
+                    header.pack_propagate(False)
                     body_children = widgets.frame.pack_slaves()
                     if body_children:
                         header.pack(fill=X, before=body_children[0])
@@ -1675,7 +1679,6 @@ class HomeView:
                         fill=X,
                         expand=True,
                         padx=(0, control_height + 24),
-                        pady=title_pady,
                     )
                 else:
                     # Some cards use grid-managed children directly in the
@@ -3460,7 +3463,6 @@ class HomeView:
 
     def _build_home_page(self, parent) -> Frame:
         page = Frame(parent, bg=BACKGROUND)
-        self._page_heading(page, "今天要做什麼", "只顯示現在需要注意的內容")
 
         card_stack = Frame(page, bg=BACKGROUND)
         card_stack.pack(fill=X)
@@ -10067,6 +10069,16 @@ class HomeView:
                 main_button.pack(side=RIGHT, padx=(0, 6))
                 if locked or self._group_reorder_mode:
                     main_button.configure(state=DISABLED)
+            role_id_message = self._role_id_messages.get(entry.entry_id, "")
+            if role_id_message:
+                Label(
+                    row,
+                    text=role_id_message,
+                    font=("Microsoft JhengHei UI", 9),
+                    bg=BACKGROUND,
+                    fg=SUCCESS if role_id_message.startswith("已") else WARNING,
+                    anchor="w",
+                ).pack(fill=X, pady=(6, 0))
             if self._group_reorder_mode:
                 Label(
                     row,
@@ -10471,7 +10483,7 @@ class HomeView:
         except Exception as error:
             self._report_refresh_error(error)
             return
-        self._show_group_setting_message(result)
+        self._show_role_id_message(entry_id, result)
         self.refresh_group_entries()
 
     def _read_group_role_id(self, entry_id: str) -> None:
@@ -10488,8 +10500,15 @@ class HomeView:
         except Exception as error:
             self._report_refresh_error(error)
             return
-        self._show_group_setting_message(result)
+        self._show_role_id_message(entry_id, result)
         self.refresh_group_entries()
+
+    def _show_role_id_message(self, entry_id: str, value: object) -> None:
+        message = value.strip() if isinstance(value, str) else ""
+        if message:
+            self._role_id_messages[entry_id] = message
+        else:
+            self._role_id_messages.pop(entry_id, None)
 
     def _set_group_main(self, entry_id: str) -> None:
         if (

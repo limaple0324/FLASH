@@ -392,6 +392,29 @@ def _normalize_window_fingerprint(value: object) -> str | None:
     return normalize_launch_fingerprint(value)
 
 
+def _sync_scope_has_all_safe_windows(
+    expected_fingerprints: tuple[str, ...],
+    windows: tuple[WindowInfo, ...],
+) -> bool:
+    """Require one safe, unique window for every selected sync role."""
+    expected = frozenset(expected_fingerprints)
+    actual = tuple(
+        fingerprint
+        for window in windows
+        if (
+            fingerprint := normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+        ) is not None
+    )
+    return (
+        bool(expected)
+        and len(expected) == len(expected_fingerprints)
+        and len(actual) == len(expected)
+        and frozenset(actual) == expected
+    )
+
+
 def build_services(
     root: Path | None = None,
     card_preview_catalog: CardPreviewCatalog | None = None,
@@ -3788,6 +3811,36 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
             return False
+        scope = (
+            sync_scope_service.scope(choice.name)
+            if sync_scope_service is not None
+            else None
+        )
+        safe_windows = (
+            target_window_contract_service.windows(choice.name)
+            if target_window_contract_service is not None
+            else ()
+        )
+        if (
+            scope is None
+            or not scope.ready
+            or not _sync_scope_has_all_safe_windows(
+                scope.fingerprints,
+                safe_windows,
+            )
+        ):
+            sync_session_state["enabled"] = False
+            clear_group_identity()
+            messagebox.showerror(
+                "輔｜同步輸入",
+                (
+                    "同步組別尚未完整開啟，沒有啟用。\n"
+                    f"目前安全視窗：{len(safe_windows)}／"
+                    f"{len(scope.fingerprints) if scope is not None else 0}"
+                ),
+                parent=window,
+            )
+            return False
         keyboard_started = start_service(keyboard_sync_monitor)
         mouse_started = start_service(mouse_sync_monitor)
         if not keyboard_started.success or not mouse_started.success:
@@ -3799,7 +3852,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if logger is not None:
             logger.info(
                 "Keyboard synchronization enabled; "
-                f"group={choice.name}; expected={choice.character_count}"
+                f"group={choice.name}; expected={len(scope.fingerprints)}"
             )
         mark_tray_operations_running()
         return True

@@ -148,6 +148,14 @@ def test_home_has_real_product_pages_and_group_selection() -> None:
     assert '("groups", "組別與視窗")' not in source
     assert '"組別與遊戲視窗"' not in source
     assert "on_group_change" in source
+
+
+def test_home_removes_redundant_heading_and_reserves_card_controls() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+
+    assert 'self._page_heading(page, "今天要做什麼"' not in source
+    assert "height=control_height" in source
+    assert "header.pack_propagate(False)" in source
     assert "character_choices" in source
     assert "_build_group_summary(sidebar)" not in source
     assert "_build_header(root)" not in source
@@ -430,6 +438,26 @@ def test_role_row_expand_change_is_saved_before_refresh() -> None:
     view._toggle_group_role_details("role-a", True)
 
     assert calls == [("role-a", True), "refresh"]
+
+
+def test_role_id_actions_report_next_to_the_pressed_role_before_refresh() -> None:
+    view = object.__new__(HomeView)
+    view.current_group_name = "group-a"
+    view._role_id_messages = {}
+    view.on_calibrate_role_id = (
+        lambda group_name, entry_id, role_id: (
+            f"已校正：{group_name}／{entry_id}／{role_id}"
+        )
+    )
+    refreshes: list[bool] = []
+    view.refresh_group_entries = lambda: refreshes.append(True)
+
+    view._calibrate_group_role_id("role-a", _EntryStub("角色甲"))
+
+    assert view._role_id_messages == {
+        "role-a": "已校正：group-a／role-a／角色甲"
+    }
+    assert refreshes == [True]
 
 
 def test_background_controls_and_cached_canvas_rendering_are_wired() -> None:

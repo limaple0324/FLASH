@@ -21,6 +21,7 @@ from main import (
     TIMED_CLICK_SETTINGS_KEY,
     UI_THEME_CLASSIC_GOLD_MIGRATION_KEY,
     UI_THEME_KEY,
+    _sync_scope_has_all_safe_windows,
     build_services,
     stop_input_sync_pair,
 )
@@ -33,6 +34,29 @@ from services.smart_reconnect_capture_settings_service import (
 )
 from services.group_role_status_service import GroupRoleStatusService
 from services.game_operation_gate import GameOperationGate
+
+
+class _SyncWindow:
+    def __init__(self, fingerprint: str) -> None:
+        self.launch_fingerprint = fingerprint
+
+
+def test_sync_scope_requires_every_safe_window_with_matching_identity():
+    first = "a" * 64
+    second = "b" * 64
+
+    assert _sync_scope_has_all_safe_windows(
+        (first, second),
+        (_SyncWindow(first), _SyncWindow(second)),
+    )
+    assert not _sync_scope_has_all_safe_windows(
+        (first, second),
+        (_SyncWindow(first),),
+    )
+    assert not _sync_scope_has_all_safe_windows(
+        (first, second),
+        (_SyncWindow(first), _SyncWindow(first)),
+    )
 
 
 def test_build_services_registers_input_controller_and_safe_default(tmp_path):
