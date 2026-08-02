@@ -53,12 +53,28 @@
     "draft_pull_request": 33,
     "cloud_run": 30730218987
   },
-  "verification_pending": [
-    "本批雲端檢查、程式審查與測試驗證尚未完成，不得標記 VERIFIED。"
-  ],
-  "status": "READY",
+  "fixed_evidence": {
+    "initial_batch_commit": "57722ab277c4ee390b516221a2a029cbdb531c6e",
+    "draft_pull_request": {
+      "number": 34,
+      "draft": true,
+      "merged_to_main": false,
+      "target_branch": "automation/fu-req-20260802-012-invalid-task-cleanup"
+    },
+    "cloud_source_status_check": "passed",
+    "automated_window_check": {
+      "status": "not_applicable",
+      "reason": "第 34 號目標分支為 automation/fu-req-20260802-012-invalid-task-cleanup，而既有流程僅限 main。"
+    },
+    "requirements_audit": "passed",
+    "code_review": "passed",
+    "test_validation": "passed",
+    "main_merged": false,
+    "formal_release": false
+  },
+  "status": "VERIFIED",
   "next_role": "INTEGRATION",
   "execution_mode": "CODEX_APP",
   "paid_api": "FORBIDDEN",
-  "github_gate": "REQUIRED"
+  "github_gate": "PASSED"
 }
