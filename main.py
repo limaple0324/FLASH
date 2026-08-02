@@ -265,6 +265,7 @@ SMART_RECONNECT_INTERVAL_MIGRATION_KEY = (
     "disconnect_detect_interval_default_v2"
 )
 UI_THEME_KEY = "ui_theme"
+SHOW_HINTS_KEY = "show_hints"
 UI_THEME_CLASSIC_GOLD_MIGRATION_KEY = "ui_theme_classic_gold_migration_v1"
 CURRENT_GROUP_NAME_KEY = "current_group_name"
 REGISTRY_FILENAME = "window_registry.json"
@@ -435,6 +436,7 @@ def build_services(
             ),
             SMART_RECONNECT_INTERVAL_MIGRATION_KEY: True,
             UI_THEME_KEY: "classic_gold",
+            SHOW_HINTS_KEY: False,
             SYNC_SELECTED_KEYS_KEY: ["ESC"],
             SYNC_KEYS_COLLAPSED_KEY: True,
             GROUP_ROLE_DETAILS_EXPANDED_KEY: {},
@@ -1878,6 +1880,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         and config.get(UI_THEME_KEY) in UI_THEME_LABELS
         else "classic_gold"
     )
+    configured_show_hints = (
+        bool(config.get(SHOW_HINTS_KEY, False))
+        if config is not None
+        else False
+    )
     known_sync_keys = {
         shortcut.key for shortcut in CONFIRMED_GAME_SHORTCUTS
     }
@@ -1986,6 +1993,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if config is None or theme_name not in UI_THEME_LABELS:
             return False
         config.set(UI_THEME_KEY, theme_name)
+        return True
+
+    def change_show_hints(show: bool) -> bool:
+        if config is None:
+            return False
+        config.set(SHOW_HINTS_KEY, bool(show))
         return True
 
     def choose_background_source():
@@ -4293,6 +4306,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_clear_habit_preferences=clear_habit_preferences,
         theme_name=configured_theme,
         on_theme_change=change_ui_theme,
+        show_hints=configured_show_hints,
+        on_show_hints_change=change_show_hints,
         feature_card_preference_provider=(
             feature_card_layout_service.preference
             if feature_card_layout_service is not None
@@ -4682,6 +4697,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     closing = False
 
+    def hide_window_to_tray() -> bool:
+        if tray_controller is not None and tray_controller.running:
+            tray_controller.hide()
+            return True
+        try:
+            window.iconify()
+        except TclError:
+            return False
+        return True
+
     def close_window() -> bool:
         nonlocal closing
         if closing:
@@ -4758,7 +4783,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         window.destroy()
         return True
 
-    window.protocol("WM_DELETE_WINDOW", close_window)
     tray_group_state = (
         workspace_service.snapshot()
         if workspace_service is not None
@@ -4784,6 +4808,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         logger.error(
             "System tray icon was not started; the main window remains usable."
         )
+    window.protocol("WM_DELETE_WINDOW", hide_window_to_tray)
     window._card_overlay_runtime = overlay_runtime
     window._card_expiry_monitor = expiry_monitor
     window._activity_reminder_monitor = activity_reminder_monitor

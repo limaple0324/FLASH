@@ -22,6 +22,9 @@ def test_main_window_uses_home_view():
     assert "tray_controller.stop(" in source
     assert "on_stop_all=stop_all_automation_from_tray" in source
     assert "on_exit=close_window" in source
+    assert "def hide_window_to_tray()" in source
+    assert 'window.protocol("WM_DELETE_WINDOW", hide_window_to_tray)' in source
+    assert 'window.protocol("WM_DELETE_WINDOW", close_window)' not in source
     assert "stop_complete_background_services" in source
     assert "沒有假裝已退出" in source
     assert "include_source=True" in source

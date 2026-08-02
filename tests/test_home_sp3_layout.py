@@ -113,6 +113,32 @@ def test_home_uses_the_same_smart_reconnect_interval_default() -> None:
     assert parameter.default == DEFAULT_SMART_RECONNECT_INTERVAL_MS
 
 
+def test_hints_are_opt_in_and_have_a_persistent_toggle() -> None:
+    parameter = inspect.signature(HomeView.__init__).parameters["show_hints"]
+    assert parameter.default is False
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+    assert "def _hint_label(" in source
+    assert "self._apply_hints_visibility()" in source
+    assert 'text="顯示提示說明"' in source
+    assert "on_show_hints_change" in source
+
+
+def test_show_hints_toggle_preserves_functional_state() -> None:
+    view = object.__new__(HomeView)
+    view._show_hints_variable = _IntStub(1)
+    view.show_hints = False
+    view.on_show_hints_change = lambda value: value
+    applied: list[bool] = []
+    view._apply_hints_visibility = lambda: applied.append(True)
+    view._sync_page_scroll_region = lambda: applied.append(True)
+
+    view._toggle_show_hints()
+
+    assert view.show_hints is True
+    assert view._show_hints_variable.get() == 1
+    assert applied == [True, True]
+
+
 def test_home_has_real_product_pages_and_group_selection() -> None:
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
