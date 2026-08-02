@@ -40,9 +40,26 @@
   ],
   "full_regression": false,
   "windows_build": false,
-  "status": "READY",
+  "verification_semantics": "VERIFIED 僅表示需求稽核、雲端檢查、程式審查與測試驗證均通過且證據已固定；不表示合併 main 或正式發布。",
+  "fixed_evidence": {
+    "final_commit": "3ce7393637b27c3aea91000fd5f8756d12780234",
+    "draft_pull_request": {
+      "number": 33,
+      "draft": true,
+      "merged_to_main": false
+    },
+    "cloud_run": {
+      "id": 30730218987,
+      "conclusion": "success"
+    },
+    "requirements_audit": "passed",
+    "code_review": "passed",
+    "test_validation": "passed",
+    "formal_release": false
+  },
+  "status": "VERIFIED",
   "next_role": "INTEGRATION",
   "execution_mode": "CODEX_APP",
   "paid_api": "FORBIDDEN",
-  "github_gate": "REQUIRED"
+  "github_gate": "PASSED"
 }

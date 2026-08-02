@@ -46,6 +46,16 @@
   ],
   "full_regression": false,
   "windows_build": false,
+  "verification_semantics": "VERIFIED 僅表示需求稽核、雲端檢查、程式審查與測試驗證均通過且證據已固定；不表示合併 main 或正式發布。",
+  "verified_source_batch": {
+    "batch_id": "FU-20260802-002",
+    "final_commit": "3ce7393637b27c3aea91000fd5f8756d12780234",
+    "draft_pull_request": 33,
+    "cloud_run": 30730218987
+  },
+  "verification_pending": [
+    "本批雲端檢查、程式審查與測試驗證尚未完成，不得標記 VERIFIED。"
+  ],
   "status": "READY",
   "next_role": "INTEGRATION",
   "execution_mode": "CODEX_APP",
