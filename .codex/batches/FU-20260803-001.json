@@ -58,6 +58,43 @@
   "施工分支": "automation/fu-20260802-010-reconnect-role-data",
   "原始固定提交": "e714eaad3ebb79a7aa5e41e664191bbac942a1cc",
   "第零階段保全提交": "a6939904916e6504ab86fdc53ef0388748c1fa5e",
+  "索爾架構審查前置": {
+    "來源": "索爾對保全提交 a6939904916e6504ab86fdc53ef0388748c1fa5e 的架構審查",
+    "適用需求": [
+      "FU-REQ-20260802-004",
+      "FU-REQ-20260802-006",
+      "FU-REQ-20260802-007",
+      "FU-REQ-20260803-002"
+    ],
+    "狀態": "待第003號只讀核對後施工",
+    "檔案所有權": [
+      "domain/character_game_data.py",
+      "services/character_game_data_capture_service.py",
+      "services/character_game_data_update_service.py",
+      "services/character_game_data_view_service.py",
+      "tests/test_character_game_data.py",
+      "tests/test_character_game_data_capture_service.py",
+      "tests/test_character_game_data_update_service.py"
+    ],
+    "最小測試": [
+      "tests/test_character_game_data.py",
+      "tests/test_character_game_data_capture_service.py",
+      "tests/test_character_game_data_update_service.py"
+    ],
+    "禁止範圍": [
+      "修改保全提交",
+      "從畫面、捷徑名稱、檔名、臨時標題或視窗順序猜測角色身分",
+      "清除未讀頁資料",
+      "遊戲輸入或自動切換頁面"
+    ],
+    "驗收": [
+      "黑曜石以第一至第十頁集合部分合併，未讀頁不清除",
+      "內容簽章鍵含可靠邏輯頁身分；命魂另含可靠寵物身分",
+      "跨程式重啟以保存內容判定不變；僅讀取時間變化不寫入也不提醒",
+      "角色歸屬只由已登錄視窗與匿名啟動指紋可靠綁定提供，頁面辨識器不產出角色識別碼",
+      "讀取、合併、寫入經單一序列化入口保護，並有直接測試"
+    ]
+  },
   "全域禁止範圍": [
     "FU-REQ-20260802-002",
     "FU-REQ-20260802-009",
@@ -103,24 +140,42 @@
     {
       "編號": "FU-REQ-20260802-011",
       "項目": "第九號合併請求七個未結束審查問題",
-      "狀態": "待只讀核對",
+      "狀態": "待索爾結束雲端討論",
       "來源合併請求": 9,
+      "來源固定提交": "60f3d06efc62a65c6cf558c7cec2ed4e0339b60b",
+      "候選修正提交": [
+        "ccd3ee02c50be94865b1990f41f9faa7ed5898ac",
+        "175700e007a7a27bb13c5035e8c632c5b4773d04",
+        "c747b74c71397539901904750a3bdda1989d0ce1",
+        "c1de4dd38c9ee69f45662cd0ab42694f78127c83"
+      ],
       "檔案所有權": [
         "services/target_window_contract_service.py",
         "adapters/windows_smart_reconnect.py",
         "main.py",
         "ui/home.py",
         "tests/test_windows_smart_reconnect.py",
+        "tests/test_api_contract_hardening.py",
+        "tests/test_main_input_sync.py",
+        "tests/test_home_sp3_layout.py",
         "tests/test_main_target_window_event_flow.py",
         "tests/test_target_window_status_presentation.py"
       ],
       "禁止範圍": ["上述以外產品檔案", "雲端", "桌面", "正式發布"],
       "最小測試": [
-        "tests/test_windows_smart_reconnect.py",
-        "tests/test_main_target_window_event_flow.py",
-        "tests/test_target_window_status_presentation.py"
+        "tests/test_api_contract_hardening.py::test_reconnect_targets_reject_incomplete_instance_before_capture",
+        "tests/test_windows_smart_reconnect.py::test_selected_group_missing_identity_prevents_false_connected_result",
+        "tests/test_windows_smart_reconnect.py::test_scoped_source_subset_without_failure_revokes_missing_evidence",
+        "tests/test_windows_smart_reconnect.py::test_source_subset_final_publish_removes_late_connected_evidence",
+        "tests/test_windows_smart_reconnect.py::test_observation_rejects_connected_state_after_source_generation_change",
+        "tests/test_windows_smart_reconnect.py::test_pending_reopen_keeps_incomplete_appeared_instance",
+        "tests/test_windows_smart_reconnect.py::test_pending_reopen_requires_unique_complete_instance_to_clear",
+        "tests/test_windows_smart_reconnect.py::test_pending_reopen_requires_non_duplicate_complete_instance_to_clear",
+        "tests/test_home_sp3_layout.py::test_successful_group_change_shows_warning_message",
+        "tests/test_main_input_sync.py::test_failed_group_change_clears_unbound_identity_before_reopening_gate"
       ],
-      "驗收": ["七個問題逐項有本機程式或測試證據", "未改動允許範圍外檔案"]
+      "本機驗證": "四個修正提交新增的十項精確測試全數通過。",
+      "驗收": ["七個問題逐項有本機程式或測試證據", "候選修正提交均為目前提交祖先", "未改動允許範圍外檔案"]
     },
     {
       "編號": "FU-REQ-20260803-004",
@@ -148,7 +203,7 @@
       "項目": "共用唯讀且不干擾玩家的畫面辨識",
       "狀態": "待前置關卡",
       "檔案所有權": [],
-      "解鎖條件": "只讀核對可靠畫面辨識與資料保存接點後填入。",
+      "解鎖條件": "第003號只讀核對完成，並先完成索爾架構審查前置後，才可填入。",
       "禁止範圍": ["遊戲輸入", "未可靠辨識", "清除未讀資料"],
       "最小測試": [],
       "驗收": ["只更新可靠且實際開啟頁面", "未讀資料不清除"]
@@ -168,7 +223,7 @@
       "項目": "四頁寵物天賦與黑曜石",
       "狀態": "待前置關卡",
       "檔案所有權": [],
-      "解鎖條件": "以第零階段保全提交和可靠頁面辨識證據核對後填入。",
+      "解鎖條件": "先完成索爾架構審查前置，再以可靠頁面辨識證據核對後填入。",
       "禁止範圍": ["屬性名稱讀取", "依顏色猜測", "遊戲操作"],
       "最小測試": [],
       "驗收": ["保存頁面、階段、格位與最後讀取時間", "不猜測"]
@@ -178,7 +233,7 @@
       "項目": "命魂部分更新與魂器最新頁面",
       "狀態": "待前置關卡",
       "檔案所有權": [],
-      "解鎖條件": "以第零階段保全提交和可靠頁面辨識證據核對後填入。",
+      "解鎖條件": "先完成索爾架構審查前置，再以可靠頁面辨識證據核對後填入。",
       "禁止範圍": ["跨角色歷史", "符文圖示辨識"],
       "最小測試": [],
       "驗收": ["命魂不清除另一頁", "魂器只保存實際開啟頁面最新資料"]
@@ -188,7 +243,7 @@
       "項目": "黑曜石與命魂背景低負擔讀取與提醒",
       "狀態": "待前置關卡",
       "檔案所有權": [],
-      "解鎖條件": "先完成共用唯讀辨識與兩項資料頁可靠讀取。",
+      "解鎖條件": "先完成索爾架構審查前置、共用唯讀辨識與兩項資料頁可靠讀取。",
       "禁止範圍": ["自動切換", "自動點亮", "黑曜石提醒"],
       "最小測試": [],
       "驗收": ["只有內容變化才更新", "命魂可靠變更才提醒"]
