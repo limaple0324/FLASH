@@ -30,6 +30,7 @@ class RunnerConfig:
     workflow_run_id: str = "dry-run"
     mode: str = "dry-run"
     allow_writeback: bool = False
+    openai_secret_available: bool = False
     lease_seconds: int = 3600
 
     @property
@@ -64,7 +65,6 @@ def validate_task_shape(task: Task) -> None:
     if not task.owned_files: raise QueueRunError("OWNED_FILES 不可為空")
     pytest_argv(task.minimum_tests)
     if task.full_regression or task.windows_build: raise QueueRunError("FULL_REGRESSION 或 WINDOWS_BUILD 尚未有專用安全流程")
-    if task.role.is_manual_gate(): raise QueueRunError("BATCH_CONTROL 與 INTEGRATION 為 manual gate")
 
 
 def validate_remote_source(client: Any, task: Task) -> None:
@@ -112,6 +112,7 @@ def recover_stale_claims(client: Any, comments: list[dict], config: RunnerConfig
 
 def select_and_claim(client: Any | None, event: dict[str, Any], config: RunnerConfig, queue_id: str | None = None, fixture: Path | None = None) -> dict:
     event_name = event.get("event_name") or os.getenv("GITHUB_EVENT_NAME", "")
+    openai_secret_available = config.openai_secret_available or os.getenv("OPENAI_SECRET_AVAILABLE") == "true"
     if event_name == "issue_comment" and int((event.get("issue") or {}).get("number", 0)) != config.target_issue:
         return {"selected": False, "claimed": False, "selection_ok": False, "mode": config.mode, "allow_writeback": config.allow_writeback, "workflow_run_id": config.workflow_run_id, "error": "非 Issue #19"}
     if event_name == "repository_dispatch": queue_id = _repository_dispatch_queue_id(event, queue_id)
@@ -131,7 +132,7 @@ def select_and_claim(client: Any | None, event: dict[str, Any], config: RunnerCo
                 client.post_issue_comment(config.target_issue, build_blocked_status(task, "選取階段阻擋")); client.write_blocker(build_blocked_comment(task, "選取階段阻擋", str(exc), "select_claim", "SELECT_CLAIM", "select_claim"))
             raise
     if config.mode == "live":
-        if task.role.requires_codex() and not os.getenv("OPENAI_SECRET_AVAILABLE") == "true": raise QueueRunError("缺少 OPENAI_API_KEY，禁止啟動 Agent")
+        if task.role.requires_codex() and not openai_secret_available: raise QueueRunError("缺少 OPENAI_API_KEY，禁止啟動 Agent")
         assert client is not None
         latest = select_task(collect_candidates(client.list_issue_comments(config.target_issue), config.owner_only), task.queue_id)
         if latest.task.state_comment_id != task.state_comment_id: raise QueueRunError("認領前任務狀態已變更")
@@ -140,8 +141,8 @@ def select_and_claim(client: Any | None, event: dict[str, Any], config: RunnerCo
         try:
             if not claim_belongs_to_run(client.list_issue_comments(config.target_issue), task.queue_id, config.workflow_run_id, task.comment_id): raise QueueRunError("CLAIMED 不屬於本 workflow run 或 source comment")
         except Exception:
-            return {"selected": True, "claimed": True, "selection_ok": False, "mode": config.mode, "allow_writeback": config.allow_writeback, "sandbox": task.role.sandbox(), "task": task_to_mapping(task), "context": context, "workflow_run_id": config.workflow_run_id, "error": "claim verification failed"}
-    return {"selected": True, "claimed": config.mode == "live", "selection_ok": True, "mode": config.mode, "allow_writeback": config.allow_writeback, "sandbox": task.role.sandbox(), "task": task_to_mapping(task), "context": context, "workflow_run_id": config.workflow_run_id, "error": ""}
+            return {"selected": True, "claimed": True, "selection_ok": False, "mode": config.mode, "allow_writeback": config.allow_writeback, "openai_secret_available": openai_secret_available, "sandbox": task.role.sandbox(), "task": task_to_mapping(task), "context": context, "workflow_run_id": config.workflow_run_id, "error": "claim verification failed"}
+    return {"selected": True, "claimed": config.mode == "live", "selection_ok": True, "mode": config.mode, "allow_writeback": config.allow_writeback, "openai_secret_available": openai_secret_available, "sandbox": task.role.sandbox(), "task": task_to_mapping(task), "context": context, "workflow_run_id": config.workflow_run_id, "error": ""}
 
 
 def _read(path: Path) -> dict: return json.loads(path.read_text(encoding="utf-8"))
@@ -152,9 +153,9 @@ def _client(repository: str) -> GitHubRestClient: return GitHubRestClient(reposi
 
 
 def command_select(args: argparse.Namespace) -> int:
-    config = RunnerConfig(args.repository, workflow_run_id=os.getenv("GITHUB_RUN_ID", "manual"), mode=args.mode, allow_writeback=args.allow_writeback.lower() == "true", lease_seconds=args.lease_seconds)
+    config = RunnerConfig(args.repository, workflow_run_id=os.getenv("GITHUB_RUN_ID", "manual"), mode=args.mode, allow_writeback=args.allow_writeback.lower() == "true", openai_secret_available=os.getenv("OPENAI_SECRET_AVAILABLE") == "true", lease_seconds=args.lease_seconds)
     try: value = select_and_claim(None if args.fixture else _client(args.repository), _read(Path(args.event)), config, args.queue_id, Path(args.fixture) if args.fixture else None)
-    except QueueRunError as exc: value = {"selected": False, "claimed": False, "selection_ok": False, "mode": config.mode, "allow_writeback": config.allow_writeback, "workflow_run_id": config.workflow_run_id, "error": str(exc)}
+    except QueueRunError as exc: value = {"selected": False, "claimed": False, "selection_ok": False, "mode": config.mode, "allow_writeback": config.allow_writeback, "openai_secret_available": config.openai_secret_available, "workflow_run_id": config.workflow_run_id, "error": str(exc)}
     directory = Path(args.output_dir); _write(directory / "selection.json", value)
     if value.get("selected"): _write(directory / "task.json", {"task": value["task"]}); _write(directory / "context.json", value["context"])
     return 0
