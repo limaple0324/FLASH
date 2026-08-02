@@ -1,0 +1,4 @@
+release_branch=release/latest
+source_branch=main
+build_kind=main_release
+publish_target=release/latest

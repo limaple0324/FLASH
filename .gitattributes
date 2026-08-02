@@ -1,2 +1,5 @@
+* -text
 *.cmd -text
 *.bat -text
+*.ps1 -text
+*.txt -text
