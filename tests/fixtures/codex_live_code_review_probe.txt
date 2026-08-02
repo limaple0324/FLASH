@@ -1,0 +1,11 @@
+Codex Queue Runner controlled live CODE_REVIEW probe.
+
+Purpose:
+- Exercise one real read-only CODE_REVIEW role through the merged queue runner.
+- Verify API key availability, structured output validation, and trusted writeback.
+
+Restrictions:
+- Do not modify product code.
+- Do not modify main or release branches.
+- Do not publish or enable the automatic queue.
+- Stop after this single controlled test.
