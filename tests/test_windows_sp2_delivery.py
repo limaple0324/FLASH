@@ -44,7 +44,6 @@ def test_sp2_validation_bundle_is_separate_from_all_formal_delivery_files():
         "Verify validation bundle metadata and hash",
     )
 
-    assert "不得以此成品更新既有安裝、建立發布頻道或取代正式成品。" in create_bundle
-    assert "'驗證建置說明.txt'" in create_bundle
+    assert "驗證建置說明.txt" not in create_bundle
     assert "A validation bundle must not contain a formal delivery file" in verify_layout
     assert "release/輔系統/UPDATE_CHANNEL.txt" in verify_layout

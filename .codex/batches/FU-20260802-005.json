@@ -26,11 +26,16 @@
     "direct_test": {
       "selector": "python -m pytest -q tests/test_self_check_contract.py tests/test_windows_command_files.py tests/test_windows_delivery_metadata.py tests/test_windows_installer.py tests/test_windows_sp1_delivery.py tests/test_windows_sp2_delivery.py tests/test_windows_sp3_delivery.py",
       "result": "26 passed",
-      "exit_code": 0
+      "exit_code": 0,
+      "duration_seconds": 6.63,
+      "after_latest_remediation": true
     },
     "cloud_execution": {
       "previous_run": 30732999807,
       "previous_result": "FAILED",
+      "latest_failed_run": 30733775339,
+      "latest_failure": "既有驗證腳本拒絕 SHA256SUMS.txt 中未列入固定雜湊契約的驗證建置說明檔。",
+      "remediation": "驗證成品只保留既有驗證腳本允許並雜湊的固定檔案；正式檔案隔離仍由建置身分守門與禁止清單驗證。",
       "final_run": "PENDING_PUSH_TRIGGER"
     },
     "delivery_state": {
