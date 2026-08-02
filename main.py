@@ -1472,6 +1472,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     group_role_status_service = AppContext.get(GroupRoleStatusService)
     operation_record_store = AppContext.get(SyncOperationRecordStore)
+    ungrouped_window_service = AppContext.get(UngroupedWindowService)
     sync_session_state = {"enabled": False}
     deferred_sync_monitor = AppContext.get(DeferredSyncOperationMonitor)
     character_view_service = AppContext.get(CharacterViewService)

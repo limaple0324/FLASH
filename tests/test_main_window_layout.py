@@ -57,6 +57,51 @@ def test_main_window_uses_home_view():
     assert "on_group_role_details_expanded_change=(" in source
 
 
+def test_ungrouped_window_provider_is_resolved_before_home_view_is_created():
+    source = Path("main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    create_main_window = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "create_main_window"
+    )
+    assignment = next(
+        node
+        for node in create_main_window.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "ungrouped_window_service"
+    )
+    assert isinstance(assignment.value, ast.Call)
+    assert isinstance(assignment.value.func, ast.Attribute)
+    assert isinstance(assignment.value.func.value, ast.Name)
+    assert assignment.value.func.value.id == "AppContext"
+    assert assignment.value.func.attr == "get"
+    assert len(assignment.value.args) == 1
+    assert isinstance(assignment.value.args[0], ast.Name)
+    assert assignment.value.args[0].id == "UngroupedWindowService"
+
+    home_view = next(
+        node
+        for node in ast.walk(create_main_window)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "HomeView"
+    )
+    provider = next(
+        keyword.value
+        for keyword in home_view.keywords
+        if keyword.arg == "ungrouped_windows_provider"
+    )
+    assert isinstance(provider, ast.Attribute)
+    assert isinstance(provider.value, ast.Name)
+    assert provider.value.id == "ungrouped_window_service"
+    assert provider.attr == "snapshot"
+    assert assignment.lineno < home_view.lineno
+
+
 def test_main_window_start_message_is_player_facing():
     source = Path("main.py").read_text(encoding="utf-8")
 
