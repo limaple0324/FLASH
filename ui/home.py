@@ -1145,6 +1145,16 @@ class HomeView:
             raise TypeError(
                 "character_choices must contain PlayerCharacterDetailChoice values."
             )
+        self._selected_character_detail: PlayerCharacterDetail | None = None
+        self._on_save_selected_character_note: (
+            Callable[[str], PlayerCharacterDetail] | None
+        ) = None
+        self._on_clear_selected_character_note: (
+            Callable[[], PlayerCharacterDetail] | None
+        ) = None
+        self._on_selected_character_detail_error: (
+            Callable[[Exception], object] | None
+        ) = None
         self.smart_reconnect_enabled = bool(smart_reconnect_enabled)
         self.on_smart_reconnect_change = on_smart_reconnect_change
         self.smart_reconnect_interval_ms = (
@@ -5820,7 +5830,217 @@ class HomeView:
             ).pack(side=LEFT, fill=X, expand=True)
             if select is not None:
                 self._button(row, "查看", select).pack(side=RIGHT)
+        self._build_selected_character_detail(card)
         return page
+
+    def _build_selected_character_detail(self, parent) -> None:
+        detail = self._selected_character_detail
+        if detail is None:
+            return
+        detail_card = Frame(
+            parent,
+            bg=SURFACE,
+            padx=18,
+            pady=12,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
+        detail_card.pack(fill=X, padx=0, pady=(12, 0))
+        Label(
+            detail_card,
+            text=f"{detail.display_name}｜詳細資料",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+
+        profile = Frame(detail_card, bg=SURFACE)
+        profile.pack(fill=X, pady=(8, 0))
+        for title, value in (
+            ("組別", detail.group),
+            ("等級", detail.level),
+            ("分類", detail.importance),
+            ("定位", detail.role),
+        ):
+            self._character_detail_row(profile, title, value)
+
+        game_data = detail.game_data
+        game_data_card = Frame(
+            detail_card,
+            bg=SURFACE,
+            padx=14,
+            pady=10,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
+        game_data_card.pack(fill=X, pady=(12, 0))
+        Label(
+            game_data_card,
+            text="遊戲資料",
+            font=("Microsoft JhengHei UI", 11, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        for title, value in (
+            ("寵物天賦", game_data.pet_talent if game_data is not None else None),
+            ("黑曜石", game_data.obsidian if game_data is not None else None),
+            ("命魂", game_data.life_soul if game_data is not None else None),
+            ("魂器", game_data.artifact if game_data is not None else None),
+        ):
+            self._character_detail_row(game_data_card, title, value, wraplength=520)
+
+        note_card = Frame(
+            detail_card,
+            bg=SURFACE,
+            padx=14,
+            pady=10,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
+        note_card.pack(fill=X, pady=(12, 0))
+        Label(
+            note_card,
+            text="備註",
+            font=("Microsoft JhengHei UI", 11, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        note_entry = Entry(
+            note_card,
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+        )
+        if detail.note:
+            note_entry.insert(0, detail.note)
+        note_entry.pack(fill=X, pady=(8, 10), ipady=7)
+        actions = Frame(note_card, bg=SURFACE)
+        actions.pack(fill=X)
+        self._button(
+            actions,
+            "儲存備註",
+            lambda: self._save_selected_character_note(note_entry.get()),
+            primary=True,
+        ).pack(side=LEFT)
+        self._button(
+            actions,
+            "清除",
+            self._clear_selected_character_note,
+        ).pack(side=LEFT, padx=(8, 0))
+
+    def _character_detail_row(
+        self,
+        parent,
+        title: str,
+        value: object,
+        *,
+        wraplength: int | None = None,
+    ) -> None:
+        row = Frame(parent, bg=SURFACE)
+        row.pack(fill=X, pady=3)
+        Label(
+            row,
+            text=title,
+            width=8,
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        ).pack(side=LEFT)
+        value_options = {
+            "text": self._character_detail_value(value),
+            "font": ("Microsoft JhengHei UI", 10),
+            "bg": SURFACE,
+            "fg": TEXT,
+            "anchor": "w",
+            "justify": LEFT,
+        }
+        if wraplength is not None:
+            value_options["wraplength"] = wraplength
+        Label(row, **value_options).pack(side=LEFT, fill=X, expand=True)
+
+    @staticmethod
+    def _character_detail_value(value: object) -> str:
+        if value is None:
+            return "尚未設定"
+        if isinstance(value, str):
+            return value.strip() or "尚未設定"
+        return str(value)
+
+    def show_character_detail(
+        self,
+        detail: PlayerCharacterDetail,
+        *,
+        on_save_note: Callable[[str], PlayerCharacterDetail],
+        on_clear_note: Callable[[], PlayerCharacterDetail],
+        on_error: Callable[[Exception], object] | None = None,
+    ) -> None:
+        if not isinstance(detail, PlayerCharacterDetail):
+            raise TypeError("detail must be PlayerCharacterDetail.")
+        if not callable(on_save_note) or not callable(on_clear_note):
+            raise TypeError("note callbacks must be callable.")
+        self._selected_character_detail = detail
+        self._on_save_selected_character_note = on_save_note
+        self._on_clear_selected_character_note = on_clear_note
+        self._on_selected_character_detail_error = on_error
+        self._refresh_characters_page()
+        self.show_page("characters")
+
+    def _save_selected_character_note(self, note: str) -> None:
+        cleaned_note = note.strip()
+        if not cleaned_note:
+            self._clear_selected_character_note()
+            return
+        callback = self._on_save_selected_character_note
+        if callback is not None:
+            self._apply_selected_character_note(lambda: callback(cleaned_note))
+
+    def _clear_selected_character_note(self) -> None:
+        callback = self._on_clear_selected_character_note
+        if callback is not None:
+            self._apply_selected_character_note(callback)
+
+    def _apply_selected_character_note(
+        self,
+        operation: Callable[[], PlayerCharacterDetail],
+    ) -> None:
+        try:
+            detail = operation()
+            if not isinstance(detail, PlayerCharacterDetail):
+                raise TypeError("note operation must return PlayerCharacterDetail.")
+        except Exception as error:
+            if self._on_selected_character_detail_error is None:
+                raise
+            self._on_selected_character_detail_error(error)
+            return
+        self._selected_character_detail = detail
+        self._refresh_characters_page()
+
+    def _refresh_characters_page(self) -> None:
+        current = self._pages.get("characters")
+        if current is None:
+            return
+        parent = current.master
+        current.destroy()
+        page = self._build_characters_page(parent)
+        self._pages["characters"] = page
+        background_label = Label(
+            page,
+            bg=BACKGROUND,
+            bd=0,
+            highlightthickness=0,
+            anchor="nw",
+        )
+        background_label.place(x=0, y=0, relwidth=1, relheight=1)
+        background_label.lower()
+        self._background_page_labels["characters"] = background_label
+        if self._active_page == "characters":
+            self.show_page("characters")
 
     def set_character_data(
         self,
@@ -5846,25 +6066,7 @@ class HomeView:
             )
         self.characters = updated_characters
         self.character_choices = updated_choices
-        current = self._pages.get("characters")
-        if current is None:
-            return
-        parent = current.master
-        current.destroy()
-        page = self._build_characters_page(parent)
-        self._pages["characters"] = page
-        background_label = Label(
-            page,
-            bg=BACKGROUND,
-            bd=0,
-            highlightthickness=0,
-            anchor="nw",
-        )
-        background_label.place(x=0, y=0, relwidth=1, relheight=1)
-        background_label.lower()
-        self._background_page_labels["characters"] = background_label
-        if self._active_page == "characters":
-            self.show_page("characters")
+        self._refresh_characters_page()
 
     def _build_settings_page(self, parent) -> Frame:
         page = Frame(parent, bg=BACKGROUND)

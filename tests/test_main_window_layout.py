@@ -13,7 +13,8 @@ def test_main_window_uses_home_view():
     assert "build_windows_card_overlay_selection_coordinator" in source
     assert "CardExpiryMonitor" in source
     assert "on_card_display_seconds_update=update_card_display_seconds" in source
-    assert "CharacterDetailWindow" in source
+    assert "CharacterDetailWindow" not in source
+    assert "home_view.show_character_detail(" in source
     assert "CharacterNoteService" in source
     assert "auto_click_service.configure_direct_left_sync(" in source
     assert "pointer_sync_controller.send_click(" in source

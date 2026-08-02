@@ -242,7 +242,6 @@ from ui.home import (
     UI_THEME_LABELS,
     theme_palette,
 )
-from ui.character_detail_window import CharacterDetailWindow
 from ui.builtin_card_preview_catalog import (
     BUILTIN_CARD_PREVIEW_PROFILE_ID,
     build_builtin_card_preview_catalog,
@@ -3525,15 +3524,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
 
-        detail_window = CharacterDetailWindow(
-            window,
+        if home_view is None:
+            return
+        home_view.show_character_detail(
             detail,
             on_save_note=save_note,
             on_clear_note=clear_note,
             on_error=note_error,
         )
-        child = detail_window.open()
-        apply_window_icon(child)
 
     def refresh_character_data(group_name: str | None) -> None:
         if (

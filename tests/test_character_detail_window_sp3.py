@@ -6,22 +6,18 @@ from ui.character_detail_window import _display_value
 from ui.home import _safe_character_detail_line
 
 
-def test_character_detail_uses_note_and_confirmed_game_data_sections() -> None:
-    source = Path("ui/character_detail_window.py").read_text(encoding="utf-8")
+def test_character_detail_uses_inline_note_and_confirmed_game_data_sections() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
 
+    assert "def show_character_detail(" in source
+    assert "def _build_selected_character_detail(" in source
     assert "備註" in source
     assert "儲存備註" in source
     assert "寵物天賦" in source
     assert "黑曜石" in source
     assert "命魂" in source
     assert "魂器" in source
-    assert "Scrollbar" in source
-    assert 'window.bind("<MouseWheel>"' in source
-    assert "canvas.yview_scroll" in source
-    assert 'BACKGROUND = "#C9A35D"' in source
-    assert 'SURFACE = "#EAD3A0"' in source
-    assert 'PRIMARY = "#8A5A24"' in source
-    assert 'TEXT = "#2B1A0A"' in source
+    assert "_selected_character_detail" in source
 
 
 def test_character_detail_summary_is_player_facing() -> None:
