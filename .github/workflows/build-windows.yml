@@ -672,6 +672,7 @@ jobs:
             Remove-Item -Recurse -Force
 
           Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
+          Copy-Item "$env:GITHUB_WORKSPACE\release\sync_plus_icon.ico" ".\sync_plus_icon.ico"
           Copy-Item "$env:GITHUB_WORKSPACE\release\.gitattributes" ".\.gitattributes"
           Copy-Item "$env:GITHUB_WORKSPACE\release\LATEST.txt" ".\LATEST.txt"
           Copy-Item "$env:GITHUB_WORKSPACE\release\安裝輔.cmd" ".\安裝輔.cmd"

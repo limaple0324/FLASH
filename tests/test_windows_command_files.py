@@ -102,6 +102,10 @@ def test_only_main_push_can_publish_over_the_live_release():
     assert condition == (
         "if: github.event_name == 'push' && github.ref == 'refs/heads/main'"
     )
+    assert (
+        'Copy-Item "$env:GITHUB_WORKSPACE\\release\\sync_plus_icon.ico" '
+        '".\\sync_plus_icon.ico"'
+    ) in publish_step
     assert "git add -A" in publish_step
 
 
