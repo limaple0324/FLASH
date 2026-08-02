@@ -1718,12 +1718,10 @@ class HomeView:
                     ),
                     add="+",
                 )
-                control_top = max(
-                    6,
-                    int(widgets.frame.winfo_pixels(widgets.frame.cget("pady"))),
-                )
-                widgets.settings_button.place_configure(y=control_top)
-                widgets.toggle_button.place_configure(y=control_top)
+                # 格狀卡片會增加內距來保留控制鈕空間；控制鈕本身仍
+                # 固定在卡片頂端，避免跟著內距往下壓住第一列內容。
+                widgets.settings_button.place_configure(y=6)
+                widgets.toggle_button.place_configure(y=6)
             self._load_feature_card_background(card_id)
             self._set_feature_card_collapsed(
                 widgets,
@@ -5809,6 +5807,7 @@ class HomeView:
             padx=18,
             pady=8,
         ).pack(fill=X)
+        self._build_selected_character_detail(card)
         rows: tuple[tuple[str, Callable[[], None] | None], ...]
         if self.character_choices:
             rows = tuple(
@@ -5832,7 +5831,6 @@ class HomeView:
             ).pack(side=LEFT, fill=X, expand=True)
             if select is not None:
                 self._button(row, "查看", select).pack(side=RIGHT)
-        self._build_selected_character_detail(card)
         return page
 
     def _build_selected_character_detail(self, parent) -> None:
@@ -10058,17 +10056,6 @@ class HomeView:
             remove_button.pack(side=RIGHT)
             if locked or self._group_reorder_mode:
                 remove_button.configure(state=DISABLED)
-            if entry.role != "主窗口":
-                main_button = self._button(
-                    top_row,
-                    "設為主窗口",
-                    lambda value=entry.entry_id: self._set_group_main(
-                        value
-                    ),
-                )
-                main_button.pack(side=RIGHT, padx=(0, 6))
-                if locked or self._group_reorder_mode:
-                    main_button.configure(state=DISABLED)
             role_id_message = self._role_id_messages.get(entry.entry_id, "")
             if role_id_message:
                 Label(
@@ -10079,6 +10066,19 @@ class HomeView:
                     fg=SUCCESS if role_id_message.startswith("已") else WARNING,
                     anchor="w",
                 ).pack(fill=X, pady=(6, 0))
+            if entry.role != "主窗口":
+                main_action_row = Frame(row, bg=BACKGROUND)
+                main_action_row.pack(fill=X, pady=(6, 0))
+                main_button = self._button(
+                    main_action_row,
+                    "設為主窗口",
+                    lambda value=entry.entry_id: self._set_group_main(
+                        value
+                    ),
+                )
+                main_button.pack(side=RIGHT)
+                if locked or self._group_reorder_mode:
+                    main_button.configure(state=DISABLED)
             if self._group_reorder_mode:
                 Label(
                     row,

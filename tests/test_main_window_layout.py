@@ -15,6 +15,7 @@ def test_main_window_uses_home_view():
     assert "on_card_display_seconds_update=update_card_display_seconds" in source
     assert "CharacterDetailWindow" not in source
     assert "home_view.show_character_detail(" in source
+    assert "entry_id=entry_id" in source
     assert "CharacterNoteService" in source
     assert "auto_click_service.configure_direct_left_sync(" in source
     assert "pointer_sync_controller.send_click(" in source

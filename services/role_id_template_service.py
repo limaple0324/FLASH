@@ -14,7 +14,7 @@ from adapters.windows_sync_calibration import Win32SyncCalibrationBackend
 
 
 ROLE_ID_REGION = (87, 13, 177, 37)
-MIN_FEATURE_PIXELS = 6
+MIN_FEATURE_PIXELS = 100
 MAX_MATCH_SCORE = 0.08
 
 
@@ -22,7 +22,7 @@ def clean_role_id_text(value: object) -> str:
     if not isinstance(value, str):
         return ""
     cleaned = re.sub(r"\s+", "", value)
-    cleaned = re.sub(r"^[0-9Il|]+", "", cleaned)
+    cleaned = re.sub(r"^[0-9Il]*[|]+", "", cleaned)
     cleaned = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]", "", cleaned)
     return cleaned[:24]
 
@@ -118,8 +118,11 @@ class RoleIdTemplateService:
         self,
         window_handle: int,
         role_id: object,
+        *,
+        entry_id: object = "",
     ) -> RoleIdReadResult:
         normalized = clean_role_id_text(role_id)
+        bound_entry_id = str(entry_id).strip()
         if not normalized:
             return RoleIdReadResult(False, message="角色ID不可空白。")
         captured = self._signature(window_handle)
@@ -134,7 +137,11 @@ class RoleIdTemplateService:
         templates = [
             item
             for item in self._load()
-            if str(item.get("role_id", "")) != normalized
+            if (
+                str(item.get("entry_id", "")) != bound_entry_id
+                if bound_entry_id
+                else str(item.get("role_id", "")) != normalized
+            )
         ]
         templates.append(
             {
@@ -144,6 +151,7 @@ class RoleIdTemplateService:
                 "signature": signature,
                 "count": count,
                 "region": list(ROLE_ID_REGION),
+                "entry_id": bound_entry_id,
             }
         )
         self._save(templates)
@@ -154,7 +162,13 @@ class RoleIdTemplateService:
             score=0.0,
         )
 
-    def read(self, window_handle: int) -> RoleIdReadResult:
+    def read(
+        self,
+        window_handle: int,
+        *,
+        entry_id: object = "",
+    ) -> RoleIdReadResult:
+        bound_entry_id = str(entry_id).strip()
         captured = self._signature(window_handle)
         if captured is None:
             return RoleIdReadResult(False, message="無法讀取角色ID區域。")
@@ -167,6 +181,10 @@ class RoleIdTemplateService:
         best_role = ""
         best_score = 1.0
         for item in self._load():
+            if bound_entry_id and (
+                str(item.get("entry_id", "")) != bound_entry_id
+            ):
+                continue
             template_signature = str(item.get("signature", ""))
             if (
                 not template_signature

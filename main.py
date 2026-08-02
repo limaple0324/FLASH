@@ -3353,6 +3353,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         result = role_id_template_service.calibrate(
             window_info.handle,
             calibrated_role_id,
+            entry_id=entry_id,
         )
         if result.success:
             group_configuration_service.set_role_id(
@@ -3372,7 +3373,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         window_info = unique_window_for_group_entry(group_name, entry_id)
         if window_info is None:
             return "無法唯一確認角色窗口，未讀取角色ID。"
-        result = role_id_template_service.read(window_info.handle)
+        result = role_id_template_service.read(
+            window_info.handle,
+            entry_id=entry_id,
+        )
         if result.success:
             group_configuration_service.set_role_id(
                 group_name,
@@ -3800,7 +3804,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if plan is None:
             messagebox.showerror(
                 "輔｜同步輸入",
-                "目前組別無法完整對應到唯一遊戲視窗；沒有啟用。",
+                "目前組別的捷徑身分尚未完整確認；為避免誤同步，沒有啟用。",
                 parent=window,
             )
             return False

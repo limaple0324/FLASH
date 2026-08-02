@@ -156,6 +156,9 @@ def test_home_removes_redundant_heading_and_reserves_card_controls() -> None:
     assert 'self._page_heading(page, "今天要做什麼"' not in source
     assert "height=control_height" in source
     assert "header.pack_propagate(False)" in source
+    assert "widgets.settings_button.place_configure(y=6)" in source
+    assert "widgets.toggle_button.place_configure(y=6)" in source
+    assert "main_action_row = Frame(row, bg=BACKGROUND)" in source
     assert "character_choices" in source
     assert "_build_group_summary(sidebar)" not in source
     assert "_build_header(root)" not in source

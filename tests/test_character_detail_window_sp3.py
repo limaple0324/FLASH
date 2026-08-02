@@ -18,6 +18,9 @@ def test_character_detail_uses_inline_note_and_confirmed_game_data_sections() ->
     assert "命魂" in source
     assert "魂器" in source
     assert "_selected_character_detail" in source
+    assert source.index("self._build_selected_character_detail(card)") < source.index(
+        "for line, select in rows:"
+    )
 
 
 def test_character_detail_summary_is_player_facing() -> None:
