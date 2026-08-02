@@ -1,5 +1,14 @@
+from config.config_manager import ConfigManager
 from core.sp1_boundaries import ExternalAdapter, OperationResult
-from main import _normalize_window_keywords, detect_target_window, format_window_status
+from main import (
+    TARGET_WINDOW_FINGERPRINT_KEY,
+    TARGET_WINDOW_KEY,
+    _normalize_window_fingerprint,
+    _normalize_window_keywords,
+    build_services,
+    detect_target_window,
+    format_window_status,
+)
 from services.app_context import AppContext
 
 
@@ -22,6 +31,48 @@ def test_normalize_window_keywords_accepts_string_and_list():
     assert _normalize_window_keywords("  game  ") == ["game"]
     assert _normalize_window_keywords([" game ", "", 123, "server"]) == ["game", "server"]
     assert _normalize_window_keywords({"game": True}) == []
+
+
+def test_normalize_window_fingerprint_accepts_only_complete_sha256():
+    assert _normalize_window_fingerprint("  " + "A" * 64 + "  ") == "a" * 64
+    assert _normalize_window_fingerprint("a" * 63) is None
+    assert _normalize_window_fingerprint("g" * 64) is None
+    assert _normalize_window_fingerprint(123) is None
+
+
+def test_build_services_connects_persisted_fingerprint_to_window_adapter(tmp_path):
+    fingerprint = "6" * 64
+    config = ConfigManager(tmp_path / "config" / "settings.json")
+    config.update_values(
+        {
+            TARGET_WINDOW_KEY: ["Adobe Flash Player"],
+            TARGET_WINDOW_FINGERPRINT_KEY: fingerprint.upper(),
+        }
+    )
+
+    build_services(root=tmp_path)
+
+    adapter = AppContext.get(ExternalAdapter)
+    assert adapter is not None
+    assert adapter._launch_fingerprint == fingerprint
+    assert adapter._fingerprint_configured is True
+
+
+def test_build_services_keeps_invalid_persisted_fingerprint_fail_closed(tmp_path):
+    config = ConfigManager(tmp_path / "config" / "settings.json")
+    config.update_values(
+        {
+            TARGET_WINDOW_KEY: ["Adobe Flash Player"],
+            TARGET_WINDOW_FINGERPRINT_KEY: "invalid",
+        }
+    )
+
+    build_services(root=tmp_path)
+
+    adapter = AppContext.get(ExternalAdapter)
+    result = adapter.health_check()
+    assert result.success is False
+    assert result.code == "window.identity_invalid"
 
 
 def test_unconfigured_window_detection_remains_unsafe():
@@ -54,7 +105,7 @@ def test_ready_window_is_reported_but_input_is_not_enabled():
     assert status["safe"] is True
     assert status["code"] == "window.ready"
     assert status["details"]["handle"] == 100
-    assert "仍未啟用輸入" in text
+    assert "同步輸入仍需玩家手動執行" in text
 
 
 def test_ambiguous_window_keeps_operation_disabled():

@@ -1,5 +1,9 @@
 # FLASH Architecture
 
+> 本文件保留 SP1 工程基準。SP2／SP3／SP3.5 的現行整合邊界以
+> [`docs/INTEGRATION_ARCHITECTURE_BASELINE.md`](docs/INTEGRATION_ARCHITECTURE_BASELINE.md)
+> 為準。
+
 ## SP1 Bootstrap v0.1
 
 SP1 establishes the minimum stable engineering foundation for FLASH.

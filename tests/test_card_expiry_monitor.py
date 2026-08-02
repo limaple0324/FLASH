@@ -1,0 +1,172 @@
+from datetime import datetime, timedelta, timezone
+
+from cards.models import GroupCard
+from cards.priority import CardPriorityReason
+from cards.service import CardService
+from cards.settings import CardDisplaySettings
+from domain.activity import ActivityDefinition, ActivityType, ResetRule
+from domain.group import CharacterGroup
+from services.card_expiry_monitor import CARD_EXPIRY_CHECK_MS, CardExpiryMonitor
+
+
+def _card() -> GroupCard:
+    return GroupCard(
+        card_id="guard",
+        group=CharacterGroup(group_id="14-windows", name="14支"),
+        activity=ActivityDefinition(
+            activity_id="guard",
+            name="守紀",
+            activity_type=ActivityType.DAILY,
+            reset_rule=ResetRule.DAILY_MIDNIGHT,
+        ),
+        current_progress="守紀中斷",
+    )
+
+
+class _Schedule:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(self, delay_ms, callback) -> None:
+        self.calls.append((delay_ms, callback))
+
+    def run_next(self) -> None:
+        _delay_ms, callback = self.calls.pop(0)
+        callback()
+
+def test_monitor_removes_card_at_thirty_seconds_and_triggers_change_notice():
+    shown_at = datetime(2026, 7, 14, 13, 0, tzinfo=timezone.utc)
+    cards = CardService()
+    cards.upsert(_card(), shown_at=shown_at)
+    changes = []
+    cards.subscribe(lambda: changes.append(cards.cards))
+    schedule = _Schedule()
+    monitor = CardExpiryMonitor(
+        cards,
+        schedule,
+        now=lambda: shown_at + timedelta(seconds=30),
+    )
+
+    monitor.start()
+    schedule.run_next()
+
+    assert cards.cards == ()
+    assert changes == [()]
+    assert schedule.calls[0][0] == CARD_EXPIRY_CHECK_MS
+
+
+def test_monitor_keeps_card_before_expiry_and_schedules_next_check():
+    shown_at = datetime(2026, 7, 14, 13, 0, tzinfo=timezone.utc)
+    cards = CardService()
+    card = _card()
+    cards.upsert(card, shown_at=shown_at)
+    schedule = _Schedule()
+    monitor = CardExpiryMonitor(
+        cards,
+        schedule,
+        now=lambda: shown_at + timedelta(seconds=29),
+    )
+
+    monitor.start()
+    schedule.run_next()
+
+    assert cards.cards == (card,)
+    assert len(schedule.calls) == 1
+
+
+def test_monitor_uses_configured_card_lifetime():
+    shown_at = datetime(2026, 7, 14, 13, 0, tzinfo=timezone.utc)
+    cards = CardService(CardDisplaySettings(lifetime_seconds=45))
+    card = _card()
+    cards.upsert(card, shown_at=shown_at)
+    schedule = _Schedule()
+    current_time = shown_at + timedelta(seconds=44)
+    monitor = CardExpiryMonitor(
+        cards,
+        schedule,
+        now=lambda: current_time,
+    )
+
+    monitor.start()
+    schedule.run_next()
+    assert cards.cards == (card,)
+
+    current_time = shown_at + timedelta(seconds=45)
+    schedule.run_next()
+    assert cards.cards == ()
+
+
+def test_start_is_idempotent_and_stop_prevents_pending_check():
+    cards = CardService()
+    schedule = _Schedule()
+    monitor = CardExpiryMonitor(cards, schedule)
+
+    monitor.start()
+    monitor.start()
+    monitor.stop()
+    schedule.run_next()
+
+    assert len(schedule.calls) == 0
+    assert monitor.running is False
+
+
+def test_stop_cancels_pending_desktop_callback():
+    cards = CardService()
+    pending = {}
+
+    def schedule(delay_ms, callback):
+        token = object()
+        pending[token] = (delay_ms, callback)
+        return token
+
+    def cancel(token):
+        pending.pop(token)
+
+    monitor = CardExpiryMonitor(cards, schedule, cancel=cancel)
+
+    assert monitor.start() is True
+    assert len(pending) == 1
+    assert monitor.stop() is True
+    assert pending == {}
+
+
+def test_pending_expired_card_is_recorded_without_becoming_visible():
+    shown_at = datetime(2026, 7, 14, 13, 0, tzinfo=timezone.utc)
+    cards = CardService()
+    for card_id in ("one", "two", "three"):
+        base = _card()
+        cards.upsert(
+            GroupCard(
+                card_id=card_id,
+                group=base.group,
+                activity=base.activity,
+                current_progress=card_id,
+                priority_reason=CardPriorityReason.DISCONNECTION,
+            ),
+            shown_at=shown_at,
+            lifetime=timedelta(minutes=5),
+        )
+    pending = _card()
+    cards.upsert(
+        pending,
+        shown_at=shown_at,
+        lifetime=timedelta(seconds=5),
+    )
+    recorded = []
+    schedule = _Schedule()
+    monitor = CardExpiryMonitor(
+        cards,
+        schedule,
+        now=lambda: shown_at + timedelta(seconds=5),
+        on_pending_expired=recorded.append,
+    )
+
+    monitor.start()
+    schedule.run_next()
+
+    assert recorded == [pending]
+    assert tuple(card.card_id for card in cards.cards) == (
+        "one",
+        "two",
+        "three",
+    )

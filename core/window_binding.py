@@ -156,8 +156,16 @@ class CharacterBindingEngine:
         self._registry.confirm_window(
             character_id,
             handle=best.handle,
-            process_id=best.process_id,
-            window_class=best.window_class,
+            process_id=(
+                best.process_id
+                if best.process_id is not None
+                else record.process_id
+            ),
+            window_class=(
+                best.window_class
+                if best.window_class is not None
+                else record.window_class
+            ),
             rect=best.rect,
             health=WindowHealth.WARNING,
         )
@@ -173,4 +181,13 @@ class CharacterBindingEngine:
 
 def candidates_from_windows(windows: Iterable[WindowInfo]) -> tuple[WindowCandidate, ...]:
     """Convert basic window observations for binding-engine use."""
-    return tuple(WindowCandidate(handle=item.handle, rect=item.rect, title=item.title) for item in windows)
+    return tuple(
+        WindowCandidate(
+            handle=item.handle,
+            rect=item.rect,
+            process_id=item.process_id,
+            window_class=item.window_class,
+            title=item.title,
+        )
+        for item in windows
+    )

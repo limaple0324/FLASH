@@ -9,7 +9,10 @@ class LoggerService:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("FLASH")
         self.logger.setLevel(logging.INFO)
-        self.logger.handlers.clear()
+        self.logger.propagate = False
+        for handler in tuple(self.logger.handlers):
+            self.logger.removeHandler(handler)
+            handler.close()
 
         formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
@@ -30,3 +33,12 @@ class LoggerService:
 
     def error(self, message: str) -> None:
         self.logger.error(message)
+
+    def close(self) -> None:
+        """Flush and release every handler owned by the application logger."""
+        for handler in tuple(self.logger.handlers):
+            self.logger.removeHandler(handler)
+            try:
+                handler.flush()
+            finally:
+                handler.close()

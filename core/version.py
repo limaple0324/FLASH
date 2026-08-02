@@ -1,6 +1,7 @@
-"""Single source of truth for FLASH SP1 release identity."""
+"""「輔」累積版的單一產品與版本身分來源。"""
 
-PRODUCT_NAME = "FLASH"
-MILESTONE = "SP1"
-VERSION = "0.1.2"
+from product.identity import PRODUCT_NAME, TECHNICAL_NAME
+
+MILESTONE = "SP3"
+VERSION = "0.3.0"
 DISPLAY_VERSION = f"{MILESTONE} {VERSION}"

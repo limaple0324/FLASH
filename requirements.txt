@@ -1,2 +1,5 @@
 pytest>=8.0.0
 Pillow>=10.0.0
+pillow-heif>=1.5.0
+rawpy>=0.25.0
+tzdata>=2025.2

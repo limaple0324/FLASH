@@ -1,5 +1,6 @@
 import json
 
+from core.version import MILESTONE
 from main import format_self_check, run
 
 
@@ -35,7 +36,7 @@ def test_self_check_only_writes_machine_readable_report(tmp_path):
     assert report_path.exists()
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["sprint"] == "SP1"
+    assert report["sprint"] == MILESTONE
     assert report["self_check_passed"] is True
     assert isinstance(report["self_check"], list)
     assert report["self_check"]

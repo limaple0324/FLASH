@@ -81,5 +81,6 @@ def test_report_is_machine_readable():
     payload = report.to_dict()
 
     assert payload["fully_supported"] is False
-    assert payload["capabilities"]["background_capture"]["state"] == CapabilityState.SUPPORTED
-    assert payload["capabilities"]["background_input"]["state"] == CapabilityState.UNSUPPORTED
+    assert payload["capabilities"]["background_capture"]["state"] == "supported"
+    assert payload["capabilities"]["background_input"]["state"] == "unsupported"
+    assert isinstance(payload["capabilities"]["minimized_input"]["state"], str)

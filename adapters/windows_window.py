@@ -7,10 +7,58 @@ explicit operation areas before future automation is allowed.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Iterable, Protocol
+from dataclasses import dataclass, replace
+from threading import RLock
+from typing import Callable, Iterable, Protocol
 
+from adapters.windows_launch_fingerprint import (
+    LaunchFingerprintResolver,
+    PowerShellLaunchFingerprintResolver,
+    normalize_launch_fingerprint,
+)
 from core.sp1_boundaries import ExternalAdapter, OperationResult
+
+
+def _configure_user32_window_api(user32):
+    """Apply pointer-safe ctypes signatures to the user32 calls used here."""
+    import ctypes
+    from ctypes import wintypes
+
+    enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = (wintypes.HWND,)
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = (
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.EnumWindows.argtypes = (enum_proc_type, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetForegroundWindow.argtypes = ()
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.WindowFromPoint.argtypes = (wintypes.POINT,)
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+    user32.GetAncestor.restype = wintypes.HWND
+
+    return enum_proc_type
+
+
+def _handle_value(handle) -> int:
+    """Normalize an HWND returned by ctypes or a test double without narrowing it."""
+    value = getattr(handle, "value", handle)
+    return int(value) if value else 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +68,11 @@ class WindowInfo:
     visible: bool
     minimized: bool
     rect: tuple[int, int, int, int]
+    process_id: int | None = None
+    window_class: str | None = None
+    launch_fingerprint: str | None = None
+    thread_id: int | None = None
+    process_lifecycle_token: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +104,146 @@ class WindowBackend(Protocol):
 class Win32WindowBackend:
     """ctypes-based backend with no third-party Windows dependency."""
 
+    def __init__(
+        self,
+        fingerprint_resolver: LaunchFingerprintResolver | None = None,
+        *,
+        process_lifecycle_provider: Callable[[int], int | None] | None = None,
+    ):
+        self._fingerprint_resolver = fingerprint_resolver
+        self._process_lifecycle_provider = (
+            process_lifecycle_provider
+            or self._process_lifecycle_token
+        )
+        # A fingerprint (including an unresolved ``None``) is trusted only for
+        # one PID creation-time token. Hot input paths reuse this snapshot and
+        # never launch PowerShell again for the same process lifecycle.
+        self._fingerprint_cache: dict[
+            int,
+            tuple[int | None, str | None],
+        ] = {}
+        self._fingerprint_cache_lock = RLock()
+
+    @staticmethod
+    def _process_lifecycle_token(process_id: int) -> int | None:
+        """Return the process creation FILETIME without reading command lines."""
+        if os.name != "nt" or process_id <= 0:
+            return None
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        )
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            int(process_id),
+        )
+        if not handle:
+            return None
+        try:
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            return (
+                int(created.dwHighDateTime) << 32
+            ) | int(created.dwLowDateTime)
+        except OSError:
+            return None
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def invalidate_identity_cache(self) -> None:
+        """Forget lifecycle snapshots only at an explicit configuration gate."""
+        with self._fingerprint_cache_lock:
+            self._fingerprint_cache.clear()
+
+    def _resolve_cached_fingerprints(
+        self,
+        process_ids: Iterable[int],
+    ) -> dict[int, str]:
+        if self._fingerprint_resolver is None:
+            return {}
+        normalized_ids = tuple(
+            dict.fromkeys(
+                process_id
+                for process_id in process_ids
+                if isinstance(process_id, int)
+                and not isinstance(process_id, bool)
+                and process_id > 0
+            )
+        )
+        with self._fingerprint_cache_lock:
+            unresolved: dict[int, int] = {}
+            for process_id in normalized_ids:
+                cached = self._fingerprint_cache.get(process_id)
+                if cached is not None and cached[0] is None:
+                    # A lifecycle token that could not be proven stays unknown
+                    # until an explicit cache invalidation.
+                    continue
+                try:
+                    lifecycle = self._process_lifecycle_provider(
+                        process_id
+                    )
+                except Exception:
+                    lifecycle = None
+                if lifecycle is None:
+                    self._fingerprint_cache[process_id] = (None, None)
+                    continue
+                if cached is not None and cached[0] == lifecycle:
+                    continue
+                unresolved[process_id] = lifecycle
+
+            if unresolved:
+                try:
+                    resolved = self._fingerprint_resolver.resolve(
+                        unresolved
+                    )
+                except Exception:
+                    resolved = {}
+                for process_id, lifecycle in unresolved.items():
+                    self._fingerprint_cache[process_id] = (
+                        lifecycle,
+                        normalize_launch_fingerprint(
+                            resolved.get(process_id)
+                        ),
+                    )
+
+            return {
+                process_id: fingerprint
+                for process_id in normalized_ids
+                if (
+                    (cached := self._fingerprint_cache.get(process_id))
+                    is not None
+                    and (fingerprint := cached[1]) is not None
+                )
+            }
+
     @staticmethod
     def _user32():
         if os.name != "nt":
@@ -68,7 +261,7 @@ class Win32WindowBackend:
         from ctypes import wintypes
 
         windows: list[WindowInfo] = []
-        enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        enum_proc_type = _configure_user32_window_api(user32)
 
         def callback(hwnd, _lparam):
             if not user32.IsWindowVisible(hwnd):
@@ -88,25 +281,111 @@ class Win32WindowBackend:
             if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 return True
 
+            process_id = None
+            window_thread_id = None
+            try:
+                process_id_value = wintypes.DWORD()
+                thread_id = user32.GetWindowThreadProcessId(
+                    hwnd,
+                    ctypes.byref(process_id_value),
+                )
+                if thread_id and process_id_value.value:
+                    process_id = int(process_id_value.value)
+                    window_thread_id = int(thread_id)
+            except OSError:
+                pass
+
+            window_class = None
+            try:
+                class_buffer = ctypes.create_unicode_buffer(256)
+                class_length = user32.GetClassNameW(
+                    hwnd,
+                    class_buffer,
+                    len(class_buffer),
+                )
+                if class_length > 0:
+                    window_class = class_buffer.value.strip() or None
+            except OSError:
+                pass
+
             windows.append(
                 WindowInfo(
-                    handle=int(hwnd),
+                    handle=_handle_value(hwnd),
                     title=title,
                     visible=True,
                     minimized=bool(user32.IsIconic(hwnd)),
                     rect=(rect.left, rect.top, rect.right, rect.bottom),
+                    process_id=process_id,
+                    window_class=window_class,
+                    thread_id=window_thread_id,
                 )
             )
             return True
 
-        user32.EnumWindows(enum_proc_type(callback), 0)
+        if not user32.EnumWindows(enum_proc_type(callback), 0):
+            return []
+        lifecycle_tokens: dict[int, int] = {}
+        if self._fingerprint_resolver is not None:
+            fingerprints = self._resolve_cached_fingerprints(
+                window.process_id
+                for window in windows
+                if window.process_id is not None
+            )
+            with self._fingerprint_cache_lock:
+                lifecycle_tokens = {
+                    process_id: lifecycle
+                    for process_id in {
+                        window.process_id
+                        for window in windows
+                        if window.process_id is not None
+                    }
+                    if (
+                        (cached := self._fingerprint_cache.get(process_id))
+                        is not None
+                        and (lifecycle := cached[0]) is not None
+                    )
+                }
+            windows = [
+                replace(
+                    window,
+                    launch_fingerprint=fingerprints.get(window.process_id),
+                    process_lifecycle_token=lifecycle_tokens.get(
+                        window.process_id
+                    ),
+                )
+                for window in windows
+            ]
+        else:
+            for process_id in {
+                window.process_id
+                for window in windows
+                if window.process_id is not None
+            }:
+                try:
+                    lifecycle = self._process_lifecycle_provider(
+                        process_id
+                    )
+                except Exception:
+                    lifecycle = None
+                if lifecycle is not None:
+                    lifecycle_tokens[process_id] = lifecycle
+            windows = [
+                replace(
+                    window,
+                    process_lifecycle_token=lifecycle_tokens.get(
+                        window.process_id
+                    ),
+                )
+                for window in windows
+            ]
         return windows
 
     def foreground_handle(self) -> int | None:
         user32 = self._user32()
         if user32 is None:
             return None
-        handle = int(user32.GetForegroundWindow())
+        _configure_user32_window_api(user32)
+        handle = _handle_value(user32.GetForegroundWindow())
         return handle or None
 
     def top_window_at(self, x: int, y: int) -> int | None:
@@ -114,25 +393,42 @@ class Win32WindowBackend:
         if user32 is None:
             return None
 
-        import ctypes
         from ctypes import wintypes
 
+        _configure_user32_window_api(user32)
         point = wintypes.POINT(x, y)
-        handle = int(user32.WindowFromPoint(point))
+        handle = _handle_value(user32.WindowFromPoint(point))
         if not handle:
             return None
 
         ga_root = 2
-        root = int(user32.GetAncestor(ctypes.c_void_p(handle), ga_root))
-        return root or handle
+        root = _handle_value(user32.GetAncestor(wintypes.HWND(handle), ga_root))
+        return root or None
 
 
 class WindowsWindowAdapter(ExternalAdapter):
     """Read-only target-window adapter used before any automation is allowed."""
 
-    def __init__(self, title_keywords: Iterable[str], backend: WindowBackend | None = None):
+    def __init__(
+        self,
+        title_keywords: Iterable[str],
+        backend: WindowBackend | None = None,
+        *,
+        launch_fingerprint: object = None,
+    ):
         self._keywords = tuple(keyword.strip().casefold() for keyword in title_keywords if keyword.strip())
-        self._backend = backend or Win32WindowBackend()
+        self._fingerprint_configured = (
+            launch_fingerprint is not None
+            and not (isinstance(launch_fingerprint, str) and not launch_fingerprint.strip())
+        )
+        self._launch_fingerprint = normalize_launch_fingerprint(launch_fingerprint)
+        self._backend = backend or Win32WindowBackend(
+            fingerprint_resolver=(
+                PowerShellLaunchFingerprintResolver()
+                if self._launch_fingerprint is not None
+                else None
+            )
+        )
         self._last_match: WindowInfo | None = None
 
     @property
@@ -224,20 +520,40 @@ class WindowsWindowAdapter(ExternalAdapter):
         self._last_match = None
         if not self._keywords:
             return OperationResult(False, "window.not_configured", "No target-window title keyword is configured.")
+        if self._fingerprint_configured and self._launch_fingerprint is None:
+            return OperationResult(
+                False,
+                "window.identity_invalid",
+                "The configured anonymous window identity is invalid; input must remain disabled.",
+            )
 
-        matches = [
+        title_matches = [
             window
             for window in self._backend.list_windows()
             if all(keyword in window.title.casefold() for keyword in self._keywords)
         ]
 
-        if not matches:
+        if not title_matches:
             return OperationResult(
                 False,
                 "window.not_found",
                 "No visible window matched the configured title keywords.",
                 {"keywords": self._keywords},
             )
+        matches = title_matches
+        if self._launch_fingerprint is not None:
+            matches = [
+                window
+                for window in title_matches
+                if window.launch_fingerprint == self._launch_fingerprint
+            ]
+            if not matches:
+                return OperationResult(
+                    False,
+                    "window.identity_not_found",
+                    "No title-matched window had the configured anonymous identity; input must remain disabled.",
+                    {"title_match_count": len(title_matches)},
+                )
         if len(matches) > 1:
             return OperationResult(
                 False,
@@ -286,6 +602,11 @@ class WindowsWindowAdapter(ExternalAdapter):
                 "handle": match.handle,
                 "rect": match.rect,
                 "checked_areas": tuple(area.name for area in areas),
+                "identity_method": (
+                    "launch_fingerprint"
+                    if self._launch_fingerprint is not None
+                    else "title_keywords"
+                ),
                 "input_enabled": False,
             },
         )

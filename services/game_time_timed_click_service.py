@@ -1,0 +1,617 @@
+"""Legacy-compatible game clock and one-window timed click coordination."""
+
+from __future__ import annotations
+
+import re
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from typing import Protocol
+
+from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
+from services.game_operation_gate import (
+    GameOperationGate,
+    GameOperationLease,
+)
+
+
+DAY_MS = 86_400_000
+HALF_DAY_MS = DAY_MS // 2
+MIN_TIME_OFFSET_MS = -60_000
+MAX_TIME_OFFSET_MS = 60_000
+MIN_TIMED_CLICK_LEAD_MS = 0
+MAX_TIMED_CLICK_LEAD_MS = 5_000
+MIN_TIMED_CLICK_REPEAT_COUNT = 1
+MAX_TIMED_CLICK_REPEAT_COUNT = 10
+MIN_TIMED_CLICK_INTERVAL_MS = 50
+MAX_TIMED_CLICK_INTERVAL_MS = 3_000
+TIMED_CLICK_POLL_MS = 5
+TIMED_CLICK_TRIGGER_WINDOW_MS = 8
+TIMED_CLICK_PRESS_MS = 35
+
+
+@dataclass(frozen=True, slots=True)
+class TimedClickTarget:
+    fingerprint: str
+    x_ratio: float
+    y_ratio: float
+    display_name: str = ""
+
+    def __post_init__(self) -> None:
+        normalized = normalize_launch_fingerprint(self.fingerprint)
+        if normalized is None:
+            raise ValueError("target fingerprint must be a complete SHA-256 value")
+        if not 0.0 <= self.x_ratio <= 1.0:
+            raise ValueError("target x ratio must be between zero and one")
+        if not 0.0 <= self.y_ratio <= 1.0:
+            raise ValueError("target y ratio must be between zero and one")
+        object.__setattr__(self, "fingerprint", normalized)
+        object.__setattr__(self, "display_name", self.display_name.strip())
+
+
+@dataclass(frozen=True, slots=True)
+class TimedClickPressReceipt:
+    handle: int
+    x_ratio: float
+    y_ratio: float
+
+
+class TimedClickBackend(Protocol):
+    def capture_target(
+        self,
+        allowed_fingerprints: Iterable[str],
+    ) -> TimedClickTarget | None: ...
+
+    def press(
+        self,
+        target: TimedClickTarget,
+        allowed_fingerprints: Iterable[str],
+    ) -> TimedClickPressReceipt | None: ...
+
+    def release(self, receipt: TimedClickPressReceipt) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class GameTimeTimedClickSnapshot:
+    offset_ms: int
+    auto_update: bool
+    current_time_ms: int
+    current_time_text: str
+    target: TimedClickTarget | None
+    enabled: bool
+    target_time_ms: int | None
+    lead_ms: int
+    repeat_count: int
+    repeat_interval_ms: int
+    sent_count: int
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class GameTimeTimedClickResult:
+    success: bool
+    action: str
+    message: str
+    failure_code: str | None = None
+    snapshot: GameTimeTimedClickSnapshot | None = None
+
+
+def clamp_time_offset_ms(value: object) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = 0
+    return max(MIN_TIME_OFFSET_MS, min(MAX_TIME_OFFSET_MS, parsed))
+
+
+def parse_target_time_ms(value: object) -> int | None:
+    if not isinstance(value, str):
+        return None
+    compact = re.fullmatch(r"\s*(\d{3,6}|\d{8,9})\s*", value)
+    if compact:
+        digits = compact.group(1)
+        milli = 0
+        if len(digits) <= 4:
+            hour = int(digits[:-2])
+            minute = int(digits[-2:])
+            second = 0
+        elif len(digits) <= 6:
+            hour = int(digits[:-4])
+            minute = int(digits[-4:-2])
+            second = int(digits[-2:])
+        else:
+            main = digits[:-3]
+            milli = int(digits[-3:])
+            hour = int(main[:-4])
+            minute = int(main[-4:-2])
+            second = int(main[-2:])
+        if hour > 23 or minute > 59 or second > 59:
+            return None
+        return ((hour * 60 + minute) * 60 + second) * 1000 + milli
+
+    matched = re.fullmatch(
+        r"\s*(\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?\s*",
+        value,
+    )
+    if matched is None:
+        return None
+    hour = int(matched.group(1))
+    minute = int(matched.group(2))
+    second = int(matched.group(3) or 0)
+    milli = int((matched.group(4) or "0").ljust(3, "0")[:3])
+    if hour > 23 or minute > 59 or second > 59:
+        return None
+    return ((hour * 60 + minute) * 60 + second) * 1000 + milli
+
+
+def game_time_ms_to_text(value: int) -> str:
+    normalized = int(value) % DAY_MS
+    hour, remaining = divmod(normalized, 3_600_000)
+    minute, remaining = divmod(remaining, 60_000)
+    second, milli = divmod(remaining, 1_000)
+    return f"{hour:02d}:{minute:02d}:{second:02d}.{milli:03d}"
+
+
+class GameTimeTimedClickService:
+    """Keep the old system-clock behavior while failing closed on window identity."""
+
+    def __init__(
+        self,
+        backend: TimedClickBackend,
+        *,
+        schedule: Callable[[int, Callable[[], object]], object],
+        cancel: Callable[[object], object],
+        allowed_fingerprints_provider: Callable[[], Iterable[str]],
+        result_callback: Callable[[GameTimeTimedClickResult], object] | None = None,
+        wall_clock_ns: Callable[[], int] = time.time_ns,
+        localtime: Callable[[float | None], time.struct_time] = time.localtime,
+        operation_gate: GameOperationGate | None = None,
+    ) -> None:
+        self._backend = backend
+        self._schedule = schedule
+        self._cancel = cancel
+        self._allowed_fingerprints_provider = allowed_fingerprints_provider
+        self._result_callback = result_callback
+        self._wall_clock_ns = wall_clock_ns
+        self._localtime = localtime
+        self._operation_gate = operation_gate
+        self._offset_ms = 0
+        self._auto_update = True
+        self._target: TimedClickTarget | None = None
+        self._enabled = False
+        self._target_time_ms: int | None = None
+        self._lead_ms = 120
+        self._repeat_count = 2
+        self._repeat_interval_ms = 250
+        self._sent_count = 0
+        self._status = "定時按下：未啟用"
+        self._poll_handle: object | None = None
+        self._scheduled_handles: list[object] = []
+        self._active_receipts: list[TimedClickPressReceipt] = []
+        self._active_operation_leases: dict[int, GameOperationLease] = {}
+
+    def set_result_callback(
+        self,
+        callback: Callable[[GameTimeTimedClickResult], object] | None,
+    ) -> None:
+        self._result_callback = callback
+
+    def configure_game_time(
+        self,
+        *,
+        offset_ms: object,
+        auto_update: object,
+    ) -> GameTimeTimedClickSnapshot:
+        self._offset_ms = clamp_time_offset_ms(offset_ms)
+        self._auto_update = bool(auto_update)
+        return self.snapshot()
+
+    def current_time_ms(self) -> int:
+        now_ns = int(self._wall_clock_ns())
+        now_seconds = now_ns // 1_000_000_000
+        local = self._localtime(float(now_seconds))
+        total_ms = (
+            ((local.tm_hour * 60 + local.tm_min) * 60 + local.tm_sec) * 1000
+            + (now_ns // 1_000_000) % 1000
+        )
+        return (total_ms + self._offset_ms) % DAY_MS
+
+    def current_time_text(self) -> str:
+        return game_time_ms_to_text(self.current_time_ms())
+
+    def snapshot(self) -> GameTimeTimedClickSnapshot:
+        current = self.current_time_ms()
+        return GameTimeTimedClickSnapshot(
+            offset_ms=self._offset_ms,
+            auto_update=self._auto_update,
+            current_time_ms=current,
+            current_time_text=game_time_ms_to_text(current),
+            target=self._target,
+            enabled=self._enabled,
+            target_time_ms=self._target_time_ms,
+            lead_ms=self._lead_ms,
+            repeat_count=self._repeat_count,
+            repeat_interval_ms=self._repeat_interval_ms,
+            sent_count=self._sent_count,
+            status=self._status,
+        )
+
+    def _result(
+        self,
+        success: bool,
+        action: str,
+        message: str,
+        failure_code: str | None = None,
+        *,
+        notify: bool = True,
+    ) -> GameTimeTimedClickResult:
+        result = GameTimeTimedClickResult(
+            success,
+            action,
+            message,
+            failure_code,
+            self.snapshot(),
+        )
+        if notify and self._result_callback is not None:
+            self._result_callback(result)
+        return result
+
+    def _allowed_fingerprints(self) -> tuple[str, ...]:
+        normalized = tuple(
+            fingerprint
+            for value in self._allowed_fingerprints_provider()
+            if (fingerprint := normalize_launch_fingerprint(value)) is not None
+        )
+        if not normalized or len(normalized) != len(set(normalized)):
+            return ()
+        return normalized
+
+    def capture_target(self) -> GameTimeTimedClickResult:
+        allowed = self._allowed_fingerprints()
+        if not allowed:
+            return self._result(
+                False,
+                "capture",
+                "目前組別無法唯一確認，按鈕位置保持不變。",
+                "group_identity_unavailable",
+            )
+        try:
+            target = self._backend.capture_target(allowed)
+        except OSError:
+            target = None
+        if target is None:
+            return self._result(
+                False,
+                "capture",
+                "沒有抓到目前組別內的唯一遊戲視窗，請再試一次。",
+                "target_capture_failed",
+            )
+        self.cancel(notify=False)
+        self._target = target
+        name = target.display_name or "遊戲視窗"
+        return self._result(
+            True,
+            "capture",
+            f"按鈕位置已設定：{name}。",
+        )
+
+    def clear_target(self, *, notify: bool = True) -> GameTimeTimedClickResult:
+        self.cancel(notify=False)
+        self._target = None
+        return self._result(
+            True,
+            "clear_target",
+            "按鈕位置已清除。",
+            notify=notify,
+        )
+
+    @staticmethod
+    def _bounded_integer(
+        value: object,
+        *,
+        minimum: int,
+        maximum: int,
+    ) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if minimum <= parsed <= maximum else None
+
+    def arm(
+        self,
+        target_time: object,
+        *,
+        lead_ms: object = 120,
+        repeat_count: object = 2,
+        repeat_interval_ms: object = 250,
+    ) -> GameTimeTimedClickResult:
+        target_ms = parse_target_time_ms(target_time)
+        lead = self._bounded_integer(
+            lead_ms,
+            minimum=MIN_TIMED_CLICK_LEAD_MS,
+            maximum=MAX_TIMED_CLICK_LEAD_MS,
+        )
+        repeats = self._bounded_integer(
+            repeat_count,
+            minimum=MIN_TIMED_CLICK_REPEAT_COUNT,
+            maximum=MAX_TIMED_CLICK_REPEAT_COUNT,
+        )
+        interval = self._bounded_integer(
+            repeat_interval_ms,
+            minimum=MIN_TIMED_CLICK_INTERVAL_MS,
+            maximum=MAX_TIMED_CLICK_INTERVAL_MS,
+        )
+        if target_ms is None:
+            return self._result(
+                False,
+                "arm",
+                "目標時間格式錯誤；可輸入 21:37、21:37:00.120 或 2137。",
+                "target_time_invalid",
+            )
+        if lead is None:
+            return self._result(
+                False,
+                "arm",
+                "提前毫秒必須介於 0 到 5000。",
+                "lead_ms_invalid",
+            )
+        if repeats is None:
+            return self._result(
+                False,
+                "arm",
+                "連點次數必須介於 1 到 10。",
+                "repeat_count_invalid",
+            )
+        if interval is None:
+            return self._result(
+                False,
+                "arm",
+                "連點間隔必須介於 50 到 3000 毫秒。",
+                "repeat_interval_invalid",
+            )
+        if self._target is None:
+            return self._result(
+                False,
+                "arm",
+                "請先設定要按下的按鈕位置。",
+                "target_unavailable",
+            )
+        allowed = self._allowed_fingerprints()
+        if self._target.fingerprint not in allowed:
+            return self._result(
+                False,
+                "arm",
+                "按鈕位置不屬於目前組別，沒有啟用定時按下。",
+                "target_not_in_current_group",
+            )
+        self.cancel(notify=False)
+        self._target_time_ms = target_ms
+        self._lead_ms = lead
+        self._repeat_count = repeats
+        self._repeat_interval_ms = interval
+        self._sent_count = 0
+        self._enabled = True
+        self._auto_update = True
+        self._status = "定時按下已啟用。"
+        result = self._result(True, "arm", self._status)
+        self._schedule_poll()
+        return result
+
+    def _cancel_handle(self, handle: object | None) -> None:
+        if handle is None:
+            return
+        try:
+            self._cancel(handle)
+        except Exception:
+            pass
+
+    def _schedule_tracked(
+        self,
+        delay_ms: int,
+        callback: Callable[[], object],
+    ) -> object:
+        state: dict[str, object] = {}
+
+        def run() -> object:
+            handle = state.get("handle")
+            if handle in self._scheduled_handles:
+                self._scheduled_handles.remove(handle)
+            return callback()
+
+        handle = self._schedule(delay_ms, run)
+        state["handle"] = handle
+        self._scheduled_handles.append(handle)
+        return handle
+
+    def cancel(
+        self,
+        *,
+        notify: bool = True,
+        message: str = "定時按下：未啟用",
+    ) -> GameTimeTimedClickResult:
+        self._enabled = False
+        self._cancel_handle(self._poll_handle)
+        self._poll_handle = None
+        for handle in tuple(self._scheduled_handles):
+            self._cancel_handle(handle)
+        self._scheduled_handles.clear()
+        for receipt in tuple(self._active_receipts):
+            try:
+                self._backend.release(receipt)
+            except OSError:
+                pass
+            lease = self._active_operation_leases.pop(id(receipt), None)
+            if lease is not None:
+                lease.release()
+        self._active_receipts.clear()
+        self._status = message
+        return self._result(
+            True,
+            "cancel",
+            message,
+            notify=notify,
+        )
+
+    def stop(self) -> None:
+        self.cancel(notify=False)
+        self._target = None
+
+    def _schedule_poll(self) -> None:
+        if not self._enabled or self._poll_handle is not None:
+            return
+        self._poll_handle = self._schedule(
+            TIMED_CLICK_POLL_MS,
+            self.poll,
+        )
+
+    def poll(self) -> GameTimeTimedClickResult:
+        self._poll_handle = None
+        if not self._enabled or self._target_time_ms is None:
+            return self._result(
+                False,
+                "poll",
+                self._status,
+                "timed_click_disabled",
+                notify=False,
+            )
+        now_ms = self.current_time_ms()
+        click_ms = (self._target_time_ms - self._lead_ms) % DAY_MS
+        remaining = (click_ms - now_ms + DAY_MS) % DAY_MS
+        if remaining > HALF_DAY_MS:
+            self._enabled = False
+            self._status = "定時按下：目標已過"
+            return self._result(
+                False,
+                "poll",
+                self._status,
+                "target_time_passed",
+            )
+        if remaining <= TIMED_CLICK_TRIGGER_WINDOW_MS:
+            return self._fire(now_ms)
+        self._status = f"定時按下：剩 {remaining} ms"
+        result = self._result(
+            True,
+            "poll",
+            self._status,
+            notify=remaining <= 1_000,
+        )
+        self._schedule_poll()
+        return result
+
+    def _fire(self, now_ms: int) -> GameTimeTimedClickResult:
+        target = self._target
+        target_ms = self._target_time_ms
+        if target is None or target_ms is None:
+            self._enabled = False
+            self._status = "定時按下失敗：按鈕位置不存在。"
+            return self._result(
+                False,
+                "fire",
+                self._status,
+                "target_unavailable",
+            )
+        allowed = self._allowed_fingerprints()
+        if target.fingerprint not in allowed:
+            self._enabled = False
+            self._status = "定時按下失敗：目標不屬於目前組別。"
+            return self._result(
+                False,
+                "fire",
+                self._status,
+                "target_not_in_current_group",
+            )
+        self._enabled = False
+        self._poll_handle = None
+        for index in range(self._repeat_count):
+            self._schedule_tracked(
+                index * self._repeat_interval_ms,
+                lambda target=target: self._press_once(target),
+            )
+        delta = now_ms - target_ms
+        self._status = (
+            f"定時按下：準備連點 {self._repeat_count} 次；"
+            f"目前差值 {delta} ms。"
+        )
+        return self._result(True, "fire", self._status)
+
+    def _press_once(self, target: TimedClickTarget) -> None:
+        lease = (
+            self._operation_gate.acquire(
+                "timed-click",
+                timeout_seconds=0,
+            )
+            if self._operation_gate is not None
+            else None
+        )
+        if self._operation_gate is not None and lease is None:
+            self._status = "定時按下失敗：目前有其他遊戲操作。"
+            self._result(
+                False,
+                "press",
+                self._status,
+                "operation_gate_closed",
+            )
+            return
+        try:
+            receipt = self._backend.press(
+                target,
+                self._allowed_fingerprints(),
+            )
+        except OSError:
+            receipt = None
+        except Exception:
+            if lease is not None:
+                lease.release()
+            raise
+        if receipt is None:
+            if lease is not None:
+                lease.release()
+            for handle in tuple(self._scheduled_handles):
+                self._cancel_handle(handle)
+            self._scheduled_handles.clear()
+            self._status = "定時按下失敗：目標視窗無法唯一確認。"
+            self._result(
+                False,
+                "press",
+                self._status,
+                "target_delivery_failed",
+            )
+            return
+        self._active_receipts.append(receipt)
+        if lease is not None:
+            self._active_operation_leases[id(receipt)] = lease
+        self._sent_count += 1
+        self._schedule_tracked(
+            TIMED_CLICK_PRESS_MS,
+            lambda receipt=receipt: self._release_once(receipt),
+        )
+        self._status = f"定時按下：已連點 {self._sent_count} 次"
+        self._result(True, "press", self._status)
+
+    def _release_once(self, receipt: TimedClickPressReceipt) -> None:
+        try:
+            released = self._backend.release(receipt)
+        except OSError:
+            released = False
+        finally:
+            lease = self._active_operation_leases.pop(id(receipt), None)
+            if lease is not None:
+                lease.release()
+        if receipt in self._active_receipts:
+            self._active_receipts.remove(receipt)
+        if not released:
+            self._status = "定時按下失敗：滑鼠放開訊息未送達。"
+            self._result(
+                False,
+                "release",
+                self._status,
+                "target_release_failed",
+            )
+        elif (
+            self._sent_count >= self._repeat_count
+            and not self._active_receipts
+            and not self._scheduled_handles
+        ):
+            self._status = f"定時按下：已完成 {self._sent_count} 次"
+            self._result(True, "complete", self._status)
