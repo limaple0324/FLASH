@@ -1345,6 +1345,27 @@ def make_controller(
     )
 
 
+def test_passive_observation_uses_explicit_ungrouped_candidates():
+    grouped = make_window(1, fingerprint="a" * 64)
+    ungrouped = make_window(2, fingerprint="b" * 64)
+    fixture = make_controller(
+        [1],
+        windows=[grouped],
+        expected_windows=1,
+    )
+    fixture.capture.states[ungrouped.handle] = 1
+
+    observed = fixture.controller.observe_screen_states(
+        (ungrouped.launch_fingerprint,),
+        candidate_windows=(ungrouped,),
+    )
+
+    assert observed == {
+        ungrouped.launch_fingerprint: ReconnectScreenState.CONNECTED,
+    }
+    assert fixture.mouse.clicks == []
+
+
 def make_group_plan(tmp_path, windows, group_name="current"):
     return GroupLaunchPlan(
         group_name,

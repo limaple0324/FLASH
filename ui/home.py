@@ -50,6 +50,7 @@ from services.group_configuration_service import (
     GroupSyncMemberChoice,
 )
 from services.group_role_status_service import GroupRoleStatus
+from services.ungrouped_window_service import UngroupedWindow
 from services.feature_hotkey_monitor import (
     FEATURE_HOTKEYS,
     normalize_feature_hotkey,
@@ -711,6 +712,12 @@ class HomeView:
             Callable[[str, bool], object] | None
         ) = None,
         on_add_group_shortcuts: Callable[[str], object] | None = None,
+        ungrouped_windows_provider: (
+            Callable[[], tuple[UngroupedWindow, ...]] | None
+        ) = None,
+        on_add_ungrouped_window_to_group: (
+            Callable[[str, str], object] | None
+        ) = None,
         on_remove_group_shortcut: (
             Callable[[str, str], object] | None
         ) = None,
@@ -1029,6 +1036,12 @@ class HomeView:
             on_group_master_locked_change
         )
         self.on_add_group_shortcuts = on_add_group_shortcuts
+        self.ungrouped_windows_provider = ungrouped_windows_provider
+        self.on_add_ungrouped_window_to_group = (
+            on_add_ungrouped_window_to_group
+        )
+        self._ungrouped_windows_frame = None
+        self._ungrouped_window_group_variables: dict[str, StringVar] = {}
         self.on_remove_group_shortcut = on_remove_group_shortcut
         self.on_set_group_main = on_set_group_main
         self.on_clear_group = on_clear_group
@@ -4215,6 +4228,26 @@ class HomeView:
             anchor="w",
         )
         self.refresh_group_entries()
+
+        ungrouped_card = self._card(
+            page,
+            padx=12,
+            pady=12,
+            card_id="groups.ungrouped_windows",
+            title="未分組視窗",
+        )
+        ungrouped_card.pack(fill=X, pady=(14, 0))
+        Label(
+            ungrouped_card,
+            text="只顯示已開啟且可唯一確認的遊戲捷徑。",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        ).pack(fill=X)
+        self._ungrouped_windows_frame = Frame(ungrouped_card, bg=SURFACE)
+        self._ungrouped_windows_frame.pack(fill=X, pady=(10, 0))
+        self.refresh_ungrouped_windows()
 
         sync_card = self._card(
             page,
@@ -8756,6 +8789,7 @@ class HomeView:
         self.refresh_workspace()
         self.refresh_current_group_summary()
         self.refresh_group_entries()
+        self.refresh_ungrouped_windows()
         self.refresh_group_sync_relations()
         self.refresh_group_role_statuses()
         self.refresh_operation_records()
@@ -9764,6 +9798,156 @@ class HomeView:
                     ),
                 ).pack(side=LEFT, padx=(6, 0))
         return entries
+
+    def refresh_ungrouped_windows(self) -> tuple[UngroupedWindow, ...]:
+        frame = self._ungrouped_windows_frame
+        if frame is None:
+            return ()
+        for child in frame.winfo_children():
+            child.destroy()
+        self._ungrouped_window_group_variables.clear()
+        if self.ungrouped_windows_provider is None:
+            windows: tuple[UngroupedWindow, ...] = ()
+        else:
+            windows = self.ungrouped_windows_provider()
+            if any(
+                not isinstance(item, UngroupedWindow)
+                for item in windows
+            ):
+                raise TypeError(
+                    "ungrouped windows provider returned invalid values."
+                )
+        if not windows:
+            Label(
+                frame,
+                text="目前沒有可唯一確認的未分組遊戲視窗。",
+                font=("Microsoft JhengHei UI", 9),
+                bg=SURFACE,
+                fg=MUTED,
+                anchor="w",
+            ).pack(fill=X, pady=4)
+            return ()
+        choices = (
+            self.group_choices_provider()
+            if self.group_choices_provider is not None
+            else self.group_choices
+        )
+        group_names = tuple(choice.name for choice in choices)
+        status_labels = {
+            "online": "在線",
+            "offline": "斷線",
+            "unknown": "無法判斷",
+        }
+        for item in windows:
+            row = Frame(frame, bg=BACKGROUND, padx=10, pady=7)
+            row.pack(fill=X, pady=3)
+            Label(
+                row,
+                text=(
+                    f"{item.shortcut_name}｜"
+                    f"{status_labels.get(item.status, '無法判斷')}"
+                ),
+                font=("Microsoft JhengHei UI", 10, "bold"),
+                bg=BACKGROUND,
+                fg=TEXT,
+                anchor="w",
+            ).pack(side=LEFT, fill=X, expand=True)
+            current_group = self.current_group_name
+            current_button = self._button(
+                row,
+                "加入目前組別",
+                lambda fingerprint=item.fingerprint,
+                group_name=current_group: self._add_ungrouped_window(
+                    fingerprint,
+                    group_name,
+                ),
+                primary=True,
+            )
+            current_button.pack(side=RIGHT)
+            if (
+                current_group is None
+                or self.on_add_ungrouped_window_to_group is None
+            ):
+                current_button.configure(state=DISABLED)
+            other_groups = tuple(
+                name for name in group_names if name != current_group
+            )
+            selected_group = StringVar(
+                master=self.parent,
+                value=(other_groups[0] if other_groups else "選擇其他組別"),
+            )
+            self._ungrouped_window_group_variables[item.fingerprint] = (
+                selected_group
+            )
+            group_menu = OptionMenu(
+                row,
+                selected_group,
+                *(other_groups or ("選擇其他組別",)),
+            )
+            group_menu.configure(
+                font=("Microsoft JhengHei UI", 9),
+                bg=SURFACE,
+                fg=TEXT,
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+            )
+            group_menu.pack(side=RIGHT, padx=(8, 0))
+            select_button = self._button(
+                row,
+                "加入所選組別",
+                lambda fingerprint=item.fingerprint,
+                selection=selected_group: self._add_ungrouped_window(
+                    fingerprint,
+                    selection.get(),
+                ),
+            )
+            select_button.pack(side=RIGHT, padx=(8, 0))
+            if (
+                not other_groups
+                or self.on_add_ungrouped_window_to_group is None
+            ):
+                group_menu.configure(state=DISABLED)
+                select_button.configure(state=DISABLED)
+        return windows
+
+    def _add_ungrouped_window(
+        self,
+        fingerprint: str,
+        group_name: str | None,
+    ) -> None:
+        choices = (
+            self.group_choices_provider()
+            if self.group_choices_provider is not None
+            else self.group_choices
+        )
+        if (
+            not isinstance(group_name, str)
+            or not group_name.strip()
+            or group_name not in {
+                choice.name for choice in choices
+            }
+            or self.on_add_ungrouped_window_to_group is None
+        ):
+            self._show_group_setting_message("請先選擇可加入的組別。")
+            return
+        try:
+            result = self.on_add_ungrouped_window_to_group(
+                fingerprint,
+                group_name,
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            return
+        if result is False:
+            self._show_group_setting_message("未加入任何組別。")
+            return
+        self._show_group_setting_message(
+            result if isinstance(result, str) else "已加入組別。"
+        )
+        self.refresh_group_entries()
+        self.refresh_group_sync_relations()
+        self.refresh_ungrouped_windows()
 
     def _toggle_group_role_details(
         self,

@@ -176,6 +176,7 @@ from services.group_window_launch_service import (
     GroupWindowLaunchResult,
     GroupWindowLaunchService,
 )
+from services.ungrouped_window_service import UngroupedWindowService
 from services.managed_game_process_service import (
     ManagedGameProcessService,
 )
@@ -832,6 +833,18 @@ def build_services(
             )
         ),
     )
+    ungrouped_window_service = UngroupedWindowService(
+        group_configuration_service,
+        shortcut_fingerprint_resolver,
+        synchronized_window_backend,
+        screen_states_provider=(
+            lambda fingerprints, windows: reconnect_controller.observe_screen_states(
+                fingerprints,
+                candidate_windows=windows,
+            )
+        ),
+    )
+    AppContext.register(UngroupedWindowService, ungrouped_window_service)
     deferred_sync_service = DeferredSyncOperationService(
         state_path=paths.data_dir() / DEFERRED_SYNC_STATE_FILENAME,
         on_failure=lambda record: operation_record_store.append(
@@ -2936,6 +2949,39 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             operation_record_store.ensure_daily_file()
         return bool(added)
 
+    def add_ungrouped_window_to_group(
+        fingerprint: str,
+        group_name: str,
+    ) -> object:
+        if group_configuration_service is None:
+            return False
+        shortcut_path = ungrouped_window_service.shortcut_for(fingerprint)
+        if shortcut_path is None:
+            return "未分組視窗已變更，沒有加入任何組別。"
+        if not stop_group_automation_for_configuration_change():
+            return "自動操作尚未完全停止，未加入角色。"
+        try:
+            added = group_configuration_service.add_shortcuts(
+                group_name,
+                (shortcut_path,),
+            )
+        except (SyncCycleError, GroupMasterLockedError) as error:
+            return error.player_message
+        if not added:
+            return "捷徑已在所選組別，沒有變更。"
+        refresh_character_data(group_name)
+        current_name = current_group_name()
+        refreshed = finish_group_management(current_name)
+        if not refreshed.success:
+            return "捷徑已加入，但目前組別設定尚未重新套用。"
+        if home_view is not None:
+            home_view.refresh_group_entries()
+            home_view.refresh_group_sync_relations()
+            home_view.refresh_ungrouped_windows()
+        if operation_record_store is not None:
+            operation_record_store.ensure_daily_file()
+        return f"{shortcut_path.name} 已加入 {group_name}。"
+
     def remove_group_shortcut(
         group_name: str,
         entry_id: str,
@@ -4054,6 +4100,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group_master_locked_provider=group_master_locked,
         on_group_master_locked_change=change_group_master_locked,
         on_add_group_shortcuts=add_group_shortcuts,
+        ungrouped_windows_provider=ungrouped_window_service.snapshot,
+        on_add_ungrouped_window_to_group=add_ungrouped_window_to_group,
         on_remove_group_shortcut=remove_group_shortcut,
         on_set_group_main=set_group_main,
         on_clear_group=clear_group,

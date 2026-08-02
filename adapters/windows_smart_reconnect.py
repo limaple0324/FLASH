@@ -2220,6 +2220,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def observe_screen_states(
         self,
         fingerprints: Iterable[str],
+        *,
+        candidate_windows: Iterable[WindowInfo] | None = None,
     ) -> dict[str, ReconnectScreenState]:
         requested = {
             fingerprint
@@ -2231,7 +2233,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         with self._screen_state_lock:
             observation_source_generation = self._source_state_generation
         _settings, observation_revision = self._capture_settings_snapshot()
-        candidates = self._candidate_windows()
+        candidates = (
+            tuple(candidate_windows)
+            if candidate_windows is not None
+            else self._candidate_windows()
+        )
         by_fingerprint: dict[str, list[WindowInfo]] = {}
         for window in candidates:
             fingerprint = normalize_launch_fingerprint(
