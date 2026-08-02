@@ -128,6 +128,23 @@ def test_live_installer_workflow_uses_its_immediate_success_status():
     assert "$LASTEXITCODE" not in installer_step
 
 
+def test_live_installer_workflow_reads_unicode_shortcuts_with_shell_application():
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    installer_step = workflow.split(
+        "- name: Verify live install update rollback and desktop entries", 1
+    )[1]
+    shortcut_check = installer_step.split("$beforeHash", 1)[0]
+
+    assert "$shellApp = New-Object -ComObject Shell.Application" in shortcut_check
+    assert "$desktopFolder = $shellApp.NameSpace($desktopRoot)" in shortcut_check
+    assert "$mainShortcut = $desktopFolder.ParseName('輔.lnk').GetLink" in shortcut_check
+    assert "$updateShortcut = $desktopFolder.ParseName('更新輔.lnk').GetLink" in shortcut_check
+    assert "$mainShortcut.Path -ne (Join-Path $installRoot 'FLASH.exe')" in shortcut_check
+    assert "$updateShortcut.Path -ne (Join-Path $installRoot '更新輔.cmd')" in shortcut_check
+    assert "WScript.Shell" not in shortcut_check
+    assert "TargetPath" not in shortcut_check
+
+
 def test_sp1_only_publication_has_a_separate_branch_and_verified_push_gate():
     workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
     publish_step = workflow.split("- name: Publish SP1-only desktop updater files", 1)[1]

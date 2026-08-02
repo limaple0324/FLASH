@@ -574,14 +574,18 @@ jobs:
             throw "Desktop shortcuts are invalid: $($shortcutNames -join ', ')"
           }
 
-          $shell = New-Object -ComObject WScript.Shell
+          $shellApp = New-Object -ComObject Shell.Application
           try {
-            $mainShortcut = $shell.CreateShortcut((Join-Path $desktopRoot '輔.lnk'))
-            $updateShortcut = $shell.CreateShortcut((Join-Path $desktopRoot '更新輔.lnk'))
-            if ($mainShortcut.TargetPath -ne (Join-Path $installRoot 'FLASH.exe')) {
+            $desktopFolder = $shellApp.NameSpace($desktopRoot)
+            if ($null -eq $desktopFolder) {
+              throw 'The installer desktop folder could not be inspected.'
+            }
+            $mainShortcut = $desktopFolder.ParseName('輔.lnk').GetLink
+            $updateShortcut = $desktopFolder.ParseName('更新輔.lnk').GetLink
+            if ($mainShortcut.Path -ne (Join-Path $installRoot 'FLASH.exe')) {
               throw 'The 輔 desktop shortcut target is invalid.'
             }
-            if ($updateShortcut.TargetPath -ne (Join-Path $installRoot '更新輔.cmd')) {
+            if ($updateShortcut.Path -ne (Join-Path $installRoot '更新輔.cmd')) {
               throw 'The 更新輔 desktop shortcut target is invalid.'
             }
           }
@@ -592,7 +596,10 @@ jobs:
             if ($updateShortcut) {
               [Runtime.InteropServices.Marshal]::FinalReleaseComObject($updateShortcut) | Out-Null
             }
-            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null
+            if ($desktopFolder) {
+              [Runtime.InteropServices.Marshal]::FinalReleaseComObject($desktopFolder) | Out-Null
+            }
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shellApp) | Out-Null
           }
 
           $beforeHash = (Get-FileHash -LiteralPath (Join-Path $installRoot 'FLASH.exe') -Algorithm SHA256).Hash
