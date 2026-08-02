@@ -137,6 +137,9 @@ from services.character_detail_view_service import CharacterDetailViewService
 from services.character_game_data_view_service import (
     CharacterGameDataViewService,
 )
+from services.character_game_data_update_service import (
+    CharacterGameDataUpdateService,
+)
 from services.character_detail_choice_service import CharacterDetailChoiceService
 from services.character_note_service import CharacterNoteService
 from services.character_view_service import CharacterViewService
@@ -505,6 +508,9 @@ def build_services(
     character_game_data_view_service = CharacterGameDataViewService(
         character_game_data_store
     )
+    character_game_data_update_service = CharacterGameDataUpdateService(
+        character_game_data_store
+    )
     characters = character_store.load()
     legacy_group_config_path = (
         default_legacy_group_config_path()
@@ -724,6 +730,10 @@ def build_services(
     AppContext.register(WindowRegistry, registry)
     AppContext.register(CharacterStore, character_store)
     AppContext.register(CharacterGameDataStore, character_game_data_store)
+    AppContext.register(
+        CharacterGameDataUpdateService,
+        character_game_data_update_service,
+    )
     AppContext.register(
         CharacterGameDataViewService,
         character_game_data_view_service,

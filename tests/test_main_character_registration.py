@@ -11,6 +11,7 @@ from services.character_detail_view_service import (
     PlayerCharacterDetail,
 )
 from services.character_game_data_view_service import CharacterGameDataView
+from services.character_game_data_update_service import CharacterGameDataUpdateService
 from services.character_view_service import CharacterViewService, PlayerCharacterView
 
 
@@ -81,6 +82,11 @@ def test_build_services_registers_confirmed_game_data_sections(tmp_path) -> None
     WindowRegistryStore(tmp_path / "data" / "window_registry.json").save(registry)
 
     build_services(root=tmp_path)
+
+    assert isinstance(
+        AppContext.get(CharacterGameDataUpdateService),
+        CharacterGameDataUpdateService,
+    )
 
     details = AppContext.get(CharacterDetailViewService)
     assert details.all() == (
