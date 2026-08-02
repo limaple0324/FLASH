@@ -882,6 +882,8 @@ class HomeView:
         ) = None,
         theme_name: str = "classic_gold",
         on_theme_change: Callable[[str], object] | None = None,
+        show_hints: bool = False,
+        on_show_hints_change: Callable[[bool], object] | None = None,
         feature_card_preference_provider: (
             Callable[[str, str], FeatureCardPreference] | None
         ) = None,
@@ -1201,6 +1203,8 @@ class HomeView:
             else "classic_gold"
         )
         self.on_theme_change = on_theme_change
+        self.show_hints = bool(show_hints)
+        self.on_show_hints_change = on_show_hints_change
         self.feature_card_preference_provider = (
             feature_card_preference_provider
         )
@@ -1272,6 +1276,9 @@ class HomeView:
         self._card_background_prepare_poll_id: str | None = None
         self._card_background_prepare_message = ""
         self._feature_card_save_error = ""
+        self._hint_labels: list[Label] = []
+        self._hint_pack_info: dict[Label, dict[str, object]] = {}
+        self._show_hints_variable: IntVar | None = None
         self._card_background_choose_button: Button | None = None
         self._card_background_cancel_button: Button | None = None
         self._card_background_progress_bar: Progressbar | None = None
@@ -1481,8 +1488,8 @@ class HomeView:
         self,
         parent,
         *,
-        padx: int = 18,
-        pady: int = 16,
+        padx: int = 14,
+        pady: int = 10,
         card_id: str | None = None,
         title: str | None = None,
         order_frame: Frame | None = None,
@@ -1542,15 +1549,6 @@ class HomeView:
             x=settings_offset,
             y=6,
             anchor="ne",
-        )
-        frame.configure(
-            pady=_feature_card_content_pady(
-                pady,
-                max(
-                    int(settings_button.winfo_reqheight()),
-                    int(toggle_button.winfo_reqheight()),
-                ),
-            )
         )
         widgets = _FeatureCardWidgets(
             card_id=clean_id,
@@ -1636,27 +1634,83 @@ class HomeView:
             )
             if title_label is None:
                 title_label = next(iter(labels), None)
-            widgets.title_label = title_label
             if title_label is not None:
-                widgets.title_original_pady = title_label.cget("pady")
-                title_label.configure(
+                original_manager = str(title_label.winfo_manager())
+                control_height = max(
+                    int(widgets.settings_button.winfo_reqheight()),
+                    int(widgets.toggle_button.winfo_reqheight()),
+                )
+                target_title = title_label
+                if original_manager == "pack":
+                    title_label.pack_forget()
+                    title_height = max(1, int(title_label.winfo_reqheight()))
+                    title_pady = max(0, (control_height - title_height + 1) // 2)
+                    header = Frame(widgets.frame, bg=SURFACE)
+                    body_children = widgets.frame.pack_slaves()
+                    if body_children:
+                        header.pack(fill=X, before=body_children[0])
+                    else:
+                        header.pack(fill=X)
+                    title_options = {
+                        key: title_label.cget(key)
+                        for key in ("font", "bg", "fg", "anchor", "justify")
+                    }
+                    target_title = Label(
+                        header,
+                        text=preference.title,
+                        cursor="fleur",
+                        **title_options,
+                    )
+                    target_title.pack(
+                        fill=X,
+                        expand=True,
+                        padx=(0, control_height + 24),
+                        pady=title_pady,
+                    )
+                else:
+                    # Some cards use grid-managed children directly in the
+                    # card frame.  Keep that manager intact and reserve the
+                    # same safe vertical space instead of mixing pack/grid.
+                    try:
+                        current_pady = int(
+                            widgets.frame.winfo_pixels(
+                                widgets.frame.cget("pady")
+                            )
+                        )
+                    except Exception:
+                        current_pady = 0
+                    widgets.frame.configure(
+                        pady=_feature_card_content_pady(
+                            current_pady,
+                            control_height,
+                        )
+                    )
+                target_title.configure(
                     text=preference.title,
                     cursor="fleur",
                 )
-                title_label.bind(
+                widgets.title_label = target_title
+                widgets.title_original_pady = target_title.cget("pady")
+                target_title.bind(
                     "<ButtonPress-1>",
                     lambda _event, selected=card_id: (
                         self._start_feature_card_drag(selected)
                     ),
                     add="+",
                 )
-                title_label.bind(
+                target_title.bind(
                     "<ButtonRelease-1>",
                     lambda event, selected=card_id: (
                         self._finish_feature_card_drag(selected, event)
                     ),
                     add="+",
                 )
+                control_top = max(
+                    6,
+                    int(widgets.frame.winfo_pixels(widgets.frame.cget("pady"))),
+                )
+                widgets.settings_button.place_configure(y=control_top)
+                widgets.toggle_button.place_configure(y=control_top)
             self._load_feature_card_background(card_id)
             self._set_feature_card_collapsed(
                 widgets,
@@ -1664,10 +1718,75 @@ class HomeView:
                 persist=False,
             )
             # Full-width contents are created after these placed controls.
-            # Raise the controls so later labels cannot cover their text.
+            # Keep the controls above the card background and content.
             widgets.settings_button.lift()
             widgets.toggle_button.lift()
         self._apply_saved_feature_card_order(page)
+
+    def _hint_label(self, parent, text: str, **kwargs) -> Label:
+        label = Label(parent, text=text, **kwargs)
+        self._hint_labels.append(label)
+        return label
+
+    def _apply_hints_visibility(self) -> None:
+        for label in tuple(self._hint_labels):
+            try:
+                if not label.winfo_exists():
+                    continue
+                manager = str(label.winfo_manager())
+            except Exception:
+                continue
+            if self.show_hints:
+                if manager:
+                    continue
+                pack_info = self._hint_pack_info.pop(label, None)
+                if not pack_info:
+                    continue
+                clean_info = {
+                    key: value
+                    for key, value in pack_info.items()
+                    if key != "in"
+                }
+                siblings = label.master.winfo_children()
+                try:
+                    index = siblings.index(label)
+                except ValueError:
+                    index = -1
+                before = next(
+                    (
+                        sibling
+                        for sibling in siblings[index + 1 :]
+                        if str(sibling.winfo_manager()) == "pack"
+                    ),
+                    None,
+                )
+                if before is not None:
+                    label.pack(before=before, **clean_info)
+                else:
+                    label.pack(**clean_info)
+                continue
+            if manager == "pack":
+                self._hint_pack_info[label] = dict(label.pack_info())
+                label.pack_forget()
+
+    def _toggle_show_hints(self) -> None:
+        variable = self._show_hints_variable
+        if variable is None:
+            return
+        requested = bool(variable.get())
+        try:
+            if self.on_show_hints_change is not None:
+                accepted = self.on_show_hints_change(requested)
+                if accepted is False:
+                    variable.set(int(self.show_hints))
+                    return
+        except Exception as error:
+            self._report_refresh_error(error)
+            variable.set(int(self.show_hints))
+            return
+        self.show_hints = requested
+        self._apply_hints_visibility()
+        self._sync_page_scroll_region()
 
     def _set_feature_card_collapsed(
         self,
@@ -1756,6 +1875,7 @@ class HomeView:
         widgets.toggle_button.configure(
             text="展開" if widgets.collapsed else "收合"
         )
+        self._apply_hints_visibility()
         if persist and self.on_feature_card_collapsed_change is not None:
             try:
                 self.on_feature_card_collapsed_change(
@@ -2091,6 +2211,8 @@ class HomeView:
         self._pages.clear()
         self._feature_cards.clear()
         self._feature_cards_by_page.clear()
+        self._hint_labels.clear()
+        self._hint_pack_info.clear()
         self._building_page_name = None
         self._navigation_buttons.clear()
         self._background_page_labels.clear()
@@ -2107,7 +2229,7 @@ class HomeView:
 
         body = Frame(root, bg=BACKGROUND)
         body.pack(fill=BOTH, expand=True)
-        sidebar = Frame(body, bg=SIDEBAR, width=176, padx=12, pady=16)
+        sidebar = Frame(body, bg=SIDEBAR, width=176, padx=10, pady=12)
         sidebar.pack(side=LEFT, fill=Y)
         sidebar.pack_propagate(False)
         self._background_sidebar_label = Label(
@@ -2124,7 +2246,7 @@ class HomeView:
             relheight=1,
         )
         self._background_sidebar_label.lower()
-        content_shell = Frame(body, bg=BACKGROUND, padx=22, pady=20)
+        content_shell = Frame(body, bg=BACKGROUND, padx=16, pady=14)
         content_shell.pack(side=LEFT, fill=BOTH, expand=True)
         scrollbar = Scrollbar(content_shell, orient="vertical")
         scrollbar.pack(side=RIGHT, fill=Y)
@@ -2185,7 +2307,7 @@ class HomeView:
                 relief="flat",
                 bd=0,
                 padx=14,
-                pady=10,
+                pady=8,
                 cursor="hand2",
             )
             button.pack(fill=X, pady=2)
@@ -2218,6 +2340,7 @@ class HomeView:
             background_label.place(x=0, y=0, relwidth=1, relheight=1)
             background_label.lower()
             self._background_page_labels[page_name] = background_label
+        self._apply_hints_visibility()
         self.show_page(
             active_page if active_page in self._pages else "home"
         )
@@ -3316,14 +3439,14 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             parent,
             text=subtitle,
             font=("Microsoft JhengHei UI", 10),
             bg=BACKGROUND,
             fg=MUTED,
             anchor="w",
-        ).pack(fill=X, pady=(2, 16))
+        ).pack(fill=X, pady=(2, 10))
 
     def _build_home_page(self, parent) -> Frame:
         page = Frame(parent, bg=BACKGROUND)
@@ -3364,7 +3487,7 @@ class HomeView:
         )
         self._workspace_label.pack(fill=X, pady=(8, 0))
 
-        target_section = card_section(8)
+        target_section = card_section(6)
         target_card = self._card(
             target_section,
             card_id="home.group",
@@ -3390,7 +3513,7 @@ class HomeView:
         )
         self._target_label.pack(fill=X, pady=(8, 0))
 
-        role_section = card_section(20)
+        role_section = card_section(12)
         Label(
             role_section,
             text="目前組別角色",
@@ -3435,7 +3558,7 @@ class HomeView:
         )
         self._reconnect_failure_label.pack(fill=X)
 
-        schedule_section = card_section(20)
+        schedule_section = card_section(12)
         self._home_activity_heading = Label(
             schedule_section,
             text="今日已登記活動",
@@ -3474,7 +3597,7 @@ class HomeView:
         self._activity_schedule_label.pack(fill=X)
         self._build_activity_description_editor(schedule_card)
 
-        reminder_section = card_section(20)
+        reminder_section = card_section(12)
         Label(
             reminder_section,
             text="需要注意",
@@ -3517,7 +3640,7 @@ class HomeView:
             primary=True,
         ).pack(side=RIGHT)
 
-        Label(
+        self._hint_label(
             page,
             text="沒有可信新資訊時保持安靜，不猜測活動或完成進度。",
             font=("Microsoft JhengHei UI", 10),
@@ -3587,7 +3710,7 @@ class HomeView:
             card_id="records.daily_files",
             title="每日文字記錄檔",
         )
-        files_card.pack(fill=X, pady=(14, 0))
+        files_card.pack(fill=X, pady=(10, 0))
         Label(
             files_card,
             text="每日文字記錄檔",
@@ -3607,7 +3730,7 @@ class HomeView:
             card_id="records.search",
             title="依日期與角色搜尋",
         )
-        search_card.pack(fill=X, pady=(14, 0))
+        search_card.pack(fill=X, pady=(10, 0))
         Label(
             search_card,
             text="依日期與角色搜尋",
@@ -3651,7 +3774,7 @@ class HomeView:
             self._search_operation_records,
             primary=True,
         ).pack(side=RIGHT, padx=(6, 0))
-        Label(
+        self._hint_label(
             search_card,
             text="日期格式：YYYY-MM-DD；角色可輸入完整或部分名稱",
             font=("Microsoft JhengHei UI", 9),
@@ -4139,7 +4262,7 @@ class HomeView:
             "匯入組別設定",
             self._import_group_configuration,
         ).pack(side=LEFT, padx=(8, 0))
-        Label(
+        self._hint_label(
             selector,
             text="匯入時同名組別會直接更新；舊版設定保持不變。",
             font=("Microsoft JhengHei UI", 9),
@@ -4155,7 +4278,7 @@ class HomeView:
             card_id="groups.roles",
             title="組別角色",
         )
-        entry_card.pack(fill=X, pady=(14, 0))
+        entry_card.pack(fill=X, pady=(10, 0))
         entry_header = Frame(entry_card, bg=SURFACE)
         entry_header.pack(fill=X)
         Label(
@@ -4236,8 +4359,8 @@ class HomeView:
             card_id="groups.ungrouped_windows",
             title="未分組視窗",
         )
-        ungrouped_card.pack(fill=X, pady=(14, 0))
-        Label(
+        ungrouped_card.pack(fill=X, pady=(10, 0))
+        self._hint_label(
             ungrouped_card,
             text="只顯示已開啟且可唯一確認的遊戲捷徑。",
             font=("Microsoft JhengHei UI", 9),
@@ -4256,7 +4379,7 @@ class HomeView:
             card_id="groups.extended_sync",
             title="延伸同步範圍",
         )
-        sync_card.pack(fill=X, pady=(14, 0))
+        sync_card.pack(fill=X, pady=(10, 0))
         Label(
             sync_card,
             text="延伸同步範圍",
@@ -4265,7 +4388,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             sync_card,
             text="從目前組別主控遞迴加入其他角色或組別主控",
             font=("Microsoft JhengHei UI", 9),
@@ -4393,7 +4516,7 @@ class HomeView:
             card_id="groups.window_size",
             title="還原／調整遊戲視窗尺寸",
         )
-        card.pack(fill=X, pady=(14, 0))
+        card.pack(fill=X, pady=(10, 0))
         Label(
             card,
             text="還原／調整遊戲視窗尺寸",
@@ -4402,7 +4525,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             card,
             text="沿用舊版操作；尺寸是遊戲內容區，不會移動或切換視窗",
             font=("Microsoft JhengHei UI", 9),
@@ -4653,7 +4776,7 @@ class HomeView:
             card_id="sync.reconnect",
             title="斷線重新連線",
         )
-        reconnect_card.pack(fill=X, pady=(14, 0))
+        reconnect_card.pack(fill=X, pady=(10, 0))
         Label(
             reconnect_card,
             text="斷線重新連線",
@@ -4770,7 +4893,7 @@ class HomeView:
             "reconnect",
             "智慧重連啟閉快捷鍵",
         )
-        Label(
+        self._hint_label(
             reconnect_card,
             text="啟用後會自動判定與重試；不需逐次按重連按鈕。",
             font=("Microsoft JhengHei UI", 9),
@@ -4788,7 +4911,7 @@ class HomeView:
             card_id="sync.auto_click",
             title="連續點擊",
         )
-        auto_click_card.pack(fill=X, pady=(14, 0))
+        auto_click_card.pack(fill=X, pady=(10, 0))
         Label(
             auto_click_card,
             text="連續點擊",
@@ -4901,7 +5024,7 @@ class HomeView:
             card_id="sync.game_time",
             title="遊戲時間",
         )
-        card.pack(fill=X, pady=(14, 0))
+        card.pack(fill=X, pady=(10, 0))
         Label(
             card,
             text="遊戲時間",
@@ -4969,7 +5092,7 @@ class HomeView:
             anchor="w",
         )
         self._game_time_value_label.pack(side=LEFT, fill=X, expand=True)
-        Label(
+        self._hint_label(
             card,
             text=(
                 f"偏移可設定 {MIN_TIME_OFFSET_MS}～{MAX_TIME_OFFSET_MS} 毫秒；"
@@ -4987,7 +5110,7 @@ class HomeView:
             card_id="sync.timed_click",
             title="定時按下",
         )
-        card.pack(fill=X, pady=(14, 0))
+        card.pack(fill=X, pady=(10, 0))
         Label(
             card,
             text="定時按下",
@@ -5085,7 +5208,7 @@ class HomeView:
             anchor="w",
         )
         self._timed_click_status_label.pack(fill=X, pady=(8, 0))
-        Label(
+        self._hint_label(
             card,
             text=(
                 "設定位置後才可啟用；只操作該唯一角色視窗，"
@@ -5764,7 +5887,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             theme_card,
             text="可隨時切換整個主畫面的配色與閱讀風格。",
             font=("Microsoft JhengHei UI", 10),
@@ -5802,13 +5925,32 @@ class HomeView:
             self._apply_selected_theme,
             primary=True,
         ).pack(side=RIGHT, padx=(8, 0))
+        hint_row = Frame(theme_card, bg=SURFACE)
+        hint_row.pack(fill=X, pady=(8, 0))
+        self._show_hints_variable = IntVar(
+            master=self.parent,
+            value=int(self.show_hints),
+        )
+        Checkbutton(
+            hint_row,
+            text="顯示提示說明",
+            variable=self._show_hints_variable,
+            command=self._toggle_show_hints,
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+            activebackground=SURFACE,
+            activeforeground=TEXT,
+            selectcolor=BACKGROUND,
+            anchor="w",
+        ).pack(side=LEFT)
 
         background_card = self._card(
             page,
             card_id="settings.background",
             title="背景圖片",
         )
-        background_card.pack(fill=X, pady=(14, 0))
+        background_card.pack(fill=X, pady=(10, 0))
         Label(
             background_card,
             text="背景圖片",
@@ -5817,7 +5959,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             background_card,
             text=(
                 "可選擇一般圖片或相機 RAW；程式只顯示轉換後的"
@@ -5896,7 +6038,7 @@ class HomeView:
         self._background_cancel_button.configure(state=DISABLED)
 
         scope_frame = Frame(background_card, bg=SURFACE)
-        scope_frame.pack(fill=X, pady=(14, 0))
+        scope_frame.pack(fill=X, pady=(10, 0))
         Label(
             scope_frame,
             text="套用頁面",
@@ -5975,7 +6117,7 @@ class HomeView:
         ).pack(side=LEFT, padx=(8, 0))
 
         display_frame = Frame(background_card, bg=SURFACE)
-        display_frame.pack(fill=X, pady=(14, 0))
+        display_frame.pack(fill=X, pady=(10, 0))
         Label(
             display_frame,
             text="填補色與區域透明度",
@@ -6056,7 +6198,7 @@ class HomeView:
             ).pack(side=LEFT, padx=(8, 0))
             self._background_opacity_scales[key] = scale
         save_row = Frame(background_card, bg=SURFACE)
-        save_row.pack(fill=X, pady=(14, 0))
+        save_row.pack(fill=X, pady=(10, 0))
         self._button(
             save_row,
             "儲存背景設定",
@@ -6089,7 +6231,7 @@ class HomeView:
             card_id="settings.reminder_lifetime",
             title="提醒顯示時間",
         )
-        card.pack(fill=X, pady=(14, 0))
+        card.pack(fill=X, pady=(10, 0))
         Label(
             card,
             text="提醒顯示時間",
@@ -6098,7 +6240,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             card,
             text="設定提醒卡在畫面上保留的秒數。",
             font=("Microsoft JhengHei UI", 10),
@@ -6144,7 +6286,7 @@ class HomeView:
             card_id="settings.reminder_style",
             title="提醒卡樣式",
         )
-        preview_card.pack(fill=X, pady=(14, 0))
+        preview_card.pack(fill=X, pady=(10, 0))
         Label(
             preview_card,
             text="提醒卡樣式",
@@ -6153,7 +6295,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             preview_card,
             text=(
                 "只會套用已確認的提醒卡樣式；選擇會保存，"
@@ -6237,7 +6379,7 @@ class HomeView:
             card_id="settings.habits",
             title="玩家習慣",
         )
-        habit_card.pack(fill=X, pady=(14, 0))
+        habit_card.pack(fill=X, pady=(10, 0))
         Label(
             habit_card,
             text="玩家習慣",
@@ -6246,7 +6388,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             habit_card,
             text=(
                 "前七個有效日只觀察活動時間與角色操作順序，"
@@ -6334,7 +6476,7 @@ class HomeView:
             card_id="settings.status",
             title="系統狀態",
         )
-        status_card.pack(fill=X, pady=(14, 0))
+        status_card.pack(fill=X, pady=(10, 0))
         Label(
             status_card,
             text="系統狀態",
@@ -6343,7 +6485,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             status_card,
             text="查看目前視窗、安全檢查與資料保存狀態。",
             font=("Microsoft JhengHei UI", 10),
@@ -6444,15 +6586,23 @@ class HomeView:
         ).pack(side=LEFT, padx=(8, 0))
         if not choices or self.on_activity_description_change is None:
             self._activity_description_entry.configure(state=DISABLED)
-        self._activity_description_status_label = Label(
+        self._hint_label(
             parent,
             text="空白後儲存可清除自訂敘述；不會改變活動識別或進度。",
             font=("Microsoft JhengHei UI", 9),
             bg=SURFACE,
             fg=MUTED,
             anchor="w",
+        ).pack(fill=X, pady=(8, 0))
+        self._activity_description_status_label = Label(
+            parent,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
         )
-        self._activity_description_status_label.pack(fill=X, pady=(8, 0))
+        self._activity_description_status_label.pack(fill=X, pady=(4, 0))
         if choices:
             self._load_activity_description(choices[0].activity_id)
 
@@ -6530,7 +6680,7 @@ class HomeView:
             card_id="settings.card_layout",
             title="功能卡片版面",
         )
-        layout_card.pack(fill=X, pady=(14, 0))
+        layout_card.pack(fill=X, pady=(10, 0))
         Label(
             layout_card,
             text="功能卡片版面",
@@ -6539,7 +6689,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             layout_card,
             text=(
                 "直接拖曳各卡片標題可重新排序；每張卡片可收合、"
@@ -6654,7 +6804,7 @@ class HomeView:
         )
         self._card_background_cancel_button.pack(side=LEFT, padx=(8, 0))
         self._card_background_cancel_button.configure(state=DISABLED)
-        self._feature_card_status_label = Label(
+        self._hint_label(
             layout_card,
             text="拖移、收合與自訂都不會改變卡片內原有功能。",
             font=("Microsoft JhengHei UI", 9),
@@ -6662,8 +6812,17 @@ class HomeView:
             fg=MUTED,
             anchor="w",
             justify=LEFT,
+        ).pack(fill=X, pady=(8, 0))
+        self._feature_card_status_label = Label(
+            layout_card,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
         )
-        self._feature_card_status_label.pack(fill=X, pady=(8, 0))
+        self._feature_card_status_label.pack(fill=X, pady=(4, 0))
         self._refresh_feature_card_settings()
 
     def _feature_card_choice_items(
@@ -6948,7 +7107,7 @@ class HomeView:
         background_row.pack(fill=X)
         status_label = Label(
             dialog,
-            text="此處只修改這張卡片。",
+            text="",
             font=("Microsoft JhengHei UI", 9),
             bg=SURFACE,
             fg=MUTED,
@@ -7004,7 +7163,17 @@ class HomeView:
             "恢復預設名稱",
             request_default_title,
         ).pack(side=LEFT, padx=(8, 0))
-        status_label.pack(fill=X, pady=(10, 0))
+        self._hint_label(
+            dialog,
+            text="此處只修改這張卡片。",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
+        ).pack(fill=X, pady=(10, 0))
+        status_label.pack(fill=X, pady=(4, 0))
+        self._apply_hints_visibility()
 
         actions = Frame(dialog, bg=SURFACE)
         actions.pack(fill=X, pady=(12, 0))

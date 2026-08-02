@@ -134,8 +134,8 @@ def test_tray_menu_show_hide_restore_and_stop_all_share_state(
 
     assert window.withdrawn == 1
     assert window.deiconified == 2
-    assert window.lifted == 1
-    assert window.focused == 1
+    assert window.lifted == 2
+    assert window.focused == 2
     assert controller.window_visible is True
     assert stop_all_calls == [True]
     assert controller.operations_stopped is True
@@ -248,10 +248,10 @@ def test_native_tray_menu_contains_all_confirmed_actions():
     )
 
     for label in (
-        "顯示主視窗",
+        "顯示主程式",
         "隱藏主視窗",
         "恢復主視窗",
         "停止全部",
-        "完全退出",
+        "完全關閉程式",
     ):
         assert label in source
