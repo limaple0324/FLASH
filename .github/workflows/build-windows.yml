@@ -556,7 +556,8 @@ jobs:
             -SourceDirectory (Resolve-Path 'release').Path `
             -InstallDirectory $installRoot `
             -DesktopDirectory $desktopRoot
-          if ($LASTEXITCODE -ne 0) {
+          $installerSucceeded = $?
+          if (-not $installerSucceeded) {
             throw 'Live release installer verification failed.'
           }
 

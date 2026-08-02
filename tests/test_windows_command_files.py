@@ -113,6 +113,21 @@ def test_windows_workflow_keeps_manual_artifact_build():
     assert "- name: Upload Windows release bundle" in workflow
 
 
+def test_live_installer_workflow_uses_its_immediate_success_status():
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    installer_step = workflow.split(
+        "- name: Verify live install update rollback and desktop entries", 1
+    )[1]
+    installer_step = installer_step.split("$shortcutNames = @(", 1)[0]
+
+    assert (
+        "-DesktopDirectory $desktopRoot\n"
+        "          $installerSucceeded = $?\n"
+        "          if (-not $installerSucceeded) {"
+    ) in installer_step
+    assert "$LASTEXITCODE" not in installer_step
+
+
 def test_sp1_only_publication_has_a_separate_branch_and_verified_push_gate():
     workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
     publish_step = workflow.split("- name: Publish SP1-only desktop updater files", 1)[1]
