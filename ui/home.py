@@ -9800,7 +9800,7 @@ class HomeView:
         return entries
 
     def refresh_ungrouped_windows(self) -> tuple[UngroupedWindow, ...]:
-        frame = self._ungrouped_windows_frame
+        frame = getattr(self, "_ungrouped_windows_frame", None)
         if frame is None:
             return ()
         for child in frame.winfo_children():
