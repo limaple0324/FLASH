@@ -98,9 +98,9 @@ def test_chinese_semicolon_and_multiline_lists_are_parsed():
 
 
 @pytest.mark.parametrize("branch", ["main", "release/latest", "release/sp1", "release/other"])
-def test_protected_branches_manual_gates_and_flags_block(branch):
+def test_protected_branches_and_flags_block(branch):
     with pytest.raises(QueueRunError): validate_remote_source(FakeClient([comment(branch=branch)]), parse_task_comment(comment(branch=branch)["body"]))
-    with pytest.raises(QueueRunError): validate_remote_source(FakeClient([comment(role="BATCH_CONTROL")]), parse_task_comment(comment(role="BATCH_CONTROL")["body"]))
+    with pytest.raises(QueueRunError): parse_task_comment(comment(role="BATCH_CONTROL")["body"])
     with pytest.raises(QueueRunError): validate_remote_source(FakeClient([comment(full="YES")]), parse_task_comment(comment(full="YES")["body"]))
     with pytest.raises(QueueRunError): validate_remote_source(FakeClient([comment(windows="YES")]), parse_task_comment(comment(windows="YES")["body"]))
 
@@ -116,6 +116,16 @@ def test_live_claim_and_context_snapshot_have_no_token(monkeypatch):
     assert result["selected"] and claim_belongs_to_run(client.comments, "Q-1", "run-a", 1)
     assert result["context"]["changed_files"] == ["tests/test_fixture.py"]
     assert "token" not in json.dumps(result["context"]).lower()
+
+
+def test_live_without_codex_secret_stops_before_claim(monkeypatch):
+    monkeypatch.delenv("OPENAI_SECRET_AVAILABLE", raising=False)
+    client = FakeClient([comment()])
+
+    with pytest.raises(QueueRunError, match="缺少 OPENAI_API_KEY"):
+        select_and_claim(client, {"event_name": "schedule"}, RunnerConfig(mode="live", allow_writeback=True, workflow_run_id="run-no-secret"))
+
+    assert not client.posts and not client.dispatches
 
 
 def test_stale_claim_recovers_only_completed_run():

@@ -24,17 +24,12 @@ class Role(str, Enum):
     REQUIREMENTS_AUDIT = "REQUIREMENTS_AUDIT"
     CODE_REVIEW = "CODE_REVIEW"
     TEST_VALIDATION = "TEST_VALIDATION"
-    BATCH_CONTROL = "BATCH_CONTROL"
-    INTEGRATION = "INTEGRATION"
 
     def requires_codex(self) -> bool:
         return self in {Role.WORKER_A, Role.REQUIREMENTS_AUDIT, Role.CODE_REVIEW}
 
     def sandbox(self) -> str:
         return "workspace-write" if self is Role.WORKER_A else "read-only"
-
-    def is_manual_gate(self) -> bool:
-        return self in {Role.BATCH_CONTROL, Role.INTEGRATION}
 
 
 ROLE_TRANSITIONS: dict[Role, Optional[Role]] = {

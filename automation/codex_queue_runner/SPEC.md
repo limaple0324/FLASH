@@ -10,7 +10,7 @@
 
 - 任務原始定義僅接受 `limaple0324`；狀態僅接受該擁有者或帶 `STATE_WRITER: CODEX_QUEUE_RUNNER` 的 `github-actions[bot]`。
 - `CLAIMED` 必須同時綁定 workflow run id 與原始任務 comment id，並有租約與已完成 run 回收機制。
-- 固定交棒：WORKER_A → REQUIREMENTS_AUDIT → CODE_REVIEW → TEST_VALIDATION → WAITING_REVIEW；稽核或審查 fail 回到 NEEDS_FIX／WORKER_A。BATCH_CONTROL 與 INTEGRATION 為 manual gate。
+- 固定交棒：WORKER_A → REQUIREMENTS_AUDIT → CODE_REVIEW → TEST_VALIDATION → WAITING_REVIEW；稽核或審查 fail 回到 NEEDS_FIX／WORKER_A。
 
 ## 推送與範圍
 

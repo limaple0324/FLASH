@@ -165,6 +165,7 @@ jobs:
       role: ${{ steps.result.outputs.role }}
       base_commit: ${{ steps.result.outputs.base_commit }}
       allow_writeback: ${{ steps.result.outputs.allow_writeback }}
+      openai_secret_available: ${{ steps.result.outputs.openai_secret_available }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
@@ -196,7 +197,7 @@ jobs:
           import json, os
           from pathlib import Path
           value = json.loads(Path("select-output/selection.json").read_text(encoding="utf-8"))
-          fields = {"selected": str(bool(value.get("selected"))).lower(), "claimed": str(bool(value.get("claimed"))).lower(), "selection_ok": str(bool(value.get("selection_ok"))).lower(), "mode": value.get("mode", ""), "role": value.get("task", {}).get("role", ""), "base_commit": value.get("task", {}).get("base_commit", ""), "allow_writeback": str(bool(value.get("allow_writeback"))).lower()}
+          fields = {"selected": str(bool(value.get("selected"))).lower(), "claimed": str(bool(value.get("claimed"))).lower(), "selection_ok": str(bool(value.get("selection_ok"))).lower(), "mode": value.get("mode", ""), "role": value.get("task", {}).get("role", ""), "base_commit": value.get("task", {}).get("base_commit", ""), "allow_writeback": str(bool(value.get("allow_writeback"))).lower(), "openai_secret_available": str(bool(value.get("openai_secret_available", value.get("openai_available", False))).lower())}
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as out:
               for key, item in fields.items(): out.write(f"{key}={item}\n")
           PY
@@ -238,11 +239,15 @@ jobs:
           PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli render-prompt --task agent-input/task.json --context agent-input/context.json --output "$RUNNER_TEMP/codex-prompt.md"
           PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli write-schema --task agent-input/task.json --output "$RUNNER_TEMP/codex-schema.json"
       - id: fixture
-        if: needs.select_claim.outputs.mode == 'dry-run' || needs.select_claim.outputs.role == 'TEST_VALIDATION'
+        if: >-
+          needs.select_claim.outputs.mode == 'dry-run' ||
+          needs.select_claim.outputs.role == 'TEST_VALIDATION' ||
+          needs.select_claim.outputs.openai_secret_available == 'false'
         run: PYTHONPATH="$GITHUB_WORKSPACE/runner-src" python -m automation.codex_queue_runner.cli dry-agent-output --task agent-input/task.json --github-output "$GITHUB_OUTPUT"
       - id: codex
         if: >-
           needs.select_claim.outputs.mode == 'live' &&
+          needs.select_claim.outputs.openai_secret_available == 'true' &&
           (needs.select_claim.outputs.role == 'WORKER_A' || needs.select_claim.outputs.role == 'REQUIREMENTS_AUDIT' || needs.select_claim.outputs.role == 'CODE_REVIEW')
         uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56
         with:
