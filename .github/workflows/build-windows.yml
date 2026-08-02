@@ -368,6 +368,7 @@ jobs:
         run: |
           $verifier = (Resolve-Path 'release/輔系統/verify_windows_release.ps1').Path
           & $verifier -NoLaunch
-          if ($LASTEXITCODE -ne 0) {
+          $verificationPassed = $?
+          if (-not $verificationPassed) {
             throw "Release bundle identity verification failed."
           }

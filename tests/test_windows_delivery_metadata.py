@@ -51,3 +51,5 @@ def test_workflow_uses_the_coordinated_build_output():
         "--output-dir dist --cache-dir .build-cache"
     ) in workflow
     assert "verify_windows_release.ps1' -NoLaunch" in workflow
+    assert "$verificationPassed = $?" in workflow
+    assert "if (-not $verificationPassed)" in workflow
