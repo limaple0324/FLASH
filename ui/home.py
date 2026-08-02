@@ -1661,6 +1661,8 @@ class HomeView:
                         height=control_height,
                     )
                     header.pack_propagate(False)
+                    title_height = max(1, int(title_label.winfo_reqheight()))
+                    title_pady = max(0, (control_height - title_height + 1) // 2)
                     body_children = widgets.frame.pack_slaves()
                     if body_children:
                         header.pack(fill=X, before=body_children[0])
@@ -1691,6 +1693,7 @@ class HomeView:
                         side=LEFT,
                         fill=X,
                         expand=True,
+                        pady=title_pady,
                     )
                 else:
                     # Some cards use grid-managed children directly in the
