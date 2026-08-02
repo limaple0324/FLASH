@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "batch_id": "FU-20260802-005",
+  "batch_type": "解除受阻",
+  "source_requirement": "FU-REQ-20260802-001",
+  "source_issue": "#32",
+  "source_pull_request": "#17",
+  "absolute_worktree": "C:\\Users\\USER\\Documents\\輔\\FLASH-fu-20260802-005-unblock-001-cloud-contract",
+  "integration_branch": "codex/release-identity-gate-2026-08-01",
+  "work_branch": "automation/fu-20260802-005-unblock-001-cloud-contract",
+  "target_branch": "codex/release-identity-gate-2026-08-01",
+  "fixed_base_commit": "5dd2c61aa7fed0b9a8d55247bcdff2621e4110a1",
+  "current_commit_at_batch_creation": "5dd2c61aa7fed0b9a8d55247bcdff2621e4110a1",
+  "total_items": 1,
+  "items": [
+    "依第001號既有成品身分規則，解除雲端建置契約與七份直接失敗測試的受阻；只可修改本批指定檔案。"
+  ],
+  "program_interface_blocks": [
+    "成品身分、雲端建置驗證與正式發布隔離契約"
+  ],
+  "official_entries": [
+    ".github/workflows/build-windows.yml"
+  ],
+  "allowed_paths": [
+    ".codex/batches/FU-20260802-005.json",
+    ".github/workflows/build-windows.yml",
+    "tests/test_self_check_contract.py",
+    "tests/test_windows_command_files.py",
+    "tests/test_windows_delivery_metadata.py",
+    "tests/test_windows_installer.py",
+    "tests/test_windows_sp1_delivery.py",
+    "tests/test_windows_sp2_delivery.py",
+    "tests/test_windows_sp3_delivery.py"
+  ],
+  "direct_dependencies_read_only": [
+    "第001號已確認規則：正式發布只能使用指定成功驗證成品，不得重新建置。",
+    "第17號草稿合併請求",
+    "雲端失敗執行 30732999807",
+    "core/self_check.py、安裝驗證支援程式與建置腳本"
+  ],
+  "direct_tests": [
+    "tests/test_self_check_contract.py",
+    "tests/test_windows_command_files.py",
+    "tests/test_windows_delivery_metadata.py",
+    "tests/test_windows_installer.py",
+    "tests/test_windows_sp1_delivery.py",
+    "tests/test_windows_sp2_delivery.py",
+    "tests/test_windows_sp3_delivery.py"
+  ],
+  "minimum_local_check": "只執行七份直接測試；不執行全專案回歸、封裝或正式發布。",
+  "cloud_gate": "最終固定提交必須取得真實雲端 Windows 驗證成功紀錄；無執行紀錄或失敗均受阻。",
+  "fixed_role_windows": [
+    "輔｜需求稽核",
+    "輔｜施工",
+    "輔｜程式審查",
+    "輔｜測試驗證"
+  ],
+  "acceptance": [
+    "四個固定角色視窗均回傳本批直接證據。",
+    "七份直接測試全數通過。",
+    "最終固定提交的雲端 Windows 驗證成功。",
+    "第17號維持草稿且未合併。",
+    "未封包、未合併主分支、未正式發布。",
+    "若需產品程式或未列檔案，施工只回報直接證據，不得修改。"
+  ],
+  "forbidden_targets": [
+    "主分支",
+    "正式發布流程檔",
+    "發布頻道",
+    "正式成品與封包",
+    "產品程式檔案",
+    "第003號批次與其紀錄",
+    "付費程式介面"
+  ],
+  "verified_unchanged_areas": [
+    "所有產品程式",
+    ".github/workflows/publish-windows-release.yml",
+    "第17號既有非本批變更",
+    "主分支與正式發布區域"
+  ],
+  "full_regression": false,
+  "windows_validation_build": true,
+  "formal_packaging": false,
+  "paid_api": "FORBIDDEN",
+  "status": "READY",
+  "next_role": "INTEGRATION",
+  "execution_mode": "CODEX_APP"
+}
