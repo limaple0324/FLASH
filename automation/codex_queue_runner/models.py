@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 
 class TaskStatus(str, Enum):
+    PENDING = "PENDING"
     READY = "READY"
     CLAIMED = "CLAIMED"
     WAITING_REVIEW = "WAITING_REVIEW"
@@ -60,12 +61,39 @@ class Task:
     windows_build: bool = False
     next_role: Optional[str] = None
     blocker_inbox: str = "#18"
+    plan_id: str = ""
+    item_id: str = ""
+    item_title: str = ""
+    item_index: int = 0
+    group_index: int = 0
+    group_size: int = 3
+    total_items: int = 0
+    total_groups: int = 0
     comment_id: Optional[int] = None
     comment_author: Optional[str] = None
     comment_created_at: Optional[str] = None
     state_comment_id: Optional[int] = None
     workflow_run_id: Optional[str] = None
     raw: Optional[str] = None
+
+    @property
+    def is_batch_item(self) -> bool:
+        if not self.plan_id or not self.item_id or not self.item_title:
+            return False
+        values = (
+            self.item_index,
+            self.group_index,
+            self.group_size,
+            self.total_items,
+            self.total_groups,
+        )
+        if any(value <= 0 for value in values) or self.group_size != 3:
+            return False
+        if self.item_index > self.total_items or self.group_index > self.total_groups:
+            return False
+        if self.total_groups != (self.total_items + self.group_size - 1) // self.group_size:
+            return False
+        return ((self.item_index - 1) // self.group_size) + 1 == self.group_index
 
 
 @dataclass
