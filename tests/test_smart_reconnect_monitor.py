@@ -1,5 +1,6 @@
 import threading
 
+import services.smart_reconnect_monitor as smart_reconnect_monitor_module
 from core.sp1_boundaries import OperationResult, ReconnectState
 from services.smart_reconnect_monitor import SmartReconnectMonitor
 
@@ -199,6 +200,83 @@ def test_unknown_or_capture_failure_respects_controller_delay():
     assert monitor.run_once()[1] == 30
 
 
+def test_disconnected_without_progress_reports_one_error_after_interval(
+    monkeypatch,
+):
+    waiting = OperationResult(
+        False,
+        "reconnect.waiting",
+        details={
+            "state_counts": {"disconnected": 1},
+            "clicked_windows": 0,
+            "restarted_windows": 0,
+            "next_check_seconds": 2,
+        },
+    )
+    logger = RecordingLogger()
+    monitor = SmartReconnectMonitor(
+        FakeBoundary([waiting, waiting, waiting]),
+        logger=logger,
+        monitor_interval_ms=2000,
+    )
+    moments = iter((0.0, 2.1, 4.2))
+    monkeypatch.setattr(
+        smart_reconnect_monitor_module.time,
+        "monotonic",
+        lambda: next(moments),
+    )
+
+    monitor.run_once()
+    monitor.run_once()
+    monitor.run_once()
+
+    assert len(logger.error_messages) == 1
+    assert "without starting recovery" in logger.error_messages[0]
+    assert "disconnected=1" in logger.error_messages[0]
+
+
+def test_reconnect_progress_clears_stalled_disconnect_monitoring(
+    monkeypatch,
+):
+    waiting = OperationResult(
+        False,
+        "reconnect.waiting",
+        details={
+            "state_counts": {"disconnected": 1},
+            "clicked_windows": 0,
+            "restarted_windows": 0,
+            "next_check_seconds": 2,
+        },
+    )
+    progressed = OperationResult(
+        True,
+        "reconnect.progressed",
+        details={
+            "state_counts": {"disconnected": 1},
+            "clicked_windows": 1,
+            "restarted_windows": 0,
+            "next_check_seconds": 2,
+        },
+    )
+    logger = RecordingLogger()
+    monitor = SmartReconnectMonitor(
+        FakeBoundary([waiting, progressed]),
+        logger=logger,
+        monitor_interval_ms=2000,
+    )
+    moments = iter((0.0, 2.1))
+    monkeypatch.setattr(
+        smart_reconnect_monitor_module.time,
+        "monotonic",
+        lambda: next(moments),
+    )
+
+    monitor.run_once()
+    monitor.run_once()
+
+    assert logger.error_messages == []
+
+
 def test_connected_code_without_complete_health_evidence_keeps_controller_delay():
     incomplete_or_failed = [
         {"next_check_seconds": 21},
@@ -262,6 +340,86 @@ def test_start_and_stop_are_idempotent():
     assert monitor.running is False
     assert boundary.execution_changes[0] is True
     assert boundary.execution_changes[-1] is False
+
+
+def test_start_failure_recloses_controller_execution(monkeypatch):
+    class FailingThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread start failed")
+
+        def is_alive(self):
+            return False
+
+    boundary = FakeBoundary([])
+    monitor = SmartReconnectMonitor(boundary)
+    monkeypatch.setattr(threading, "Thread", FailingThread)
+
+    assert monitor.start() is False
+    assert monitor.running is False
+    assert boundary.execution_enabled is False
+    assert boundary.execution_changes == [True, False]
+
+
+def test_stop_blocks_concurrent_start_until_execution_is_closed(monkeypatch):
+    native_thread = threading.Thread
+
+    class StoppedThread:
+        def is_alive(self):
+            return False
+
+        def join(self, _timeout):
+            pass
+
+    class ImmediateThread(StoppedThread):
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    class BlockingDisableBoundary(FakeBoundary):
+        def __init__(self):
+            super().__init__([])
+            self.disable_started = threading.Event()
+            self.allow_disable = threading.Event()
+
+        def set_execution_enabled(self, enabled):
+            super().set_execution_enabled(enabled)
+            if not enabled:
+                self.disable_started.set()
+                self.allow_disable.wait(1)
+
+    boundary = BlockingDisableBoundary()
+    monitor = SmartReconnectMonitor(boundary)
+    monitor._thread = StoppedThread()
+    monkeypatch.setattr(threading, "Thread", ImmediateThread)
+    stop_results = []
+    start_results = []
+    start_finished = threading.Event()
+
+    stop_worker = native_thread(
+        target=lambda: stop_results.append(monitor.stop()),
+    )
+    stop_worker.start()
+    assert boundary.disable_started.wait(1) is True
+
+    def start_monitor():
+        start_results.append(monitor.start())
+        start_finished.set()
+
+    start_worker = native_thread(target=start_monitor)
+    start_worker.start()
+    assert start_finished.wait(0.2) is False
+
+    boundary.allow_disable.set()
+    stop_worker.join(1)
+    start_worker.join(1)
+
+    assert stop_results == [True]
+    assert start_results == [True]
 
 
 def test_stop_timeout_remains_running_and_disables_all_execution():

@@ -9,6 +9,7 @@ def test_smart_reconnect_verifier_defaults_to_read_only_and_requires_clear_flag(
     assert "--execute-approved-reconnect" in source
     assert "controller.check_connection()" in source
     assert "controller.reconnect()" in source
+    assert "controller.set_execution_enabled(True)" in source
     assert "--watch-seconds requires --execute-approved-reconnect" in source
     assert '"input_sent"' in source
     assert '"monitor_cycles"' in source

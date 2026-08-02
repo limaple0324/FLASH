@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+import time
+from collections.abc import Mapping
 
 from core.sp1_boundaries import OperationResult, SmartReconnectBoundary
 from services.logger_service import LoggerService
@@ -58,6 +60,8 @@ class SmartReconnectMonitor:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._last_signature: tuple[object, ...] | None = None
+        self._disconnected_without_progress_at: float | None = None
+        self._disconnected_without_progress_reported = False
 
     @property
     def running(self) -> bool:
@@ -149,12 +153,69 @@ class SmartReconnectMonitor:
             and not failure_codes
         )
 
+    @staticmethod
+    def _has_positive_count(
+        details: Mapping[str, object],
+        name: str,
+    ) -> bool:
+        value = details.get(name)
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+        )
+
+    def _report_stalled_reconnect(
+        self,
+        result: OperationResult,
+        details: Mapping[str, object],
+        now: float,
+    ) -> None:
+        state_counts = details.get("state_counts")
+        disconnected = (
+            state_counts.get("disconnected")
+            if isinstance(state_counts, Mapping)
+            else 0
+        )
+        detected = (
+            isinstance(disconnected, int)
+            and not isinstance(disconnected, bool)
+            and disconnected > 0
+        )
+        started = self._has_positive_count(details, "clicked_windows") or (
+            self._has_positive_count(details, "restarted_windows")
+        )
+        if not detected or started:
+            self._disconnected_without_progress_at = None
+            self._disconnected_without_progress_reported = False
+            return
+        if self._disconnected_without_progress_at is None:
+            self._disconnected_without_progress_at = now
+            return
+        interval_seconds = self.monitor_interval_ms / 1000.0
+        if (
+            self._disconnected_without_progress_reported
+            or now - self._disconnected_without_progress_at
+            <= interval_seconds
+        ):
+            return
+        self._disconnected_without_progress_reported = True
+        if self._logger is not None:
+            self._logger.error(
+                "Smart reconnect detected a disconnection without starting "
+                "recovery within one monitoring interval; "
+                f"code={result.code}; "
+                f"disconnected={disconnected}; "
+                f"interval_seconds={interval_seconds}"
+            )
+
     def run_once(self) -> tuple[OperationResult, float]:
         result = self._boundary.reconnect()
         delay = self._safe_delay(result, self._fallback_delay_seconds)
         details = result.details or {}
         if self._is_fully_connected_healthy(result):
             delay = max(0.001, self.monitor_interval_ms / 1000.0)
+        self._report_stalled_reconnect(result, details, time.monotonic())
         signature = self._signature(result)
         if self._logger is not None and signature != self._last_signature:
             state_counts = details.get("state_counts", {})
@@ -218,7 +279,15 @@ class SmartReconnectMonitor:
                 name="FLASH-SmartReconnect",
                 daemon=True,
             )
-            self._thread.start()
+            try:
+                self._thread.start()
+            except Exception:
+                self._thread = None
+                if callable(execution_switch):
+                    execution_switch(False)
+                self._stop_event.set()
+                self._settings_changed_event.set()
+                return False
             return True
 
     def stop(self, timeout_seconds: float = 5.0) -> bool:
@@ -227,9 +296,9 @@ class SmartReconnectMonitor:
             "set_execution_enabled",
             None,
         )
-        if callable(execution_switch):
-            execution_switch(False)
         with self._lock:
+            if callable(execution_switch):
+                execution_switch(False)
             thread = self._thread
             if thread is None:
                 return True

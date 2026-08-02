@@ -2092,6 +2092,72 @@ def test_each_known_role_failure_records_then_restarts_only_that_role(
     assert len(records) == 4
 
 
+def test_known_role_failure_restarts_without_status_service(tmp_path):
+    windows = [make_window(1), make_window(2)]
+    plan = make_group_plan(tmp_path, windows, "120")
+    restarter = FakeBattleRestarter(succeeds=False)
+    fixture = make_controller(
+        [1, 1],
+        windows=windows,
+        battle_restarter=restarter,
+        group_launch_plan=plan,
+    )
+
+    fixture.controller._report_reconnect_failure(
+        windows[0].launch_fingerprint
+    )
+
+    assert restarter.calls == [(windows[0], plan.targets[0])]
+    assert restarter.reopen_calls == []
+
+
+def test_target_provider_failure_blocks_direct_role_restart(tmp_path):
+    window = make_window(1)
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [1],
+        windows=[window],
+        expected_windows=1,
+        battle_restarter=restarter,
+        group_launch_plan=make_group_plan(tmp_path, [window], "120"),
+        target_windows_provider=lambda: (_ for _ in ()).throw(
+            RuntimeError("target source failed")
+        ),
+    )
+
+    fixture.controller._report_reconnect_failure(window.launch_fingerprint)
+
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
+def test_target_provider_failure_blocks_pending_role_reopen(tmp_path):
+    window = make_window(1)
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [1],
+        windows=[window],
+        expected_windows=1,
+        battle_restarter=restarter,
+        group_launch_plan=make_group_plan(tmp_path, [window], "120"),
+        target_windows_provider=lambda: (_ for _ in ()).throw(
+            RuntimeError("target source failed")
+        ),
+    )
+    fixture.controller._pending_reopen_fingerprints.add(
+        window.launch_fingerprint
+    )
+    fixture.controller._reopen_retry_after[window.launch_fingerprint] = 0.0
+
+    result = fixture.controller.reconnect()
+
+    assert "target_window_provider_failed" in result.details[
+        "failure_codes"
+    ]
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
 def test_failure_report_does_not_restart_after_capture_settings_change(
     tmp_path,
 ):

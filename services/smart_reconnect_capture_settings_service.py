@@ -82,9 +82,10 @@ class SmartReconnectCaptureSettingsService:
         settings = SmartReconnectCaptureSettings.from_value(value)
         if settings == self._settings:
             return settings
-        self._config.set(
-            SMART_RECONNECT_CAPTURE_MODES_KEY,
-            settings.to_dict(),
-        )
+        with self._config.transaction():
+            self._config.set(
+                SMART_RECONNECT_CAPTURE_MODES_KEY,
+                settings.to_dict(),
+            )
         self._settings = settings
         return settings

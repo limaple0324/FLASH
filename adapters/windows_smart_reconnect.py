@@ -3062,16 +3062,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         capture_route: str | None = None,
     ) -> None:
         service = self._failure_status_service
-        if service is None:
-            return
         target = (
             self._target_for_fingerprint(fingerprint)
             if fingerprint is not None
             else None
         )
+        if target is None and service is None:
+            return
         if target is not None:
             key = f"role:{target.fingerprint}"
-            service.report(key, target.display_name)
+            if service is not None:
+                service.report(key, target.display_name)
             self._record_reconnect_failure(
                 target.display_name,
                 "重連失敗",
@@ -3134,9 +3135,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 False,
                 "reconnect_restart_identity_unresolved",
             )
-        candidates, _source_failures, blocked_fingerprints = (
+        candidates, source_failures, blocked_fingerprints = (
             self._candidate_window_set()
         )
+        if "target_window_provider_failed" in source_failures:
+            self._clear_action_confirmation(fingerprint)
+            return BattleRestartResult(
+                False,
+                "target_window_provider_failed",
+            )
         if fingerprint in blocked_fingerprints:
             self._clear_action_confirmation(fingerprint)
             return BattleRestartResult(
@@ -3395,6 +3402,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self,
         *,
         candidate_windows: tuple[WindowInfo, ...],
+        source_failures: tuple[str, ...],
         blocked_fingerprints: frozenset[str],
         execute: bool,
         now: float,
@@ -3438,6 +3446,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         missing = tuple(sorted(self._pending_reopen_fingerprints))
         if not missing:
             return 0, [], None
+        if "target_window_provider_failed" in source_failures:
+            return (
+                0,
+                [],
+                self._policy.retry_interval_seconds,
+            )
 
         failures: list[str] = []
         reopened = 0
@@ -3584,6 +3598,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         retried_reopens, retry_failures, pending_reopen_delay = (
             self._retry_pending_reopens(
                 candidate_windows=candidate_windows,
+                source_failures=source_failures,
                 blocked_fingerprints=blocked_fingerprints,
                 execute=execute,
                 now=now,

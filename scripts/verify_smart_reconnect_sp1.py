@@ -67,6 +67,8 @@ def main() -> int:
         title_keywords=args.keywords,
         state_path=paths.data_dir() / RECONNECT_STATE_FILENAME,
     )
+    if args.execute_approved_reconnect:
+        controller.set_execution_enabled(True)
     cycles = 0
     if args.watch_seconds:
         deadline = time.monotonic() + args.watch_seconds

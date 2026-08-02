@@ -72,11 +72,13 @@ def test_capture_settings_invalid_items_fail_to_safe_enabled_defaults(tmp_path):
 def test_failed_persist_keeps_previous_runtime_selection(tmp_path, monkeypatch):
     config = ConfigManager(tmp_path / "settings.json")
     service = SmartReconnectCaptureSettingsService(config)
+    previous = service.snapshot()
+    previous_config = config.get(SMART_RECONNECT_CAPTURE_MODES_KEY)
 
-    def fail_set(_key, _value):
+    def fail_save():
         raise OSError("save failed")
 
-    monkeypatch.setattr(config, "set", fail_set)
+    monkeypatch.setattr(config, "_save_now", fail_save)
 
     with pytest.raises(OSError):
         service.update(
@@ -87,4 +89,5 @@ def test_failed_persist_keeps_previous_runtime_selection(tmp_path, monkeypatch):
             )
         )
 
-    assert service.snapshot() == SmartReconnectCaptureSettings()
+    assert service.snapshot() == previous
+    assert config.get(SMART_RECONNECT_CAPTURE_MODES_KEY) == previous_config
