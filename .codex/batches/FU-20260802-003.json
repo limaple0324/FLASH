@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "batch_id": "FU-20260802-003",
+  "source_issue": "#32 / FU-REQ-20260802-014",
+  "source_pr": "#33",
+  "base_commit": "3ce7393637b27c3aea91000fd5f8756d12780234",
+  "target_branch": "automation/fu-batch-verification-record-20260802",
+  "api_scopes": [
+    "批次狀態、驗證證據與合併請求紀錄"
+  ],
+  "confirmed_changes": [
+    "定義 VERIFIED 為所有必要關卡通過的驗證完成，且不代表主分支合併或正式發布。",
+    "將 VERIFIED 納入第 32 號需求收件匣與批次單的適用方式。",
+    "為 FU-20260802-002 補上最終固定提交、草稿合併請求、雲端檢查、需求稽核、程式審查與測試驗證紀錄。",
+    "將第 33 號草稿合併請求的待檢查說明改為實際結果。"
+  ],
+  "owned_paths": [
+    ".codex/batches/FU-20260802-003.json",
+    ".codex/batches/FU-20260802-002.json",
+    "GitHub Issue #32 body",
+    "GitHub Issue #32 comment FU-REQ-20260802-012",
+    "GitHub Issue #32 comment FU-REQ-20260802-014",
+    "GitHub Pull Request #33 body"
+  ],
+  "forbidden_targets": [
+    "產品程式碼",
+    "main",
+    "release/latest",
+    "release/sp1",
+    "正式發布",
+    "正式頻道",
+    "桌面成品",
+    "付費程式介面"
+  ],
+  "acceptance": [
+    "VERIFIED 只表示必要關卡通過，不表示主分支合併或正式發布。",
+    "第 32 號收件匣明確定義 VERIFIED 且不將其列為可派工需求。",
+    "FU-20260802-002 記錄最終固定提交、草稿合併請求、雲端檢查、需求稽核、程式審查與測試驗證。",
+    "第 33 號草稿合併請求只保留實際結果，不含待檢查項目。",
+    "不修改產品程式、主分支或正式發布狀態。"
+  ],
+  "minimum_tests": [
+    "第 32 號收件匣狀態定義與第 012、014 號完成紀錄回讀",
+    "兩份批次單的 VERIFIED 狀態與固定證據核對",
+    "第 33 號草稿合併請求實際結果回讀"
+  ],
+  "full_regression": false,
+  "windows_build": false,
+  "verification_semantics": "VERIFIED 僅表示需求稽核、雲端檢查、程式審查與測試驗證均通過且證據已固定；不表示合併 main 或正式發布。",
+  "verified_source_batch": {
+    "batch_id": "FU-20260802-002",
+    "final_commit": "3ce7393637b27c3aea91000fd5f8756d12780234",
+    "draft_pull_request": 33,
+    "cloud_run": 30730218987
+  },
+  "fixed_evidence": {
+    "initial_batch_commit": "57722ab277c4ee390b516221a2a029cbdb531c6e",
+    "draft_pull_request": {
+      "number": 34,
+      "draft": true,
+      "merged_to_main": false,
+      "target_branch": "automation/fu-req-20260802-012-invalid-task-cleanup"
+    },
+    "cloud_source_status_check": "passed",
+    "automated_window_check": {
+      "status": "not_applicable",
+      "reason": "第 34 號目標分支為 automation/fu-req-20260802-012-invalid-task-cleanup，而既有流程僅限 main。"
+    },
+    "requirements_audit": "passed",
+    "code_review": "passed",
+    "test_validation": "passed",
+    "main_merged": false,
+    "formal_release": false
+  },
+  "status": "VERIFIED",
+  "next_role": "INTEGRATION",
+  "execution_mode": "CODEX_APP",
+  "paid_api": "FORBIDDEN",
+  "github_gate": "PASSED"
+}
