@@ -18,8 +18,10 @@ from typing import Callable, Iterable, Protocol
 
 from adapters.game_screen_recognizer import (
     CharacterSelectionCandidate,
+    DEFAULT_LINE_NUMBER,
     FORCE_LOGIN_CLICK_POINT,
     CHARACTER_ENTER_CLICK_POINT,
+    LINE_ROUTE_CLICK_POINTS,
     NormalizedPoint,
     ReferenceScreenRecognizer,
     ScreenRecognition,
@@ -1311,6 +1313,7 @@ class ReconnectRuntimeState:
     terminal_ready_after: dict[str, float]
     flow_pause_until: dict[str, float]
     scope_token: str | None
+    preferred_line_numbers: dict[str, int]
 
 
 @dataclass(slots=True)
@@ -1326,8 +1329,9 @@ class _TerminalEvidence:
 class ReconnectRuntimeStateStore:
     """Persist only anonymous fingerprints and reconnect timing state."""
 
-    VERSION = 6
+    VERSION = 7
     LEGACY_VERSIONS = frozenset({1, 2, 3, 4, 5})
+    MIGRATABLE_VERSIONS = frozenset({6})
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -1346,6 +1350,7 @@ class ReconnectRuntimeStateStore:
             {},
             {},
             None,
+            {},
         )
 
     @staticmethod
@@ -1369,7 +1374,9 @@ class ReconnectRuntimeStateStore:
             if (
                 not isinstance(payload, dict)
                 or payload.get("version")
-                not in self.LEGACY_VERSIONS | {self.VERSION}
+                not in self.LEGACY_VERSIONS
+                | self.MIGRATABLE_VERSIONS
+                | {self.VERSION}
             ):
                 raise ValueError("Unsupported reconnect state version")
             # Versions 1-3 can contain reconnect authorization created before
@@ -1472,6 +1479,20 @@ class ReconnectRuntimeStateStore:
                 ):
                     raise ValueError("Invalid reconnect flow pause")
                 flow_pauses[fingerprint] = pause_until
+            raw_preferred_lines = payload.get("preferred_line_numbers", {})
+            if not isinstance(raw_preferred_lines, dict):
+                raise ValueError("preferred_line_numbers must be an object")
+            preferred_line_numbers: dict[str, int] = {}
+            for raw_fingerprint, raw_line_number in raw_preferred_lines.items():
+                fingerprint = normalize_launch_fingerprint(raw_fingerprint)
+                if (
+                    fingerprint is None
+                    or isinstance(raw_line_number, bool)
+                    or not isinstance(raw_line_number, int)
+                    or raw_line_number not in LINE_ROUTE_CLICK_POINTS
+                ):
+                    raise ValueError("Invalid preferred reconnect line")
+                preferred_line_numbers[fingerprint] = raw_line_number
             state = ReconnectRuntimeState(
                 pending,
                 active,
@@ -1482,6 +1503,7 @@ class ReconnectRuntimeStateStore:
                 terminal_ready,
                 flow_pauses,
                 scope_token,
+                preferred_line_numbers,
             )
             if scope_token is None and (
                 state.pending_fingerprints
@@ -1493,6 +1515,9 @@ class ReconnectRuntimeStateStore:
                 or state.flow_pause_until
             ):
                 empty = self._empty()
+                empty.preferred_line_numbers = (
+                    state.preferred_line_numbers
+                )
                 self.save(empty)
                 return empty
             return state
@@ -1543,6 +1568,10 @@ class ReconnectRuntimeStateStore:
                 fingerprint: state.flow_pause_until[fingerprint]
                 for fingerprint in sorted(state.flow_pause_until)
             },
+            "preferred_line_numbers": {
+                fingerprint: state.preferred_line_numbers[fingerprint]
+                for fingerprint in sorted(state.preferred_line_numbers)
+            },
         }
         temp_path = self.path.with_name(
             f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -1579,6 +1608,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         obscured_capture_provider: WindowCaptureProvider | None = None,
         active_refresh_capture_provider: WindowCaptureProvider | None = None,
         primary_capture_is_trusted: bool = False,
+        primary_capture_is_fresh_without_visibility: bool = False,
         capture_settings: SmartReconnectCaptureSettings | None = None,
         policy: ReconnectPolicy | None = None,
         preflight_timeout_ms: int = 1000,
@@ -1612,6 +1642,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._obscured_capture_provider = obscured_capture_provider
         self._active_refresh_capture_provider = active_refresh_capture_provider
         self._primary_capture_is_trusted = bool(primary_capture_is_trusted)
+        self._primary_capture_is_fresh_without_visibility = bool(
+            primary_capture_is_fresh_without_visibility
+        )
         self._capture_settings_lock = threading.RLock()
         self._capture_settings = (
             capture_settings
@@ -1650,6 +1683,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 {},
                 {},
                 None,
+                {},
             )
         )
         self._runtime_scope_token = runtime_state.scope_token
@@ -1682,6 +1716,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             tuple[ReconnectScreenState, float],
         ] = {}
         self._flow_pause_until = runtime_state.flow_pause_until
+        self._preferred_line_numbers = runtime_state.preferred_line_numbers
         self._allowed_fingerprints: frozenset[str] | None = None
         self.set_allowed_fingerprints(allowed_fingerprints)
         self._battle_restarter = battle_restarter
@@ -1733,18 +1768,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             expected_windows=expected_windows,
             title_keywords=title_keywords,
             window_backend=window_backend,
-            # Observation must never restore or activate a minimized game.
-            # If a passive PrintWindow frame is stale, the controller fails
-            # closed instead of disturbing the player to refresh it.
+            # All reading remains in the background. Reconnect checks must not
+            # reveal, restore, reorder, or activate a player's game window.
             capture_provider=Win32PrintWindowProvider(),
             visible_capture_provider=Win32VisibleRegionCaptureProvider(),
-            obscured_capture_provider=(
-                Win32TemporarilyRevealedCaptureProvider()
-            ),
-            # Active reconnect may briefly restore a minimized projector
-            # without activation, capture a current frame, then return it to
-            # its original minimized state. Passive monitoring never uses it.
-            active_refresh_capture_provider=Win32RecoveringPrintWindowProvider(),
+            obscured_capture_provider=None,
+            active_refresh_capture_provider=None,
+            primary_capture_is_trusted=True,
+            primary_capture_is_fresh_without_visibility=True,
             recognizer=ReferenceScreenRecognizer(reference_dir),
             mouse_backend=Win32MouseMessageBackend(),
             capture_settings=capture_settings,
@@ -2034,6 +2065,23 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         True,
                         route,
                     )
+            if self._primary_capture_is_fresh_without_visibility:
+                try:
+                    passive_sample = self._capture_provider.capture(
+                        window.handle
+                    )
+                except OSError:
+                    passive_sample = None
+                if (
+                    passive_sample is not None
+                    and passive_sample.api_succeeded
+                ):
+                    return (
+                        passive_sample,
+                        self._recognizer.recognize_capture(passive_sample),
+                        True,
+                        route,
+                    )
             return self._unknown_capture_result(route=route)
 
         fallback_provider = self._visible_capture_provider
@@ -2112,6 +2160,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._remember_capture_route(fingerprint, route)
         if not settings.obscured:
             return self._disabled_capture_result(route)
+
+        if self._primary_capture_is_fresh_without_visibility:
+            try:
+                passive_sample = self._capture_provider.capture(window.handle)
+            except OSError:
+                passive_sample = None
+            if (
+                passive_sample is not None
+                and passive_sample.api_succeeded
+            ):
+                return (
+                    passive_sample,
+                    self._recognizer.recognize_capture(passive_sample),
+                    True,
+                    route,
+                )
 
         if not execute or not self._execution_allowed():
             # Passive observers may inspect already visible desktop pixels,
@@ -2670,6 +2734,30 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             item.battle_context,
         )
 
+    def _recognition_for_preferred_line(
+        self,
+        fingerprint: str,
+        item: ScreenRecognition,
+    ) -> ScreenRecognition:
+        """Use the last confirmed route instead of an ambiguous dialog hint."""
+        if (
+            item.state is not ReconnectScreenState.LINE_SELECTION
+            or item.click_point is None
+        ):
+            return item
+        line_number = self._preferred_line_numbers.get(
+            fingerprint,
+            DEFAULT_LINE_NUMBER,
+        )
+        click_point = LINE_ROUTE_CLICK_POINTS.get(line_number)
+        if click_point is None:
+            return item
+        return replace(
+            item,
+            line_number=line_number,
+            click_point=click_point,
+        )
+
     def _clear_action_confirmation(self, fingerprint: str | None = None) -> None:
         if fingerprint is None:
             self._action_confirmations.clear()
@@ -3048,6 +3136,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             fingerprint,
             recognition,
         )
+        current = self._recognition_for_preferred_line(
+            fingerprint,
+            current,
+        )
         if self._action_signature(current) != self._action_signature(expected):
             return None
         return current_route
@@ -3368,6 +3460,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 dict(self._terminal_ready_after),
                 dict(self._flow_pause_until),
                 self._runtime_scope_token,
+                dict(self._preferred_line_numbers),
             )
 
     def _persist_runtime_state(self) -> bool:
@@ -3402,6 +3495,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 tuple(sorted(self._terminal_ready_after.items())),
                 tuple(sorted(self._flow_pause_until.items())),
                 self._runtime_scope_token,
+                tuple(sorted(self._preferred_line_numbers.items())),
             )
 
     def _retry_pending_reopens(
@@ -3810,6 +3904,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     self._terminal_evidence.pop(fingerprint, None)
                     self._clear_reconnect_failure(fingerprint)
             recognition = self._recognition_for_session_action(
+                fingerprint,
+                recognition,
+            )
+            recognition = self._recognition_for_preferred_line(
                 fingerprint,
                 recognition,
             )
@@ -4293,6 +4391,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     self._clear_action_confirmation(fingerprint)
                     continue
                 if click_result.delivered:
+                    if (
+                        item.state is ReconnectScreenState.LINE_SELECTION
+                        and item.line_number in LINE_ROUTE_CLICK_POINTS
+                    ):
+                        self._preferred_line_numbers[fingerprint] = (
+                            item.line_number
+                        )
                     if item.state is ReconnectScreenState.CHARACTER_SELECTION:
                         if item.character_slot_selected is True:
                             self._character_selection_pending.discard(

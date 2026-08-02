@@ -2278,7 +2278,7 @@ def test_confirm_force_login_and_followup_obey_five_ten_ten_waits():
     assert fixture.mouse.clicks == [
         (1, (0.5, 0.5)),
         (1, (0.505, 0.856)),
-        (1, (0.5, 0.3)),
+        (1, (0.5, 0.327)),
     ]
 
 
@@ -2367,7 +2367,7 @@ def test_legacy_reconnect_authority_is_cleared_before_controller_can_act(
     assert fixture.controller.reconnecting_fingerprints() == frozenset()
     assert fixture.mouse.clicks == []
     migrated = json.loads(state_path.read_text(encoding="utf-8"))
-    assert migrated["version"] == 6
+    assert migrated["version"] == ReconnectRuntimeStateStore.VERSION
     assert migrated["scope_token"] is None
     assert migrated["pending_fingerprints"] == []
     assert migrated["active_fingerprints"] == []
@@ -2813,7 +2813,7 @@ def test_unknown_peer_is_never_operated_during_a_known_reconnect_session():
     assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
 
 
-def test_changed_action_target_requires_two_new_matching_frames():
+def test_line_selection_keeps_default_when_dialog_indicator_changes():
     fixture = make_controller([4, 1])
     fingerprint = make_window(1).launch_fingerprint
     fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
@@ -2823,12 +2823,12 @@ def test_changed_action_target_requires_two_new_matching_frames():
     changed = fixture.controller.reconnect()
     confirmed = fixture.controller.reconnect()
 
-    assert changed.details["clicked_windows"] == 0
-    assert confirmed.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(1, (0.5, 0.4))]
+    assert changed.details["clicked_windows"] == 1
+    assert confirmed.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == [(1, (0.5, 0.327))]
 
 
-def test_real_controller_separates_passive_and_active_minimized_capture():
+def test_real_controller_uses_only_non_disruptive_background_capture():
     controller = WindowsSmartReconnectController.for_real_windows(
         reference_dir=Path("assets") / "reconnect_reference",
         expected_windows=1,
@@ -2836,11 +2836,31 @@ def test_real_controller_separates_passive_and_active_minimized_capture():
 
     assert isinstance(controller._capture_provider, Win32PrintWindowProvider)
     assert type(controller._capture_provider) is Win32PrintWindowProvider
-    assert isinstance(
-        controller._active_refresh_capture_provider,
-        Win32RecoveringPrintWindowProvider,
+    assert controller._obscured_capture_provider is None
+    assert controller._active_refresh_capture_provider is None
+    assert controller._primary_capture_is_trusted is True
+    assert controller._primary_capture_is_fresh_without_visibility is True
+
+
+def test_line_selection_keeps_the_saved_default_instead_of_dialog_hint(
+    tmp_path,
+):
+    state_path = tmp_path / "reconnect-state.json"
+    fixture = make_controller(
+        [4, 1],
+        points={4: (0.5, 0.665)},
+        state_path=state_path,
     )
-    assert controller._primary_capture_is_trusted is False
+    fingerprint = make_window(1).launch_fingerprint
+    fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(1, (0.5, 0.327))]
+    saved = ReconnectRuntimeStateStore(state_path).load()
+    assert saved.preferred_line_numbers == {fingerprint: 1}
 
 
 def test_fresh_visible_capture_wins_without_running_stale_primary_capture():

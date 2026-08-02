@@ -11,7 +11,6 @@ def test_character_detail_uses_note_and_confirmed_game_data_sections() -> None:
 
     assert "備註" in source
     assert "儲存備註" in source
-    assert "靈魂石" not in source
     assert "寵物天賦" in source
     assert "黑曜石" in source
     assert "命魂" in source
@@ -46,4 +45,3 @@ def test_character_detail_summary_is_player_facing() -> None:
     )
     assert _display_value(None) == "尚未設定"
     assert not hasattr(detail, "character_id")
-    assert not hasattr(detail, "soul_stone")

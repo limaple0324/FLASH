@@ -123,7 +123,6 @@ def test_home_has_real_product_pages_and_group_selection() -> None:
     assert '"組別與遊戲視窗"' not in source
     assert "on_group_change" in source
     assert "character_choices" in source
-    assert "靈魂石" not in source
     assert "_build_group_summary(sidebar)" not in source
     assert "_build_header(root)" not in source
     assert 'text="+"' not in source

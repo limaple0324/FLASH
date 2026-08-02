@@ -164,6 +164,17 @@ def test_role_id_read_uses_the_entry_safe_window_not_groupwide_failure():
     assert "if snapshot.failure_codes:" not in function_source
 
 
+def test_role_id_calibration_uses_the_registered_label_when_field_is_empty():
+    source = Path("main.py").read_text(encoding="utf-8")
+    function_source = source[
+        source.index("    def calibrate_role_id("):
+        source.index("    def read_role_id(")
+    ]
+
+    assert "if not calibrated_role_id.strip():" in function_source
+    assert "calibrated_role_id = entry.display_name" in function_source
+
+
 def test_startup_error_uses_product_name():
     source = Path("main.py").read_text(encoding="utf-8")
 

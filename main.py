@@ -3296,9 +3296,28 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         window_info = unique_window_for_group_entry(group_name, entry_id)
         if window_info is None:
             return "無法唯一確認角色窗口，未校正角色ID。"
+        calibrated_role_id = role_id
+        if not calibrated_role_id.strip():
+            group = group_configuration_service.group(group_name)
+            entry = (
+                next(
+                    (
+                        item
+                        for item in group.entries
+                        if item.entry_id == entry_id
+                    ),
+                    None,
+                )
+                if group is not None
+                else None
+            )
+            if entry is not None:
+                # The configured role label is the only existing identity
+                # evidence available before the first visual calibration.
+                calibrated_role_id = entry.display_name
         result = role_id_template_service.calibrate(
             window_info.handle,
-            role_id,
+            calibrated_role_id,
         )
         if result.success:
             group_configuration_service.set_role_id(
