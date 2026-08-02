@@ -138,6 +138,18 @@ jobs:
           ) {
             throw 'The Windows build workflow must produce a validation-only artifact.'
           }
+          if ($buildKind -eq 'sp1_snapshot' -and $metadata.milestone -ne 'SP1') {
+            throw 'SP1 validation branch must use milestone=SP1.'
+          }
+          if ($buildKind -eq 'sp2_snapshot' -and $metadata.milestone -ne 'SP2') {
+            throw 'SP2 validation branch must use milestone=SP2.'
+          }
+          if ($buildKind -eq 'sp3_snapshot' -and $metadata.milestone -ne 'SP3') {
+            throw 'SP3 validation branch must use milestone=SP3.'
+          }
+          if ($env:BUILD_REF -eq 'refs/heads/main' -and $metadata.milestone -ne 'SP3') {
+            throw 'The main validation branch must use milestone=SP3.'
+          }
           $approvalActor = 'none'
           $approvalRunId = 'none'
           $approvalEvent = 'none'

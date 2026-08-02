@@ -25,12 +25,13 @@
     ],
     "direct_test": {
       "selector": "python -m pytest -q tests/test_self_check_contract.py tests/test_windows_command_files.py tests/test_windows_delivery_metadata.py tests/test_windows_installer.py tests/test_windows_sp1_delivery.py tests/test_windows_sp2_delivery.py tests/test_windows_sp3_delivery.py",
-      "result": "26 passed",
+      "result": "30 passed",
       "exit_code": 0,
-      "duration_seconds": 8.55,
+      "duration_seconds": 6.81,
       "after_latest_remediation": true,
       "after_second_latest_remediation": true,
-      "after_third_latest_remediation": true
+      "after_third_latest_remediation": true,
+      "after_code_review_remediation": true
     },
     "cloud_execution": {
       "previous_run": 30732999807,
@@ -43,6 +44,12 @@
       "third_latest_failure": "驗證腳本已通過，但工作流程讀取殘留的外部程式退出碼而誤判失敗。",
       "remediation": "驗證成品包含既有驗證腳本要求並雜湊的固定檔案，正式檔案隔離仍由建置身分守門與禁止清單驗證，且驗證腳本呼叫後立即保存 PowerShell 成功狀態。",
       "final_run": "PENDING_PUSH_TRIGGER"
+    },
+    "code_review_remediation": {
+      "reviewed_commit": "0cb79ec754755f19e9d25f03ff25f51751b5948d",
+      "finding": "特殊施工分支與里程碑的一致性檢查缺失，可能讓錯配身分通過驗證建置。",
+      "remediation": "建置流程恢復 SP1、SP2、SP3 特殊施工分支及主分支的里程碑一致性檢查；維持僅產生驗證成品且不自動正式發布。",
+      "cloud_execution": "PENDING_PUSH_TRIGGER"
     },
     "delivery_state": {
       "packaged": false,

@@ -31,6 +31,18 @@ def test_sp2_branch_is_built_as_a_validation_artifact():
     assert "'SP2' { 'FLASH-SP1+SP2-Windows' }" in metadata_step
 
 
+def test_sp2_validation_branch_requires_the_sp2_milestone():
+    metadata_step = _step(
+        _workflow(),
+        "Read delivery metadata",
+        "Build windowed executable",
+    )
+
+    assert "$buildKind -eq 'sp2_snapshot'" in metadata_step
+    assert "$metadata.milestone -ne 'SP2'" in metadata_step
+    assert "SP2 validation branch must use milestone=SP2." in metadata_step
+
+
 def test_sp2_validation_bundle_is_separate_from_all_formal_delivery_files():
     workflow = _workflow()
     create_bundle = _step(

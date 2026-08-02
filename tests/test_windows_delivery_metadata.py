@@ -43,6 +43,21 @@ def test_validation_build_has_no_formal_release_channel():
     assert "release/sp1" not in workflow
 
 
+def test_validation_build_rejects_special_branch_and_milestone_mismatches():
+    workflow = _workflow()
+
+    for build_kind, milestone in (
+        ("sp1_snapshot", "SP1"),
+        ("sp2_snapshot", "SP2"),
+        ("sp3_snapshot", "SP3"),
+    ):
+        assert f"$buildKind -eq '{build_kind}'" in workflow
+        assert f"$metadata.milestone -ne '{milestone}'" in workflow
+        assert f"{milestone} validation branch must use milestone={milestone}." in workflow
+    assert "$env:BUILD_REF -eq 'refs/heads/main'" in workflow
+    assert "The main validation branch must use milestone=SP3." in workflow
+
+
 def test_workflow_uses_the_coordinated_build_output():
     workflow = _workflow()
 

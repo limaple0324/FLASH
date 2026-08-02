@@ -38,6 +38,18 @@ def test_validation_build_info_records_non_publishable_identity():
     assert "'分支驗證說明.txt'" in create_bundle
 
 
+def test_sp1_validation_branch_requires_the_sp1_milestone():
+    metadata_step = _step(
+        _workflow(),
+        "Read delivery metadata",
+        "Build windowed executable",
+    )
+
+    assert "$buildKind -eq 'sp1_snapshot'" in metadata_step
+    assert "$metadata.milestone -ne 'SP1'" in metadata_step
+    assert "SP1 validation branch must use milestone=SP1." in metadata_step
+
+
 def test_validation_bundle_excludes_the_live_updater_and_installers():
     workflow = _workflow()
     create_bundle = _step(

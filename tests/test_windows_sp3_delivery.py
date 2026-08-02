@@ -31,6 +31,18 @@ def test_sp3_branch_uses_the_complete_validation_identity():
     assert "release/latest" not in workflow
 
 
+def test_sp3_validation_branch_requires_the_sp3_milestone():
+    metadata_step = _step(
+        _workflow(),
+        "Read delivery metadata",
+        "Build windowed executable",
+    )
+
+    assert "$buildKind -eq 'sp3_snapshot'" in metadata_step
+    assert "$metadata.milestone -ne 'SP3'" in metadata_step
+    assert "SP3 validation branch must use milestone=SP3." in metadata_step
+
+
 def test_validation_builds_never_create_formal_install_or_update_payloads():
     workflow = _workflow()
     create_bundle = _step(
