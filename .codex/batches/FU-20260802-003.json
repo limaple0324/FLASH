@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "batch_id": "FU-20260802-003",
+  "source_issue": "#32 / FU-REQ-20260802-014",
+  "source_pr": "#33",
+  "base_commit": "3ce7393637b27c3aea91000fd5f8756d12780234",
+  "target_branch": "automation/fu-batch-verification-record-20260802",
+  "api_scopes": [
+    "批次狀態、驗證證據與合併請求紀錄"
+  ],
+  "confirmed_changes": [
+    "定義 VERIFIED 為所有必要關卡通過的驗證完成，且不代表主分支合併或正式發布。",
+    "將 VERIFIED 納入第 32 號需求收件匣與批次單的適用方式。",
+    "為 FU-20260802-002 補上最終固定提交、草稿合併請求、雲端檢查、需求稽核、程式審查與測試驗證紀錄。",
+    "將第 33 號草稿合併請求的待檢查說明改為實際結果。"
+  ],
+  "owned_paths": [
+    ".codex/batches/FU-20260802-003.json",
+    ".codex/batches/FU-20260802-002.json",
+    "GitHub Issue #32 body",
+    "GitHub Issue #32 comment FU-REQ-20260802-012",
+    "GitHub Issue #32 comment FU-REQ-20260802-014",
+    "GitHub Pull Request #33 body"
+  ],
+  "forbidden_targets": [
+    "產品程式碼",
+    "main",
+    "release/latest",
+    "release/sp1",
+    "正式發布",
+    "正式頻道",
+    "桌面成品",
+    "付費程式介面"
+  ],
+  "acceptance": [
+    "VERIFIED 只表示必要關卡通過，不表示主分支合併或正式發布。",
+    "第 32 號收件匣明確定義 VERIFIED 且不將其列為可派工需求。",
+    "FU-20260802-002 記錄最終固定提交、草稿合併請求、雲端檢查、需求稽核、程式審查與測試驗證。",
+    "第 33 號草稿合併請求只保留實際結果，不含待檢查項目。",
+    "不修改產品程式、主分支或正式發布狀態。"
+  ],
+  "minimum_tests": [
+    "第 32 號收件匣狀態定義與第 012、014 號完成紀錄回讀",
+    "兩份批次單的 VERIFIED 狀態與固定證據核對",
+    "第 33 號草稿合併請求實際結果回讀"
+  ],
+  "full_regression": false,
+  "windows_build": false,
+  "status": "READY",
+  "next_role": "INTEGRATION",
+  "execution_mode": "CODEX_APP",
+  "paid_api": "FORBIDDEN",
+  "github_gate": "REQUIRED"
+}
