@@ -1,0 +1,470 @@
+{
+  "app_state": {
+    "machine_id": "li-hj|user",
+    "active_group_index": 0,
+    "active_group_name": "14支",
+    "window_geometry": "760x504+835+474",
+    "disconnect_detect_enabled": false,
+    "disconnect_restore_minimized": false,
+    "disconnect_detect_interval_ms": "1000",
+    "section_visibility": {
+      "窗口": true,
+      "同步窗口": false,
+      "組別啟動設定": true,
+      "遊戲時間": false,
+      "定時按下": false,
+      "自動點擊": false,
+      "還原調整 Flash 視窗": false,
+      "狀態紀錄": false
+    }
+  },
+  "groups": [
+    {
+      "name": "14支",
+      "custom_key_display": "XBUTTON1",
+      "launch_hotkey_display": "",
+      "master_locked": true,
+      "sync_left_enabled": true,
+      "sync_keyboard_enabled": true,
+      "keyboard_key_displays": [
+        "ESC"
+      ],
+      "fishing_route_name": "東郊",
+      "launch_entries": [
+        {
+          "path": "C:\\Users\\USER\\Desktop\\120古.lnk",
+          "role": "主窗口",
+          "x": -2191,
+          "y": -523,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\120靈.lnk",
+          "role": "同步窗口",
+          "x": -2192,
+          "y": 100,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\120射.lnk",
+          "role": "同步窗口",
+          "x": -2192,
+          "y": 252,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\120福.lnk",
+          "role": "同步窗口",
+          "x": -3092,
+          "y": 252,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\120獵.lnk",
+          "role": "同步窗口",
+          "x": -3844,
+          "y": 253,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\100古.lnk",
+          "role": "同步窗口",
+          "x": -3848,
+          "y": -523,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\100靈.lnk",
+          "role": "同步窗口",
+          "x": -3093,
+          "y": -523,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\100福.lnk",
+          "role": "同步窗口",
+          "x": -3848,
+          "y": -129,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\100獵.lnk",
+          "role": "同步窗口",
+          "x": -3093,
+          "y": -127,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\160福.lnk",
+          "role": "同步窗口",
+          "x": -8,
+          "y": 0,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\160帥.lnk",
+          "role": "同步窗口",
+          "x": 109,
+          "y": 411,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\大排.lnk",
+          "role": "同步窗口",
+          "x": 117,
+          "y": 0,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\和尚.lnk",
+          "role": "同步窗口",
+          "x": -10,
+          "y": 413,
+          "width": 915,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\餐廳.lnk",
+          "role": "同步窗口",
+          "x": 1017,
+          "y": 0,
+          "width": 911,
+          "height": 629,
+          "delay_ms": 0
+        }
+      ]
+    },
+    {
+      "name": "諸魔掛機",
+      "custom_key_display": "",
+      "launch_hotkey_display": "",
+      "master_locked": true,
+      "sync_left_enabled": true,
+      "sync_keyboard_enabled": true,
+      "keyboard_key_displays": [
+        "ESC"
+      ],
+      "fishing_route_name": "湖北",
+      "launch_entries": [
+        {
+          "path": "C:\\Users\\USER\\Desktop\\134獵人.lnk",
+          "role": "主窗口",
+          "x": -6,
+          "y": 0,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\150魔心射手.lnk",
+          "role": "同步窗口",
+          "x": 115,
+          "y": 0,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\153魔心.lnk",
+          "role": "同步窗口",
+          "x": 1013,
+          "y": 0,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\160帥.lnk",
+          "role": "同步窗口",
+          "x": 109,
+          "y": 411,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\和尚.lnk",
+          "role": "同步窗口",
+          "x": -10,
+          "y": 413,
+          "width": 915,
+          "height": 629,
+          "delay_ms": 0
+        }
+      ]
+    },
+    {
+      "name": "160",
+      "custom_key_display": "",
+      "launch_hotkey_display": "",
+      "master_locked": true,
+      "sync_left_enabled": true,
+      "sync_keyboard_enabled": true,
+      "keyboard_key_displays": [
+        "ESC"
+      ],
+      "fishing_route_name": "雲天",
+      "launch_entries": [
+        {
+          "path": "C:\\Users\\USER\\Desktop\\餐廳.lnk",
+          "role": "主窗口",
+          "x": 1009,
+          "y": 0,
+          "width": 918,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\160帥.lnk",
+          "role": "同步窗口",
+          "x": -9,
+          "y": 0,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\160福.lnk",
+          "role": "同步窗口",
+          "x": 109,
+          "y": 0,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\大排.lnk",
+          "role": "同步窗口",
+          "x": -10,
+          "y": 413,
+          "width": 915,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\和尚.lnk",
+          "role": "同步窗口",
+          "x": -10,
+          "y": 413,
+          "width": 915,
+          "height": 629,
+          "delay_ms": 0
+        }
+      ]
+    },
+    {
+      "name": "雙古打守紀用",
+      "custom_key_display": "",
+      "launch_hotkey_display": "",
+      "master_locked": true,
+      "sync_left_enabled": true,
+      "sync_keyboard_enabled": false,
+      "keyboard_key_displays": [
+        "ESC"
+      ],
+      "fishing_route_name": "平原",
+      "launch_entries": [
+        {
+          "path": "C:\\Users\\USER\\Desktop\\和尚.lnk",
+          "role": "主窗口",
+          "x": 895,
+          "y": 415,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\160帥.lnk",
+          "role": "同步窗口",
+          "x": -7,
+          "y": 415,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        }
+      ]
+    },
+    {
+      "name": "魔心次元組",
+      "custom_key_display": "",
+      "launch_hotkey_display": "",
+      "master_locked": true,
+      "sync_left_enabled": true,
+      "sync_keyboard_enabled": true,
+      "keyboard_key_displays": [
+        "ESC"
+      ],
+      "fishing_route_name": "東郊",
+      "launch_entries": [
+        {
+          "path": "C:\\Users\\USER\\Desktop\\130射.lnk",
+          "role": "主窗口",
+          "x": -2191,
+          "y": -523,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\120福.lnk",
+          "role": "同步窗口",
+          "x": 929,
+          "y": 1,
+          "width": 1000,
+          "height": 700,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\130工.lnk",
+          "role": "同步窗口",
+          "x": -3093,
+          "y": -523,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\130古.lnk",
+          "role": "同步窗口",
+          "x": -3848,
+          "y": -523,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\90獵.lnk",
+          "role": "同步窗口",
+          "x": -3848,
+          "y": -95,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\85獵.lnk",
+          "role": "同步窗口",
+          "x": -3855,
+          "y": 251,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\90古.lnk",
+          "role": "同步窗口",
+          "x": -3094,
+          "y": -89,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\100射.lnk",
+          "role": "同步窗口",
+          "x": -3091,
+          "y": 251,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\70射.lnk",
+          "role": "同步窗口",
+          "x": -2190,
+          "y": 100,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\70獵.lnk",
+          "role": "同步窗口",
+          "x": -2190,
+          "y": 249,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\90工程5.lnk",
+          "role": "同步窗口",
+          "x": -8,
+          "y": 0,
+          "width": 916,
+          "height": 629,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\134獵人.lnk",
+          "role": "同步窗口",
+          "x": 927,
+          "y": 347,
+          "width": 1000,
+          "height": 700,
+          "delay_ms": 0
+        },
+        {
+          "path": "C:\\Users\\USER\\Desktop\\150魔心射手.lnk",
+          "role": "同步窗口",
+          "x": -7,
+          "y": 348,
+          "width": 1000,
+          "height": 700,
+          "delay_ms": 0
+        }
+      ]
+    },
+    {
+      "name": "魔心隊長雙人",
+      "custom_key_display": "ESCAPE",
+      "launch_hotkey_display": "",
+      "master_locked": true,
+      "sync_left_enabled": true,
+      "sync_keyboard_enabled": true,
+      "keyboard_key_displays": [
+        "ESC"
+      ],
+      "fishing_route_name": "東郊",
+      "launch_entries": []
+    },
+    {
+      "name": "第7組",
+      "custom_key_display": "F4",
+      "launch_hotkey_display": "",
+      "master_locked": false,
+      "sync_left_enabled": true,
+      "sync_keyboard_enabled": false,
+      "keyboard_key_displays": [
+        "ESC"
+      ],
+      "fishing_route_name": "東郊",
+      "launch_entries": []
+    }
+  ]
+}

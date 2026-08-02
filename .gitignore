@@ -1,0 +1,6 @@
+# 產生基本排除
+*__pycache__/
+*.pyc
+*.pyo
+outputs/__pycache__/
+outputs/.packaging_v02/
