@@ -180,13 +180,24 @@
     {
       "編號": "FU-REQ-20260803-004",
       "項目": "同步器保存、視窗識別、縮小喚醒、組別啟動、位置還原、鍵盤同步與取消批量加入",
-      "狀態": "待比對備份提交",
+      "狀態": "本機核對通過，無須恢復",
       "比對來源提交": "673f86876dc88d43bd15809ca5d8b0c608291678",
       "檔案所有權": [],
       "解鎖條件": "只讀比對後，僅將可由程式與直接測試證明的檔案寫入本批次單。",
       "禁止範圍": ["未經比對證明的行為", "較新安全修正", "雲端", "桌面", "正式發布"],
-      "最小測試": [],
-      "驗收": ["不覆蓋較新安全修正", "只恢復可直接證明的既有行為"]
+      "最小測試": [
+        "tests/test_main_input_sync.py::test_sync_key_collapsed_state_is_loaded_saved_and_wired_to_home",
+        "tests/test_main_input_sync.py::test_smart_reconnect_interval_uses_legacy_key_and_is_saved",
+        "tests/test_main_input_sync.py::test_smart_reconnect_capture_modes_use_one_formal_persistent_entrypoint",
+        "tests/test_group_window_launch_service.py::test_launches_only_missing_roles_and_restores_every_saved_position",
+        "tests/test_group_window_launch_service.py::test_unknown_existing_game_window_stops_before_launch",
+        "tests/test_group_window_launch_service.py::test_records_all_current_exact_window_positions_in_one_save",
+        "tests/test_windows_input_sync.py::test_all_policy_sends_b_to_foreground_background_and_minimized",
+        "tests/test_keyboard_sync_monitor.py::test_key_keeps_the_source_handle_captured_at_press_time",
+        "tests/test_windows_smart_reconnect.py::test_win32_mouse_minimized_click_restores_full_window_state"
+      ],
+      "本機比對": "現行程式已保存同步設定；以啟動指紋與完整視窗身分處理目標；縮小視窗可安全還原；整組只啟動缺少角色並還原已保存位置；鍵盤保留按下瞬間來源；檔案選擇取消時不寫入任何批量加入。",
+      "驗收": ["不覆蓋較新安全修正", "只恢復可直接證明的既有行為", "九項最小測試全數通過"]
     },
     {
       "編號": "FU-REQ-20260802-003",
