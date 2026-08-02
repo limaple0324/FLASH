@@ -255,12 +255,18 @@ jobs:
            Copy-Item 'dist/輔系統/BUILD_INFO.txt' 'release/輔系統/BUILD_INFO.txt'
            Copy-Item 'assets/flash_icon.ico' 'release/sync_plus_icon.ico'
           Copy-Item 'tools/verify_windows_release.ps1' 'release/輔系統/verify_windows_release.ps1'
+          @(
+            '這是一般分支驗證包，不是正式發布版。'
+            '本驗證包不包含「更新輔」，不得用於安裝或更新既有成品。'
+            '請先執行 輔系統\verify_windows_release.ps1 核對成品。'
+          ) | Set-Content 'release/分支驗證說明.txt' -Encoding utf8
 
            $manifestPaths = @(
              'FLASH.exe'
              '輔系統/BUILD_INFO.txt'
              'sync_plus_icon.ico'
              '輔系統/verify_windows_release.ps1'
+             '分支驗證說明.txt'
            )
           @(
             foreach ($relativePath in $manifestPaths) {
@@ -281,9 +287,10 @@ jobs:
           foreach ($required in @(
             'release/FLASH.exe',
             'release/輔系統/SHA256SUMS.txt',
-            'release/輔系統/BUILD_INFO.txt',
-            'release/sync_plus_icon.ico',
-             'release/輔系統/verify_windows_release.ps1'
+             'release/輔系統/BUILD_INFO.txt',
+             'release/sync_plus_icon.ico',
+             'release/輔系統/verify_windows_release.ps1',
+             'release/分支驗證說明.txt'
           )) {
             if (-not (Test-Path $required -PathType Leaf)) {
               throw "Release bundle is missing: $required"

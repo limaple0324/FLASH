@@ -38,6 +38,7 @@ def test_validation_build_has_no_formal_release_channel():
     assert "$approvalStatus -ne 'not_approved'" in workflow
     assert "$approvalMethod -ne 'none'" in workflow
     assert "The Windows build workflow must produce a validation-only artifact." in workflow
+    assert "分支驗證說明.txt" in workflow
     assert "release/latest" not in workflow
     assert "release/sp1" not in workflow
 

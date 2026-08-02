@@ -35,7 +35,7 @@ def test_validation_build_info_records_non_publishable_identity():
         '"run_id=$env:GITHUB_RUN_ID"',
     ):
         assert metadata_line in _workflow()
-    assert "驗證建置說明.txt" not in create_bundle
+    assert "'分支驗證說明.txt'" in create_bundle
 
 
 def test_validation_bundle_excludes_the_live_updater_and_installers():
@@ -51,7 +51,7 @@ def test_validation_bundle_excludes_the_live_updater_and_installers():
         "Verify validation bundle metadata and hash",
     )
 
-    assert "驗證建置說明.txt" not in create_bundle
+    assert "分支驗證說明.txt" in create_bundle
     assert "A validation bundle must not contain a formal delivery file" in verify_layout
     for forbidden_path in (
         "release/LATEST.txt",

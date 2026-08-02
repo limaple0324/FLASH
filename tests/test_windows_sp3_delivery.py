@@ -33,12 +33,18 @@ def test_sp3_branch_uses_the_complete_validation_identity():
 
 def test_validation_builds_never_create_formal_install_or_update_payloads():
     workflow = _workflow()
+    create_bundle = _step(
+        workflow,
+        "Create validation bundle",
+        "Verify validation bundle layout",
+    )
     verify_layout = _step(
         workflow,
         "Verify validation bundle layout",
         "Verify validation bundle metadata and hash",
     )
 
+    assert "'分支驗證說明.txt'" in create_bundle
     assert "release/安裝輔.cmd" in verify_layout
     assert "release/更新輔.cmd" in verify_layout
     assert "release/輔系統/安裝輔.ps1" in verify_layout
