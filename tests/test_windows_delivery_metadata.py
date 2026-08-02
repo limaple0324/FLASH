@@ -30,13 +30,32 @@ def test_windows_build_info_keeps_product_and_technical_names_separate():
     assert '"milestone=$env:FLASH_MILESTONE"' in workflow
 
 
-def test_snapshot_and_live_release_channels_remain_separate():
+def test_validation_build_has_no_formal_release_channel():
     workflow = _workflow()
 
-    assert "$publishTarget = 'release/latest'" in workflow
-    assert "$publishTarget = 'release/sp1'" in workflow
-    assert "$publishTarget = 'none'" in workflow
-    assert "本快照不包含「更新輔」" in workflow
+    assert "$publishTarget -ne 'none'" in workflow
+    assert "$artifactKind -ne 'validation'" in workflow
+    assert "$approvalStatus -ne 'not_approved'" in workflow
+    assert "$approvalMethod -ne 'none'" in workflow
+    assert "The Windows build workflow must produce a validation-only artifact." in workflow
+    assert "分支驗證說明.txt" in workflow
+    assert "release/latest" not in workflow
+    assert "release/sp1" not in workflow
+
+
+def test_validation_build_rejects_special_branch_and_milestone_mismatches():
+    workflow = _workflow()
+
+    for build_kind, milestone in (
+        ("sp1_snapshot", "SP1"),
+        ("sp2_snapshot", "SP2"),
+        ("sp3_snapshot", "SP3"),
+    ):
+        assert f"$buildKind -eq '{build_kind}'" in workflow
+        assert f"$metadata.milestone -ne '{milestone}'" in workflow
+        assert f"{milestone} validation branch must use milestone={milestone}." in workflow
+    assert "$env:BUILD_REF -eq 'refs/heads/main'" in workflow
+    assert "The main validation branch must use milestone=SP3." in workflow
 
 
 def test_workflow_uses_the_coordinated_build_output():
@@ -47,3 +66,5 @@ def test_workflow_uses_the_coordinated_build_output():
         "--output-dir dist --cache-dir .build-cache"
     ) in workflow
     assert "verify_windows_release.ps1' -NoLaunch" in workflow
+    assert "$verificationPassed = $?" in workflow
+    assert "if (-not $verificationPassed)" in workflow

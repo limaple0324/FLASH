@@ -46,7 +46,7 @@ def _create_bundle(
     digest = hashlib.sha256(executable_path.read_bytes()).hexdigest()
 
     if event_name is None:
-        event_name = "push" if build_kind == "main_release" else "workflow_dispatch"
+        event_name = "workflow_dispatch"
     if source_ref is None:
         if build_kind in {"main_release", "validation_build"}:
             source_ref = "refs/heads/main"
@@ -57,22 +57,54 @@ def _create_bundle(
         else:
             source_ref = "refs/heads/sp1/completion-2026-07-25"
 
+    commit = "a" * 40
+    short_commit = commit[:7]
+    is_release = build_kind in {"main_release", "sp1_release"}
+    artifact_kind = "release" if is_release else "validation"
+    approval_status = "approved" if is_release else "not_approved"
+    approval_method = "workflow_dispatch_input" if is_release else "none"
+    approval_actor = "fixture-user" if is_release else "none"
+    approval_run_id = "123456789" if is_release else "none"
+    approval_event = "workflow_dispatch" if is_release else "none"
+    artifact_prefix = {
+        "SP1": "FLASH-SP1-Windows",
+        "SP2": "FLASH-SP1+SP2-Windows",
+        "SP3": "FLASH-SP1+SP2+SP3-Windows",
+    }[milestone]
+    artifact_name = f"{artifact_prefix}-{version}-{short_commit}-{artifact_kind}"
+
     build_info = {
         "product": "輔",
         "technical_name": "FLASH",
         "version": version,
         "milestone": milestone,
         "build_kind": build_kind,
+        "artifact_kind": artifact_kind,
         "event_name": event_name,
         "source_ref": source_ref,
         "source_branch": source_branch,
         "publish_target": publish_target,
-        "commit": "a" * 40,
+        "approval_status": approval_status,
+        "approval_method": approval_method,
+        "approval_actor": approval_actor,
+        "approval_run_id": approval_run_id,
+        "approval_event": approval_event,
+        "commit": commit,
+        "short_commit": short_commit,
         "run_id": "123456789",
         "built_utc": "2026-07-25T00:00:00Z",
+        "artifact_name": artifact_name,
         "python": "Python 3.12",
         "sha256": digest,
     }
+    if is_release:
+        build_info.update(
+            {
+                "verification_run_id": "987654321",
+                "verification_artifact_name": f"{artifact_prefix}-{version}-{short_commit}-validation",
+                "verification_artifact_sha256": "b" * 64,
+            }
+        )
     (system_dir / "BUILD_INFO.txt").write_text(
         "".join(f"{key}={value}\n" for key, value in build_info.items()),
         encoding="utf-8",
@@ -132,8 +164,17 @@ def _create_bundle(
             "\n".join(
                 (
                     f"branch={source_branch}",
+                    f"version={build_info['version']}",
                     f"commit={build_info['commit']}",
+                    f"short_commit={build_info['short_commit']}",
                     f"run_id={build_info['run_id']}",
+                    f"artifact_name={build_info['artifact_name']}",
+                    f"approval_status={build_info['approval_status']}",
+                    f"approval_method={build_info['approval_method']}",
+                    f"approval_actor={build_info['approval_actor']}",
+                    f"approval_run_id={build_info['approval_run_id']}",
+                    f"approval_event={build_info['approval_event']}",
+                    "approved_utc=2026-07-25T00:00:00Z",
                     "updated_utc=2026-07-25T00:00:00Z",
                     "",
                 )
@@ -185,6 +226,35 @@ def _create_bundle(
         encoding="utf-8",
     )
     return verifier_path
+
+
+def _replace_metadata_value(path: Path, key: str, value: str) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text(
+        "\n".join(
+            f"{key}={value}" if line.startswith(f"{key}=") else line
+            for line in lines
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _refresh_manifest_entry(verifier_path: Path, relative_path: str) -> None:
+    release_dir = verifier_path.parent.parent
+    payload_path = release_dir.joinpath(*relative_path.split("/"))
+    digest = hashlib.sha256(payload_path.read_bytes()).hexdigest()
+    manifest_path = verifier_path.parent / "SHA256SUMS.txt"
+    manifest_path.write_text(
+        "\n".join(
+            f"{digest}  {relative_path}"
+            if line.endswith(f"  {relative_path}")
+            else line
+            for line in manifest_path.read_text(encoding="utf-8").splitlines()
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _run_verifier(verifier_path: Path) -> subprocess.CompletedProcess[bytes]:
@@ -329,6 +399,64 @@ def test_no_launch_accepts_a_main_release(tmp_path: Path):
     assert result.returncode == 0, _output(result)
 
 
+def test_formal_release_uses_one_present_utc_timestamp(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="main_release",
+        source_branch="main",
+        publish_target="release/latest",
+    )
+    build_info = (verifier_path.parent / "BUILD_INFO.txt").read_text(encoding="utf-8")
+    latest = (verifier_path.parent.parent / "LATEST.txt").read_text(encoding="utf-8")
+
+    built_utc = next(line.split("=", 1)[1] for line in build_info.splitlines() if line.startswith("built_utc="))
+    approved_utc = next(line.split("=", 1)[1] for line in latest.splitlines() if line.startswith("approved_utc="))
+    updated_utc = next(line.split("=", 1)[1] for line in latest.splitlines() if line.startswith("updated_utc="))
+
+    assert built_utc == approved_utc == updated_utc
+    assert built_utc == "2026-07-25T00:00:00Z"
+
+
+@pytest.mark.parametrize("value", ("", "2026-08-01", "2026-13-01T00:00:00Z"))
+def test_formal_release_rejects_blank_or_invalid_build_utc(
+    tmp_path: Path,
+    value: str,
+):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="main_release",
+        source_branch="main",
+        publish_target="release/latest",
+    )
+    _replace_metadata_value(verifier_path.parent / "BUILD_INFO.txt", "built_utc", value)
+    _refresh_manifest_entry(verifier_path, "輔系統/BUILD_INFO.txt")
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode != 0
+    assert "built_utc" in _output(result)
+
+
+def test_formal_release_rejects_inconsistent_utc_timestamps(tmp_path: Path):
+    verifier_path = _create_bundle(
+        tmp_path,
+        build_kind="main_release",
+        source_branch="main",
+        publish_target="release/latest",
+    )
+    _replace_metadata_value(
+        verifier_path.parent.parent / "LATEST.txt",
+        "updated_utc",
+        "2026-07-25T00:00:01Z",
+    )
+    _refresh_manifest_entry(verifier_path, "LATEST.txt")
+
+    result = _run_verifier(verifier_path)
+
+    assert result.returncode != 0
+    assert "timestamps must match" in _output(result)
+
+
 def test_main_release_rejects_an_sp1_only_milestone(tmp_path: Path):
     verifier_path = _create_bundle(
         tmp_path,
@@ -359,7 +487,7 @@ def test_no_launch_accepts_an_sp1_only_release(tmp_path: Path):
     assert result.returncode == 0, _output(result)
 
 
-def test_no_launch_accepts_an_sp1_only_push_release(tmp_path: Path):
+def test_sp1_release_rejects_an_implicit_push(tmp_path: Path):
     verifier_path = _create_bundle(
         tmp_path,
         build_kind="sp1_release",
@@ -370,7 +498,8 @@ def test_no_launch_accepts_an_sp1_only_push_release(tmp_path: Path):
 
     result = _run_verifier(verifier_path)
 
-    assert result.returncode == 0, _output(result)
+    assert result.returncode != 0
+    assert "workflow_dispatch" in _output(result)
 
 
 def test_no_launch_accepts_a_non_release_validation_build(tmp_path: Path):

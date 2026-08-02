@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "batch_id": "FU-20260802-004",
+  "batch_type": "解除受阻",
+  "source_issue": "#32 / FU-REQ-20260802-001",
+  "source_pull_request": "#17",
+  "absolute_worktree": "C:\\Users\\USER\\Documents\\輔\\FLASH-fu-20260802-004-unblock-001",
+  "integration_branch": "codex/release-identity-gate-2026-08-01",
+  "target_branch": "codex/release-identity-gate-2026-08-01",
+  "fixed_base_commit": "fca9a7428f2782802c81d7d3a2158f9497cd1376",
+  "current_commit_at_batch_creation": "fca9a7428f2782802c81d7d3a2158f9497cd1376",
+  "construction_evidence": {
+    "verified_commit_before_evidence_record": "6780ca6d27d8660327df5c5f9efff4d3fba81d1b",
+    "direct_test": {
+      "selector": "python -m pytest -q tests/test_release_identity.py tests/test_release_workflow_gate.py tests/test_release_security_architecture.py tests/test_windows_release_verifier.py tests/test_windows_transactional_updater.py tests/test_packaged_identity_self_check.py tests/test_packaged_self_check.py tests/test_build_coordinator.py",
+      "result": "86 passed",
+      "exit_code": 0
+    },
+    "allowed_scope_result": {
+      "program_issue_found": false,
+      "product_code_modified": false,
+      "modified_product_paths": []
+    },
+    "cloud_execution": {
+      "status": "PENDING_PUSH_TRIGGER",
+      "result": "NOT_RUN",
+      "evidence": "目前提交尚無真實雲端執行紀錄；本機直接測試不得取代雲端關卡。"
+    },
+    "delivery_state": {
+      "packaged": false,
+      "merged": false,
+      "formally_released": false
+    }
+  },
+  "total_items": 1,
+  "items": [
+    "以既有固定提交補齊第 001 號的真實雲端執行、需求稽核、程式審查與測試驗證證據；若發現程式問題，只能在既定允許檔案內集中修正後，以新固定提交重走關卡。"
+  ],
+  "program_interface_blocks": [
+    "成品身分、正式發布閘門與最小權限"
+  ],
+  "official_entries": [
+    ".github/workflows/publish-windows-release.yml",
+    "core/release_identity.py 的正式發布輸入驗證介面"
+  ],
+  "allowed_paths": [
+    ".codex/batches/FU-20260802-004.json",
+    ".github/workflows/publish-windows-release.yml",
+    "tests/test_release_security_architecture.py",
+    "tests/test_release_workflow_gate.py"
+  ],
+  "direct_dependencies": [
+    "core/release_identity.py（唯讀依賴；未授權修改）",
+    "第 17 號草稿合併請求與固定提交 fca9a7428f2782802c81d7d3a2158f9497cd1376",
+    "GitHub Build Windows FLASH 的真實雲端執行紀錄"
+  ],
+  "direct_tests": [
+    "python -m pytest -q tests/test_release_identity.py tests/test_release_workflow_gate.py tests/test_release_security_architecture.py tests/test_windows_release_verifier.py tests/test_windows_transactional_updater.py tests/test_packaged_identity_self_check.py tests/test_packaged_self_check.py tests/test_build_coordinator.py"
+  ],
+  "verified_unchanged_areas": [
+    "第 17 號其餘既有變更在本批不得修改",
+    "主分支、正式頻道、正式成品、封包與桌面更新"
+  ],
+  "fixed_role_windows": [
+    "輔｜需求稽核",
+    "輔｜施工",
+    "輔｜程式審查",
+    "輔｜測試驗證"
+  ],
+  "acceptance": [
+    "第 001 號以同一固定提交或經允許範圍修正後的新固定提交，取得四個固定角色視窗各自回傳的證據。",
+    "凡涉及產品程式的提交，必須有真實雲端執行成功紀錄；沒有紀錄即為受阻，不得以來源狀態核對取代。",
+    "第 17 號草稿合併請求維持未合併；不封包、不建立正式成品、不合併主分支、不正式發布。"
+  ],
+  "forbidden_targets": [
+    "main",
+    "release/latest",
+    "release/sp1",
+    "產品程式的未授權檔案",
+    "封包",
+    "正式成品",
+    "正式發布",
+    "付費程式介面"
+  ],
+  "full_regression": false,
+  "windows_validation_build": true,
+  "formal_packaging": false,
+  "paid_api": "FORBIDDEN",
+  "github_gate": "REQUIRED_REAL_CLOUD_RUN",
+  "status": "READY",
+  "next_role": "INTEGRATION",
+  "execution_mode": "CODEX_APP"
+}

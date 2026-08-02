@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -12,7 +13,11 @@ from config.config_manager import ConfigManager
 from config.path_manager import PathManager
 from core.sp1_boundaries import ExternalAdapter, RecoveryBoundary, SmartReconnectBoundary
 from core.target_window_observation import TargetWindowObservation
-from core.version import MILESTONE
+from core.release_identity import (
+    read_key_value_file,
+    validate_packaged_identity,
+)
+from core.version import MILESTONE, VERSION
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from domain.progress_store import ActivityProgressStore
@@ -51,6 +56,7 @@ class SelfCheck:
     def run_all(self) -> dict[str, object]:
         checks = [
             self._run("path_manager", self._check_paths),
+            self._run("packaged_identity", self._check_packaged_identity),
             self._run("config_manager", self._check_config),
             self._run("logger_service", self._check_logger),
             self._run("event_bus", self._check_event_bus),
@@ -75,6 +81,24 @@ class SelfCheck:
             "passed": all(item.passed for item in checks),
             "checks": [asdict(item) for item in checks],
         }
+
+    def _check_packaged_identity(self) -> str:
+        if not bool(getattr(sys, "frozen", False)):
+            return "Packaged identity metadata is not required in the source run."
+
+        build_info_path = Path(sys.executable).resolve().parent / "輔系統" / "BUILD_INFO.txt"
+        if not build_info_path.is_file():
+            raise RuntimeError("Packaged artifact is missing BUILD_INFO.txt.")
+        info = read_key_value_file(build_info_path)
+        validate_packaged_identity(
+            info,
+            expected_version=VERSION,
+            expected_milestone=MILESTONE,
+        )
+        return (
+            "Packaged identity matches "
+            f"{info['build_kind']} commit {info['short_commit']}."
+        )
 
     def _check_paths(self) -> str:
         config_path = self.paths.config_file("settings.json")

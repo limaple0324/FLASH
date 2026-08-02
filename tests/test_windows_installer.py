@@ -106,14 +106,7 @@ def _assert_shortcut_targets(
 
 
 def test_complete_installer_creates_only_main_and_update_shortcuts(tmp_path: Path):
-    release_root = _create_release(
-        tmp_path,
-        build_kind="sp1_release",
-        event_name="push",
-        source_ref="refs/heads/sp1/completion-2026-07-25",
-        source_branch="sp1/completion-2026-07-25",
-        publish_target="release/sp1",
-    )
+    release_root = _create_release(tmp_path)
     install_root = tmp_path / "installed" / "SP1"
     desktop_root = tmp_path / "desktop"
     desktop_root.mkdir()
@@ -156,14 +149,7 @@ def test_complete_installer_creates_only_main_and_update_shortcuts(tmp_path: Pat
 def test_first_install_keeps_fixed_shortcut_names_when_desktop_has_fu_directory(
     tmp_path: Path,
 ):
-    release_root = _create_release(
-        tmp_path,
-        build_kind="sp1_release",
-        event_name="push",
-        source_ref="refs/heads/sp1/completion-2026-07-25",
-        source_branch="sp1/completion-2026-07-25",
-        publish_target="release/sp1",
-    )
+    release_root = _create_release(tmp_path)
     install_root = tmp_path / "installed" / "SP1"
     desktop_root = tmp_path / "desktop"
     visible_name_conflict = desktop_root / "輔"
@@ -190,14 +176,7 @@ def test_first_install_keeps_fixed_shortcut_names_when_desktop_has_fu_directory(
 def test_reinstall_preserves_existing_shortcut_name_despite_visible_name_conflict(
     tmp_path: Path,
 ):
-    release_root = _create_release(
-        tmp_path,
-        build_kind="sp1_release",
-        event_name="push",
-        source_ref="refs/heads/sp1/completion-2026-07-25",
-        source_branch="sp1/completion-2026-07-25",
-        publish_target="release/sp1",
-    )
+    release_root = _create_release(tmp_path)
     install_root = tmp_path / "installed" / "SP1"
     desktop_root = tmp_path / "desktop"
     (desktop_root / "輔").mkdir(parents=True)
@@ -217,14 +196,7 @@ def test_reinstall_preserves_existing_shortcut_name_despite_visible_name_conflic
 
 
 def test_install_failure_restores_existing_install_and_shortcut(tmp_path: Path):
-    release_root = _create_release(
-        tmp_path,
-        build_kind="sp1_release",
-        event_name="push",
-        source_ref="refs/heads/sp1/completion-2026-07-25",
-        source_branch="sp1/completion-2026-07-25",
-        publish_target="release/sp1",
-    )
+    release_root = _create_release(tmp_path)
     install_root = tmp_path / "installed" / "SP1"
     install_root.mkdir(parents=True)
     sentinel = install_root / "existing-player-install.txt"
@@ -267,7 +239,6 @@ def test_complete_cumulative_release_installs_without_sp1_identity_rejection(
         tmp_path,
         milestone="SP3",
         build_kind="main_release",
-        event_name="push",
         source_ref="refs/heads/main",
         source_branch="main",
         publish_target="release/latest",

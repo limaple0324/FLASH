@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-WORKFLOW_PATH = Path(".github/workflows/build-windows.yml")
+WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "build-windows.yml"
 
 
 def _workflow() -> str:
@@ -14,7 +14,7 @@ def _step(workflow: str, name: str, next_name: str) -> str:
     )[0]
 
 
-def test_sp2_branch_builds_a_separate_cumulative_snapshot():
+def test_sp2_branch_is_built_as_a_validation_artifact():
     workflow = _workflow()
     metadata_step = _step(
         workflow,
@@ -23,33 +23,39 @@ def test_sp2_branch_builds_a_separate_cumulative_snapshot():
     )
 
     assert "      - sp2/completion-2026-07-26" in workflow
-    assert "$sp2DeliveryBranch = 'sp2/completion-2026-07-26'" in metadata_step
-    assert "$buildKind = 'sp2_snapshot'" in metadata_step
-    assert "$publishTarget = 'none'" in metadata_step
-    assert "$artifactPrefix = 'FLASH-SP1+SP2-Windows'" in metadata_step
-    assert (
-        "$buildKind -eq 'validation_build' -and "
-        "$metadata.milestone -eq 'SP2'"
-    ) in metadata_step
+    assert "from core.release_identity import classify_build" in metadata_step
+    assert "$artifactKind -ne 'validation'" in metadata_step
+    assert "$publishTarget -ne 'none'" in metadata_step
+    assert "$approvalStatus -ne 'not_approved'" in metadata_step
+    assert "$approvalMethod -ne 'none'" in metadata_step
+    assert "'SP2' { 'FLASH-SP1+SP2-Windows' }" in metadata_step
+
+
+def test_sp2_validation_branch_requires_the_sp2_milestone():
+    metadata_step = _step(
+        _workflow(),
+        "Read delivery metadata",
+        "Build windowed executable",
+    )
+
+    assert "$buildKind -eq 'sp2_snapshot'" in metadata_step
     assert "$metadata.milestone -ne 'SP2'" in metadata_step
+    assert "SP2 validation branch must use milestone=SP2." in metadata_step
 
 
-def test_sp2_snapshot_is_explicitly_separate_from_sp1_and_live_updaters():
+def test_sp2_validation_bundle_is_separate_from_all_formal_delivery_files():
     workflow = _workflow()
     create_bundle = _step(
         workflow,
-        "Create release bundle",
-        "Verify release bundle layout",
+        "Create validation bundle",
+        "Verify validation bundle layout",
     )
     verify_layout = _step(
         workflow,
-        "Verify release bundle layout",
-        "Verify release bundle metadata and hash",
+        "Verify validation bundle layout",
+        "Verify validation bundle metadata and hash",
     )
 
-    assert "SP1+SP2累積快照說明.txt" in create_bundle
-    assert "SP1 獨立成品仍保留，不會被本快照覆蓋。" in create_bundle
-    assert "不會追蹤 release/latest 或 release/sp1" in create_bundle
-    assert "$manifestPaths += 'SP1+SP2累積快照說明.txt'" in create_bundle
-    assert "A snapshot must not contain a live updater" in verify_layout
-    assert "SP1+SP2 cumulative snapshot notice is missing." in verify_layout
+    assert "'分支驗證說明.txt'" in create_bundle
+    assert "A validation bundle must not contain a formal delivery file" in verify_layout
+    assert "release/輔系統/UPDATE_CHANNEL.txt" in verify_layout

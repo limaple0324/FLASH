@@ -144,13 +144,21 @@ foreach ($requiredKey in @(
     "version",
     "milestone",
     "build_kind",
+    "artifact_kind",
     "event_name",
     "source_ref",
     "source_branch",
     "publish_target",
+    "approval_status",
+    "approval_method",
+    "approval_actor",
+    "approval_run_id",
+    "approval_event",
     "commit",
+    "short_commit",
     "run_id",
     "built_utc",
+    "artifact_name",
     "sha256"
 )) {
     if (
@@ -173,6 +181,33 @@ if ($buildInfo["version"] -notmatch "^\d+\.\d+\.\d+$") {
 }
 if ($buildInfo["commit"] -notmatch "^[0-9a-fA-F]{40}$") {
     throw "Release commit SHA has an invalid format."
+}
+if ($buildInfo["short_commit"].ToLowerInvariant() -ne $buildInfo["commit"].Substring(0, 7).ToLowerInvariant()) {
+    throw "Release short commit does not match the full source commit."
+}
+if ($buildInfo["built_utc"] -notmatch "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$") {
+    throw "BUILD_INFO.txt built_utc must use UTC format yyyy-MM-ddTHH:mm:ssZ."
+}
+try {
+    [DateTime]::ParseExact(
+        $buildInfo["built_utc"],
+        "yyyy-MM-ddTHH:mm:ssZ",
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::AssumeUniversal
+    ) | Out-Null
+}
+catch {
+    throw "BUILD_INFO.txt built_utc is not a valid UTC timestamp."
+}
+$artifactPrefix = switch ($buildInfo["milestone"]) {
+    "SP1" { "FLASH-SP1-Windows" }
+    "SP2" { "FLASH-SP1+SP2-Windows" }
+    "SP3" { "FLASH-SP1+SP2+SP3-Windows" }
+    default { throw "Release artifact milestone is invalid." }
+}
+$expectedArtifactName = "$artifactPrefix-$($buildInfo['version'])-$($buildInfo['short_commit'].ToLowerInvariant())-$($buildInfo['artifact_kind'])"
+if ($buildInfo["artifact_name"] -cne $expectedArtifactName) {
+    throw "Release artifact name does not match version, short commit, and artifact kind."
 }
 
 $buildKind = $buildInfo["build_kind"]
@@ -289,28 +324,29 @@ if (
 }
 
 if ($buildKind -in @("main_release", "sp1_release")) {
+    if (
+        $buildInfo["artifact_kind"] -ne "release" -or
+        $buildInfo["approval_status"] -ne "approved" -or
+        $buildInfo["approval_method"] -ne "workflow_dispatch_input" -or
+        $buildInfo["approval_event"] -ne "workflow_dispatch" -or
+        $buildInfo["approval_actor"] -eq "none" -or
+        $buildInfo["approval_run_id"] -ne $buildInfo["run_id"]
+    ) {
+        throw "A formal release requires an auditable workflow approval."
+    }
     if ($buildKind -eq "main_release") {
-        $expectedEventName = "push"
+        $expectedEventName = "workflow_dispatch"
         $expectedSourceRef = "refs/heads/main"
         $expectedSourceBranch = "main"
         $expectedPublishTarget = "release/latest"
     }
     else {
-        $expectedEventName = ""
+        $expectedEventName = "workflow_dispatch"
         $expectedSourceRef = "refs/heads/sp1/completion-2026-07-25"
         $expectedSourceBranch = "sp1/completion-2026-07-25"
         $expectedPublishTarget = "release/sp1"
     }
-    if (
-        $buildKind -eq "sp1_release" -and
-        $buildInfo["event_name"] -notin @("push", "workflow_dispatch")
-    ) {
-        throw "An sp1_release build must use event_name=push or workflow_dispatch."
-    }
-    if (
-        $buildKind -eq "main_release" -and
-        $buildInfo["event_name"] -ne $expectedEventName
-    ) {
+    if ($buildInfo["event_name"] -ne $expectedEventName) {
         throw "A $buildKind build must use event_name=$expectedEventName."
     }
     if ($buildInfo["source_ref"] -ne $expectedSourceRef) {
@@ -321,6 +357,25 @@ if ($buildKind -in @("main_release", "sp1_release")) {
     }
     if ($buildInfo["publish_target"] -ne $expectedPublishTarget) {
         throw "A $buildKind build must use publish_target=$expectedPublishTarget."
+    }
+    foreach ($requiredKey in @(
+        "verification_run_id",
+        "verification_artifact_name",
+        "verification_artifact_sha256"
+    )) {
+        if (
+            -not $buildInfo.ContainsKey($requiredKey) -or
+            [string]::IsNullOrWhiteSpace($buildInfo[$requiredKey])
+        ) {
+            throw "A formal release is missing verification traceability: $requiredKey"
+        }
+    }
+    if ($buildInfo["verification_artifact_sha256"] -notmatch "^[0-9a-fA-F]{64}$") {
+        throw "Formal verification artifact SHA-256 has an invalid format."
+    }
+    $expectedVerificationArtifactName = "$artifactPrefix-$($buildInfo['version'])-$($buildInfo['short_commit'].ToLowerInvariant())-validation"
+    if ($buildInfo["verification_artifact_name"] -cne $expectedVerificationArtifactName) {
+        throw "Formal verification artifact name does not match source identity."
     }
 
     $channel = Read-KeyValueFile -Path $ChannelPath -DisplayName "UPDATE_CHANNEL.txt"
@@ -342,13 +397,49 @@ if ($buildKind -in @("main_release", "sp1_release")) {
     }
 
     $latest = Read-KeyValueFile -Path $LatestPath -DisplayName "LATEST.txt"
-    foreach ($requiredKey in @("branch", "commit", "run_id", "updated_utc")) {
+    foreach ($requiredKey in @(
+        "branch",
+        "version",
+        "commit",
+        "short_commit",
+        "run_id",
+        "artifact_name",
+        "approval_status",
+        "approval_method",
+        "approval_actor",
+        "approval_run_id",
+        "approval_event",
+        "approved_utc",
+        "updated_utc"
+    )) {
         if (
             -not $latest.ContainsKey($requiredKey) -or
             [string]::IsNullOrWhiteSpace($latest[$requiredKey])
         ) {
             throw "LATEST.txt is missing required key: $requiredKey"
         }
+    }
+    foreach ($timestampKey in @("approved_utc", "updated_utc")) {
+        if ($latest[$timestampKey] -notmatch "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$") {
+            throw "LATEST.txt $timestampKey must use UTC format yyyy-MM-ddTHH:mm:ssZ."
+        }
+        try {
+            [DateTime]::ParseExact(
+                $latest[$timestampKey],
+                "yyyy-MM-ddTHH:mm:ssZ",
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::AssumeUniversal
+            ) | Out-Null
+        }
+        catch {
+            throw "LATEST.txt $timestampKey is not a valid UTC timestamp."
+        }
+    }
+    if (
+        $latest["approved_utc"] -ne $buildInfo["built_utc"] -or
+        $latest["updated_utc"] -ne $buildInfo["built_utc"]
+    ) {
+        throw "Formal release UTC timestamps must match BUILD_INFO.txt built_utc."
     }
     if ($latest["branch"] -ne $expectedSourceBranch) {
         throw "LATEST.txt must use branch=$expectedSourceBranch."
@@ -358,6 +449,34 @@ if ($buildKind -in @("main_release", "sp1_release")) {
     }
     if ($latest["run_id"] -ne $buildInfo["run_id"]) {
         throw "LATEST.txt run_id does not match BUILD_INFO.txt."
+    }
+    foreach ($matchingKey in @(
+        "version",
+        "short_commit",
+        "artifact_name",
+        "approval_status",
+        "approval_method",
+        "approval_run_id",
+        "approval_event"
+    )) {
+        if ($latest[$matchingKey] -ne $buildInfo[$matchingKey]) {
+            throw "LATEST.txt $matchingKey does not match BUILD_INFO.txt."
+        }
+    }
+    if ($latest["approval_actor"] -ne $buildInfo["approval_actor"]) {
+        throw "LATEST.txt approval_actor does not match BUILD_INFO.txt."
+    }
+}
+else {
+    if (
+        $buildInfo["artifact_kind"] -ne "validation" -or
+        $buildInfo["approval_status"] -ne "not_approved" -or
+        $buildInfo["approval_method"] -ne "none" -or
+        $buildInfo["approval_actor"] -ne "none" -or
+        $buildInfo["approval_run_id"] -ne "none" -or
+        $buildInfo["approval_event"] -ne "none"
+    ) {
+        throw "A validation artifact must not contain formal approval identity."
     }
 }
 

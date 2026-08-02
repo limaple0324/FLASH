@@ -14,6 +14,7 @@ def test_self_check_reports_all_required_checks_once(tmp_path):
 
     assert names == [
         "path_manager",
+        "packaged_identity",
         "config_manager",
         "logger_service",
         "event_bus",
