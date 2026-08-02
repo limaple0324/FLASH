@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from adapters.game_screen_recognizer import (
+    CHARACTER_ENTER_CLICK_POINT,
     CharacterSelectionCandidate,
     ScreenRecognition,
 )
@@ -22,6 +23,7 @@ from adapters.windows_battle_restart import BattleRestartResult
 from adapters.windows_smart_reconnect import (
     MouseClickResult,
     ReconnectRuntimeStateStore,
+    RegisteredReconnectRole,
     Win32MouseMessageBackend,
     WindowInstanceToken,
     WindowsSmartReconnectController,
@@ -1275,6 +1277,7 @@ def make_controller(
     primary_capture_is_trusted=True,
     operation_gate=None,
     window_backend=None,
+    require_expected_window_count=True,
 ):
     if clock is None:
         default_time = [-5.0]
@@ -1330,6 +1333,7 @@ def make_controller(
             monotonic_clock=clock,
             state_path=state_path,
             execution_enabled=True,
+            require_expected_window_count=require_expected_window_count,
             battle_restarter=battle_restarter,
             failure_status_service=failure_status_service,
             failure_record_callback=failure_record_callback,
@@ -1745,6 +1749,243 @@ def test_unscoped_incomplete_window_set_still_fails_before_capture():
     assert "window_count_mismatch" in result.details["failure_codes"]
     assert fixture.capture.calls == []
     assert fixture.mouse.clicks == []
+
+
+def test_global_reconnect_handles_a_confirmed_disconnect_without_a_group():
+    window = make_window(1)
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=14,
+        require_expected_window_count=False,
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert "window_count_mismatch" not in result.details["failure_codes"]
+    assert fixture.capture.calls == [
+        window.handle,
+        window.handle,
+        window.handle,
+    ]
+    assert fixture.mouse.clicks == [(window.handle, (0.5, 0.5))]
+
+
+def test_global_reconnect_does_not_act_on_manual_login_without_disconnect():
+    window = make_window(1)
+    fixture = make_controller(
+        [3],
+        windows=[window],
+        expected_windows=14,
+        require_expected_window_count=False,
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["actionable_windows"] == 0
+    assert fixture.mouse.clicks == []
+
+
+def test_global_reconnect_enters_only_the_game_selected_role_after_disconnect():
+    window = make_window(1)
+    capture = FakeCaptureProvider({window.handle: 5})
+    mouse = FakeMouseBackend()
+
+    class SelectedRoleRecognizer:
+        def recognize_capture(self, _sample):
+            return ScreenRecognition(
+                state=ReconnectScreenState.CHARACTER_SELECTION,
+                score=0.0,
+                click_point=(0.3, 0.8),
+                reference_name="character_selection",
+                character_slot_selected=True,
+            )
+
+    controller = WindowsSmartReconnectController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=FakeWindowBackend([window]),
+        capture_provider=capture,
+        recognizer=SelectedRoleRecognizer(),
+        mouse_backend=mouse,
+        execution_enabled=True,
+        primary_capture_is_trusted=True,
+        require_expected_window_count=False,
+    )
+    controller._pending_reconnect_fingerprints.add(window.launch_fingerprint)
+
+    controller.reconnect()
+    result = controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert mouse.clicks == [(window.handle, CHARACTER_ENTER_CLICK_POINT)]
+
+
+def test_global_reconnect_selects_the_unique_highest_level_after_disconnect():
+    window = make_window(1)
+    capture = FakeCaptureProvider({window.handle: 5})
+    mouse = FakeMouseBackend()
+    candidates = (
+        CharacterSelectionCandidate(
+            120,
+            CharacterImportance.PRIMARY,
+            0,
+            False,
+            (0.355, 0.706),
+        ),
+        CharacterSelectionCandidate(
+            160,
+            CharacterImportance.SECONDARY,
+            2,
+            False,
+            (0.651, 0.706),
+        ),
+    )
+
+    class HighestLevelRecognizer:
+        def recognize_capture(self, _sample):
+            return ScreenRecognition(
+                state=ReconnectScreenState.CHARACTER_SELECTION,
+                score=0.0,
+                click_point=candidates[0].click_point,
+                reference_name="character_selection",
+                character_candidates=candidates,
+            )
+
+    controller = WindowsSmartReconnectController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=FakeWindowBackend([window]),
+        capture_provider=capture,
+        recognizer=HighestLevelRecognizer(),
+        mouse_backend=mouse,
+        execution_enabled=True,
+        primary_capture_is_trusted=True,
+        require_expected_window_count=False,
+    )
+    controller._pending_reconnect_fingerprints.add(window.launch_fingerprint)
+
+    controller.reconnect()
+    result = controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert mouse.clicks == [(window.handle, candidates[1].click_point)]
+
+
+def test_global_reconnect_uses_the_main_role_for_a_highest_level_tie():
+    window = make_window(1)
+    capture = FakeCaptureProvider({window.handle: 5})
+    mouse = FakeMouseBackend()
+    candidates = (
+        CharacterSelectionCandidate(
+            160,
+            CharacterImportance.SECONDARY,
+            0,
+            False,
+            (0.355, 0.706),
+        ),
+        CharacterSelectionCandidate(
+            160,
+            CharacterImportance.PRIMARY,
+            1,
+            False,
+            (0.500, 0.706),
+        ),
+    )
+
+    class TiedLevelRecognizer:
+        def recognize_capture(self, _sample):
+            return ScreenRecognition(
+                state=ReconnectScreenState.CHARACTER_SELECTION,
+                score=0.0,
+                click_point=candidates[0].click_point,
+                reference_name="character_selection",
+                character_candidates=candidates,
+            )
+
+    controller = WindowsSmartReconnectController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=FakeWindowBackend([window]),
+        capture_provider=capture,
+        recognizer=TiedLevelRecognizer(),
+        mouse_backend=mouse,
+        execution_enabled=True,
+        primary_capture_is_trusted=True,
+        require_expected_window_count=False,
+    )
+    controller._pending_reconnect_fingerprints.add(window.launch_fingerprint)
+
+    controller.reconnect()
+    result = controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert mouse.clicks == [(window.handle, candidates[1].click_point)]
+
+
+def test_global_reconnect_uses_the_saved_main_role_for_a_highest_level_tie():
+    window = make_window(1)
+    capture = FakeCaptureProvider({window.handle: 5})
+    mouse = FakeMouseBackend()
+    candidates = (
+        CharacterSelectionCandidate(
+            160,
+            None,
+            0,
+            False,
+            (0.355, 0.706),
+            identity="角色乙",
+        ),
+        CharacterSelectionCandidate(
+            160,
+            None,
+            1,
+            False,
+            (0.500, 0.706),
+            identity="角色甲",
+        ),
+    )
+
+    class TiedLevelRecognizer:
+        def recognize_capture(self, _sample):
+            return ScreenRecognition(
+                state=ReconnectScreenState.CHARACTER_SELECTION,
+                score=0.0,
+                click_point=candidates[0].click_point,
+                reference_name="character_selection",
+                character_candidates=candidates,
+            )
+
+    controller = WindowsSmartReconnectController(
+        expected_windows=14,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=FakeWindowBackend([window]),
+        capture_provider=capture,
+        recognizer=TiedLevelRecognizer(),
+        mouse_backend=mouse,
+        execution_enabled=True,
+        primary_capture_is_trusted=True,
+        require_expected_window_count=False,
+        registered_role_provider=lambda: (
+            RegisteredReconnectRole(
+                "角色乙",
+                CharacterImportance.SECONDARY,
+            ),
+            RegisteredReconnectRole(
+                "角色甲",
+                CharacterImportance.PRIMARY,
+            ),
+        ),
+    )
+    controller._pending_reconnect_fingerprints.add(window.launch_fingerprint)
+
+    controller.reconnect()
+    result = controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert mouse.clicks == [(window.handle, candidates[1].click_point)]
 
 
 @pytest.mark.parametrize("unsafe_group", ("missing", "duplicate"))

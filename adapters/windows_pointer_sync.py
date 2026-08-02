@@ -55,7 +55,10 @@ class Win32PointerMessageBackend:
     WM_LBUTTONDOWN = 0x0201
     WM_LBUTTONUP = 0x0202
     MK_LBUTTON = 0x0001
+    SMTO_BLOCK = 0x0001
     SMTO_ABORTIFHUNG = 0x0002
+    SMTO_ERRORONEXIT = 0x0020
+    MESSAGE_TIMEOUT_MS = 1000
 
     @staticmethod
     def _user32():
@@ -70,13 +73,6 @@ class Win32PointerMessageBackend:
             ctypes.POINTER(wintypes.RECT),
         )
         user32.GetClientRect.restype = wintypes.BOOL
-        user32.PostMessageW.argtypes = (
-            wintypes.HWND,
-            wintypes.UINT,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
-        )
-        user32.PostMessageW.restype = wintypes.BOOL
         user32.SendMessageTimeoutW.argtypes = (
             wintypes.HWND,
             wintypes.UINT,
@@ -87,6 +83,69 @@ class Win32PointerMessageBackend:
             ctypes.POINTER(ctypes.c_size_t),
         )
         user32.SendMessageTimeoutW.restype = wintypes.LPARAM
+
+    @classmethod
+    def _send_confirmed(
+        cls,
+        user32,
+        hwnd,
+        message: int,
+        wparam: int,
+        lparam: int,
+    ) -> bool:
+        result = ctypes.c_size_t()
+        return bool(
+            user32.SendMessageTimeoutW(
+                hwnd,
+                message,
+                wparam,
+                lparam,
+                (
+                    cls.SMTO_BLOCK
+                    | cls.SMTO_ABORTIFHUNG
+                    | cls.SMTO_ERRORONEXIT
+                ),
+                cls.MESSAGE_TIMEOUT_MS,
+                ctypes.byref(result),
+            )
+        )
+
+    @classmethod
+    def _send_pointer_event(
+        cls,
+        user32,
+        hwnd,
+        lparam: int,
+        event: str,
+    ) -> bool:
+        if event == "left_down":
+            return bool(
+                cls._send_confirmed(
+                    user32,
+                    hwnd,
+                    cls.WM_MOUSEMOVE,
+                    0,
+                    lparam,
+                )
+                and cls._send_confirmed(
+                    user32,
+                    hwnd,
+                    cls.WM_LBUTTONDOWN,
+                    cls.MK_LBUTTON,
+                    lparam,
+                )
+            )
+        message, flags = {
+            "move": (cls.WM_MOUSEMOVE, cls.MK_LBUTTON),
+            "left_up": (cls.WM_LBUTTONUP, 0),
+        }[event]
+        return cls._send_confirmed(
+            user32,
+            hwnd,
+            message,
+            flags,
+            lparam,
+        )
 
     def is_window(self, handle: int) -> bool:
         user32 = self._user32()
@@ -133,12 +192,7 @@ class Win32PointerMessageBackend:
         x = min(width - 1, max(0, round(float(x_ratio) * (width - 1))))
         y = min(height - 1, max(0, round(float(y_ratio) * (height - 1))))
         lparam = (int(y) << 16) | (int(x) & 0xFFFF)
-        message, flags = {
-            "move": (self.WM_MOUSEMOVE, self.MK_LBUTTON),
-            "left_down": (self.WM_LBUTTONDOWN, self.MK_LBUTTON),
-            "left_up": (self.WM_LBUTTONUP, 0),
-        }[event]
-        return bool(user32.PostMessageW(hwnd, message, flags, lparam))
+        return self._send_pointer_event(user32, hwnd, lparam, event)
 
     def send_pointer_adjusted(
         self,
@@ -165,12 +219,7 @@ class Win32PointerMessageBackend:
         if not (0 <= x < width and 0 <= y < height):
             return False
         lparam = (int(y) << 16) | (int(x) & 0xFFFF)
-        message, flags = {
-            "move": (self.WM_MOUSEMOVE, self.MK_LBUTTON),
-            "left_down": (self.WM_LBUTTONDOWN, self.MK_LBUTTON),
-            "left_up": (self.WM_LBUTTONUP, 0),
-        }[event]
-        return bool(user32.PostMessageW(hwnd, message, flags, lparam))
+        return self._send_pointer_event(user32, hwnd, lparam, event)
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,8 +299,12 @@ class WindowsPointerSyncController:
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
         operation_gate: GameOperationGate | None = None,
+        require_expected_window_count: bool = True,
     ) -> None:
         self._expected_windows = max(1, int(expected_windows))
+        self._require_expected_window_count = bool(
+            require_expected_window_count
+        )
         self._keywords = tuple(
             keyword.strip().casefold()
             for keyword in title_keywords
@@ -335,6 +388,7 @@ class WindowsPointerSyncController:
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
         operation_gate: GameOperationGate | None = None,
+        require_expected_window_count: bool = True,
     ) -> "WindowsPointerSyncController":
         return cls(
             expected_windows=14,
@@ -353,6 +407,7 @@ class WindowsPointerSyncController:
             screen_state_provider=screen_state_provider,
             target_windows_provider=target_windows_provider,
             operation_gate=operation_gate,
+            require_expected_window_count=require_expected_window_count,
         )
 
     def _record_role_operation(
@@ -755,6 +810,12 @@ class WindowsPointerSyncController:
                     return
             except Exception:
                 return
+        if (
+            self._screen_state_provider is not None
+            and self._screen_state_provider(fingerprint)
+            is not ReconnectScreenState.CONNECTED
+        ):
+            return
         reconnecting = {
             normalized
             for value in self._reconnecting_provider()
@@ -767,6 +828,7 @@ class WindowsPointerSyncController:
         if (
             fingerprint in reconnecting
             and self._deferred_service is not None
+            and self._screen_state_provider is None
         ):
             self._deferred_service.enqueue(
                 fingerprint,
@@ -947,7 +1009,10 @@ class WindowsPointerSyncController:
             return False
         windows = self._windows()
         if (
-            len(windows) != self._expected_windows
+            (
+                self._require_expected_window_count
+                and len(windows) != self._expected_windows
+            )
             or self._window_backend.foreground_handle() != source_handle
         ):
             return False
@@ -977,8 +1042,13 @@ class WindowsPointerSyncController:
             and
             all(fingerprint is not None for fingerprint in fingerprints)
             and len(fingerprints) == len(set(fingerprints))
-            and set(fingerprints) == self._allowed_fingerprint_set
+            and set(fingerprints) <= self._allowed_fingerprint_set
             and source_fingerprint == self._controller_fingerprint
+            and (
+                self._screen_state_provider is None
+                or self._screen_state_provider(source_fingerprint)
+                is ReconnectScreenState.CONNECTED
+            )
         )
 
     def source_is_group_member(self, source_handle: int) -> bool:
@@ -1290,8 +1360,17 @@ class WindowsPointerSyncController:
             partial_reconnect_candidate
             and not unresolved_title_identity
         )
+        safe_partial_group = (
+            not self._require_expected_window_count
+            and process_identity_valid
+            and fingerprint_identity_valid
+            and self._allowed_fingerprint_set is not None
+            and visible_fingerprint_set
+            <= self._allowed_fingerprint_set
+        )
         if (
-            len(windows) != self._expected_windows
+            self._require_expected_window_count
+            and len(windows) != self._expected_windows
             and not safe_partial_reconnect
         ):
             failures.append("window_count_mismatch")
@@ -1300,6 +1379,7 @@ class WindowsPointerSyncController:
             and visible_fingerprint_set
             != self._allowed_fingerprint_set
             and not safe_partial_reconnect
+            and not safe_partial_group
         ):
             failures.append("group_identity_set_mismatch")
 
@@ -1325,6 +1405,25 @@ class WindowsPointerSyncController:
                 if include_source or window.handle != source_handle
             )
 
+        if self._screen_state_provider is not None:
+            if (
+                source_fingerprint is None
+                or self._screen_state_provider(source_fingerprint)
+                is not ReconnectScreenState.CONNECTED
+            ):
+                failures.append("source_not_in_game")
+            eligible = tuple(
+                window
+                for window in eligible
+                if (
+                    (fingerprint := normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    )) is not None
+                    and self._screen_state_provider(fingerprint)
+                    is ReconnectScreenState.CONNECTED
+                )
+            )
+
         if failures or normalized_event is None or normalized_policy is None:
             return self._result(
                 discovered_windows=len(windows),
@@ -1344,6 +1443,7 @@ class WindowsPointerSyncController:
             and group_reconnecting
             and self._deferred_service is not None
             and self._allowed_fingerprints is not None
+            and self._screen_state_provider is None
         ):
             operation = (
                 f"pointer:{normalized_event}:"
@@ -1467,6 +1567,7 @@ class WindowsPointerSyncController:
                 if (
                     fingerprint in reconnecting
                     and self._deferred_service is not None
+                    and self._screen_state_provider is None
                 ):
                     self._deferred_service.enqueue(
                         fingerprint,

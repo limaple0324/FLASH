@@ -9,6 +9,7 @@ import traceback
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from time import monotonic
 from tkinter import PhotoImage, TclError, Tk, filedialog, messagebox
 
@@ -30,6 +31,7 @@ from adapters.windows_launch_fingerprint import (
 )
 from adapters.windows_smart_reconnect import (
     ReconnectRuntimeStateStore,
+    RegisteredReconnectRole,
     WindowsSmartReconnectController,
 )
 from adapters.windows_pointer_sync import (
@@ -274,7 +276,6 @@ OPERATION_RECORD_FILENAME = "operation_records.json"
 MANAGED_GAME_PROCESS_FILENAME = "managed_game_processes.json"
 OPERATION_RECORD_ARCHIVE_DIRNAME = "角色每日紀錄"
 DEFERRED_SYNC_STATE_FILENAME = "deferred_sync_operations.json"
-ROLE_ID_TEMPLATE_FILENAME = "role_id_templates.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
 BACKGROUND_IMAGE_VERIFY_REPORT_FILENAME = "background_image_verification.json"
 CHARACTER_FILENAME = "characters.json"
@@ -541,10 +542,7 @@ def build_services(
         synchronized_window_backend,
     )
     sync_calibration_backend = Win32SyncCalibrationBackend()
-    role_id_template_service = RoleIdTemplateService(
-        paths.data_dir() / ROLE_ID_TEMPLATE_FILENAME,
-        capture_backend=sync_calibration_backend,
-    )
+    role_id_template_service = RoleIdTemplateService()
     progress_store = ActivityProgressStore(
         paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
     )
@@ -830,13 +828,91 @@ def build_services(
             else None
         )
 
-    def current_reconnect_targets():
-        return target_window_contract_service.reconnect_targets(
-            current_group_name()
+    def registered_reconnect_roles():
+        profiles = {
+            character.character_id: character
+            for character in character_store.load()
+        }
+        roles_by_id: dict[
+            str,
+            tuple[RegisteredReconnectRole, ...],
+        ] = {}
+        for choice in group_selection_service.choices():
+            for member in choice.members:
+                if not member.role_id or member.character_id is None:
+                    continue
+                profile = profiles.get(member.character_id)
+                if profile is None:
+                    continue
+                try:
+                    role = RegisteredReconnectRole(
+                        member.role_id,
+                        profile.importance,
+                    )
+                except (TypeError, ValueError):
+                    continue
+                key = role.role_id.casefold()
+                roles_by_id[key] = tuple(
+                    dict.fromkeys((*roles_by_id.get(key, ()), role))
+                )
+        return tuple(
+            matches[0]
+            for matches in roles_by_id.values()
+            if len(matches) == 1
         )
 
-    def current_sync_target_windows():
-        return target_window_contract_service.windows(current_group_name())
+    def current_sync_target_windows() -> tuple[WindowInfo, ...]:
+        if target_window_contract_service is None:
+            return ()
+        return target_window_contract_service.reconnect_targets(
+            current_group_name()
+        ).windows
+
+    sync_screen_state_lock = Lock()
+    sync_screen_state_cache: dict[str, object] = {
+        "group_name": None,
+        "expires_at": 0.0,
+        "states": {},
+    }
+
+    def current_sync_screen_state(
+        fingerprint: str,
+    ) -> ReconnectScreenState:
+        normalized = normalize_launch_fingerprint(fingerprint)
+        if normalized is None:
+            return ReconnectScreenState.UNKNOWN
+        group_name = current_group_name()
+        now = monotonic()
+        with sync_screen_state_lock:
+            states = sync_screen_state_cache["states"]
+            if (
+                sync_screen_state_cache["group_name"] == group_name
+                and now < float(sync_screen_state_cache["expires_at"])
+                and isinstance(states, dict)
+            ):
+                return states.get(normalized, ReconnectScreenState.UNKNOWN)
+            candidates = current_sync_target_windows()
+            requested = tuple(
+                candidate_fingerprint
+                for window in candidates
+                if (
+                    candidate_fingerprint := normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    )
+                ) is not None
+            )
+            observed = reconnect_controller.observe_screen_states(
+                requested,
+                candidate_windows=candidates,
+            )
+            sync_screen_state_cache.update(
+                {
+                    "group_name": group_name,
+                    "expires_at": now + 0.75,
+                    "states": observed,
+                }
+            )
+            return observed.get(normalized, ReconnectScreenState.UNKNOWN)
 
     AppContext.register(SyncOperationRecordStore, operation_record_store)
     reconnect_controller = WindowsSmartReconnectController.for_real_windows(
@@ -846,7 +922,8 @@ def build_services(
         capture_settings=(
             smart_reconnect_capture_settings_service.snapshot()
         ),
-        target_windows_provider=current_reconnect_targets,
+        require_expected_window_count=False,
+        registered_role_provider=registered_reconnect_roles,
         operation_gate=game_operation_gate,
         failure_status_service=reconnect_failure_status_service,
         failure_record_callback=lambda role_name, detail: (
@@ -906,6 +983,7 @@ def build_services(
             window_backend=synchronized_window_backend,
             target_windows_provider=current_sync_target_windows,
             operation_gate=game_operation_gate,
+            require_expected_window_count=False,
             conflict_arbiter=sync_conflict_arbiter,
             deferred_service=deferred_sync_service,
             reconnecting_provider=(
@@ -918,11 +996,7 @@ def build_services(
                     f"{operation}－{outcome}",
                 )
             ),
-            screen_state_provider=lambda fingerprint: (
-                reconnect_controller.observe_screen_states(
-                    (fingerprint,)
-                ).get(fingerprint)
-            ),
+            screen_state_provider=current_sync_screen_state,
         ),
     )
     AppContext.register(
@@ -931,6 +1005,7 @@ def build_services(
             window_backend=synchronized_window_backend,
             target_windows_provider=current_sync_target_windows,
             operation_gate=game_operation_gate,
+            require_expected_window_count=False,
             conflict_arbiter=sync_conflict_arbiter,
             deferred_service=deferred_sync_service,
             reconnecting_provider=(
@@ -943,11 +1018,7 @@ def build_services(
                     f"{operation}－{outcome}",
                 )
             ),
-            screen_state_provider=lambda fingerprint: (
-                reconnect_controller.observe_screen_states(
-                    (fingerprint,)
-                ).get(fingerprint)
-            ),
+            screen_state_provider=current_sync_screen_state,
         ),
     )
     AppContext.register(
@@ -2272,20 +2343,32 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 pointer_sync_controller.set_controller_fingerprint(
                     scope.fingerprints[0]
                 )
-        if smart_reconnect_controller is not None:
-            smart_reconnect_controller.set_expected_windows(
-                choice.character_count
-            )
-            smart_reconnect_controller.set_group_launch_plan(plan)
         return plan
+
+    def group_identity_failure_message(choice) -> str:
+        plan = selected_group_plan(choice)
+        if plan is None:
+            return "目前組別的遊戲視窗設定尚未完成；維持安全停止。"
+        scope = (
+            sync_scope_service.scope(choice.name)
+            if sync_scope_service is not None
+            else None
+        )
+        if scope is None or not scope.ready:
+            return "目前組別的同步範圍尚未安全確認；維持安全停止。"
+        scoped_entries = scoped_group_entries(choice.name, scope.entry_ids)
+        if scoped_entries is None:
+            return (
+                "目前組別因共用捷徑延伸到其他組別；其中角色在多組設定中"
+                "無法唯一對應遊戲視窗。為避免錯誤同步，維持安全停止。"
+            )
+        return "目前組別無法完整對應到唯一遊戲視窗；維持安全停止。"
 
     def clear_group_identity() -> None:
         if input_controller is not None:
             input_controller.set_allowed_fingerprints(None)
         if pointer_sync_controller is not None:
             pointer_sync_controller.set_allowed_fingerprints(None)
-        if smart_reconnect_controller is not None:
-            smart_reconnect_controller.set_group_launch_plan(None)
 
     def close_group_operation_gate() -> bool:
         return (
@@ -3321,7 +3404,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def calibrate_role_id(
         group_name: str,
         entry_id: str,
-        role_id: str,
     ) -> str:
         if (
             role_id_template_service is None
@@ -3331,28 +3413,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         window_info = unique_window_for_group_entry(group_name, entry_id)
         if window_info is None:
             return "無法唯一確認角色窗口，未校正角色ID。"
-        calibrated_role_id = role_id
-        if not calibrated_role_id.strip():
-            group = group_configuration_service.group(group_name)
-            entry = (
-                next(
-                    (
-                        item
-                        for item in group.entries
-                        if item.entry_id == entry_id
-                    ),
-                    None,
-                )
-                if group is not None
-                else None
-            )
-            if entry is not None:
-                # The configured role label is the only existing identity
-                # evidence available before the first visual calibration.
-                calibrated_role_id = entry.display_name
         result = role_id_template_service.calibrate(
             window_info.handle,
-            calibrated_role_id,
             entry_id=entry_id,
         )
         if result.success:
@@ -3384,7 +3446,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 result.role_id,
             )
             refresh_group_sync_identity(group_name)
-            return f"已讀取角色ID：{result.role_id}"
+            return f"已讀取遊戲內角色ID：{result.role_id}"
         return result.message
 
     def add_group_sync_relation(
@@ -3782,7 +3844,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             # still-polling monitor can deliver another game input.
             return True
 
-        state = workspace_service.snapshot() if workspace_service is not None else None
+        state = (
+            workspace_service.snapshot()
+            if workspace_service is not None
+            else None
+        )
         group_name = (
             state.current_group.name
             if state is not None and state.current_group is not None
@@ -3800,8 +3866,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
             return False
-        plan = apply_group_identity(choice)
-        if plan is None:
+        if apply_group_identity(choice) is None:
             messagebox.showerror(
                 "輔｜同步輸入",
                 "目前組別的捷徑身分尚未完整確認；為避免誤同步，沒有啟用。",
@@ -3815,36 +3880,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
             return False
-        scope = (
-            sync_scope_service.scope(choice.name)
-            if sync_scope_service is not None
-            else None
-        )
-        safe_windows = (
-            target_window_contract_service.windows(choice.name)
-            if target_window_contract_service is not None
-            else ()
-        )
-        if (
-            scope is None
-            or not scope.ready
-            or not _sync_scope_has_all_safe_windows(
-                scope.fingerprints,
-                safe_windows,
-            )
-        ):
-            sync_session_state["enabled"] = False
-            clear_group_identity()
-            messagebox.showerror(
-                "輔｜同步輸入",
-                (
-                    "同步組別尚未完整開啟，沒有啟用。\n"
-                    f"目前安全視窗：{len(safe_windows)}／"
-                    f"{len(scope.fingerprints) if scope is not None else 0}"
-                ),
-                parent=window,
-            )
-            return False
         keyboard_started = start_service(keyboard_sync_monitor)
         mouse_started = start_service(mouse_sync_monitor)
         if not keyboard_started.success or not mouse_started.success:
@@ -3855,8 +3890,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         sync_session_state["enabled"] = True
         if logger is not None:
             logger.info(
-                "Keyboard synchronization enabled; "
-                f"group={choice.name}; expected={len(scope.fingerprints)}"
+                "Keyboard synchronization enabled for connected group windows; "
+                f"group={choice.name}"
             )
         mark_tray_operations_running()
         return True
@@ -3874,36 +3909,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
             return False
         if enabled:
-            state = (
-                workspace_service.snapshot()
-                if workspace_service is not None
-                else None
-            )
-            group_name = (
-                state.current_group.name
-                if state is not None and state.current_group is not None
-                else None
-            )
-            choice = (
-                group_selection_service.find(group_name)
-                if group_selection_service is not None
-                else None
-            )
-            if choice is None or choice.character_count <= 0:
-                messagebox.showerror(
-                    "輔｜智慧重連",
-                    "請先選擇已有視窗設定的組別；目前維持安全停止。",
-                    parent=window,
-                )
-                return False
-            plan = apply_group_identity(choice)
-            if plan is None:
-                messagebox.showerror(
-                    "輔｜智慧重連",
-                    "目前組別無法完整對應到唯一遊戲視窗；維持安全停止。",
-                    parent=window,
-                )
-                return False
+            smart_reconnect_controller.set_group_launch_plan(None)
             started = start_service(smart_reconnect_monitor)
             if not started.success:
                 return False
@@ -4578,6 +4584,94 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             else None
         )
 
+    role_id_auto_read_id: str | None = None
+    role_id_auto_read_cursor = 0
+
+    def auto_read_missing_role_id() -> None:
+        """只讀取一個可見且已進遊戲的空白角色名稱。"""
+        nonlocal role_id_auto_read_id, role_id_auto_read_cursor
+        try:
+            group_name = current_group_name()
+            if (
+                group_name is None
+                or group_configuration_service is None
+                or role_id_template_service is None
+                or smart_reconnect_controller is None
+            ):
+                return
+            group = group_configuration_service.group(group_name)
+            if group is None:
+                return
+            missing_entries = tuple(
+                entry
+                for entry in group.entries
+                if not entry.role_id.strip()
+            )
+            if not missing_entries:
+                return
+            entry = missing_entries[
+                role_id_auto_read_cursor % len(missing_entries)
+            ]
+            role_id_auto_read_cursor += 1
+            window_info = unique_window_for_group_entry(
+                group_name,
+                entry.entry_id,
+            )
+            if window_info is None or window_info.minimized:
+                return
+            fingerprint = normalize_launch_fingerprint(
+                window_info.launch_fingerprint
+            )
+            if fingerprint is None:
+                return
+            screen_state = smart_reconnect_controller.observe_screen_states(
+                (fingerprint,),
+                candidate_windows=(window_info,),
+            ).get(fingerprint)
+            if screen_state is not ReconnectScreenState.CONNECTED:
+                return
+            result = role_id_template_service.read_if_missing(
+                window_info.handle,
+                existing_role_id=entry.role_id,
+            )
+            if result.success:
+                latest_group = group_configuration_service.group(group_name)
+                latest_entry = (
+                    next(
+                        (
+                            item
+                            for item in latest_group.entries
+                            if item.entry_id == entry.entry_id
+                        ),
+                        None,
+                    )
+                    if latest_group is not None
+                    else None
+                )
+                if latest_entry is not None and not latest_entry.role_id.strip():
+                    saved = group_configuration_service.set_role_id(
+                        group_name,
+                        entry.entry_id,
+                        result.role_id,
+                    )
+                    if saved:
+                        refresh_group_sync_identity(group_name)
+                        home_view.refresh_group_entries()
+                        home_view.refresh_group_role_statuses()
+        except Exception:
+            if logger is not None:
+                logger.warning("自動讀取遊戲內角色名稱失敗。")
+        finally:
+            try:
+                role_id_auto_read_id = window.after(
+                    1000,
+                    auto_read_missing_role_id,
+                )
+            except TclError:
+                role_id_auto_read_id = None
+
+    auto_read_missing_role_id()
+
     player_habit_reminder_service = (
         PlayerHabitReminderService(
             player_habit_service,
@@ -4793,6 +4887,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if reconnect_status_refresh_id is not None:
             try:
                 window.after_cancel(reconnect_status_refresh_id)
+            except TclError:
+                pass
+        if role_id_auto_read_id is not None:
+            try:
+                window.after_cancel(role_id_auto_read_id)
             except TclError:
                 pass
         if failures:

@@ -169,15 +169,34 @@ def test_role_id_read_uses_the_entry_safe_window_not_groupwide_failure():
     assert "if snapshot.failure_codes:" not in function_source
 
 
-def test_role_id_calibration_uses_the_registered_label_when_field_is_empty():
+def test_role_id_calibration_uses_only_the_visible_game_text():
     source = Path("main.py").read_text(encoding="utf-8")
     function_source = source[
         source.index("    def calibrate_role_id("):
         source.index("    def read_role_id(")
     ]
 
-    assert "if not calibrated_role_id.strip():" in function_source
-    assert "calibrated_role_id = entry.display_name" in function_source
+    assert "entry.display_name" not in function_source
+    assert "role_id_template_service.calibrate(" in function_source
+    assert "entry_id=entry_id" in function_source
+
+
+def test_role_id_is_automatically_read_only_for_connected_missing_roles():
+    source = Path("main.py").read_text(encoding="utf-8")
+    function_source = source[
+        source.index("    def auto_read_missing_role_id("):
+        source.index("    player_habit_reminder_service = (")
+    ]
+
+    assert "if not entry.role_id.strip()" in function_source
+    assert "window_info is None or window_info.minimized" in function_source
+    assert "screen_state is not ReconnectScreenState.CONNECTED" in function_source
+    assert "role_id_template_service.read_if_missing(" in function_source
+    assert "existing_role_id=entry.role_id" in function_source
+    assert "group_configuration_service.set_role_id(" in function_source
+    assert "entry.display_name" not in function_source
+    assert "window.after(" in function_source
+    assert "window.after_cancel(role_id_auto_read_id)" in source
 
 
 def test_startup_error_uses_product_name():

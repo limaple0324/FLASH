@@ -231,14 +231,6 @@ def _configure_win32_capture_api(user32, gdi32) -> None:
     user32.GetWindowDC.restype = wintypes.HDC
     user32.PrintWindow.argtypes = (wintypes.HWND, wintypes.HDC, wintypes.UINT)
     user32.PrintWindow.restype = wintypes.BOOL
-    if hasattr(user32, "RedrawWindow"):
-        user32.RedrawWindow.argtypes = (
-            wintypes.HWND,
-            ctypes.POINTER(wintypes.RECT),
-            wintypes.HRGN,
-            wintypes.UINT,
-        )
-        user32.RedrawWindow.restype = wintypes.BOOL
     user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
     user32.ReleaseDC.restype = ctypes.c_int
 
@@ -279,10 +271,6 @@ class WindowCaptureProvider(Protocol):
 
 class Win32PrintWindowProvider:
     """ctypes implementation of an off-screen PrintWindow capture."""
-
-    RDW_INVALIDATE = 0x0001
-    RDW_UPDATENOW = 0x0100
-    RDW_ALLCHILDREN = 0x0080
 
     @staticmethod
     def _libraries():
@@ -335,20 +323,6 @@ class Win32PrintWindowProvider:
             if not old_object:
                 return None
             bitmap_selected = True
-
-            # Legacy Flash projectors can leave an off-screen frame stale after
-            # a modal appears. Ask the target to process a paint cycle without
-            # activating it or moving the user's pointer.
-            redraw_window = getattr(user32, "RedrawWindow", None)
-            if redraw_window is not None:
-                redraw_window(
-                    hwnd,
-                    None,
-                    None,
-                    self.RDW_INVALIDATE
-                    | self.RDW_UPDATENOW
-                    | self.RDW_ALLCHILDREN,
-                )
 
             # Legacy Flash projectors render more reliably with the documented
             # whole-window mode (flags=0); PW_RENDERFULLCONTENT can return a

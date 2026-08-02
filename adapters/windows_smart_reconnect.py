@@ -161,6 +161,26 @@ class _TrustedConnectedEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class RegisteredReconnectRole:
+    """One saved game ID used only to resolve a same-level role tie."""
+
+    role_id: str
+    importance: CharacterImportance
+
+    def __post_init__(self) -> None:
+        role_id = "".join(
+            character
+            for character in self.role_id.strip()
+            if not character.isspace() and ord(character) >= 32
+        )
+        if not role_id:
+            raise ValueError("role_id must not be empty")
+        if not isinstance(self.importance, CharacterImportance):
+            raise TypeError("importance must be CharacterImportance")
+        object.__setattr__(self, "role_id", role_id)
+
+
+@dataclass(frozen=True, slots=True)
 class MouseClickResult:
     delivered: bool
     restored: bool
@@ -1615,6 +1635,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         monotonic_clock: Callable[[], float] = time.time,
         state_path: Path | None = None,
         execution_enabled: bool = False,
+        require_expected_window_count: bool = True,
         allowed_fingerprints: Iterable[str] | None = None,
         battle_restarter: WindowsBattleWindowRestarter | None = None,
         failure_status_service: ReconnectFailureStatusService | None = None,
@@ -1624,11 +1645,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         target_windows_provider: (
             Callable[[], Iterable[WindowInfo] | ResolvedTargetWindows] | None
         ) = None,
+        registered_role_provider: (
+            Callable[[], Iterable[RegisteredReconnectRole]] | None
+        ) = None,
         operation_gate: GameOperationGate | None = None,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
         self._expected_windows = expected_windows
+        self._require_expected_window_count = bool(
+            require_expected_window_count
+        )
         self._keywords = tuple(
             keyword.strip().casefold()
             for keyword in title_keywords
@@ -1724,6 +1751,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._failure_status_service = failure_status_service
         self._failure_record_callback = failure_record_callback
         self._target_windows_provider = target_windows_provider
+        if (
+            registered_role_provider is not None
+            and not callable(registered_role_provider)
+        ):
+            raise TypeError("registered_role_provider must be callable")
+        self._registered_role_provider = registered_role_provider
         self._operation_gate = operation_gate
         self._last_screen_states: dict[str, ReconnectScreenState] = {}
         self._last_trusted_capture_routes: dict[str, str] = {}
@@ -1757,8 +1790,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         target_windows_provider: (
             Callable[[], Iterable[WindowInfo] | ResolvedTargetWindows] | None
         ) = None,
+        registered_role_provider: (
+            Callable[[], Iterable[RegisteredReconnectRole]] | None
+        ) = None,
         operation_gate: GameOperationGate | None = None,
         capture_settings: SmartReconnectCaptureSettings | None = None,
+        require_expected_window_count: bool = True,
     ) -> "WindowsSmartReconnectController":
         window_backend = (
             window_backend
@@ -1780,6 +1817,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             mouse_backend=Win32MouseMessageBackend(),
             capture_settings=capture_settings,
             state_path=state_path,
+            require_expected_window_count=require_expected_window_count,
             battle_restarter=WindowsBattleWindowRestarter(
                 window_backend,
                 Win32WindowCloseBackend(),
@@ -1788,6 +1826,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             failure_status_service=failure_status_service,
             failure_record_callback=failure_record_callback,
             target_windows_provider=target_windows_provider,
+            registered_role_provider=registered_role_provider,
             operation_gate=operation_gate,
         )
 
@@ -2879,12 +2918,103 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             character_identity=candidate.identity,
         )
 
+    def _registered_role_for_candidate(
+        self,
+        candidate: CharacterSelectionCandidate,
+    ) -> RegisteredReconnectRole | None:
+        provider = self._registered_role_provider
+        identity = candidate.identity
+        if provider is None or not isinstance(identity, str):
+            return None
+        observed = identity.strip().casefold()
+        abbreviated = observed.endswith(("…", "..."))
+        observed = observed.rstrip(".…").strip()
+        if len(observed) < 3:
+            return None
+        try:
+            available = tuple(provider())
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        matches = tuple(
+            role
+            for role in available
+            if isinstance(role, RegisteredReconnectRole)
+            and (
+                role.role_id.casefold() == observed
+                if not abbreviated
+                else role.role_id.casefold().startswith(observed)
+            )
+        )
+        unique = {
+            (role.role_id.casefold(), role.importance): role
+            for role in matches
+        }
+        return next(iter(unique.values())) if len(unique) == 1 else None
+
+    def _global_character_candidate(
+        self,
+        item: ScreenRecognition,
+    ) -> tuple[CharacterSelectionCandidate, CharacterImportance | None] | None:
+        """Choose only a proven highest-level global login candidate."""
+        candidates = tuple(item.character_candidates)
+        known_levels = tuple(
+            candidate
+            for candidate in candidates
+            if candidate.level is not None
+        )
+        if not known_levels:
+            return None
+        highest_level = max(
+            candidate.level
+            for candidate in known_levels
+            if candidate.level is not None
+        )
+        highest_digit_count = len(str(highest_level))
+        if any(
+            candidate.level is None
+            and (
+                candidate.digit_count is None
+                or candidate.digit_count >= highest_digit_count
+            )
+            for candidate in candidates
+        ):
+            return None
+        highest = tuple(
+            candidate
+            for candidate in known_levels
+            if candidate.level == highest_level
+        )
+        if len(highest) == 1:
+            candidate = highest[0]
+            registered = self._registered_role_for_candidate(candidate)
+            return (
+                candidate,
+                (
+                    registered.importance
+                    if registered is not None
+                    else candidate.importance
+                ),
+            )
+        primary: list[
+            tuple[CharacterSelectionCandidate, CharacterImportance]
+        ] = []
+        for candidate in highest:
+            registered = self._registered_role_for_candidate(candidate)
+            importance = (
+                registered.importance
+                if registered is not None
+                else candidate.importance
+            )
+            if importance is CharacterImportance.PRIMARY:
+                primary.append((candidate, importance))
+        return primary[0] if len(primary) == 1 else None
+
     def _character_target_is_safe(
         self,
         fingerprint: str,
         item: ScreenRecognition,
     ) -> ScreenRecognition | None:
-        """Apply the confirmed original-role, highest-level, then role order."""
+        """Choose the highest level and resolve only a proven same-level main role."""
         target = self._target_for_fingerprint(fingerprint)
         plan = self._group_launch_plan
         identity = (
@@ -2893,7 +3023,36 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             and item.character_identity.strip()
             else None
         )
-        if target is None or plan is None:
+        if plan is None:
+            global_selection = self._global_character_candidate(item)
+            if global_selection is not None:
+                selected, importance = global_selection
+                return self._candidate_result(
+                    item,
+                    selected,
+                    importance,
+                )
+            selected_candidates = tuple(
+                candidate
+                for candidate in item.character_candidates
+                if candidate.selected
+            )
+            if (
+                self._has_reconnect_session(fingerprint)
+                and (
+                    item.character_slot_selected
+                    or len(selected_candidates) == 1
+                )
+            ):
+                # Global reconnect never chooses a role.  It can only press
+                # enter for the one role the game itself already selected
+                # after a confirmed disconnect flow.
+                return replace(
+                    item,
+                    click_point=CHARACTER_ENTER_CLICK_POINT,
+                )
+            return None
+        if target is None:
             return None
         expected_level = self._target_level(target)
         if identity is not None:
@@ -3316,12 +3475,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
     def _group_failures(self, windows: tuple[WindowInfo, ...]) -> list[str]:
         failures: list[str] = []
-        # Without an explicit group identity scope, completeness remains the
-        # safety boundary.  With a ready group plan, reconnect monitors only
-        # the uniquely resolved windows that are currently open.  A role that
-        # is deliberately closed or belongs to another group must not block a
-        # safe open sibling.
+        # The default keeps the original fixed-count safety boundary.  The
+        # player may explicitly enable global reconnect, which checks every
+        # uniquely identified open game window without requiring a group.
         if (
+            self._require_expected_window_count
+            and
             self._allowed_fingerprints is None
             and len(windows) != self._expected_windows
         ):

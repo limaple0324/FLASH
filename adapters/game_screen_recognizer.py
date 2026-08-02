@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+import sys
+from typing import Any, Iterable
 
 from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat
 
 from adapters.windows_background_capture import CaptureSample
+from adapters.windows_role_id_ocr import ROLE_ID_MODEL
 from core.reconnect_policy import ReconnectScreenState
 from domain.character import CharacterImportance
 
@@ -86,6 +88,16 @@ CHARACTER_LEVEL_REGIONS: tuple[NormalizedRect, ...] = (
     (698.1 / 1348, 657.9 / 937, 768.1 / 1348, 699.9 / 937),
     (903.1 / 1348, 657.9 / 937, 973.1 / 1348, 699.9 / 937),
 )
+# The visible character-name line is read only after the selection template and
+# its level glyphs already match.  A trailing ellipsis remains part of the
+# result so the controller can distinguish an abbreviated name from a full ID.
+CHARACTER_NAME_REGIONS: tuple[NormalizedRect, ...] = (
+    (460 / 1348, 640 / 937, 570 / 1348, 675 / 937),
+    (660 / 1348, 640 / 937, 770 / 1348, 675 / 937),
+    (865 / 1348, 640 / 937, 975 / 1348, 675 / 937),
+)
+CHARACTER_NAME_THRESHOLD = 150
+CHARACTER_NAME_SCALE = 4
 CHARACTER_SLOT_REGIONS: tuple[NormalizedRect, ...] = (
     (0.282, 0.665, 0.426, 0.783),
     (0.430, 0.665, 0.568, 0.783),
@@ -115,7 +127,25 @@ BATTLE_SCREEN_MINIMUM_STDDEV = 30.0
 BATTLE_SCREEN_MINIMUM_EDGE_MEAN = 12.0
 DISCONNECT_OVERLAY_REGION: NormalizedRect = (0.323, 0.477, 0.677, 0.607)
 DISCONNECT_OVERLAY_SIGNATURE_SIZE = (162, 41)
+DISCONNECT_OVERLAY_PROBE_SIZE = (32, 8)
+DISCONNECT_OVERLAY_FULL_MATCH_LIMIT = 64
 DISCONNECT_OVERLAY_MINIMUM_MASKED_STDDEV = 12.0
+# This is the text line in the confirmed disconnect dialog.  Template matching
+# narrows the candidate first; the local reader then requires the core
+# disconnect word before the reconnect flow can send any input.
+DISCONNECT_TEXT_WITHIN_OVERLAY: NormalizedRect = (
+    ((470 / 1349) - DISCONNECT_OVERLAY_REGION[0])
+    / (DISCONNECT_OVERLAY_REGION[2] - DISCONNECT_OVERLAY_REGION[0]),
+    ((480 / 936) - DISCONNECT_OVERLAY_REGION[1])
+    / (DISCONNECT_OVERLAY_REGION[3] - DISCONNECT_OVERLAY_REGION[1]),
+    ((890 / 1349) - DISCONNECT_OVERLAY_REGION[0])
+    / (DISCONNECT_OVERLAY_REGION[2] - DISCONNECT_OVERLAY_REGION[0]),
+    ((505 / 936) - DISCONNECT_OVERLAY_REGION[1])
+    / (DISCONNECT_OVERLAY_REGION[3] - DISCONNECT_OVERLAY_REGION[1]),
+)
+DISCONNECT_TEXT_THRESHOLD = 160
+DISCONNECT_TEXT_SCALE = 3
+DISCONNECT_TEXT_PADDING = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,8 +332,17 @@ class ReferenceScreenRecognizer:
             raise ValueError("Screen template states must be unique")
         self._references: dict[str, Image.Image] = {}
         self._disconnect_overlay_reference: (
-            tuple[Image.Image, Image.Image, Image.Image] | None
+            tuple[
+                Image.Image,
+                Image.Image,
+                Image.Image,
+                Image.Image,
+                Image.Image,
+            ]
+            | None
         ) = None
+        self._disconnect_text_reader: Any | None = None
+        self._disconnect_text_reader_loaded = False
 
     @property
     def missing_references(self) -> tuple[str, ...]:
@@ -827,6 +866,8 @@ class ReferenceScreenRecognizer:
     def _character_selection_candidates(
         self,
         image: Image.Image,
+        *,
+        read_identity: bool = False,
     ) -> tuple[CharacterSelectionCandidate, ...]:
         selected_slot = self._selected_character_slot_index(image)
         choices: list[CharacterSelectionCandidate] = []
@@ -841,6 +882,14 @@ class ReferenceScreenRecognizer:
                 image,
                 level_region,
             )
+            identity = (
+                self._character_selection_identity(
+                    image,
+                    CHARACTER_NAME_REGIONS[index],
+                )
+                if read_identity
+                else None
+            )
             choices.append(
                 CharacterSelectionCandidate(
                     level=level,
@@ -853,13 +902,28 @@ class ReferenceScreenRecognizer:
                         else CHARACTER_SLOT_CLICK_POINTS[index]
                     ),
                     digit_count=digit_count,
+                    identity=identity,
                 )
             )
         return tuple(choices)
 
+    def _character_selection_identity(
+        self,
+        image: Image.Image,
+        region: NormalizedRect,
+    ) -> str | None:
+        text = self._read_local_text(
+            self._crop(image, region),
+            threshold=CHARACTER_NAME_THRESHOLD,
+            scale=CHARACTER_NAME_SCALE,
+        )
+        return text or None
+
     def _character_selection_target(
         self,
         image: Image.Image,
+        *,
+        candidates: tuple[CharacterSelectionCandidate, ...] | None = None,
     ) -> tuple[
         NormalizedPoint | None,
         int | None,
@@ -867,7 +931,11 @@ class ReferenceScreenRecognizer:
         int | None,
         bool | None,
     ]:
-        candidates = self._character_selection_candidates(image)
+        if candidates is None:
+            candidates = self._character_selection_candidates(
+                image,
+                read_identity=True,
+            )
         if not candidates:
             return None, None, None, None, None
         selected_candidates = tuple(
@@ -998,10 +1066,15 @@ class ReferenceScreenRecognizer:
     def _prepared_disconnect_overlay_reference(
         self,
         reference: Image.Image,
-    ) -> tuple[Image.Image, Image.Image] | None:
+    ) -> tuple[
+        Image.Image,
+        Image.Image,
+        Image.Image,
+        Image.Image,
+    ] | None:
         prepared = self._disconnect_overlay_reference
         if prepared is not None and prepared[0] is reference:
-            return prepared[1], prepared[2]
+            return prepared[1], prepared[2], prepared[3], prepared[4]
 
         reference_crop = self._crop(
             reference,
@@ -1025,12 +1098,22 @@ class ReferenceScreenRecognizer:
         )
         if mask.getbbox() is None:
             return None
+        probe_reference = reference_crop.resize(
+            DISCONNECT_OVERLAY_PROBE_SIZE,
+            Image.Resampling.BILINEAR,
+        )
+        probe_mask = mask.resize(
+            DISCONNECT_OVERLAY_PROBE_SIZE,
+            Image.Resampling.NEAREST,
+        )
         self._disconnect_overlay_reference = (
             reference,
             reference_crop,
             mask,
+            probe_reference,
+            probe_mask,
         )
-        return reference_crop, mask
+        return reference_crop, mask, probe_reference, probe_mask
 
     @staticmethod
     def _disconnect_overlay_candidate_boxes(
@@ -1096,16 +1179,42 @@ class ReferenceScreenRecognizer:
         self,
         candidate: Image.Image,
         reference: Image.Image,
-    ) -> tuple[float, Image.Image | None]:
+    ) -> tuple[
+        float,
+        Image.Image | None,
+        tuple[int, int, int, int] | None,
+    ]:
         """Return the best bounded position/scale match and its exact crop."""
         prepared = self._prepared_disconnect_overlay_reference(reference)
         if prepared is None:
-            return 255.0, None
-        reference_crop, mask = prepared
+            return 255.0, None, None
+        reference_crop, mask, probe_reference, probe_mask = prepared
 
         best = 255.0
         best_crop = None
-        for box in self._disconnect_overlay_candidate_boxes(candidate):
+        best_box = None
+        probe_matches: list[tuple[float, int, tuple[int, int, int, int]]] = []
+        for index, box in enumerate(
+            self._disconnect_overlay_candidate_boxes(candidate)
+        ):
+            probe_crop = candidate.crop(box).resize(
+                DISCONNECT_OVERLAY_PROBE_SIZE,
+                Image.Resampling.BILINEAR,
+            )
+            probe_difference = ImageChops.difference(
+                probe_crop,
+                probe_reference,
+            )
+            probe_means = ImageStat.Stat(
+                probe_difference,
+                mask=probe_mask,
+            ).mean
+            probe_matches.append(
+                (sum(probe_means) / len(probe_means), index, box)
+            )
+        for _probe_score, _index, box in sorted(probe_matches)[
+            :DISCONNECT_OVERLAY_FULL_MATCH_LIMIT
+        ]:
             candidate_crop = candidate.crop(box).resize(
                 DISCONNECT_OVERLAY_SIGNATURE_SIZE,
                 Image.Resampling.BILINEAR,
@@ -1122,9 +1231,10 @@ class ReferenceScreenRecognizer:
             if score < best:
                 best = score
                 best_crop = candidate_crop
+                best_box = box
             if best == 0.0:
                 break
-        return best, best_crop
+        return best, best_crop, best_box
 
     def _disconnect_overlay_score(
         self,
@@ -1132,7 +1242,7 @@ class ReferenceScreenRecognizer:
         reference: Image.Image,
     ) -> float:
         """Compare stable dialog pixels across bounded position/scale drift."""
-        score, _crop = self._best_disconnect_overlay_match(
+        score, _crop, _box = self._best_disconnect_overlay_match(
             candidate,
             reference,
         )
@@ -1146,8 +1256,8 @@ class ReferenceScreenRecognizer:
         prepared = self._prepared_disconnect_overlay_reference(reference)
         if prepared is None:
             return False
-        _reference_crop, mask = prepared
-        _score, candidate_crop = self._best_disconnect_overlay_match(
+        _reference_crop, mask, _probe_reference, _probe_mask = prepared
+        _score, candidate_crop, _box = self._best_disconnect_overlay_match(
             candidate,
             reference,
         )
@@ -1161,6 +1271,111 @@ class ReferenceScreenRecognizer:
             sum(channel_stddev) / len(channel_stddev)
             >= DISCONNECT_OVERLAY_MINIMUM_MASKED_STDDEV
         )
+
+    @staticmethod
+    def _local_model_path() -> Path:
+        bundle_root = getattr(sys, "_MEIPASS", None)
+        root = (
+            Path(bundle_root)
+            if bundle_root
+            else Path(__file__).resolve().parents[1]
+        )
+        return root / ROLE_ID_MODEL
+
+    def _disconnect_reader(self) -> Any | None:
+        if self._disconnect_text_reader_loaded:
+            return self._disconnect_text_reader
+        self._disconnect_text_reader_loaded = True
+        try:
+            from rapidocr_onnxruntime.ch_ppocr_rec.text_recognize import (
+                TextRecognizer,
+            )
+
+            model_path = self._local_model_path()
+            if not model_path.is_file():
+                return None
+            self._disconnect_text_reader = TextRecognizer(
+                {
+                    "intra_op_num_threads": -1,
+                    "inter_op_num_threads": -1,
+                    "use_cuda": False,
+                    "use_dml": False,
+                    "model_path": str(model_path),
+                    "rec_img_shape": [3, 48, 320],
+                    "rec_batch_num": 6,
+                }
+            )
+        except (ImportError, OSError, RuntimeError, ValueError):
+            return None
+        return self._disconnect_text_reader
+
+    def _disconnect_text_has_words(
+        self,
+        candidate: Image.Image,
+        dialog_box: tuple[int, int, int, int] | None,
+    ) -> bool:
+        if dialog_box is None:
+            return False
+        text = self._crop(
+            candidate.crop(dialog_box),
+            DISCONNECT_TEXT_WITHIN_OVERLAY,
+        )
+        text = self._read_local_text(
+            text,
+            threshold=DISCONNECT_TEXT_THRESHOLD,
+            scale=DISCONNECT_TEXT_SCALE,
+        )
+        return "中斷" in text
+
+    def _read_local_text(
+        self,
+        image: Image.Image,
+        *,
+        threshold: int,
+        scale: int,
+    ) -> str:
+        reader = self._disconnect_reader()
+        if reader is None:
+            return ""
+        glyphs = image.convert("L").point(
+            lambda value: 255 if value >= threshold else 0
+        ).convert("RGB")
+        prepared = Image.new(
+            "RGB",
+            (
+                glyphs.width + DISCONNECT_TEXT_PADDING * 2,
+                glyphs.height + DISCONNECT_TEXT_PADDING * 2,
+            ),
+            "black",
+        )
+        prepared.paste(
+            glyphs,
+            (DISCONNECT_TEXT_PADDING, DISCONNECT_TEXT_PADDING),
+        )
+        try:
+            from numpy import asarray
+
+            result, _elapsed = reader(
+                asarray(
+                    prepared.resize(
+                        (
+                            prepared.width * scale,
+                            prepared.height * scale,
+                        ),
+                        Image.Resampling.NEAREST,
+                    )
+                )
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return ""
+        parts = [
+            item[0]
+            for item in result
+            if isinstance(item, (list, tuple))
+            and item
+            and isinstance(item[0], str)
+        ]
+        return "".join(parts).replace(" ", "")
 
     def recognize_image(self, image: Image.Image) -> ScreenRecognition:
         candidate = image.convert("RGB")
@@ -1178,7 +1393,11 @@ class ReferenceScreenRecognizer:
             if definition.state is ReconnectScreenState.DISCONNECTED
         )
         disconnected_reference = self._reference(disconnected.filename)
-        disconnected_score = self._disconnect_overlay_score(
+        (
+            disconnected_score,
+            _disconnected_crop,
+            disconnected_box,
+        ) = self._best_disconnect_overlay_match(
             candidate,
             disconnected_reference,
         )
@@ -1193,6 +1412,7 @@ class ReferenceScreenRecognizer:
                 candidate,
                 disconnected_reference,
             )
+            and self._disconnect_text_has_words(candidate, disconnected_box)
         ):
             return ScreenRecognition(
                 state=ReconnectScreenState.DISCONNECTED,
@@ -1338,13 +1558,20 @@ class ReferenceScreenRecognizer:
                 line_number = DEFAULT_LINE_NUMBER
             click_point = LINE_ROUTE_CLICK_POINTS[line_number]
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
+            character_candidates = self._character_selection_candidates(
+                candidate,
+                read_identity=True,
+            )
             (
                 click_point,
                 character_level,
                 character_importance,
                 character_slot_index,
                 character_slot_selected,
-            ) = self._character_selection_target(candidate)
+            ) = self._character_selection_target(
+                candidate,
+                candidates=character_candidates,
+            )
         return ScreenRecognition(
             state=definition.state,
             score=round(score, 3),

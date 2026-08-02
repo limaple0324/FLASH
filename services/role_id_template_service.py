@@ -1,55 +1,80 @@
-"""Legacy-compatible role-ID calibration using passive client-region reads."""
+"""Read role IDs only from visible game-character text."""
 
 from __future__ import annotations
 
-import json
-import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Mapping
+from typing import Protocol
 
-from adapters.windows_background_capture import CaptureSample
-from adapters.windows_sync_calibration import Win32SyncCalibrationBackend
+from adapters.windows_background_capture import (
+    CaptureSample,
+    Win32PrintWindowProvider,
+)
+from adapters.windows_role_id_ocr import (
+    WindowsRoleIdOcrReader,
+)
 
 
-ROLE_ID_REGION = (87, 13, 177, 37)
-MIN_FEATURE_PIXELS = 100
-MAX_MATCH_SCORE = 0.08
+# The HUD permits names wider than the old 58-pixel sample.  Keep the entire
+# visible name band here; the OCR preprocessor excludes the coloured envelope
+# icon by its pixels instead of truncating a real name before that icon.
+ROLE_ID_REGION = (86, 50, 320, 63)
+
+
+class RoleIdOcrReader(Protocol):
+    def read(self, sample: CaptureSample) -> str:
+        """Return text read from the captured game-character name."""
+
+
+class RoleIdCaptureProvider(Protocol):
+    def capture(self, window_handle: int) -> CaptureSample | None:
+        """Capture a game window without changing its foreground state."""
+
+
+def role_id_region_sample(sample: CaptureSample) -> CaptureSample | None:
+    left, top, right, bottom = ROLE_ID_REGION
+    if (
+        sample.width < right
+        or sample.height < bottom
+        or len(sample.pixels) < sample.width * sample.height * 4
+    ):
+        return None
+    width, height = right - left, bottom - top
+    pixels = bytearray()
+    for y in range(top, bottom):
+        start = (y * sample.width + left) * 4
+        pixels.extend(sample.pixels[start : start + width * 4])
+    return CaptureSample(width, height, bytes(pixels), sample.api_succeeded)
 
 
 def clean_role_id_text(value: object) -> str:
     if not isinstance(value, str):
         return ""
-    cleaned = re.sub(r"\s+", "", value)
-    cleaned = re.sub(r"^[0-9Il]*[|]+", "", cleaned)
-    cleaned = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]", "", cleaned)
-    return cleaned[:24]
-
-
-def signature_from_sample(
-    sample: CaptureSample,
-) -> tuple[int, int, str, int]:
+    raw = value.strip()
     if (
-        sample.width <= 0
-        or sample.height <= 0
-        or len(sample.pixels) < sample.width * sample.height * 4
+        not raw
+        or "\\" in raw
+        or "/" in raw
+        or raw.casefold().endswith(".lnk")
+        or "..." in raw
+        or "…" in raw
     ):
-        return 0, 0, "", 0
-    bits: list[str] = []
-    for offset in range(0, sample.width * sample.height * 4, 4):
-        blue, green, red = sample.pixels[offset : offset + 3]
-        bright = max(red, green, blue)
-        dark = min(red, green, blue)
-        bits.append("1" if bright >= 170 and bright - dark <= 95 else "0")
-    signature = "".join(bits)
-    return sample.width, sample.height, signature, signature.count("1")
-
-
-def signature_distance(left: str, right: str) -> int:
-    return sum(a != b for a, b in zip(left, right)) + abs(
-        len(left) - len(right)
-    )
+        # A shortcut name or an ellipsized HUD label is not a complete
+        # in-game role name.  Never turn either into a saved identity.
+        return ""
+    accepted = re.compile(r"[0-9A-Za-z_\-\u3040-\u30ff\u4e00-\u9fff]")
+    cleaned: list[str] = []
+    for character in raw:
+        if character.isspace():
+            continue
+        if accepted.fullmatch(character):
+            cleaned.append(character)
+        else:
+            # Do not replace an unreadable glyph with a guessed character.
+            # Retain its position as the user-visible blank requested for
+            # partially readable names.
+            cleaned.append(" ")
+    return "".join(cleaned).strip()[:24]
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,110 +82,59 @@ class RoleIdReadResult:
     success: bool
     role_id: str = ""
     message: str = ""
-    score: float | None = None
 
 
 class RoleIdTemplateService:
+    """Compatibility name for the role-ID service.
+
+    Older versions used a shortcut label and an image signature as a template.
+    This service deliberately ignores that old data: every successful value
+    comes from the current game's visible character-name pixels.
+    """
+
     def __init__(
         self,
-        path: Path,
         *,
-        capture_backend: Win32SyncCalibrationBackend | None = None,
+        capture_provider: RoleIdCaptureProvider | None = None,
+        ocr_reader: RoleIdOcrReader | None = None,
     ) -> None:
-        self.path = Path(path)
-        self._capture_backend = (
-            capture_backend or Win32SyncCalibrationBackend()
+        self._capture_provider = (
+            capture_provider or Win32PrintWindowProvider()
         )
+        self._ocr_reader = ocr_reader or WindowsRoleIdOcrReader()
 
-    def _load(self) -> list[dict[str, object]]:
-        if not self.path.is_file():
-            return []
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return []
-        return [
-            dict(item)
-            for item in payload
-            if isinstance(item, Mapping)
-        ] if isinstance(payload, list) else []
-
-    def _save(self, templates: list[dict[str, object]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        try:
-            temporary.write_text(
-                json.dumps(
-                    templates,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            os.replace(temporary, self.path)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-    def _signature(
-        self,
-        window_handle: int,
-    ) -> tuple[int, int, str, int] | None:
-        sample = self._capture_backend.capture_client_region(
-            window_handle,
-            ROLE_ID_REGION,
+    def _read_game_role_id(self, window_handle: int) -> RoleIdReadResult:
+        whole_window = self._capture_provider.capture(window_handle)
+        sample = (
+            role_id_region_sample(whole_window)
+            if whole_window is not None
+            else None
         )
         if sample is None or not sample.api_succeeded:
-            return None
-        return signature_from_sample(sample)
+            return RoleIdReadResult(
+                False,
+                message="無法讀取遊戲畫面的角色ID；原本資料保持不變。",
+            )
+        role_id = clean_role_id_text(self._ocr_reader.read(sample))
+        if not role_id:
+            return RoleIdReadResult(
+                False,
+                message="無法辨識遊戲內角色ID；原本資料保持不變。",
+            )
+        return RoleIdReadResult(
+            True,
+            role_id=role_id,
+            message=f"已讀取遊戲內角色ID：{role_id}",
+        )
 
     def calibrate(
         self,
         window_handle: int,
-        role_id: object,
         *,
         entry_id: object = "",
     ) -> RoleIdReadResult:
-        normalized = clean_role_id_text(role_id)
-        bound_entry_id = str(entry_id).strip()
-        if not normalized:
-            return RoleIdReadResult(False, message="角色ID不可空白。")
-        captured = self._signature(window_handle)
-        if captured is None:
-            return RoleIdReadResult(False, message="無法讀取角色ID區域。")
-        width, height, signature, count = captured
-        if count < MIN_FEATURE_PIXELS:
-            return RoleIdReadResult(
-                False,
-                message="角色ID區域內沒有足夠文字特徵。",
-            )
-        templates = [
-            item
-            for item in self._load()
-            if (
-                str(item.get("entry_id", "")) != bound_entry_id
-                if bound_entry_id
-                else str(item.get("role_id", "")) != normalized
-            )
-        ]
-        templates.append(
-            {
-                "role_id": normalized,
-                "width": width,
-                "height": height,
-                "signature": signature,
-                "count": count,
-                "region": list(ROLE_ID_REGION),
-                "entry_id": bound_entry_id,
-            }
-        )
-        self._save(templates)
-        return RoleIdReadResult(
-            True,
-            role_id=normalized,
-            message=f"已保存角色ID範本：{normalized}",
-            score=0.0,
-        )
+        del entry_id
+        return self._read_game_role_id(window_handle)
 
     def read(
         self,
@@ -168,54 +142,19 @@ class RoleIdTemplateService:
         *,
         entry_id: object = "",
     ) -> RoleIdReadResult:
-        bound_entry_id = str(entry_id).strip()
-        captured = self._signature(window_handle)
-        if captured is None:
-            return RoleIdReadResult(False, message="無法讀取角色ID區域。")
-        width, height, signature, count = captured
-        if count < MIN_FEATURE_PIXELS:
+        del entry_id
+        return self._read_game_role_id(window_handle)
+
+    def read_if_missing(
+        self,
+        window_handle: int,
+        *,
+        existing_role_id: object,
+    ) -> RoleIdReadResult:
+        """Read only an empty role name for the automatic background pass."""
+        if isinstance(existing_role_id, str) and existing_role_id.strip():
             return RoleIdReadResult(
                 False,
-                message="角色ID區域內沒有足夠文字特徵。",
+                message="已有已保存的角色名稱，自動讀取不覆寫。",
             )
-        best_role = ""
-        best_score = 1.0
-        for item in self._load():
-            if bound_entry_id and (
-                str(item.get("entry_id", "")) != bound_entry_id
-            ):
-                continue
-            template_signature = str(item.get("signature", ""))
-            if (
-                not template_signature
-                or item.get("width") != width
-                or item.get("height") != height
-            ):
-                continue
-            score = signature_distance(
-                signature,
-                template_signature,
-            ) / max(1, len(signature))
-            if score < best_score:
-                best_score = score
-                best_role = str(item.get("role_id", ""))
-        if best_role and best_score <= MAX_MATCH_SCORE:
-            return RoleIdReadResult(
-                True,
-                role_id=best_role,
-                message=f"相似度差異 {best_score:.3f}",
-                score=best_score,
-            )
-        if best_role:
-            return RoleIdReadResult(
-                False,
-                message=(
-                    f"最接近 {best_role}，但差異過大 "
-                    f"{best_score:.3f}"
-                ),
-                score=best_score,
-            )
-        return RoleIdReadResult(
-            False,
-            message="沒有可用的角色ID範本，請先校正角色ID。",
-        )
+        return self._read_game_role_id(window_handle)

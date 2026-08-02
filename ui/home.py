@@ -740,7 +740,7 @@ class HomeView:
             Callable[[str, str], object] | None
         ) = None,
         on_calibrate_role_id: (
-            Callable[[str, str, str], object] | None
+            Callable[[str, str], object] | None
         ) = None,
         on_read_role_id: (
             Callable[[str, str], object] | None
@@ -1353,6 +1353,7 @@ class HomeView:
         self._group_reorder_original: tuple[str, ...] = ()
         self._group_reorder_working: list[str] = []
         self._group_drag_entry_id: str | None = None
+        self._group_drag_preview: Label | None = None
         self._group_launch_running = False
         self._group_launch_status_label: Label | None = None
         self._group_launch_hotkey_variable: StringVar | None = None
@@ -1675,10 +1676,21 @@ class HomeView:
                         cursor="fleur",
                         **title_options,
                     )
+                    widgets.toggle_button.place_forget()
+                    widgets.settings_button.place_forget()
+                    widgets.toggle_button.pack(
+                        in_=header,
+                        side=RIGHT,
+                    )
+                    widgets.settings_button.pack(
+                        in_=header,
+                        side=RIGHT,
+                        padx=(0, 6),
+                    )
                     target_title.pack(
+                        side=LEFT,
                         fill=X,
                         expand=True,
-                        padx=(0, control_height + 24),
                     )
                 else:
                     # Some cards use grid-managed children directly in the
@@ -1718,10 +1730,17 @@ class HomeView:
                     ),
                     add="+",
                 )
-                # 格狀卡片會增加內距來保留控制鈕空間；控制鈕本身仍
-                # 固定在卡片頂端，避免跟著內距往下壓住第一列內容。
-                widgets.settings_button.place_configure(y=6)
-                widgets.toggle_button.place_configure(y=6)
+                if original_manager != "pack":
+                    # 格狀卡片不能把已存在的內容改成標題列子元件；保留
+                    # 原有安全內距，避免右上按鈕壓到第一列格狀內容。
+                    content_pady = int(
+                        widgets.frame.winfo_pixels(
+                            widgets.frame.cget("pady")
+                        )
+                    )
+                    control_y = 6 - content_pady
+                    widgets.settings_button.place_configure(y=control_y)
+                    widgets.toggle_button.place_configure(y=control_y)
             self._load_feature_card_background(card_id)
             self._set_feature_card_collapsed(
                 widgets,
@@ -9702,6 +9721,7 @@ class HomeView:
         )
 
     def _cancel_group_entry_reorder(self) -> None:
+        self._clear_group_entry_drag_preview()
         self._group_reorder_mode = False
         self._group_reorder_original = ()
         self._group_reorder_working = []
@@ -9718,7 +9738,9 @@ class HomeView:
             return
         proposed = tuple(self._group_reorder_working)
         if proposed == self._group_reorder_original:
-            self._cancel_group_entry_reorder()
+            self._show_group_setting_message(
+                "順序尚未調整；請拖曳到另一個角色位置。"
+            )
             return
         try:
             result = self.on_reorder_group_entries(
@@ -9739,18 +9761,63 @@ class HomeView:
         self._group_reorder_original = ()
         self._group_reorder_working = []
         self._group_drag_entry_id = None
+        self._clear_group_entry_drag_preview()
         self.build()
         self._show_group_setting_message("角色啟動順序已保存。")
 
-    def _start_group_entry_drag(self, entry_id: str) -> None:
-        if self._group_reorder_mode:
-            self._group_drag_entry_id = entry_id
+    def _start_group_entry_drag(
+        self,
+        event,
+        entry_id: str,
+        display_name: str,
+    ) -> None:
+        if not self._group_reorder_mode:
+            return
+        self._clear_group_entry_drag_preview()
+        self._group_drag_entry_id = entry_id
+        self._group_drag_preview = Label(
+            self.parent,
+            text=f"正在移動：{display_name}",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            relief="solid",
+            bd=1,
+            padx=10,
+            pady=4,
+        )
+        self._move_group_entry_drag(event)
+
+    def _move_group_entry_drag(self, event) -> None:
+        preview = self._group_drag_preview
+        if preview is None:
+            return
+        try:
+            preview.place_configure(
+                x=max(0, event.x_root - self.parent.winfo_rootx() + 14),
+                y=max(0, event.y_root - self.parent.winfo_rooty() + 14),
+            )
+            preview.lift()
+        except Exception:
+            self._clear_group_entry_drag_preview()
+
+    def _clear_group_entry_drag_preview(self) -> None:
+        preview = self._group_drag_preview
+        self._group_drag_preview = None
+        if preview is not None:
+            try:
+                preview.destroy()
+            except Exception:
+                pass
 
     def _bind_group_entry_drag_tree(
         self,
         widget,
         entry_id: str,
+        display_name: str,
     ) -> None:
+        if isinstance(widget, (Button, Checkbutton, Entry)):
+            return
         widget._group_entry_id = entry_id
         try:
             widget.configure(cursor="fleur")
@@ -9758,20 +9825,30 @@ class HomeView:
             pass
         widget.bind(
             "<ButtonPress-1>",
-            lambda _event, value=entry_id: self._start_group_entry_drag(
-                value
+            lambda event, value=entry_id, label=display_name: (
+                self._start_group_entry_drag(
+                    event,
+                    value,
+                    label,
+                )
             ),
         )
+        widget.bind("<B1-Motion>", self._move_group_entry_drag)
         widget.bind(
             "<ButtonRelease-1>",
             self._finish_group_entry_drag,
         )
         for child in widget.winfo_children():
-            self._bind_group_entry_drag_tree(child, entry_id)
+            self._bind_group_entry_drag_tree(
+                child,
+                entry_id,
+                display_name,
+            )
 
     def _finish_group_entry_drag(self, event) -> None:
         source_id = self._group_drag_entry_id
         self._group_drag_entry_id = None
+        self._clear_group_entry_drag_preview()
         if not self._group_reorder_mode or source_id is None:
             return
         try:
@@ -10013,14 +10090,13 @@ class HomeView:
                 bd=0,
             )
             role_id_entry.insert(0, entry.role_id)
+            role_id_entry.configure(state="readonly")
             role_id_entry.pack(side=LEFT, padx=(0, 6), ipady=4)
             self._button(
                 top_row,
                 "校正角色 ID",
-                lambda value=entry.entry_id,
-                field=role_id_entry: self._calibrate_group_role_id(
+                lambda value=entry.entry_id: self._calibrate_group_role_id(
                     value,
-                    field,
                 ),
             ).pack(side=LEFT)
             self._button(
@@ -10077,7 +10153,7 @@ class HomeView:
                     ),
                 )
                 main_button.pack(side=RIGHT)
-                if locked or self._group_reorder_mode:
+                if locked:
                     main_button.configure(state=DISABLED)
             if self._group_reorder_mode:
                 Label(
@@ -10091,6 +10167,7 @@ class HomeView:
                 self._bind_group_entry_drag_tree(
                     row,
                     entry.entry_id,
+                    entry.display_name,
                 )
                 continue
             settings_row = Frame(row, bg=BACKGROUND)
@@ -10467,7 +10544,6 @@ class HomeView:
     def _calibrate_group_role_id(
         self,
         entry_id: str,
-        field: Entry,
     ) -> None:
         if (
             self.current_group_name is None
@@ -10478,7 +10554,6 @@ class HomeView:
             result = self.on_calibrate_role_id(
                 self.current_group_name,
                 entry_id,
-                field.get(),
             )
         except Exception as error:
             self._report_refresh_error(error)

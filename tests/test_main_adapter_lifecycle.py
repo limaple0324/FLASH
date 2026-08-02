@@ -240,7 +240,7 @@ def test_run_shuts_down_adapter_after_normal_window_close(monkeypatch, tmp_path)
     assert adapter.shutdown_calls == 1
 
 
-def test_build_services_keeps_reconnect_and_sync_target_providers_separate(
+def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
     monkeypatch,
     tmp_path,
 ):
@@ -250,19 +250,14 @@ def test_build_services_keeps_reconnect_and_sync_target_providers_separate(
     keyboard = AppContext.get(main_module.WindowsInputSyncController)
     pointer = AppContext.get(main_module.WindowsPointerSyncController)
     strict_targets = ("strict-target",)
-    reconnect_targets = ResolvedTargetWindows(
-        windows=("safe-reconnect-target",),
-        failure_codes=("unidentified_candidate_window",),
-    )
-
-    monkeypatch.setattr(contract, "windows", lambda _group_name: strict_targets)
     monkeypatch.setattr(
         contract,
         "reconnect_targets",
-        lambda _group_name: reconnect_targets,
+        lambda _group_name: ResolvedTargetWindows(strict_targets),
     )
 
-    assert reconnect._target_windows_provider() is reconnect_targets
+    assert reconnect._target_windows_provider is None
+    assert reconnect._require_expected_window_count is False
     assert keyboard._target_windows_provider() == strict_targets
     assert pointer._target_windows_provider() == strict_targets
 

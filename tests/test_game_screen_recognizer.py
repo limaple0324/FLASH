@@ -111,6 +111,33 @@ def test_disconnect_overlay_accepts_confirmed_darker_game_rendering():
     assert 31.0 < result.score <= 38.0
 
 
+def test_disconnect_overlay_does_not_act_without_disconnect_words(monkeypatch):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    monkeypatch.setattr(
+        recognizer,
+        "_disconnect_text_has_words",
+        lambda _candidate, _dialog_box: False,
+    )
+    with Image.open(REFERENCE_DIR / "01_disconnected_dialog.png") as source:
+        candidate = source.convert("RGB")
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is not ReconnectScreenState.DISCONNECTED
+    assert result.click_point is None
+
+
+def test_character_selection_keeps_an_abbreviated_visible_name():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "05_character_selection.png") as source:
+        result = recognizer.recognize_image(source)
+
+    assert len(result.character_candidates) == 1
+    identity = result.character_candidates[0].identity
+    assert identity is not None
+    assert identity.endswith("…")
+
+
 def _paste_level_reference(
     recognizer,
     candidate,

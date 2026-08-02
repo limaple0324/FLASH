@@ -1,26 +1,38 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 
 
 rawpy_binaries = collect_dynamic_libs('rawpy')
 pillow_heif_binaries = collect_dynamic_libs('pillow_heif')
 pillow_heif_hiddenimports = collect_submodules('pillow_heif')
+rapidocr_binaries = (
+    collect_dynamic_libs('rapidocr_onnxruntime')
+    + collect_dynamic_libs('onnxruntime')
+)
+rapidocr_datas = collect_data_files('rapidocr_onnxruntime')
+rapidocr_hiddenimports = collect_submodules('rapidocr_onnxruntime')
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=rawpy_binaries + pillow_heif_binaries,
+    binaries=rawpy_binaries + pillow_heif_binaries + rapidocr_binaries,
     datas=[
         ('assets/flash_icon.png', 'assets'),
         ('assets/flash_icon.ico', 'assets'),
         ('assets/reconnect_reference', 'assets/reconnect_reference'),
-    ],
+        ('assets/role_id_ocr', 'assets/role_id_ocr'),
+    ] + rapidocr_datas,
     hiddenimports=[
         'tkinter',
         'rawpy',
         'rawpy._rawpy',
         *pillow_heif_hiddenimports,
+        *rapidocr_hiddenimports,
     ],
     hookspath=[],
     hooksconfig={},

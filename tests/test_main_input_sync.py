@@ -59,6 +59,34 @@ def test_sync_scope_requires_every_safe_window_with_matching_identity():
     )
 
 
+def test_group_identity_failure_explains_cross_group_ambiguity():
+    source = Path("main.py").read_text(encoding="utf-8")
+    function_source = source[
+        source.index("    def group_identity_failure_message("):
+        source.index("    def clear_group_identity(")
+    ]
+
+    assert "共用捷徑延伸到其他組別" in function_source
+    assert "無法唯一對應遊戲視窗" in function_source
+    assert "維持安全停止" in function_source
+
+
+def test_smart_reconnect_enables_without_group_identity():
+    source = Path("main.py").read_text(encoding="utf-8")
+    function_source = source[
+        source.index("    def change_smart_reconnect("):
+        source.index("    def change_smart_reconnect_interval(")
+    ]
+
+    enabled_branch = function_source[
+        function_source.index("        if enabled:"):
+        function_source.index("        stopped_result = stop_service(")
+    ]
+    assert "apply_group_identity" not in enabled_branch
+    assert "group_selection_service.find" not in enabled_branch
+    assert "set_group_launch_plan(None)" in enabled_branch
+
+
 def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     build_services(root=tmp_path)
 

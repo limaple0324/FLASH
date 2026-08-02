@@ -156,9 +156,16 @@ def test_home_removes_redundant_heading_and_reserves_card_controls() -> None:
     assert 'self._page_heading(page, "今天要做什麼"' not in source
     assert "height=control_height" in source
     assert "header.pack_propagate(False)" in source
-    assert "widgets.settings_button.place_configure(y=6)" in source
-    assert "widgets.toggle_button.place_configure(y=6)" in source
+    assert "widgets.toggle_button.place_forget()" in source
+    assert "widgets.settings_button.place_forget()" in source
+    assert "widgets.toggle_button.pack(" in source
+    assert "widgets.settings_button.pack(" in source
+    assert 'if original_manager != "pack":' in source
     assert "main_action_row = Frame(row, bg=BACKGROUND)" in source
+    assert 'widget.bind("<B1-Motion>", self._move_group_entry_drag)' in source
+    assert 'text=f"正在移動：{display_name}"' in source
+    assert "順序尚未調整；請拖曳到另一個角色位置。" in source
+    assert "if isinstance(widget, (Button, Checkbutton, Entry)):" in source
     assert "character_choices" in source
     assert "_build_group_summary(sidebar)" not in source
     assert "_build_header(root)" not in source
@@ -448,17 +455,15 @@ def test_role_id_actions_report_next_to_the_pressed_role_before_refresh() -> Non
     view.current_group_name = "group-a"
     view._role_id_messages = {}
     view.on_calibrate_role_id = (
-        lambda group_name, entry_id, role_id: (
-            f"已校正：{group_name}／{entry_id}／{role_id}"
-        )
+        lambda group_name, entry_id: f"已校正遊戲內角色：{group_name}／{entry_id}"
     )
     refreshes: list[bool] = []
     view.refresh_group_entries = lambda: refreshes.append(True)
 
-    view._calibrate_group_role_id("role-a", _EntryStub("角色甲"))
+    view._calibrate_group_role_id("role-a")
 
     assert view._role_id_messages == {
-        "role-a": "已校正：group-a／role-a／角色甲"
+        "role-a": "已校正遊戲內角色：group-a／role-a"
     }
     assert refreshes == [True]
 
