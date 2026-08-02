@@ -9,6 +9,29 @@
   "target_branch": "codex/release-identity-gate-2026-08-01",
   "fixed_base_commit": "fca9a7428f2782802c81d7d3a2158f9497cd1376",
   "current_commit_at_batch_creation": "fca9a7428f2782802c81d7d3a2158f9497cd1376",
+  "construction_evidence": {
+    "verified_commit_before_evidence_record": "6780ca6d27d8660327df5c5f9efff4d3fba81d1b",
+    "direct_test": {
+      "selector": "python -m pytest -q tests/test_release_identity.py tests/test_release_workflow_gate.py tests/test_release_security_architecture.py tests/test_windows_release_verifier.py tests/test_windows_transactional_updater.py tests/test_packaged_identity_self_check.py tests/test_packaged_self_check.py tests/test_build_coordinator.py",
+      "result": "86 passed",
+      "exit_code": 0
+    },
+    "allowed_scope_result": {
+      "program_issue_found": false,
+      "product_code_modified": false,
+      "modified_product_paths": []
+    },
+    "cloud_execution": {
+      "status": "PENDING_PUSH_TRIGGER",
+      "result": "NOT_RUN",
+      "evidence": "目前提交尚無真實雲端執行紀錄；本機直接測試不得取代雲端關卡。"
+    },
+    "delivery_state": {
+      "packaged": false,
+      "merged": false,
+      "formally_released": false
+    }
+  },
   "total_items": 1,
   "items": [
     "以既有固定提交補齊第 001 號的真實雲端執行、需求稽核、程式審查與測試驗證證據；若發現程式問題，只能在既定允許檔案內集中修正後，以新固定提交重走關卡。"
