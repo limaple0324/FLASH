@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "batch_id": "FU-20260802-002",
+  "source_issue": "#32 / FU-REQ-20260802-012",
+  "source_pr": "NONE",
+  "base_commit": "d6440247e9f94ec7838305fc3f7a852bf8e18669",
+  "target_branch": "automation/fu-req-20260802-012-invalid-task-cleanup",
+  "api_scopes": [
+    "批次派工任務格式與選取前檢核"
+  ],
+  "confirmed_changes": [
+    "將第 19 號佇列的三筆無效範例任務標記為作廢，不建立替代任務。",
+    "三筆作廢任務為留言 5154133475、5154156294、5154170219。",
+    "三筆任務均因基準提交不是完整 40 位元、來源與檔案範圍不正確而作廢。"
+  ],
+  "owned_paths": [
+    ".codex/batches/FU-20260802-002.json",
+    "GitHub Issue #19 comment 5154133475",
+    "GitHub Issue #19 comment 5154156294",
+    "GitHub Issue #19 comment 5154170219"
+  ],
+  "forbidden_targets": [
+    "main",
+    "release/latest",
+    "release/sp1",
+    "產品程式碼",
+    "正式發布",
+    "付費程式介面",
+    "新增替代任務"
+  ],
+  "acceptance": [
+    "三筆範例任務不再處於可認領狀態。",
+    "第 19 號佇列不再嘗試認領三筆無效範例任務。",
+    "僅修改三筆指定留言的任務狀態與作廢原因，不修改產品程式。",
+    "以固定提交完成需求稽核、雲端檢核、程式審查與測試驗證。"
+  ],
+  "minimum_tests": [
+    "第 19 號三筆指定留言狀態與作廢原因核對",
+    "佇列選取前格式與可認領狀態雲端乾跑"
+  ],
+  "full_regression": false,
+  "windows_build": false,
+  "status": "READY",
+  "next_role": "INTEGRATION",
+  "execution_mode": "CODEX_APP",
+  "paid_api": "FORBIDDEN",
+  "github_gate": "REQUIRED"
+}
