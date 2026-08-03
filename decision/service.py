@@ -67,8 +67,8 @@ class DecisionService:
 
         urgent = category in {
             DecisionCategory.SAFETY_AND_DISCONNECTION,
-            DecisionCategory.TIME_LIMIT,
             DecisionCategory.LOSS_RISK,
+            DecisionCategory.TIME_LIMIT,
         }
         if urgent:
             return self._result(
@@ -146,6 +146,23 @@ class DecisionService:
                 "這是可選擇的建議，不取代玩家決定。",
             )
 
+        if category is DecisionCategory.GENERAL_INFORMATION:
+            if not candidate.has_new_information:
+                return self._result(
+                    candidate,
+                    DecisionOutput.QUIET,
+                    DecisionCategory.QUIET,
+                    "information.no_new_information",
+                    "沒有新的一般資訊，不重複打擾。",
+                )
+            return self._result(
+                candidate,
+                DecisionOutput.REMIND,
+                category,
+                "priority.general_information",
+                "這是已確認的一般資訊通知。",
+            )
+
         return self._result(
             candidate,
             DecisionOutput.QUIET,
@@ -156,18 +173,18 @@ class DecisionService:
 
     @staticmethod
     def _category(candidate: DecisionCandidate) -> DecisionCategory:
-        if candidate.priority_reason in {
-            CardPriorityReason.DISCONNECTION,
-            CardPriorityReason.RECOVERY,
-        }:
+        if candidate.priority_reason is CardPriorityReason.DISCONNECTION:
             return DecisionCategory.SAFETY_AND_DISCONNECTION
-        if candidate.priority_reason is CardPriorityReason.TIME_LIMIT:
-            return DecisionCategory.TIME_LIMIT
         if candidate.priority_reason is CardPriorityReason.LOSS_RISK:
             return DecisionCategory.LOSS_RISK
+        if candidate.priority_reason is CardPriorityReason.TIME_LIMIT:
+            return DecisionCategory.TIME_LIMIT
         if candidate.is_current_focus:
             return DecisionCategory.CURRENT_FOCUS
-        if candidate.interrupted_recoverable:
+        if (
+            candidate.priority_reason is CardPriorityReason.RECOVERY
+            or candidate.interrupted_recoverable
+        ):
             return DecisionCategory.INTERRUPTED_RECOVERY
         if candidate.is_current_group_progress:
             return DecisionCategory.CURRENT_GROUP_PROGRESS
@@ -175,8 +192,13 @@ class DecisionService:
             return DecisionCategory.IMPORTANT_TODAY
         if candidate.is_deferrable:
             return DecisionCategory.DEFERRABLE
-        if candidate.suggestion_only:
+        if (
+            candidate.suggestion_only
+            or candidate.priority_reason is CardPriorityReason.PREFERENCE
+        ):
             return DecisionCategory.SUGGESTION
+        if candidate.priority_reason is CardPriorityReason.GENERAL:
+            return DecisionCategory.GENERAL_INFORMATION
         return DecisionCategory.QUIET
 
     @staticmethod

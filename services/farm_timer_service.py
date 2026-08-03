@@ -331,14 +331,27 @@ class FarmTimerService:
                 if timer.emitted_stage == stage:
                     continue
                 card = self._card(timer, stage, reason)
-                self._coordinator.show(card, shown_at=now)
+                remaining_time = (
+                    FARM_OVERDUE_AFTER - elapsed
+                    if reason is CardPriorityReason.TIME_LIMIT
+                    else None
+                )
+                presented = self._coordinator.submit(
+                    self._coordinator.candidate_for_card(
+                        card,
+                        remaining_time=remaining_time,
+                    ),
+                    card,
+                    shown_at=now,
+                )
                 self._timers[timer_id] = replace(
                     timer,
                     emitted_stage=stage,
                 )
                 self._save()
                 self._record(timer.character_name, stage)
-                emitted.append(card)
+                if presented is not None:
+                    emitted.append(presented)
         return tuple(emitted)
 
     @staticmethod

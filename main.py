@@ -658,7 +658,11 @@ def build_services(
         card_display_settings_resolution,
         on_changed=register_card_display_settings,
     )
-    card_coordinator = CardCoordinator(card_service, card_history_service)
+    card_coordinator = CardCoordinator(
+        card_service,
+        card_history_service,
+        decision_service,
+    )
     activity_reminder_service = ActivityReminderService(
         activity_schedule_catalog,
         card_coordinator,

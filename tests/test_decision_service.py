@@ -48,7 +48,7 @@ def test_unknown_evidence_and_player_cancellation_fail_closed():
     }
 
 
-def test_safety_time_and_loss_risk_remind_even_when_context_is_busy():
+def test_safety_loss_risk_and_time_remind_in_fixed_common_order():
     service = DecisionService()
     results = service.decide(
         (
@@ -70,7 +70,7 @@ def test_safety_time_and_loss_risk_remind_even_when_context_is_busy():
         )
     )
 
-    assert [item.candidate_id for item in results] == ["disconnect", "time", "loss"]
+    assert [item.candidate_id for item in results] == ["disconnect", "loss", "time"]
     assert all(item.output is DecisionOutput.REMIND for item in results)
 
 
@@ -112,6 +112,22 @@ def test_recovery_group_and_today_activity_require_action_before_reminding():
     assert by_id["today"].output is DecisionOutput.QUIET
 
 
+def test_recovery_without_required_player_action_stays_quiet():
+    result = DecisionService().decide(
+        (
+            _candidate(
+                "recovered",
+                priority_reason=CardPriorityReason.RECOVERY,
+                requires_player_action=False,
+            ),
+        )
+    )[0]
+
+    assert result.output is DecisionOutput.QUIET
+    assert result.category is DecisionCategory.QUIET
+    assert result.reason_code == "action.not_required"
+
+
 def test_deferrable_and_optional_items_are_suggestions_not_commands():
     results = DecisionService().decide(
         (
@@ -121,6 +137,27 @@ def test_deferrable_and_optional_items_are_suggestions_not_commands():
     )
 
     assert all(item.output is DecisionOutput.SUGGEST for item in results)
+
+
+def test_general_information_is_a_visible_notification_not_a_suggestion():
+    result = DecisionService().decide(
+        (
+            _candidate(
+                "general",
+                priority_reason=CardPriorityReason.GENERAL,
+            ),
+        )
+    )[0]
+
+    assert result.output is DecisionOutput.REMIND
+    assert result.category is DecisionCategory.GENERAL_INFORMATION
+
+
+def test_unclassified_activity_fails_closed_to_quiet():
+    result = DecisionService().decide((_candidate("activity"),))[0]
+
+    assert result.output is DecisionOutput.QUIET
+    assert result.category is DecisionCategory.QUIET
 
 
 def test_unchanged_reminder_does_not_repeat():

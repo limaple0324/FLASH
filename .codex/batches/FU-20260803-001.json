@@ -247,10 +247,11 @@
     {
       "編號": "FU-REQ-20260802-003",
       "項目": "唯一決策入口、共同優先順序與單一事件卡",
-      "狀態": "核對完成，已鎖定施工範圍",
+      "狀態": "本機驗證通過",
       "檔案所有權": [
         "cards/lifecycle.py",
         "cards/service.py",
+        "cards/view_state.py",
         "decision/models.py",
         "decision/service.py",
         "services/card_coordinator.py",
@@ -261,6 +262,7 @@
         "main.py",
         "tests/test_decision_service.py",
         "tests/test_card_service.py",
+        "tests/test_card_view_state.py",
         "tests/test_card_coordinator.py",
         "tests/test_activity_reminder_service.py",
         "tests/test_farm_timer_service.py",
@@ -270,8 +272,11 @@
       "核對證據": [
         "所有產品 .show 呼叫僅有五處：活動提醒一處、農場一處、玩家習慣一處、真實事件兩處；均直接繞過 DecisionService。",
         "DecisionService 只在 build_services 建立與登錄，沒有產品呼叫 decide。",
-        "DecisionCategory 現為時間限制第二、損失風險第三，且缺少一般資訊第十層。",
-        "CardService 目前只以舊五層 CardPriorityTier 排序，未接收 DecisionCategory、剩餘時間或角色重要度。"
+        "施工前 DecisionCategory 為時間限制第二、損失風險第三，且缺少一般資訊第十層。",
+        "施工前 CardService 只以舊五層 CardPriorityTier 排序，未接收 DecisionCategory、剩餘時間或角色重要度。",
+        "恢復必須進第五層、一般資訊第十層、偏好建議第九層；不以舊五層反推。",
+        "來源僅能依既有具型別事件分類；無法由現有欄位證明的層級不施工猜測。",
+        "直接在 cards.lifecycle 模組頂層匯入 DecisionCategory 會因 cards 套件初始化反向載入未完成的 decision.models 而失敗；生命週期改以延後匯入保留 DecisionCategory 實型別。"
       ],
       "解鎖條件": "已完成全量 .show 呼叫點核對；施工僅限本階段檔案所有權。",
       "禁止範圍": [
@@ -283,18 +288,23 @@
       "最小測試": [
         "tests/test_decision_service.py",
         "tests/test_card_service.py",
+        "tests/test_card_view_state.py",
         "tests/test_card_coordinator.py",
         "tests/test_activity_reminder_service.py",
         "tests/test_farm_timer_service.py",
         "tests/test_player_habit_reminder_service.py",
         "tests/test_true_event_card_service.py"
       ],
+      "本機驗證": "八個直接測試檔共五十五項通過；零個產品 .show 呼叫，唯一卡片寫入為 CardCoordinator 內部呼叫 CardService.upsert。",
       "驗收": [
         "固定順序為安全與斷線、損失風險、時間限制、玩家焦點、中斷恢復、組別核心進度、今日重要、可延後、習慣建議、一般資訊、保持安靜",
         "每個來源以同一事件識別提交具型別 DecisionCandidate 與 GroupCard，且唯一入口強制兩者識別相同",
-        "DecisionService 每次提交只呼叫一次，保持安靜不寫入卡片",
-        "CardService 的可見三張與等待佇列依十一層、剩餘時間、角色重要度、穩定事件識別排序",
+        "DecisionService 每次提交只呼叫一次；保持安靜時移除既有同識別卡",
+        "DecisionService 保留十一層結果；CardService 的可見三張與等待佇列只接受前十個可呈現層級，依層級、剩餘時間、角色重要度、穩定事件識別排序",
+        "CardViewItem 從同一個已決策生命週期輸出可呈現層級 priority_level，不由 CardPriorityReason 反推",
         "相同事件更新只更新同一張卡",
+        "不把 requires_player_action 造假；恢復、組別進度與今日重要沿用既有決策規則",
+        "來源只依斷線、恢復、農場損失或時間、活動排程時間與習慣建議等既有具型別事件證據分類；跨午夜活動以剩餘時間進第三層",
         "決策與卡片入口不含遊戲輸入、點擊或啟動能力"
       ]
     },
