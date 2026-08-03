@@ -1,14 +1,11 @@
 from adapters.windows_background_capture import CaptureSample
-from domain.character_game_data import (
-    ArtifactSnapshot,
-    ObsidianSnapshot,
-    PetTalentPageSnapshot,
-)
+from domain.character_game_data import PetTalentPageSnapshot
 from domain.character_game_data_store import CharacterGameDataStore
 from services.character_game_data_capture_service import (
     CharacterGameDataCaptureService,
     GameDataPageKind,
     GameDataReadStatus,
+    RegisteredGameDataWindow,
     VerifiedGameDataPage,
 )
 from services.character_game_data_update_service import (
@@ -16,18 +13,63 @@ from services.character_game_data_update_service import (
 )
 
 
+_FINGERPRINT = "a" * 64
+
+
 def _sample() -> CaptureSample:
     return CaptureSample(2, 2, bytes([0, 0, 0, 255] * 4), True)
+
+
+def _target(
+    window_handle: int = 123,
+    character_id: str = "char-a",
+) -> RegisteredGameDataWindow:
+    return RegisteredGameDataWindow(
+        window_handle=window_handle,
+        character_id=character_id,
+        launch_fingerprint=_FINGERPRINT,
+    )
+
+
+def _page(
+    logical_page_id: str = "verified-page-a",
+    content_signature: str = "content-a",
+    observed_text: str = "已確認內容甲",
+    page_number: int = 1,
+) -> VerifiedGameDataPage:
+    return VerifiedGameDataPage(
+        page_kind=GameDataPageKind.PET_TALENT,
+        logical_page_id=logical_page_id,
+        content_signature=content_signature,
+        data=PetTalentPageSnapshot(
+            page_number,
+            observed_text,
+            "2026-08-03 12:00",
+        ),
+    )
 
 
 class FakeCaptureProvider:
     def __init__(self, sample):
         self.sample = sample
         self.handles = []
+        self.actions = []
 
     def capture(self, window_handle):
         self.handles.append(window_handle)
         return self.sample
+
+    def activate(self, *args, **kwargs):
+        self.actions.append(("activate", args, kwargs))
+        raise AssertionError("capture service must not activate a window")
+
+    def click(self, *args, **kwargs):
+        self.actions.append(("click", args, kwargs))
+        raise AssertionError("capture service must not click a game window")
+
+    def send_keys(self, *args, **kwargs):
+        self.actions.append(("send_keys", args, kwargs))
+        raise AssertionError("capture service must not send game input")
 
 
 class FakeRecognizer:
@@ -40,111 +82,100 @@ class FakeRecognizer:
         return self.page
 
 
-def test_capture_updates_verified_page_without_focus_or_input(tmp_path) -> None:
-    page = VerifiedGameDataPage(
-        character_id="char-a",
-        page_kind=GameDataPageKind.PET_TALENT,
-        content_signature="pet-1",
-        data=PetTalentPageSnapshot(1, "第一頁", "2026-08-03 12:00"),
-    )
-    provider = FakeCaptureProvider(_sample())
-    store = CharacterGameDataStore(tmp_path / "character_game_data.json")
-    service = CharacterGameDataCaptureService(
-        provider,
-        FakeRecognizer(page),
-        CharacterGameDataUpdateService(store),
-        lambda handle, character_id: True,
-    )
+class SequenceRecognizer:
+    def __init__(self, pages):
+        self.pages = iter(pages)
+        self.samples = []
 
-    result = service.read(123, "char-a")
-
-    assert result.status is GameDataReadStatus.UPDATED
-    assert provider.handles == [123]
-    assert store.load()[0].pet_talent.pages[0].page_number == 1
+    def read(self, sample):
+        self.samples.append(sample)
+        return next(self.pages)
 
 
-def test_same_page_signature_is_not_read_or_written_again(tmp_path) -> None:
-    page = VerifiedGameDataPage(
-        character_id="char-a",
-        page_kind=GameDataPageKind.OBSIDIAN,
-        content_signature="obsidian-1",
-        data=ObsidianSnapshot(
-            1,
-            3,
-            "2026-08-03 12:00",
-            stage="50-80",
-            opened_nodes=7,
-            page_shape_signature="shape-1",
-        ),
-    )
-    recognizer = FakeRecognizer(page)
-    provider = FakeCaptureProvider(_sample())
-    store = CharacterGameDataStore(tmp_path / "character_game_data.json")
-    service = CharacterGameDataCaptureService(
+def _service(tmp_path, provider, recognizer, resolver=None):
+    return CharacterGameDataCaptureService(
         provider,
         recognizer,
-        CharacterGameDataUpdateService(store),
-        lambda handle, character_id: True,
+        CharacterGameDataUpdateService(
+            CharacterGameDataStore(tmp_path / "character_game_data.json")
+        ),
+        resolver or (lambda window_handle: _target(window_handle)),
     )
 
-    assert service.read(123, "char-a").status is GameDataReadStatus.UPDATED
-    before = store.path.read_bytes()
-    assert service.read(123, "char-a").status is GameDataReadStatus.UNCHANGED
-    assert store.path.read_bytes() == before
-    assert len(recognizer.samples) == 2
 
-
-def test_unrecognized_page_does_not_create_data(tmp_path) -> None:
+def test_recognizer_page_does_not_contain_character_identity(tmp_path) -> None:
+    page = _page()
     provider = FakeCaptureProvider(_sample())
-    store = CharacterGameDataStore(tmp_path / "character_game_data.json")
-    service = CharacterGameDataCaptureService(
-        provider,
-        FakeRecognizer(None),
-        CharacterGameDataUpdateService(store),
-        lambda handle, character_id: True,
-    )
+    service = _service(tmp_path, provider, FakeRecognizer(page))
 
-    result = service.read(123, "char-a")
+    result = service.read(123)
 
-    assert result.status is GameDataReadStatus.PAGE_UNRECOGNIZED
-    assert store.load() == ()
+    assert not hasattr(page, "character_id")
+    assert result.status is GameDataReadStatus.UPDATED
+    assert provider.handles == [123]
+    assert service._update_service.store.load()[0].character_id == "char-a"
 
 
-def test_identity_mismatch_does_not_write_other_character(tmp_path) -> None:
-    page = VerifiedGameDataPage(
-        character_id="other",
-        page_kind=GameDataPageKind.ARTIFACT,
-        content_signature="artifact-1",
-        data=ArtifactSnapshot("皇冠", 41, (), (), "2026-08-03 12:00"),
-    )
-    store = CharacterGameDataStore(tmp_path / "character_game_data.json")
-    service = CharacterGameDataCaptureService(
-        FakeCaptureProvider(_sample()),
-        FakeRecognizer(page),
-        CharacterGameDataUpdateService(store),
-        lambda handle, character_id: True,
-    )
-
-    assert service.read(123, "char-a").status is GameDataReadStatus.IDENTITY_MISMATCH
-    assert store.load() == ()
-
-
-def test_target_guard_blocks_unregistered_window_before_capture(tmp_path) -> None:
+def test_capture_rejects_missing_verified_window_binding(tmp_path) -> None:
     provider = FakeCaptureProvider(_sample())
-    store = CharacterGameDataStore(tmp_path / "character_game_data.json")
-    service = CharacterGameDataCaptureService(
+    service = _service(
+        tmp_path,
         provider,
-        FakeRecognizer(None),
-        CharacterGameDataUpdateService(store),
-        lambda handle, character_id: False,
+        FakeRecognizer(_page()),
+        resolver=lambda _window_handle: None,
     )
 
-    result = service.read(123, "char-a")
+    result = service.read(123)
 
     assert result.status is GameDataReadStatus.TARGET_NOT_ELIGIBLE
     assert result.error
     assert provider.handles == []
-    assert store.load() == ()
+    assert service._update_service.store.load() == ()
+
+
+def test_signature_cache_isolated_by_reliable_logical_page_identity(tmp_path) -> None:
+    provider = FakeCaptureProvider(_sample())
+    first = _page("logical-a", "same-signature", "內容甲")
+    second = _page("logical-b", "same-signature", "內容乙", 2)
+    service = _service(
+        tmp_path,
+        provider,
+        SequenceRecognizer((first, second, first)),
+    )
+
+    assert service.read(123).status is GameDataReadStatus.UPDATED
+    assert service.read(123).status is GameDataReadStatus.UPDATED
+    assert service.read(123).status is GameDataReadStatus.UNCHANGED
+
+
+def test_capture_reads_only_capture_provider(tmp_path) -> None:
+    provider = FakeCaptureProvider(_sample())
+    service = _service(tmp_path, provider, FakeRecognizer(_page()))
+
+    assert service.read(123).status is GameDataReadStatus.UPDATED
+    assert provider.handles == [123]
+    assert provider.actions == []
+
+
+def test_unrecognized_page_does_not_create_data(tmp_path) -> None:
+    provider = FakeCaptureProvider(_sample())
+    service = _service(tmp_path, provider, FakeRecognizer(None))
+
+    result = service.read(123)
+
+    assert result.status is GameDataReadStatus.PAGE_UNRECOGNIZED
+    assert service._update_service.store.load() == ()
+
+
+def test_invalid_recognizer_result_is_not_saved_or_raised(tmp_path) -> None:
+    provider = FakeCaptureProvider(_sample())
+    service = _service(tmp_path, provider, FakeRecognizer(object()))
+
+    result = service.read(123)
+
+    assert result.status is GameDataReadStatus.PAGE_UNRECOGNIZED
+    assert provider.handles == [123]
+    assert service._update_service.store.load() == ()
 
 
 def test_recognizer_error_is_returned_without_writing(tmp_path) -> None:
@@ -152,16 +183,14 @@ def test_recognizer_error_is_returned_without_writing(tmp_path) -> None:
         def read(self, sample):
             raise RuntimeError("測試辨識錯誤")
 
-    store = CharacterGameDataStore(tmp_path / "character_game_data.json")
-    service = CharacterGameDataCaptureService(
+    service = _service(
+        tmp_path,
         FakeCaptureProvider(_sample()),
         FailingRecognizer(),
-        CharacterGameDataUpdateService(store),
-        lambda handle, character_id: True,
     )
 
-    result = service.read(123, "char-a")
+    result = service.read(123)
 
     assert result.status is GameDataReadStatus.PAGE_UNRECOGNIZED
     assert result.error == "測試辨識錯誤"
-    assert store.load() == ()
+    assert service._update_service.store.load() == ()

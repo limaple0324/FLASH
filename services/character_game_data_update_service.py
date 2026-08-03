@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import RLock
 from typing import Iterable
 
 from domain.character_game_data import (
@@ -34,6 +35,7 @@ class CharacterGameDataUpdateService:
         if not isinstance(store, CharacterGameDataStore):
             raise TypeError("store must be CharacterGameDataStore.")
         self._store = store
+        self._update_lock = RLock()
 
     @property
     def store(self) -> CharacterGameDataStore:
@@ -50,6 +52,28 @@ class CharacterGameDataUpdateService:
         cultivated_pet_count: int | object = _UNSET,
     ) -> CharacterGameDataUpdateResult:
         """套用一個或多個已可靠辨識的區域；未傳入的區域保持原值。"""
+
+        with self._update_lock:
+            return self._update_serialized(
+                character_id,
+                pet_talent=pet_talent,
+                obsidian=obsidian,
+                life_souls=life_souls,
+                artifact=artifact,
+                cultivated_pet_count=cultivated_pet_count,
+            )
+
+    def _update_serialized(
+        self,
+        character_id: str,
+        *,
+        pet_talent: PetTalentSnapshot | PetTalentPageSnapshot | object = _UNSET,
+        obsidian: ObsidianSnapshot | object = _UNSET,
+        life_souls: Iterable[PetLifeSoulSnapshot] | PetLifeSoulSnapshot | object = _UNSET,
+        artifact: ArtifactSnapshot | object = _UNSET,
+        cultivated_pet_count: int | object = _UNSET,
+    ) -> CharacterGameDataUpdateResult:
+        """在同一把鎖內讀取、部分合併與保存。"""
 
         if not isinstance(character_id, str) or not character_id.strip():
             raise ValueError("character_id must be a non-empty string.")

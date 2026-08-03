@@ -60,26 +60,24 @@
   "第零階段保全提交": "a6939904916e6504ab86fdc53ef0388748c1fa5e",
   "索爾架構審查前置": {
     "來源": "索爾對保全提交 a6939904916e6504ab86fdc53ef0388748c1fa5e 的架構審查",
-    "適用需求": [
-      "FU-REQ-20260802-004",
+    "目前施工需求": ["FU-REQ-20260802-004"],
+    "後續保持鎖定需求": [
       "FU-REQ-20260802-006",
       "FU-REQ-20260802-007",
       "FU-REQ-20260803-002"
     ],
-    "狀態": "待第003號只讀核對後施工",
-    "檔案所有權": [
-      "domain/character_game_data.py",
-      "services/character_game_data_capture_service.py",
-      "services/character_game_data_update_service.py",
-      "services/character_game_data_view_service.py",
-      "tests/test_character_game_data.py",
-      "tests/test_character_game_data_capture_service.py",
-      "tests/test_character_game_data_update_service.py"
+    "狀態": "只讀核對完成，施工範圍已鎖定",
+    "用途": "只記錄共同設計與只讀證據；實際施工所有權與直接測試僅填入目前解鎖的第004號階段。",
+    "只讀核對證據": [
+      "VerifiedGameDataPage 目前仍由頁面辨識器攜帶 character_id，與只辨識頁面資料的固定架構衝突。",
+      "目前簽章快取鍵只有視窗、角色與資料種類；缺少呼叫端已提供的可靠邏輯頁身分。",
+      "黑曜石目前是單一 ObsidianSnapshot，更新會整體取代；其第一至第十頁集合規則屬第006號，保持待前置關卡。",
+      "目前更新服務以 load、合併、save 連續執行，但沒有序列鎖；背景併發可遺失另一筆更新。",
+      "全倉庫只有資料擷取服務定義與直接測試引用 CharacterGameDataCaptureService，沒有實際頁面辨識器或產品端建立／接線。"
     ],
-    "最小測試": [
-      "tests/test_character_game_data.py",
-      "tests/test_character_game_data_capture_service.py",
-      "tests/test_character_game_data_update_service.py"
+    "施工後仍需交接的缺口": [
+      "現有範圍內沒有真實遊戲資料頁辨識器可供接線；本前置只完成安全擷取契約與保存層。",
+      "現有範圍外尚無將已註冊視窗與匿名啟動指紋解析為角色身分的產品端注入點；本前置只要求呼叫端提供已驗證綁定，未提供即拒絕。"
     ],
     "禁止範圍": [
       "修改保全提交",
@@ -88,11 +86,10 @@
       "遊戲輸入或自動切換頁面"
     ],
     "驗收": [
-      "黑曜石以第一至第十頁集合部分合併，未讀頁不清除",
-      "內容簽章鍵含可靠邏輯頁身分；命魂另含可靠寵物身分",
-      "跨程式重啟以保存內容判定不變；僅讀取時間變化不寫入也不提醒",
-      "角色歸屬只由已登錄視窗與匿名啟動指紋可靠綁定提供，頁面辨識器不產出角色識別碼",
-      "讀取、合併、寫入經單一序列化入口保護，並有直接測試"
+      "頁面辨識器只產出頁面種類、可靠邏輯頁身分、內容與內容簽章；不產出角色識別",
+      "角色歸屬只由已登錄視窗與匿名啟動指紋可靠綁定提供；未可靠綁定即拒絕",
+      "共用部分更新不得清除未提供區域；讀取、合併、寫入經單一序列化入口保護",
+      "第006、007與20260803-002完成前，不加入任何資料頁具體辨識、頁集合、跨重啟內容判斷或提醒規則"
     ]
   },
   "索爾程式審查阻擋項": {
@@ -311,12 +308,42 @@
     {
       "編號": "FU-REQ-20260802-004",
       "項目": "共用唯讀且不干擾玩家的畫面辨識",
-      "狀態": "待前置關卡",
-      "檔案所有權": [],
-      "解鎖條件": "第003號只讀核對完成，並先完成索爾架構審查前置後，才可填入。",
+      "狀態": "本機驗證通過，待索爾程式審查",
+      "檔案所有權": [
+        "services/character_game_data_capture_service.py",
+        "services/character_game_data_update_service.py",
+        "tests/test_character_game_data_capture_service.py",
+        "tests/test_character_game_data_update_service.py"
+      ],
+      "解鎖條件": "第003號已通過索爾架構審查；本階段只實作共用擷取契約與保存層，不實作資料頁具體辨識規則。",
       "禁止範圍": ["遊戲輸入", "未可靠辨識", "清除未讀資料"],
-      "最小測試": [],
-      "驗收": ["只更新可靠且實際開啟頁面", "未讀資料不清除"]
+      "最小測試": [
+        "tests/test_character_game_data_capture_service.py::test_recognizer_page_does_not_contain_character_identity",
+        "tests/test_character_game_data_capture_service.py::test_capture_rejects_missing_verified_window_binding",
+        "tests/test_character_game_data_capture_service.py::test_signature_cache_isolated_by_reliable_logical_page_identity",
+        "tests/test_character_game_data_capture_service.py::test_capture_reads_only_capture_provider",
+        "tests/test_character_game_data_capture_service.py::test_invalid_recognizer_result_is_not_saved_or_raised",
+        "tests/test_character_game_data_update_service.py::test_partial_pages_do_not_clear_unread_sections",
+        "tests/test_character_game_data_update_service.py::test_unprovided_sections_are_preserved",
+        "tests/test_character_game_data_update_service.py::test_update_serialization_prevents_concurrent_lost_updates"
+      ],
+      "本機驗證": "八項精確直接測試全數通過。",
+      "驗證命令紀錄": [
+        {
+          "類型": "驗證命令錯誤",
+          "程序編號": 11772,
+          "命令": "python -m pytest -q \\\\ ",
+          "原因": "PowerShell 將反斜線視為實際路徑參數，非換行續行符。",
+          "處置": "核對命令列相符後只終止該程序，回讀確認程序不存在；改用同一行精確測試清單。",
+          "產品結果": "不計入產品失敗"
+        }
+      ],
+      "驗收": [
+        "只更新呼叫端已可靠綁定的已註冊視窗與實際開啟頁面",
+        "一次只更新一個可靠區域時，其他既有未讀區域保持原值",
+        "併發讀取不遺失資料",
+        "不送輸入、不切前景、不切頁"
+      ]
     },
     {
       "編號": "FU-REQ-20260802-005",

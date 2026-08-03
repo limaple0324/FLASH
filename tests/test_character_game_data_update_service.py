@@ -1,3 +1,5 @@
+from threading import Event, Lock, Thread
+
 from domain.character_game_data import (
     ArtifactSnapshot,
     CharacterGameData,
@@ -30,6 +32,28 @@ def _soul_page(name: str, page: int) -> PetLifeSoulSnapshot:
         souls=(LifeSoul("命魂名稱", page, "效果文字"),),
         updated_at=f"2026-08-03 11:0{page}",
     )
+
+
+class BlockingFirstSaveStore(CharacterGameDataStore):
+    def __init__(self, path) -> None:
+        super().__init__(path)
+        self.first_save_entered = Event()
+        self.release_first_save = Event()
+        self.second_save_entered = Event()
+        self._save_lock = Lock()
+        self._save_count = 0
+
+    def save(self, records) -> None:
+        with self._save_lock:
+            self._save_count += 1
+            save_index = self._save_count
+        if save_index == 1:
+            self.first_save_entered.set()
+            if not self.release_first_save.wait(timeout=1):
+                raise AssertionError("first save was not released")
+        else:
+            self.second_save_entered.set()
+        super().save(records)
 
 
 def test_four_sections_round_trip_and_view_summary(tmp_path) -> None:
@@ -77,6 +101,82 @@ def test_partial_pages_do_not_clear_unread_sections(tmp_path) -> None:
     record = store.load()[0]
     assert tuple(page.page_number for page in record.pet_talent.pages) == (1, 2)
     assert len(record.life_souls) == 1
+
+
+def test_unprovided_sections_are_preserved(tmp_path) -> None:
+    store = CharacterGameDataStore(tmp_path / "character_game_data.json")
+    service = CharacterGameDataUpdateService(store)
+    initial_talent = _pet_page(1, "第一頁")
+    service.update(
+        "char-a",
+        pet_talent=initial_talent,
+        artifact=ArtifactSnapshot(
+            page_name="皇冠",
+            level=41,
+            rune_text=(),
+            summary_lines=("目前屬性",),
+            updated_at="2026-08-03 12:00",
+        ),
+    )
+
+    service.update(
+        "char-a",
+        artifact=ArtifactSnapshot(
+            page_name="皇冠",
+            level=42,
+            rune_text=(),
+            summary_lines=("下一級屬性",),
+            updated_at="2026-08-03 12:05",
+        ),
+    )
+
+    record = store.load()[0]
+    assert record.pet_talent.pages == (initial_talent,)
+    assert record.artifact.level == 42
+
+
+def test_update_serialization_prevents_concurrent_lost_updates(tmp_path) -> None:
+    store = BlockingFirstSaveStore(tmp_path / "character_game_data.json")
+    service = CharacterGameDataUpdateService(store)
+    errors = []
+
+    def update_talent() -> None:
+        try:
+            service.update("char-a", pet_talent=_pet_page(1, "第一頁"))
+        except Exception as error:
+            errors.append(error)
+
+    def update_artifact() -> None:
+        try:
+            service.update(
+                "char-a",
+                artifact=ArtifactSnapshot(
+                    page_name="皇冠",
+                    level=41,
+                    rune_text=(),
+                    summary_lines=("目前屬性",),
+                    updated_at="2026-08-03 12:05",
+                ),
+            )
+        except Exception as error:
+            errors.append(error)
+
+    first = Thread(target=update_talent)
+    second = Thread(target=update_artifact)
+    first.start()
+    assert store.first_save_entered.wait(timeout=1)
+    second.start()
+    assert not store.second_save_entered.wait(timeout=0.1)
+    store.release_first_save.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    record = store.load()[0]
+    assert record.pet_talent.pages[0].observed_text == "第一頁"
+    assert record.artifact.page_name == "皇冠"
 
 
 def test_life_soul_second_page_updates_only_that_pet_page(tmp_path) -> None:
