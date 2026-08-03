@@ -247,12 +247,56 @@
     {
       "編號": "FU-REQ-20260802-003",
       "項目": "唯一決策入口、共同優先順序與單一事件卡",
-      "狀態": "待前置關卡",
-      "檔案所有權": [],
-      "解鎖條件": "只讀核對既有決策、卡片與直接測試後填入。",
-      "禁止範圍": ["遊戲操作授權", "未定案事件規則"],
-      "最小測試": [],
-      "驗收": ["高優先度不授權遊戲操作", "同一事件只有一張卡"]
+      "狀態": "核對完成，已鎖定施工範圍",
+      "檔案所有權": [
+        "cards/lifecycle.py",
+        "cards/service.py",
+        "decision/models.py",
+        "decision/service.py",
+        "services/card_coordinator.py",
+        "services/activity_reminder_service.py",
+        "services/farm_timer_service.py",
+        "services/player_habit_reminder_service.py",
+        "services/true_event_card_service.py",
+        "main.py",
+        "tests/test_decision_service.py",
+        "tests/test_card_service.py",
+        "tests/test_card_coordinator.py",
+        "tests/test_activity_reminder_service.py",
+        "tests/test_farm_timer_service.py",
+        "tests/test_player_habit_reminder_service.py",
+        "tests/test_true_event_card_service.py"
+      ],
+      "核對證據": [
+        "所有產品 .show 呼叫僅有五處：活動提醒一處、農場一處、玩家習慣一處、真實事件兩處；均直接繞過 DecisionService。",
+        "DecisionService 只在 build_services 建立與登錄，沒有產品呼叫 decide。",
+        "DecisionCategory 現為時間限制第二、損失風險第三，且缺少一般資訊第十層。",
+        "CardService 目前只以舊五層 CardPriorityTier 排序，未接收 DecisionCategory、剩餘時間或角色重要度。"
+      ],
+      "解鎖條件": "已完成全量 .show 呼叫點核對；施工僅限本階段檔案所有權。",
+      "禁止範圍": [
+        "遊戲操作授權",
+        "未定案事件規則",
+        "卡片視覺修改",
+        "以舊五層 CardPriorityTier 作為可見或等待佇列排序依據"
+      ],
+      "最小測試": [
+        "tests/test_decision_service.py",
+        "tests/test_card_service.py",
+        "tests/test_card_coordinator.py",
+        "tests/test_activity_reminder_service.py",
+        "tests/test_farm_timer_service.py",
+        "tests/test_player_habit_reminder_service.py",
+        "tests/test_true_event_card_service.py"
+      ],
+      "驗收": [
+        "固定順序為安全與斷線、損失風險、時間限制、玩家焦點、中斷恢復、組別核心進度、今日重要、可延後、習慣建議、一般資訊、保持安靜",
+        "每個來源以同一事件識別提交具型別 DecisionCandidate 與 GroupCard，且唯一入口強制兩者識別相同",
+        "DecisionService 每次提交只呼叫一次，保持安靜不寫入卡片",
+        "CardService 的可見三張與等待佇列依十一層、剩餘時間、角色重要度、穩定事件識別排序",
+        "相同事件更新只更新同一張卡",
+        "決策與卡片入口不含遊戲輸入、點擊或啟動能力"
+      ]
     },
     {
       "編號": "FU-REQ-20260802-004",
