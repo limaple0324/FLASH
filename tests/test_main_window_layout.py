@@ -199,6 +199,49 @@ def test_role_id_is_automatically_read_only_for_connected_missing_roles():
     assert "window.after_cancel(role_id_auto_read_id)" in source
 
 
+def test_cancelled_bulk_shortcut_selection_has_no_side_effects():
+    source = Path("main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    create_main_window = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "create_main_window"
+    )
+    add_group_shortcuts = next(
+        node
+        for node in ast.walk(create_main_window)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "add_group_shortcuts"
+    )
+    body = ast.get_source_segment(source, add_group_shortcuts)
+    assert body is not None
+
+    cancel_guard = next(
+        node
+        for node in add_group_shortcuts.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and isinstance(node.test.operand, ast.Name)
+        and node.test.operand.id == "selected"
+    )
+    assert len(cancel_guard.body) == 1
+    assert isinstance(cancel_guard.body[0], ast.Return)
+    assert isinstance(cancel_guard.body[0].value, ast.Constant)
+    assert cancel_guard.body[0].value.value is False
+
+    cancel_end = cancel_guard.end_lineno
+    assert cancel_end is not None
+    assert cancel_end < body.count("\n") + add_group_shortcuts.lineno
+    assert body.index("if not selected:") < body.index(
+        "stop_group_automation_for_configuration_change()"
+    ) < body.index("group_configuration_service.add_shortcuts(")
+    assert body.count("group_configuration_service.add_shortcuts(") == 1
+    assert "tuple(Path(path) for path in selected)" in body
+    assert "set_role_id(" not in body
+
+
 def test_startup_error_uses_product_name():
     source = Path("main.py").read_text(encoding="utf-8")
 

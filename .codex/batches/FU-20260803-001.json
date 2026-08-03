@@ -95,6 +95,37 @@
       "讀取、合併、寫入經單一序列化入口保護，並有直接測試"
     ]
   },
+  "索爾程式審查阻擋項": {
+    "來源": "索爾對基準提交 df3babc 的角色名稱自動讀取程式審查",
+    "狀態": "已登記；待第003號完成後、FU-REQ-20260803-001 身分資料階段前修正",
+    "施工順序": "FU-REQ-20260803-004 只讀比對已完成；本項必須先於 FU-REQ-20260803-001 施工完成。",
+    "檔案所有權": [
+      "adapters/windows_role_id_ocr.py",
+      "services/role_id_template_service.py",
+      "services/role_id_auto_read_service.py",
+      "main.py",
+      "tests/test_role_id_template_service.py",
+      "tests/test_role_id_auto_read_service.py",
+      "tests/test_main_window_layout.py"
+    ],
+    "禁止範圍": [
+      "adapters/windows_smart_reconnect.py",
+      "遊戲輸入",
+      "工作流程",
+      "捷徑名稱、檔名、臨時標題或視窗順序的身分判斷",
+      "未經可靠觀測的角色名稱保存"
+    ],
+    "審查證據": [
+      "ROLE_ID_REGION=(86,50,320,63) 套用完整 Win32PrintWindow 畫面；舊可靠實作使用用戶區座標 (87,13,177,37)，倉庫真實參考圖目前裁切結果為黑色。",
+      "windows_role_id_ocr._text_from_result 丟棄辨識可信度；main.auto_read_missing_role_id 單次成功即永久保存。",
+      "main.auto_read_missing_role_id 由 window.after 每秒在介面執行緒同步執行畫面辨識、模型初始化與辨識。"
+    ],
+    "直接驗收": [
+      "以倉庫真實參考圖、非用戶區偏移與縮放變化驗證角色名稱裁切。",
+      "低可信度、前後不一致、視窗實例更換與已存在資料不覆寫均不保存。",
+      "單一有界背景工作者不重疊；過期結果與關閉後回呼不保存，介面回呼不被阻塞。"
+    ]
+  },
   "全域禁止範圍": [
     "FU-REQ-20260802-002",
     "FU-REQ-20260802-009",
@@ -188,7 +219,7 @@
       "項目": "同步器保存、視窗識別、縮小喚醒、組別啟動、位置還原、鍵盤同步與取消批量加入",
       "狀態": "本機核對通過，無須恢復",
       "比對來源提交": "673f86876dc88d43bd15809ca5d8b0c608291678",
-      "檔案所有權": [],
+      "檔案所有權": ["tests/test_main_window_layout.py"],
       "解鎖條件": "只讀比對後，僅將可由程式與直接測試證明的檔案寫入本批次單。",
       "禁止範圍": ["未經比對證明的行為", "較新安全修正", "雲端", "桌面", "正式發布"],
       "最小測試": [
@@ -200,10 +231,18 @@
         "tests/test_group_window_launch_service.py::test_records_all_current_exact_window_positions_in_one_save",
         "tests/test_windows_input_sync.py::test_all_policy_sends_b_to_foreground_background_and_minimized",
         "tests/test_keyboard_sync_monitor.py::test_key_keeps_the_source_handle_captured_at_press_time",
-        "tests/test_windows_smart_reconnect.py::test_win32_mouse_minimized_click_restores_full_window_state"
+        "tests/test_windows_smart_reconnect.py::test_win32_mouse_minimized_click_restores_full_window_state",
+        "tests/test_main_window_layout.py::test_cancelled_bulk_shortcut_selection_has_no_side_effects",
+        "tests/test_group_configuration_service.py::test_export_and_import_round_trip_preserves_group_order_and_layout",
+        "tests/test_group_configuration_service.py::test_reorder_entries_is_atomic_persistent_and_keeps_main_identity",
+        "tests/test_group_configuration_service.py::test_saved_window_layout_survives_owned_configuration_reload",
+        "tests/test_group_configuration_service.py::test_each_group_keeps_one_unique_launch_hotkey",
+        "tests/test_group_configuration_service.py::test_sync_offset_delay_base_point_and_role_id_survive_reload"
       ],
-      "本機比對": "現行程式已保存同步設定；以啟動指紋與完整視窗身分處理目標；縮小視窗可安全還原；整組只啟動缺少角色並還原已保存位置；鍵盤保留按下瞬間來源；檔案選擇取消時不寫入任何批量加入。",
-      "驗收": ["不覆蓋較新安全修正", "只恢復可直接證明的既有行為", "九項最小測試全數通過"]
+      "取消批量加入直接證據": "檔案選擇取消時先回傳，不得停止自動操作、不得呼叫 add_shortcuts、不得寫入角色；多選只以一次 add_shortcuts 原子處理。",
+      "本機比對": "現行程式已保存同步設定；以啟動指紋與完整視窗身分處理目標；縮小視窗可安全還原；整組只啟動缺少角色並還原已保存位置；鍵盤保留按下瞬間來源；取消批量加入與完整重啟保存範圍已有直接測試。",
+      "本機驗證": "十五項最小測試全數通過。",
+      "驗收": ["不覆蓋較新安全修正", "只恢復可直接證明的既有行為", "十五項最小測試全數通過"]
     },
     {
       "編號": "FU-REQ-20260802-003",
@@ -282,7 +321,7 @@
       "狀態": "待前置關卡",
       "前置證據合併請求": 17,
       "檔案所有權": [],
-      "解鎖條件": "只讀核對匿名啟動指紋與可靠遊戲畫面資料接點後填入。",
+      "解鎖條件": "先完成索爾程式審查阻擋項，再只讀核對匿名啟動指紋與可靠遊戲畫面資料接點後填入。",
       "禁止範圍": ["捷徑名稱判斷", "檔名判斷"],
       "最小測試": [],
       "驗收": ["身分只依匿名啟動指紋與可靠遊戲畫面"]
