@@ -156,6 +156,22 @@ def test_status_must_match_the_recognized_central_shape() -> None:
     assert _recognizer().read(_sample_from_image(mixed)) is None
 
 
+def test_completed_page_requires_visible_stage_evidence() -> None:
+    with Image.open(_reference_path(1)) as source:
+        masked = source.convert("RGB")
+    ImageDraw.Draw(masked).rectangle((70, 625, 170, 668), fill=(0, 0, 0))
+
+    assert _recognizer().read(_sample_from_image(masked)) is None
+
+
+def test_completed_page_requires_visible_completion_evidence() -> None:
+    with Image.open(_reference_path(1)) as source:
+        masked = source.convert("RGB")
+    ImageDraw.Draw(masked).rectangle((70, 670, 170, 717), fill=(0, 0, 0))
+
+    assert _recognizer().read(_sample_from_image(masked)) is None
+
+
 def test_blank_low_confidence_and_missing_reference_fail_closed(tmp_path) -> None:
     with Image.open(_reference_path(1)) as source:
         blank = Image.new("RGB", source.size, "black")

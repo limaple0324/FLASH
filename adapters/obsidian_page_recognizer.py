@@ -22,7 +22,9 @@ from services.character_game_data_capture_service import (
 
 _CENTRAL_SHAPE_REGION = (0.06, 0.07, 0.70, 0.73)
 _SHAPE_SIGNATURE_SIZE = (160, 160)
-_STATUS_SIGNATURE_SIZE = (80, 80)
+_SELECTION_TEXT_SIGNATURE_SIZE = (80, 80)
+_STAGE_EVIDENCE_REGION = (0.10, 0.14, 0.90, 0.47)
+_STATUS_EVIDENCE_REGION = (0.10, 0.48, 0.90, 0.90)
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +348,7 @@ class _ReferenceFrame:
     definition: ObsidianPageDefinition
     image: Image.Image
     shape_signature: bytes
+    stage_signature: bytes | None
     status_signature: bytes
 
 
@@ -426,6 +429,7 @@ class ObsidianPageRecognizer:
         self._missing_references: tuple[str, ...] = ()
         self._shape_minimum_score = 1.0
         self._shape_minimum_margin = 1.0
+        self._stage_minimum_score = 1.0
         self._status_minimum_score = 1.0
         self._status_minimum_margin = 1.0
         self._lit_brightness_boundary = 255.0
@@ -509,16 +513,27 @@ class ObsidianPageRecognizer:
         return region.crop((min_x, min_y, max_x + 1, max_y + 1))
 
     @classmethod
-    def _status_signature(cls, image: Image.Image) -> bytes | None:
+    def _selection_text_signature(
+        cls,
+        image: Image.Image,
+        region: tuple[float, float, float, float],
+    ) -> bytes | None:
         panel = cls._gold_panel(image)
         if panel is None:
             return None
-        width, height = panel.size
         return _binary_signature(
             panel,
-            (0.10, 0.14, 0.90, 0.90),
-            _STATUS_SIGNATURE_SIZE,
+            region,
+            _SELECTION_TEXT_SIGNATURE_SIZE,
         )
+
+    @classmethod
+    def _stage_signature(cls, image: Image.Image) -> bytes | None:
+        return cls._selection_text_signature(image, _STAGE_EVIDENCE_REGION)
+
+    @classmethod
+    def _status_signature(cls, image: Image.Image) -> bytes | None:
+        return cls._selection_text_signature(image, _STATUS_EVIDENCE_REGION)
 
     @staticmethod
     def _node_metrics(
@@ -575,7 +590,15 @@ class ObsidianPageRecognizer:
                 missing.append(definition.filename)
                 continue
             status_signature = self._status_signature(image)
-            if status_signature is None:
+            stage_signature = (
+                self._stage_signature(image)
+                if definition.status_text == "階段一／完成"
+                else None
+            )
+            if status_signature is None or (
+                definition.status_text == "階段一／完成"
+                and stage_signature is None
+            ):
                 missing.append(definition.filename)
                 continue
             frames.append(
@@ -587,6 +610,7 @@ class ObsidianPageRecognizer:
                         _CENTRAL_SHAPE_REGION,
                         _SHAPE_SIGNATURE_SIZE,
                     ),
+                    stage_signature=stage_signature,
                     status_signature=status_signature,
                 )
             )
@@ -607,7 +631,13 @@ class ObsidianPageRecognizer:
         self._shape_minimum_score = (1.0 + shape_cross) / 2.0
         self._shape_minimum_margin = (1.0 - shape_cross) / 2.0
 
-        completed = [
+        completed_stages = [
+            frame.stage_signature
+            for frame in self._frames
+            if frame.definition.status_text == "階段一／完成"
+            and frame.stage_signature is not None
+        ]
+        completed_statuses = [
             frame.status_signature
             for frame in self._frames
             if frame.definition.status_text == "階段一／完成"
@@ -617,15 +647,24 @@ class ObsidianPageRecognizer:
             for frame in self._frames
             if frame.definition.status_text == "激活"
         ]
-        if not completed or not activated:
+        if not completed_stages or not completed_statuses or not activated:
             self._missing_references = ("階段一／完成或激活狀態參考",)
             self._frames = ()
             return
         status_cross = max(
             _jaccard_score(first, second)
-            for first in completed
+            for first in completed_statuses
             for second in activated
         )
+        # 上行「階段一」的零像素簽章代表文字完全缺失；門檻取其與
+        # 原圖自比對分數的中點，不能由下行「完成」補造。
+        self._stage_minimum_score = (
+            1.0
+            + max(
+                _jaccard_score(signature, bytes(len(signature)))
+                for signature in completed_stages
+            )
+        ) / 2.0
         self._status_minimum_score = (1.0 + status_cross) / 2.0
         self._status_minimum_margin = (1.0 - status_cross) / 2.0
 
@@ -714,13 +753,17 @@ class ObsidianPageRecognizer:
             return None
         return definition
 
-    def _recognized_status(self, image: Image.Image) -> str | None:
-        candidate = self._status_signature(image)
-        if candidate is None:
+    def _recognized_status(
+        self,
+        image: Image.Image,
+        definition: ObsidianPageDefinition,
+    ) -> str | None:
+        status_candidate = self._status_signature(image)
+        if status_candidate is None:
             return None
-        complete_score = max(
+        completed_status_score = max(
             (
-                _jaccard_score(candidate, frame.status_signature)
+                _jaccard_score(status_candidate, frame.status_signature)
                 for frame in self._frames
                 if frame.definition.status_text == "階段一／完成"
             ),
@@ -728,20 +771,33 @@ class ObsidianPageRecognizer:
         )
         active_score = max(
             (
-                _jaccard_score(candidate, frame.status_signature)
+                _jaccard_score(status_candidate, frame.status_signature)
                 for frame in self._frames
                 if frame.definition.status_text == "激活"
             ),
             default=0.0,
         )
-        if (
-            complete_score >= self._status_minimum_score
-            and complete_score - active_score >= self._status_minimum_margin
-        ):
+        if definition.status_text == "階段一／完成":
+            stage_candidate = self._stage_signature(image)
+            stage_score = max(
+                (
+                    _jaccard_score(stage_candidate, frame.stage_signature)
+                    for frame in self._frames
+                    if frame.definition.status_text == "階段一／完成"
+                    and frame.stage_signature is not None
+                ),
+                default=0.0,
+            ) if stage_candidate is not None else 0.0
+            if (
+                stage_score < self._stage_minimum_score
+                or completed_status_score < self._status_minimum_score
+                or completed_status_score - active_score < self._status_minimum_margin
+            ):
+                return None
             return "階段一／完成"
-        if (
+        if definition.status_text == "激活" and (
             active_score >= self._status_minimum_score
-            and active_score - complete_score >= self._status_minimum_margin
+            and active_score - completed_status_score >= self._status_minimum_margin
         ):
             return "激活"
         return None
@@ -787,7 +843,7 @@ class ObsidianPageRecognizer:
         definition = self._recognized_definition(image)
         if definition is None:
             return None
-        status_text = self._recognized_status(image)
+        status_text = self._recognized_status(image, definition)
         if status_text != definition.status_text:
             return None
         states = self._node_states(image, definition)
