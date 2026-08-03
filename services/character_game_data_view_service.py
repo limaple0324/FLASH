@@ -66,14 +66,21 @@ class CharacterGameDataViewService:
         snapshot = record.obsidian
         if snapshot is None:
             return "尚未安全讀取"
-        parts = [f"已開啟至第 {snapshot.opened_page} 頁"]
-        if snapshot.stage is not None:
-            parts.append(f"階段 {snapshot.stage}")
-        if snapshot.opened_nodes is not None:
-            parts.append(f"已開 {snapshot.opened_nodes} 格")
-        parts.append(f"尚餘 {snapshot.unlit_nodes} 個未點亮節點")
-        parts.append(f"最後更新 {snapshot.updated_at}")
-        return "｜".join(parts)
+        lines = [
+            f"已讀取 {snapshot.read_page_count}／10 頁",
+            f"最高已讀到第 {snapshot.highest_read_page} 頁",
+            f"已讀頁尚餘 {snapshot.total_unlit_nodes} 個未點亮節點",
+        ]
+        for page in snapshot.pages:
+            parts = [f"第 {page.opened_page} 頁"]
+            if page.stage is not None:
+                parts.append(page.stage)
+            if page.opened_nodes is not None:
+                parts.append(f"已亮 {page.opened_nodes} 格")
+            parts.append(f"未亮 {page.unlit_nodes} 格")
+            parts.append(f"最後更新 {page.updated_at}")
+            lines.append("｜".join(parts))
+        return "\n".join(lines)
 
     @staticmethod
     def _life_soul_summary(record) -> str:

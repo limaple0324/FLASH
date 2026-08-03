@@ -9,6 +9,7 @@ from typing import Iterable
 from domain.character_game_data import (
     ArtifactSnapshot,
     CharacterGameData,
+    ObsidianPagesSnapshot,
     ObsidianSnapshot,
     PetLifeSoulSnapshot,
     PetTalentPageSnapshot,
@@ -105,13 +106,7 @@ class CharacterGameDataUpdateService:
 
         next_obsidian = existing.obsidian if existing is not None else None
         if obsidian is not _UNSET:
-            if not isinstance(obsidian, ObsidianSnapshot):
-                raise TypeError("obsidian must be ObsidianSnapshot.")
-            if not obsidian.verified:
-                raise ValueError(
-                    "obsidian update requires stage, opened_nodes, and page shape evidence."
-                )
-            next_obsidian = obsidian
+            next_obsidian = self._merge_obsidian(next_obsidian, obsidian)
 
         next_life_souls = existing.life_souls if existing is not None else ()
         if life_souls is not _UNSET:
@@ -188,6 +183,24 @@ class CharacterGameDataUpdateService:
         for item in incoming_pages:
             pages[item.page_number] = item
         return PetTalentSnapshot(tuple(pages[number] for number in sorted(pages)))
+
+    @staticmethod
+    def _merge_obsidian(
+        existing: ObsidianPagesSnapshot | None,
+        incoming: object,
+    ) -> ObsidianPagesSnapshot:
+        if not isinstance(incoming, ObsidianSnapshot):
+            raise TypeError("obsidian must be ObsidianSnapshot.")
+        if not incoming.verified:
+            raise ValueError(
+                "obsidian update requires stage, opened_nodes, and page shape evidence."
+            )
+        pages = {
+            item.opened_page: item
+            for item in (existing.pages if existing is not None else ())
+        }
+        pages[incoming.opened_page] = incoming
+        return ObsidianPagesSnapshot(tuple(pages.values()))
 
     @staticmethod
     def _merge_life_souls(

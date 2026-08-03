@@ -25,6 +25,7 @@ a = Analysis(
         ('assets/flash_icon.png', 'assets'),
         ('assets/flash_icon.ico', 'assets'),
         ('assets/reconnect_reference', 'assets/reconnect_reference'),
+        ('assets/game_data_reference/obsidian', 'assets/game_data_reference/obsidian'),
         ('assets/role_id_ocr', 'assets/role_id_ocr'),
     ] + rapidocr_datas,
     hiddenimports=[

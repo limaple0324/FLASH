@@ -189,6 +189,69 @@ class ObsidianSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ObsidianPagesSnapshot:
+    """同一角色已可靠讀到的黑曜石每頁最新快照。"""
+
+    pages: tuple[ObsidianSnapshot, ...]
+
+    def __post_init__(self) -> None:
+        try:
+            pages = tuple(self.pages)
+        except TypeError as error:
+            raise TypeError("pages must be an iterable of ObsidianSnapshot values.") from error
+        if not pages:
+            raise ValueError("pages must contain at least one page.")
+        if any(not isinstance(item, ObsidianSnapshot) for item in pages):
+            raise TypeError("pages must contain only ObsidianSnapshot values.")
+        numbers = [item.opened_page for item in pages]
+        if len(numbers) != len(set(numbers)):
+            raise ValueError("Obsidian page numbers must be unique.")
+        object.__setattr__(
+            self,
+            "pages",
+            tuple(sorted(pages, key=lambda item: item.opened_page)),
+        )
+
+    @property
+    def read_page_count(self) -> int:
+        return len(self.pages)
+
+    @property
+    def highest_read_page(self) -> int:
+        return self.pages[-1].opened_page
+
+    @property
+    def total_unlit_nodes(self) -> int:
+        return sum(item.unlit_nodes for item in self.pages)
+
+    def page(self, page_number: int) -> ObsidianSnapshot | None:
+        if (
+            isinstance(page_number, bool)
+            or not isinstance(page_number, int)
+            or not 1 <= page_number <= 10
+        ):
+            raise ValueError("page_number must be between 1 and 10.")
+        return next(
+            (item for item in self.pages if item.opened_page == page_number),
+            None,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {"pages": [item.to_dict() for item in self.pages]}
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "ObsidianPagesSnapshot":
+        raw_pages = payload.get("pages")
+        if not isinstance(raw_pages, list) or any(
+            not isinstance(item, Mapping) for item in raw_pages
+        ):
+            raise ValueError("pages must be a list of objects.")
+        return cls(
+            pages=tuple(ObsidianSnapshot.from_dict(item) for item in raw_pages)
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class LifeSoul:
     name: str
     level: int
@@ -328,7 +391,7 @@ class CharacterGameData:
 
     character_id: str
     cultivated_pet_count: int = 0
-    obsidian: ObsidianSnapshot | None = None
+    obsidian: ObsidianPagesSnapshot | ObsidianSnapshot | None = None
     life_souls: tuple[PetLifeSoulSnapshot, ...] = ()
     pet_talent: PetTalentSnapshot | None = None
     artifact: ArtifactSnapshot | None = None
@@ -340,8 +403,19 @@ class CharacterGameData:
             _required_text(self.character_id, "character_id"),
         )
         _nonnegative_int(self.cultivated_pet_count, "cultivated_pet_count")
-        if self.obsidian is not None and not isinstance(self.obsidian, ObsidianSnapshot):
-            raise TypeError("obsidian must be ObsidianSnapshot or None.")
+        if isinstance(self.obsidian, ObsidianSnapshot):
+            object.__setattr__(
+                self,
+                "obsidian",
+                ObsidianPagesSnapshot((self.obsidian,)),
+            )
+        elif self.obsidian is not None and not isinstance(
+            self.obsidian,
+            ObsidianPagesSnapshot,
+        ):
+            raise TypeError(
+                "obsidian must be ObsidianPagesSnapshot, ObsidianSnapshot, or None."
+            )
         if self.pet_talent is not None and not isinstance(self.pet_talent, PetTalentSnapshot):
             raise TypeError("pet_talent must be PetTalentSnapshot or None.")
         if self.artifact is not None and not isinstance(self.artifact, ArtifactSnapshot):
@@ -388,9 +462,15 @@ class CharacterGameData:
             character_id=payload.get("character_id"),  # type: ignore[arg-type]
             cultivated_pet_count=payload.get("cultivated_pet_count", 0),  # type: ignore[arg-type]
             obsidian=(
-                ObsidianSnapshot.from_dict(raw_obsidian)
-                if raw_obsidian is not None
-                else None
+                ObsidianPagesSnapshot.from_dict(raw_obsidian)
+                if raw_obsidian is not None and "pages" in raw_obsidian
+                else (
+                    ObsidianPagesSnapshot(
+                        (ObsidianSnapshot.from_dict(raw_obsidian),)
+                    )
+                    if raw_obsidian is not None
+                    else None
+                )
             ),
             life_souls=tuple(PetLifeSoulSnapshot.from_dict(item) for item in raw_life_souls),
             pet_talent=(

@@ -60,14 +60,14 @@
   "第零階段保全提交": "a6939904916e6504ab86fdc53ef0388748c1fa5e",
   "索爾架構審查前置": {
     "來源": "索爾對保全提交 a6939904916e6504ab86fdc53ef0388748c1fa5e 的架構審查",
-    "目前施工需求": ["FU-REQ-20260802-005"],
+    "目前施工需求": ["FU-REQ-20260802-006 黑曜石子項"],
     "後續保持鎖定需求": [
-      "FU-REQ-20260802-006",
+      "FU-REQ-20260802-006 寵物天賦子項",
       "FU-REQ-20260802-007",
       "FU-REQ-20260803-002"
     ],
-    "狀態": "第004號已通過索爾程式審查；第005號只讀核對完成，施工範圍已鎖定",
-    "用途": "只記錄共同設計與只讀證據；實際施工所有權與直接測試僅填入目前解鎖的第005號階段。",
+    "狀態": "第004、005號已通過索爾程式審查；第006號僅黑曜石子項已解鎖，寵物天賦仍保持鎖定",
+    "用途": "只記錄共同設計與只讀證據；實際施工所有權與直接測試僅填入目前解鎖的第006號黑曜石子項。",
     "第004索爾程式審查固定提交": "a827a0f2f3562be59a8df51125ba0b8541c187b1",
     "只讀核對證據": [
       "VerifiedGameDataPage 目前仍由頁面辨識器攜帶 character_id，與只辨識頁面資料的固定架構衝突。",
@@ -390,12 +390,62 @@
     {
       "編號": "FU-REQ-20260802-006",
       "項目": "四頁寵物天賦與黑曜石",
-      "狀態": "待前置關卡",
-      "檔案所有權": [],
-      "解鎖條件": "先完成索爾架構審查前置，再以可靠頁面辨識證據核對後填入。",
-      "禁止範圍": ["屬性名稱讀取", "依顏色猜測", "遊戲操作"],
-      "最小測試": [],
-      "驗收": ["保存頁面、階段、格位與最後讀取時間", "不猜測"]
+      "狀態": "本機驗證通過，待索爾程式審查：黑曜石子項；寵物天賦待可靠畫面證據",
+      "固定基準": "3ac1c15ffa75a7647acf936bd92c965a570a6017",
+      "子項範圍": "只處理黑曜石第 1 至第 10 頁的可靠唯讀辨識、每頁最新集合保存、唯讀摘要與封裝參考資產；不接主程式。",
+      "檔案所有權": [
+        ".codex/batches/FU-20260803-001.json",
+        "adapters/obsidian_page_recognizer.py",
+        "assets/game_data_reference/obsidian/",
+        "domain/character_game_data.py",
+        "services/character_game_data_update_service.py",
+        "services/character_game_data_view_service.py",
+        "FLASH.spec",
+        "tests/test_obsidian_page_recognizer.py",
+        "tests/test_character_game_data.py",
+        "tests/test_character_game_data_capture_service.py",
+        "tests/test_character_game_data_update_service.py",
+        "tests/test_app_icon.py"
+      ],
+      "原圖證據": [
+        {"頁碼": 1, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-67f95ff0-840a-440f-bf08-c794f31131fe.png", "SHA256": "ea613be92723ad5c50807d23df2495a0b9fad116c03d8472ff5d2e1a8ad6d86c"},
+        {"頁碼": 2, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-599d72f6-1a84-474e-b0ff-7200f765d706.png", "SHA256": "dcdcb69bbeda8cfdbe6dbc1b6ab8a1f90324d77f430de543d02a67a02fbaaea3"},
+        {"頁碼": 3, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-746792b5-9ece-437c-b19a-71d30df941a5.png", "SHA256": "bc7e1f115183e85bb53d72a6e8e81eaeb481e08ae748b34e0409c70285f7d29d"},
+        {"頁碼": 4, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-95d849da-6869-4e27-990b-915766b4e06f.png", "SHA256": "2c08443f0cb6f75a010c99aef6f5990cb37350698a3fd12d0e0e3f99254478be"},
+        {"頁碼": 5, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-aad8ae73-409d-4663-85b8-d2646f4d0bf8.png", "SHA256": "e39ab6ea14e2f45d1aada4adf652cee4085631b4be0bc9731a2163e705e80754"},
+        {"頁碼": 6, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-2f64ade5-d5a9-473b-985e-03086ca89e9b.png", "SHA256": "7202f50b8d342b2331eb84b5ebaf44bfefba8d3e00412e8279a45e4de2445dff"},
+        {"頁碼": 7, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-2971eea2-9536-45fc-9d8d-11eca876f1ad.png", "SHA256": "2793685803eeb0cec4b10268c066ac65b723128930f5c9de707d3e7db1fa8e36"},
+        {"頁碼": 8, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-503b5abf-918e-4176-9122-cc649d97ea68.png", "SHA256": "ebd472671034e0e700811926dd03f2d9a1d49ca967f4fd976257bba58581ecf7"},
+        {"頁碼": 9, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-4abbac88-ff39-4645-84af-1f2d54f221c5.png", "SHA256": "57642714dc8688c2eeccfd1d088e7165f4b8cfb127f7fbb74d18e2107224bcca"},
+        {"頁碼": 10, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-c940e16a-b4de-4d47-bf3c-2c200c540077.png", "SHA256": "262924e496079e06beabccc68a85b91e839bc4405b69d6e839ced53001375582"}
+      ],
+      "頁碼映射": "十張原圖依使用者已確認順序為第 1 至第 10 頁；執行期僅比較中央陣列形狀，不讀候選檔名、底部按鈕順序或單獨外框。",
+      "禁止範圍": [
+        "寵物天賦施工或猜測",
+        "第007號與第20260803-002號施工",
+        "main.py 與背景排程接線",
+        "右側格位屬性名稱或資源數字讀取",
+        "依整張色調、底部選取框或外框單獨推斷頁碼",
+        "提醒、自動點亮、鍵盤、滑鼠、切頁、切前景或任何遊戲輸入",
+        "雲端讀寫、推送、合併、封裝、桌面更新與正式發布"
+      ],
+      "最小測試": [
+        "tests/test_obsidian_page_recognizer.py",
+        "tests/test_character_game_data.py",
+        "tests/test_character_game_data_capture_service.py",
+        "tests/test_character_game_data_update_service.py",
+        "tests/test_app_icon.py"
+      ],
+      "驗收": [
+        "十張原圖逐一以中央形狀及選取階段／狀態共同確認為第 1 至第 10 頁，且打亂參考定義順序結果不變；第 1 至第 9 頁保存同一原文「階段一／完成」，第 10 頁只保存「激活」",
+        "所有預期格位均可靠分類亮或灰，且每格須有校準的最低亮度與局部結構證據；模糊、缺格、純黑或單色遮蓋、同分、低可信度、空白圖、缺參考圖與階段／形狀矛盾一律未辨識",
+        "保存單頁的可見階段／狀態原文、已亮格、未亮格、具時區最後讀取時間與穩定中央形狀簽章；時間、星空動畫與右側數字不影響簽章",
+        "黑曜石以第 1 至第 10 頁最新快照集合保存；不同頁保留、同頁取代、舊單頁格式可讀、新格式往返且重複頁拒絕",
+        "唯讀摘要只統計已讀頁，不將未讀頁當成未亮零；封裝規格明列新參考目錄",
+        "全程不呼叫啟用、點擊、鍵盤、切頁、切前景或任何遊戲輸入"
+      ],
+      "本機驗證": "2026-08-03：限定五個測試檔共 42 項通過；語法檢查、範圍、批次單與十張原圖雜湊核對通過。",
+      "剩餘阻礙": ["寵物天賦四頁仍缺可靠畫面證據，保持待前置關卡。"]
     },
     {
       "編號": "FU-REQ-20260802-007",

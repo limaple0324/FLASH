@@ -34,6 +34,23 @@ def _soul_page(name: str, page: int) -> PetLifeSoulSnapshot:
     )
 
 
+def _verified_obsidian(
+    page: int,
+    *,
+    opened: int,
+    unlit: int,
+    updated_at: str,
+) -> ObsidianSnapshot:
+    return ObsidianSnapshot(
+        opened_page=page,
+        opened_nodes=opened,
+        unlit_nodes=unlit,
+        stage="階段一／完成",
+        page_shape_signature=f"shape-{page}",
+        updated_at=updated_at,
+    )
+
+
 class BlockingFirstSaveStore(CharacterGameDataStore):
     def __init__(self, path) -> None:
         super().__init__(path)
@@ -246,3 +263,64 @@ def test_obsidian_update_requires_stage_and_shape_evidence(tmp_path) -> None:
         assert "page shape" in str(error)
     else:
         raise AssertionError("unverified obsidian data must not be saved")
+
+
+def test_obsidian_pages_preserve_other_pages_and_replace_only_current_page(tmp_path) -> None:
+    store = CharacterGameDataStore(tmp_path / "character_game_data.json")
+    service = CharacterGameDataUpdateService(store)
+    first = _verified_obsidian(
+        1,
+        opened=2,
+        unlit=0,
+        updated_at="2026-08-03T12:00:00+08:00",
+    )
+    fourth = _verified_obsidian(
+        4,
+        opened=12,
+        unlit=3,
+        updated_at="2026-08-03T12:05:00+08:00",
+    )
+    refreshed_first = _verified_obsidian(
+        1,
+        opened=1,
+        unlit=1,
+        updated_at="2026-08-03T12:10:00+08:00",
+    )
+
+    service.update("char-a", obsidian=first)
+    service.update("char-a", obsidian=fourth)
+    result = service.update("char-a", obsidian=refreshed_first)
+
+    assert result.changed_sections == ("黑曜石",)
+    pages = store.load()[0].obsidian.pages
+    assert pages == (refreshed_first, fourth)
+
+
+def test_unverified_obsidian_page_does_not_replace_existing_collection(tmp_path) -> None:
+    store = CharacterGameDataStore(tmp_path / "character_game_data.json")
+    service = CharacterGameDataUpdateService(store)
+    first = _verified_obsidian(
+        1,
+        opened=2,
+        unlit=0,
+        updated_at="2026-08-03T12:00:00+08:00",
+    )
+    service.update("char-a", obsidian=first)
+    before = store.path.read_bytes()
+
+    try:
+        service.update(
+            "char-a",
+            obsidian=ObsidianSnapshot(
+                opened_page=2,
+                unlit_nodes=3,
+                updated_at="2026-08-03T12:05:00+08:00",
+            ),
+        )
+    except ValueError as error:
+        assert "page shape" in str(error)
+    else:
+        raise AssertionError("unverified obsidian page must be rejected")
+
+    assert store.path.read_bytes() == before
+    assert store.load()[0].obsidian.pages == (first,)
