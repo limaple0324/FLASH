@@ -1,7 +1,9 @@
 from datetime import datetime
 
+import pytest
+
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
-from domain.progress import TAIPEI_TIMEZONE
+from domain.progress import ActivityInterruptionReason, TAIPEI_TIMEZONE
 from domain.progress_store import ActivityProgressStore
 from domain.status import ActivityStatus
 from main import ACTIVITY_PROGRESS_FILENAME, build_services
@@ -21,6 +23,26 @@ def _definition() -> ActivityDefinition:
         activity_type=ActivityType.DAILY,
         reset_rule=ResetRule.DAILY_MIDNIGHT,
         max_completions=2,
+    )
+
+
+def _second_definition() -> ActivityDefinition:
+    return ActivityDefinition(
+        activity_id="raid",
+        name="group-raid",
+        activity_type=ActivityType.DAILY,
+        reset_rule=ResetRule.DAILY_MIDNIGHT,
+        max_completions=2,
+    )
+
+
+def _completed_definition() -> ActivityDefinition:
+    return ActivityDefinition(
+        activity_id="completed",
+        name="completed-activity",
+        activity_type=ActivityType.DAILY,
+        reset_rule=ResetRule.DAILY_MIDNIGHT,
+        max_completions=1,
     )
 
 
@@ -160,3 +182,153 @@ def test_failed_atomic_save_keeps_old_memory_and_publishes_nothing(tmp_path):
 
     assert service.all() == ()
     assert changes == []
+
+
+def test_role_interruption_updates_only_running_exact_subject_and_persists(tmp_path):
+    path = tmp_path / "activity_progress.json"
+    service = ActivityProgressService(ActivityProgressStore(path))
+    service.register_definition(_definition())
+    service.register_definition(_second_definition())
+    service.register_definition(_completed_definition())
+    started = datetime(2026, 7, 11, 20, 0, tzinfo=TAIPEI_TIMEZONE)
+    interrupted_at = datetime(2026, 7, 11, 20, 5, tzinfo=TAIPEI_TIMEZONE)
+    service.start("farm", "character-a", started)
+    service.start("raid", "character-a", started)
+    service.start("farm", "character-b", started)
+    service.record_completion("completed", "character-a", started)
+
+    changed = service.record_interruption(
+        "character-a",
+        ActivityInterruptionReason.DISCONNECTED,
+        interrupted_at,
+    )
+    reloaded = ActivityProgressService(ActivityProgressStore(path))
+
+    assert {item.activity_id for item in changed} == {"farm", "raid"}
+    assert (
+        service.get("farm", "character-a").interruption.reason
+        is ActivityInterruptionReason.DISCONNECTED
+    )
+    assert service.get("raid", "character-a").interruption is not None
+    assert service.get("farm", "character-b").interruption is None
+    assert service.get("completed", "character-a").interruption is None
+    assert (
+        reloaded.get("farm", "character-a").interruption.reason
+        is ActivityInterruptionReason.DISCONNECTED
+    )
+
+
+def test_open_role_clears_only_exact_subject_interruption(tmp_path):
+    service = ActivityProgressService(
+        ActivityProgressStore(tmp_path / "activity_progress.json")
+    )
+    service.register_definition(_definition())
+    started = datetime(2026, 7, 11, 20, 0, tzinfo=TAIPEI_TIMEZONE)
+    disconnected = datetime(2026, 7, 11, 20, 5, tzinfo=TAIPEI_TIMEZONE)
+    reopened = datetime(2026, 7, 11, 20, 10, tzinfo=TAIPEI_TIMEZONE)
+    service.start("farm", "character-a", started)
+    service.start("farm", "character-b", started)
+    service.record_interruption(
+        "character-a",
+        ActivityInterruptionReason.DISCONNECTED,
+        disconnected,
+    )
+    service.record_interruption(
+        "character-b",
+        ActivityInterruptionReason.GAME_CLOSED,
+        disconnected,
+    )
+    before_reopen = service.get("farm", "character-a")
+
+    changed = service.clear_interruption("character-a", reopened)
+
+    assert len(changed) == 1
+    restored = service.get("farm", "character-a")
+    assert restored.status is ActivityStatus.RUNNING
+    assert restored.started_at == before_reopen.started_at == started
+    assert restored.current_count == before_reopen.current_count
+    assert restored.period_started_on == before_reopen.period_started_on
+    assert restored.interruption is None
+    assert service.get("farm", "character-b").interruption.reason is (
+        ActivityInterruptionReason.GAME_CLOSED
+    )
+
+
+def test_interruption_transition_saves_all_affected_progress_before_typed_changes(
+    tmp_path,
+):
+    class CountingStore(ActivityProgressStore):
+        def __init__(self, path):
+            super().__init__(path)
+            self.save_calls = 0
+            self.fail_saves = False
+
+        def save(self, progress):
+            self.save_calls += 1
+            if self.fail_saves:
+                raise OSError("interruption save failed")
+            super().save(progress)
+
+    bus = EventBus()
+    changes: list[ActivityProgressChange] = []
+    snapshots = []
+    path = tmp_path / "activity_progress.json"
+    bus.subscribe(ACTIVITY_PROGRESS_CHANGED_EVENT, changes.append)
+    bus.subscribe(
+        ACTIVITY_PROGRESS_CHANGED_EVENT,
+        lambda _change: snapshots.append(
+            ActivityProgressStore(path).load()
+        ),
+    )
+    store = CountingStore(path)
+    service = ActivityProgressService(store, bus)
+    service.register_definition(_definition())
+    service.register_definition(_second_definition())
+    started = datetime(2026, 7, 11, 20, 0, tzinfo=TAIPEI_TIMEZONE)
+    closed_at = datetime(2026, 7, 11, 20, 5, tzinfo=TAIPEI_TIMEZONE)
+    service.start("farm", "character-a", started)
+    service.start("raid", "character-a", started)
+    changes.clear()
+    snapshots.clear()
+    saves_before_interruption = store.save_calls
+
+    changed = service.record_interruption(
+        "character-a",
+        ActivityInterruptionReason.GAME_CLOSED,
+        closed_at,
+    )
+
+    assert len(changed) == 2
+    assert store.save_calls == saves_before_interruption + 1
+    assert [change.reason for change in changes] == ["interrupted", "interrupted"]
+    assert all(isinstance(change, ActivityProgressChange) for change in changes)
+    assert len(snapshots) == 2
+    assert all(
+        all(
+            item.interruption is not None
+            and item.interruption.reason is ActivityInterruptionReason.GAME_CLOSED
+            for item in snapshot
+        )
+        for snapshot in snapshots
+    )
+
+    failed_bus = EventBus()
+    failed_changes: list[ActivityProgressChange] = []
+    failed_bus.subscribe(ACTIVITY_PROGRESS_CHANGED_EVENT, failed_changes.append)
+    failed_store = CountingStore(tmp_path / "failed_activity_progress.json")
+    failed_service = ActivityProgressService(failed_store, failed_bus)
+    failed_service.register_definition(_definition())
+    failed_service.start("farm", "character-a", started)
+    failed_changes.clear()
+    before_failure = failed_service.all()
+    failed_store.fail_saves = True
+
+    with pytest.raises(OSError, match="interruption save failed"):
+        failed_service.record_interruption(
+            "character-a",
+            ActivityInterruptionReason.DISCONNECTED,
+            closed_at,
+        )
+
+    assert failed_service.all() == before_failure
+    assert failed_changes == []

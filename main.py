@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 import traceback
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -77,7 +78,7 @@ from domain.activity_schedule import (
 from domain.character_store import CharacterStore
 from domain.character_game_data_store import CharacterGameDataStore
 from domain.game_shortcuts import CONFIRMED_GAME_SHORTCUTS
-from domain.progress import TAIPEI_TIMEZONE
+from domain.progress import ActivityInterruptionReason, TAIPEI_TIMEZONE
 from domain.progress_store import ActivityProgressStore
 from habit.service import ActivityOrderHabitService
 from habit.store import ActivityOrderHabitStore
@@ -176,6 +177,12 @@ from services.group_role_status_service import (
     GROUP_ROLE_STATUS_CHANGED_EVENT,
     GroupRoleStatusChange,
     GroupRoleStatusService,
+    ROLE_STATUS_CHECK_DISABLED,
+    ROLE_STATUS_CLOSED,
+    ROLE_STATUS_DISCONNECTED,
+    ROLE_STATUS_FAILED,
+    ROLE_STATUS_OPEN,
+    ROLE_STATUS_RECONNECTING,
 )
 from services.group_window_launch_service import (
     GroupWindowLaunchResult,
@@ -394,6 +401,136 @@ def _normalize_window_keywords(value: object) -> list[str]:
 
 def _normalize_window_fingerprint(value: object) -> str | None:
     return normalize_launch_fingerprint(value)
+
+
+def resolve_group_role_progress_subject_id(
+    change: object,
+    *,
+    group_launch_service: GroupLaunchService,
+    group_selection_service: GroupSelectionService,
+) -> str | None:
+    """Return one stable character subject for one verified group role."""
+    if not isinstance(change, GroupRoleStatusChange):
+        return None
+    group_name = change.group_name.strip()
+    fingerprint = normalize_launch_fingerprint(change.current.action_id)
+    if not group_name or fingerprint is None:
+        return None
+    try:
+        plan = group_launch_service.plan(group_name)
+        choices = group_selection_service.choices()
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(plan, GroupLaunchPlan) or not plan.ready:
+        return None
+    target = plan.target_for_fingerprint(fingerprint)
+    if target is None or not target.entry_id:
+        return None
+    if sum(
+        item.entry_id == target.entry_id
+        for item in plan.targets
+    ) != 1:
+        return None
+    matching_choices = tuple(
+        choice
+        for choice in choices
+        if isinstance(choice.name, str) and choice.name.strip() == group_name
+    )
+    if len(matching_choices) != 1:
+        return None
+    matching_members = tuple(
+        member
+        for member in matching_choices[0].members
+        if (
+            member.entry_id == target.entry_id
+            and isinstance(member.character_id, str)
+            and member.character_id.strip()
+        )
+    )
+    if len(matching_members) != 1:
+        return None
+    return matching_members[0].character_id.strip()
+
+
+def route_group_role_status_to_activity_progress(
+    change: object,
+    *,
+    activity_progress_service: ActivityProgressService | None,
+    subject_id_resolver: Callable[[GroupRoleStatusChange], str | None],
+    occurred_at: datetime,
+) -> tuple[object, ...]:
+    """Apply only verified game-role transitions to matching activity progress."""
+    if (
+        not isinstance(change, GroupRoleStatusChange)
+        or not isinstance(activity_progress_service, ActivityProgressService)
+        or occurred_at.tzinfo is None
+        or occurred_at.utcoffset() is None
+    ):
+        return ()
+    status = change.current.status
+    if status not in {
+        ROLE_STATUS_DISCONNECTED,
+        ROLE_STATUS_RECONNECTING,
+        ROLE_STATUS_CLOSED,
+        ROLE_STATUS_OPEN,
+    }:
+        return ()
+    try:
+        subject_id = subject_id_resolver(change)
+    except (KeyError, TypeError, ValueError):
+        return ()
+    if not isinstance(subject_id, str) or not subject_id.strip():
+        return ()
+    if status in {ROLE_STATUS_DISCONNECTED, ROLE_STATUS_RECONNECTING}:
+        return activity_progress_service.record_interruption(
+            subject_id,
+            ActivityInterruptionReason.DISCONNECTED,
+            occurred_at,
+        )
+    if status == ROLE_STATUS_CLOSED:
+        return activity_progress_service.record_interruption(
+            subject_id,
+            ActivityInterruptionReason.GAME_CLOSED,
+            occurred_at,
+        )
+    return activity_progress_service.clear_interruption(
+        subject_id,
+        occurred_at,
+    )
+
+
+def handle_group_role_status_change(
+    change: object,
+    *,
+    activity_progress_service: ActivityProgressService | None,
+    subject_id_resolver: Callable[[GroupRoleStatusChange], str | None],
+    occurred_at: datetime,
+    logger: LoggerService | None,
+    on_role_status_card: Callable[[GroupRoleStatusChange], object] | None,
+) -> tuple[object, ...]:
+    """Keep the existing role-status card independent from progress persistence."""
+    if not isinstance(change, GroupRoleStatusChange):
+        return ()
+    try:
+        progress_changes = route_group_role_status_to_activity_progress(
+            change,
+            activity_progress_service=activity_progress_service,
+            subject_id_resolver=subject_id_resolver,
+            occurred_at=occurred_at,
+        )
+    except Exception as error:
+        progress_changes = ()
+        if logger is not None:
+            try:
+                logger.error(
+                    "Activity progress interruption routing failed and was "
+                    f"isolated: {error}"
+                )
+            except Exception:
+                pass
+    if on_role_status_card is not None:
+        on_role_status_card(change)
+    return progress_changes
 
 
 def _sync_scope_has_all_safe_windows(
@@ -4513,13 +4650,28 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         dispatch_to_main_window(apply_change)
 
     def group_role_status_changed_handler(change: object) -> None:
-        if (
-            true_event_card_service is not None
-            and isinstance(change, GroupRoleStatusChange)
-        ):
-            dispatch_to_main_window(
-                lambda: true_event_card_service.handle_role_status(change)
-            )
+        handle_group_role_status_change(
+            change,
+            activity_progress_service=activity_progress_service,
+            subject_id_resolver=(
+                lambda item: resolve_group_role_progress_subject_id(
+                    item,
+                    group_launch_service=group_launch_service,
+                    group_selection_service=group_selection_service,
+                )
+            ),
+            occurred_at=datetime.now(TAIPEI_TIMEZONE),
+            logger=logger,
+            on_role_status_card=(
+                (
+                    lambda item: dispatch_to_main_window(
+                        lambda: true_event_card_service.handle_role_status(item)
+                    )
+                )
+                if true_event_card_service is not None
+                else None
+            ),
+        )
 
     def farm_planting_confirmed_handler(event: object) -> None:
         if (

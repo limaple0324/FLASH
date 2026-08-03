@@ -3,7 +3,11 @@ from datetime import datetime
 import pytest
 
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
-from domain.progress import ActivityProgress, TAIPEI_TIMEZONE
+from domain.progress import (
+    ActivityInterruptionReason,
+    ActivityProgress,
+    TAIPEI_TIMEZONE,
+)
 from domain.status import ActivityStatus
 
 
@@ -107,3 +111,70 @@ def test_progress_requires_timezone_aware_times():
 
     with pytest.raises(ValueError):
         progress.start(datetime(2026, 7, 11, 20, 0))
+
+
+def test_running_progress_preserves_interruption_at_daily_reset():
+    definition = _guard()
+    before_midnight = datetime(
+        2026,
+        7,
+        11,
+        23,
+        59,
+        tzinfo=TAIPEI_TIMEZONE,
+    )
+    after_midnight = datetime(
+        2026,
+        7,
+        12,
+        0,
+        0,
+        tzinfo=TAIPEI_TIMEZONE,
+    )
+    interrupted = ActivityProgress(
+        activity_id="guard",
+        subject_id="character-a",
+        current_count=3,
+    ).start(before_midnight).record_interruption(
+        ActivityInterruptionReason.DISCONNECTED,
+        before_midnight,
+    )
+
+    carried = interrupted.reset_if_due(definition, after_midnight)
+
+    assert carried.status is ActivityStatus.RUNNING
+    assert carried.current_count == 0
+    assert carried.started_at == before_midnight
+    assert carried.period_started_on == after_midnight.date()
+    assert carried.interruption == interrupted.interruption
+
+
+def test_interruption_requires_running_progress():
+    at = datetime(2026, 7, 11, 20, 0, tzinfo=TAIPEI_TIMEZONE)
+    later = datetime(2026, 7, 11, 20, 5, tzinfo=TAIPEI_TIMEZONE)
+    standby = ActivityProgress(activity_id="guard", subject_id="character-a")
+    completed = ActivityProgress(
+        activity_id="guard",
+        subject_id="character-a",
+        status=ActivityStatus.COMPLETED,
+    )
+
+    assert standby.record_interruption(
+        ActivityInterruptionReason.DISCONNECTED,
+        at,
+    ) is standby
+    assert completed.record_interruption(
+        ActivityInterruptionReason.GAME_CLOSED,
+        at,
+    ) is completed
+
+    interrupted = standby.start(at).record_interruption(
+        ActivityInterruptionReason.DISCONNECTED,
+        at,
+    )
+    restarted = interrupted.start(later)
+    completed_after_interruption = interrupted.record_completion(_guard(), later)
+
+    assert interrupted.interruption is not None
+    assert restarted.interruption is None
+    assert completed_after_interruption.interruption is None

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from enum import Enum
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
@@ -18,6 +19,42 @@ def _require_aware(value: datetime, field: str) -> datetime:
     return value
 
 
+class ActivityInterruptionReason(str, Enum):
+    DISCONNECTED = "disconnected"
+    GAME_CLOSED = "game_closed"
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityInterruption:
+    reason: ActivityInterruptionReason
+    occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, ActivityInterruptionReason):
+            raise TypeError("reason must be ActivityInterruptionReason.")
+        _require_aware(self.occurred_at, "occurred_at")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "reason": self.reason.value,
+            "occurred_at": self.occurred_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "ActivityInterruption":
+        reason = payload.get("reason")
+        occurred_at = payload.get("occurred_at")
+        if not isinstance(reason, str) or not isinstance(occurred_at, str):
+            raise ValueError("Interruption fields must be strings.")
+        try:
+            return cls(
+                ActivityInterruptionReason(reason),
+                datetime.fromisoformat(occurred_at),
+            )
+        except ValueError as exc:
+            raise ValueError("Interruption data is invalid.") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class ActivityProgress:
     activity_id: str
@@ -27,6 +64,7 @@ class ActivityProgress:
     period_started_on: date | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    interruption: ActivityInterruption | None = None
 
     def __post_init__(self) -> None:
         activity_id = self.activity_id.strip()
@@ -47,6 +85,16 @@ class ActivityProgress:
             _require_aware(self.started_at, "started_at")
         if self.completed_at is not None:
             _require_aware(self.completed_at, "completed_at")
+        if self.interruption is not None and not isinstance(
+            self.interruption,
+            ActivityInterruption,
+        ):
+            raise TypeError("interruption must be ActivityInterruption or None.")
+        if (
+            self.interruption is not None
+            and self.status is not ActivityStatus.RUNNING
+        ):
+            raise ValueError("Only running progress can hold an interruption.")
         object.__setattr__(self, "activity_id", activity_id)
         object.__setattr__(self, "subject_id", subject_id)
 
@@ -61,6 +109,7 @@ class ActivityProgress:
             status=ActivityStatus.RUNNING,
             period_started_on=self.period_started_on or at.astimezone(TAIPEI_TIMEZONE).date(),
             started_at=at,
+            interruption=None,
         )
 
     def record_completion(
@@ -85,7 +134,33 @@ class ActivityProgress:
             status=next_status,
             period_started_on=self.period_started_on or at.astimezone(TAIPEI_TIMEZONE).date(),
             completed_at=at,
+            interruption=None,
         )
+
+    def record_interruption(
+        self,
+        reason: ActivityInterruptionReason,
+        at: datetime,
+    ) -> "ActivityProgress":
+        if not isinstance(reason, ActivityInterruptionReason):
+            raise TypeError("reason must be ActivityInterruptionReason.")
+        at = _require_aware(at, "at")
+        if self.status is not ActivityStatus.RUNNING:
+            return self
+        if (
+            self.interruption is not None
+            and self.interruption.reason is reason
+        ):
+            return self
+        return replace(
+            self,
+            interruption=ActivityInterruption(reason, at),
+        )
+
+    def clear_interruption(self) -> "ActivityProgress":
+        if self.interruption is None:
+            return self
+        return replace(self, interruption=None)
 
     def reset_if_due(
         self,
@@ -109,6 +184,7 @@ class ActivityProgress:
                 status=ActivityStatus.RUNNING,
                 period_started_on=today,
                 started_at=self.started_at,
+                interruption=self.interruption,
             )
         return ActivityProgress(
             activity_id=self.activity_id,
@@ -125,6 +201,11 @@ class ActivityProgress:
             "period_started_on": self.period_started_on.isoformat() if self.period_started_on else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "interruption": (
+                self.interruption.to_dict()
+                if self.interruption is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -141,12 +222,18 @@ class ActivityProgress:
         period_value = payload.get("period_started_on")
         started_value = payload.get("started_at")
         completed_value = payload.get("completed_at")
+        interruption_value = payload.get("interruption")
         try:
             period = date.fromisoformat(period_value) if isinstance(period_value, str) else None
             started = datetime.fromisoformat(started_value) if isinstance(started_value, str) else None
             completed = datetime.fromisoformat(completed_value) if isinstance(completed_value, str) else None
         except ValueError as exc:
             raise ValueError("Progress date or time is invalid.") from exc
+        if interruption_value is not None and not isinstance(
+            interruption_value,
+            Mapping,
+        ):
+            raise ValueError("interruption must be an object or null.")
 
         return cls(
             activity_id=activity_id,
@@ -156,4 +243,9 @@ class ActivityProgress:
             period_started_on=period,
             started_at=started,
             completed_at=completed,
+            interruption=(
+                ActivityInterruption.from_dict(interruption_value)
+                if interruption_value is not None
+                else None
+            ),
         )

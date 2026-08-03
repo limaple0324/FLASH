@@ -60,14 +60,15 @@
   "第零階段保全提交": "a6939904916e6504ab86fdc53ef0388748c1fa5e",
   "索爾架構審查前置": {
     "來源": "索爾對保全提交 a6939904916e6504ab86fdc53ef0388748c1fa5e 的架構審查",
-    "目前施工需求": ["FU-REQ-20260802-004"],
+    "目前施工需求": ["FU-REQ-20260802-005"],
     "後續保持鎖定需求": [
       "FU-REQ-20260802-006",
       "FU-REQ-20260802-007",
       "FU-REQ-20260803-002"
     ],
-    "狀態": "只讀核對完成，施工範圍已鎖定",
-    "用途": "只記錄共同設計與只讀證據；實際施工所有權與直接測試僅填入目前解鎖的第004號階段。",
+    "狀態": "第004號已通過索爾程式審查；第005號只讀核對完成，施工範圍已鎖定",
+    "用途": "只記錄共同設計與只讀證據；實際施工所有權與直接測試僅填入目前解鎖的第005號階段。",
+    "第004索爾程式審查固定提交": "a827a0f2f3562be59a8df51125ba0b8541c187b1",
     "只讀核對證據": [
       "VerifiedGameDataPage 目前仍由頁面辨識器攜帶 character_id，與只辨識頁面資料的固定架構衝突。",
       "目前簽章快取鍵只有視窗、角色與資料種類；缺少呼叫端已提供的可靠邏輯頁身分。",
@@ -308,7 +309,8 @@
     {
       "編號": "FU-REQ-20260802-004",
       "項目": "共用唯讀且不干擾玩家的畫面辨識",
-      "狀態": "本機驗證通過，待索爾程式審查",
+      "狀態": "索爾程式審查通過",
+      "索爾審查固定提交": "a827a0f2f3562be59a8df51125ba0b8541c187b1",
       "檔案所有權": [
         "services/character_game_data_capture_service.py",
         "services/character_game_data_update_service.py",
@@ -348,12 +350,42 @@
     {
       "編號": "FU-REQ-20260802-005",
       "項目": "活動共用狀態與中斷分流",
-      "狀態": "待前置關卡",
-      "檔案所有權": [],
-      "解鎖條件": "只讀核對現有活動狀態與直接測試後填入。",
-      "禁止範圍": ["未定案活動規則"],
-      "最小測試": [],
-      "驗收": ["跨午夜、斷線、遊戲關閉與只關閉輔分開"]
+      "狀態": "索爾程式審查通過",
+      "索爾審查固定基準": "a827a0f2f3562be59a8df51125ba0b8541c187b1",
+      "索爾獨立複驗": "八項精確直接測試 8 passed。",
+      "檔案所有權": [
+        "domain/progress.py",
+        "services/activity_progress_service.py",
+        "main.py",
+        "tests/test_domain_progress.py",
+        "tests/test_activity_progress_service.py",
+        "tests/test_main_activity_progress.py"
+      ],
+      "解鎖條件": "第004號已通過索爾程式審查；只處理共用中斷資料、精確角色身分映射與原子保存，不處理個別活動規則。",
+      "禁止範圍": [
+        "第四種活動狀態",
+        "個別活動完成畫面或每日規則猜測",
+        "全體或組別共用活動的身分映射猜測",
+        "遊戲操作"
+      ],
+      "最小測試": [
+        "tests/test_domain_progress.py::test_running_progress_preserves_interruption_at_daily_reset",
+        "tests/test_domain_progress.py::test_interruption_requires_running_progress",
+        "tests/test_activity_progress_service.py::test_role_interruption_updates_only_running_exact_subject_and_persists",
+        "tests/test_activity_progress_service.py::test_open_role_clears_only_exact_subject_interruption",
+        "tests/test_activity_progress_service.py::test_interruption_transition_saves_all_affected_progress_before_typed_changes",
+        "tests/test_main_activity_progress.py::test_group_role_subject_resolution_requires_unique_nonempty_registered_identity",
+        "tests/test_main_activity_progress.py::test_group_status_routes_disconnect_reconnect_closed_and_open",
+        "tests/test_main_activity_progress.py::test_non_group_or_unresolved_status_does_not_change_activity_progress"
+      ],
+      "本機驗證": "八項精確直接測試與六個檔案語法檢查全數通過。",
+      "驗收": [
+        "活動狀態只保留待命中、執行中、已完成；中斷以獨立具型別資料保存斷線或遊戲關閉與可靠發生時間",
+        "只修改精確且唯一對應到非空穩定 subject_id 的執行中進度；待命中、已完成與無可靠身分保持不變",
+        "重新開啟遊戲只清除中斷資料，保留執行中、開始時間、完成次數與當日歸屬",
+        "跨午夜的執行中進度保留中斷資料、開始時間與新日期；開始或完成活動清除舊中斷資料",
+        "一次原子保存全部受影響進度後才發布具型別變更；不送輸入、不點擊、不切換遊戲畫面"
+      ]
     },
     {
       "編號": "FU-REQ-20260802-006",
