@@ -77,6 +77,10 @@ from domain.activity_schedule import (
 )
 from domain.character_store import CharacterStore
 from domain.character_game_data_store import CharacterGameDataStore
+from domain.confirmed_activity_rules import (
+    CONFIRMED_ACTIVITY_RULE_EVENT,
+    ConfirmedActivityEvent,
+)
 from domain.game_shortcuts import CONFIRMED_GAME_SHORTCUTS
 from domain.progress import ActivityInterruptionReason, TAIPEI_TIMEZONE
 from domain.progress_store import ActivityProgressStore
@@ -144,6 +148,12 @@ from services.character_game_data_update_service import (
 from services.character_detail_choice_service import CharacterDetailChoiceService
 from services.character_note_service import CharacterNoteService
 from services.character_view_service import CharacterViewService
+from services.confirmed_activity_rule_monitor import (
+    ConfirmedActivityRuleMonitor,
+)
+from services.confirmed_activity_rule_service import (
+    ConfirmedActivityRuleService,
+)
 from services.event_bus import EventBus
 from services.event_subscription_scope import EventSubscriptionScope
 from services.farm_timer_monitor import FarmTimerMonitor
@@ -296,6 +306,7 @@ CARD_PREVIEW_SELECTION_FILENAME = "card_preview_selection.json"
 ACTIVITY_REMINDER_STATE_FILENAME = "activity_reminder_state.json"
 TRUE_EVENT_CARD_STATE_FILENAME = "true_event_card_state.json"
 FARM_TIMER_STATE_FILENAME = "farm_timers.json"
+CONFIRMED_ACTIVITY_RULE_STATE_FILENAME = "confirmed_activity_rules.json"
 ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
 PLAYER_HABIT_FILENAME = "player_habits.json"
 SYNC_SELECTED_KEYS_KEY = "sync_selected_keys"
@@ -499,6 +510,96 @@ def route_group_role_status_to_activity_progress(
     )
 
 
+def route_group_role_status_to_farm_timer(
+    change: object,
+    *,
+    farm_timer_service: FarmTimerService | None,
+    subject_id_resolver: Callable[[GroupRoleStatusChange], str | None],
+    occurred_at: datetime,
+) -> bool:
+    """只以既有可靠身分將遊戲關閉狀態交給農場計時。"""
+    if (
+        not isinstance(change, GroupRoleStatusChange)
+        or not isinstance(farm_timer_service, FarmTimerService)
+        or occurred_at.tzinfo is None
+        or occurred_at.utcoffset() is None
+    ):
+        return False
+    try:
+        subject_id = subject_id_resolver(change)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not isinstance(subject_id, str) or not subject_id.strip():
+        return False
+    return farm_timer_service.handle_role_status(
+        subject_id,
+        change.current.status,
+        occurred_at,
+    )
+
+
+def route_group_role_status_to_confirmed_activity_rules(
+    change: object,
+    *,
+    confirmed_activity_rule_service: ConfirmedActivityRuleService | None,
+    subject_id_resolver: Callable[[GroupRoleStatusChange], str | None],
+    occurred_at: datetime,
+) -> tuple[object, ...]:
+    """僅以可靠角色身分更新已定案活動的暫停與登入提示。"""
+    if (
+        not isinstance(change, GroupRoleStatusChange)
+        or not isinstance(
+            confirmed_activity_rule_service,
+            ConfirmedActivityRuleService,
+        )
+        or occurred_at.tzinfo is None
+        or occurred_at.utcoffset() is None
+    ):
+        return ()
+    try:
+        subject_id = subject_id_resolver(change)
+    except (KeyError, TypeError, ValueError):
+        return ()
+    if not isinstance(subject_id, str) or not subject_id.strip():
+        return ()
+    return confirmed_activity_rule_service.handle_role_status(
+        subject_id,
+        change.current.status,
+        occurred_at,
+    )
+
+
+def refresh_confirmed_activity_group_scope(
+    *,
+    workspace_service: WorkspaceService | None,
+    confirmed_activity_rule_service: ConfirmedActivityRuleService | None,
+    logger: LoggerService | None,
+) -> bool:
+    """只以目前工作區群組更新已定案活動的主動提醒範圍。"""
+    if not isinstance(workspace_service, WorkspaceService) or not isinstance(
+        confirmed_activity_rule_service,
+        ConfirmedActivityRuleService,
+    ):
+        return False
+    current_group = workspace_service.snapshot().current_group
+    try:
+        saved = (
+            confirmed_activity_rule_service.register_group(current_group)
+            if current_group is not None
+            else confirmed_activity_rule_service.clear_current_group()
+        )
+    except Exception as error:
+        if logger is not None:
+            logger.error(
+                "Confirmed activity group registration was isolated: "
+                f"{error}"
+            )
+        return False
+    if not saved and logger is not None:
+        logger.error("Confirmed activity group state could not be saved.")
+    return saved
+
+
 def handle_group_role_status_change(
     change: object,
     *,
@@ -507,6 +608,10 @@ def handle_group_role_status_change(
     occurred_at: datetime,
     logger: LoggerService | None,
     on_role_status_card: Callable[[GroupRoleStatusChange], object] | None,
+    on_farm_timer_status: Callable[[GroupRoleStatusChange], object] | None = None,
+    on_confirmed_activity_status: (
+        Callable[[GroupRoleStatusChange], object] | None
+    ) = None,
 ) -> tuple[object, ...]:
     """Keep the existing role-status card independent from progress persistence."""
     if not isinstance(change, GroupRoleStatusChange):
@@ -528,6 +633,20 @@ def handle_group_role_status_change(
                 )
             except Exception:
                 pass
+    for label, callback in (
+        ("Farm timer status routing", on_farm_timer_status),
+        ("Confirmed activity status routing", on_confirmed_activity_status),
+    ):
+        if callback is None:
+            continue
+        try:
+            callback(change)
+        except Exception as error:
+            if logger is not None:
+                try:
+                    logger.error(f"{label} failed and was isolated: {error}")
+                except Exception:
+                    pass
     if on_role_status_card is not None:
         on_role_status_card(change)
     return progress_changes
@@ -840,6 +959,19 @@ def build_services(
         state_path=paths.data_dir() / FARM_TIMER_STATE_FILENAME,
         record_callback=operation_record_store.append,
     )
+    confirmed_activity_rule_service = ConfirmedActivityRuleService(
+        card_coordinator,
+        state_path=(
+            paths.data_dir() / CONFIRMED_ACTIVITY_RULE_STATE_FILENAME
+        ),
+        event_bus=event_bus,
+    )
+
+    refresh_confirmed_activity_group_scope(
+        workspace_service=workspace_service,
+        confirmed_activity_rule_service=confirmed_activity_rule_service,
+        logger=logger,
+    )
 
     AppContext.register(PathManager, paths)
     AppContext.register(LoggerService, logger)
@@ -942,6 +1074,10 @@ def build_services(
     )
     AppContext.register(TrueEventCardService, true_event_card_service)
     AppContext.register(FarmTimerService, farm_timer_service)
+    AppContext.register(
+        ConfirmedActivityRuleService,
+        confirmed_activity_rule_service,
+    )
 
     def role_name_for_fingerprint(fingerprint: str) -> str:
         state = workspace_service.snapshot()
@@ -1673,6 +1809,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     activity_reminder_service = AppContext.get(ActivityReminderService)
     true_event_card_service = AppContext.get(TrueEventCardService)
     farm_timer_service = AppContext.get(FarmTimerService)
+    confirmed_activity_rule_service = AppContext.get(
+        ConfirmedActivityRuleService
+    )
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
     card_preview_selection_store = AppContext.get(
         CardPreviewSelectionStore
@@ -2675,6 +2814,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "組別身分無法完整重新綁定，未切換組別。",
             )
         reopen_group_operation_gate()
+        refresh_confirmed_activity_group_scope(
+            workspace_service=workspace_service,
+            confirmed_activity_rule_service=confirmed_activity_rule_service,
+            logger=logger,
+        )
         if group_role_status_service is not None:
             group_role_status_service.clear_cache()
         refresh_character_data(choice.name)
@@ -2811,6 +2955,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "組別身分無法完整重新綁定，設定未套用。",
             )
         reopen_group_operation_gate()
+        refresh_confirmed_activity_group_scope(
+            workspace_service=workspace_service,
+            confirmed_activity_rule_service=confirmed_activity_rule_service,
+            logger=logger,
+        )
         if group_role_status_service is not None:
             group_role_status_service.clear_cache()
         if operation_record_store is not None:
@@ -4650,17 +4799,19 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         dispatch_to_main_window(apply_change)
 
     def group_role_status_changed_handler(change: object) -> None:
+        occurred_at = datetime.now(TAIPEI_TIMEZONE)
+        subject_id_resolver = (
+            lambda item: resolve_group_role_progress_subject_id(
+                item,
+                group_launch_service=group_launch_service,
+                group_selection_service=group_selection_service,
+            )
+        )
         handle_group_role_status_change(
             change,
             activity_progress_service=activity_progress_service,
-            subject_id_resolver=(
-                lambda item: resolve_group_role_progress_subject_id(
-                    item,
-                    group_launch_service=group_launch_service,
-                    group_selection_service=group_selection_service,
-                )
-            ),
-            occurred_at=datetime.now(TAIPEI_TIMEZONE),
+            subject_id_resolver=subject_id_resolver,
+            occurred_at=occurred_at,
             logger=logger,
             on_role_status_card=(
                 (
@@ -4670,6 +4821,24 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 )
                 if true_event_card_service is not None
                 else None
+            ),
+            on_farm_timer_status=(
+                lambda item: route_group_role_status_to_farm_timer(
+                    item,
+                    farm_timer_service=farm_timer_service,
+                    subject_id_resolver=subject_id_resolver,
+                    occurred_at=occurred_at,
+                )
+            ),
+            on_confirmed_activity_status=(
+                lambda item: route_group_role_status_to_confirmed_activity_rules(
+                    item,
+                    confirmed_activity_rule_service=(
+                        confirmed_activity_rule_service
+                    ),
+                    subject_id_resolver=subject_id_resolver,
+                    occurred_at=occurred_at,
+                )
             ),
         )
 
@@ -4686,6 +4855,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             and isinstance(event, FarmCompleted)
         ):
             dispatch_to_main_window(lambda: farm_timer_service.complete(event))
+
+    def confirmed_activity_rule_event_handler(event: object) -> None:
+        if (
+            confirmed_activity_rule_service is not None
+            and isinstance(event, ConfirmedActivityEvent)
+        ):
+            dispatch_to_main_window(
+                lambda: confirmed_activity_rule_service.handle(event)
+            )
 
     event_subscription_scope = (
         EventSubscriptionScope(event_bus)
@@ -4708,6 +4886,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         event_subscription_scope.subscribe(
             FARM_COMPLETED_EVENT,
             farm_completed_handler,
+        )
+        event_subscription_scope.subscribe(
+            CONFIRMED_ACTIVITY_RULE_EVENT,
+            confirmed_activity_rule_event_handler,
         )
     auto_click_service.subscribe(
         lambda snapshot: home_view.set_auto_click_running(
@@ -4906,6 +5088,17 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     if farm_timer_monitor is not None:
         start_service(farm_timer_monitor)
+    confirmed_activity_rule_monitor = (
+        ConfirmedActivityRuleMonitor(
+            confirmed_activity_rule_service,
+            window.after,
+            window.after_cancel,
+        )
+        if confirmed_activity_rule_service is not None
+        else None
+    )
+    if confirmed_activity_rule_monitor is not None:
+        start_service(confirmed_activity_rule_monitor)
 
     reconnect_status_refresh_id: str | None = None
 
@@ -5015,6 +5208,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         stop_named("activity_reminder", activity_reminder_monitor)
         stop_named("activity_progress", activity_progress_monitor)
         stop_named("farm_timer", farm_timer_monitor)
+        stop_named(
+            "confirmed_activity_rules",
+            confirmed_activity_rule_monitor,
+        )
         stop_named("card_overlay", overlay_runtime)
         stop_named("keyboard_sync", keyboard_sync_monitor)
         stop_named("mouse_sync", mouse_sync_monitor)

@@ -97,7 +97,7 @@
     "來源": "索爾對基準提交 df3babc 的角色名稱自動讀取程式審查",
     "狀態": "已登記；待第003號完成後、FU-REQ-20260803-001 身分資料階段前修正",
     "施工順序": "FU-REQ-20260803-004 只讀比對已完成；本項必須先於 FU-REQ-20260803-001 施工完成。",
-    "檔案所有權": [
+      "檔案所有權": [
       "adapters/windows_role_id_ocr.py",
       "services/role_id_template_service.py",
       "services/role_id_auto_read_service.py",
@@ -472,13 +472,74 @@
     {
       "編號": "FU-REQ-20260802-008",
       "項目": "已定案活動接入",
-      "狀態": "待前置關卡",
+      "狀態": "索爾程式審查通過",
+      "固定基準": "bd7f9df7623fc2bc6b547d8c15572892200d5de1",
+      "索爾程式審查證據": [
+        "十六個程式與測試檔語法檢查通過",
+        "九份指定直接測試 43 項通過，耗時 0.97 秒",
+        "差異檢查、批次檔解析、固定基準、實際範圍與批次所有權比對均通過",
+        "八項規則、跨午夜與重啟、目前組別範圍、原子保存與卡片、拒絕型別、路由隔離均有直接證據"
+      ],
       "已定案活動": ["魔兵", "次元空間", "農場", "幻魔修練", "莊園第一輪", "魂器每日處理", "神修", "金票兌換"],
-      "檔案所有權": [],
-      "解鎖條件": "只讀核對各活動既有程式和雲端排除事項的本機證據後填入。",
-      "禁止範圍": ["雲端明列排除事項", "未定案活動規則"],
-      "最小測試": [],
-      "驗收": ["只接入已定案活動"]
+    "檔案所有權": [
+        ".codex/batches/FU-20260803-001.json",
+        "domain/activity_schedule.py",
+        "services/activity_schedule_view_service.py",
+        "domain/confirmed_activity_rules.py",
+        "services/confirmed_activity_rule_service.py",
+        "services/confirmed_activity_rule_monitor.py",
+        "services/farm_timer_service.py",
+        "main.py",
+        "tests/test_activity_schedule_catalog.py",
+        "tests/test_activity_schedule_view_service.py",
+        "tests/test_activity_reminder_service.py",
+        "tests/test_farm_timer_service.py",
+        "tests/test_confirmed_activity_rules.py",
+        "tests/test_confirmed_activity_rule_service.py",
+        "tests/test_confirmed_activity_rule_monitor.py",
+        "tests/test_main_confirmed_activity_rules.py",
+        "tests/test_main_activity_progress.py"
+      ],
+      "解鎖條件": "固定基準與乾淨工作目錄已核對；第003、004、005號既有決策卡片入口與共用中斷狀態保持不繞過。",
+      "禁止範圍": [
+        "世界首領",
+        "守紀防重複",
+        "農場只關閉輔規則",
+        "莊園第二輪循環",
+        "除魔",
+        "探險",
+        "手動120副本",
+        "第006號寵物天賦",
+        "第007號",
+        "FU-REQ-20260803-001",
+        "FU-REQ-20260803-002",
+        "FU-REQ-20260803-003",
+        "角色名稱審查阻擋項",
+        "畫面辨識、座標、鍵盤、滑鼠、切頁、切前景與自動操作",
+        "雲端讀寫、推送、合併、封裝、桌面更新與正式發布"
+      ],
+      "最小測試": [
+        "tests/test_activity_schedule_catalog.py",
+        "tests/test_activity_schedule_view_service.py",
+        "tests/test_activity_reminder_service.py",
+        "tests/test_farm_timer_service.py",
+        "tests/test_confirmed_activity_rules.py",
+        "tests/test_confirmed_activity_rule_service.py",
+        "tests/test_confirmed_activity_rule_monitor.py",
+        "tests/test_main_confirmed_activity_rules.py",
+        "tests/test_main_activity_progress.py"
+      ],
+      "驗收": [
+        "八項規則與角色等級限制完整接入",
+        "每日歸屬、跨午夜與重啟往返",
+        "農場台北午夜：23:xx 種植，隔日達四十分鐘成熟且同一計時識別不重置",
+        "農場與幻魔分別符合斷線繼續、遊戲關閉暫停",
+        "禁止提醒活動不建立卡片，重複輪詢不重複卡片",
+        "幻魔五分鐘節流與金票十分鐘卡片",
+        "保存失敗時記憶體、事件與卡片都不變，包含本會出卡的魂器登入提示",
+        "次元樓層只接受非布林的整數一或二",
+        "活動路由失敗隔離且既有角色狀態卡不受阻"
+      ]
     },
     {
       "編號": "FU-REQ-20260803-001",

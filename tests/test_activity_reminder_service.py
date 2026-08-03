@@ -76,7 +76,7 @@ def test_midnight_activities_are_reminded_at_previous_day_2355(tmp_path):
         datetime(2026, 7, 27, 23, 55, 0, tzinfo=TAIPEI_TIMEZONE)
     )
 
-    assert {card.activity.name for card in due} == {"迷陣", "魔兵降臨"}
+    assert {card.activity.name for card in due} == {"迷陣"}
     assert all(card.current_progress == card.activity.name for card in due)
     assert all(card.name_only for card in due)
     assert all(
@@ -84,7 +84,7 @@ def test_midnight_activities_are_reminded_at_previous_day_2355(tmp_path):
     )
     assert tuple(
         entry.presentation_order.category for entry in cards.entries
-    ) == (DecisionCategory.TIME_LIMIT, DecisionCategory.TIME_LIMIT)
+    ) == (DecisionCategory.TIME_LIMIT,)
 
 
 def test_manual_close_does_not_allow_same_occurrence_to_reappear(tmp_path):

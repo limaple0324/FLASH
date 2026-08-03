@@ -25,8 +25,8 @@ def test_current_sunday_shows_corrected_fantasy_realm_not_strange_stone() -> Non
     assert "幻境（隔週14:20）" in names
     assert "奇石" not in names
     assert _activity_schedule_text(state) == (
-        "魔兵降臨｜00:00–23:59｜適用：僅 120／160 等級"
-        "｜狀態：活動時段中｜下一步：等待可信遊戲進度\n"
+        "魔兵降臨｜無固定時間｜適用：僅 120／160 等級"
+        "｜狀態：尚無固定時間｜下一步：等待可信遊戲進度\n"
         "迷陣｜00:00–23:59｜適用：尚未確認"
         "｜狀態：活動時段中｜下一步：等待可信遊戲進度\n"
         "諸魔殿｜13:00–14:00｜適用：尚未確認"
@@ -46,7 +46,6 @@ def test_current_sunday_shows_corrected_fantasy_realm_not_strange_stone() -> Non
         "東玄角斗場｜20:00–21:00｜適用：尚未確認"
         "｜狀態：尚未開始｜下一步：等待 20:00"
     )
-
 
 def test_next_sunday_shows_strange_stone_not_alternating_fantasy_realm() -> None:
     state = _service().snapshot(

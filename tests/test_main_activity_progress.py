@@ -320,3 +320,35 @@ def test_non_group_or_unresolved_status_does_not_change_activity_progress(tmp_pa
     assert progress_changes == []
     assert card_changes == [change]
     assert len(logger.messages) == 1
+
+
+def test_new_activity_status_routes_are_isolated_from_existing_status_card(tmp_path):
+    class Logger:
+        def __init__(self):
+            self.messages = []
+
+        def error(self, message):
+            self.messages.append(message)
+
+    change = _change(ROLE_STATUS_DISCONNECTED)
+    logger = Logger()
+    cards = []
+
+    def fail_farm(_change):
+        raise OSError("farm route failed")
+
+    def fail_confirmed(_change):
+        raise OSError("confirmed route failed")
+
+    assert handle_group_role_status_change(
+        change,
+        activity_progress_service=_service(tmp_path),
+        subject_id_resolver=lambda _change: None,
+        occurred_at=datetime(2026, 7, 11, 20, 5, tzinfo=TAIPEI_TIMEZONE),
+        logger=logger,
+        on_role_status_card=cards.append,
+        on_farm_timer_status=fail_farm,
+        on_confirmed_activity_status=fail_confirmed,
+    ) == ()
+    assert cards == [change]
+    assert len(logger.messages) == 2

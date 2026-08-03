@@ -378,10 +378,8 @@ def build_confirmed_activity_catalog() -> ActivityScheduleCatalog:
         ScheduledActivityRule(
             _activity("magic-soldiers", "魔兵降臨", calendar=False),
             ALL_WEEKDAYS,
-            time(0, 0),
-            time(23, 59),
-            reminder_lead_minutes=5,
-            reminder_enabled=True,
+            None,
+            reminder_enabled=False,
             eligible_levels=(120, 160),
         ),
     )
