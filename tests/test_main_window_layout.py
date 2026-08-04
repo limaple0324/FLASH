@@ -10,6 +10,10 @@ def test_main_window_uses_home_view():
     assert "on_keyboard_sync_change=change_keyboard_sync" in source
     assert "group_choices=group_choices" in source
     assert "on_group_change=change_group" in source
+    assert "group_entries_provider=group_entries" in source
+    assert "workspace_state=workspace_state" in source
+    assert "workspace_state_provider=(" in source
+    assert "workspace_service.snapshot" in source
     assert "build_windows_card_overlay_selection_coordinator" in source
     assert "CardExpiryMonitor" in source
     assert "on_card_display_seconds_update=update_card_display_seconds" in source
@@ -42,6 +46,13 @@ def test_main_window_uses_home_view():
     assert "on_save_sync_target_settings=save_sync_target_settings" in source
     assert "on_calibrate_role_id=calibrate_role_id" in source
     assert "on_read_role_id=read_role_id" in source
+    assert "game_time_offset_ms=(" in source
+    assert "clamp_time_offset_ms(config.get(GAME_TIME_OFFSET_MS_KEY, 0))" in source
+    assert "game_time_auto_update=(" in source
+    assert "bool(config.get(GAME_TIME_AUTO_UPDATE_KEY, True))" in source
+    assert "game_time_snapshot_provider=(" in source
+    assert "game_time_timed_click_service.snapshot" in source
+    assert "on_game_time_settings_change=change_game_time_settings" in source
     assert "FeatureCardLayoutService(config)" in source
     assert "feature_card_layout_service.preference" in source
     assert "feature_card_layout_service.order_for" in source

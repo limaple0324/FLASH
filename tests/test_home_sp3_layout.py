@@ -3,28 +3,35 @@ import inspect
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from tkinter import Button, TclError, Tk
+from tkinter import DISABLED, Button, Checkbutton, Entry, Label, TclError, Tk
 
 import pytest
 
 from PIL import Image
 
 from core.target_window_observation import TargetWindowObservation
+from domain.activity import ActivityDefinition, ActivityType, ResetRule
+from domain.group import CharacterGroup
 from habit.preference_service import (
     PlayerHabitObservationView,
     PlayerHabitPreferenceView,
     PlayerHabitSettingsView,
 )
 from services.character_view_service import PlayerCharacterView
+from services.character_detail_view_service import PlayerCharacterDetail
 from services.group_selection_service import PlayerGroupChoice
 from services.group_role_status_service import GroupRoleStatus
 from services.feature_card_layout_service import FeatureCardPreference
+from services.game_time_timed_click_service import (
+    GameTimeTimedClickSnapshot,
+)
 from services.smart_reconnect_monitor import (
     DEFAULT_SMART_RECONNECT_INTERVAL_MS,
 )
 from ui.home import (
     FeatureCardSettingsSaveResult,
     GroupManagementViewResult,
+    SyncToggleViewResult,
     UI_THEME_LABELS,
     HomeView,
     _background_crop_boxes,
@@ -183,7 +190,7 @@ def test_home_removes_redundant_heading_and_reserves_card_controls() -> None:
     assert 'text="定時按下"' in source
     assert "設定按鈕位置" in source
     assert "啟用定時" in source
-    assert "時間來源：系統時間" in source
+    assert "來源：系統時間" in source
 
 
 def test_sync_key_section_has_saved_collapsed_summary_and_full_catalog() -> None:
@@ -201,13 +208,259 @@ def test_sync_key_section_has_saved_collapsed_summary_and_full_catalog() -> None
     assert _selected_sync_key_summary(()) == "未勾選"
 
 
+def test_home_overview_merges_group_primary_window_count_activity_and_next_step() -> None:
+    view = object.__new__(HomeView)
+    view.workspace_state = WorkspaceState(
+        current_group=CharacterGroup("group-a", "甲組"),
+        current_activity=ActivityDefinition(
+            "daily-a",
+            "每日任務",
+            ActivityType.DAILY,
+            ResetRule.DAILY_MIDNIGHT,
+        ),
+        next_step="查看提醒",
+    )
+    view.current_group_name = "甲組"
+    view.group_entries_provider = lambda _name: (
+        SimpleNamespace(display_name="主角色"),
+        SimpleNamespace(display_name="副角色"),
+    )
+
+    assert view._home_overview_text() == (
+        "目前組別：甲組\n"
+        "主控：主角色\n"
+        "視窗數：2\n"
+        "目前活動：每日任務\n"
+        "下一步：查看提醒"
+    )
+
+
+def test_sync_feedback_checks_first_and_failure_never_enables() -> None:
+    view = object.__new__(HomeView)
+    view.keyboard_sync_enabled = False
+    view._keyboard_sync_status_message = ""
+    view._keyboard_sync_status_color = ""
+    view.parent = SimpleNamespace(update_idletasks=lambda: None)
+    view.on_keyboard_sync_change = lambda _enabled: SyncToggleViewResult(
+        False,
+        False,
+        "目前組別無法完整對應到唯一遊戲視窗；維持安全停止。",
+    )
+    snapshots: list[tuple[bool, str]] = []
+    view._refresh_keyboard_sync_controls = lambda: snapshots.append(
+        (view.keyboard_sync_enabled, view._keyboard_sync_status_message)
+    )
+    view._report_refresh_error = lambda _error: None
+
+    view._toggle_keyboard_sync()
+
+    assert snapshots[0] == (False, "正在檢查同步條件…")
+    assert snapshots[-1] == (
+        False,
+        "目前組別無法完整對應到唯一遊戲視窗；維持安全停止。",
+    )
+    assert view.keyboard_sync_enabled is False
+
+
+def test_ungrouped_join_failure_preserves_row_and_success_refreshes_once() -> None:
+    view = object.__new__(HomeView)
+    view.group_choices = (PlayerGroupChoice("group-a", "甲組", 1),)
+    view.group_choices_provider = None
+    messages: list[tuple[str, bool]] = []
+    view._show_ungrouped_status = (
+        lambda message, success=False: messages.append((message, success))
+    )
+    view._report_refresh_error = lambda _error: None
+    refreshes: list[str] = []
+    view.refresh_group_entries = lambda: refreshes.append("roles")
+    view.refresh_group_sync_relations = lambda: refreshes.append("sync")
+    view.refresh_ungrouped_windows = lambda: refreshes.append("ungrouped")
+    view.on_add_ungrouped_window_to_group = lambda *_args: (
+        GroupManagementViewResult(False, "甲組", "主窗上鎖中，未加入。")
+    )
+
+    view._add_ungrouped_window("fingerprint", "甲組")
+
+    assert messages == [("主窗上鎖中，未加入。", False)]
+    assert refreshes == []
+
+    view.on_add_ungrouped_window_to_group = lambda *_args: (
+        GroupManagementViewResult(True, "甲組", "角色甲已加入甲組。")
+    )
+    view._add_ungrouped_window("fingerprint", "甲組")
+
+    assert messages[-1] == ("角色甲已加入甲組。", True)
+    assert refreshes == ["roles", "sync", "ungrouped"]
+
+
+def test_game_time_and_expand_controls_stay_in_their_required_layout() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+
+    assert "navigation_frame = Frame(sidebar" in source
+    assert "self._build_game_time_sidebar(sidebar)" in source
+    assert "card.pack(side=BOTTOM, fill=X" in source
+    assert "self._build_game_time_card(page)" not in source
+    assert "self._build_game_time_settings_card(page)" in source
+    assert 'card_id="settings.game_time"' in source
+    assert "self._build_timed_click_card(page)" in source
+    assert 'self._feature_card_header_button(\n            "sync.input"' in source
+    assert 'self._feature_card_header_button(\n            "home.schedule"' in source
+
+
+def test_game_time_sidebar_has_only_title_and_current_value_at_900x620() -> None:
+    try:
+        root = Tk()
+    except TclError:
+        pytest.skip("目前環境沒有可用顯示")
+    root.geometry("900x620+20+20")
+    changes: list[tuple[int, bool]] = []
+
+    def snapshot(
+        offset_ms: int = 0,
+        auto_update: bool = True,
+    ) -> GameTimeTimedClickSnapshot:
+        return GameTimeTimedClickSnapshot(
+            offset_ms,
+            auto_update,
+            86_399_999,
+            "23:59:59.999",
+            None,
+            False,
+            None,
+            120,
+            2,
+            250,
+            0,
+            "尚未啟用",
+        )
+
+    def save_settings(
+        offset_ms: int,
+        auto_update: bool,
+    ) -> GameTimeTimedClickSnapshot:
+        changes.append((offset_ms, auto_update))
+        return snapshot(offset_ms, auto_update)
+
+    try:
+        view = HomeView(
+            root,
+            {"self_check_passed": True},
+            game_time_snapshot_provider=snapshot,
+            on_game_time_settings_change=save_settings,
+        )
+        view.build()
+        root.deiconify()
+        view._cancel_game_time_tick()
+        view._poll_game_time()
+        root.update()
+
+        card = view._game_time_sidebar_card
+        assert card is not None
+        visible_children = tuple(
+            child
+            for child in card.winfo_children()
+            if child.winfo_manager()
+        )
+        assert visible_children == (
+            view._game_time_title_label,
+            view._game_time_value_label,
+        )
+        assert all(isinstance(child, Label) for child in visible_children)
+        assert tuple(child.cget("text") for child in visible_children) == (
+            "遊戲時間",
+            "23:59:59.999",
+        )
+        recursive_visible = []
+        pending_sidebar = list(card.winfo_children())
+        while pending_sidebar:
+            child = pending_sidebar.pop(0)
+            if child.winfo_manager():
+                recursive_visible.append(child)
+            pending_sidebar.extend(child.winfo_children())
+        assert tuple(recursive_visible) == visible_children
+        assert not any(
+            isinstance(child, (Button, Checkbutton, Entry))
+            for child in card.winfo_children()
+        )
+
+        settings_card = view._feature_cards["settings.game_time"].frame
+        pending = list(settings_card.winfo_children())
+        descendants = []
+        while pending:
+            child = pending.pop(0)
+            descendants.append(child)
+            pending.extend(child.winfo_children())
+        assert view._game_time_offset_entry in descendants
+        assert any(
+            isinstance(child, Checkbutton)
+            and child.cget("text") == "自動更新"
+            for child in descendants
+        )
+        assert any(
+            isinstance(child, Label)
+            and child.cget("text") == "來源：系統時間"
+            for child in descendants
+        )
+        view._game_time_offset_entry.delete(0, "end")
+        view._game_time_offset_entry.insert(0, "250")
+        view._game_time_auto_variable.set(0)
+        view._apply_game_time_settings()
+        assert changes == [(250, False)]
+
+        assert (
+            view._navigation_frame.winfo_rooty()
+            + view._navigation_frame.winfo_height()
+            <= card.winfo_rooty()
+        )
+        assert (
+            card.winfo_rooty() + card.winfo_height()
+            <= view._sidebar.winfo_rooty() + view._sidebar.winfo_height()
+        )
+    finally:
+        root.destroy()
+
+
+def test_character_detail_selection_replaces_and_can_be_closed() -> None:
+    first = PlayerCharacterDetail("角色甲", "甲組", 120, "主號", "古", None)
+    second = PlayerCharacterDetail("角色乙", "甲組", 110, "副號", "補", None)
+    view = object.__new__(HomeView)
+    view._selected_character_detail = None
+    view._on_save_selected_character_note = None
+    view._on_clear_selected_character_note = None
+    view._on_selected_character_detail_error = None
+    refreshes: list[str] = []
+    view._refresh_characters_page = lambda: refreshes.append("refresh")
+    view.show_page = lambda name: refreshes.append(name)
+
+    view.show_character_detail(
+        first,
+        on_save_note=lambda _note: first,
+        on_clear_note=lambda: first,
+    )
+    view.show_character_detail(
+        second,
+        on_save_note=lambda _note: second,
+        on_clear_note=lambda: second,
+    )
+    assert view._selected_character_detail == second
+
+    view.hide_character_detail()
+
+    assert view._selected_character_detail is None
+    assert view._on_save_selected_character_note is None
+    assert refreshes == ["refresh", "characters", "refresh", "characters", "refresh"]
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+    assert '"收起" if selected else "查看"' in source
+    assert "if selected:\n                self._build_selected_character_detail(card)" in source
+
+
 def test_current_group_page_replaces_sidebar_duplicate() -> None:
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
-    assert 'text="目前組別"' in source
+    assert 'title="目前總覽"' in source
     assert '("groups", "目前組別")' in source
     assert "主控：" in source
-    assert "個視窗" in source
+    assert "視窗數：" in source
     assert "_current_group_summary_text" in source
 
 
@@ -220,7 +473,9 @@ def test_failed_group_change_keeps_previous_group_selected() -> None:
     view.current_group_name = "甲組"
     view._group_variable = _ValueStub("乙組")
     messages: list[str] = []
-    view._show_group_setting_message = messages.append
+    view._show_group_selection_message = (
+        lambda message, **_kwargs: messages.append(message)
+    )
     view.on_group_change = lambda _name: GroupManagementViewResult(
         False,
         "甲組",
@@ -245,7 +500,10 @@ def test_successful_group_change_shows_warning_message() -> None:
     view._group_value_label = _ConfigureStub()
     view._group_name_entry = _EntryStub("甲組")
     messages: list[str] = []
-    view._show_group_setting_message = messages.append
+    view._show_group_selection_message = (
+        lambda message, **_kwargs: messages.append(message)
+    )
+    view._refresh_group_selection_controls = lambda: None
     view.on_group_change = lambda _name: GroupManagementViewResult(
         True,
         "乙組",
@@ -255,6 +513,7 @@ def test_successful_group_change_shows_warning_message() -> None:
     view.refresh_workspace = lambda: None
     view.refresh_current_group_summary = lambda: None
     view.refresh_group_entries = lambda: None
+    view.refresh_ungrouped_windows = lambda: None
     view.refresh_group_sync_relations = lambda: None
     view.refresh_group_role_statuses = lambda: None
     view.refresh_operation_records = lambda: None
@@ -644,7 +903,6 @@ def test_home_feature_cards_use_draggable_sections_in_one_stack() -> None:
 
     assert home_sections == {
         "home.workspace": ("workspace_section", "workspace_section"),
-        "home.group": ("target_section", "target_section"),
         "home.roles": ("role_section", "role_section"),
         "home.schedule": ("schedule_section", "schedule_section"),
         "home.reminders": ("reminder_section", "reminder_section"),
@@ -1102,6 +1360,50 @@ def test_full_home_build_keeps_grid_and_pack_cards_safe_when_settings_toggle():
             for child in grid_card.frame.grid_slaves()
             if child is not grid_card.control_row
         } == baseline_rows
+    finally:
+        root.destroy()
+
+
+def test_clean_build_collapses_cards_but_keeps_required_statuses_visible():
+    try:
+        root = Tk()
+    except TclError:
+        pytest.skip("目前環境沒有可用顯示")
+    root.withdraw()
+    try:
+        view = HomeView(
+            root,
+            {"self_check_passed": True},
+            group_choices=(PlayerGroupChoice("group-a", "甲組", 1),),
+            current_group_name="甲組",
+        )
+        view.build()
+        root.update_idletasks()
+
+        assert all(card.collapsed for card in view._feature_cards.values())
+        assert view._keyboard_sync_label.winfo_manager() == "pack"
+        assert view._ungrouped_status_label.winfo_manager() == "pack"
+        assert view._group_selection_status_label.winfo_manager() == "grid"
+        assert view._sync_key_count_label in view._hint_labels
+        assert view._sync_key_summary_label in view._hint_labels
+        assert view._keyboard_sync_label not in view._hint_labels
+        assert (
+            view._sync_key_toggle_button.master
+            is view._feature_cards["sync.input"].control_row
+        )
+        assert (
+            view._activity_schedule_toggle_button.master
+            is view._feature_cards["home.schedule"].control_row
+        )
+        current_button = view._group_selection_buttons["甲組"]
+        assert current_button.cget("text") == "目前使用"
+        assert current_button.cget("state") == DISABLED
+        view._set_feature_card_collapsed(
+            view._feature_cards["groups.list"],
+            False,
+            persist=False,
+        )
+        assert int(current_button.master.grid_info()["row"]) >= 2
     finally:
         root.destroy()
 

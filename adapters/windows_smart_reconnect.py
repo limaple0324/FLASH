@@ -27,6 +27,7 @@ from adapters.game_screen_recognizer import (
     ScreenRecognition,
 )
 from adapters.windows_background_capture import (
+    CaptureSample,
     _WINDOWPLACEMENT,
     Win32PrintWindowProvider,
     Win32RecoveringPrintWindowProvider,
@@ -34,6 +35,7 @@ from adapters.windows_background_capture import (
     Win32VisibleRegionCaptureProvider,
     WindowCaptureProvider,
 )
+from adapters.windows_auto_battle import AutoBattleEvidence, AutoBattleRecognizer
 from adapters.windows_battle_restart import (
     BattleRestartResult,
     Win32WindowCloseBackend,
@@ -1661,6 +1663,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             Callable[[], Iterable[RegisteredReconnectRole]] | None
         ) = None,
         operation_gate: GameOperationGate | None = None,
+        auto_battle_enabled: bool = False,
+        auto_battle_recognizer: AutoBattleRecognizer | None = None,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -1775,6 +1779,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             raise TypeError("registered_role_provider must be callable")
         self._registered_role_provider = registered_role_provider
         self._operation_gate = operation_gate
+        # This is deliberately independent of execution permission.  Both
+        # gates must be open before any future auto-battle mutation can occur.
+        self._auto_battle_enabled = auto_battle_enabled is True
+        self._auto_battle_recognizer = auto_battle_recognizer
+        self._auto_battle_evidence: dict[
+            str, tuple[WindowInstanceToken, str, int, int, tuple[int, int, int, int]]
+        ] = {}
         self._last_screen_states: dict[str, ReconnectScreenState] = {}
         self._last_trusted_capture_routes: dict[str, str] = {}
         self._trusted_connected_evidence: dict[
@@ -1818,6 +1829,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         operation_gate: GameOperationGate | None = None,
         capture_settings: SmartReconnectCaptureSettings | None = None,
         require_expected_window_count: bool = True,
+        auto_battle_enabled: bool = False,
     ) -> "WindowsSmartReconnectController":
         window_backend = (
             window_backend
@@ -1850,6 +1862,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             target_windows_provider=target_windows_provider,
             registered_role_provider=registered_role_provider,
             operation_gate=operation_gate,
+            auto_battle_enabled=auto_battle_enabled,
+            auto_battle_recognizer=AutoBattleRecognizer(
+                reference_dir / "auto_battle"
+            ),
         )
 
     @property
@@ -2869,6 +2885,175 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             # A later enable is a new session, never permission to resume an
             # old click, reopen, flow pause, terminal, or capture-route grant.
             self._revoke_capture_authority()
+            self._auto_battle_evidence.clear()
+
+    @property
+    def auto_battle_enabled(self) -> bool:
+        return self._auto_battle_enabled
+
+    def set_auto_battle_enabled(self, enabled: bool) -> None:
+        """關閉子開關立即撤銷任何尚未完成的畫面證據。"""
+        self._auto_battle_enabled = enabled is True
+        if not self._auto_battle_enabled:
+            with self._scan_lock:
+                self._auto_battle_evidence.clear()
+
+    def auto_battle_execution_allowed(self) -> bool:
+        """自動戰鬥只能在智慧重連與子開關均開啟時處理。"""
+        return self._execution_allowed() and self._auto_battle_enabled
+
+    @staticmethod
+    def _auto_battle_image(sample: object | None):
+        """只接受完整、未裁切的擷取，格式不符即拒絕。"""
+        if not isinstance(sample, CaptureSample) or not sample.api_succeeded:
+            return None
+        if sample.width <= 0 or sample.height <= 0:
+            return None
+        if len(sample.pixels) != sample.width * sample.height * 4:
+            return None
+        try:
+            from PIL import Image
+            return Image.frombytes(
+                "RGB", (sample.width, sample.height), sample.pixels, "raw", "BGRX"
+            )
+        except (ValueError, OSError):
+            return None
+
+    def _auto_battle_evidence_for_sample(
+        self, sample: object | None
+    ) -> AutoBattleEvidence:
+        recognizer = self._auto_battle_recognizer
+        image = self._auto_battle_image(sample)
+        if recognizer is None or image is None:
+            return AutoBattleEvidence(False, False, False)
+        return recognizer.read(image)
+
+    def _run_auto_battle_for_connected(
+        self,
+        window: WindowInfo,
+        fingerprint: str,
+        instance: WindowInstanceToken,
+        first_sample: object | None,
+        capture_route: str | None,
+        capture_settings_revision: int,
+        source_state_generation: int,
+    ) -> bool:
+        """一個角色的一輪閉環；任何不一致都清除且零輸入。"""
+        self._auto_battle_evidence.pop(fingerprint, None)
+        if (
+            not self.auto_battle_execution_allowed()
+            or capture_route is None
+            or not self._capture_authority_is_current(capture_settings_revision, capture_route)
+            or not self._source_authority_is_current(source_state_generation)
+            or self._current_action_window(instance, fingerprint) is None
+        ):
+            return False
+        first = self._auto_battle_evidence_for_sample(first_sample)
+        if first.enabled:
+            return True
+        if not first.disabled or first.red_x_box is None:
+            return False
+        left, top, right, bottom = first.red_x_box
+        first_point: NormalizedPoint = (
+            (left + right) / 2 / first_sample.width,
+            (top + bottom) / 2 / first_sample.height,
+        )
+        # Feed frame one to the same consecutive-frame verifier used by every
+        # reconnect input.  Frame two below must have the identical signature.
+        self._action_is_confirmed(
+            fingerprint,
+            ScreenRecognition(
+                state=ReconnectScreenState.CONNECTED,
+                score=1.0,
+                click_point=first_point,
+                reference_name="auto_battle_red_x",
+            ),
+            instance=instance,
+            capture_route=capture_route,
+            capture_settings_revision=capture_settings_revision,
+            source_state_generation=source_state_generation,
+        )
+        # Second complete capture must prove the same instance, route, scale and box.
+        current = self._current_action_window(instance, fingerprint)
+        if current is None:
+            return False
+        second_sample, second_state, second_fresh, second_route = self._capture_and_recognize(
+            current, fingerprint, execute=True,
+            expected_source_state_generation=source_state_generation,
+        )
+        second = self._auto_battle_evidence_for_sample(second_sample)
+        if (
+            not second_fresh or second_route != capture_route
+            or second.red_x_box != first.red_x_box or not second.disabled
+            or second_state.state is not ReconnectScreenState.CONNECTED
+            or self._capture_settings_snapshot()[1] != capture_settings_revision
+            or self._current_action_window(instance, fingerprint) is None
+            or not self._source_authority_is_current(source_state_generation)
+        ):
+            return False
+        self._auto_battle_evidence[fingerprint] = (
+            instance, capture_route, capture_settings_revision,
+            source_state_generation, first.red_x_box,
+        )
+        point: NormalizedPoint = (
+            (left + right) / 2 / second_sample.width,
+            (top + bottom) / 2 / second_sample.height,
+        )
+        if not self._action_is_confirmed(
+            fingerprint,
+            ScreenRecognition(
+                state=ReconnectScreenState.CONNECTED,
+                score=1.0,
+                click_point=point,
+                reference_name="auto_battle_red_x",
+            ),
+            instance=instance,
+            capture_route=capture_route,
+            capture_settings_revision=capture_settings_revision,
+            source_state_generation=source_state_generation,
+        ):
+            return False
+
+        def deliver() -> MouseClickResult | None:
+            if self._current_action_window(instance, fingerprint) is None:
+                return None
+            permitted, result = self._run_authorized_backend_call(
+                lambda: self._mouse_backend.click_relative(
+                    instance.handle, point, instance.process_id, instance
+                ),
+                expected_capture_settings_revision=capture_settings_revision,
+                capture_route=capture_route,
+                expected_source_state_generation=source_state_generation,
+            )
+            return result if permitted and isinstance(result, MouseClickResult) else None
+
+        permitted, delivered = self._run_game_mutation(
+            "auto-battle-click", deliver,
+            expected_capture_settings_revision=capture_settings_revision,
+            capture_route=capture_route,
+            expected_source_state_generation=source_state_generation,
+        )
+        if not permitted or not isinstance(delivered, MouseClickResult) or not delivered.delivered:
+            self._auto_battle_evidence.pop(fingerprint, None)
+            return False
+        # Third fresh capture is confirmation only; it never authorizes retry.
+        current = self._current_action_window(instance, fingerprint)
+        if current is None:
+            self._auto_battle_evidence.pop(fingerprint, None)
+            return False
+        third_sample, _third_state, third_fresh, third_route = self._capture_and_recognize(
+            current, fingerprint, execute=True,
+            expected_source_state_generation=source_state_generation,
+        )
+        confirmed = (
+            third_fresh and third_route == capture_route
+            and self._capture_settings_snapshot()[1] == capture_settings_revision
+            and self._auto_battle_evidence_for_sample(third_sample).enabled
+            and self._current_action_window(instance, fingerprint) is not None
+            and self._source_authority_is_current(source_state_generation)
+        )
+        self._auto_battle_evidence.pop(fingerprint, None)
+        return confirmed
 
     def _execution_allowed(self) -> bool:
         """Read the stop gate immediately before every mutating backend call."""
@@ -4715,6 +4900,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             str,
             tuple[WindowInstanceToken, str],
         ] = {}
+        connected_capture_samples: dict[str, object | None] = {}
         confirmed_action_instances: dict[str, WindowInstanceToken] = {}
         pending_confirmation_delays: list[int] = []
         pending_action_wait_delays: list[int] = []
@@ -4769,6 +4955,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             else:
                 self._clear_action_confirmation(fingerprint)
             if recognition.state is ReconnectScreenState.CONNECTED:
+                connected_capture_samples[fingerprint] = sample
                 if self._has_reconnect_session(fingerprint):
                     if (
                         fingerprint not in self._terminal_ready_after
@@ -5590,6 +5777,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
         else:
             next_check_seconds = self._policy.retry_interval_seconds
+
+        # This distinct CONNECTED-only path never changes reconnect state and
+        # never shares a role's two-frame evidence with any other role.
+        if execute and self.auto_battle_execution_allowed():
+            for window, fingerprint, item in recognized:
+                if item.state is not ReconnectScreenState.CONNECTED:
+                    continue
+                instance_and_route = fresh_capture_instances.get(fingerprint)
+                if instance_and_route is None:
+                    continue
+                instance, route = instance_and_route
+                self._run_auto_battle_for_connected(
+                    window,
+                    fingerprint,
+                    instance,
+                    connected_capture_samples.get(fingerprint),
+                    route,
+                    capture_settings_revision,
+                    scan_source_state_generation,
+                )
 
         # A re-entrant backend or policy callback can change settings after the
         # earlier action checks. Revoke the returned batch itself, not only the

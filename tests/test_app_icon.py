@@ -1,5 +1,7 @@
 import hashlib
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import main
 from adapters import windows_app_identity
@@ -57,6 +59,40 @@ def test_windows_build_uses_the_confirmed_icon():
     assert "for page in range(1, 11)" in spec
     assert "full_window_page_10.png" not in spec
     assert "icon='assets/flash_icon.ico'" in spec
+    assert "splash = Splash(" in spec
+    assert "text_default='輔正在啟動，請稍候…'" in spec
+    assert "splash.binaries" in spec
+
+
+def test_packaged_splash_close_is_safe_and_idempotent(monkeypatch):
+    state = {"alive": True, "close_calls": 0}
+
+    def close() -> None:
+        state["close_calls"] += 1
+        state["alive"] = False
+
+    fake_splash = SimpleNamespace(
+        is_alive=lambda: state["alive"],
+        close=close,
+    )
+    monkeypatch.setitem(sys.modules, "pyi_splash", fake_splash)
+
+    main.close_startup_splash()
+    main.close_startup_splash()
+
+    assert state["close_calls"] == 1
+
+
+def test_normal_startup_closes_splash_after_window_construction():
+    source = Path("main.py").read_text(encoding="utf-8")
+    run_source = source[
+        source.index("def _run_application("):
+        source.index("def run(")
+    ]
+
+    assert run_source.index("window = create_main_window(status, paths)") < (
+        run_source.index("close_startup_splash()", run_source.index("window ="))
+    ) < run_source.index("window.mainloop()")
 
 
 def test_taskbar_icon_uses_packaged_executable_resource(monkeypatch, tmp_path):

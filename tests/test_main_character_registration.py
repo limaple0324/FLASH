@@ -198,3 +198,20 @@ def test_main_window_backfills_current_group_character_data_on_start() -> None:
     )
 
     assert build_index < refresh_index < subscribe_index
+
+
+def test_character_rows_keep_one_right_side_toggle_and_inline_detail() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+    page_source = source[
+        source.index("    def _build_characters_page("):
+        source.index("    def set_game_data_read_status(")
+    ]
+
+    assert '"收起" if selected else "查看"' in page_source
+    assert ").pack(side=RIGHT)" in page_source
+    assert "if selected:" in page_source
+    assert "self._build_selected_character_detail(card)" in page_source
+    assert "self._build_selected_character_detail(card)" not in page_source[
+        :page_source.index("for line, detail, select in rows:")
+    ]
+    assert "def hide_character_detail(" in source

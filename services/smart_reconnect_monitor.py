@@ -122,7 +122,8 @@ class SmartReconnectMonitor:
             bool(normalized_failure_codes)
         )
         safely_waiting = (
-            result.code == "reconnect.waiting" and not has_failure
+            result.code == "reconnect.waiting"
+            and normalized_failure_codes in ((), ("screen_unknown",))
         )
         safely_paused_for_rebinding = (
             result.code == "reconnect.operation_paused"
@@ -187,7 +188,9 @@ class SmartReconnectMonitor:
             tuple(sorted(state_counts.items()))
             if isinstance(state_counts, dict)
             else (),
-            tuple(failure_codes) if isinstance(failure_codes, list) else (),
+            tuple(failure_codes)
+            if isinstance(failure_codes, (list, tuple))
+            else (),
             details.get("clicked_windows"),
             details.get("restarted_windows"),
         )
@@ -381,6 +384,16 @@ class SmartReconnectMonitor:
         signature = self._signature(result)
         if self._logger is not None and signature != self._last_signature:
             state_counts = details.get("state_counts", {})
+            failure_codes = details.get("failure_codes", ())
+            safe_failure_codes = (
+                ",".join(
+                    str(code)
+                    for code in failure_codes
+                    if isinstance(code, str) and code
+                )
+                if isinstance(failure_codes, (list, tuple))
+                else ""
+            )
             safe_states = (
                 ",".join(
                     f"{state}:{count}"
@@ -401,6 +414,7 @@ class SmartReconnectMonitor:
                 f"clicked={details.get('clicked_windows', 0)}; "
                 f"restarted={details.get('restarted_windows', 0)}; "
                 f"unknown={details.get('unknown_windows', 0)}; "
+                f"failure_codes={safe_failure_codes or 'none'}; "
                 f"next_check_seconds={delay}"
             )
         self._last_signature = signature

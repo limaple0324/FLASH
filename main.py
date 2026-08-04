@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import re
@@ -270,10 +271,21 @@ from services.target_window_contract_service import (
 )
 from services.true_event_card_service import TrueEventCardService
 from services.ui_callback_dispatcher import UiCallbackDispatcher
+from services.ui_font_service import (
+    DEFAULT_CONTENT_FONT_SIZE,
+    DEFAULT_SIDEBAR_FONT_SIZE,
+    DEFAULT_UI_FONT_ID,
+    UIFontService,
+    normalize_content_font_size,
+    normalize_sidebar_font_size,
+    normalize_ui_font_id,
+    resolve_ui_font_preferences,
+)
 from ui.home import HomeView
 from ui.home import (
     FeatureCardSettingsSaveResult,
     GroupManagementViewResult,
+    SyncToggleViewResult,
     UI_THEME_LABELS,
     theme_palette,
 )
@@ -289,11 +301,14 @@ APP_TITLE = PRODUCT_NAME
 SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_DESKTOP_VERIFY_ARGUMENT = "--verify-target-desktop"
 BACKGROUND_IMAGE_VERIFY_ARGUMENT_PREFIX = "--verify-background-image="
+MAIN_INSTANCE_MUTEX_NAME = r"Local\Limaple.Fu.MainInterface"
+WINDOWS_ERROR_ALREADY_EXISTS = 183
 TARGET_WINDOW_KEY = "target_window_keywords"
 TARGET_WINDOW_FINGERPRINT_KEY = "target_window_fingerprint"
 INPUT_POLICY_KEY = "input_policy"
 SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
 SMART_RECONNECT_CONSENT_KEY = "smart_reconnect_consent_v1"
+SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY = "smart_reconnect_auto_battle_enabled"
 SMART_RECONNECT_INTERVAL_MS_KEY = "disconnect_detect_interval_ms"
 SMART_RECONNECT_MODE_KEY = "smart_reconnect_mode"
 SMART_RECONNECT_STATUS_COLORS_KEY = "smart_reconnect_status_colors"
@@ -302,6 +317,9 @@ SMART_RECONNECT_INTERVAL_MIGRATION_KEY = (
 )
 UI_THEME_KEY = "ui_theme"
 SHOW_HINTS_KEY = "show_hints"
+UI_FONT_ID_KEY = "ui_font_id"
+UI_SIDEBAR_FONT_SIZE_KEY = "ui_sidebar_font_size"
+UI_CONTENT_FONT_SIZE_KEY = "ui_content_font_size"
 UI_THEME_CLASSIC_GOLD_MIGRATION_KEY = "ui_theme_classic_gold_migration_v1"
 CURRENT_GROUP_NAME_KEY = "current_group_name"
 REGISTRY_FILENAME = "window_registry.json"
@@ -335,6 +353,7 @@ APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 RECONNECT_REFERENCE_DIR = Path("assets") / "reconnect_reference"
 OBSIDIAN_REFERENCE_DIR = Path("assets") / "game_data_reference" / "obsidian"
+UI_FONT_ASSET_DIR = Path("assets") / "ui_fonts"
 BACKGROUND_IMAGE_FILETYPES = (
     (
         "圖片與相機 RAW",
@@ -377,6 +396,64 @@ def resource_path(relative_path: Path) -> Path:
     if bundle_root:
         return Path(bundle_root) / relative_path
     return Path(__file__).resolve().parent / relative_path
+
+
+class MainInstanceLock:
+    """Retain one cross-process lock until complete application cleanup."""
+
+    def __init__(self, release_callback: Callable[[], object]) -> None:
+        self._release_callback = release_callback
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._release_callback()
+
+
+def acquire_main_instance_lock(
+    name: str = MAIN_INSTANCE_MUTEX_NAME,
+) -> MainInstanceLock | None:
+    """Return None when another ordinary UI process already owns the lock."""
+    if sys.platform != "win32":
+        return MainInstanceLock(lambda: None)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_bool,
+        ctypes.c_wchar_p,
+    )
+    create_mutex.restype = ctypes.c_void_p
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_bool
+    ctypes.set_last_error(0)
+    handle = create_mutex(None, False, name)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "無法建立主介面執行鎖。")
+    if ctypes.get_last_error() == WINDOWS_ERROR_ALREADY_EXISTS:
+        close_handle(handle)
+        return None
+    return MainInstanceLock(lambda: close_handle(handle))
+
+
+def close_startup_splash() -> None:
+    """Close the packaged startup splash safely and idempotently."""
+    try:
+        import pyi_splash  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    try:
+        is_alive = getattr(pyi_splash, "is_alive", None)
+        if callable(is_alive) and not is_alive():
+            return
+        close = getattr(pyi_splash, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
 
 
 def registered_game_data_target(
@@ -797,6 +874,7 @@ def build_services(
     paths = PathManager(root=root)
     logger = LoggerService(paths.log_file("flash.log"))
     config = ConfigManager(paths.config_file("settings.json"))
+    ui_font_service = UIFontService(resource_path(UI_FONT_ASSET_DIR))
     background_image_service = BackgroundImageService(
         config,
         paths.data_dir(),
@@ -826,6 +904,7 @@ def build_services(
             INPUT_POLICY_KEY: WindowInputPolicy.ALL.value,
             SMART_RECONNECT_ENABLED_KEY: False,
             SMART_RECONNECT_CONSENT_KEY: False,
+            SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY: False,
             SMART_RECONNECT_INTERVAL_MS_KEY: (
                 DEFAULT_SMART_RECONNECT_INTERVAL_MS
             ),
@@ -838,6 +917,9 @@ def build_services(
             SMART_RECONNECT_INTERVAL_MIGRATION_KEY: True,
             UI_THEME_KEY: "classic_gold",
             SHOW_HINTS_KEY: False,
+            UI_FONT_ID_KEY: DEFAULT_UI_FONT_ID,
+            UI_SIDEBAR_FONT_SIZE_KEY: DEFAULT_SIDEBAR_FONT_SIZE,
+            UI_CONTENT_FONT_SIZE_KEY: DEFAULT_CONTENT_FONT_SIZE,
             SYNC_SELECTED_KEYS_KEY: ["ESC"],
             SYNC_KEYS_COLLAPSED_KEY: True,
             GROUP_ROLE_DETAILS_EXPANDED_KEY: {},
@@ -1095,6 +1177,7 @@ def build_services(
     AppContext.register(PathManager, paths)
     AppContext.register(LoggerService, logger)
     AppContext.register(ConfigManager, config)
+    AppContext.register(UIFontService, ui_font_service)
     AppContext.register(
         SmartReconnectCaptureSettingsService,
         smart_reconnect_capture_settings_service,
@@ -1349,6 +1432,9 @@ def build_services(
         require_expected_window_count=False,
         registered_role_provider=registered_reconnect_roles,
         operation_gate=game_operation_gate,
+        auto_battle_enabled=(
+            config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY) is True
+        ),
         failure_status_service=reconnect_failure_status_service,
         failure_record_callback=lambda role_name, detail: (
             operation_record_store.append(
@@ -1691,6 +1777,25 @@ def shutdown_smart_reconnect_monitor(
                 pass
 
 
+def shutdown_ui_font_service(
+    logger: LoggerService | None = None,
+) -> bool:
+    """Release every process-private UI font before the logger closes."""
+    service = AppContext.get(UIFontService)
+    if service is None:
+        return True
+    try:
+        closed = service.close()
+    except Exception:
+        closed = False
+    if not closed and logger is not None:
+        try:
+            logger.error("私有介面字體資源未能完整解除。")
+        except Exception:
+            pass
+    return closed
+
+
 def shutdown_event_subscriptions(
     logger: LoggerService | None = None,
 ) -> bool:
@@ -2002,6 +2107,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window.deiconify()
 
     config = AppContext.get(ConfigManager)
+    ui_font_service = AppContext.get(UIFontService)
     input_controller = AppContext.get(WindowsInputSyncController)
     pointer_sync_controller = AppContext.get(
         WindowsPointerSyncController
@@ -2105,6 +2211,55 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     home_view: HomeView | None = None
     tray_controller: SystemTrayController | None = None
+
+    def current_workspace_group_name() -> str | None:
+        state = (
+            workspace_service.snapshot()
+            if workspace_service is not None
+            else None
+        )
+        return (
+            state.current_group.name
+            if state is not None and state.current_group is not None
+            else None
+        )
+
+    def current_sync_target_windows() -> tuple[WindowInfo, ...]:
+        """Return only registered targets currently confirmed as connected."""
+        if (
+            target_window_contract_service is None
+            or smart_reconnect_controller is None
+        ):
+            return ()
+        candidates = target_window_contract_service.reconnect_targets(
+            current_workspace_group_name()
+        ).windows
+        if any(not isinstance(candidate, WindowInfo) for candidate in candidates):
+            return ()
+        requested = tuple(
+            fingerprint
+            for candidate in candidates
+            if (
+                fingerprint := normalize_launch_fingerprint(
+                    candidate.launch_fingerprint
+                )
+            )
+            is not None
+        )
+        states = smart_reconnect_controller.observe_screen_states(
+            requested,
+            candidate_windows=candidates,
+        )
+        return tuple(
+            candidate
+            for candidate in candidates
+            if states.get(
+                normalize_launch_fingerprint(
+                    candidate.launch_fingerprint
+                )
+            )
+            is ReconnectScreenState.CONNECTED
+        )
 
     def mark_tray_operations_running() -> None:
         if tray_controller is not None:
@@ -2488,6 +2643,33 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if config is not None
         else False
     )
+    configured_font_preferences = resolve_ui_font_preferences(
+        config.get(UI_FONT_ID_KEY) if config is not None else None,
+        (
+            config.get(UI_SIDEBAR_FONT_SIZE_KEY)
+            if config is not None
+            else None
+        ),
+        (
+            config.get(UI_CONTENT_FONT_SIZE_KEY)
+            if config is not None
+            else None
+        ),
+    )
+    if config is not None:
+        normalized_font_values = {
+            UI_FONT_ID_KEY: configured_font_preferences.font_id,
+            UI_SIDEBAR_FONT_SIZE_KEY: (
+                configured_font_preferences.sidebar_size
+            ),
+            UI_CONTENT_FONT_SIZE_KEY: (
+                configured_font_preferences.content_size
+            ),
+        }
+        try:
+            config.update_values(normalized_font_values)
+        except Exception:
+            logger.error("介面字體偏好無法寫入，這次仍使用安全預設值。")
     known_sync_keys = {
         shortcut.key for shortcut in CONFIRMED_GAME_SHORTCUTS
     }
@@ -2602,6 +2784,39 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if config is None:
             return False
         config.set(SHOW_HINTS_KEY, bool(show))
+        return True
+
+    def change_ui_font(font_id: str) -> bool:
+        normalized = normalize_ui_font_id(font_id)
+        if config is None or normalized != font_id:
+            return False
+        try:
+            config.set(UI_FONT_ID_KEY, normalized)
+        except Exception:
+            logger.error("介面字體偏好保存失敗。")
+            return False
+        return True
+
+    def change_sidebar_font_size(size: int) -> bool:
+        normalized = normalize_sidebar_font_size(size)
+        if config is None or normalized != size:
+            return False
+        try:
+            config.set(UI_SIDEBAR_FONT_SIZE_KEY, normalized)
+        except Exception:
+            logger.error("左側選單字級偏好保存失敗。")
+            return False
+        return True
+
+    def change_content_font_size(size: int) -> bool:
+        normalized = normalize_content_font_size(size)
+        if config is None or normalized != size:
+            return False
+        try:
+            config.set(UI_CONTENT_FONT_SIZE_KEY, normalized)
+        except Exception:
+            logger.error("內容區字級偏好保存失敗。")
+            return False
         return True
 
     def choose_background_source():
@@ -3643,35 +3858,74 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def add_ungrouped_window_to_group(
         fingerprint: str,
         group_name: str,
-    ) -> object:
-        if group_configuration_service is None:
-            return False
-        shortcut_path = ungrouped_window_service.shortcut_for(fingerprint)
+    ) -> GroupManagementViewResult:
+        current_name = current_group_name()
+        if (
+            group_configuration_service is None
+            or ungrouped_window_service is None
+        ):
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "未分組視窗服務尚未準備完成，沒有加入任何組別。",
+            )
+        try:
+            shortcut_path = ungrouped_window_service.shortcut_for(fingerprint)
+        except Exception:
+            shortcut_path = None
         if shortcut_path is None:
-            return "未分組視窗已變更，沒有加入任何組別。"
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "未分組視窗已變更，沒有加入任何組別。",
+            )
         if not stop_group_automation_for_configuration_change():
-            return "自動操作尚未完全停止，未加入角色。"
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "自動操作尚未完全停止，未加入角色。",
+            )
         try:
             added = group_configuration_service.add_shortcuts(
                 group_name,
                 (shortcut_path,),
             )
         except (SyncCycleError, GroupMasterLockedError) as error:
-            return error.player_message
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                error.player_message,
+            )
+        except Exception:
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "加入組別時發生錯誤，原本設定已保留。",
+            )
         if not added:
-            return "捷徑已在所選組別，沒有變更。"
-        refresh_character_data(group_name)
-        current_name = current_group_name()
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "捷徑已在所選組別，沒有變更。",
+            )
+        refresh_warning = False
+        try:
+            refresh_character_data(group_name)
+        except Exception:
+            refresh_warning = True
         refreshed = finish_group_management(current_name)
         if not refreshed.success:
-            return "捷徑已加入，但目前組別設定尚未重新套用。"
-        if home_view is not None:
-            home_view.refresh_group_entries()
-            home_view.refresh_group_sync_relations()
-            home_view.refresh_ungrouped_windows()
+            refresh_warning = True
         if operation_record_store is not None:
             operation_record_store.ensure_daily_file()
-        return f"{shortcut_path.name} 已加入 {group_name}。"
+        message = f"{shortcut_path.name} 已加入 {group_name}。"
+        if refresh_warning:
+            message += "目前組別顯示尚未完整重新套用，操作保持安全停止。"
+        return GroupManagementViewResult(
+            True,
+            refreshed.current_group_name,
+            message,
+        )
 
     def remove_group_shortcut(
         group_name: str,
@@ -4389,19 +4643,18 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             ),
         )
 
-    def change_keyboard_sync(enabled: bool) -> bool:
+    def change_keyboard_sync(enabled: bool) -> SyncToggleViewResult:
         if (
             keyboard_sync_monitor is None
             or mouse_sync_monitor is None
             or input_controller is None
             or pointer_sync_controller is None
         ):
-            messagebox.showerror(
-                "輔｜同步輸入",
+            return SyncToggleViewResult(
+                False,
+                False,
                 "同步輸入尚未正確設定，沒有啟用。",
-                parent=window,
             )
-            return False
         auto_click_service.invalidate_direct_sync()
         if not enabled:
             sync_session_state["enabled"] = False
@@ -4416,7 +4669,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 )
             # The shared execution gate is already closed, so no queued or
             # still-polling monitor can deliver another game input.
-            return True
+            return SyncToggleViewResult(
+                True,
+                False,
+                (
+                    "同步已停止。"
+                    if cleanup_stopped
+                    else "同步已停止；背景清理仍在完成中。"
+                ),
+            )
 
         state = (
             workspace_service.snapshot()
@@ -4434,28 +4695,42 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             else None
         )
         if choice is None:
-            messagebox.showerror(
-                "輔｜同步輸入",
+            return SyncToggleViewResult(
+                False,
+                False,
                 "請先選擇至少有 2 個視窗設定的組別；目前沒有啟用。",
-                parent=window,
             )
-            return False
         if not apply_connected_sync_identity(choice):
-            return False
-        if current_input_policy() is None:
-            messagebox.showerror(
-                "輔｜同步輸入",
-                "允許範圍尚未正確設定；目前沒有啟用。",
-                parent=window,
+            return SyncToggleViewResult(
+                False,
+                False,
+                group_identity_failure_message(choice),
             )
-            return False
+        if current_input_policy() is None:
+            return SyncToggleViewResult(
+                False,
+                False,
+                "允許範圍尚未正確設定；目前沒有啟用。",
+            )
         keyboard_started = start_service(keyboard_sync_monitor)
         mouse_started = start_service(mouse_sync_monitor)
         if not keyboard_started.success or not mouse_started.success:
             sync_session_state["enabled"] = False
             stop_service(keyboard_sync_monitor)
             stop_service(mouse_sync_monitor)
-            return False
+            failed_parts = "、".join(
+                name
+                for name, started in (
+                    ("鍵盤監看", keyboard_started),
+                    ("滑鼠監看", mouse_started),
+                )
+                if not started.success
+            )
+            return SyncToggleViewResult(
+                False,
+                False,
+                f"{failed_parts}未能啟動；同步沒有啟用。",
+            )
         sync_session_state["enabled"] = True
         if logger is not None:
             logger.info(
@@ -4463,7 +4738,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 f"group={choice.name}"
             )
         mark_tray_operations_running()
-        return True
+        return SyncToggleViewResult(
+            True,
+            True,
+            "同步中｜同步左鍵、拖曳與已確認快捷鍵",
+        )
 
     def change_smart_reconnect(enabled: bool) -> bool:
         if (
@@ -4511,6 +4790,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 f"worker_stopped={stopped}"
             )
         return stopped
+
+    def change_smart_reconnect_auto_battle(enabled: bool) -> bool:
+        """子開關永遠不會自行開啟智慧重連總開關。"""
+        if config is None or smart_reconnect_controller is None:
+            return False
+        normalized = enabled is True
+        smart_reconnect_controller.set_auto_battle_enabled(normalized)
+        config.set(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY, normalized)
+        return True
 
     def change_smart_reconnect_interval(interval_ms: int) -> bool:
         if config is None or smart_reconnect_monitor is None:
@@ -4905,6 +5193,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         smart_reconnect_enabled=bool(
             status.get("smart_reconnect_enabled", False)
         ),
+        smart_reconnect_auto_battle_enabled=(
+            config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY) is True
+            if config is not None else False
+        ),
         smart_reconnect_runtime_status=(
             smart_reconnect_monitor.runtime_status
             if smart_reconnect_monitor is not None
@@ -4918,6 +5210,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             change_smart_reconnect_status_colors
         ),
         on_smart_reconnect_change=change_smart_reconnect,
+        on_smart_reconnect_auto_battle_change=(
+            change_smart_reconnect_auto_battle
+        ),
         smart_reconnect_interval_ms=(
             smart_reconnect_monitor.monitor_interval_ms
             if smart_reconnect_monitor is not None
@@ -5005,6 +5300,23 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_theme_change=change_ui_theme,
         show_hints=configured_show_hints,
         on_show_hints_change=change_show_hints,
+        ui_font_choices=(
+            ui_font_service.choices
+            if ui_font_service is not None
+            else ()
+        ),
+        ui_font_id=configured_font_preferences.font_id,
+        sidebar_font_size=configured_font_preferences.sidebar_size,
+        content_font_size=configured_font_preferences.content_size,
+        ui_font_failure_message=(
+            ui_font_service.result.message
+            if ui_font_service is not None
+            and not ui_font_service.result.success
+            else ""
+        ),
+        on_ui_font_change=change_ui_font,
+        on_sidebar_font_size_change=change_sidebar_font_size,
+        on_content_font_size_change=change_content_font_size,
         feature_card_preference_provider=(
             feature_card_layout_service.preference
             if feature_card_layout_service is not None
@@ -5109,16 +5421,21 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def poll_registered_obsidian_once() -> None:
         nonlocal game_data_read_after_id, game_data_read_cursor
         game_data_read_after_id = None
+        stage = "resolve_candidates"
+        candidate_index = -1
         try:
             capture_service = AppContext.get(CharacterGameDataCaptureService)
             candidates = current_sync_target_windows()
             if capture_service is not None and candidates:
-                selected = candidates[game_data_read_cursor % len(candidates)]
+                candidate_index = game_data_read_cursor % len(candidates)
+                selected = candidates[candidate_index]
                 game_data_read_cursor += 1
                 home_view.set_game_data_read_status("安全讀取中")
+                stage = "capture"
                 result = capture_service.read(selected.handle)
                 if result.status.value in {"updated", "unchanged"}:
                     if result.status.value == "updated":
+                        stage = "refresh"
                         refresh_character_data(current_group_name())
                     page = result.page.data if result.page is not None else None
                     opened_page = getattr(page, "opened_page", None)
@@ -5135,7 +5452,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if logger is not None:
                 logger.error(
                     "Obsidian read-only polling cycle failed safely; "
-                    f"error_type={type(error).__name__}"
+                    f"error_type={type(error).__name__}; "
+                    f"stage={stage}; candidate_index={candidate_index}"
                 )
         finally:
             schedule_registered_obsidian_poll()
@@ -5291,16 +5609,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     start_service(group_launch_hotkey_monitor)
 
     def current_group_name() -> str | None:
-        state = (
-            workspace_service.snapshot()
-            if workspace_service is not None
-            else None
-        )
-        return (
-            state.current_group.name
-            if state is not None and state.current_group is not None
-            else None
-        )
+        return current_workspace_group_name()
 
     role_id_auto_read_id: str | None = None
     role_id_auto_read_cursor = 0
@@ -5812,7 +6121,7 @@ def verify_background_image_runtime(
     return (0 if payload["passed"] else 5), report_path
 
 
-def run(
+def _run_application(
     *,
     self_check_only: bool = False,
     target_desktop_verify_only: bool = False,
@@ -5823,6 +6132,12 @@ def run(
     logger: LoggerService | None = None
     operation_record_store: SyncOperationRecordStore | None = None
     try:
+        if (
+            self_check_only
+            or target_desktop_verify_only
+            or background_image_verify_path is not None
+        ):
+            close_startup_splash()
         configure_process_app_identity()
         paths, logger = build_services(root=root)
         operation_record_store = AppContext.get(SyncOperationRecordStore)
@@ -5887,11 +6202,28 @@ def run(
         if self_check_only:
             return 0 if bool(status.get("self_check_passed", False)) else 2
 
+        ui_font_service = AppContext.get(UIFontService)
+        if ui_font_service is not None:
+            try:
+                ui_font_result = ui_font_service.load_all()
+            except Exception:
+                ui_font_result = None
+            if ui_font_result is None:
+                logger.warning(
+                    "離線介面字體載入發生未預期錯誤，已使用系統預設字體。"
+                )
+            elif not ui_font_result.success:
+                logger.warning(
+                    f"{ui_font_result.message} 原因代碼={ui_font_result.code}"
+                )
+
         window = create_main_window(status, paths)
+        close_startup_splash()
         window.mainloop()
         logger.info(f"FLASH {MILESTONE} closed normally.")
         return 0
     except Exception as exc:
+        close_startup_splash()
         details = traceback.format_exc()
         if logger is not None:
             logger.error(f"FLASH startup failed: {exc}\n{details}")
@@ -5944,11 +6276,51 @@ def run(
                         try:
                             shutdown_external_adapter(logger)
                         finally:
-                            close_operation_record_store(
-                                operation_record_store,
-                                logger,
-                            )
-                            close_logger(logger)
+                            try:
+                                shutdown_ui_font_service(logger)
+                            finally:
+                                close_operation_record_store(
+                                    operation_record_store,
+                                    logger,
+                                )
+                                close_logger(logger)
+
+
+def run(
+    *,
+    self_check_only: bool = False,
+    target_desktop_verify_only: bool = False,
+    background_image_verify_path: Path | None = None,
+    root: Path | None = None,
+) -> int:
+    ordinary_ui = not (
+        self_check_only
+        or target_desktop_verify_only
+        or background_image_verify_path is not None
+    )
+    if not ordinary_ui:
+        try:
+            return _run_application(
+                self_check_only=self_check_only,
+                target_desktop_verify_only=target_desktop_verify_only,
+                background_image_verify_path=background_image_verify_path,
+                root=root,
+            )
+        finally:
+            close_startup_splash()
+    try:
+        instance_lock = acquire_main_instance_lock()
+    except OSError:
+        close_startup_splash()
+        return 1
+    if instance_lock is None:
+        close_startup_splash()
+        return 0
+    try:
+        return _run_application(root=root)
+    finally:
+        close_startup_splash()
+        instance_lock.release()
 
 
 def close_operation_record_store(

@@ -1,3 +1,10 @@
+import sys
+import uuid
+from pathlib import Path
+
+import pytest
+
+import main as main_module
 from config.config_manager import ConfigManager
 from core.sp1_boundaries import ExternalAdapter, OperationResult
 from main import (
@@ -126,3 +133,81 @@ def test_ambiguous_window_keeps_operation_disabled():
     assert status["safe"] is False
     assert status["code"] == "window.ambiguous"
     assert "不可操作" in text
+
+
+def test_duplicate_ui_instance_exits_before_application_services(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        main_module,
+        "acquire_main_instance_lock",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_run_application",
+        lambda **_kwargs: calls.append("started") or 9,
+    )
+
+    assert main_module.run() == 0
+    assert calls == []
+
+
+def test_ui_instance_lock_is_released_only_after_complete_run(monkeypatch):
+    events: list[str] = []
+
+    class Lock:
+        def release(self) -> None:
+            events.append("released")
+
+    monkeypatch.setattr(
+        main_module,
+        "acquire_main_instance_lock",
+        lambda: Lock(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_run_application",
+        lambda **_kwargs: events.append("application_complete") or 7,
+    )
+
+    assert main_module.run() == 7
+    assert events == ["application_complete", "released"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        {"self_check_only": True},
+        {"target_desktop_verify_only": True},
+        {"background_image_verify_path": Path("sample.png")},
+    ),
+)
+def test_verification_commands_bypass_ui_instance_lock(monkeypatch, arguments):
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        main_module,
+        "acquire_main_instance_lock",
+        lambda: pytest.fail("驗證命令不應取得主介面鎖"),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_run_application",
+        lambda **kwargs: calls.append(kwargs) or 0,
+    )
+
+    assert main_module.run(**arguments) == 0
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="只適用 Windows 命名互斥鎖")
+def test_real_named_instance_lock_rejects_second_handle_until_release():
+    name = rf"Local\Limaple.Fu.Test.{uuid.uuid4()}"
+    first = main_module.acquire_main_instance_lock(name)
+    assert first is not None
+    try:
+        assert main_module.acquire_main_instance_lock(name) is None
+    finally:
+        first.release()
+    restored = main_module.acquire_main_instance_lock(name)
+    assert restored is not None
+    restored.release()

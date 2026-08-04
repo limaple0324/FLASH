@@ -327,6 +327,21 @@ def test_home_exposes_three_policies_and_complete_confirmed_shortcuts():
     assert "測試 B" not in source
 
 
+def test_sync_toggle_returns_direct_card_feedback_for_every_branch():
+    source = Path("main.py").read_text(encoding="utf-8")
+    function_source = source[
+        source.index("    def change_keyboard_sync("):
+        source.index("    def change_smart_reconnect(")
+    ]
+
+    assert "-> SyncToggleViewResult:" in function_source
+    assert function_source.count("SyncToggleViewResult(") >= 7
+    assert "同步中｜同步左鍵、拖曳與已確認快捷鍵" in function_source
+    assert "同步已停止；背景清理仍在完成中。" in function_source
+    assert "未能啟動；同步沒有啟用。" in function_source
+    assert "messagebox.showerror" not in function_source
+
+
 def test_sync_key_collapsed_state_is_loaded_saved_and_wired_to_home():
     source = Path("main.py").read_text(encoding="utf-8")
 

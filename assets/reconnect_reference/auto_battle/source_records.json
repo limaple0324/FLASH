@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "records": [
+    {
+      "purpose": "自動戰鬥停用紅叉圖示",
+      "file": "disabled_red_x.png",
+      "source": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-5ac8ab25-429d-4f77-9e6c-af5779cb0e52.png",
+      "width": 61,
+      "height": 62,
+      "sha256": "9351290cc8b3292350373a018b666a28417259fccf8aa6a17fcbb8dd8ba30a56"
+    },
+    {
+      "purpose": "自動戰鬥入口圖示",
+      "file": "entry_icon.png",
+      "source": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-8f2c16c3-69b5-4e22-a407-12771320c472.png",
+      "width": 45,
+      "height": 45,
+      "sha256": "a07a61a4568d1c63cca14ae1ea9816fde23f1fca3377c81df2085409d5c6ae4b"
+    },
+    {
+      "purpose": "自動戰鬥已啟用完整面板",
+      "file": "enabled_full_panel.png",
+      "source": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-7905db1b-a7fb-4091-ad1e-43672b0dc15b.png",
+      "width": 895,
+      "height": 579,
+      "sha256": "351227dd1d6883cd1a7434502afb87d4b639ebe716ab31327b27e7f78061db93"
+    },
+    {
+      "purpose": "一般遊戲畫面與自動戰鬥入口",
+      "file": "normal_game_with_entry.png",
+      "source": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-b9aa3ae1-35e6-4b0e-b9f0-e29d230d660d.png",
+      "width": 897,
+      "height": 574,
+      "sha256": "12f601c9d2c0b72f50add2d3aeb769bce2c94e7fa30095c535c4485011de93d0"
+    },
+    {
+      "purpose": "紅叉按鈕含外框與周圍背景",
+      "file": "disabled_red_x_with_context.png",
+      "source": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-7f23a21c-e182-4146-87c2-e944a2eefaa2.png",
+      "width": 65,
+      "height": 71,
+      "sha256": "fdb6cd848cb78dff4b1c58e9928797ad4cd3b366bd84c894f9b6125210c39ce9"
+    },
+    {
+      "purpose": "紅叉消失後的自動戰鬥文字圖示",
+      "file": "enabled_text_icon.png",
+      "source": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-bd589726-0d75-4029-abc7-de97b066e795.png",
+      "width": 66,
+      "height": 76,
+      "sha256": "a42324dc881488888832607af55bb9e1d766e42cb445d7d8b3e6ca241e7aa5dd"
+    },
+    {
+      "purpose": "戰鬥進行中的右上自動戰鬥完整面板",
+      "file": "enabled_battle_full_panel.png",
+      "source": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-718fbe45-aa4b-4682-8e90-2479a75c305e.png",
+      "width": 899,
+      "height": 567,
+      "sha256": "b067ee4c362df832e52145f08f0bc381d50228ac9ab09d9d0c552936196bc11c"
+    },
+    {
+      "purpose": "戰鬥開始階段的右上自動戰鬥完整面板",
+      "file": "enabled_start_full_panel.png",
+      "source": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-b7c9e603-4d2d-47aa-ad66-bf5d671ec1ab.png",
+      "width": 891,
+      "height": 570,
+      "sha256": "8a2f5683b3e4401b81ba1cf1bdb18720cf6e31e86f71989a3e980eb7b5b85188"
+    }
+  ]
+}

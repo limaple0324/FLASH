@@ -32,7 +32,9 @@ a = Analysis(
         ('assets/flash_icon.png', 'assets'),
         ('assets/flash_icon.ico', 'assets'),
         ('assets/reconnect_reference', 'assets/reconnect_reference'),
+        ('assets/reconnect_reference/auto_battle', 'assets/reconnect_reference/auto_battle'),
         ('assets/role_id_ocr', 'assets/role_id_ocr'),
+        ('assets/ui_fonts', 'assets/ui_fonts'),
     ] + obsidian_reference_datas + rapidocr_datas,
     hiddenimports=[
         'tkinter',
@@ -50,9 +52,21 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+splash = Splash(
+    'assets/flash_icon.png',
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=(48, 224),
+    text_size=12,
+    text_color='white',
+    text_default='輔正在啟動，請稍候…',
+)
+
 exe = EXE(
     pyz,
     a.scripts,
+    splash,
+    splash.binaries,
     a.binaries,
     a.datas,
     [],

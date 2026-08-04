@@ -110,6 +110,7 @@ def test_run_once_uses_result_delay_and_logs_only_aggregate_state():
     assert "states=connected:1,disconnected:1" in logger.info_messages[0]
     assert "connected=1" in logger.info_messages[0]
     assert "clicked=1" in logger.info_messages[0]
+    assert "failure_codes=none" in logger.info_messages[0]
     assert "handle" not in logger.info_messages[0]
     assert "fingerprint" not in logger.info_messages[0]
 
@@ -186,11 +187,43 @@ def test_runtime_status_treats_safe_wait_and_rebinding_pause_as_reconnecting():
     monitor._set_runtime_status(
         OperationResult(
             False,
+            "reconnect.waiting",
+            details={"failure_codes": ["screen_unknown"]},
+        )
+    )
+    assert monitor.runtime_status == "重連中"
+
+    monitor._set_runtime_status(
+        OperationResult(
+            False,
             "reconnect.operation_paused",
             details={"failure_codes": ["operation_gate_closed"]},
         )
     )
     assert monitor.runtime_status == "重連中"
+
+
+def test_status_change_log_includes_actual_failure_codes():
+    logger = RecordingLogger()
+    monitor = SmartReconnectMonitor(
+        FakeBoundary(
+            [
+                OperationResult(
+                    False,
+                    "reconnect.waiting",
+                    details={
+                        "failure_codes": ["capture_failed"],
+                        "next_check_seconds": 3,
+                    },
+                )
+            ]
+        ),
+        logger=logger,
+    )
+
+    monitor.run_once()
+
+    assert "failure_codes=capture_failed" in logger.info_messages[0]
 
 
 def test_only_complete_healthy_connected_scan_uses_saved_monitoring_interval():
