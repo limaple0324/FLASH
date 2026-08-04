@@ -132,6 +132,67 @@ def test_repeated_identical_state_does_not_spam_log():
     assert len(logger.info_messages) == 1
 
 
+def test_runtime_status_separates_waiting_recovery_from_real_failure():
+    monitor = SmartReconnectMonitor(FakeBoundary([]))
+    monitor._thread = type("AliveThread", (), {"is_alive": lambda self: True})()
+
+    monitor._set_runtime_status(
+        OperationResult(
+            True,
+            "reconnect.connected",
+            details=healthy_connected_details(),
+        )
+    )
+    assert monitor.runtime_status == "已開啟"
+
+    monitor._set_runtime_status(
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                "state_counts": {"line_selection": 1},
+                "failure_codes": [],
+            },
+        )
+    )
+    assert monitor.runtime_status == "重連中"
+
+    monitor._set_runtime_status(
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                "state_counts": {"unknown": 1},
+                "failure_codes": ["capture_failed"],
+            },
+        )
+    )
+    assert monitor.runtime_status == "重連失敗"
+
+
+def test_runtime_status_treats_safe_wait_and_rebinding_pause_as_reconnecting():
+    monitor = SmartReconnectMonitor(FakeBoundary([]))
+    monitor._thread = type("AliveThread", (), {"is_alive": lambda self: True})()
+
+    monitor._set_runtime_status(
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={"failure_codes": []},
+        )
+    )
+    assert monitor.runtime_status == "重連中"
+
+    monitor._set_runtime_status(
+        OperationResult(
+            False,
+            "reconnect.operation_paused",
+            details={"failure_codes": ["operation_gate_closed"]},
+        )
+    )
+    assert monitor.runtime_status == "重連中"
+
+
 def test_only_complete_healthy_connected_scan_uses_saved_monitoring_interval():
     monitor = SmartReconnectMonitor(
         FakeBoundary(
@@ -146,7 +207,7 @@ def test_only_complete_healthy_connected_scan_uses_saved_monitoring_interval():
         monitor_interval_ms=1500,
     )
 
-    assert monitor.run_once()[1] == 1.5
+    assert monitor.run_once()[1] == 2.0
 
 
 def test_passive_waiting_respects_controller_delay_or_safe_fallback():
@@ -197,7 +258,7 @@ def test_unknown_or_capture_failure_respects_controller_delay():
         monitor_interval_ms=1500,
     )
 
-    assert monitor.run_once()[1] == 30
+    assert monitor.run_once()[1] == 2
 
 
 def test_disconnected_without_progress_reports_one_error_after_interval(
@@ -309,10 +370,33 @@ def test_connected_code_without_complete_health_evidence_keeps_controller_delay(
 
     assert [monitor.run_once()[1] for _ in incomplete_or_failed] == [
         21,
-        22,
-        23,
-        24,
+        2,
+        2,
+        2,
     ]
+
+
+def test_full_health_waits_30_minutes_before_downgrade(monkeypatch):
+    healthy = OperationResult(
+        True,
+        "reconnect.connected",
+        details=healthy_connected_details(next_check_seconds=5, windows=3),
+    )
+    monitor = SmartReconnectMonitor(
+        FakeBoundary([healthy, healthy, healthy]),
+        fallback_delay_seconds=60,
+        monitor_interval_ms=2000,
+    )
+    times = iter((100.0, 120.0, 2000.0))
+    monkeypatch.setattr(
+        smart_reconnect_monitor_module.time,
+        "monotonic",
+        lambda: next(times),
+    )
+
+    assert monitor.run_once()[1] == 2
+    assert monitor.run_once()[1] == 2
+    assert monitor.run_once()[1] == 60
 
 
 def test_monitoring_interval_can_change_without_restarting_monitor():
@@ -340,6 +424,50 @@ def test_start_and_stop_are_idempotent():
     assert monitor.running is False
     assert boundary.execution_changes[0] is True
     assert boundary.execution_changes[-1] is False
+
+
+def test_one_cycle_exception_marks_failure_then_monitor_continues_and_stops():
+    class FailsOnceBoundary(FakeBoundary):
+        def __init__(self):
+            super().__init__([])
+            self.failed = threading.Event()
+            self.recovered = threading.Event()
+
+        def reconnect(self):
+            self.calls += 1
+            if self.calls == 1:
+                self.failed.set()
+                raise RuntimeError("單輪測試失敗")
+            self.recovered.set()
+            return OperationResult(
+                True,
+                "reconnect.connected",
+                details=healthy_connected_details(),
+            )
+
+    class NotifyingLogger(RecordingLogger):
+        def __init__(self):
+            super().__init__()
+            self.error_recorded = threading.Event()
+
+        def error(self, message):
+            super().error(message)
+            self.error_recorded.set()
+
+    boundary = FailsOnceBoundary()
+    logger = NotifyingLogger()
+    monitor = SmartReconnectMonitor(boundary, logger=logger)
+
+    assert monitor.start() is True
+    assert boundary.failed.wait(1) is True
+    assert logger.error_recorded.wait(1) is True
+    assert monitor.runtime_status == "重連失敗"
+
+    assert monitor.set_monitor_interval_ms(2500) is True
+    assert boundary.recovered.wait(1) is True
+    assert monitor.stop(timeout_seconds=1) is True
+    assert monitor.running is False
+    assert boundary.calls >= 2
 
 
 def test_start_failure_recloses_controller_execution(monkeypatch):

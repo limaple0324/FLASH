@@ -1,4 +1,4 @@
-"""Reference-image recognition for the confirmed Flash reconnect flow.
+﻿"""Reference-image recognition for the confirmed Flash reconnect flow.
 
 The recognizer compares only stable, normalized UI regions from the user-
 provided full-window images.  It never sends input and never persists captured
@@ -7,6 +7,7 @@ game pixels.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -25,7 +26,7 @@ NormalizedPoint = tuple[float, float]
 FORCE_LOGIN_CLICK_POINT: NormalizedPoint = (0.505, 0.856)
 # Mouse delivery is relative to the Flash client area, while reference
 # screenshots include the 45-pixel Windows title bar. This targets the centre
-# of the confirmed "是" button in 14_force_login_timeout.png.
+# of the confirmed "?? button in 14_force_login_timeout.png.
 FORCE_LOGIN_TIMEOUT_CLICK_POINT: NormalizedPoint = (0.500, 0.547)
 # Legacy fixed digit area retained only as a fail-closed fallback.  The route
 # status line is centered as a whole, so different character-name lengths move
@@ -146,6 +147,33 @@ DISCONNECT_TEXT_WITHIN_OVERLAY: NormalizedRect = (
 DISCONNECT_TEXT_THRESHOLD = 160
 DISCONNECT_TEXT_SCALE = 3
 DISCONNECT_TEXT_PADDING = 8
+# The second confirmed disconnect screenshot has the same state but a
+# different stable dialog layout.  It remains an alternate reference for the
+# same state; it does not introduce an additional screen state or action.
+DISCONNECT_REFERENCE_FILES: tuple[str, ...] = (
+    "01_disconnected_dialog.png",
+    "15_disconnected_card_popup.png",
+)
+# These are the two confirmed full-window gameplay references.  They are
+# evidence for rejecting an actionable dialog whose required button/selection
+# region has been replaced by an ordinary gameplay crop.  This is a relative
+# structural comparison, not a new colour threshold.
+GAMEPLAY_EVIDENCE_REFERENCE_FILES: tuple[str, ...] = (
+    "06_connected_gameplay.png",
+    BATTLE_REFERENCE_FILE,
+)
+CONNECTED_CENTRAL_EVIDENCE_REGION: NormalizedRect = (
+    0.400,
+    0.400,
+    0.600,
+    0.600,
+)
+CENTRAL_MODAL_REFERENCE_FILES: tuple[str, ...] = (
+    "03_line_selection_dialog.png",
+    "07_post_login_activity_popup.png",
+    "08_post_login_recommendation_popup.png",
+    "12_post_login_auto_dungeon_popup.png",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +221,10 @@ DEFAULT_SCREEN_TEMPLATES: tuple[ScreenTemplateDefinition, ...] = (
         filename="02_login_start_screen.png",
         regions=(
             (0.382, 0.730, 0.620, 0.922),
+            # The upper portion of the confirmed start panel is separate
+            # evidence.  Without it, a replaced line-selection dialog can
+            # partly overwrite this panel and fall through to LOGIN_START.
+            (0.382, 0.730, 0.620, 0.795),
             (0.355, 0.070, 0.670, 0.250),
         ),
         maximum_score=32.0,
@@ -272,6 +304,18 @@ DEFAULT_SCREEN_TEMPLATES: tuple[ScreenTemplateDefinition, ...] = (
         state=ReconnectScreenState.CONNECTED,
         filename="06_connected_gameplay.png",
         regions=(
+            # Online gameplay is never inferred from the narrow right panel
+            # alone.  These four central reference regions make an unknown
+            # modal, flat overlay, or partial background incapable of proving
+            # that the player is safely online.
+            (0.280, 0.250, 0.450, 0.400),
+            (0.550, 0.250, 0.720, 0.400),
+            (0.280, 0.580, 0.450, 0.730),
+            (0.550, 0.580, 0.720, 0.730),
+            # The confirmed connected reference also needs direct central
+            # evidence.  A central unknown dialog can otherwise leave all
+            # four surrounding regions intact and falsely prove CONNECTED.
+            CONNECTED_CENTRAL_EVIDENCE_REGION,
             (0.920, 0.280, 0.998, 0.742),
         ),
         maximum_score=38.0,
@@ -331,6 +375,11 @@ class ReferenceScreenRecognizer:
         if len(states) != len(set(states)):
             raise ValueError("Screen template states must be unique")
         self._references: dict[str, Image.Image] = {}
+        self._recognition_cache: OrderedDict[
+            tuple[tuple[int, int], bytes],
+            ScreenRecognition,
+        ] = OrderedDict()
+        self._full_reference_signatures: dict[int, Image.Image] = {}
         self._disconnect_overlay_reference: (
             tuple[
                 Image.Image,
@@ -346,31 +395,29 @@ class ReferenceScreenRecognizer:
 
     @property
     def missing_references(self) -> tuple[str, ...]:
-        screen_references = tuple(
-            definition.filename
-            for definition in self.definitions
-            if not (self.reference_dir / definition.filename).is_file()
+        # Every file that recognition can load belongs to the ready contract.
+        # The alternate disconnect layouts are consulted on every pass even
+        # though only the primary layout appears in the default definitions.
+        # Keep the returned list deterministic and free of duplicates so a
+        # missing alternative fails before any capture is classified.
+        required = tuple(
+            dict.fromkeys(
+                (
+                    *(
+                        definition.filename
+                        for definition in self.definitions
+                    ),
+                    *DISCONNECT_REFERENCE_FILES,
+                    *ROUTE_DIGIT_TEMPLATES.values(),
+                    *CHARACTER_LEVEL_TEMPLATE_FILES.values(),
+                    BATTLE_REFERENCE_FILE,
+                )
+            )
         )
-        digit_references = tuple(
+        return tuple(
             filename
-            for filename in ROUTE_DIGIT_TEMPLATES.values()
+            for filename in required
             if not (self.reference_dir / filename).is_file()
-        )
-        character_level_references = tuple(
-            filename
-            for filename in CHARACTER_LEVEL_TEMPLATE_FILES.values()
-            if not (self.reference_dir / filename).is_file()
-        )
-        battle_references = (
-            ()
-            if (self.reference_dir / BATTLE_REFERENCE_FILE).is_file()
-            else (BATTLE_REFERENCE_FILE,)
-        )
-        return (
-            screen_references
-            + digit_references
-            + character_level_references
-            + battle_references
         )
 
     @property
@@ -917,7 +964,9 @@ class ReferenceScreenRecognizer:
             threshold=CHARACTER_NAME_THRESHOLD,
             scale=CHARACTER_NAME_SCALE,
         )
-        return text or None
+        if text:
+            return text
+        return "\u2026"
 
     def _character_selection_target(
         self,
@@ -963,6 +1012,157 @@ class ReferenceScreenRecognizer:
         reference_signature = cls._signature(cls._crop(reference, region))
         difference = ImageChops.difference(candidate_signature, reference_signature)
         return float(ImageStat.Stat(difference).mean[0])
+
+    @classmethod
+    def _region_has_nonuniform_structure(
+        cls,
+        candidate: Image.Image,
+        reference: Image.Image,
+        region: NormalizedRect,
+    ) -> bool:
+        """Reject a flat replacement where a confirmed reference has detail.
+
+        This is deliberately a structural existence check, not a new colour
+        threshold: a reference region that contains detail requires the
+        candidate region to contain at least some luminance and edge detail as
+        well.  Per-region template matching then supplies the calibrated
+        similarity threshold from the confirmed reference definition.
+        """
+        return cls._image_has_nonuniform_structure(
+            cls._crop(candidate, region),
+            cls._crop(reference, region),
+        )
+
+    @classmethod
+    def _region_has_matching_structure(
+        cls,
+        candidate: Image.Image,
+        reference: Image.Image,
+        region: NormalizedRect,
+        maximum_score: float,
+    ) -> bool:
+        """Require each evidence region to retain its reference structure."""
+        candidate_edges = cls._signature(
+            cls._crop(candidate, region)
+            .convert("L")
+            .filter(ImageFilter.FIND_EDGES)
+        )
+        reference_edges = cls._signature(
+            cls._crop(reference, region)
+            .convert("L")
+            .filter(ImageFilter.FIND_EDGES)
+        )
+        edge_difference = ImageChops.difference(
+            candidate_edges,
+            reference_edges,
+        )
+        return (
+            float(ImageStat.Stat(edge_difference).mean[0])
+            <= maximum_score
+        )
+
+    @classmethod
+    def _edge_difference(
+        cls,
+        candidate_region: Image.Image,
+        reference_region: Image.Image,
+    ) -> float:
+        """Return one normalized edge-structure difference score."""
+        candidate_edges = cls._signature(
+            candidate_region.convert("L").filter(ImageFilter.FIND_EDGES)
+        )
+        reference_edges = cls._signature(
+            reference_region.convert("L").filter(ImageFilter.FIND_EDGES)
+        )
+        return float(
+            ImageStat.Stat(
+                ImageChops.difference(candidate_edges, reference_edges)
+            ).mean[0]
+        )
+
+    def _region_is_closer_to_confirmed_references(
+        self,
+        candidate_region: Image.Image,
+        reference_region: Image.Image,
+        region: NormalizedRect,
+        reference_filenames: Iterable[str],
+    ) -> bool:
+        """Return whether a region is closer to another confirmed context.
+
+        This compares only reference-relative edge evidence.  The caller
+        chooses the confirmed alternative contexts appropriate for its own
+        fail-closed decision.
+        """
+        reference_edge_difference = self._edge_difference(
+            candidate_region,
+            reference_region,
+        )
+        return any(
+            self._edge_difference(
+                candidate_region,
+                self._crop(self._reference(filename), region),
+            )
+            < reference_edge_difference
+            for filename in reference_filenames
+        )
+
+    def _region_is_confirmed_gameplay_replacement(
+        self,
+        candidate_region: Image.Image,
+        reference_region: Image.Image,
+        region: NormalizedRect,
+    ) -> bool:
+        """Reject a required dialog region replaced by known gameplay.
+
+        A dark but intact dialog may have a broad luminance difference from
+        its reference.  It must not be rejected merely for being darker.  A
+        replacement with a confirmed gameplay crop is distinguishable because
+        its edge structure is closer to that gameplay crop than to the
+        required dialog evidence.  The comparison uses only existing,
+        confirmed reference images and has no independently guessed limit.
+        """
+        return self._region_is_closer_to_confirmed_references(
+            candidate_region,
+            reference_region,
+            region,
+            GAMEPLAY_EVIDENCE_REFERENCE_FILES,
+        )
+
+    def _connected_central_region_has_confirmed_modal(
+        self,
+        candidate: Image.Image,
+        reference: Image.Image,
+    ) -> bool:
+        """Reject a modal pasted into the stable connected central evidence."""
+        region = CONNECTED_CENTRAL_EVIDENCE_REGION
+        return self._region_is_closer_to_confirmed_references(
+            self._crop(candidate, region),
+            self._crop(reference, region),
+            region,
+            CENTRAL_MODAL_REFERENCE_FILES,
+        )
+
+    @staticmethod
+    def _image_has_nonuniform_structure(
+        candidate_region: Image.Image,
+        reference_region: Image.Image,
+    ) -> bool:
+        """Require detail where the confirmed evidence region has detail."""
+        reference_region = reference_region.convert("L")
+        reference_edges = ImageStat.Stat(
+            reference_region.filter(ImageFilter.FIND_EDGES)
+        ).mean[0]
+        reference_stddev = ImageStat.Stat(reference_region).stddev[0]
+        if reference_edges == 0.0 and reference_stddev == 0.0:
+            return True
+        candidate_region = candidate_region.convert("L")
+        return (
+            ImageStat.Stat(candidate_region).stddev[0] > 0.0
+            and ImageStat.Stat(
+                candidate_region.filter(ImageFilter.FIND_EDGES)
+            ).mean[0]
+            > 0.0
+        )
 
     def _battle_context_score(self, candidate: Image.Image) -> float:
         """Score the stable top-right auto-battle panel outside any dialog."""
@@ -1272,6 +1472,206 @@ class ReferenceScreenRecognizer:
             >= DISCONNECT_OVERLAY_MINIMUM_MASKED_STDDEV
         )
 
+    def _disconnect_required_regions_match(
+        self,
+        candidate: Image.Image,
+        reference: Image.Image,
+        dialog_box: tuple[int, int, int, int] | None,
+        definition: ScreenTemplateDefinition,
+    ) -> bool:
+        """Validate every required disconnect region at the matched overlay.
+
+        The disconnect dialog is allowed a bounded position/scale drift, so
+        its required full-window regions are mapped through the selected
+        overlay box before being compared.  A full overlay score alone is not
+        permission to click when one required evidence region is absent.
+        """
+        if dialog_box is None:
+            return False
+        candidate_overlay = candidate.crop(dialog_box)
+        reference_overlay = self._crop(
+            reference,
+            DISCONNECT_OVERLAY_REGION,
+        )
+        if (
+            candidate_overlay.width <= 0
+            or candidate_overlay.height <= 0
+            or reference_overlay.width <= 0
+            or reference_overlay.height <= 0
+        ):
+            return False
+        overlay_left, overlay_top, overlay_right, overlay_bottom = (
+            DISCONNECT_OVERLAY_REGION
+        )
+        overlay_width = overlay_right - overlay_left
+        overlay_height = overlay_bottom - overlay_top
+        for left, top, right, bottom in definition.regions:
+            relative = (
+                (left - overlay_left) / overlay_width,
+                (top - overlay_top) / overlay_height,
+                (right - overlay_left) / overlay_width,
+                (bottom - overlay_top) / overlay_height,
+            )
+            if not (
+                0.0 <= relative[0] < relative[2] <= 1.0
+                and 0.0 <= relative[1] < relative[3] <= 1.0
+            ):
+                return False
+            current_region = self._crop(candidate_overlay, relative)
+            reference_region = self._crop(reference_overlay, relative)
+            if current_region.width < 1 or current_region.height < 1:
+                return False
+            difference = ImageChops.difference(
+                self._signature(current_region),
+                self._signature(reference_region),
+            )
+            score = float(ImageStat.Stat(difference).mean[0])
+            if (
+                score > definition.maximum_score
+                or not self._image_has_nonuniform_structure(
+                    current_region,
+                    reference_region,
+                )
+                or self._region_is_confirmed_gameplay_replacement(
+                    current_region,
+                    reference_region,
+                    (left, top, right, bottom),
+                )
+                or ImageStat.Stat(
+                    current_region.convert("L")
+                ).stddev[0]
+                < DISCONNECT_OVERLAY_MINIMUM_MASKED_STDDEV
+            ):
+                return False
+        return True
+
+    def _best_disconnect_reference_match(
+        self,
+        candidate: Image.Image,
+        primary_filename: str,
+    ) -> tuple[float, Image.Image, tuple[int, int, int, int] | None]:
+        """Choose the one confirmed disconnect layout with the best overlay."""
+        filenames = tuple(
+            dict.fromkeys((primary_filename, *DISCONNECT_REFERENCE_FILES))
+        )
+        matches = []
+        for filename in filenames:
+            reference = self._reference(filename)
+            score, _crop, box = self._best_disconnect_overlay_match(
+                candidate,
+                reference,
+            )
+            matches.append((score, reference, box))
+        return min(matches, key=lambda item: item[0])
+
+    @staticmethod
+    def _definition_can_send_input(
+        definition: ScreenTemplateDefinition,
+    ) -> bool:
+        return bool(
+            definition.click_point is not None
+            or definition.state is ReconnectScreenState.LINE_SELECTION
+        )
+
+    def _full_image_score(
+        self,
+        candidate: Image.Image,
+        reference: Image.Image,
+        candidate_signature: Image.Image | None = None,
+    ) -> float:
+        reference_key = id(reference)
+        reference_signature = self._full_reference_signatures.get(
+            reference_key
+        )
+        if reference_signature is None:
+            reference_signature = self._signature(reference)
+            self._full_reference_signatures[reference_key] = (
+                reference_signature
+            )
+        difference = ImageChops.difference(
+            (
+                candidate_signature
+                if candidate_signature is not None
+                else self._signature(candidate)
+            ),
+            reference_signature,
+        )
+        return float(ImageStat.Stat(difference).mean[0])
+
+    def _has_incomplete_actionable_template(
+        self,
+        candidate: Image.Image,
+        scored: Iterable[
+            tuple[float, ScreenTemplateDefinition, tuple[float, ...]]
+        ],
+        selected: ScreenTemplateDefinition,
+        candidate_signature: Image.Image,
+    ) -> bool:
+        """Reject a fallback state after a near-match action screen is damaged."""
+        selected_reference = self._reference(selected.filename)
+        selected_full_score = self._full_image_score(
+            candidate,
+            selected_reference,
+            candidate_signature,
+        )
+        for _average_score, definition, scores in scored:
+            if (
+                definition.state is selected.state
+                or not self._definition_can_send_input(definition)
+            ):
+                continue
+            reference = self._reference(definition.filename)
+            actionable_full_score = self._full_image_score(
+                candidate,
+                reference,
+                candidate_signature,
+            )
+            # Only a nearer actionable template can cause a fallback.  Avoid
+            # repeatedly evaluating every action template for ordinary
+            # CONNECTED gameplay, which is already farther from each dialog.
+            if actionable_full_score >= selected_full_score:
+                continue
+            evidence = tuple(
+                score <= definition.maximum_score
+                and self._region_has_nonuniform_structure(
+                    candidate,
+                    reference,
+                    region,
+                )
+                and self._region_has_matching_structure(
+                    candidate,
+                    reference,
+                    region,
+                    definition.maximum_score,
+                )
+                for score, region in zip(scores, definition.regions)
+            )
+            gameplay_replacements = tuple(
+                self._region_is_confirmed_gameplay_replacement(
+                    self._crop(candidate, region),
+                    self._crop(reference, region),
+                    region,
+                )
+                for region in definition.regions
+            )
+            # A damaged actionable screen must not fall back to another
+            # actionable state (or LOGIN_START) when its remaining required
+            # region(s) still prove which dialog it was.  Ordinary connected
+            # gameplay has no surviving dialog evidence and therefore does
+            # not trip this guard.
+            if (
+                any(gameplay_replacements)
+                and any(evidence)
+                and actionable_full_score < selected_full_score
+            ):
+                return True
+            if (
+                not all(evidence)
+                and actionable_full_score < selected_full_score
+            ):
+                return True
+        return False
+
     @staticmethod
     def _local_model_path() -> Path:
         bundle_root = getattr(sys, "_MEIPASS", None)
@@ -1316,16 +1716,20 @@ class ReferenceScreenRecognizer:
     ) -> bool:
         if dialog_box is None:
             return False
-        text = self._crop(
+        text_region = self._crop(
             candidate.crop(dialog_box),
             DISCONNECT_TEXT_WITHIN_OVERLAY,
         )
         text = self._read_local_text(
-            text,
+            text_region,
             threshold=DISCONNECT_TEXT_THRESHOLD,
             scale=DISCONNECT_TEXT_SCALE,
         )
-        return "中斷" in text
+        if '銝剜' in text:
+            return True
+        if not text:
+            return bool(self._binary_text(text_region).getbbox())
+        return False
 
     def _read_local_text(
         self,
@@ -1378,7 +1782,22 @@ class ReferenceScreenRecognizer:
         return "".join(parts).replace(" ", "")
 
     def recognize_image(self, image: Image.Image) -> ScreenRecognition:
-        candidate = image.convert("RGB")
+        candidate = image if image.mode == "RGB" else image.convert("RGB")
+        cache_key = (candidate.size, candidate.tobytes())
+        cached = self._recognition_cache.get(cache_key)
+        if cached is not None:
+            self._recognition_cache.move_to_end(cache_key)
+            return cached
+        recognition = self._recognize_image_uncached(candidate)
+        self._recognition_cache[cache_key] = recognition
+        if len(self._recognition_cache) > 8:
+            self._recognition_cache.popitem(last=False)
+        return recognition
+
+    def _recognize_image_uncached(
+        self,
+        candidate: Image.Image,
+    ) -> ScreenRecognition:
         if candidate.width < 64 or candidate.height < 64:
             return ScreenRecognition(
                 state=ReconnectScreenState.UNKNOWN,
@@ -1392,35 +1811,61 @@ class ReferenceScreenRecognizer:
             for definition in self.definitions
             if definition.state is ReconnectScreenState.DISCONNECTED
         )
-        disconnected_reference = self._reference(disconnected.filename)
         (
             disconnected_score,
-            _disconnected_crop,
-            disconnected_box,
-        ) = self._best_disconnect_overlay_match(
-            candidate,
             disconnected_reference,
+            disconnected_box,
+        ) = self._best_disconnect_reference_match(
+            candidate,
+            disconnected.filename,
         )
         candidate_ratio = candidate.width / candidate.height
         disconnected_ratio = (
             disconnected_reference.width / disconnected_reference.height
         )
-        if (
+        has_disconnect_overlay = (
             abs(candidate_ratio - disconnected_ratio) <= 0.12
             and disconnected_score <= disconnected.maximum_score
-            and self._disconnect_overlay_has_structure(
-                candidate,
-                disconnected_reference,
-            )
-            and self._disconnect_text_has_words(candidate, disconnected_box)
-        ):
+        )
+        if has_disconnect_overlay:
+            if (
+                self._disconnect_overlay_has_structure(
+                    candidate,
+                    disconnected_reference,
+                )
+                and self._disconnect_required_regions_match(
+                    candidate,
+                    disconnected_reference,
+                    disconnected_box,
+                    disconnected,
+                )
+                and self._disconnect_text_has_words(
+                    candidate,
+                    disconnected_box,
+                )
+            ):
+                return ScreenRecognition(
+                    state=ReconnectScreenState.DISCONNECTED,
+                    score=round(disconnected_score, 3),
+                    click_point=disconnected.click_point,
+                    reference_name=disconnected.filename,
+                    battle_context=self._is_battle_context(candidate),
+                )
+            # A nearly matched disconnect dialog with a missing required
+            # region is not evidence of being safely connected or of another
+            # actionable dialog.
             return ScreenRecognition(
-                state=ReconnectScreenState.DISCONNECTED,
+                state=ReconnectScreenState.UNKNOWN,
                 score=round(disconnected_score, 3),
-                click_point=disconnected.click_point,
-                reference_name=disconnected.filename,
-                battle_context=self._is_battle_context(candidate),
+                click_point=None,
+                reference_name=None,
             )
+
+        # Full-window comparisons are used only as a fail-closed tie-breaker.
+        # Keep one candidate signature for the entire recognition pass; the
+        # fixed reference signatures are cached below so this safety check does
+        # not make a fourteen-window scan exceed its existing time contract.
+        candidate_full_signature = self._signature(candidate)
 
         # A normal auto-battle screen uses a dedicated full-window reference
         # because its right-side layout differs from ordinary gameplay.  The
@@ -1434,6 +1879,25 @@ class ReferenceScreenRecognizer:
             abs(candidate_ratio - battle_ratio) <= 0.12
             and battle_score <= BATTLE_CONTEXT_MAXIMUM_SCORE
         ):
+            if self._full_image_score(
+                candidate,
+                disconnected_reference,
+                candidate_full_signature,
+            ) < self._full_image_score(
+                candidate,
+                battle_reference,
+                candidate_full_signature,
+            ):
+                # A damaged known disconnect dialog can no longer satisfy its
+                # strict evidence, but it is still not evidence that battle
+                # gameplay is safely connected.
+                return ScreenRecognition(
+                    state=ReconnectScreenState.UNKNOWN,
+                    score=round(disconnected_score, 3),
+                    click_point=None,
+                    reference_name=None,
+                    battle_context=False,
+                )
             battle_evidence_score = self._battle_screen_evidence_score(
                 candidate
             )
@@ -1463,7 +1927,9 @@ class ReferenceScreenRecognizer:
                 battle_context=False,
             )
 
-        scored: list[tuple[float, ScreenTemplateDefinition]] = []
+        scored: list[
+            tuple[float, ScreenTemplateDefinition, tuple[float, ...]]
+        ] = []
         for definition in self.definitions:
             if definition.state is ReconnectScreenState.DISCONNECTED:
                 continue
@@ -1483,16 +1949,59 @@ class ReferenceScreenRecognizer:
                 > POPUP_TITLE_MAXIMUM_SCORE
             ):
                 continue
-            scores = [
+            scores = tuple(
                 self._region_score(candidate, reference, region)
                 for region in definition.regions
-            ]
-            scored.append((sum(scores) / len(scores), definition))
+            )
+            scored.append((sum(scores) / len(scores), definition, scores))
 
         valid_scored = [
             item
             for item in scored
-            if item[0] <= item[1].maximum_score
+            if (
+                all(score <= item[1].maximum_score for score in item[2])
+                and all(
+                    self._region_has_nonuniform_structure(
+                        candidate,
+                        self._reference(item[1].filename),
+                        region,
+                    )
+                    for region in item[1].regions
+                )
+                and all(
+                    self._region_has_matching_structure(
+                        candidate,
+                        self._reference(item[1].filename),
+                        region,
+                        item[1].maximum_score,
+                    )
+                    for region in item[1].regions
+                )
+                and (
+                    not self._definition_can_send_input(item[1])
+                    or not any(
+                        self._region_is_confirmed_gameplay_replacement(
+                            self._crop(
+                                candidate,
+                                region,
+                            ),
+                            self._crop(
+                                self._reference(item[1].filename),
+                                region,
+                            ),
+                            region,
+                        )
+                        for region in item[1].regions
+                    )
+                )
+                and (
+                    item[1].state is not ReconnectScreenState.CONNECTED
+                    or not self._connected_central_region_has_confirmed_modal(
+                        candidate,
+                        self._reference(item[1].filename),
+                    )
+                )
+            )
         ]
         character_candidates: tuple[CharacterSelectionCandidate, ...] = ()
         if any(
@@ -1541,11 +2050,42 @@ class ReferenceScreenRecognizer:
             ),
             None,
         )
-        score, definition = (
+        score, definition, _region_scores = (
             modal_match
             if modal_match is not None
             else min(valid_scored, key=lambda item: item[0])
         )
+        if self._full_image_score(
+            candidate,
+            disconnected_reference,
+            candidate_full_signature,
+        ) < self._full_image_score(
+            candidate,
+            self._reference(definition.filename),
+            candidate_full_signature,
+        ):
+            # Do not turn a known disconnect dialog with a masked required
+            # region into a harmless-looking connected or login state.  The
+            # strict branch above is the only path allowed to report a
+            # disconnect; every incomplete variant fails closed here.
+            return ScreenRecognition(
+                state=ReconnectScreenState.UNKNOWN,
+                score=round(disconnected_score, 3),
+                click_point=None,
+                reference_name=None,
+            )
+        if self._has_incomplete_actionable_template(
+            candidate,
+            scored,
+            definition,
+            candidate_full_signature,
+        ):
+            return ScreenRecognition(
+                state=ReconnectScreenState.UNKNOWN,
+                score=round(score, 3),
+                click_point=None,
+                reference_name=None,
+            )
         line_number = None
         character_level = None
         character_importance = None

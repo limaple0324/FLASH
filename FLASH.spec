@@ -16,6 +16,13 @@ rapidocr_binaries = (
 )
 rapidocr_datas = collect_data_files('rapidocr_onnxruntime')
 rapidocr_hiddenimports = collect_submodules('rapidocr_onnxruntime')
+obsidian_reference_datas = [
+    (
+        f'assets/game_data_reference/obsidian/page_{page:02d}.png',
+        'assets/game_data_reference/obsidian',
+    )
+    for page in range(1, 11)
+]
 
 a = Analysis(
     ['main.py'],
@@ -25,9 +32,8 @@ a = Analysis(
         ('assets/flash_icon.png', 'assets'),
         ('assets/flash_icon.ico', 'assets'),
         ('assets/reconnect_reference', 'assets/reconnect_reference'),
-        ('assets/game_data_reference/obsidian', 'assets/game_data_reference/obsidian'),
         ('assets/role_id_ocr', 'assets/role_id_ocr'),
-    ] + rapidocr_datas,
+    ] + obsidian_reference_datas + rapidocr_datas,
     hiddenimports=[
         'tkinter',
         'rawpy',

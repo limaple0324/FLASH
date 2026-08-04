@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -10,6 +11,9 @@ from urllib.request import Request, urlopen
 from .models import QueueRunError
 
 
+_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
 @dataclass
 class GitHubRestClient:
     repository: str
@@ -17,7 +21,17 @@ class GitHubRestClient:
     api_url: str = "https://api.github.com"
     max_pages: int = 50
 
+    def __post_init__(self) -> None:
+        repository_parts = self.repository.split("/")
+        if (
+            not _REPOSITORY_PATTERN.fullmatch(self.repository)
+            or any(part in {".", ".."} for part in repository_parts)
+        ):
+            raise QueueRunError("invalid repository name")
+
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> tuple[Any, dict[str, str]]:
+        if not path.startswith("/"):
+            raise QueueRunError("invalid api path")
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
         if self.token: headers["Authorization"] = f"Bearer {self.token}"
         request = Request(f"{self.api_url}{path}", data=json.dumps(body).encode("utf-8") if body is not None else None, method=method, headers=headers)

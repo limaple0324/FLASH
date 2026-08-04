@@ -53,10 +53,9 @@ def test_windows_build_uses_the_confirmed_icon():
     assert "assets/flash_icon.png" in spec
     assert "('assets/flash_icon.ico', 'assets')" in spec
     assert "('assets/reconnect_reference', 'assets/reconnect_reference')" in spec
-    assert (
-        "('assets/game_data_reference/obsidian', "
-        "'assets/game_data_reference/obsidian')"
-    ) in spec
+    assert "obsidian_reference_datas" in spec
+    assert "for page in range(1, 11)" in spec
+    assert "full_window_page_10.png" not in spec
     assert "icon='assets/flash_icon.ico'" in spec
 
 

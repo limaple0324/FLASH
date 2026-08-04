@@ -18,7 +18,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: windows-build-${{ github.ref }}
@@ -27,11 +27,15 @@ concurrency:
 jobs:
   test-and-build:
     name: Test and build Windows package
+    outputs:
+      artifact_name: ${{ steps.delivery_metadata.outputs.artifact_name }}
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -97,6 +101,7 @@ jobs:
           }
 
       - name: Read delivery metadata
+        id: delivery_metadata
         shell: pwsh
         env:
           BUILD_EVENT_NAME: ${{ github.event_name }}
@@ -222,6 +227,7 @@ jobs:
           "FLASH_SOURCE_BRANCH=$env:BUILD_SOURCE_BRANCH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "FLASH_PUBLISH_TARGET=$publishTarget" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "FLASH_ARTIFACT_NAME=$artifactName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "artifact_name=$artifactName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Build windowed executable
         run: python scripts/build_coordinator.py --root . --output-dir dist --cache-dir .build-cache
@@ -640,6 +646,24 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    name: Publish verified Windows updater files
+    needs: test-and-build
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/sp1/completion-2026-07-25' &&
+      (github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_sp1))
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - name: Download verified Windows release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.test-and-build.outputs.artifact_name }}
+          path: .
 
       - name: Publish latest desktop updater files
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

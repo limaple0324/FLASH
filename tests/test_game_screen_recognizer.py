@@ -1,8 +1,10 @@
 import hashlib
 from pathlib import Path
+import shutil
 from time import perf_counter
 
 from PIL import Image, ImageEnhance
+import pytest
 
 from adapters.game_screen_recognizer import (
     BATTLE_CONTEXT_REGION,
@@ -35,6 +37,20 @@ def test_all_confirmed_full_window_references_are_present_and_unique():
     assert len(DEFAULT_SCREEN_TEMPLATES) == 10
     assert len({item.filename for item in DEFAULT_SCREEN_TEMPLATES}) == 10
     assert len({item.state for item in DEFAULT_SCREEN_TEMPLATES}) == 10
+
+
+def test_missing_disconnect_alternative_fails_ready_before_recognition(
+    tmp_path,
+):
+    missing_filename = "15_disconnected_card_popup.png"
+    for source in REFERENCE_DIR.glob("*.png"):
+        if source.name != missing_filename:
+            shutil.copyfile(source, tmp_path / source.name)
+
+    recognizer = ReferenceScreenRecognizer(tmp_path)
+
+    assert recognizer.ready is False
+    assert recognizer.missing_references == (missing_filename,)
 
 
 def test_all_user_reference_images_match_the_fixed_sha256_manifest():
@@ -592,6 +608,170 @@ def test_battle_panel_alone_or_under_unknown_modal_is_not_online():
     assert panel_only_result.click_point is None
     assert modal_result.state is ReconnectScreenState.UNKNOWN
     assert modal_result.click_point is None
+
+
+@pytest.mark.parametrize("coverage", (0.20, 0.25, 0.40, 0.50, 0.60))
+@pytest.mark.parametrize("overlay", ("black", "white", (90, 120, 130)))
+def test_connected_reference_rejects_central_flat_overlays(
+    coverage,
+    overlay,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "06_connected_gameplay.png") as source:
+        candidate = source.convert("RGB")
+    left = round(candidate.width * ((1.0 - coverage) / 2.0))
+    top = round(candidate.height * ((1.0 - coverage) / 2.0))
+    right = candidate.width - left
+    bottom = candidate.height - top
+    candidate.paste(
+        Image.new("RGB", (right - left, bottom - top), overlay),
+        (left, top),
+    )
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.UNKNOWN
+    assert result.click_point is None
+
+
+@pytest.mark.parametrize("coverage", (0.20, 0.25))
+@pytest.mark.parametrize(
+    "popup_filename",
+    (
+        "03_line_selection_dialog.png",
+        "07_post_login_activity_popup.png",
+        "08_post_login_recommendation_popup.png",
+        "12_post_login_auto_dungeon_popup.png",
+    ),
+)
+def test_connected_reference_rejects_central_confirmed_popup_overlays(
+    coverage,
+    popup_filename,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "06_connected_gameplay.png") as source:
+        candidate = source.convert("RGB")
+    with Image.open(REFERENCE_DIR / popup_filename) as source:
+        popup = source.convert("RGB").resize(candidate.size)
+    left = round(candidate.width * ((1.0 - coverage) / 2.0))
+    top = round(candidate.height * ((1.0 - coverage) / 2.0))
+    right = candidate.width - left
+    bottom = candidate.height - top
+    candidate.paste(
+        popup.crop((left, top, right, bottom)),
+        (left, top),
+    )
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.UNKNOWN
+    assert result.click_point is None
+
+
+def test_connected_reference_rejects_foreign_gameplay_background_overlay():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "06_connected_gameplay.png") as source:
+        candidate = source.convert("RGB")
+    with Image.open(REFERENCE_DIR / BATTLE_REFERENCE_FILE) as source:
+        foreign = source.convert("RGB").resize(candidate.size)
+    box = (
+        round(candidate.width * 0.25),
+        round(candidate.height * 0.25),
+        round(candidate.width * 0.75),
+        round(candidate.height * 0.75),
+    )
+    candidate.paste(foreign.crop(box), box[:2])
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.UNKNOWN
+    assert result.click_point is None
+
+
+@pytest.mark.parametrize("overlay", ("black", "white", (90, 120, 130)))
+def test_every_actionable_template_requires_each_confirmed_region(overlay):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    # This test isolates structural template evidence.  OCR availability is
+    # covered separately; a confirmed text result lets the disconnect branch
+    # reach its required-region gate in this image-only test.
+    recognizer._disconnect_text_has_words = lambda *_args: True
+    actionable = [
+        definition
+        for definition in DEFAULT_SCREEN_TEMPLATES
+        if (
+            definition.click_point is not None
+            or definition.state is ReconnectScreenState.LINE_SELECTION
+        )
+    ]
+
+    for definition in actionable:
+        with Image.open(REFERENCE_DIR / definition.filename) as source:
+            reference = source.convert("RGB")
+        for region in definition.regions:
+            candidate = reference.copy()
+            left, top, right, bottom = region
+            box = (
+                round(candidate.width * left),
+                round(candidate.height * top),
+                round(candidate.width * right),
+                round(candidate.height * bottom),
+            )
+            candidate.paste(
+                Image.new(
+                    "RGB",
+                    (box[2] - box[0], box[3] - box[1]),
+                    overlay,
+                ),
+                box[:2],
+            )
+
+            result = recognizer.recognize_image(candidate)
+
+            assert result.state is ReconnectScreenState.UNKNOWN
+            assert result.click_point is None
+
+
+@pytest.mark.parametrize(
+    "foreign_filename",
+    (
+        "06_connected_gameplay.png",
+        BATTLE_REFERENCE_FILE,
+    ),
+)
+def test_every_actionable_template_rejects_confirmed_gameplay_replacement(
+    foreign_filename,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    recognizer._disconnect_text_has_words = lambda *_args: True
+    actionable = [
+        definition
+        for definition in DEFAULT_SCREEN_TEMPLATES
+        if (
+            definition.click_point is not None
+            or definition.state is ReconnectScreenState.LINE_SELECTION
+        )
+    ]
+
+    for definition in actionable:
+        with Image.open(REFERENCE_DIR / definition.filename) as source:
+            reference = source.convert("RGB")
+        with Image.open(REFERENCE_DIR / foreign_filename) as source:
+            foreign = source.convert("RGB").resize(reference.size)
+        for region in definition.regions:
+            candidate = reference.copy()
+            left, top, right, bottom = region
+            box = (
+                round(candidate.width * left),
+                round(candidate.height * top),
+                round(candidate.width * right),
+                round(candidate.height * bottom),
+            )
+            candidate.paste(foreign.crop(box), box[:2])
+
+            result = recognizer.recognize_image(candidate)
+
+            assert result.state is ReconnectScreenState.UNKNOWN
+            assert result.click_point is None
 
 
 def test_blank_or_wrong_aspect_image_is_unknown_and_has_no_click_target():

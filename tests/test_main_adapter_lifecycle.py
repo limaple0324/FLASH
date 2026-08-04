@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -258,8 +259,9 @@ def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
 
     assert reconnect._target_windows_provider is None
     assert reconnect._require_expected_window_count is False
-    assert keyboard._target_windows_provider() == strict_targets
-    assert pointer._target_windows_provider() == strict_targets
+    # 未驗證的測試替身不得進入同步目標集合。
+    assert keyboard._target_windows_provider() == ()
+    assert pointer._target_windows_provider() == ()
 
 
 def test_run_shuts_down_adapter_after_startup_failure(monkeypatch, tmp_path):
@@ -329,3 +331,21 @@ def test_event_subscription_shutdown_reports_detach_failure():
         "listeners were not detached" in message
         for message in logger.error_messages
     )
+
+
+def test_obsidian_polling_reschedules_after_a_safe_cycle_failure_and_cancels_on_close():
+    source = Path("main.py").read_text(encoding="utf-8")
+    polling = source[
+        source.index("    def schedule_registered_obsidian_poll("):
+        source.index("    def activity_progress_changed_handler(")
+    ]
+    closing = source[
+        source.index("    def close_window("):
+        source.index("    window.protocol(")
+    ]
+
+    assert "if closing:" in polling
+    assert "except Exception as error:" in polling
+    assert "finally:" in polling
+    assert "schedule_registered_obsidian_poll()" in polling
+    assert "window.after_cancel(game_data_read_after_id)" in closing

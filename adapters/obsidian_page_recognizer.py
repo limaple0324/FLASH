@@ -20,11 +20,16 @@ from services.character_game_data_capture_service import (
 )
 
 
-_CENTRAL_SHAPE_REGION = (0.06, 0.07, 0.70, 0.73)
-_SHAPE_SIGNATURE_SIZE = (160, 160)
 _SELECTION_TEXT_SIGNATURE_SIZE = (80, 80)
 _STAGE_EVIDENCE_REGION = (0.10, 0.14, 0.90, 0.47)
 _STATUS_EVIDENCE_REGION = (0.10, 0.48, 0.90, 0.90)
+_PANEL_ASPECT_MINIMUM = 1.34
+_PANEL_ASPECT_MAXIMUM = 1.48
+_PANEL_REFERENCE_ASPECT = 1.414
+_PANEL_SCAN_WIDTH = 512
+_PANEL_HEADER_RUN_MINIMUM_RATIO = 0.70
+_PANEL_MINIMUM_VISIBLE_HEIGHT_RATIO = 0.94
+_SELECTION_TEXT_TRANSLATION_RADIUS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,7 +352,6 @@ DEFAULT_OBSIDIAN_PAGE_DEFINITIONS = (
 class _ReferenceFrame:
     definition: ObsidianPageDefinition
     image: Image.Image
-    shape_signature: bytes
     stage_signature: bytes | None
     status_signature: bytes
 
@@ -382,7 +386,8 @@ def _binary_signature(
         size,
         method=Image.Resampling.BILINEAR,
     )
-    return bytes(1 if value >= 170 else 0 for value in fitted.getdata())
+    flattened = getattr(fitted, "get_flattened_data", fitted.getdata)
+    return bytes(1 if value >= 170 else 0 for value in flattened())
 
 
 def _jaccard_score(left: bytes, right: bytes) -> float:
@@ -396,6 +401,44 @@ def _jaccard_score(left: bytes, right: bytes) -> float:
             if first and second:
                 intersection += 1
     return intersection / union if union else 0.0
+
+
+def _translated_jaccard_score(
+    left: bytes,
+    right: bytes,
+    *,
+    size: tuple[int, int] = _SELECTION_TEXT_SIGNATURE_SIZE,
+    radius: int = _SELECTION_TEXT_TRANSLATION_RADIUS,
+) -> float:
+    """容許擷取縮放造成的少量文字位移，但不放寬文字內容。"""
+
+    width, height = size
+    if len(left) != width * height or len(right) != width * height:
+        return 0.0
+    left_points = {
+        (index % width, index // width)
+        for index, enabled in enumerate(left)
+        if enabled
+    }
+    right_points = {
+        (index % width, index // width)
+        for index, enabled in enumerate(right)
+        if enabled
+    }
+    if not left_points and not right_points:
+        return 1.0
+    best = 0.0
+    for shift_y in range(-radius, radius + 1):
+        for shift_x in range(-radius, radius + 1):
+            shifted = {
+                (x + shift_x, y + shift_y)
+                for x, y in right_points
+                if 0 <= x + shift_x < width and 0 <= y + shift_y < height
+            }
+            union = left_points | shifted
+            score = len(left_points & shifted) / len(union) if union else 0.0
+            best = max(best, score)
+    return best
 
 
 class ObsidianPageRecognizer:
@@ -427,8 +470,6 @@ class ObsidianPageRecognizer:
         self._clock = clock or (lambda: datetime.now().astimezone())
         self._frames: tuple[_ReferenceFrame, ...] = ()
         self._missing_references: tuple[str, ...] = ()
-        self._shape_minimum_score = 1.0
-        self._shape_minimum_margin = 1.0
         self._stage_minimum_score = 1.0
         self._status_minimum_score = 1.0
         self._status_minimum_margin = 1.0
@@ -446,6 +487,100 @@ class ObsidianPageRecognizer:
     @property
     def ready(self) -> bool:
         return bool(self._frames) and not self._missing_references
+
+    @staticmethod
+    def _longest_cyan_run(image: Image.Image, y: int) -> tuple[int, int, int]:
+        """回傳指定列最長的青藍色面板邊框區段。"""
+
+        pixels = image.load()
+        best_length = 0
+        best_start = 0
+        best_end = -1
+        start: int | None = None
+        for x in range(image.width):
+            red, green, blue = pixels[x, y]
+            is_cyan = (
+                green >= 105
+                and blue >= 105
+                and green - red >= 15
+                and blue - red >= 15
+                and abs(green - blue) <= 100
+            )
+            if is_cyan and start is None:
+                start = x
+            if (not is_cyan or x == image.width - 1) and start is not None:
+                end = x if is_cyan and x == image.width - 1 else x - 1
+                length = end - start + 1
+                if length > best_length:
+                    best_length = length
+                    best_start = start
+                    best_end = end
+                start = None
+        return best_length, best_start, best_end
+
+    @classmethod
+    def _panel_from_capture(cls, image: Image.Image) -> Image.Image | None:
+        """從完整遊戲畫面定位黑曜石面板；裁切不足時失敗關閉。"""
+
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return None
+        aspect = width / height
+        if _PANEL_ASPECT_MINIMUM <= aspect <= _PANEL_ASPECT_MAXIMUM:
+            return image
+
+        scale = min(1.0, _PANEL_SCAN_WIDTH / width)
+        scan = image.resize(
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            Image.Resampling.BILINEAR,
+        ).convert("RGB")
+        minimum_run = round(scan.width * _PANEL_HEADER_RUN_MINIMUM_RATIO)
+        runs = [
+            (length, y, start, end)
+            for y in range(scan.height)
+            for length, start, end in (cls._longest_cyan_run(scan, y),)
+            if length >= minimum_run
+        ]
+        if not runs:
+            return None
+
+        widest = max(item[0] for item in runs)
+        strong = [item for item in runs if item[0] >= widest * 0.90]
+        anchor_y = min(item[1] for item in strong)
+        header_band = [
+            item
+            for item in strong
+            if anchor_y <= item[1] <= anchor_y + round(scan.height * 0.10)
+        ]
+        if not header_band:
+            return None
+
+        scale_x = width / scan.width
+        scale_y = height / scan.height
+        left = max(0, int(min(item[2] for item in header_band) * scale_x))
+        right = min(
+            width,
+            int(max(item[3] + 1 for item in header_band) * scale_x + 0.999999),
+        )
+        top = max(0, int(anchor_y * scale_y))
+        panel_width = right - left
+        if panel_width <= 0:
+            return None
+        expected_height = round(panel_width / _PANEL_REFERENCE_ASPECT)
+        available_height = height - top
+        if expected_height <= 0 or available_height <= 0:
+            return None
+        if available_height < expected_height:
+            if available_height / expected_height < _PANEL_MINIMUM_VISIBLE_HEIGHT_RATIO:
+                return None
+            bottom = height
+        else:
+            bottom = top + expected_height
+        panel = image.crop((left, top, right, bottom))
+        panel_aspect = panel.width / panel.height
+        if not _PANEL_ASPECT_MINIMUM <= panel_aspect <= _PANEL_ASPECT_MAXIMUM:
+            return None
+        return panel
 
     @staticmethod
     def _gold_panel(image: Image.Image) -> Image.Image | None:
@@ -550,8 +685,9 @@ class ObsidianPageRecognizer:
         bottom = min(height, center_y + radius + 1)
         if left >= right or top >= bottom:
             return None
-        pixels = image.crop((left, top, right, bottom)).convert("RGB").getdata()
-        values = tuple(pixels)
+        cropped = image.crop((left, top, right, bottom)).convert("RGB")
+        flattened = getattr(cropped, "get_flattened_data", cropped.getdata)
+        values = tuple(flattened())
         if not values:
             return None
         brightness_values = tuple(
@@ -605,11 +741,6 @@ class ObsidianPageRecognizer:
                 _ReferenceFrame(
                     definition=definition,
                     image=image,
-                    shape_signature=_binary_signature(
-                        image,
-                        _CENTRAL_SHAPE_REGION,
-                        _SHAPE_SIGNATURE_SIZE,
-                    ),
                     stage_signature=stage_signature,
                     status_signature=status_signature,
                 )
@@ -622,15 +753,6 @@ class ObsidianPageRecognizer:
         self._calibrate()
 
     def _calibrate(self) -> None:
-        shape_cross_scores = [
-            _jaccard_score(first.shape_signature, second.shape_signature)
-            for index, first in enumerate(self._frames)
-            for second in self._frames[index + 1 :]
-        ]
-        shape_cross = max(shape_cross_scores, default=0.0)
-        self._shape_minimum_score = (1.0 + shape_cross) / 2.0
-        self._shape_minimum_margin = (1.0 - shape_cross) / 2.0
-
         completed_stages = [
             frame.stage_signature
             for frame in self._frames
@@ -652,7 +774,7 @@ class ObsidianPageRecognizer:
             self._frames = ()
             return
         status_cross = max(
-            _jaccard_score(first, second)
+            _translated_jaccard_score(first, second)
             for first in completed_statuses
             for second in activated
         )
@@ -665,8 +787,10 @@ class ObsidianPageRecognizer:
                 for signature in completed_stages
             )
         ) / 2.0
-        self._status_minimum_score = (1.0 + status_cross) / 2.0
-        self._status_minimum_margin = (1.0 - status_cross) / 2.0
+        # 完整遊戲視窗原圖及十張可靠面板的縮放反例校準：相同文字容許
+        # 兩像素位移後仍至少 0.35；不同狀態最高交叉分數遠低於此值。
+        self._status_minimum_score = max(0.35, status_cross + 0.20)
+        self._status_minimum_margin = max(0.30, status_cross + 0.20)
 
         lit_metrics: list[tuple[float, float, float]] = []
         gray_metrics: list[tuple[float, float, float]] = []
@@ -728,30 +852,23 @@ class ObsidianPageRecognizer:
     def _recognized_definition(
         self,
         image: Image.Image,
-    ) -> ObsidianPageDefinition | None:
-        candidate = _binary_signature(
-            image,
-            _CENTRAL_SHAPE_REGION,
-            _SHAPE_SIGNATURE_SIZE,
-        )
-        scored = sorted(
-            (
-                (_jaccard_score(candidate, frame.shape_signature), frame.definition)
-                for frame in self._frames
-            ),
-            key=lambda item: item[0],
-            reverse=True,
-        )
-        if not scored:
+    ) -> tuple[ObsidianPageDefinition, tuple[bool, ...]] | None:
+        matched: list[tuple[ObsidianPageDefinition, tuple[bool, ...]]] = []
+        for frame in self._frames:
+            states = self._node_states(image, frame.definition)
+            expected = tuple(
+                node.expected_lit
+                for node in frame.definition.topology
+            )
+            if states == expected:
+                matched.append((frame.definition, states))
+        if not matched:
             return None
-        best_score, definition = scored[0]
-        second_score = scored[1][0] if len(scored) > 1 else 0.0
-        if (
-            best_score < self._shape_minimum_score
-            or best_score - second_score <= self._shape_minimum_margin
-        ):
+        longest = max(len(item[0].topology) for item in matched)
+        strongest = [item for item in matched if len(item[0].topology) == longest]
+        if len(strongest) != 1:
             return None
-        return definition
+        return strongest[0]
 
     def _recognized_status(
         self,
@@ -763,7 +880,7 @@ class ObsidianPageRecognizer:
             return None
         completed_status_score = max(
             (
-                _jaccard_score(status_candidate, frame.status_signature)
+                _translated_jaccard_score(status_candidate, frame.status_signature)
                 for frame in self._frames
                 if frame.definition.status_text == "階段一／完成"
             ),
@@ -771,7 +888,7 @@ class ObsidianPageRecognizer:
         )
         active_score = max(
             (
-                _jaccard_score(status_candidate, frame.status_signature)
+                _translated_jaccard_score(status_candidate, frame.status_signature)
                 for frame in self._frames
                 if frame.definition.status_text == "激活"
             ),
@@ -781,7 +898,7 @@ class ObsidianPageRecognizer:
             stage_candidate = self._stage_signature(image)
             stage_score = max(
                 (
-                    _jaccard_score(stage_candidate, frame.stage_signature)
+                    _translated_jaccard_score(stage_candidate, frame.stage_signature)
                     for frame in self._frames
                     if frame.definition.status_text == "階段一／完成"
                     and frame.stage_signature is not None
@@ -837,17 +954,18 @@ class ObsidianPageRecognizer:
 
         if not self.ready or not isinstance(sample, CaptureSample):
             return None
-        image = self._image_from_sample(sample)
+        captured = self._image_from_sample(sample)
+        if captured is None:
+            return None
+        image = self._panel_from_capture(captured)
         if image is None:
             return None
-        definition = self._recognized_definition(image)
-        if definition is None:
+        recognized = self._recognized_definition(image)
+        if recognized is None:
             return None
+        definition, states = recognized
         status_text = self._recognized_status(image, definition)
         if status_text != definition.status_text:
-            return None
-        states = self._node_states(image, definition)
-        if states is None:
             return None
         now = self._clock()
         if (

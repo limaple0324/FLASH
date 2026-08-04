@@ -13,6 +13,17 @@ from services.logger_service import LoggerService
 DEFAULT_SMART_RECONNECT_INTERVAL_MS = 2000
 MINIMUM_SMART_RECONNECT_INTERVAL_MS = 500
 MAXIMUM_SMART_RECONNECT_INTERVAL_MS = 60_000
+FULLY_CONNECTED_STABLE_SECONDS = 30 * 60
+RECOVERY_POLL_SECONDS = 2.0
+SMART_RECONNECT_MODE_BALANCED = "balanced"
+SMART_RECONNECT_MODE_HIGH_PERFORMANCE = "high_performance"
+SMART_RECONNECT_MONITOR_MODES = (
+    SMART_RECONNECT_MODE_BALANCED,
+    SMART_RECONNECT_MODE_HIGH_PERFORMANCE,
+)
+SMART_RECONNECT_STATUS_ENABLED = "已開啟"
+SMART_RECONNECT_STATUS_RECONNECTING = "重連中"
+SMART_RECONNECT_STATUS_FAILED = "重連失敗"
 
 
 def normalize_smart_reconnect_interval_ms(
@@ -36,6 +47,16 @@ def normalize_smart_reconnect_interval_ms(
     return normalized
 
 
+def normalize_smart_reconnect_mode(
+    value: object,
+    *,
+    default: str = SMART_RECONNECT_MODE_BALANCED,
+) -> str:
+    if value in SMART_RECONNECT_MONITOR_MODES:
+        return str(value)
+    return default
+
+
 class SmartReconnectMonitor:
     """Run safe reconnect scans until explicitly stopped with the application."""
 
@@ -46,6 +67,7 @@ class SmartReconnectMonitor:
         logger: LoggerService | None = None,
         fallback_delay_seconds: int = 60,
         monitor_interval_ms: int = DEFAULT_SMART_RECONNECT_INTERVAL_MS,
+        monitor_mode: str = SMART_RECONNECT_MODE_BALANCED,
     ):
         if fallback_delay_seconds <= 0:
             raise ValueError("fallback_delay_seconds must be positive")
@@ -55,6 +77,9 @@ class SmartReconnectMonitor:
         self._monitor_interval_ms = normalize_smart_reconnect_interval_ms(
             monitor_interval_ms
         )
+        self._monitor_mode = normalize_smart_reconnect_mode(
+            monitor_mode,
+        )
         self._stop_event = threading.Event()
         self._settings_changed_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -62,6 +87,8 @@ class SmartReconnectMonitor:
         self._last_signature: tuple[object, ...] | None = None
         self._disconnected_without_progress_at: float | None = None
         self._disconnected_without_progress_reported = False
+        self._fully_connected_stable_from: float | None = None
+        self._runtime_status: str | None = None
 
     @property
     def running(self) -> bool:
@@ -72,6 +99,61 @@ class SmartReconnectMonitor:
     def monitor_interval_ms(self) -> int:
         with self._lock:
             return self._monitor_interval_ms
+
+    @property
+    def monitor_mode(self) -> str:
+        with self._lock:
+            return self._monitor_mode
+
+    @property
+    def runtime_status(self) -> str | None:
+        with self._lock:
+            return self._runtime_status if self.running else None
+
+    def _set_runtime_status(self, result: OperationResult) -> None:
+        details = result.details or {}
+        failure_codes = details.get("failure_codes")
+        normalized_failure_codes = (
+            tuple(str(item) for item in failure_codes)
+            if isinstance(failure_codes, (list, tuple))
+            else ()
+        )
+        has_failure = (
+            bool(normalized_failure_codes)
+        )
+        safely_waiting = (
+            result.code == "reconnect.waiting" and not has_failure
+        )
+        safely_paused_for_rebinding = (
+            result.code == "reconnect.operation_paused"
+            and normalized_failure_codes == ("operation_gate_closed",)
+        )
+        recovering = self._contains_recovery_states(details) or any(
+            self._has_positive_count(details, name)
+            for name in ("actionable_windows", "clicked_windows", "restarted_windows")
+        )
+        if safely_waiting or safely_paused_for_rebinding:
+            status = SMART_RECONNECT_STATUS_RECONNECTING
+        elif not result.success and has_failure:
+            status = SMART_RECONNECT_STATUS_FAILED
+        elif recovering:
+            status = SMART_RECONNECT_STATUS_RECONNECTING
+        elif not result.success:
+            status = SMART_RECONNECT_STATUS_FAILED
+        else:
+            status = SMART_RECONNECT_STATUS_ENABLED
+        with self._lock:
+            if self.running:
+                self._runtime_status = status
+
+    def set_monitor_mode(self, value: object) -> bool:
+        normalized = normalize_smart_reconnect_mode(value)
+        with self._lock:
+            changed = normalized != self._monitor_mode
+            self._monitor_mode = normalized
+        if changed:
+            self._settings_changed_event.set()
+        return True
 
     def set_monitor_interval_ms(self, value: object) -> bool:
         normalized = normalize_smart_reconnect_interval_ms(
@@ -153,6 +235,59 @@ class SmartReconnectMonitor:
             and not failure_codes
         )
 
+    def _recovery_poll_seconds(self) -> float:
+        if self.monitor_mode == SMART_RECONNECT_MODE_HIGH_PERFORMANCE:
+            return max(1.0, self.monitor_interval_ms / 1000.0)
+        return RECOVERY_POLL_SECONDS
+
+    @staticmethod
+    def _has_open_windows(details: Mapping[str, object]) -> bool:
+        discovered = details.get("discovered_windows")
+        return (
+            isinstance(discovered, int)
+            and not isinstance(discovered, bool)
+            and discovered > 0
+        )
+
+    @staticmethod
+    def _contains_disconnected_windows(details: Mapping[str, object]) -> bool:
+        state_counts = details.get("state_counts")
+        disconnected = (
+            state_counts.get("disconnected")
+            if isinstance(state_counts, Mapping)
+            else 0
+        )
+        return (
+            isinstance(disconnected, int)
+            and not isinstance(disconnected, bool)
+            and disconnected > 0
+        )
+
+    @staticmethod
+    def _contains_recovery_states(details: Mapping[str, object]) -> bool:
+        state_counts = details.get("state_counts")
+        if not isinstance(state_counts, Mapping):
+            return False
+        recovery_states = {
+            "disconnected",
+            "login_start",
+            "force_login_start",
+            "force_login_timeout",
+            "line_selection",
+            "character_selection",
+            "post_login_activity",
+            "post_login_recommendation",
+            "post_login_auto_dungeon",
+            "reconnecting",
+        }
+        return any(
+            state in recovery_states
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+            for state, count in state_counts.items()
+        )
+
     @staticmethod
     def _has_positive_count(
         details: Mapping[str, object],
@@ -211,11 +346,38 @@ class SmartReconnectMonitor:
 
     def run_once(self) -> tuple[OperationResult, float]:
         result = self._boundary.reconnect()
-        delay = self._safe_delay(result, self._fallback_delay_seconds)
         details = result.details or {}
-        if self._is_fully_connected_healthy(result):
-            delay = max(0.001, self.monitor_interval_ms / 1000.0)
-        self._report_stalled_reconnect(result, details, time.monotonic())
+        self._set_runtime_status(result)
+        now = time.monotonic()
+
+        delay = self._safe_delay(result, self._fallback_delay_seconds)
+        is_full_health = self._is_fully_connected_healthy(result)
+        has_open_windows = self._has_open_windows(details)
+        recovery_interval = self._recovery_poll_seconds()
+        if self._contains_disconnected_windows(details):
+            delay = recovery_interval
+            self._fully_connected_stable_from = None
+        elif has_open_windows:
+            if is_full_health:
+                if self._fully_connected_stable_from is None:
+                    self._fully_connected_stable_from = now
+                    delay = recovery_interval
+                elif now - self._fully_connected_stable_from >= FULLY_CONNECTED_STABLE_SECONDS:
+                    if self.monitor_mode == SMART_RECONNECT_MODE_BALANCED:
+                        delay = max(
+                            float(self._fallback_delay_seconds),
+                            delay,
+                        )
+                    else:
+                        delay = recovery_interval
+                else:
+                    delay = recovery_interval
+            else:
+                self._fully_connected_stable_from = None
+                delay = recovery_interval
+        else:
+            self._fully_connected_stable_from = None
+        self._report_stalled_reconnect(result, details, now)
         signature = self._signature(result)
         if self._logger is not None and signature != self._last_signature:
             state_counts = details.get("state_counts", {})
@@ -250,6 +412,8 @@ class SmartReconnectMonitor:
                 _result, delay = self.run_once()
             except Exception as exc:
                 delay = self._fallback_delay_seconds
+                with self._lock:
+                    self._runtime_status = SMART_RECONNECT_STATUS_FAILED
                 if self._logger is not None:
                     self._logger.error(
                         "Smart reconnect monitor cycle failed safely; "
@@ -274,6 +438,7 @@ class SmartReconnectMonitor:
                 execution_switch(True)
             self._stop_event.clear()
             self._settings_changed_event.clear()
+            self._runtime_status = SMART_RECONNECT_STATUS_ENABLED
             self._thread = threading.Thread(
                 target=self._run,
                 name="FLASH-SmartReconnect",
@@ -287,6 +452,7 @@ class SmartReconnectMonitor:
                     execution_switch(False)
                 self._stop_event.set()
                 self._settings_changed_event.set()
+                self._runtime_status = None
                 return False
             return True
 
@@ -311,5 +477,6 @@ class SmartReconnectMonitor:
             with self._lock:
                 if self._thread is thread:
                     self._thread = None
+                    self._runtime_status = None
         return stopped
 

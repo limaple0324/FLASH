@@ -39,6 +39,11 @@ class RegisteredGameDataWindow:
     window_handle: int
     character_id: str
     launch_fingerprint: str
+    process_id: int
+    rect: tuple[int, int, int, int]
+    thread_id: int
+    window_class: str
+    process_lifecycle_token: int
 
     def __post_init__(self) -> None:
         if (
@@ -49,11 +54,40 @@ class RegisteredGameDataWindow:
             raise ValueError("window_handle must be a positive integer.")
         if not isinstance(self.character_id, str) or not self.character_id.strip():
             raise ValueError("character_id must be a non-empty string.")
+        if (
+            isinstance(self.process_id, bool)
+            or not isinstance(self.process_id, int)
+            or self.process_id <= 0
+        ):
+            raise ValueError("process_id must be a positive integer.")
+        if (
+            not isinstance(self.rect, tuple)
+            or len(self.rect) != 4
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in self.rect)
+            or self.rect[2] <= self.rect[0]
+            or self.rect[3] <= self.rect[1]
+        ):
+            raise ValueError("rect must contain four integers with positive size.")
+        if (
+            isinstance(self.thread_id, bool)
+            or not isinstance(self.thread_id, int)
+            or self.thread_id <= 0
+        ):
+            raise ValueError("thread_id must be a positive integer.")
+        if not isinstance(self.window_class, str) or not self.window_class.strip():
+            raise ValueError("window_class must be a non-empty string.")
+        if (
+            isinstance(self.process_lifecycle_token, bool)
+            or not isinstance(self.process_lifecycle_token, int)
+            or self.process_lifecycle_token <= 0
+        ):
+            raise ValueError("process_lifecycle_token must be a positive integer.")
         fingerprint = normalize_launch_fingerprint(self.launch_fingerprint)
         if fingerprint is None:
             raise ValueError("launch_fingerprint must be a complete SHA-256 value.")
         object.__setattr__(self, "character_id", self.character_id.strip())
         object.__setattr__(self, "launch_fingerprint", fingerprint)
+        object.__setattr__(self, "window_class", self.window_class.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +219,20 @@ class CharacterGameDataCaptureService:
             return GameDataReadResult(
                 GameDataReadStatus.PAGE_UNRECOGNIZED,
                 error="目前畫面不是已確認的資料頁。",
+            )
+        try:
+            confirmed_target = self._registered_target_resolver(window_handle)
+        except Exception as error:
+            return GameDataReadResult(
+                GameDataReadStatus.TARGET_NOT_ELIGIBLE,
+                page=page,
+                error=str(error) or "擷取後目標視窗可靠綁定檢查失敗。",
+            )
+        if confirmed_target != target:
+            return GameDataReadResult(
+                GameDataReadStatus.TARGET_NOT_ELIGIBLE,
+                page=page,
+                error="擷取期間視窗、角色或匿名啟動指紋已變更。",
             )
         signature_key = (
             window_handle,

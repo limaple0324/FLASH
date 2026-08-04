@@ -138,6 +138,8 @@ class WindowInstanceToken:
                 not isinstance(value, int) or isinstance(value, bool)
                 for value in window.rect
             )
+            or window.rect[2] <= window.rect[0]
+            or window.rect[3] <= window.rect[1]
             or type(window.minimized) is not bool
         ):
             return None
@@ -1338,12 +1340,22 @@ class ReconnectRuntimeState:
 
 @dataclass(slots=True)
 class _TerminalEvidence:
-    handle: int
+    instance: WindowInstanceToken
     width: int
     height: int
     first_seen: float
     last_digest: bytes
     changing_frames: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ActionConfirmation:
+    instance: WindowInstanceToken
+    capture_route: str
+    capture_settings_revision: int
+    source_state_generation: int
+    signature: tuple[object, ...]
+    consecutive_frames: int
 
 
 class ReconnectRuntimeStateStore:
@@ -1689,6 +1701,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._execution_enabled = threading.Event()
         if execution_enabled:
             self._execution_enabled.set()
+        # Source revocation must serialize with the actual backend delivery.
+        # It intentionally has its own lock so the final delivery boundary
+        # never nests the screen-state and capture-settings locks in opposite
+        # directions.
+        self._source_authority_lock = threading.RLock()
         self._screen_state_lock = threading.RLock()
         self._scan_lock = threading.RLock()
         self._runtime_persist_lock = threading.RLock()
@@ -1740,7 +1757,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._character_selection_pending: set[str] = set()
         self._action_state_since: dict[
             str,
-            tuple[ReconnectScreenState, float],
+            tuple[WindowInstanceToken, ReconnectScreenState, float],
         ] = {}
         self._flow_pause_until = runtime_state.flow_pause_until
         self._preferred_line_numbers = runtime_state.preferred_line_numbers
@@ -1765,9 +1782,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             _TrustedConnectedEvidence,
         ] = {}
         self._source_state_generation = 0
+        # A continuing source failure is one revocation edge.  Keep its
+        # identity until a complete authority source observes that identity
+        # again, so repeated scans of the same missing role do not keep
+        # resetting every safe role to its first action frame.
+        self._source_revoked_fingerprints: set[str] = set()
         self._action_confirmations: dict[
             str,
-            tuple[tuple[object, ...], int],
+            _ActionConfirmation,
         ] = {}
         if self._expire_active_automation(now):
             self._persist_runtime_state()
@@ -1894,6 +1916,38 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         with self._screen_state_lock:
             self._last_trusted_capture_routes[fingerprint] = route
 
+    def _source_state_generation_snapshot(self) -> int:
+        with self._source_authority_lock:
+            return self._source_state_generation
+
+    def _source_authority_is_current(
+        self,
+        expected_source_state_generation: int | None,
+    ) -> bool:
+        if expected_source_state_generation is None:
+            return True
+        with self._source_authority_lock:
+            return (
+                self._source_state_generation
+                == expected_source_state_generation
+            )
+
+    def _remember_capture_route_if_source_current(
+        self,
+        fingerprint: str,
+        route: str | None,
+        expected_source_state_generation: int,
+    ) -> bool:
+        """Remember a route only while the capture source is still current."""
+        with self._source_authority_lock:
+            if (
+                self._source_state_generation
+                != expected_source_state_generation
+            ):
+                return False
+            self._remember_capture_route(fingerprint, route)
+            return True
+
     def _capture_authority_is_current(
         self,
         expected_revision: int | None,
@@ -1917,7 +1971,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._terminal_evidence.clear()
             self._character_selection_pending.clear()
             self._action_state_since.clear()
+            self._action_confirmations.clear()
             self._flow_pause_until.clear()
+            self._last_trusted_capture_routes.clear()
             self._trusted_connected_evidence.clear()
         self._publish_reconnecting_fingerprints()
         self._persist_runtime_state()
@@ -1934,6 +1990,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         # lock is re-entrant so a backend callback that changes a setting is
         # still detected by the scan revision checks below.
         with self._scan_lock:
+            with self._screen_state_lock:
+                previous_routes = dict(self._last_trusted_capture_routes)
+                previous_states = set(self._last_screen_states)
             with self._capture_settings_lock:
                 if settings == self._capture_settings:
                     return
@@ -1946,14 +2005,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._revoke_capture_authority()
             allowed = self._allowed_fingerprints
             with self._screen_state_lock:
-                tracked = set(self._last_screen_states)
-                tracked.update(self._last_trusted_capture_routes)
+                tracked = previous_states | set(previous_routes)
                 if allowed is not None:
                     tracked.update(allowed)
                 self._last_screen_states = {
                     fingerprint: self._revoked_screen_state(
                         settings,
-                        self._last_trusted_capture_routes.get(fingerprint),
+                        previous_routes.get(fingerprint),
                     )
                     for fingerprint in tracked
                 }
@@ -2067,16 +2125,39 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         fingerprint: str,
         *,
         execute: bool = False,
+        expected_source_state_generation: int | None = None,
     ) -> tuple[
         object | None,
         ScreenRecognition,
         bool,
         str | None,
     ]:
+        # Every capture route must start from one complete, immutable window
+        # instance. Do this before reading settings or probing/capturing so
+        # an incomplete source candidate cannot refresh online evidence.
+        if WindowInstanceToken.from_window(window) is None:
+            return self._unknown_capture_result()
+        if expected_source_state_generation is None:
+            expected_source_state_generation = (
+                self._source_state_generation_snapshot()
+            )
+        if not self._source_authority_is_current(
+            expected_source_state_generation,
+        ):
+            return self._unknown_capture_result()
+
+        def remember_route(route: str | None) -> bool:
+            return self._remember_capture_route_if_source_current(
+                fingerprint,
+                route,
+                expected_source_state_generation,
+            )
+
         settings = self.capture_settings
         if window.minimized:
             route = CAPTURE_ROUTE_MINIMIZED
-            self._remember_capture_route(fingerprint, route)
+            if not remember_route(route):
+                return self._unknown_capture_result()
             if not settings.minimized:
                 return self._disabled_capture_result(route)
             if (
@@ -2137,7 +2218,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 # UNKNOWN, so a stale background frame can never authorize a
                 # click or report a false disconnect.
                 route = CAPTURE_ROUTE_VISIBLE
-                self._remember_capture_route(fingerprint, route)
+                if not remember_route(route):
+                    return self._unknown_capture_result()
                 return (
                     visible_sample,
                     self._recognizer.recognize_capture(visible_sample),
@@ -2155,10 +2237,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             except OSError:
                 primary_sample = None
             if primary_sample is not None and primary_sample.api_succeeded:
-                self._remember_capture_route(
-                    fingerprint,
-                    CAPTURE_ROUTE_VISIBLE,
-                )
+                if not remember_route(CAPTURE_ROUTE_VISIBLE):
+                    return self._unknown_capture_result()
                 return (
                     primary_sample,
                     self._recognizer.recognize_capture(primary_sample),
@@ -2177,7 +2257,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     else None
                 )
             )
-            self._remember_capture_route(fingerprint, route)
+            if not remember_route(route):
+                return self._unknown_capture_result()
             return self._unknown_capture_result(primary_sample, route)
 
         visibly_unobscured = self._window_is_fully_visible_without_capture(
@@ -2185,7 +2266,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
         if visibly_unobscured is True:
             route = CAPTURE_ROUTE_VISIBLE
-            self._remember_capture_route(fingerprint, route)
+            if not remember_route(route):
+                return self._unknown_capture_result()
             if not settings.visible:
                 return self._disabled_capture_result(route)
             return self._unknown_capture_result(visible_sample, route)
@@ -2196,7 +2278,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return self._unknown_capture_result(visible_sample)
 
         route = CAPTURE_ROUTE_OBSCURED
-        self._remember_capture_route(fingerprint, route)
+        if not remember_route(route):
+            return self._unknown_capture_result()
         if not settings.obscured:
             return self._disabled_capture_result(route)
 
@@ -2264,8 +2347,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         sample,
         now: float,
     ) -> bool:
+        instance = WindowInstanceToken.from_window(window)
         ready_at = self._terminal_ready_after.get(fingerprint)
         if (
+            instance is None
+            or
             ready_at is None
             or sample is None
             or not sample.api_succeeded
@@ -2285,19 +2371,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             digest_size=16,
         ).digest()
         previous = self._terminal_evidence.get(fingerprint)
-        same_window = (
+        same_instance = (
             previous is not None
-            and previous.handle == window.handle
+            and previous.instance == instance
             and previous.width == sample.width
             and previous.height == sample.height
         )
         if (
-            same_window
+            same_instance
             and previous is not None
             and previous.last_digest != digest
         ):
             evidence = _TerminalEvidence(
-                handle=window.handle,
+                instance=instance,
                 width=sample.width,
                 height=sample.height,
                 first_seen=previous.first_seen,
@@ -2306,7 +2392,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
         else:
             evidence = _TerminalEvidence(
-                handle=window.handle,
+                instance=instance,
                 width=sample.width,
                 height=sample.height,
                 first_seen=now,
@@ -2314,11 +2400,63 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 changing_frames=1,
             )
         self._terminal_evidence[fingerprint] = evidence
+        # Three fresh, changing frames from the same responsive instance prove
+        # that the reconnect completed. A wall-clock delay adds no evidence and
+        # can keep a finished login flow in a false waiting state.
         return (
             evidence.changing_frames >= TERMINAL_CONFIRMATION_FRAMES
             and now - evidence.first_seen >= TERMINAL_CONFIRMATION_SECONDS
             and now - ready_at >= TERMINAL_CONFIRMATION_SECONDS
         )
+
+    @staticmethod
+    def _unique_complete_candidate_instances(
+        windows: Iterable[WindowInfo],
+    ) -> dict[str, tuple[WindowInfo, WindowInstanceToken]] | None:
+        """Return a fail-closed, one-role-per-live-instance collection."""
+        resolved: dict[str, tuple[WindowInfo, WindowInstanceToken]] = {}
+        handles: set[int] = set()
+        process_ids: set[int] = set()
+        for window in windows:
+            if not isinstance(window, WindowInfo):
+                return None
+            fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+            instance = WindowInstanceToken.from_window(window)
+            if fingerprint is None or instance is None:
+                return None
+            if (
+                fingerprint in resolved
+                or instance.handle in handles
+                or instance.process_id in process_ids
+            ):
+                return None
+            resolved[fingerprint] = (window, instance)
+            handles.add(instance.handle)
+            process_ids.add(instance.process_id)
+        return resolved
+
+    @staticmethod
+    def _candidate_collections_overlap(
+        supplied: dict[str, tuple[WindowInfo, WindowInstanceToken]],
+        authority_windows: Iterable[WindowInfo],
+    ) -> bool:
+        """Identify whether an explicit observation refers to live authority."""
+        supplied_fingerprints = set(supplied)
+        supplied_handles = {
+            instance.handle for _window, instance in supplied.values()
+        }
+        for window in authority_windows:
+            fingerprint = normalize_launch_fingerprint(
+                getattr(window, "launch_fingerprint", None)
+            )
+            if fingerprint in supplied_fingerprints:
+                return True
+            handle = getattr(window, "handle", None)
+            if handle in supplied_handles:
+                return True
+        return False
 
     def observe_screen_states(
         self,
@@ -2333,21 +2471,74 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         }
         if not requested:
             return {}
-        with self._screen_state_lock:
-            observation_source_generation = self._source_state_generation
         _settings, observation_revision = self._capture_settings_snapshot()
-        candidates = (
+        supplied = (
             tuple(candidate_windows)
             if candidate_windows is not None
-            else self._candidate_windows()
+            else None
         )
-        by_fingerprint: dict[str, list[WindowInfo]] = {}
-        for window in candidates:
-            fingerprint = normalize_launch_fingerprint(
-                window.launch_fingerprint
+        source_windows, source_failures, blocked_fingerprints = (
+            self._candidate_window_set()
+        )
+        source_instances = self._unique_complete_candidate_instances(
+            source_windows
+        )
+        if supplied is None:
+            candidates = source_windows
+            by_fingerprint = source_instances
+            recheck_live_authority = True
+            unsafe_candidate_set = bool(
+                source_failures
+                or blocked_fingerprints
+                or by_fingerprint is None
             )
-            if fingerprint in requested:
-                by_fingerprint.setdefault(fingerprint, []).append(window)
+        else:
+            candidates = supplied
+            by_fingerprint = self._unique_complete_candidate_instances(
+                candidates
+            )
+            overlap = self._candidate_collections_overlap(
+                by_fingerprint or {},
+                source_windows,
+            )
+            # Explicit candidates are used by the main-thread target contract.
+            # Preserve its existing ungrouped read-only path when the live
+            # enumerator knows nothing about that unrelated explicit instance.
+            recheck_live_authority = overlap
+            unsafe_candidate_set = by_fingerprint is None
+            if overlap and (
+                source_failures
+                or blocked_fingerprints
+                or source_instances is None
+                or any(
+                    source_instances.get(fingerprint, (None, None))[1]
+                    != instance
+                    for fingerprint, (_window, instance)
+                    in (by_fingerprint or {}).items()
+                )
+            ):
+                unsafe_candidate_set = True
+        if (
+            unsafe_candidate_set
+            or by_fingerprint is None
+            or not requested.issubset(by_fingerprint)
+        ):
+            # Missing, ambiguous, incomplete, or conflicting requested roles
+            # invalidate this entire passive source before its first capture.
+            # Advancing the generation prevents an older observer from later
+            # publishing any stale state over this UNKNOWN result.
+            self._revoke_source_failure_evidence(
+                frozenset(requested),
+                revoke_runtime_authority=True,
+                refresh_source_generation=True,
+            )
+            return {
+                fingerprint: ReconnectScreenState.UNKNOWN
+                for fingerprint in requested
+            }
+        observation_source_generation = (
+            self._source_state_generation_snapshot()
+        )
         observed: dict[str, ReconnectScreenState] = {}
         observed_routes: dict[str, str | None] = {}
         fresh_instances: dict[
@@ -2355,29 +2546,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             tuple[WindowInstanceToken, str],
         ] = {}
         for fingerprint in requested:
-            matches = by_fingerprint.get(fingerprint, ())
-            if len(matches) != 1:
-                # A missing or ambiguous live instance invalidates both the
-                # passive status cache and any short-lived CONNECTED evidence.
-                observed[fingerprint] = ReconnectScreenState.UNKNOWN
-                continue
+            window, initial_instance = by_fingerprint[fingerprint]
             (
                 sample,
                 recognition,
                 fresh_capture,
                 route,
             ) = self._capture_and_recognize(
-                matches[0],
+                window,
                 fingerprint,
+                expected_source_state_generation=(
+                    observation_source_generation
+                ),
             )
             observed_routes[fingerprint] = route
-            instance = WindowInstanceToken.from_window(matches[0])
             if (
                 fresh_capture
-                and instance is not None
+                and initial_instance is not None
                 and route is not None
             ):
-                fresh_instances[fingerprint] = (instance, route)
+                fresh_instances[fingerprint] = (initial_instance, route)
             _, current_revision = self._capture_settings_snapshot()
             if current_revision != observation_revision:
                 observed[fingerprint] = ReconnectScreenState.UNKNOWN
@@ -2389,7 +2577,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             ):
                 observed[fingerprint] = recognition.state
             elif self._recent_trusted_connected_state(
-                matches[0],
+                window,
                 fingerprint,
                 route,
                 observation_revision,
@@ -2397,18 +2585,49 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 observed[fingerprint] = ReconnectScreenState.CONNECTED
             else:
                 observed[fingerprint] = ReconnectScreenState.UNKNOWN
-        with self._screen_state_lock:
+        if recheck_live_authority:
+            final_windows, final_failures, final_blocked = (
+                self._candidate_window_set()
+            )
+            final_instances = self._unique_complete_candidate_instances(
+                final_windows
+            )
+            if (
+                final_failures
+                or final_blocked
+                or final_instances is None
+                or any(
+                    final_instances.get(fingerprint, (None, None))[1]
+                    != instance
+                    for fingerprint, (_window, instance)
+                    in by_fingerprint.items()
+                )
+            ):
+                self._revoke_source_failure_evidence(
+                    frozenset(requested),
+                    revoke_runtime_authority=True,
+                    refresh_source_generation=True,
+                )
+                return {
+                    fingerprint: ReconnectScreenState.UNKNOWN
+                    for fingerprint in requested
+                }
+        final_settings, final_revision = self._capture_settings_snapshot()
+        # Keep the source generation and the published observation in one
+        # source-authority -> screen-state order.  A completed revocation
+        # cannot be followed by an older observer publishing its stale frame.
+        with self._source_authority_lock:
             source_generation_changed = (
                 self._source_state_generation
                 != observation_source_generation
             )
-            with self._capture_settings_lock:
-                if self._capture_settings_revision != observation_revision:
+            with self._screen_state_lock:
+                if final_revision != observation_revision:
                     observed = {
-                        fingerprint: self._revoked_screen_state(
-                            self._capture_settings,
-                            observed_routes.get(fingerprint),
-                        )
+                        # The capture result belongs to an older setting
+                        # revision. A newly disabled route cannot describe
+                        # that stale capture as currently disabled.
+                        fingerprint: ReconnectScreenState.UNKNOWN
                         for fingerprint in observed
                     }
                     for fingerprint in fresh_instances:
@@ -2417,11 +2636,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             None,
                         )
                 elif source_generation_changed:
-                    for fingerprint, state in tuple(observed.items()):
-                        if state is ReconnectScreenState.CONNECTED:
-                            observed[fingerprint] = (
-                                ReconnectScreenState.UNKNOWN
-                            )
+                    # A source-generation change invalidates the complete
+                    # observation premise, not only online evidence.  The
+                    # sole exception is a current, explicit disabled setting.
+                    observed = {
+                        fingerprint: (
+                            ReconnectScreenState.CHECK_DISABLED
+                            if state is ReconnectScreenState.CHECK_DISABLED
+                            else ReconnectScreenState.UNKNOWN
+                        )
+                        for fingerprint, state in observed.items()
+                    }
+                    for fingerprint in fresh_instances:
                         self._trusted_connected_evidence.pop(
                             fingerprint,
                             None,
@@ -2455,7 +2681,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                                 fingerprint,
                                 None,
                             )
-            self._last_screen_states.update(observed)
+                self._last_screen_states.update(observed)
         return observed
 
     def reconnecting_fingerprints(self) -> frozenset[str]:
@@ -2469,6 +2695,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def _publish_reconnecting_fingerprints(
         self,
         now: float | None = None,
+        *,
+        observed_fingerprints: frozenset[str] | None = None,
     ) -> None:
         with self._screen_state_lock:
             current = self._monotonic_clock() if now is None else now
@@ -2482,6 +2710,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 self._pending_reconnect_fingerprints
                 | self._pending_reopen_fingerprints
                 | active
+                | (observed_fingerprints or frozenset())
             )
 
     def _expire_active_automation(self, now: float) -> bool:
@@ -2631,8 +2860,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         """Allow an active scan to stop before its next game-changing click."""
         if enabled:
             self._execution_enabled.set()
-        else:
-            self._execution_enabled.clear()
+            return
+        # Close the gate before waiting for an active scan.  Its next final
+        # authorization check must fail even while the remaining revocation is
+        # waiting for the scan's read-only work to finish.
+        self._execution_enabled.clear()
+        with self._scan_lock:
+            # A later enable is a new session, never permission to resume an
+            # old click, reopen, flow pause, terminal, or capture-route grant.
+            self._revoke_capture_authority()
 
     def _execution_allowed(self) -> bool:
         """Read the stop gate immediately before every mutating backend call."""
@@ -2645,13 +2881,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         *,
         expected_capture_settings_revision: int | None = None,
         capture_route: str | None = None,
+        expected_source_state_generation: int | None = None,
     ) -> tuple[bool, object | None]:
-        """Run only the actual game change under the shared exclusive gate."""
+        """Run one game-change transaction under the shared exclusive gate.
+
+        Capture settings are deliberately not held while ``callback`` performs
+        read-only preflight work.  Capture routes remember screen evidence,
+        so holding that lock here used to invert the screen-state lock order.
+        The tiny final backend operation is instead linearized by
+        ``_run_authorized_backend_call`` immediately before it is sent.
+        """
         if not self._execution_allowed():
             return False, None
         if not self._capture_authority_is_current(
             expected_capture_settings_revision,
             capture_route,
+        ):
+            return False, None
+        if not self._source_authority_is_current(
+            expected_source_state_generation,
         ):
             return False, None
         gate = self._operation_gate
@@ -2669,9 +2917,38 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         try:
             if not self._execution_allowed():
                 return False, None
-            # Keep this lock through the backend call. A settings update then
-            # linearizes either before this final authorization check or after
-            # the mutation has completed, never between the two.
+            return True, callback()
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def _run_authorized_backend_call(
+        self,
+        callback: Callable[[], object],
+        *,
+        expected_capture_settings_revision: int | None,
+        capture_route: str | None,
+        expected_source_state_generation: int | None,
+    ) -> tuple[bool, object | None]:
+        """Linearize one final backend mutation with capture settings.
+
+        Callers must do all enumeration, capture, and screen-state checks
+        before this method.  Keeping this critical section free of those
+        operations gives the module one lock direction: capture settings are
+        never held while the screen-state lock can be acquired.
+        """
+        # Hold the source authority generation across the backend call.  A
+        # completed source revocation therefore linearizes before an older
+        # scan can reach this final mutation boundary.  The only nested lock
+        # is source-authority -> capture-settings; no path takes the reverse
+        # order or involves the screen-state lock here.
+        with self._source_authority_lock:
+            if (
+                expected_source_state_generation is not None
+                and self._source_state_generation
+                != expected_source_state_generation
+            ):
+                return False, None
             with self._capture_settings_lock:
                 if (
                     expected_capture_settings_revision is not None
@@ -2687,9 +2964,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 if not self._execution_allowed():
                     return False, None
                 return True, callback()
-        finally:
-            if lease is not None:
-                lease.release()
 
     def _matching_windows(self) -> tuple[WindowInfo, ...]:
         return tuple(
@@ -2764,6 +3038,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         return (
             item.state,
             item.click_point,
+            item.reference_name,
             item.line_number,
             item.character_level,
             item.character_slot_index,
@@ -2771,6 +3046,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             item.character_identity,
             item.character_candidates,
             item.battle_context,
+        )
+
+    @staticmethod
+    def _action_signature_is_complete(item: ScreenRecognition) -> bool:
+        point = item.click_point
+        return bool(
+            isinstance(item.reference_name, str)
+            and item.reference_name.strip()
+            and isinstance(point, tuple)
+            and len(point) == 2
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and 0.0 <= value <= 1.0
+                for value in point
+            )
         )
 
     def _recognition_for_preferred_line(
@@ -2818,31 +3109,91 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._terminal_evidence.pop(fingerprint, None)
         self._clear_action_confirmation(fingerprint)
 
+    def _clear_reconnect_authority(
+        self,
+        windows: tuple[WindowInfo, ...],
+    ) -> None:
+        for window in windows:
+            fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
+            if fingerprint is None:
+                continue
+            self._clear_reconnect_session(fingerprint)
+            self._clear_reconnect_failure(fingerprint)
+
     def _action_is_confirmed(
         self,
         fingerprint: str,
         item: ScreenRecognition,
+        *,
+        instance: WindowInstanceToken | None,
+        capture_route: str | None,
+        capture_settings_revision: int,
+        source_state_generation: int,
     ) -> bool:
-        signature = self._action_signature(item)
-        previous_signature, previous_count = self._action_confirmations.get(
-            fingerprint,
-            ((), 0),
-        )
-        count = previous_count + 1 if previous_signature == signature else 1
-        self._action_confirmations[fingerprint] = (signature, count)
-        return count >= ACTION_CONFIRMATION_FRAMES
+        if instance is None or capture_route is None:
+            self._clear_action_confirmation(fingerprint)
+            return False
+        # A source revoke has to break both existing and concurrently captured
+        # two-frame evidence. Keep this update inside the same source lock
+        # used by the final backend boundary, so stale scans cannot recreate
+        # a confirmation after the revoke has completed.
+        with self._source_authority_lock:
+            if (
+                self._source_state_generation
+                != source_state_generation
+            ):
+                with self._screen_state_lock:
+                    self._clear_action_confirmation(fingerprint)
+                return False
+            signature = self._action_signature(item)
+            with self._screen_state_lock:
+                previous = self._action_confirmations.get(fingerprint)
+                count = (
+                    previous.consecutive_frames + 1
+                    if (
+                        previous is not None
+                        and previous.instance == instance
+                        and previous.capture_route == capture_route
+                        and previous.capture_settings_revision
+                        == capture_settings_revision
+                        and previous.source_state_generation
+                        == source_state_generation
+                        and previous.signature == signature
+                    )
+                    else 1
+                )
+                self._action_confirmations[fingerprint] = (
+                    _ActionConfirmation(
+                        instance=instance,
+                        capture_route=capture_route,
+                        capture_settings_revision=(
+                            capture_settings_revision
+                        ),
+                        source_state_generation=(
+                            source_state_generation
+                        ),
+                        signature=signature,
+                        consecutive_frames=count,
+                    )
+                )
+                return count >= ACTION_CONFIRMATION_FRAMES
 
     def _action_wait_seconds(
         self,
         fingerprint: str,
         state: ReconnectScreenState,
         now: float,
+        instance: WindowInstanceToken | None = None,
     ) -> int:
         deadlines: list[float] = []
         first_seen = self._action_state_since.get(fingerprint)
-        if state is ReconnectScreenState.DISCONNECTED and first_seen is not None:
+        if (
+            state is ReconnectScreenState.DISCONNECTED
+            and first_seen is not None
+            and (instance is None or first_seen[0] == instance)
+        ):
             deadlines.append(
-                first_seen[1]
+                first_seen[2]
                 + self._policy.disconnect_confirmation_wait_seconds
             )
         pause_until = self._flow_pause_until.get(fingerprint)
@@ -3228,49 +3579,99 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return role_target
         return recognition
 
+    def _selected_group_is_complete(
+        self,
+        windows: tuple[WindowInfo, ...],
+    ) -> bool:
+        allowed = self._allowed_fingerprints
+        if allowed is None:
+            return True
+        complete_instances = self._unique_complete_candidate_instances(windows)
+        return (
+            complete_instances is not None
+            and set(complete_instances) == allowed
+        )
+
     def _current_action_window(
         self,
-        expected: WindowInfo,
+        expected: WindowInfo | WindowInstanceToken,
         fingerprint: str,
     ) -> WindowInfo | None:
         candidates, failures, blocked_fingerprints = (
             self._candidate_window_set()
         )
-        if (
-            fingerprint in blocked_fingerprints
-            or "target_window_provider_failed" in failures
-        ):
-            return None
-        matches = tuple(
+        expected_instance = (
+            expected
+            if isinstance(expected, WindowInstanceToken)
+            else WindowInstanceToken.from_window(expected)
+        )
+        allowed = self._allowed_fingerprints
+        scoped_candidates = tuple(
             candidate
             for candidate in candidates
-            if normalize_launch_fingerprint(candidate.launch_fingerprint)
-            == fingerprint
+            if (
+                allowed is None
+                or normalize_launch_fingerprint(
+                    candidate.launch_fingerprint
+                )
+                in allowed
+            )
         )
-        if len(matches) != 1:
-            return None
-        current = matches[0]
+        scoped_blocked_fingerprints = frozenset(
+            item
+            for item in blocked_fingerprints
+            if allowed is None or item in allowed
+        )
+        instances = self._unique_complete_candidate_instances(
+            scoped_candidates
+        )
+        group_failures = self._group_failures(scoped_candidates)
         if (
-            current.handle != expected.handle
-            or current.process_id is None
-            or expected.process_id is None
-            or current.process_id != expected.process_id
+            expected_instance is None
+            or failures
+            or scoped_blocked_fingerprints
+            or instances is None
+            or group_failures
         ):
+            # A final delivery must not reuse a two-frame confirmation when
+            # its original group identity premise has disappeared.  Clear the
+            # target's captured route and confirmation together, so the next
+            # scan starts from fresh, consecutive evidence.
+            with self._screen_state_lock:
+                self._mark_fingerprints_unknown_locked((fingerprint,))
             return None
-        return current
+        current = instances.get(fingerprint)
+        if current is None:
+            with self._screen_state_lock:
+                self._mark_fingerprints_unknown_locked((fingerprint,))
+            return None
+        window, instance = current
+        if instance != expected_instance:
+            with self._screen_state_lock:
+                self._mark_fingerprints_unknown_locked((fingerprint,))
+            return None
+        return window
 
     def _action_still_matches(
         self,
-        window: WindowInfo,
+        expected_instance: WindowInstanceToken,
         fingerprint: str,
         expected: ScreenRecognition,
         expected_capture_settings_revision: int,
         expected_capture_route: str | None,
+        expected_source_state_generation: int,
     ) -> str | None:
         if not self._capture_authority_is_current(
             expected_capture_settings_revision,
             expected_capture_route,
         ):
+            return None
+        if not self._source_authority_is_current(
+            expected_source_state_generation,
+        ):
+            return None
+        window = self._current_action_window(expected_instance, fingerprint)
+        if window is None:
             return None
         (
             _sample,
@@ -3281,6 +3682,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             window,
             fingerprint,
             execute=True,
+            expected_source_state_generation=(
+                expected_source_state_generation
+            ),
         )
         if (
             not fresh_capture
@@ -3288,6 +3692,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or not self._capture_authority_is_current(
                 expected_capture_settings_revision,
                 current_route,
+            )
+            or not self._source_authority_is_current(
+                expected_source_state_generation,
             )
         ):
             return None
@@ -3300,6 +3707,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             current,
         )
         if self._action_signature(current) != self._action_signature(expected):
+            return None
+        if (
+            self._current_action_window(expected_instance, fingerprint)
+            is None
+        ):
+            return None
+        if not self._source_authority_is_current(
+            expected_source_state_generation,
+        ):
             return None
         return current_route
 
@@ -3317,6 +3733,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         *,
         expected_capture_settings_revision: int | None = None,
         capture_route: str | None = None,
+        expected_source_state_generation: int | None = None,
     ) -> None:
         service = self._failure_status_service
         target = (
@@ -3345,6 +3762,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     expected_capture_settings_revision
                 ),
                 capture_route=capture_route,
+                expected_source_state_generation=(
+                    expected_source_state_generation
+                ),
             )
             self._record_reconnect_failure(
                 target.display_name,
@@ -3383,7 +3803,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         *,
         expected_capture_settings_revision: int | None = None,
         capture_route: str | None = None,
+        expected_source_state_generation: int | None = None,
     ) -> BattleRestartResult:
+        if expected_source_state_generation is None:
+            expected_source_state_generation = (
+                self._source_state_generation_snapshot()
+            )
+        if not self._source_authority_is_current(
+            expected_source_state_generation,
+        ):
+            self._clear_action_confirmation(fingerprint)
+            return BattleRestartResult(False, "reconnect_stopped")
         target = self._target_for_fingerprint(fingerprint)
         restarter = self._battle_restarter
         if target is None or restarter is None:
@@ -3395,17 +3825,20 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         candidates, source_failures, blocked_fingerprints = (
             self._candidate_window_set()
         )
-        if "target_window_provider_failed" in source_failures:
+        safety_failures = self._reopen_safety_failures(
+            candidates,
+            source_failures,
+            blocked_fingerprints,
+        )
+        if safety_failures:
             self._clear_action_confirmation(fingerprint)
             return BattleRestartResult(
                 False,
-                "target_window_provider_failed",
-            )
-        if fingerprint in blocked_fingerprints:
-            self._clear_action_confirmation(fingerprint)
-            return BattleRestartResult(
-                False,
-                "reconnect_restart_identity_unsafe",
+                (
+                    "target_window_provider_failed"
+                    if "target_window_provider_failed" in safety_failures
+                    else "reconnect_restart_identity_unsafe"
+                ),
             )
         matches = tuple(
             window
@@ -3420,7 +3853,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 "reconnect_restart_window_ambiguous",
             )
         if len(matches) == 1:
-            mutation = lambda: restarter.restart(matches[0], target)
+            mutation = lambda: self._run_authorized_backend_call(
+                lambda: restarter.restart(matches[0], target),
+                expected_capture_settings_revision=(
+                    expected_capture_settings_revision
+                ),
+                capture_route=capture_route,
+                expected_source_state_generation=(
+                    expected_source_state_generation
+                ),
+            )[1]
         else:
             reopen_missing = getattr(restarter, "reopen_missing", None)
             if not callable(reopen_missing):
@@ -3429,7 +3871,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     False,
                     "reconnect_restart_unavailable",
                 )
-            mutation = lambda: reopen_missing(target, candidates)
+            mutation = lambda: self._run_authorized_backend_call(
+                lambda: reopen_missing(target, candidates),
+                expected_capture_settings_revision=(
+                    expected_capture_settings_revision
+                ),
+                capture_route=capture_route,
+                expected_source_state_generation=(
+                    expected_source_state_generation
+                ),
+            )[1]
         permitted, mutation_result = self._run_game_mutation(
             "smart-reconnect-restart",
             mutation,
@@ -3437,6 +3888,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 expected_capture_settings_revision
             ),
             capture_route=capture_route,
+            expected_source_state_generation=(
+                expected_source_state_generation
+            ),
         )
         if not permitted or not isinstance(
             mutation_result,
@@ -3448,6 +3902,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if not self._capture_authority_is_current(
             expected_capture_settings_revision,
             capture_route,
+        ):
+            self._clear_action_confirmation(fingerprint)
+            return BattleRestartResult(False, "reconnect_stopped")
+        if not self._source_authority_is_current(
+            expected_source_state_generation,
         ):
             self._clear_action_confirmation(fingerprint)
             return BattleRestartResult(False, "reconnect_stopped")
@@ -3482,6 +3941,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._require_expected_window_count
             and
             self._allowed_fingerprints is None
+            and not (
+                self._pending_reconnect_fingerprints
+                or self._pending_reopen_fingerprints
+                or self._active_automation_fingerprints
+            )
             and len(windows) != self._expected_windows
         ):
             failures.append("window_count_mismatch")
@@ -3512,53 +3976,146 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or len(set(fingerprints)) != len(fingerprints)
         ):
             failures.append("fingerprint_missing_or_duplicate")
-        if self._allowed_fingerprints is not None and not set(
-            fingerprints
-        ).issubset(self._allowed_fingerprints):
+        if (
+            self._allowed_fingerprints is not None
+            and set(
+                fingerprint
+                for fingerprint in fingerprints
+                if fingerprint is not None
+            ) != set(self._allowed_fingerprints)
+            and (
+                self._action_confirmations
+                or self._pending_reconnect_fingerprints
+                or self._pending_reopen_fingerprints
+                or self._active_automation_fingerprints
+            )
+        ):
             failures.append("group_identity_set_mismatch")
         return failures
+
+    def _reopen_safety_failures(
+        self,
+        windows: tuple[WindowInfo, ...],
+        source_failures: tuple[str, ...],
+        blocked_fingerprints: frozenset[str],
+    ) -> list[str]:
+        """Fail closed before any restart or reopen backend call.
+
+        A missing role is deliberately safe to reopen.  Every other live
+        candidate must nevertheless form one complete, collision-free
+        identity collection, independent of the caller that reached this
+        boundary.
+        """
+        failures = list(source_failures)
+        if blocked_fingerprints:
+            failures.append("window_identity_blocked")
+        if self._unique_complete_candidate_instances(windows) is not None:
+            return failures
+        group_failures = self._group_failures(windows)
+        identity_failures = [
+            code
+            for code in group_failures
+            if code
+            in {
+                "window_handle_missing_or_duplicate",
+                "process_identity_missing_or_duplicate",
+                "window_instance_incomplete",
+                "fingerprint_missing_or_duplicate",
+                "group_identity_set_mismatch",
+            }
+        ]
+        return failures + (identity_failures or ["window_identity_unsafe"])
 
     def _revoke_group_failure_evidence(
         self,
         windows: tuple[WindowInfo, ...],
         blocked_fingerprints: frozenset[str],
     ) -> None:
-        """Replace every identity affected by an unsafe group with UNKNOWN."""
-        live_fingerprints = {
-            fingerprint
+        """Revoke only identities proven unsafe by a group failure.
+
+        A temporarily absent planned role may still be retried safely.  It is
+        not interchangeable with a live candidate that is incomplete or
+        collides with another live instance, so do not erase the safe subset.
+        """
+        affected = set(blocked_fingerprints)
+        affected.update(self._last_screen_states)
+        affected.update(self._trusted_connected_evidence)
+        if self._allowed_fingerprints is not None:
+            affected.update(self._allowed_fingerprints)
+        normalized_windows = [
+            (
+                normalize_launch_fingerprint(window.launch_fingerprint),
+                WindowInstanceToken.from_window(window),
+            )
             for window in windows
+        ]
+        handle_counts = Counter(
+            token.handle for _fingerprint, token in normalized_windows
+            if token is not None
+        )
+        process_counts = Counter(
+            token.process_id for _fingerprint, token in normalized_windows
+            if token is not None
+        )
+        fingerprint_counts = Counter(
+            fingerprint
+            for fingerprint, _token in normalized_windows
+            if fingerprint is not None
+        )
+        for fingerprint, token in normalized_windows:
+            if fingerprint is None:
+                continue
             if (
-                fingerprint := normalize_launch_fingerprint(
-                    window.launch_fingerprint
-                )
-            )
-            is not None
-        }
+                token is None
+                or handle_counts[token.handle] != 1
+                or process_counts[token.process_id] != 1
+                or fingerprint_counts[fingerprint] != 1
+            ):
+                affected.add(fingerprint)
+        if not affected:
+            return
         with self._screen_state_lock:
-            affected = (
-                set(self._last_screen_states)
-                | set(self._trusted_connected_evidence)
-                | set(blocked_fingerprints)
-                | live_fingerprints
+            self._mark_fingerprints_unknown_locked(
+                affected,
+                revoke_runtime_authority=False,
             )
-            if self._allowed_fingerprints is not None:
-                affected.update(self._allowed_fingerprints)
-            self._mark_fingerprints_unknown_locked(affected)
 
     def _mark_fingerprints_unknown_locked(
         self,
         fingerprints: Iterable[str],
+        *,
+        revoke_runtime_authority: bool = False,
     ) -> None:
         for fingerprint in fingerprints:
-            if normalize_launch_fingerprint(fingerprint) is None:
+            normalized = normalize_launch_fingerprint(fingerprint)
+            if normalized is None:
                 continue
-            self._last_screen_states[fingerprint] = (
+            # No unknown source frame may bridge action confirmation or retain
+            # a capture route. A full runtime revocation is reserved for a
+            # passive source failure or an unsafe live instance; a planned
+            # role that is simply absent remains eligible for its separately
+            # guarded reopen retry.
+            self._last_screen_states[normalized] = (
                 ReconnectScreenState.UNKNOWN
             )
             self._trusted_connected_evidence.pop(
-                fingerprint,
+                normalized,
                 None,
             )
+            self._last_trusted_capture_routes.pop(normalized, None)
+            self._action_retry_after.pop(normalized, None)
+            self._action_state_since.pop(normalized, None)
+            self._action_confirmations.pop(normalized, None)
+            if revoke_runtime_authority:
+                self._pending_reconnect_fingerprints.discard(normalized)
+                self._pending_reopen_fingerprints.discard(normalized)
+                self._active_automation_fingerprints.discard(normalized)
+                self._active_automation_until.pop(normalized, None)
+                self._reopen_retry_after.pop(normalized, None)
+                self._terminal_ready_after.pop(normalized, None)
+                self._terminal_evidence.pop(normalized, None)
+                self._character_selection_pending.discard(normalized)
+                self._flow_pause_until.pop(normalized, None)
 
     def _source_failure_affected_fingerprints(
         self,
@@ -3574,38 +4131,104 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
             is not None
         }
-        allowed = self._allowed_fingerprints
-        if allowed is None:
-            return frozenset(affected)
-        live_counts = Counter(
-            fingerprint
-            for window in windows
-            if (
-                fingerprint := normalize_launch_fingerprint(
-                    window.launch_fingerprint
-                )
+        complete_counts: Counter[str] = Counter()
+        unsafe_live_fingerprints: set[str] = set()
+        for window in windows:
+            fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
             )
-            is not None
-            and fingerprint in allowed
-            and fingerprint not in affected
-        )
+            if fingerprint is None:
+                continue
+            if (
+                fingerprint in affected
+                or WindowInstanceToken.from_window(window) is None
+            ):
+                unsafe_live_fingerprints.add(fingerprint)
+                continue
+            complete_counts[fingerprint] += 1
         uniquely_valid = {
             fingerprint
-            for fingerprint, count in live_counts.items()
-            if count == 1
+            for fingerprint, count in complete_counts.items()
+            if count == 1 and fingerprint not in unsafe_live_fingerprints
         }
-        affected.update(allowed - uniquely_valid)
+        allowed = self._allowed_fingerprints
+        if allowed is not None:
+            affected.update(allowed - uniquely_valid)
+            return frozenset(affected)
+        # In global mode there is no planned identity set to compare against.
+        # Previously published states and trusted CONNECTED evidence are the
+        # only known identities. A source empty-set or subset must revoke any
+        # one no longer represented by exactly one complete instance.
+        with self._screen_state_lock:
+            # An already UNKNOWN identity was revoked by an earlier source
+            # transition.  It is not fresh evidence that should revoke the
+            # same source generation again on every subsequent scan.
+            previously_published = {
+                fingerprint
+                for fingerprint, state in self._last_screen_states.items()
+                if state is not ReconnectScreenState.UNKNOWN
+            } | set(self._trusted_connected_evidence)
+        affected.update(previously_published - uniquely_valid)
         return frozenset(affected)
+
+    def _clear_recovered_source_revocations(
+        self,
+        windows: tuple[WindowInfo, ...],
+        source_failures: tuple[str, ...],
+        blocked_fingerprints: frozenset[str],
+    ) -> None:
+        """Allow a later, new failure only after full authority recovery."""
+        if source_failures or blocked_fingerprints:
+            return
+        complete_instances = self._unique_complete_candidate_instances(
+            windows
+        )
+        if complete_instances is None:
+            return
+        with self._source_authority_lock:
+            self._source_revoked_fingerprints.difference_update(
+                complete_instances
+            )
 
     def _revoke_source_failure_evidence(
         self,
         fingerprints: frozenset[str],
+        *,
+        revoke_runtime_authority: bool = False,
+        refresh_source_generation: bool = True,
     ) -> None:
         if not fingerprints:
             return
-        with self._screen_state_lock:
-            self._source_state_generation += 1
-            self._mark_fingerprints_unknown_locked(fingerprints)
+        normalized_fingerprints = {
+            fingerprint
+            for fingerprint in (
+                normalize_launch_fingerprint(item) for item in fingerprints
+            )
+            if fingerprint is not None
+        }
+        if not normalized_fingerprints:
+            return
+        # Revocation and final backend delivery share this source lock. Once
+        # this method returns, an older scan cannot deliver any mutation that
+        # was authorized by the previous source generation.
+        with self._source_authority_lock:
+            newly_revoked = (
+                normalized_fingerprints
+                - self._source_revoked_fingerprints
+            )
+            self._source_revoked_fingerprints.update(
+                normalized_fingerprints
+            )
+            with self._screen_state_lock:
+                if refresh_source_generation and newly_revoked:
+                    self._source_state_generation += 1
+                self._mark_fingerprints_unknown_locked(
+                    normalized_fingerprints,
+                    revoke_runtime_authority=revoke_runtime_authority,
+                )
+        self._publish_reconnecting_fingerprints()
+        if revoke_runtime_authority:
+            self._persist_runtime_state()
 
     def _runtime_state(self) -> ReconnectRuntimeState:
         with self._screen_state_lock:
@@ -3666,6 +4289,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         execute: bool,
         now: float,
         expected_capture_settings_revision: int,
+        expected_source_state_generation: int,
+        safety_failures: tuple[str, ...] = (),
     ) -> tuple[int, list[str], int | None]:
         live_counts: Counter[str] = Counter()
         unsafe_live_fingerprints: set[str] = set()
@@ -3705,6 +4330,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         missing = tuple(sorted(self._pending_reopen_fingerprints))
         if not missing:
             return 0, [], None
+        if safety_failures:
+            failures = list(safety_failures)
+            if set(missing) & set(blocked_fingerprints):
+                failures.append("battle_reopen_identity_unsafe")
+            return (
+                0,
+                failures,
+                self._policy.retry_interval_seconds,
+            )
         if "target_window_provider_failed" in source_failures:
             return (
                 0,
@@ -3723,6 +4357,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if not self._capture_authority_is_current(
                 expected_capture_settings_revision,
                 capture_route,
+            ):
+                continue
+            if not self._source_authority_is_current(
+                expected_source_state_generation,
             ):
                 continue
             retry_at = self._reopen_retry_after.get(fingerprint, now)
@@ -3761,11 +4399,23 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
             permitted, mutation_result = self._run_game_mutation(
                 "smart-reconnect-reopen",
-                lambda: retry_open(target, candidate_windows),
+                lambda: self._run_authorized_backend_call(
+                    lambda: retry_open(target, candidate_windows),
+                    expected_capture_settings_revision=(
+                        expected_capture_settings_revision
+                    ),
+                    capture_route=capture_route,
+                    expected_source_state_generation=(
+                        expected_source_state_generation
+                    ),
+                )[1],
                 expected_capture_settings_revision=(
                     expected_capture_settings_revision
                 ),
                 capture_route=capture_route,
+                expected_source_state_generation=(
+                    expected_source_state_generation
+                ),
             )
             if not permitted or not isinstance(
                 mutation_result,
@@ -3782,6 +4432,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if not self._capture_authority_is_current(
                 expected_capture_settings_revision,
                 capture_route,
+            ):
+                self._clear_action_confirmation(fingerprint)
+                continue
+            if not self._source_authority_is_current(
+                expected_source_state_generation,
             ):
                 self._clear_action_confirmation(fingerprint)
                 continue
@@ -3806,6 +4461,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         expected_capture_settings_revision
                     ),
                     capture_route=capture_route,
+                    expected_source_state_generation=(
+                        expected_source_state_generation
+                    ),
                 )
 
         next_delay = min(next_delays) if next_delays else None
@@ -3849,11 +4507,67 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 blocked_fingerprints,
             )
         )
-        self._revoke_source_failure_evidence(
-            source_failure_affected_fingerprints
+        self._clear_recovered_source_revocations(
+            candidate_windows,
+            source_failures,
+            blocked_fingerprints,
+        )
+        if source_failure_affected_fingerprints:
+            if (
+                self._allowed_fingerprints is not None
+                and not source_failures
+                and not blocked_fingerprints
+            ):
+                # A planned role that is temporarily absent is not a new
+                # source-authority failure. Mark only that role UNKNOWN while
+                # preserving the current scan generation for its healthy peers.
+                self._revoke_source_failure_evidence(
+                    source_failure_affected_fingerprints,
+                    refresh_source_generation=False,
+                )
+            else:
+                preserve_pending_reopen = bool(
+                    self._pending_reopen_fingerprints
+                    & source_failure_affected_fingerprints
+                )
+                self._revoke_source_failure_evidence(
+                    source_failure_affected_fingerprints,
+                    # Keep a pending missing role long enough for the guarded
+                    # reopen boundary to report its identity failure.  It
+                    # remains blocked from every backend call by
+                    # _retry_pending_reopens.
+                    revoke_runtime_authority=not preserve_pending_reopen,
+                    refresh_source_generation=True,
+                )
+        scan_source_state_generation = (
+            self._source_state_generation_snapshot()
         )
         state_before = self._runtime_state_signature()
         now = self._monotonic_clock()
+        group_failures = self._group_failures(windows)
+        source_identity_unsafe = bool(
+            source_failures
+            or blocked_fingerprints
+            or self._unique_complete_candidate_instances(
+                candidate_windows
+            )
+            is None
+        )
+        if source_identity_unsafe:
+            # A source-reported failure or unsafe live instance interrupts
+            # every pending action frame.  No safe-looking peer may rebuild
+            # confirmation until the source itself is complete again.
+            self._clear_action_confirmation()
+        selected_group_complete = self._selected_group_is_complete(windows)
+        reopen_safety_failures = self._reopen_safety_failures(
+            candidate_windows,
+            source_failures,
+            blocked_fingerprints,
+        )
+        # A planned role that is absent from an otherwise complete, unique
+        # source is safe to reopen through its own original shortcut. The
+        # retry routine rejects incomplete or colliding live identities before
+        # it can reach a backend call.
         retried_reopens, retry_failures, pending_reopen_delay = (
             self._retry_pending_reopens(
                 candidate_windows=candidate_windows,
@@ -3864,13 +4578,39 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 expected_capture_settings_revision=(
                     capture_settings_revision
                 ),
+                expected_source_state_generation=(
+                    scan_source_state_generation
+                ),
+                safety_failures=tuple(reopen_safety_failures),
             )
         )
-        group_failures = self._group_failures(windows)
         failures = [*group_failures, *source_failures, *retry_failures]
         if blocked_fingerprints and not source_failures:
             failures.append("window_identity_blocked")
-        if group_failures:
+        blocking_group_failures = [
+            code
+            for code in group_failures
+            if code != "group_identity_set_mismatch"
+        ]
+        if blocking_group_failures:
+            if (
+                self._action_confirmations
+                and self._allowed_fingerprints is not None
+                and not selected_group_complete
+            ):
+                failures.append("input_target_changed_before_delivery")
+            scan_complete_group_fingerprints = (
+                frozenset(
+                    fingerprint
+                    for fingerprint in (
+                        normalize_launch_fingerprint(window.launch_fingerprint)
+                        for window in windows
+                    )
+                    if fingerprint is not None
+                )
+                if (self._allowed_fingerprints is not None and not selected_group_complete)
+                else frozenset()
+            )
             # A partially validated group must never carry a first-frame
             # confirmation or old CONNECTED evidence into a later, different
             # group or identity set.
@@ -3912,7 +4652,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 failure_codes=tuple(dict.fromkeys(failures)),
             )
             self._last_result = result
-            self._publish_reconnecting_fingerprints(now)
+            self._publish_reconnecting_fingerprints(
+                now,
+                observed_fingerprints=scan_complete_group_fingerprints,
+            )
             self._state = (
                 ReconnectState.RECONNECTING
                 if result.progressed
@@ -3936,6 +4679,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             | self._pending_reopen_fingerprints
             | self._active_automation_fingerprints
         )
+        missing_pending_reopen_targets = (
+            self._pending_reopen_fingerprints - live_fingerprints
+        )
+        if missing_pending_reopen_targets:
+            # While an original role is still being reopened, no other role
+            # may receive a reconnect click from this scan.
+            self._clear_action_confirmation()
         retained_deadline_fingerprints = (
             live_fingerprints | session_fingerprints
         )
@@ -3965,7 +4715,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             str,
             tuple[WindowInstanceToken, str],
         ] = {}
-        confirmed_action_fingerprints: set[str] = set()
+        confirmed_action_instances: dict[str, WindowInstanceToken] = {}
         pending_confirmation_delays: list[int] = []
         pending_action_wait_delays: list[int] = []
         captured_windows = 0
@@ -3985,6 +4735,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 window,
                 fingerprint,
                 execute=execute,
+                expected_source_state_generation=(
+                    scan_source_state_generation
+                ),
             )
             capture_routes[fingerprint] = capture_route
             _, current_capture_settings_revision = (
@@ -4015,16 +4768,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 captured_windows += 1
             else:
                 self._clear_action_confirmation(fingerprint)
-            if recognition.state is ReconnectScreenState.DISCONNECTED:
-                if (
-                    fresh_capture
-                    and recognition.click_point is not None
-                    and self._action_is_confirmed(fingerprint, recognition)
-                ):
-                    confirmed_action_fingerprints.add(fingerprint)
-                elif not fresh_capture:
-                    self._clear_action_confirmation(fingerprint)
-            elif recognition.state is ReconnectScreenState.CONNECTED:
+            if recognition.state is ReconnectScreenState.CONNECTED:
                 if self._has_reconnect_session(fingerprint):
                     if (
                         fingerprint not in self._terminal_ready_after
@@ -4081,11 +4825,20 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             }:
                 self._terminal_evidence.pop(fingerprint, None)
             previous_state = self._action_state_since.get(fingerprint)
-            if previous_state is None or previous_state[0] is not recognition.state:
-                self._action_state_since[fingerprint] = (
-                    recognition.state,
-                    now,
-                )
+            if (
+                instance is None
+                or previous_state is None
+                or previous_state[0] != instance
+                or previous_state[1] is not recognition.state
+            ):
+                if instance is None:
+                    self._action_state_since.pop(fingerprint, None)
+                else:
+                    self._action_state_since[fingerprint] = (
+                        instance,
+                        recognition.state,
+                        now,
+                    )
             action = self._policy.decide(recognition.state).action
             is_action_candidate = (
                 action in ACTIONABLE_RECONNECT_ACTIONS
@@ -4098,17 +4851,55 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     )
                 )
             )
-            if recognition.state is not ReconnectScreenState.DISCONNECTED:
-                if is_action_candidate and self._action_is_confirmed(
+            action_evidence_complete = (
+                fresh_capture
+                and instance is not None
+                and capture_route is not None
+                and self._action_signature_is_complete(recognition)
+                and recognition.state
+                not in {
+                    ReconnectScreenState.UNKNOWN,
+                    ReconnectScreenState.CHECK_DISABLED,
+                }
+                and is_action_candidate
+            )
+            if not action_evidence_complete:
+                # A frame with no actionable point, an unknown/disabled
+                # result, stale capture, route change, or instance change is
+                # an interruption.  It must never bridge two action frames.
+                self._clear_action_confirmation(fingerprint)
+                if (
+                    recognition.state is ReconnectScreenState.DISCONNECTED
+                    and instance is not None
+                ):
+                    # A disconnect with an incomplete action signature cannot
+                    # lend its earlier start time to a later safe click.
+                    self._action_state_since[fingerprint] = (
+                        instance,
+                        recognition.state,
+                        now,
+                    )
+            elif (
+                not source_identity_unsafe
+                and self._action_is_confirmed(
                     fingerprint,
                     recognition,
-                ):
-                    confirmed_action_fingerprints.add(fingerprint)
-                elif not is_action_candidate:
-                    self._clear_action_confirmation(fingerprint)
+                    instance=instance,
+                    capture_route=capture_route,
+                    capture_settings_revision=(
+                        capture_settings_revision
+                    ),
+                    source_state_generation=(
+                        scan_source_state_generation
+                    ),
+                )
+            ):
+                confirmed_action_instances[fingerprint] = instance
+            elif source_identity_unsafe:
+                self._clear_action_confirmation(fingerprint)
             if (
                 is_action_candidate
-                and fingerprint not in confirmed_action_fingerprints
+                and fingerprint not in confirmed_action_instances
             ):
                 pending_confirmation_delays.append(
                     self._policy.progress_interval_seconds
@@ -4140,17 +4931,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             capture_settings_revision
             != current_capture_settings_revision
         )
-        if settings_changed_during_scan:
-            confirmed_action_fingerprints.clear()
+        source_changed_during_scan = (
+            not self._source_authority_is_current(
+                scan_source_state_generation
+            )
+        )
+        if settings_changed_during_scan or source_changed_during_scan:
+            confirmed_action_instances.clear()
             recognized = [
                 (
                     window,
                     fingerprint,
                     replace(
                         item,
-                        state=self._revoked_screen_state(
-                            current_capture_settings,
-                            capture_routes.get(fingerprint),
+                        state=(
+                            ReconnectScreenState.UNKNOWN
+                            if source_changed_during_scan
+                            else self._revoked_screen_state(
+                                current_capture_settings,
+                                capture_routes.get(fingerprint),
+                            )
                         ),
                         click_point=None,
                     ),
@@ -4158,16 +4958,29 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 for window, fingerprint, item in recognized
             ]
 
-        if execute and not settings_changed_during_scan:
-            latest_capture_settings = current_capture_settings
-            with self._screen_state_lock:
-                with self._capture_settings_lock:
-                    latest_capture_settings = self._capture_settings
-                    settings_changed_during_scan = (
-                        capture_settings_revision
-                        != self._capture_settings_revision
-                    )
-                    if not settings_changed_during_scan:
+        if (
+            execute
+            and not settings_changed_during_scan
+            and not source_changed_during_scan
+        ):
+            (
+                latest_capture_settings,
+                latest_capture_settings_revision,
+            ) = self._capture_settings_snapshot()
+            with self._source_authority_lock:
+                settings_changed_during_scan = (
+                    capture_settings_revision
+                    != latest_capture_settings_revision
+                )
+                source_changed_during_scan = (
+                    self._source_state_generation
+                    != scan_source_state_generation
+                )
+                if (
+                    not settings_changed_during_scan
+                    and not source_changed_during_scan
+                ):
+                    with self._screen_state_lock:
                         self._pending_reconnect_fingerprints.update(
                             fingerprint
                             for _window, fingerprint, item in recognized
@@ -4175,21 +4988,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                                 item.state
                                 is ReconnectScreenState.DISCONNECTED
                                 and fingerprint
-                                in confirmed_action_fingerprints
+                                in confirmed_action_instances
                             )
                         )
                         self._publish_reconnecting_fingerprints(now)
-            if settings_changed_during_scan:
-                confirmed_action_fingerprints.clear()
+            if settings_changed_during_scan or source_changed_during_scan:
+                confirmed_action_instances.clear()
                 recognized = [
                     (
                         window,
                         fingerprint,
                         replace(
                             item,
-                            state=self._revoked_screen_state(
-                                latest_capture_settings,
-                                capture_routes.get(fingerprint),
+                            state=(
+                                ReconnectScreenState.UNKNOWN
+                                if source_changed_during_scan
+                                else self._revoked_screen_state(
+                                    latest_capture_settings,
+                                    capture_routes.get(fingerprint),
+                                )
                             ),
                             click_point=None,
                         ),
@@ -4230,12 +5047,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         # uniquely identified window with two matching disconnected frames
         # from being recovered.
         actionable_candidates = [
-            (window, fingerprint, item)
+            (
+                window,
+                fingerprint,
+                item,
+                confirmed_action_instances[fingerprint],
+            )
             for window, fingerprint, item in recognized
             if self._policy.decide(item.state).action
             in ACTIONABLE_RECONNECT_ACTIONS
             and item.click_point is not None
-            and fingerprint in confirmed_action_fingerprints
+            and fingerprint in confirmed_action_instances
             and (
                 item.state is ReconnectScreenState.DISCONNECTED
                 or self._has_reconnect_session(fingerprint)
@@ -4254,23 +5076,31 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 or fingerprint in self._active_automation_fingerprints
             )
         ]
-        actionable: list[tuple[WindowInfo, str, ScreenRecognition]] = []
-        for window, fingerprint, item in actionable_candidates:
+        actionable: list[
+            tuple[WindowInfo, str, ScreenRecognition, WindowInstanceToken]
+        ] = []
+        for window, fingerprint, item, instance in actionable_candidates:
             wait_seconds = self._action_wait_seconds(
                 fingerprint,
                 item.state,
                 now,
+                instance,
             )
             if wait_seconds:
                 pending_action_wait_delays.append(wait_seconds)
             else:
-                actionable.append((window, fingerprint, item))
+                actionable.append((window, fingerprint, item, instance))
         battle_actionable = [
-            (window, fingerprint, item)
+            (
+                window,
+                fingerprint,
+                item,
+                confirmed_action_instances[fingerprint],
+            )
             for window, fingerprint, item in recognized
             if item.state is ReconnectScreenState.DISCONNECTED
             and item.battle_context
-            and fingerprint in confirmed_action_fingerprints
+            and fingerprint in confirmed_action_instances
         ]
         clicked_windows = 0
         restarted_windows = retried_reopens
@@ -4279,15 +5109,48 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         unresponsive_targets = 0
         delivery_failures = 0
         if execute:
-            for window, fingerprint, item in battle_actionable:
+            for window, fingerprint, item, instance in battle_actionable:
                 if not self._execution_allowed():
                     break
-                capture_route = capture_routes.get(fingerprint)
+                confirmation = self._action_confirmations.get(fingerprint)
+                if (
+                    confirmation is None
+                    or confirmation.instance != instance
+                    or confirmation.capture_settings_revision
+                    != capture_settings_revision
+                    or confirmation.source_state_generation
+                    != scan_source_state_generation
+                ):
+                    self._clear_action_confirmation(fingerprint)
+                    continue
+                capture_route = confirmation.capture_route
                 if not self._capture_authority_is_current(
                     capture_settings_revision,
                     capture_route,
                 ):
                     self._clear_action_confirmation(fingerprint)
+                    continue
+                if not self._source_authority_is_current(
+                    confirmation.source_state_generation,
+                ):
+                    self._clear_action_confirmation(fingerprint)
+                    continue
+                wait_seconds = self._action_wait_seconds(
+                    fingerprint,
+                    item.state,
+                    now,
+                    instance,
+                )
+                if wait_seconds:
+                    pending_action_wait_delays.append(wait_seconds)
+                    continue
+                current_battle_window = self._current_action_window(
+                    instance,
+                    fingerprint,
+                )
+                if current_battle_window is None:
+                    self._clear_action_confirmation(fingerprint)
+                    failures.append("input_target_changed_before_delivery")
                     continue
                 retry = self._action_retry_after.get(fingerprint)
                 if (
@@ -4310,14 +5173,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 battle_restart_attempted = True
                 permitted, mutation_result = self._run_game_mutation(
                     "smart-reconnect-battle-restart",
-                    lambda: self._battle_restarter.restart(
-                        window,
-                        target,
-                    ),
+                    lambda: self._run_authorized_backend_call(
+                        lambda: self._battle_restarter.restart(
+                            current_battle_window,
+                            target,
+                        ),
+                        expected_capture_settings_revision=(
+                            capture_settings_revision
+                        ),
+                        capture_route=capture_route,
+                        expected_source_state_generation=(
+                            confirmation.source_state_generation
+                        ),
+                    )[1],
                     expected_capture_settings_revision=(
                         capture_settings_revision
                     ),
                     capture_route=capture_route,
+                    expected_source_state_generation=(
+                        confirmation.source_state_generation
+                    ),
                 )
                 if not permitted or not isinstance(
                     mutation_result,
@@ -4327,6 +5202,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     if self._capture_authority_is_current(
                         capture_settings_revision,
                         capture_route,
+                    ) and self._source_authority_is_current(
+                        confirmation.source_state_generation,
                     ):
                         pending_action_wait_delays.append(1)
                     continue
@@ -4334,6 +5211,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 if not self._capture_authority_is_current(
                     capture_settings_revision,
                     capture_route,
+                ):
+                    self._clear_action_confirmation(fingerprint)
+                    continue
+                if not self._source_authority_is_current(
+                    confirmation.source_state_generation,
                 ):
                     self._clear_action_confirmation(fingerprint)
                     continue
@@ -4354,6 +5236,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             capture_settings_revision
                         ),
                         capture_route=capture_route,
+                        expected_source_state_generation=(
+                            confirmation.source_state_generation
+                        ),
                     )
                     if restart_result.window_closed:
                         self._pending_reopen_fingerprints.add(fingerprint)
@@ -4373,13 +5258,29 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     mutation_completed_at
                     + POST_LOGIN_AUTOMATION_GRACE_SECONDS
                 )
-            for window, fingerprint, item in actionable:
+            for window, fingerprint, item, confirmed_instance in actionable:
                 if not self._execution_allowed():
                     break
-                initial_capture_route = capture_routes.get(fingerprint)
+                confirmation = self._action_confirmations.get(fingerprint)
+                if (
+                    confirmation is None
+                    or confirmation.instance != confirmed_instance
+                    or confirmation.capture_settings_revision
+                    != capture_settings_revision
+                    or confirmation.source_state_generation
+                    != scan_source_state_generation
+                ):
+                    self._clear_action_confirmation(fingerprint)
+                    continue
+                initial_capture_route = confirmation.capture_route
                 if not self._capture_authority_is_current(
                     capture_settings_revision,
                     initial_capture_route,
+                ):
+                    self._clear_action_confirmation(fingerprint)
+                    continue
+                if not self._source_authority_is_current(
+                    confirmation.source_state_generation,
                 ):
                     self._clear_action_confirmation(fingerprint)
                     continue
@@ -4392,46 +5293,44 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     continue
                 def deliver_click():
                     current_window = self._current_action_window(
-                        window,
+                        confirmed_instance,
                         fingerprint,
                     )
                     if current_window is None:
                         return "changed", False
-                    capture_instance_token = (
-                        WindowInstanceToken.from_window(current_window)
-                    )
-                    if capture_instance_token is None:
-                        return "changed", False
                     current_capture_route = self._action_still_matches(
-                        current_window,
+                        confirmed_instance,
                         fingerprint,
                         item,
                         capture_settings_revision,
                         initial_capture_route,
+                        confirmation.source_state_generation,
                     )
-                    if current_capture_route is None:
+                    if current_capture_route != initial_capture_route:
                         return "changed", False
                     current_window = self._current_action_window(
-                        current_window,
+                        confirmed_instance,
                         fingerprint,
                     )
-                    if (
-                        current_window is None
-                        or WindowInstanceToken.from_window(current_window)
-                        != capture_instance_token
-                    ):
+                    if current_window is None:
                         return "changed", False
                     if not self._mouse_backend.is_window(
                         current_window.handle
                     ):
                         return "invalid", False
+                    current_window = self._current_action_window(
+                        confirmed_instance,
+                        fingerprint,
+                    )
+                    if current_window is None:
+                        return "changed", False
                     if not self._mouse_backend.probe_responsive(
                         current_window.handle,
                         self._preflight_timeout_ms,
                     ):
                         return "unresponsive", False
                     current_window = self._current_action_window(
-                        current_window,
+                        confirmed_instance,
                         fingerprint,
                     )
                     if (
@@ -4440,22 +5339,34 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             capture_settings_revision,
                             current_capture_route,
                         )
+                        or not self._source_authority_is_current(
+                            confirmation.source_state_generation,
+                        )
                     ):
                         return "changed", False
-                    instance_token = WindowInstanceToken.from_window(
-                        current_window
-                    )
-                    if instance_token != capture_instance_token:
-                        return "changed", False
                     try:
+                        permitted, click_result = (
+                            self._run_authorized_backend_call(
+                                lambda: self._mouse_backend.click_relative(
+                                    confirmed_instance.handle,
+                                    item.click_point,
+                                    confirmed_instance.process_id,
+                                    confirmed_instance,
+                                ),
+                                expected_capture_settings_revision=(
+                                    capture_settings_revision
+                                ),
+                                capture_route=current_capture_route,
+                                expected_source_state_generation=(
+                                    confirmation.source_state_generation
+                                ),
+                            )
+                        )
+                        if not permitted:
+                            return "changed", False
                         return (
                             "delivered",
-                            self._mouse_backend.click_relative(
-                                current_window.handle,
-                                item.click_point,
-                                current_window.process_id,
-                                instance_token,
-                            ),
+                            click_result,
                         )
                     except OSError:
                         return (
@@ -4475,12 +5386,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         capture_settings_revision
                     ),
                     capture_route=initial_capture_route,
+                    expected_source_state_generation=(
+                        confirmation.source_state_generation
+                    ),
                 )
                 if not permitted or not isinstance(mutation_result, tuple):
                     self._clear_action_confirmation(fingerprint)
                     if self._capture_authority_is_current(
                         capture_settings_revision,
                         initial_capture_route,
+                    ) and self._source_authority_is_current(
+                        confirmation.source_state_generation,
                     ):
                         pending_action_wait_delays.append(1)
                     continue
@@ -4513,6 +5429,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 authority_is_current = self._capture_authority_is_current(
                     capture_settings_revision,
                     initial_capture_route,
+                ) and self._source_authority_is_current(
+                    confirmation.source_state_generation,
                 )
                 if (
                     authority_is_current
@@ -4545,6 +5463,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         self._flow_pause_until[fingerprint] = (
                             mutation_completed_at
                             + self._policy.retry_interval_seconds
+                        )
+                    elif item.state is ReconnectScreenState.LINE_SELECTION:
+                        self._flow_pause_until[fingerprint] = (
+                            mutation_completed_at
+                            + self._policy.line_transition_wait_seconds
+                        )
+                    elif item.state is ReconnectScreenState.CHARACTER_SELECTION:
+                        self._flow_pause_until[fingerprint] = (
+                            mutation_completed_at
+                            + self._policy.entry_transition_wait_seconds
+                        )
+                    elif item.state in {
+                        ReconnectScreenState.POST_LOGIN_ACTIVITY,
+                        ReconnectScreenState.POST_LOGIN_RECOMMENDATION,
+                        ReconnectScreenState.POST_LOGIN_AUTO_DUNGEON,
+                    }:
+                        self._flow_pause_until[fingerprint] = (
+                            mutation_completed_at
+                            + self._policy.announcement_transition_wait_seconds
                         )
                 if not authority_is_current:
                     self._clear_action_confirmation(fingerprint)
@@ -4614,7 +5551,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         elif actionable:
             next_check_seconds = min(
                 self._policy.decide(item.state).delay_seconds
-                for _window, _fingerprint, item in (
+                for _window, _fingerprint, item, _instance in (
                     actionable
                 )
             )
@@ -4661,19 +5598,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         final_capture_settings, final_capture_settings_revision = (
             self._capture_settings_snapshot()
         )
-        if final_capture_settings_revision != capture_settings_revision:
+        source_changed_during_scan = (
+            not self._source_authority_is_current(
+                scan_source_state_generation
+            )
+        )
+        if (
+            final_capture_settings_revision != capture_settings_revision
+            or source_changed_during_scan
+        ):
             settings_changed_during_scan = True
-            confirmed_action_fingerprints.clear()
+            confirmed_action_instances.clear()
             recognized = [
                 (
                     window,
                     fingerprint,
                     replace(
                         item,
-                        state=self._revoked_screen_state(
-                            final_capture_settings,
-                            capture_routes.get(fingerprint),
-                        ),
+                        # A changed capture configuration or revoked source
+                        # cannot retroactively validate this old observation.
+                        state=ReconnectScreenState.UNKNOWN,
                         click_point=None,
                     ),
                 )
@@ -4733,62 +5677,71 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             state_counts=tuple(sorted(state_counts.items())),
             failure_codes=tuple(dict.fromkeys(failures)),
         )
-        with self._screen_state_lock:
-            with self._capture_settings_lock:
-                latest_capture_settings = self._capture_settings
-                settings_changed_during_scan = (
-                    capture_settings_revision
-                    != self._capture_settings_revision
+        (
+            latest_capture_settings,
+            latest_capture_settings_revision,
+        ) = self._capture_settings_snapshot()
+        # Do not allow the last publication of an old scan to revive its
+        # source evidence. Source revocation already advanced the generation;
+        # this block only emits UNKNOWN and removes trust for stale work.
+        with self._source_authority_lock:
+            settings_changed_during_scan = (
+                capture_settings_revision
+                != latest_capture_settings_revision
+            )
+            source_changed_during_scan = (
+                self._source_state_generation
+                != scan_source_state_generation
+            )
+            with self._screen_state_lock:
+                published_states = (
+                    {
+                        fingerprint: ReconnectScreenState.UNKNOWN
+                        for _window, fingerprint, _item in recognized
+                    }
+                    if (
+                        settings_changed_during_scan
+                        or source_changed_during_scan
+                    )
+                    else {
+                        fingerprint: item.state
+                        for _window, fingerprint, item in recognized
+                    }
                 )
-            published_states = (
-                {
-                    fingerprint: self._revoked_screen_state(
-                        latest_capture_settings,
-                        capture_routes.get(fingerprint),
-                    )
-                    for _window, fingerprint, _item in recognized
-                }
-                if settings_changed_during_scan
-                else {
-                    fingerprint: item.state
-                    for _window, fingerprint, item in recognized
-                }
-            )
-            published_states.update(
-                {
-                    fingerprint: ReconnectScreenState.UNKNOWN
-                    for fingerprint in (
-                        source_failure_affected_fingerprints
-                    )
-                }
-            )
-            self._last_screen_states = published_states
-            if source_failure_affected_fingerprints:
-                self._source_state_generation += 1
-            evidence_observed_at = time.monotonic()
-            for _window, fingerprint, item in recognized:
-                fresh_instance = fresh_capture_instances.get(fingerprint)
-                if (
-                    not settings_changed_during_scan
-                    and item.state is ReconnectScreenState.CONNECTED
-                    and fresh_instance is not None
-                ):
-                    instance, route = fresh_instance
-                    self._trusted_connected_evidence[fingerprint] = (
-                        _TrustedConnectedEvidence(
-                            instance,
-                            route,
-                            capture_settings_revision,
-                            evidence_observed_at,
+                published_states.update(
+                    {
+                        fingerprint: ReconnectScreenState.UNKNOWN
+                        for fingerprint in (
+                            source_failure_affected_fingerprints
                         )
-                    )
-                elif item.state is not ReconnectScreenState.CONNECTED:
-                    self._trusted_connected_evidence.pop(
-                        fingerprint,
-                        None,
-                    )
-            for fingerprint in source_failure_affected_fingerprints:
-                self._trusted_connected_evidence.pop(fingerprint, None)
+                    }
+                )
+                self._last_screen_states = published_states
+                evidence_observed_at = time.monotonic()
+                for _window, fingerprint, item in recognized:
+                    fresh_instance = fresh_capture_instances.get(fingerprint)
+                    if (
+                        not settings_changed_during_scan
+                        and not source_changed_during_scan
+                        and item.state is ReconnectScreenState.CONNECTED
+                        and fresh_instance is not None
+                    ):
+                        instance, route = fresh_instance
+                        self._trusted_connected_evidence[fingerprint] = (
+                            _TrustedConnectedEvidence(
+                                instance,
+                                route,
+                                capture_settings_revision,
+                                evidence_observed_at,
+                            )
+                        )
+                    elif item.state is not ReconnectScreenState.CONNECTED:
+                        self._trusted_connected_evidence.pop(
+                            fingerprint,
+                            None,
+                        )
+                for fingerprint in source_failure_affected_fingerprints:
+                    self._trusted_connected_evidence.pop(fingerprint, None)
         if result.all_connected:
             self._clear_unknown_reconnect_failure()
         self._last_result = result

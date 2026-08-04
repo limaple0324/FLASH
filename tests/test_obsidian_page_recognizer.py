@@ -19,6 +19,8 @@ REFERENCE_DIR = (
     / "game_data_reference"
     / "obsidian"
 )
+FULL_WINDOW_PATH = REFERENCE_DIR / "full_window_page_10.png"
+FULL_WINDOW_SHA256 = "b7b681406f79f88d7e0df0c3bc6eb28e0bc4dd9493c248de5debbae3c5944b7c"
 FIXED_TIME = datetime(2026, 8, 3, 12, 0, tzinfo=timezone(timedelta(hours=8)))
 EXPECTED_COUNTS = {
     1: (2, 0, "階段一／完成"),
@@ -66,6 +68,7 @@ def test_reference_assets_hashes_and_source_description_are_consistent() -> None
         definition.filename: definition.source_sha256
         for definition in DEFAULT_OBSIDIAN_PAGE_DEFINITIONS
     }
+    expected_hashes[FULL_WINDOW_PATH.name] = FULL_WINDOW_SHA256
     manifest = {}
     for line in (REFERENCE_DIR / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
         digest, filename = line.split("  ", maxsplit=1)
@@ -82,6 +85,7 @@ def test_reference_assets_hashes_and_source_description_are_consistent() -> None
     assert "灰色格為未亮" in source
     assert "| 1 | 2 | 0 | 階段一／完成 |" in source
     assert "| 10 | 12 | 6 | 激活 |" in source
+    assert "完整遊戲視窗" in source
 
 
 def test_each_reference_is_recognized_by_central_shape_not_candidate_filename() -> None:
@@ -111,6 +115,49 @@ def test_tenth_reference_has_six_gray_unlit_nodes() -> None:
     assert page is not None
     assert page.data.opened_nodes == 12
     assert page.data.unlit_nodes == 6
+
+
+def test_real_full_game_window_is_localized_before_page_recognition() -> None:
+    with Image.open(FULL_WINDOW_PATH) as source:
+        full_window = source.convert("RGB")
+
+    page = _recognizer().read(_sample_from_image(full_window))
+
+    assert page is not None
+    assert page.data.opened_page == 10
+    assert page.data.opened_nodes == 12
+    assert page.data.unlit_nodes == 6
+    assert page.data.stage == "激活"
+
+
+def test_common_capture_scaling_keeps_all_verified_pages() -> None:
+    recognizer = _recognizer()
+
+    for page_number in EXPECTED_COUNTS:
+        with Image.open(_reference_path(page_number)) as source:
+            resized = source.convert("RGB").resize(
+                (1126, 769),
+                Image.Resampling.LANCZOS,
+            )
+
+        page = recognizer.read(_sample_from_image(resized))
+
+        assert page is not None
+        assert page.data.opened_page == page_number
+
+
+def test_full_window_without_panel_or_with_most_of_panel_cut_off_fails_closed() -> None:
+    with Image.open(FULL_WINDOW_PATH) as source:
+        full_window = source.convert("RGB")
+    blank = Image.new("RGB", full_window.size, "black")
+    truncated = full_window.crop(
+        (0, 0, full_window.width, round(full_window.height * 0.75))
+    )
+
+    recognizer = _recognizer()
+
+    assert recognizer.read(_sample_from_image(blank)) is None
+    assert recognizer.read(_sample_from_image(truncated)) is None
 
 
 def test_covering_a_required_node_fails_closed() -> None:

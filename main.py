@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import traceback
 from collections.abc import Callable
@@ -15,7 +16,11 @@ from time import monotonic
 from tkinter import PhotoImage, TclError, Tk, filedialog, messagebox
 
 from adapters.background_capability import BackgroundCapabilityProbe
-from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
+from adapters.obsidian_page_recognizer import ObsidianPageRecognizer
+from adapters.windows_background_capture import (
+    Win32PrintWindowProvider,
+    WindowsBackgroundCaptureBackend,
+)
 from adapters.windows_app_identity import (
     configure_process_app_identity,
     configure_tk_window_app_identity,
@@ -145,6 +150,10 @@ from services.character_game_data_view_service import (
 from services.character_game_data_update_service import (
     CharacterGameDataUpdateService,
 )
+from services.character_game_data_capture_service import (
+    CharacterGameDataCaptureService,
+    RegisteredGameDataWindow,
+)
 from services.character_detail_choice_service import CharacterDetailChoiceService
 from services.character_note_service import CharacterNoteService
 from services.character_view_service import CharacterViewService
@@ -166,6 +175,8 @@ from services.farm_timer_service import (
 )
 from services.group_selection_service import (
     GroupSelectionService,
+    PlayerGroupChoice,
+    PlayerGroupMember,
     default_legacy_group_config_path,
 )
 from services.group_configuration_service import (
@@ -229,6 +240,8 @@ from services.role_id_template_service import RoleIdTemplateService
 from services.smart_reconnect_monitor import (
     DEFAULT_SMART_RECONNECT_INTERVAL_MS,
     SmartReconnectMonitor,
+    SMART_RECONNECT_MODE_BALANCED,
+    normalize_smart_reconnect_mode,
     normalize_smart_reconnect_interval_ms,
 )
 from services.smart_reconnect_capture_settings_service import (
@@ -282,6 +295,8 @@ INPUT_POLICY_KEY = "input_policy"
 SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
 SMART_RECONNECT_CONSENT_KEY = "smart_reconnect_consent_v1"
 SMART_RECONNECT_INTERVAL_MS_KEY = "disconnect_detect_interval_ms"
+SMART_RECONNECT_MODE_KEY = "smart_reconnect_mode"
+SMART_RECONNECT_STATUS_COLORS_KEY = "smart_reconnect_status_colors"
 SMART_RECONNECT_INTERVAL_MIGRATION_KEY = (
     "disconnect_detect_interval_default_v2"
 )
@@ -319,6 +334,7 @@ TIMED_CLICK_SETTINGS_KEY = "timed_click_settings"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 RECONNECT_REFERENCE_DIR = Path("assets") / "reconnect_reference"
+OBSIDIAN_REFERENCE_DIR = Path("assets") / "game_data_reference" / "obsidian"
 BACKGROUND_IMAGE_FILETYPES = (
     (
         "圖片與相機 RAW",
@@ -361,6 +377,76 @@ def resource_path(relative_path: Path) -> Path:
     if bundle_root:
         return Path(bundle_root) / relative_path
     return Path(__file__).resolve().parent / relative_path
+
+
+def registered_game_data_target(
+    current_group_name: str | None,
+    selection: PlayerGroupChoice | None,
+    member: PlayerGroupMember | None,
+    window: WindowInfo | None,
+    screen_state: ReconnectScreenState,
+) -> RegisteredGameDataWindow | None:
+    """只將目前組別內唯一、完整且已登入的角色交給唯讀資料擷取。"""
+    if (
+        not isinstance(current_group_name, str)
+        or not current_group_name.strip()
+        or not isinstance(selection, PlayerGroupChoice)
+        or selection.name != current_group_name
+        or not isinstance(member, PlayerGroupMember)
+        or not isinstance(window, WindowInfo)
+        or screen_state is not ReconnectScreenState.CONNECTED
+    ):
+        return None
+    character_id = member.character_id.strip() if isinstance(member.character_id, str) else ""
+    role_id = member.role_id.strip() if isinstance(member.role_id, str) else ""
+    fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
+    if (
+        not character_id
+        or not role_id
+        or sum(item.entry_id == member.entry_id for item in selection.members) != 1
+        or sum(
+            isinstance(item.character_id, str)
+            and item.character_id.strip() == character_id
+            for item in selection.members
+        ) != 1
+        or sum(
+            isinstance(item.role_id, str)
+            and item.role_id.strip().casefold() == role_id.casefold()
+            for item in selection.members
+        ) != 1
+        or isinstance(window.handle, bool)
+        or window.handle <= 0
+        or isinstance(window.process_id, bool)
+        or not isinstance(window.process_id, int)
+        or window.process_id <= 0
+        or not isinstance(window.rect, tuple)
+        or len(window.rect) != 4
+        or not all(isinstance(value, int) and not isinstance(value, bool) for value in window.rect)
+        or window.rect[2] <= window.rect[0]
+        or window.rect[3] <= window.rect[1]
+        or window.visible is not True
+        or window.minimized is not False
+        or isinstance(window.thread_id, bool)
+        or not isinstance(window.thread_id, int)
+        or window.thread_id <= 0
+        or not isinstance(window.window_class, str)
+        or not window.window_class.strip()
+        or isinstance(window.process_lifecycle_token, bool)
+        or not isinstance(window.process_lifecycle_token, int)
+        or window.process_lifecycle_token <= 0
+        or fingerprint is None
+    ):
+        return None
+    return RegisteredGameDataWindow(
+        window_handle=window.handle,
+        character_id=character_id,
+        launch_fingerprint=fingerprint,
+        process_id=window.process_id,
+        rect=window.rect,
+        thread_id=window.thread_id,
+        window_class=window.window_class,
+        process_lifecycle_token=window.process_lifecycle_token,
+    )
 
 
 def apply_window_icon(window: Tk) -> None:
@@ -675,6 +761,33 @@ def _sync_scope_has_all_safe_windows(
     )
 
 
+def _connected_sync_fingerprints(
+    scoped_fingerprints: tuple[str, ...],
+    windows: tuple[WindowInfo, ...],
+) -> tuple[str, ...]:
+    """依組別固定順序保留目前唯一且已連線的安全身分。"""
+
+    normalized_scope = tuple(
+        fingerprint
+        for value in scoped_fingerprints
+        if (fingerprint := normalize_launch_fingerprint(value)) is not None
+    )
+    if len(normalized_scope) != len(set(normalized_scope)):
+        return ()
+    observed: dict[str, int] = {}
+    for window in windows:
+        fingerprint = normalize_launch_fingerprint(
+            getattr(window, "launch_fingerprint", None)
+        )
+        if fingerprint in normalized_scope:
+            observed[fingerprint] = observed.get(fingerprint, 0) + 1
+    return tuple(
+        fingerprint
+        for fingerprint in normalized_scope
+        if observed.get(fingerprint) == 1
+    )
+
+
 def build_services(
     root: Path | None = None,
     card_preview_catalog: CardPreviewCatalog | None = None,
@@ -716,6 +829,12 @@ def build_services(
             SMART_RECONNECT_INTERVAL_MS_KEY: (
                 DEFAULT_SMART_RECONNECT_INTERVAL_MS
             ),
+            SMART_RECONNECT_MODE_KEY: SMART_RECONNECT_MODE_BALANCED,
+            SMART_RECONNECT_STATUS_COLORS_KEY: {
+                "已開啟": "#26845B",
+                "重連中": "#B36A18",
+                "重連失敗": "#D64545",
+            },
             SMART_RECONNECT_INTERVAL_MIGRATION_KEY: True,
             UI_THEME_KEY: "classic_gold",
             SHOW_HINTS_KEY: False,
@@ -1151,9 +1270,24 @@ def build_services(
     def current_sync_target_windows() -> tuple[WindowInfo, ...]:
         if target_window_contract_service is None:
             return ()
-        return target_window_contract_service.reconnect_targets(
+        candidates = target_window_contract_service.reconnect_targets(
             current_group_name()
         ).windows
+        if any(not isinstance(window, WindowInfo) for window in candidates):
+            return ()
+        requested = tuple(
+            fingerprint for window in candidates
+            if (fingerprint := normalize_launch_fingerprint(window.launch_fingerprint))
+            is not None
+        )
+        states = reconnect_controller.observe_screen_states(
+            requested, candidate_windows=candidates
+        )
+        return tuple(
+            window for window in candidates
+            if states.get(normalize_launch_fingerprint(window.launch_fingerprint))
+            is ReconnectScreenState.CONNECTED
+        )
 
     sync_screen_state_lock = Lock()
     sync_screen_state_cache: dict[str, object] = {
@@ -1178,7 +1312,10 @@ def build_services(
                 and isinstance(states, dict)
             ):
                 return states.get(normalized, ReconnectScreenState.UNKNOWN)
-            candidates = current_sync_target_windows()
+            candidates = (
+                target_window_contract_service.reconnect_targets(group_name).windows
+                if target_window_contract_service is not None else ()
+            )
             requested = tuple(
                 candidate_fingerprint
                 for window in candidates
@@ -1221,6 +1358,86 @@ def build_services(
             )
         ),
     )
+
+    def registered_game_data_window(window_handle: int) -> RegisteredGameDataWindow | None:
+        group_name = current_group_name()
+        choice = group_selection_service.find(group_name)
+        if choice is None or target_window_contract_service is None:
+            return None
+        candidates = target_window_contract_service.reconnect_targets(
+            group_name
+        ).windows
+        matches = tuple(
+            window
+            for window in candidates
+            if isinstance(window, WindowInfo) and window.handle == window_handle
+        )
+        if len(matches) != 1:
+            return None
+        window = matches[0]
+        fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
+        group = group_configuration_service.group(group_name)
+        plan = group_launch_service.plan(group_name)
+        if (
+            fingerprint is None
+            or group is None
+            or not plan.ready
+        ):
+            return None
+        members = tuple(
+            member
+            for member in choice.members
+            if any(
+                entry.entry_id == member.entry_id
+                and (
+                    target := next(
+                        (
+                            item
+                            for item in plan.targets
+                            if str(item.shortcut_path.resolve(strict=False)).casefold()
+                            == str(entry.shortcut_path.resolve(strict=False)).casefold()
+                        ),
+                        None,
+                    )
+                ) is not None
+                and normalize_launch_fingerprint(target.fingerprint) == fingerprint
+                for entry in group.entries
+            )
+        )
+        if len(members) != 1:
+            return None
+        state = reconnect_controller.observe_screen_states(
+            (fingerprint,),
+            candidate_windows=(window,),
+        ).get(fingerprint, ReconnectScreenState.UNKNOWN)
+        return registered_game_data_target(
+            group_name,
+            choice,
+            members[0],
+            window,
+            state,
+        )
+
+    character_game_data_capture_service = None
+    try:
+        obsidian_recognizer = ObsidianPageRecognizer(
+            reference_dir=resource_path(OBSIDIAN_REFERENCE_DIR),
+        )
+        if not obsidian_recognizer.ready:
+            raise RuntimeError("黑曜石可靠參考圖不完整。")
+        character_game_data_capture_service = CharacterGameDataCaptureService(
+            Win32PrintWindowProvider(),
+            obsidian_recognizer,
+            character_game_data_update_service,
+            registered_game_data_window,
+        )
+    except Exception as error:
+        logger.warning(f"黑曜石唯讀資料擷取未啟用：{error}")
+    else:
+        AppContext.register(
+            CharacterGameDataCaptureService,
+            character_game_data_capture_service,
+        )
     ungrouped_window_service = UngroupedWindowService(
         group_configuration_service,
         shortcut_fingerprint_resolver,
@@ -1361,6 +1578,9 @@ def build_services(
             logger=logger,
             monitor_interval_ms=normalize_smart_reconnect_interval_ms(
                 config.get(SMART_RECONNECT_INTERVAL_MS_KEY)
+            ),
+            monitor_mode=normalize_smart_reconnect_mode(
+                config.get(SMART_RECONNECT_MODE_KEY),
             ),
         ),
     )
@@ -2634,6 +2854,58 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                     scope.fingerprints[0]
                 )
         return plan
+
+    sync_connected_fingerprints: tuple[str, ...] | None = None
+
+    def apply_connected_sync_identity(
+        choice,
+        connected_windows: tuple[WindowInfo, ...] | None = None,
+    ) -> bool:
+        """Only the currently connected and already scoped windows may sync."""
+        if input_controller is None or pointer_sync_controller is None:
+            return False
+        scope = sync_scope_service.scope(choice.name) if sync_scope_service else None
+        if scope is None or not scope.ready:
+            return False
+        fingerprints = _connected_sync_fingerprints(
+            scope.fingerprints,
+            tuple(
+                connected_windows
+                if connected_windows is not None
+                else current_sync_target_windows()
+            ),
+        )
+        entries = scoped_group_entries(choice.name, scope.entry_ids)
+        if entries is None:
+            return False
+        settings_by_fingerprint = {
+            fingerprint: entry.sync_settings
+            for entry, fingerprint in zip(entries, scope.fingerprints)
+        }
+        settings = {
+            fingerprint: settings_by_fingerprint[fingerprint]
+            for fingerprint in fingerprints
+            if fingerprint in settings_by_fingerprint
+        }
+        if len(settings) != len(fingerprints):
+            return False
+        nonlocal sync_connected_fingerprints
+        if sync_connected_fingerprints == fingerprints:
+            return True
+        if not fingerprints:
+            for controller in (input_controller, pointer_sync_controller):
+                controller.set_allowed_fingerprints(())
+                controller.set_target_settings({})
+                controller.invalidate_scheduled()
+            sync_connected_fingerprints = fingerprints
+            return True
+        for controller in (input_controller, pointer_sync_controller):
+            controller.set_expected_windows(len(fingerprints))
+            controller.set_allowed_fingerprints(fingerprints)
+            controller.set_target_settings(settings)
+            controller.set_controller_fingerprint(fingerprints[0])
+        sync_connected_fingerprints = fingerprints
+        return True
 
     def group_identity_failure_message(choice) -> str:
         plan = selected_group_plan(choice)
@@ -3981,10 +4253,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             and now < float(sync_source_handle_cache["expires_at"])
         ):
             return tuple(sync_source_handle_cache["handles"])
-        handles = tuple(
-            window.handle
-            for window in target_window_contract_service.windows(group_name)
-        )
+        connected_windows = current_sync_target_windows()
+        handles = tuple(window.handle for window in connected_windows)
+        if sync_session_state["enabled"] and group_selection_service is not None:
+            choice = group_selection_service.find(group_name)
+            if choice is not None:
+                apply_connected_sync_identity(choice, connected_windows)
         sync_source_handle_cache.update(
             {
                 "group_name": group_name,
@@ -4159,19 +4433,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if group_selection_service is not None
             else None
         )
-        if choice is None or choice.character_count <= 1:
+        if choice is None:
             messagebox.showerror(
                 "輔｜同步輸入",
                 "請先選擇至少有 2 個視窗設定的組別；目前沒有啟用。",
                 parent=window,
             )
             return False
-        if apply_group_identity(choice) is None:
-            messagebox.showerror(
-                "輔｜同步輸入",
-                "目前組別的捷徑身分尚未完整確認；為避免誤同步，沒有啟用。",
-                parent=window,
-            )
+        if not apply_connected_sync_identity(choice):
             return False
         if current_input_policy() is None:
             messagebox.showerror(
@@ -4260,6 +4529,34 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "Smart reconnect monitoring interval changed; "
                 f"interval_ms={normalized}"
             )
+        return True
+
+    def change_smart_reconnect_mode(mode: str) -> bool:
+        if config is None or smart_reconnect_monitor is None:
+            return False
+        normalized = normalize_smart_reconnect_mode(mode)
+        if not smart_reconnect_monitor.set_monitor_mode(normalized):
+            return False
+        config.set(SMART_RECONNECT_MODE_KEY, normalized)
+        if logger is not None:
+            logger.info(
+                "Smart reconnect monitoring mode changed; "
+                f"mode={normalized}"
+            )
+        return True
+
+    def change_smart_reconnect_status_colors(value: object) -> bool:
+        if config is None or not isinstance(value, dict):
+            return False
+        normalized: dict[str, str] = {}
+        for name in ("已開啟", "重連中", "重連失敗"):
+            color = value.get(name)
+            if not isinstance(color, str) or not re.fullmatch(
+                r"#[0-9A-Fa-f]{6}", color
+            ):
+                return False
+            normalized[name] = color.upper()
+        config.set(SMART_RECONNECT_STATUS_COLORS_KEY, normalized)
         return True
 
     def change_smart_reconnect_capture_modes(modes: object) -> bool:
@@ -4608,14 +4905,34 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         smart_reconnect_enabled=bool(
             status.get("smart_reconnect_enabled", False)
         ),
+        smart_reconnect_runtime_status=(
+            smart_reconnect_monitor.runtime_status
+            if smart_reconnect_monitor is not None
+            else None
+        ),
+        smart_reconnect_status_colors=(
+            config.get(SMART_RECONNECT_STATUS_COLORS_KEY)
+            if config is not None else None
+        ),
+        on_smart_reconnect_status_colors_change=(
+            change_smart_reconnect_status_colors
+        ),
         on_smart_reconnect_change=change_smart_reconnect,
         smart_reconnect_interval_ms=(
             smart_reconnect_monitor.monitor_interval_ms
             if smart_reconnect_monitor is not None
             else DEFAULT_SMART_RECONNECT_INTERVAL_MS
         ),
+        smart_reconnect_mode=(
+            smart_reconnect_monitor.monitor_mode
+            if smart_reconnect_monitor is not None
+            else SMART_RECONNECT_MODE_BALANCED
+        ),
         on_smart_reconnect_interval_change=(
             change_smart_reconnect_interval
+        ),
+        on_smart_reconnect_mode_change=(
+            change_smart_reconnect_mode
         ),
         smart_reconnect_capture_modes=(
             smart_reconnect_capture_settings_service.snapshot().to_dict()
@@ -4772,6 +5089,59 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     home_view.build()
     refresh_character_data(current_character_group)
+    closing = False
+    game_data_read_after_id: str | None = None
+    game_data_read_cursor = 0
+
+    def schedule_registered_obsidian_poll() -> None:
+        nonlocal game_data_read_after_id
+        if closing:
+            game_data_read_after_id = None
+            return
+        try:
+            game_data_read_after_id = window.after(
+                1500,
+                poll_registered_obsidian_once,
+            )
+        except TclError:
+            game_data_read_after_id = None
+
+    def poll_registered_obsidian_once() -> None:
+        nonlocal game_data_read_after_id, game_data_read_cursor
+        game_data_read_after_id = None
+        try:
+            capture_service = AppContext.get(CharacterGameDataCaptureService)
+            candidates = current_sync_target_windows()
+            if capture_service is not None and candidates:
+                selected = candidates[game_data_read_cursor % len(candidates)]
+                game_data_read_cursor += 1
+                home_view.set_game_data_read_status("安全讀取中")
+                result = capture_service.read(selected.handle)
+                if result.status.value in {"updated", "unchanged"}:
+                    if result.status.value == "updated":
+                        refresh_character_data(current_group_name())
+                    page = result.page.data if result.page is not None else None
+                    opened_page = getattr(page, "opened_page", None)
+                    home_view.set_game_data_read_status(
+                        f"已確認黑曜石第 {opened_page} 頁"
+                        if isinstance(opened_page, int) else "尚未安全讀取"
+                    )
+                else:
+                    home_view.set_game_data_read_status("尚未安全讀取")
+            else:
+                home_view.set_game_data_read_status("尚未安全讀取")
+        except Exception as error:
+            home_view.set_game_data_read_status("尚未安全讀取")
+            if logger is not None:
+                logger.error(
+                    "Obsidian read-only polling cycle failed safely; "
+                    f"error_type={type(error).__name__}"
+                )
+        finally:
+            schedule_registered_obsidian_poll()
+
+    if AppContext.get(CharacterGameDataCaptureService) is not None:
+        schedule_registered_obsidian_poll()
     def activity_progress_changed_handler(change: object) -> None:
         def apply_change() -> None:
             home_view.refresh_activity_schedule()
@@ -5104,6 +5474,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     def refresh_reconnect_status() -> None:
         nonlocal reconnect_status_refresh_id
+        home_view.set_smart_reconnect_runtime_status(
+            smart_reconnect_monitor.runtime_status
+            if smart_reconnect_monitor is not None else None
+        )
         home_view.refresh_reconnect_failures()
         home_view.refresh_group_role_statuses()
         reconnect_status_refresh_id = window.after(
@@ -5226,8 +5600,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             failures.append("event_subscriptions")
         return tuple(failures)
 
-    closing = False
-
     def hide_window_to_tray() -> bool:
         if tray_controller is not None and tray_controller.running:
             tray_controller.hide()
@@ -5250,6 +5622,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if reconnect_status_refresh_id is not None:
             try:
                 window.after_cancel(reconnect_status_refresh_id)
+            except TclError:
+                pass
+        if game_data_read_after_id is not None:
+            try:
+                window.after_cancel(game_data_read_after_id)
             except TclError:
                 pass
         if role_id_auto_read_id is not None:

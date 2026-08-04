@@ -47,3 +47,16 @@ def test_workflow_uses_the_coordinated_build_output():
         "--output-dir dist --cache-dir .build-cache"
     ) in workflow
     assert "verify_windows_release.ps1' -NoLaunch" in workflow
+
+
+def test_validation_and_publication_permissions_are_separated():
+    workflow = _workflow()
+
+    validation, publication = workflow.split("  publish:\n", 1)
+    assert "contents: read" in validation
+    assert "persist-credentials: false" in validation
+    assert "contents: write" not in validation
+    assert "needs: test-and-build" in publication
+    assert "contents: write" in publication
+    assert "actions/download-artifact@v4" in publication
+    assert "needs.test-and-build.outputs.artifact_name" in publication

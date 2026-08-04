@@ -168,6 +168,22 @@ class PagedClient(GitHubRestClient):
         return [{"id": item} for item in range(100)], {"Link": '<https://api.github.com/repos/owner/repo/issues/19/comments?per_page=100&page=2>; rel="next"'}
 
 
+@pytest.mark.parametrize(
+    "repository",
+    ["owner", "owner/repo/extra", "../repo", "owner/..", "owner/repo?ref=bad"],
+)
+def test_github_client_rejects_invalid_repository_paths(repository):
+    with pytest.raises(QueueRunError, match="invalid repository name"):
+        GitHubRestClient(repository, "token")
+
+
+def test_github_client_rejects_non_relative_api_path():
+    client = GitHubRestClient("owner/repo", "token")
+
+    with pytest.raises(QueueRunError, match="invalid api path"):
+        client._request("GET", "repos/owner/repo")
+
+
 def test_issue_comments_paginate_past_101():
     client = PagedClient(); assert len(client.list_issue_comments(19)) == 101 and len(client.calls) == 2
 

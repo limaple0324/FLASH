@@ -1,11 +1,20 @@
 import ast
 import inspect
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from tkinter import Button, TclError, Tk
+
+import pytest
 
 from PIL import Image
 
 from core.target_window_observation import TargetWindowObservation
+from habit.preference_service import (
+    PlayerHabitObservationView,
+    PlayerHabitPreferenceView,
+    PlayerHabitSettingsView,
+)
 from services.character_view_service import PlayerCharacterView
 from services.group_selection_service import PlayerGroupChoice
 from services.group_role_status_service import GroupRoleStatus
@@ -23,6 +32,7 @@ from ui.home import (
     _blend_hex_color,
     _collapsed_card_title_pady,
     _contrast_ratio,
+    _status_text_color,
     _contain_geometry,
     _feature_card_content_pady,
     _feature_card_control_offsets,
@@ -154,13 +164,12 @@ def test_home_removes_redundant_heading_and_reserves_card_controls() -> None:
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
     assert 'self._page_heading(page, "今天要做什麼"' not in source
-    assert "height=control_height" in source
-    assert "header.pack_propagate(False)" in source
-    assert "widgets.toggle_button.place_forget()" in source
-    assert "widgets.settings_button.place_forget()" in source
-    assert "widgets.toggle_button.pack(" in source
-    assert "widgets.settings_button.pack(" in source
-    assert 'if original_manager != "pack":' in source
+    assert "control_row = Frame(frame" in source
+    assert "widgets.control_row.grid(" in source
+    assert "widgets.control_row.pack(" in source
+    assert "widgets.toggle_button.place" not in source
+    assert "widgets.settings_button.place" not in source
+    assert 'widgets.content_manager = "grid" if grid_children else "pack"' in source
     assert "main_action_row = Frame(row, bg=BACKGROUND)" in source
     assert 'widget.bind("<B1-Motion>", self._move_group_entry_drag)' in source
     assert 'text=f"正在移動：{display_name}"' in source
@@ -272,6 +281,75 @@ def test_smart_reconnect_stop_timeout_never_displays_safe_stop() -> None:
 
     assert view.smart_reconnect_enabled is True
     assert refreshes == []
+
+
+def test_smart_reconnect_enable_and_disable_update_the_header_immediately() -> None:
+    view = object.__new__(HomeView)
+    view.smart_reconnect_enabled = False
+    view.smart_reconnect_runtime_status = None
+    view._last_smart_reconnect_runtime_status = None
+    view.on_smart_reconnect_change = lambda _enabled: True
+    refreshed: list[tuple[bool, object]] = []
+    view._refresh_smart_reconnect_controls = lambda: refreshed.append(
+        (view.smart_reconnect_enabled, view.smart_reconnect_runtime_status)
+    )
+
+    view._toggle_smart_reconnect()
+    assert refreshed[-1] == (True, "已開啟")
+
+    view._toggle_smart_reconnect()
+    assert refreshed[-1] == (False, None)
+
+
+def test_invalid_runtime_status_preserves_legal_state_or_fails_closed() -> None:
+    view = object.__new__(HomeView)
+    view.smart_reconnect_enabled = True
+    view.smart_reconnect_runtime_status = "重連中"
+    view._last_smart_reconnect_runtime_status = "重連中"
+    view._refresh_smart_reconnect_controls = lambda: None
+
+    view.set_smart_reconnect_runtime_status(object())
+    assert view.smart_reconnect_runtime_status == "重連中"
+
+    view._last_smart_reconnect_runtime_status = None
+    view.set_smart_reconnect_runtime_status(object())
+    assert view.smart_reconnect_runtime_status == "重連失敗"
+
+
+def test_bad_saved_status_colors_use_defaults_and_rejected_edit_is_restored() -> None:
+    loaded = HomeView(
+        None,
+        {},
+        smart_reconnect_status_colors={
+            "已開啟": "錯誤",
+            "重連中": "#ffffff",
+            "重連失敗": 123,
+        },
+    )
+    assert loaded.smart_reconnect_status_colors["已開啟"] != "錯誤"
+    assert loaded.smart_reconnect_status_colors["重連中"] == "#FFFFFF"
+    assert loaded.smart_reconnect_status_colors["重連失敗"] == "#D64545"
+
+    view = object.__new__(HomeView)
+    view.smart_reconnect_status_colors = {
+        "已開啟": "#112233",
+        "重連中": "#445566",
+        "重連失敗": "#778899",
+    }
+    view._smart_reconnect_color_entries = {
+        name: _EntryStub("不是色碼")
+        for name in view.smart_reconnect_status_colors
+    }
+    view._smart_reconnect_label = _ConfigureStub()
+    view.on_smart_reconnect_status_colors_change = lambda _colors: False
+
+    view._save_smart_reconnect_status_colors()
+
+    assert {
+        name: entry.get()
+        for name, entry in view._smart_reconnect_color_entries.items()
+    } == view.smart_reconnect_status_colors
+    assert "已恢復原設定" in view._smart_reconnect_label.values["text"]
 
 
 def test_smart_reconnect_capture_modes_are_checkbox_settings_with_clear_status():
@@ -502,9 +580,13 @@ def test_feature_cards_share_persistent_collapse_drag_and_customization() -> Non
     assert "選擇卡片背景" in source
     assert "移除卡片背景" in source
     assert "卡片背景已預覽" in source
-    assert "widgets.settings_button.lift()" in source
-    assert "widgets.toggle_button.lift()" in source
-    assert "dialog.grab_set()" in source
+    assert "_close_feature_card_settings" in source
+    settings_source = source[source.index("def _open_feature_card_settings"):]
+    assert "dialog = Frame(widgets.frame" in settings_source
+    assert "Toplevel(" not in settings_source
+    assert "grab_set" not in settings_source
+    assert "control_row = Frame(frame" in source
+    assert "settings_button.pack(side=RIGHT)" in source
     assert "card_id=card_id" in source
     assert 'card_id == "groups.current"' in source
     assert "_should_reset_feature_card_title" in source
@@ -567,7 +649,7 @@ def test_home_feature_cards_use_draggable_sections_in_one_stack() -> None:
         "home.schedule": ("schedule_section", "schedule_section"),
         "home.reminders": ("reminder_section", "reminder_section"),
     }
-    assert set(other_parents) == {"page"}
+    assert set(other_parents) == {"page", "self._group_management_details_frame"}
 
 
 def test_drag_moves_the_whole_feature_section_and_keeps_its_heading() -> None:
@@ -690,7 +772,10 @@ def test_card_selector_rebuilds_real_menu_and_keeps_duplicate_titles_unique():
 def test_player_habit_settings_use_confirmed_thresholds_and_clear_confirmation() -> None:
     source = Path("ui/home.py").read_text(encoding="utf-8")
 
-    assert 'text="玩家習慣"' in source
+    assert "def _build_habit_settings_card" in source
+    assert "玩家可能想記錄的習慣" in source
+    assert "_toggle_habit_management" in source
+    assert "self._build_habit_settings_card(page)" in source
     assert "前七個有效日只觀察活動時間與角色操作順序" in source
     assert "第八天才提出建議" in source
     assert "同一習慣至少" in source
@@ -705,6 +790,102 @@ def test_player_habit_settings_use_confirmed_thresholds_and_clear_confirmation()
     assert "刪除紀錄" in source
 
 
+def test_habit_settings_card_is_first_and_keeps_existing_controls_inline() -> None:
+    try:
+        root = Tk()
+    except TclError:
+        pytest.skip("目前環境沒有可用顯示")
+    root.withdraw()
+    settings = PlayerHabitSettingsView(
+        7,
+        7,
+        7,
+        (
+            PlayerHabitPreferenceView(
+                "first", "活動時間", "第一位角色", ("早上",), "", "保存"
+            ),
+            PlayerHabitPreferenceView(
+                "second", "操作順序", "第二位角色", ("第二",), "", "保存"
+            ),
+        ),
+        (
+            PlayerHabitObservationView(
+                "observation",
+                datetime(2026, 8, 4, 9, 0),
+                "活動時間",
+                "第一位角色",
+                ("早上",),
+                False,
+                (),
+            ),
+        ),
+    )
+    try:
+        view = HomeView(
+            root,
+            {"self_check_passed": True},
+            habit_settings_provider=lambda: settings,
+        )
+        view.build()
+        root.update_idletasks()
+        habit = view._feature_cards["settings.habits"]
+        theme = view._feature_cards["settings.theme"]
+        assert habit.title_label.cget("text") == "玩家可能想記錄的習慣"
+        assert view._pages["settings"].winfo_children().index(habit.frame) < (
+            view._pages["settings"].winfo_children().index(theme.frame)
+        )
+        assert view._habit_status_label.cget("text") == "已記錄 2 項"
+        assert view._habit_management_frame.winfo_manager() == ""
+        assert view._habit_management_button.cget("text") == "管理習慣"
+        view._toggle_habit_management()
+        root.update_idletasks()
+        assert view._habit_management_frame.winfo_manager() == "pack"
+        descendants = [view._habit_management_frame]
+        for container in descendants:
+            descendants.extend(container.winfo_children())
+        texts = {
+            child.cget("text")
+            for child in descendants
+            if isinstance(child, Button)
+        }
+        assert {"儲存", "儲存修改", "刪除", "刪除紀錄", "全部清除玩家習慣"} <= texts
+        assert view._habit_observation_days_entry.winfo_manager() == "pack"
+        assert view._habit_preferences_frame.winfo_manager() == "pack"
+        view._toggle_habit_management()
+        assert view._habit_management_frame.winfo_manager() == ""
+        assert view._habit_status_label.cget("text") == "已記錄 2 項"
+        assert tuple(view._feature_cards).count("settings.habits") == 1
+        view._render_habit_preferences(PlayerHabitSettingsView(7, 7, 7, ()))
+        assert view._habit_status_label.cget("text") == "尚無已記錄習慣"
+    finally:
+        root.destroy()
+
+
+def test_habit_changes_refresh_the_same_summary_renderer(monkeypatch) -> None:
+    view = object.__new__(HomeView)
+    updated = PlayerHabitSettingsView(9, 7, 7, ())
+    rendered: list[PlayerHabitSettingsView] = []
+    view._habit_observation_days_entry = _EntryStub("9")
+    view._render_habit_preferences = rendered.append
+    view._report_refresh_error = lambda _error: pytest.fail("不應回報錯誤")
+    view.on_habit_observation_days_update = lambda _days: updated
+    view.on_remove_habit_preference = lambda _preference_id: updated
+    view.on_remove_habit_observation = lambda _observation_id: updated
+    view.on_clear_habit_preferences = lambda: updated
+    view.parent = None
+
+    view._save_habit_observation_days()
+    view._remove_habit_preference("preference")
+    view._remove_habit_observation("observation")
+    monkeypatch.setattr(
+        "ui.home.messagebox.askyesno",
+        lambda *_args, **_kwargs: True,
+    )
+    view._clear_habit_preferences()
+
+    assert rendered == [updated, updated, updated, updated]
+
+
 def test_background_contain_geometry_never_crops_or_upscales() -> None:
     assert _contain_geometry((200, 100), (100, 100)) == (100, 50, 0, 25)
 
@@ -715,6 +896,11 @@ def test_background_region_opacity_blends_legacy_color_over_image() -> None:
     assert _contrast_ratio("#000000", "#FFFFFF") == 21
     assert _contain_geometry((100, 200), (100, 100)) == (50, 100, 25, 0)
     assert _contain_geometry((80, 60), (320, 240)) == (80, 60, 120, 90)
+
+
+def test_smart_reconnect_status_uses_readable_extreme_color_text() -> None:
+    assert _status_text_color("#000000") == "#FFFFFF"
+    assert _status_text_color("#FFFFFF") == "#000000"
 
 
 def test_background_region_preserves_real_image_details_and_alignment() -> None:
@@ -876,6 +1062,115 @@ def test_feature_card_buttons_and_collapsed_title_keep_safe_spacing() -> None:
     assert abs(settings_offset) - abs(toggle_offset) - 62 == 6
     assert _feature_card_content_pady(12, 37) >= 6 + 37 + 8
     assert _feature_card_content_pady(80, 37) == 80
+
+
+def test_full_home_build_keeps_grid_and_pack_cards_safe_when_settings_toggle():
+    try:
+        root = Tk()
+    except TclError:
+        pytest.skip("目前環境沒有可用顯示")
+    root.withdraw()
+    try:
+        view = HomeView(root, {"self_check_passed": True})
+        view.build()
+        root.update_idletasks()
+        grid_card = view._feature_cards["groups.list"]
+        pack_card = view._feature_cards["sync.input"]
+        assert grid_card.content_manager == "grid"
+        assert pack_card.content_manager == "pack"
+        baseline_rows = {
+            child: int(child.grid_info().get("row", 0))
+            for child in grid_card.frame.grid_slaves()
+            if child is not grid_card.control_row
+        }
+        view._open_feature_card_settings("groups.list")
+        root.update_idletasks()
+        assert view._feature_card_settings_dialog is not None
+        view._open_feature_card_settings("groups.list")
+        assert view._feature_card_settings_dialog is None
+        assert {
+            child: int(child.grid_info().get("row", 0))
+            for child in grid_card.frame.grid_slaves()
+            if child is not grid_card.control_row
+        } == baseline_rows
+        view._open_feature_card_settings("groups.list")
+        view._open_feature_card_settings("sync.input")
+        root.update_idletasks()
+        assert view._feature_card_settings_dialog is not None
+        assert {
+            child: int(child.grid_info().get("row", 0))
+            for child in grid_card.frame.grid_slaves()
+            if child is not grid_card.control_row
+        } == baseline_rows
+    finally:
+        root.destroy()
+
+
+def test_current_group_management_starts_hidden_and_toggles_inline():
+    try:
+        root = Tk()
+    except TclError:
+        pytest.skip("目前環境沒有可用顯示")
+    root.withdraw()
+    try:
+        view = HomeView(root, {"self_check_passed": True})
+        view.build()
+        assert view._group_management_frame.winfo_manager() == ""
+        assert view._group_management_button.cget("text") == "管理組別"
+        view._toggle_group_management()
+        assert view._group_management_frame.winfo_manager() == "pack"
+        assert view._group_management_button.cget("text") == "收起管理"
+        for button in (view._group_restore_button, view._group_record_button):
+            assert button.winfo_manager() == "pack"
+        view._toggle_group_management()
+        assert view._group_management_frame.winfo_manager() == ""
+    finally:
+        root.destroy()
+
+
+def test_current_group_details_toggle_without_hiding_external_group_lists():
+    try:
+        root = Tk()
+    except TclError:
+        pytest.skip("目前環境沒有可用顯示")
+    root.withdraw()
+    try:
+        view = HomeView(root, {"self_check_passed": True})
+        view.build()
+        assert view._group_management_details_frame.winfo_manager() == ""
+        view._toggle_group_management()
+        assert view._group_management_details_frame.winfo_manager() == "pack"
+        assert view._feature_cards["groups.roles"].frame.master is view._group_management_details_frame
+        assert view._feature_cards["groups.extended_sync"].frame.master is view._group_management_details_frame
+        assert view._feature_cards["groups.window_size"].frame.master is view._group_management_details_frame
+        assert view._feature_cards["groups.ungrouped_windows"].frame.winfo_manager() == "pack"
+        view._toggle_group_management()
+        assert view._group_management_details_frame.winfo_manager() == ""
+    finally:
+        root.destroy()
+
+
+def test_group_management_action_rows_fit_three_buttons_at_narrow_width():
+    try:
+        root = Tk()
+    except TclError:
+        pytest.skip("目前環境沒有可用顯示")
+    root.geometry("760x600")
+    root.withdraw()
+    try:
+        view = HomeView(root, {"self_check_passed": True})
+        view.build()
+        view._toggle_group_management()
+        root.update_idletasks()
+        rows = (
+            view._group_stop_all_button.master,
+            view._group_add_button.master,
+            view._group_clear_button.master,
+        )
+        for row in rows:
+            assert sum(isinstance(child, Button) for child in row.winfo_children()) <= 3
+    finally:
+        root.destroy()
     required_pady = _collapsed_card_title_pady(24, 2, 31)
     collapsed_height = 24 - 4 + required_pady * 2
     assert collapsed_height >= 31 + 12

@@ -1,3 +1,8 @@
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
 from adapters.windows_background_capture import CaptureSample
 from adapters.windows_role_id_ocr import (
     WindowsRoleIdOcrReader,
@@ -5,6 +10,7 @@ from adapters.windows_role_id_ocr import (
 )
 from services.role_id_template_service import (
     ROLE_ID_REGION,
+    ROLE_ID_REFERENCE_SIZE,
     RoleIdTemplateService,
     clean_role_id_text,
     role_id_region_sample,
@@ -32,7 +38,7 @@ class OcrReader:
 
 
 def sample_with_name_pixels():
-    width, height = 400, 100
+    width, height = ROLE_ID_REFERENCE_SIZE
     pixels = bytearray(b"\x00\x00\x00\xff" * (width * height))
     left, top, right, bottom = ROLE_ID_REGION
     for y in range(top, bottom):
@@ -49,6 +55,7 @@ def sample_with_name_pixels():
 
 def test_role_id_text_cleanup_keeps_supported_game_name_characters():
     assert clean_role_id_text(" 120 嗚の百二古武！ ") == "120嗚の百二古武"
+    assert clean_role_id_text("嘻の百级古武") == "嘻の百級古武"
     assert clean_role_id_text("Mae嶽") == "Mae嶽"
     assert clean_role_id_text("這是?測試") == "這是 測試"
 
@@ -68,7 +75,7 @@ def test_role_id_ocr_image_uses_only_the_game_name_area():
     # The complete 120-pixel name is kept while the coloured icon is absent.
     assert image.width >= 130 * 10
     assert image.width < (ROLE_ID_REGION[2] - ROLE_ID_REGION[0]) * 10
-    assert image.height == (13 + 10) * 10
+    assert image.height == ((ROLE_ID_REGION[3] - ROLE_ID_REGION[1]) + 10) * 10
     assert image.getpixel((0, 0)) == (0, 0, 0)
 
 
@@ -90,6 +97,35 @@ def test_local_reader_keeps_only_text_returned_from_game_pixels():
     assert len(engine.images) == 1
 
 
+def test_saved_real_game_window_reads_the_complete_role_name():
+    reference = (
+        Path("assets")
+        / "game_data_reference"
+        / "role_id"
+        / "full_window_1347x933.png"
+    )
+    with Image.open(reference) as image:
+        rgba = image.convert("RGBA")
+        sample = CaptureSample(
+            rgba.width,
+            rgba.height,
+            rgba.tobytes("raw", "BGRA"),
+            True,
+        )
+    reader = WindowsRoleIdOcrReader()
+    if reader._reader() is None:
+        pytest.skip("本機未安裝封裝時會包含的角色名稱辨識元件。")
+    backend = CaptureBackend(sample)
+    result = RoleIdTemplateService(
+        capture_provider=backend,
+        ocr_reader=reader,
+    ).read(123)
+
+    assert result.success is True
+    assert result.role_id == "嘻の百級古武"
+    assert backend.calls == [123, 123]
+
+
 def test_read_uses_current_game_text_not_a_shortcut_or_saved_template():
     sample = sample_with_name_pixels()
     backend = CaptureBackend(sample)
@@ -103,8 +139,8 @@ def test_read_uses_current_game_text_not_a_shortcut_or_saved_template():
 
     assert result.success is True
     assert result.role_id == "嗚の百二古武"
-    assert backend.calls == [123]
-    assert len(reader.samples) == 1
+    assert backend.calls == [123, 123]
+    assert len(reader.samples) == 2
 
 
 def test_calibration_reads_current_game_text_and_ignores_entry_identity():

@@ -1,6 +1,9 @@
 import pytest
 
-from adapters.windows_battle_restart import WindowsBattleWindowRestarter
+from adapters.windows_battle_restart import (
+    WindowsBattleWindowRestarter,
+    WindowsShortcutOpenBackend,
+)
 from adapters.windows_window import WindowInfo
 from services.group_launch_service import GroupLaunchTarget
 
@@ -619,3 +622,208 @@ def test_missing_retry_opens_only_exact_absent_target(tmp_path):
     assert result.success is True
     assert result.shortcut_open_requested is True
     assert opener.targets == [target]
+
+
+@pytest.mark.parametrize("shared_field", ("handle", "process_id"))
+def test_direct_restart_refuses_cross_role_live_instance_collision(
+    tmp_path,
+    shared_field,
+):
+    target_window = _window()
+    conflicting = _window(
+        handle=22,
+        process_id=202,
+        fingerprint="b" * 64,
+    )
+    conflicting = WindowInfo(
+        handle=(
+            target_window.handle
+            if shared_field == "handle"
+            else conflicting.handle
+        ),
+        title=conflicting.title,
+        visible=conflicting.visible,
+        minimized=conflicting.minimized,
+        rect=conflicting.rect,
+        process_id=(
+            target_window.process_id
+            if shared_field == "process_id"
+            else conflicting.process_id
+        ),
+        window_class=conflicting.window_class,
+        launch_fingerprint=conflicting.launch_fingerprint,
+        thread_id=conflicting.thread_id,
+        process_lifecycle_token=conflicting.process_lifecycle_token,
+    )
+    closer = _Closer()
+    opener = _Opener()
+    restarter = WindowsBattleWindowRestarter(
+        _Windows([target_window, conflicting]),
+        closer,
+        opener,
+    )
+
+    result = restarter.restart(target_window, _target(tmp_path))
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_identity_duplicate"
+    assert closer.closed == []
+    assert opener.targets == []
+
+
+def test_direct_reopen_refuses_cross_role_handle_collision(tmp_path):
+    first = _window(handle=21, process_id=201, fingerprint="b" * 64)
+    second = _window(
+        handle=first.handle,
+        process_id=202,
+        fingerprint="c" * 64,
+    )
+    opener = _Opener()
+    restarter = WindowsBattleWindowRestarter(
+        _Windows([first, second]),
+        _Closer(),
+        opener,
+    )
+
+    result = restarter.reopen_missing(_target(tmp_path), [])
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_identity_duplicate"
+    assert opener.targets == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("thread_id", 0),
+        ("window_class", ""),
+        ("process_lifecycle_token", False),
+    ),
+)
+def test_direct_restart_refuses_incomplete_live_candidate(
+    tmp_path,
+    field,
+    value,
+):
+    target_window = _window()
+    invalid = _window(
+        handle=22,
+        process_id=202,
+        fingerprint="b" * 64,
+        **{field: value},
+    )
+    closer = _Closer()
+    opener = _Opener()
+    restarter = WindowsBattleWindowRestarter(
+        _Windows([target_window, invalid]),
+        closer,
+        opener,
+    )
+
+    result = restarter.restart(target_window, _target(tmp_path))
+
+    assert result.success is False
+    assert result.failure_code == "battle_window_existing_state_unknown"
+    assert closer.closed == []
+    assert opener.targets == []
+
+
+class _ShortcutResolver:
+    def __init__(self, resolved):
+        self.resolved = resolved
+        self.calls = []
+
+    def resolve(self, shortcut_paths):
+        paths = tuple(shortcut_paths)
+        self.calls.append(paths)
+        return self.resolved(paths)
+
+
+def test_final_shortcut_delivery_rechecks_replaced_fingerprint(
+    tmp_path,
+    monkeypatch,
+):
+    target = _target(tmp_path)
+    target.shortcut_path.write_bytes(b"shortcut")
+    resolver = _ShortcutResolver(
+        lambda _paths: {target.shortcut_path: "b" * 64}
+    )
+    backend = WindowsShortcutOpenBackend(resolver)
+    starts = []
+    monkeypatch.setattr(
+        "adapters.windows_battle_restart.os.startfile",
+        lambda path: starts.append(path),
+        raising=False,
+    )
+
+    opened, failure_code = backend.open_shortcut_if_target_absent(
+        target,
+        lambda: None,
+    )
+
+    assert opened is False
+    assert failure_code == "battle_shortcut_identity_changed"
+    assert starts == []
+
+
+def test_final_shortcut_delivery_refuses_resolver_failure(tmp_path, monkeypatch):
+    target = _target(tmp_path)
+    target.shortcut_path.write_bytes(b"shortcut")
+    resolver = _ShortcutResolver(lambda _paths: {})
+    backend = WindowsShortcutOpenBackend(resolver)
+    starts = []
+    monkeypatch.setattr(
+        "adapters.windows_battle_restart.os.startfile",
+        lambda path: starts.append(path),
+        raising=False,
+    )
+
+    opened, failure_code = backend.open_shortcut_if_target_absent(
+        target,
+        lambda: None,
+    )
+
+    assert opened is False
+    assert failure_code == "battle_shortcut_identity_unresolved"
+    assert starts == []
+
+
+def test_final_shortcut_delivery_rechecks_absence_after_identity_resolution(
+    tmp_path,
+    monkeypatch,
+):
+    target = _target(tmp_path)
+    target.shortcut_path.write_bytes(b"shortcut")
+    target_present = [False]
+    calls = []
+
+    def resolve(paths):
+        calls.append("resolve")
+        target_present[0] = True
+        return {path: target.fingerprint for path in paths}
+
+    resolver = _ShortcutResolver(resolve)
+    backend = WindowsShortcutOpenBackend(resolver)
+    starts = []
+    monkeypatch.setattr(
+        "adapters.windows_battle_restart.os.startfile",
+        lambda path: starts.append(path),
+        raising=False,
+    )
+
+    def absence_check():
+        calls.append("absence")
+        if target_present[0]:
+            return "battle_window_already_exists"
+        return None
+
+    opened, failure_code = backend.open_shortcut_if_target_absent(
+        target,
+        absence_check,
+    )
+
+    assert opened is False
+    assert failure_code == "battle_window_already_exists"
+    assert calls == ["absence", "resolve", "absence"]
+    assert resolver.calls == [(target.shortcut_path,)]
+    assert starts == []

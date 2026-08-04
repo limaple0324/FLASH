@@ -21,6 +21,7 @@ from main import (
     TIMED_CLICK_SETTINGS_KEY,
     UI_THEME_CLASSIC_GOLD_MIGRATION_KEY,
     UI_THEME_KEY,
+    _connected_sync_fingerprints,
     _sync_scope_has_all_safe_windows,
     build_services,
     stop_input_sync_pair,
@@ -57,6 +58,27 @@ def test_sync_scope_requires_every_safe_window_with_matching_identity():
         (first, second),
         (_SyncWindow(first), _SyncWindow(first)),
     )
+
+
+def test_partial_connected_sync_tracks_three_roles_in_stable_scope_order():
+    first = "a" * 64
+    second = "b" * 64
+    third = "c" * 64
+    scope = (first, second, third)
+
+    assert _connected_sync_fingerprints(
+        scope,
+        (_SyncWindow(third), _SyncWindow(first)),
+    ) == (first, third)
+    assert _connected_sync_fingerprints(
+        scope,
+        (_SyncWindow(second),),
+    ) == (second,)
+    assert _connected_sync_fingerprints(scope, ()) == ()
+    assert _connected_sync_fingerprints(
+        scope,
+        (_SyncWindow(first), _SyncWindow(first), _SyncWindow(third)),
+    ) == (third,)
 
 
 def test_group_identity_failure_explains_cross_group_ambiguity():
