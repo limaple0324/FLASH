@@ -35,7 +35,7 @@ def test_card_changes_notify_home_refresh_listener():
     assert changes == [("guard",), ("guard",), ()]
 
 
-def test_missing_remove_is_quiet_and_queued_fourth_card_triggers_refresh():
+def test_missing_remove_is_quiet_and_priority_reorder_triggers_refresh():
     service = CardService()
     notifications = 0
 
@@ -52,7 +52,7 @@ def test_missing_remove_is_quiet_and_queued_fourth_card_triggers_refresh():
     service.upsert(_card("fourth"))
 
     assert notifications == baseline + 1
-    assert service.pending_entries[0].card.card_id == "fourth"
+    assert service.pending_entries[0].card.card_id == "third"
 
 
 def test_expiry_notifies_once_only_when_cards_are_removed():

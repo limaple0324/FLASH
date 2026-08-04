@@ -143,6 +143,41 @@ def test_disconnect_overlay_does_not_act_without_disconnect_words(monkeypatch):
     assert result.click_point is None
 
 
+@pytest.mark.parametrize("disconnect_word", ["中斷", "中断"])
+def test_disconnect_reader_accepts_traditional_or_simplified_core_word(
+    disconnect_word,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    recognizer._disconnect_text_reader_loaded = True
+    recognizer._disconnect_text_reader = lambda _image: (
+        [
+            (
+                f"與伺服器的連線已{disconnect_word}，點選確定將返回登錄界面",
+                0.99,
+            )
+        ],
+        0.0,
+    )
+    with Image.open(REFERENCE_DIR / "01_disconnected_dialog.png") as source:
+        result = recognizer.recognize_image(source)
+
+    assert result.state is ReconnectScreenState.DISCONNECTED
+
+
+def test_disconnect_reader_rejects_non_disconnect_text():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    recognizer._disconnect_text_reader_loaded = True
+    recognizer._disconnect_text_reader = lambda _image: (
+        [("活動進行中", 0.99)],
+        0.0,
+    )
+    with Image.open(REFERENCE_DIR / "01_disconnected_dialog.png") as source:
+        result = recognizer.recognize_image(source)
+
+    assert result.state is ReconnectScreenState.UNKNOWN
+    assert result.click_point is None
+
+
 def test_character_selection_keeps_an_abbreviated_visible_name():
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
     with Image.open(REFERENCE_DIR / "05_character_selection.png") as source:

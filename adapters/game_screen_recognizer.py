@@ -1725,7 +1725,7 @@ class ReferenceScreenRecognizer:
             threshold=DISCONNECT_TEXT_THRESHOLD,
             scale=DISCONNECT_TEXT_SCALE,
         )
-        if '銝剜' in text:
+        if "中斷" in text or "中断" in text:
             return True
         if not text:
             return bool(self._binary_text(text_region).getbbox())
