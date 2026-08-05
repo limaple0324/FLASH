@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -240,7 +241,7 @@ def test_run_shuts_down_adapter_after_normal_window_close(monkeypatch, tmp_path)
     assert adapter.shutdown_calls == 1
 
 
-def test_build_services_keeps_reconnect_and_sync_target_providers_separate(
+def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
     monkeypatch,
     tmp_path,
 ):
@@ -250,21 +251,17 @@ def test_build_services_keeps_reconnect_and_sync_target_providers_separate(
     keyboard = AppContext.get(main_module.WindowsInputSyncController)
     pointer = AppContext.get(main_module.WindowsPointerSyncController)
     strict_targets = ("strict-target",)
-    reconnect_targets = ResolvedTargetWindows(
-        windows=("safe-reconnect-target",),
-        failure_codes=("unidentified_candidate_window",),
-    )
-
-    monkeypatch.setattr(contract, "windows", lambda _group_name: strict_targets)
     monkeypatch.setattr(
         contract,
         "reconnect_targets",
-        lambda _group_name: reconnect_targets,
+        lambda _group_name: ResolvedTargetWindows(strict_targets),
     )
 
-    assert reconnect._target_windows_provider() is reconnect_targets
-    assert keyboard._target_windows_provider() == strict_targets
-    assert pointer._target_windows_provider() == strict_targets
+    assert reconnect._target_windows_provider is None
+    assert reconnect._require_expected_window_count is False
+    # 未驗證的測試替身不得進入同步目標集合。
+    assert keyboard._target_windows_provider() == ()
+    assert pointer._target_windows_provider() == ()
 
 
 def test_run_shuts_down_adapter_after_startup_failure(monkeypatch, tmp_path):
@@ -334,3 +331,32 @@ def test_event_subscription_shutdown_reports_detach_failure():
         "listeners were not detached" in message
         for message in logger.error_messages
     )
+
+
+def test_obsidian_polling_reschedules_after_a_safe_cycle_failure_and_cancels_on_close():
+    source = Path("main.py").read_text(encoding="utf-8")
+    window_setup = source[
+        source.index("def create_main_window("):
+        source.index("    def schedule_registered_obsidian_poll(")
+    ]
+    polling = source[
+        source.index("    def schedule_registered_obsidian_poll("):
+        source.index("    def activity_progress_changed_handler(")
+    ]
+    closing = source[
+        source.index("    def close_window("):
+        source.index("    window.protocol(")
+    ]
+
+    assert "if closing:" in polling
+    assert "def current_sync_target_windows()" in window_setup
+    assert "target_window_contract_service.reconnect_targets(" in window_setup
+    assert "smart_reconnect_controller.observe_screen_states(" in window_setup
+    assert "ReconnectScreenState.CONNECTED" in window_setup
+    assert "candidate_index = game_data_read_cursor % len(candidates)" in polling
+    assert "result = capture_service.read(selected.handle)" in polling
+    assert "except Exception as error:" in polling
+    assert "stage={stage}; candidate_index={candidate_index}" in polling
+    assert "finally:" in polling
+    assert "schedule_registered_obsidian_poll()" in polling
+    assert "window.after_cancel(game_data_read_after_id)" in closing

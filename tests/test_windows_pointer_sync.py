@@ -3,8 +3,12 @@ from dataclasses import replace
 from threading import Event
 
 from adapters.windows_input_sync import WindowInputPolicy
-from adapters.windows_pointer_sync import WindowsPointerSyncController
+from adapters.windows_pointer_sync import (
+    Win32PointerMessageBackend,
+    WindowsPointerSyncController,
+)
 from adapters.windows_window import WindowInfo
+from core.reconnect_policy import ReconnectScreenState
 from domain.sync_target_settings import SyncTargetSettings
 from services.deferred_sync_operation_service import (
     DeferredSyncOperationService,
@@ -74,6 +78,44 @@ class AdjustedMessages(Messages):
         self.completed.set()
         return True
 
+
+class Win32Function:
+    def __init__(self, callback):
+        self._callback = callback
+
+    def __call__(self, *args):
+        return self._callback(*args)
+
+
+class Win32PointerApi:
+    def __init__(self):
+        self.messages = []
+        self.GetClientRect = Win32Function(self._get_client_rect)
+        self.IsWindow = Win32Function(lambda _handle: True)
+        self.SendMessageTimeoutW = Win32Function(self._send_message)
+
+    @staticmethod
+    def _get_client_rect(_handle, pointer):
+        rect = pointer._obj
+        rect.left, rect.top, rect.right, rect.bottom = (0, 0, 900, 600)
+        return True
+
+    def _send_message(
+        self,
+        handle,
+        message,
+        wparam,
+        lparam,
+        flags,
+        timeout,
+        result_pointer,
+    ):
+        self.messages.append(
+            (handle, message, wparam, lparam, flags, timeout)
+        )
+        result_pointer._obj.value = 1
+        return True
+
 def _controller(windows, messages):
     controller = WindowsPointerSyncController(
         expected_windows=len(windows),
@@ -85,6 +127,30 @@ def _controller(windows, messages):
     controller.set_allowed_fingerprints(allowed)
     controller.set_controller_fingerprint(allowed[0])
     return controller
+
+
+def test_win32_left_down_moves_before_press_and_confirms_delivery(monkeypatch):
+    api = Win32PointerApi()
+    backend = Win32PointerMessageBackend()
+    monkeypatch.setattr(backend, "_user32", lambda: api)
+
+    assert backend.send_pointer(123, 0.5, 0.25, "left_down") is True
+
+    assert [item[1] for item in api.messages] == [
+        backend.WM_MOUSEMOVE,
+        backend.WM_LBUTTONDOWN,
+    ]
+    assert [item[2] for item in api.messages] == [0, backend.MK_LBUTTON]
+    assert all(
+        item[4]
+        == (
+            backend.SMTO_BLOCK
+            | backend.SMTO_ABORTIFHUNG
+            | backend.SMTO_ERRORONEXIT
+        )
+        and item[5] == backend.MESSAGE_TIMEOUT_MS
+        for item in api.messages
+    )
 
 
 def test_background_policy_mirrors_left_click_except_source_and_minimized():
@@ -133,6 +199,73 @@ def test_fourteen_window_left_sync_sends_once_to_each_non_controller():
 
     assert result.passed is True
     assert [item[0] for item in messages.sent] == list(range(2, 15))
+
+
+def test_partial_group_click_skips_login_screen_and_keeps_group_scope():
+    windows = [_window(1), _window(2)]
+    messages = Messages()
+    allowed = tuple(f"{handle:064x}" for handle in range(1, 4))
+    states = {
+        allowed[0]: ReconnectScreenState.CONNECTED,
+        allowed[1]: ReconnectScreenState.CONNECTED,
+        allowed[2]: ReconnectScreenState.LOGIN_START,
+    }
+    controller = WindowsPointerSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=Windows(windows, foreground=1),
+        message_backend=messages,
+        screen_state_provider=states.get,
+        require_expected_window_count=False,
+    )
+    controller.set_allowed_fingerprints(allowed)
+    controller.set_controller_fingerprint(allowed[0])
+
+    result = controller.send_click(
+        source_handle=1,
+        x_ratio=0.5,
+        y_ratio=0.5,
+        policy=WindowInputPolicy.ALL,
+        include_source=False,
+    )
+
+    assert result.passed is True
+    assert result.discovered_windows == 2
+    assert result.eligible_windows == 1
+    assert [item[0] for item in messages.sent] == [2, 2]
+    assert controller.source_is_eligible(1) is True
+
+
+def test_partial_group_login_source_cannot_start_click_sync():
+    windows = [_window(1), _window(2)]
+    messages = Messages()
+    allowed = tuple(f"{handle:064x}" for handle in range(1, 4))
+    states = {
+        allowed[0]: ReconnectScreenState.LOGIN_START,
+        allowed[1]: ReconnectScreenState.CONNECTED,
+    }
+    controller = WindowsPointerSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=Windows(windows, foreground=1),
+        message_backend=messages,
+        screen_state_provider=states.get,
+        require_expected_window_count=False,
+    )
+    controller.set_allowed_fingerprints(allowed)
+    controller.set_controller_fingerprint(allowed[0])
+
+    result = controller.send_click(
+        source_handle=1,
+        x_ratio=0.5,
+        y_ratio=0.5,
+        policy=WindowInputPolicy.ALL,
+        include_source=False,
+    )
+
+    assert result.failure_codes == ("source_not_in_game",)
+    assert messages.sent == []
+    assert controller.source_is_eligible(1) is False
 
 
 def test_send_click_uses_configured_order_and_one_preflight():

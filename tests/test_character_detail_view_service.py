@@ -89,7 +89,6 @@ def test_detail_snapshot_excludes_frozen_and_future_fields(tmp_path) -> None:
     for name in (
         "character_id",
         "window_handle",
-        "soul_stone",
         "life_soul",
         "pet",
         "artifact",

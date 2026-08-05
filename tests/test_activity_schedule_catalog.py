@@ -35,12 +35,6 @@ def test_catalog_preserves_all_confirmed_timed_activity_facts():
         "strange-stone-square": ("奇石廣場", (6,), "14:00", "23:59"),
         "eastern-mystic-arena": ("東玄角斗場", (6,), "20:00", "21:00"),
         "maze": ("迷陣", (0, 1, 2, 3, 4, 5, 6), "00:00", "23:59"),
-        "magic-soldiers": (
-            "魔兵降臨",
-            (0, 1, 2, 3, 4, 5, 6),
-            "00:00",
-            "23:59",
-        ),
         "hall-of-demons": (
             "諸魔殿",
             (0, 1, 2, 3, 4, 5, 6),
@@ -59,6 +53,12 @@ def test_catalog_preserves_all_confirmed_timed_activity_facts():
         assert rule.reminder_enabled is True
         assert rule.is_ready_for_reminders is True
         assert rule.definition.reset_rule.value == "每日00:00"
+
+    magic_soldiers = catalog.get("magic-soldiers")
+    assert magic_soldiers.local_start is None
+    assert magic_soldiers.local_end is None
+    assert magic_soldiers.reminder_enabled is False
+    assert magic_soldiers.is_ready_for_reminders is False
 
 
 def test_sunday_1420_alternates_from_the_supplied_anchor_week():
@@ -84,7 +84,8 @@ def test_confirmed_level_restrictions_do_not_guess_other_activity_audiences():
     assert magic_soldiers.level_eligibility(120) is True
     assert magic_soldiers.level_eligibility(160) is True
     assert magic_soldiers.level_eligibility(100) is False
-    assert magic_soldiers.local_start.strftime("%H:%M") == "00:00"
+    assert magic_soldiers.local_start is None
+    assert magic_soldiers.is_ready_for_reminders is False
     assert hall.level_eligibility(160) is None
     assert hall.is_ready_for_reminders is True
     assert hall.reminder_scope is ReminderScope.UNCONFIRMED

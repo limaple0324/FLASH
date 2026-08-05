@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "fallback_family": "Microsoft JhengHei UI",
+  "default_font_id": "jason_3",
+  "fonts": [
+    {
+      "font_id": "cubic_11",
+      "display_name": "俐方體十一號",
+      "repository": "ACh-K/Cubic-11",
+      "commit": "4c566f7d6cc5c05ee360fe9cff56b5da1fcafd4d",
+      "source_path": "fonts/ttf/Cubic_11.ttf",
+      "managed_path": "cubic_11/Cubic_11.ttf",
+      "size": 2773732,
+      "sha256": "0193f5f033612496df6b45ee92ac3b335bc6a5a24ff95da55ca87b33e57dcf62",
+      "internal_family": "Cubic 11",
+      "ui_family": "Cubic 11",
+      "license_evidence": [
+        "cubic_11/OFL.txt"
+      ]
+    },
+    {
+      "font_id": "naikai",
+      "display_name": "內海字體",
+      "repository": "max32002/naikaifont",
+      "commit": "7baa43a6adad4a82eab6fd27c9612b316f69d7c9",
+      "source_path": "tw/NaikaiFont-Regular-Lite.ttf",
+      "managed_path": "naikai/NaikaiFont-Regular-Lite.ttf",
+      "size": 4664452,
+      "sha256": "4e42aef5ab08f00bfcb5093205eda1d3e1da57c72ef3029fb1ae513050bfd402",
+      "internal_family": "NaikaiFont",
+      "ui_family": "NaikaiFont",
+      "license_evidence": [
+        "naikai/SIL_Open_Font_License_1.1.txt"
+      ]
+    },
+    {
+      "font_id": "jason_3",
+      "display_name": "清松手寫體三",
+      "repository": "jasonhandwriting/JasonHandwriting",
+      "commit": "e488583c07077850aa4a2a6280baa20374cccde2",
+      "source_path": "JasonHandwriting3.ttf",
+      "managed_path": "jason_handwriting/JasonHandwriting3.ttf",
+      "size": 6089404,
+      "sha256": "7747c276f3b16306c7ab7d52465647c566d01f91faeefa70c271a3890ed35fb0",
+      "internal_family": "JasonHandwriting3",
+      "ui_family": "JasonHandwriting3",
+      "license_evidence": [
+        "jason_handwriting/README.md",
+        "official_sil/OFL-1.1.txt"
+      ]
+    },
+    {
+      "font_id": "jason_4",
+      "display_name": "清松手寫體四",
+      "repository": "jasonhandwriting/JasonHandwriting",
+      "commit": "e488583c07077850aa4a2a6280baa20374cccde2",
+      "source_path": "JasonHandwriting4.ttf",
+      "managed_path": "jason_handwriting/JasonHandwriting4.ttf",
+      "size": 4137276,
+      "sha256": "1db91107a80c78e6d04b6d78f86a4b8946f083cb0b41ff5864009c4e1698ee4b",
+      "internal_family": "JasonHandwriting4",
+      "ui_family": "JasonHandwriting4",
+      "license_evidence": [
+        "jason_handwriting/README.md",
+        "official_sil/OFL-1.1.txt"
+      ]
+    },
+    {
+      "font_id": "jason_6",
+      "display_name": "清松手寫體六",
+      "repository": "jasonhandwriting/JasonHandwriting",
+      "commit": "e488583c07077850aa4a2a6280baa20374cccde2",
+      "source_path": "JasonHandwriting6.ttf",
+      "managed_path": "jason_handwriting/JasonHandwriting6.ttf",
+      "size": 7462032,
+      "sha256": "2fa5886c15b4053eb32f3dc9e83fd7a8bf8fc599dcddd37e6c706b3fefe32ffd",
+      "internal_family": "JasonHandwriting6",
+      "ui_family": "JasonHandwriting6",
+      "license_evidence": [
+        "jason_handwriting/README.md",
+        "official_sil/OFL-1.1.txt"
+      ]
+    },
+    {
+      "font_id": "jason_8",
+      "display_name": "清松手寫體八",
+      "repository": "jasonhandwriting/JasonHandwriting",
+      "commit": "e488583c07077850aa4a2a6280baa20374cccde2",
+      "source_path": "JasonHandwriting8.ttf",
+      "managed_path": "jason_handwriting/JasonHandwriting8.ttf",
+      "size": 8030664,
+      "sha256": "1437de4a5fee29a5c6b43450df56e734af9cddb5b3a68d236cf5f42be178c93f",
+      "internal_family": "JasonHandwriting8",
+      "ui_family": "JasonHandwriting8",
+      "license_evidence": [
+        "jason_handwriting/README.md",
+        "official_sil/OFL-1.1.txt"
+      ]
+    },
+    {
+      "font_id": "jason_9",
+      "display_name": "清松手寫體九",
+      "repository": "jasonhandwriting/JasonHandwriting",
+      "commit": "e488583c07077850aa4a2a6280baa20374cccde2",
+      "source_path": "JasonHandwriting9.ttf",
+      "managed_path": "jason_handwriting/JasonHandwriting9.ttf",
+      "size": 8379644,
+      "sha256": "b50728e2c7442a76a661c4d43c8ec22142e8edc83909a9d40b7c25d04bd04cf5",
+      "internal_family": "JasonHandwriting9",
+      "ui_family": "JasonHandwriting9",
+      "license_evidence": [
+        "jason_handwriting/README.md",
+        "official_sil/OFL-1.1.txt"
+      ]
+    },
+    {
+      "font_id": "chenyu_luoyan",
+      "display_name": "辰宇落雁體",
+      "repository": "Chenyu-otf/chenyuluoyan_thin",
+      "commit": "6e36815b0bec9f4f948298698d00b27a5f0b65c1",
+      "source_path": "ChenYuluoyan-2.0-Thin.ttf",
+      "managed_path": "chenyu_luoyan/ChenYuluoyan-2.0-Thin.ttf",
+      "size": 9522140,
+      "sha256": "1289e42a6d1ec995d0cb23aee89efc69fc95749fbd54a610057a3e992dc453db",
+      "internal_family": "ChenYuluoyan 2.0",
+      "ui_family": "ChenYuluoyan 2.0 Thin",
+      "license_evidence": [
+        "chenyu_luoyan/license.txt"
+      ]
+    }
+  ],
+  "licenses": [
+    {
+      "managed_path": "cubic_11/OFL.txt",
+      "repository": "ACh-K/Cubic-11",
+      "commit": "4c566f7d6cc5c05ee360fe9cff56b5da1fcafd4d",
+      "source_path": "OFL.txt",
+      "size": 5364,
+      "sha256": "2b6e5938e5cffa0b9e183bd05f8c363e174e7ebed1a0556e2855fd1707fa2188"
+    },
+    {
+      "managed_path": "naikai/SIL_Open_Font_License_1.1.txt",
+      "repository": "max32002/naikaifont",
+      "commit": "7baa43a6adad4a82eab6fd27c9612b316f69d7c9",
+      "source_path": "SIL_Open_Font_License_1.1.txt",
+      "size": 4302,
+      "sha256": "e564f06d018e7b95bc3594c96a17f1d41865af4038c375e7aa974dd69df38602"
+    },
+    {
+      "managed_path": "jason_handwriting/README.md",
+      "repository": "jasonhandwriting/JasonHandwriting",
+      "commit": "e488583c07077850aa4a2a6280baa20374cccde2",
+      "source_path": "README.md",
+      "size": 1012,
+      "sha256": "11996d4e9f85c58af598b7dc7992681f8ac11f51122ca3d6997f45b8b2927423"
+    },
+    {
+      "managed_path": "chenyu_luoyan/license.txt",
+      "repository": "Chenyu-otf/chenyuluoyan_thin",
+      "commit": "6e36815b0bec9f4f948298698d00b27a5f0b65c1",
+      "source_path": "license.txt",
+      "size": 4506,
+      "sha256": "393732512d2658fa5841dfaad325e002ccb6755b9037a818500434c0a5c4a6d1"
+    },
+    {
+      "managed_path": "official_sil/OFL-1.1.txt",
+      "source_url": "https://openfontlicense.org/documents/OFL.txt",
+      "source_page": "https://openfontlicense.org/open-font-license-official-text/",
+      "size": 4599,
+      "sha256": "1d361a8f8e8ce6e68457dcd93fb56e162e6baa3bbb7e7573a290d44399f6b57e"
+    }
+  ]
+}

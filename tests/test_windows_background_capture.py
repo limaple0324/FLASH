@@ -21,6 +21,16 @@ class FakeProvider:
         return self.sample
 
 
+class CallbackProvider:
+    def __init__(self, callback):
+        self.callback = callback
+        self.handles = []
+
+    def capture(self, window_handle):
+        self.handles.append(window_handle)
+        return self.callback(window_handle)
+
+
 def sample(pixels, *, width=2, height=2, api_succeeded=True):
     return CaptureSample(
         width=width,
@@ -304,6 +314,47 @@ class FakeCallable:
         return self.callback(*args)
 
 
+def install_minimized_neighbor_reorder(user32, preserved_relation):
+    original_set_window_pos = user32.SetWindowPos.callback
+
+    def restore_then_reorder(
+        handle,
+        insert_after,
+        x,
+        y,
+        width,
+        height,
+        flags,
+    ):
+        restored = original_set_window_pos(
+            handle,
+            insert_after,
+            x,
+            y,
+            width,
+            height,
+            flags,
+        )
+        if not restored or handle_value(insert_after) != 300:
+            return restored
+        target_index = user32.z_order.index(user32.target)
+        user32.z_order.remove(700)
+        target_index = user32.z_order.index(user32.target)
+        if preserved_relation == "previous":
+            user32.z_order.insert(target_index + 1, 700)
+        elif preserved_relation == "next":
+            user32.z_order.insert(target_index, 700)
+        elif preserved_relation == "none":
+            user32.z_order.insert(target_index, 700)
+            target_index = user32.z_order.index(user32.target)
+            user32.z_order.insert(target_index + 1, 888)
+        else:
+            raise AssertionError("unsupported relation")
+        return restored
+
+    user32.SetWindowPos = FakeCallable(restore_then_reorder)
+
+
 class FakeVisibleRegionUser32:
     def __init__(self):
         self.target = 123
@@ -470,8 +521,10 @@ def test_visible_capture_fails_closed_without_target_lifecycle(
 def test_recovering_provider_refreshes_and_restores_minimized_window(monkeypatch):
     expected = sample([0, 20, 80, 255] * 4)
     user32 = FakeWindowStateApi(minimized=True)
+    fresh = FakeProvider(expected)
     provider = Win32RecoveringPrintWindowProvider(
         paint_settle_seconds=0,
+        fresh_capture_provider=fresh,
         process_lifecycle_provider=fake_process_lifecycle_token,
     )
     original_order = list(user32.z_order)
@@ -481,10 +534,14 @@ def test_recovering_provider_refreshes_and_restores_minimized_window(monkeypatch
     monkeypatch.setattr(
         Win32PrintWindowProvider,
         "capture",
-        lambda _self, _handle: expected,
+        lambda _self, _handle: (_ for _ in ()).throw(
+            AssertionError("passive PrintWindow fallback is forbidden")
+        ),
     )
 
     assert provider.capture(123) is expected
+    assert fresh.handles == [123]
+    assert provider.last_failure_stage is None
     assert user32.minimized is True
     assert user32.foreground == 700
     assert user32.foreground_calls == []
@@ -498,25 +555,361 @@ def test_recovering_provider_refreshes_and_restores_minimized_window(monkeypatch
     ]
 
 
+def test_minimized_capture_accepts_exact_previous_with_current_reordered_next(
+    monkeypatch,
+):
+    expected = sample([0, 20, 80, 255] * 4)
+    user32 = FakeWindowStateApi(minimized=True)
+    install_minimized_neighbor_reorder(user32, "previous")
+    provider = Win32RecoveringPrintWindowProvider(
+        paint_settle_seconds=0,
+        fresh_capture_provider=FakeProvider(expected),
+        process_lifecycle_provider=fake_process_lifecycle_token,
+    )
+    monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
+
+    captured = provider.capture(user32.target)
+
+    assert captured is expected
+    assert user32.minimized is True
+    assert user32.foreground == 700
+    assert user32.process_ids[300] == 30
+    assert user32.process_ids[400] == 40
+    target_index = user32.z_order.index(user32.target)
+    assert user32.z_order[target_index - 1] == 300
+    assert user32.z_order[target_index + 1] != 400
+
+
+def test_minimized_capture_accepts_exact_next_with_current_reordered_previous(
+    monkeypatch,
+):
+    expected = sample([0, 20, 80, 255] * 4)
+    user32 = FakeWindowStateApi(minimized=True)
+    install_minimized_neighbor_reorder(user32, "next")
+    provider = Win32RecoveringPrintWindowProvider(
+        paint_settle_seconds=0,
+        fresh_capture_provider=FakeProvider(expected),
+        process_lifecycle_provider=fake_process_lifecycle_token,
+    )
+    monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
+
+    captured = provider.capture(user32.target)
+
+    assert captured is expected
+    assert user32.minimized is True
+    assert user32.foreground == 700
+    assert user32.process_ids[300] == 30
+    assert user32.process_ids[400] == 40
+    target_index = user32.z_order.index(user32.target)
+    assert user32.z_order[target_index - 1] != 300
+    assert user32.z_order[target_index + 1] == 400
+
+
+def test_minimized_capture_rejects_when_neither_neighbor_edge_is_exact(
+    monkeypatch,
+):
+    expected = sample([0, 20, 80, 255] * 4)
+    user32 = FakeWindowStateApi(minimized=True)
+    install_minimized_neighbor_reorder(user32, "none")
+    provider = Win32RecoveringPrintWindowProvider(
+        paint_settle_seconds=0,
+        fresh_capture_provider=FakeProvider(expected),
+        process_lifecycle_provider=fake_process_lifecycle_token,
+    )
+    monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
+
+    assert provider.capture(user32.target) is None
+    assert user32.process_ids[300] == 30
+    assert user32.process_ids[400] == 40
+
+
+def test_minimized_capture_rejects_replaced_original_neighbor_instance(
+    monkeypatch,
+):
+    expected = sample([0, 20, 80, 255] * 4)
+    for replaced_handle in (300, 400):
+        user32 = FakeWindowStateApi(minimized=True)
+
+        def replace_neighbor(_handle, neighbor=replaced_handle):
+            user32.process_ids[neighbor] = 999
+            return expected
+
+        provider = Win32RecoveringPrintWindowProvider(
+            paint_settle_seconds=0,
+            fresh_capture_provider=CallbackProvider(replace_neighbor),
+            process_lifecycle_provider=fake_process_lifecycle_token,
+        )
+        monkeypatch.setattr(
+            provider,
+            "_libraries",
+            lambda api=user32: (api, object()),
+        )
+
+        assert provider.capture(user32.target) is None, replaced_handle
+
+
+def test_minimized_neighbor_trust_revalidates_after_relationship_reads():
+    user32 = FakeWindowStateApi(minimized=True)
+    state = Win32TemporarilyRevealedCaptureProvider
+    previous_handle = 300
+    next_handle = 400
+    previous_instance = state._window_instance_credential(
+        user32,
+        ctypes.c_void_p(previous_handle),
+        fake_process_lifecycle_token,
+    )
+    next_instance = state._window_instance_credential(
+        user32,
+        ctypes.c_void_p(next_handle),
+        fake_process_lifecycle_token,
+    )
+    assert previous_instance is not None
+    assert next_instance is not None
+    original_get_window = user32.GetWindow.callback
+    relationship_reads = 0
+
+    def replace_neighbor_after_relationship_read(handle, command):
+        nonlocal relationship_reads
+        result = original_get_window(handle, command)
+        if handle_value(handle) == user32.target and command in {
+            state.GW_HWNDPREV,
+            state.GW_HWNDNEXT,
+        }:
+            relationship_reads += 1
+            if relationship_reads == 2:
+                user32.process_ids[previous_handle] = 999
+        return result
+
+    user32.GetWindow = FakeCallable(
+        replace_neighbor_after_relationship_read
+    )
+
+    assert not Win32RecoveringPrintWindowProvider._trusted_minimized_neighbor_restoration(
+        user32,
+        ctypes.c_void_p(user32.target),
+        previous_handle=previous_handle,
+        next_handle=next_handle,
+        previous_instance=previous_instance,
+        next_instance=next_instance,
+        lifecycle_provider=fake_process_lifecycle_token,
+    )
+    assert relationship_reads == 2
+    assert user32.process_ids[previous_handle] == 999
+
+
+def test_minimized_capture_with_only_previous_requires_that_exact_edge(
+    monkeypatch,
+):
+    expected = sample([0, 20, 80, 255] * 4)
+    for break_after_repair, expected_result in (
+        (False, expected),
+        (True, None),
+    ):
+        user32 = FakeWindowStateApi(minimized=True)
+        user32.z_order = [700, 300, user32.target]
+        original_show = user32.ShowWindow.callback
+
+        def show_then_reorder(handle, command):
+            result = original_show(handle, command)
+            if command == Win32RecoveringPrintWindowProvider.SW_SHOWMINNOACTIVE:
+                user32.z_order.remove(700)
+                target_index = user32.z_order.index(user32.target)
+                user32.z_order.insert(target_index, 700)
+            return result
+
+        user32.ShowWindow = FakeCallable(show_then_reorder)
+        original_position = user32.SetWindowPos.callback
+
+        def restore_previous_then_optionally_break(*args):
+            result = original_position(*args)
+            if result and break_after_repair:
+                user32.z_order.remove(700)
+                target_index = user32.z_order.index(user32.target)
+                user32.z_order.insert(target_index, 700)
+            return result
+
+        user32.SetWindowPos = FakeCallable(
+            restore_previous_then_optionally_break
+        )
+        fresh = FakeProvider(expected)
+        provider = Win32RecoveringPrintWindowProvider(
+            paint_settle_seconds=0,
+            fresh_capture_provider=fresh,
+            process_lifecycle_provider=fake_process_lifecycle_token,
+        )
+        monkeypatch.setattr(
+            provider,
+            "_libraries",
+            lambda api=user32: (api, object()),
+        )
+
+        assert provider.capture(user32.target) is expected_result
+        assert fresh.handles == [user32.target]
+        target_index = user32.z_order.index(user32.target)
+        assert (
+            user32.z_order[target_index - 1] == 300
+        ) is (not break_after_repair)
+
+
+def test_minimized_capture_with_only_next_requires_that_exact_edge(
+    monkeypatch,
+):
+    expected = sample([0, 20, 80, 255] * 4)
+    for break_after_repair, expected_result in (
+        (False, expected),
+        (True, None),
+    ):
+        user32 = FakeWindowStateApi(minimized=True)
+        user32.z_order = [user32.target, 400, 700]
+        original_position = user32.SetWindowPos.callback
+
+        def restore_next_then_optionally_break(*args):
+            result = original_position(*args)
+            if result and break_after_repair:
+                user32.z_order.remove(700)
+                target_index = user32.z_order.index(user32.target)
+                user32.z_order.insert(target_index + 1, 700)
+            return result
+
+        user32.SetWindowPos = FakeCallable(
+            restore_next_then_optionally_break
+        )
+        fresh = FakeProvider(expected)
+        provider = Win32RecoveringPrintWindowProvider(
+            paint_settle_seconds=0,
+            fresh_capture_provider=fresh,
+            process_lifecycle_provider=fake_process_lifecycle_token,
+        )
+        monkeypatch.setattr(
+            provider,
+            "_libraries",
+            lambda api=user32: (api, object()),
+        )
+
+        assert provider.capture(user32.target) is expected_result
+        assert fresh.handles == [user32.target]
+        target_index = user32.z_order.index(user32.target)
+        exact_next = (
+            target_index + 1 < len(user32.z_order)
+            and user32.z_order[target_index + 1] == 400
+        )
+        assert exact_next is (not break_after_repair)
+
+
+def test_recovering_provider_defaults_to_temporary_reveal_visible_pixels():
+    provider = Win32RecoveringPrintWindowProvider(
+        process_lifecycle_provider=fake_process_lifecycle_token,
+    )
+
+    assert isinstance(
+        provider._fresh_capture_provider,
+        Win32TemporarilyRevealedCaptureProvider,
+    )
+    assert isinstance(
+        provider._fresh_capture_provider._visible_provider,
+        Win32VisibleRegionCaptureProvider,
+    )
+
+
+def test_default_minimized_capture_composition_restores_every_window_state(
+    monkeypatch,
+):
+    expected = sample([0, 20, 80, 255] * 4)
+    user32 = FakeDefaultMinimizedCaptureApi()
+    visible = FakeVisibleCaptureProvider(expected)
+    provider = Win32RecoveringPrintWindowProvider(
+        paint_settle_seconds=0,
+        process_lifecycle_provider=fake_process_lifecycle_token,
+    )
+    revealed = provider._fresh_capture_provider
+    assert isinstance(revealed, Win32TemporarilyRevealedCaptureProvider)
+    revealed._paint_settle_seconds = 0
+    revealed._visible_provider = visible
+    monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
+    monkeypatch.setattr(revealed, "_libraries", lambda: (user32, object()))
+    original_order = list(user32.z_order)
+    original_rect = user32.rects[user32.target]
+    original_placement = user32.normal_rect
+    original_foreground = user32.foreground
+    original_topmost = set(user32.topmost)
+
+    captured = provider.capture(user32.target)
+
+    assert captured is expected
+    assert visible.handles == [user32.target]
+    assert user32.show_commands == [
+        provider.SW_SHOWNOACTIVATE,
+        provider.SW_SHOWMINNOACTIVE,
+    ]
+    anchors = [call[1] for call in user32.position_calls]
+    assert Win32TemporarilyRevealedCaptureProvider.HWND_TOPMOST in anchors
+    assert Win32TemporarilyRevealedCaptureProvider.HWND_NOTOPMOST in anchors
+    assert 300 in anchors
+    assert user32.minimized is True
+    assert user32.foreground == original_foreground
+    assert user32.foreground_calls == []
+    assert user32.z_order == original_order
+    assert user32.rects[user32.target] == original_rect
+    assert user32.normal_rect == original_placement
+    assert user32.topmost == original_topmost
+
+
+def test_default_minimized_capture_composition_rejects_any_restore_failure(
+    monkeypatch,
+):
+    expected = sample([0, 20, 80, 255] * 4)
+    for failure in (
+        "inner_demote",
+        "inner_restore",
+        "outer_minimize",
+        "outer_neighbor",
+    ):
+        user32 = FakeDefaultMinimizedCaptureApi(
+            restoration_failure=failure,
+        )
+        visible = FakeVisibleCaptureProvider(expected)
+        provider = Win32RecoveringPrintWindowProvider(
+            paint_settle_seconds=0,
+            process_lifecycle_provider=fake_process_lifecycle_token,
+        )
+        revealed = provider._fresh_capture_provider
+        assert isinstance(
+            revealed,
+            Win32TemporarilyRevealedCaptureProvider,
+        )
+        revealed._paint_settle_seconds = 0
+        revealed._visible_provider = visible
+        monkeypatch.setattr(
+            provider,
+            "_libraries",
+            lambda api=user32: (api, object()),
+        )
+        monkeypatch.setattr(
+            revealed,
+            "_libraries",
+            lambda api=user32: (api, object()),
+        )
+
+        assert provider.capture(user32.target) is None, failure
+        assert visible.handles == [user32.target], failure
+
+
 def test_recovering_provider_rejects_stale_snapshot_of_normal_window(
     monkeypatch,
 ):
     expected = sample([0, 20, 80, 255] * 4)
     user32 = FakeWindowStateApi(minimized=False)
+    fresh = FakeProvider(expected)
     provider = Win32RecoveringPrintWindowProvider(
         paint_settle_seconds=0,
+        fresh_capture_provider=fresh,
         process_lifecycle_provider=fake_process_lifecycle_token,
     )
-    capture_calls = []
     monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
-    monkeypatch.setattr(
-        Win32PrintWindowProvider,
-        "capture",
-        lambda _self, handle: capture_calls.append(handle) or expected,
-    )
 
     assert provider.capture(123) is None
-    assert capture_calls == []
+    assert fresh.handles == []
+    assert provider.last_failure_stage == "window_not_minimized"
     assert user32.show_commands == []
 
 
@@ -695,19 +1088,18 @@ def test_recovering_provider_discards_sample_when_reminimize_fails(
         minimized=True,
         minimize_succeeds=False,
     )
+    fresh = FakeProvider(expected)
     provider = Win32RecoveringPrintWindowProvider(
         paint_settle_seconds=0,
+        fresh_capture_provider=fresh,
         process_lifecycle_provider=fake_process_lifecycle_token,
     )
     monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
-    monkeypatch.setattr(
-        Win32PrintWindowProvider,
-        "capture",
-        lambda _self, _handle: expected,
-    )
 
     assert provider.capture(user32.target) is None
     assert user32.minimized is False
+    assert fresh.handles == [user32.target]
+    assert provider.last_failure_stage == "restoration_barrier_failed"
 
 
 def test_recovering_provider_discards_sample_when_z_order_restore_fails(
@@ -718,20 +1110,18 @@ def test_recovering_provider_discards_sample_when_z_order_restore_fails(
         minimized=True,
         position_restore_succeeds=False,
     )
+    fresh = FakeProvider(expected)
     provider = Win32RecoveringPrintWindowProvider(
         paint_settle_seconds=0,
+        fresh_capture_provider=fresh,
         process_lifecycle_provider=fake_process_lifecycle_token,
     )
     monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
-    monkeypatch.setattr(
-        Win32PrintWindowProvider,
-        "capture",
-        lambda _self, _handle: expected,
-    )
 
     assert provider.capture(user32.target) is None
     assert user32.minimized is True
     assert user32.position_calls == [(user32.target, 300)]
+    assert provider.last_failure_stage == "restoration_barrier_failed"
 
 
 def test_recovering_provider_never_anchors_to_reused_neighbor(
@@ -739,21 +1129,17 @@ def test_recovering_provider_never_anchors_to_reused_neighbor(
 ):
     expected = sample([0, 20, 80, 255] * 4)
     user32 = FakeWindowStateApi(minimized=True)
-    provider = Win32RecoveringPrintWindowProvider(
-        paint_settle_seconds=0,
-        process_lifecycle_provider=fake_process_lifecycle_token,
-    )
-    monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
-
-    def capture_and_reuse_neighbor(_self, _handle):
+    def capture_and_reuse_neighbor(_handle):
         user32.process_ids[300] = 999
         return expected
 
-    monkeypatch.setattr(
-        Win32PrintWindowProvider,
-        "capture",
-        capture_and_reuse_neighbor,
+    fresh = CallbackProvider(capture_and_reuse_neighbor)
+    provider = Win32RecoveringPrintWindowProvider(
+        paint_settle_seconds=0,
+        fresh_capture_provider=fresh,
+        process_lifecycle_provider=fake_process_lifecycle_token,
     )
+    monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
 
     assert provider.capture(user32.target) is None
 
@@ -772,16 +1158,12 @@ def test_recovering_provider_discards_sample_after_position_race(
     )
     monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
 
-    def capture_and_move(_self, _handle):
+    def capture_and_move(_handle):
         user32.normal_rect = (30, 40, 946, 669)
         user32.rects[user32.target] = user32.normal_rect
         return expected
 
-    monkeypatch.setattr(
-        Win32PrintWindowProvider,
-        "capture",
-        capture_and_move,
-    )
+    provider._fresh_capture_provider = CallbackProvider(capture_and_move)
 
     assert provider.capture(user32.target) is None
     assert user32.minimized is True
@@ -801,15 +1183,11 @@ def test_recovering_provider_rechecks_pid_immediately_before_reminimize(
     )
     monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
 
-    def finish_capture(_self, _handle):
+    def finish_capture(_handle):
         user32.capture_finished = True
         return expected
 
-    monkeypatch.setattr(
-        Win32PrintWindowProvider,
-        "capture",
-        finish_capture,
-    )
+    provider._fresh_capture_provider = CallbackProvider(finish_capture)
 
     assert provider.capture(user32.target) is None
 
@@ -1038,6 +1416,81 @@ class FakeRevealedWindowApi:
         if value not in self.process_ids:
             return False
         self.foreground = value
+        return True
+
+
+class FakeDefaultMinimizedCaptureApi(FakeWindowStateApi):
+    """One fake Win32 state shared by both default provider layers."""
+
+    def __init__(self, *, restoration_failure=None):
+        super().__init__(
+            minimized=True,
+            minimize_succeeds=(restoration_failure != "outer_minimize"),
+        )
+        self.restoration_failure = restoration_failure
+        self.position_calls = []
+        self.SetWindowPos = FakeCallable(self._set_layered_window_pos)
+
+    def _set_layered_window_pos(
+        self,
+        handle,
+        insert_after,
+        x,
+        y,
+        width,
+        height,
+        flags,
+    ):
+        value = handle_value(handle)
+        anchor = handle_value(insert_after)
+        self.position_calls.append(
+            (value, anchor, x, y, width, height, flags)
+        )
+        if (
+            self.restoration_failure == "inner_demote"
+            and anchor
+            == Win32TemporarilyRevealedCaptureProvider.HWND_NOTOPMOST
+        ):
+            return False
+        if (
+            self.restoration_failure == "inner_restore"
+            and anchor == Win32TemporarilyRevealedCaptureProvider.HWND_TOP
+            and len(self.position_calls) >= 3
+        ):
+            return False
+        if (
+            self.restoration_failure == "outer_neighbor"
+            and anchor == 300
+        ):
+            return False
+        if value not in self.z_order:
+            return False
+        self.z_order.remove(value)
+        if anchor == Win32TemporarilyRevealedCaptureProvider.HWND_TOPMOST:
+            self.topmost.add(value)
+            self.z_order.insert(0, value)
+        elif anchor in (
+            Win32TemporarilyRevealedCaptureProvider.HWND_TOP,
+            Win32TemporarilyRevealedCaptureProvider.HWND_NOTOPMOST,
+        ):
+            self.topmost.discard(value)
+            first_normal = next(
+                (
+                    index
+                    for index, candidate in enumerate(self.z_order)
+                    if candidate not in self.topmost
+                ),
+                len(self.z_order),
+            )
+            self.z_order.insert(first_normal, value)
+        elif anchor in self.z_order:
+            if anchor in self.topmost:
+                self.topmost.add(value)
+            else:
+                self.topmost.discard(value)
+            self.z_order.insert(self.z_order.index(anchor) + 1, value)
+        else:
+            return False
         return True
 
 
@@ -1569,6 +2022,7 @@ def test_minimized_capture_never_restores_to_neighbor_reused_at_call_boundary(
     user32 = FakeWindowStateApi(minimized=True)
     provider = Win32RecoveringPrintWindowProvider(
         paint_settle_seconds=0,
+        fresh_capture_provider=FakeProvider(expected),
         process_lifecycle_provider=fake_process_lifecycle_token,
     )
     original_query = user32.GetWindowThreadProcessId.callback
@@ -1601,11 +2055,6 @@ def test_minimized_capture_never_restores_to_neighbor_reused_at_call_boundary(
         reuse_neighbor_during_final_target_check
     )
     monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
-    monkeypatch.setattr(
-        Win32PrintWindowProvider,
-        "capture",
-        lambda _self, _handle: expected,
-    )
 
     assert provider.capture(user32.target) is None
 

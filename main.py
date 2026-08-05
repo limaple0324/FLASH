@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
+import re
 import sys
 import traceback
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from time import monotonic
 from tkinter import PhotoImage, TclError, Tk, filedialog, messagebox
 
 from adapters.background_capability import BackgroundCapabilityProbe
-from adapters.windows_background_capture import WindowsBackgroundCaptureBackend
+from adapters.obsidian_page_recognizer import ObsidianPageRecognizer
+from adapters.windows_background_capture import (
+    Win32PrintWindowProvider,
+    WindowsBackgroundCaptureBackend,
+)
 from adapters.windows_app_identity import (
     configure_process_app_identity,
     configure_tk_window_app_identity,
@@ -30,6 +38,7 @@ from adapters.windows_launch_fingerprint import (
 )
 from adapters.windows_smart_reconnect import (
     ReconnectRuntimeStateStore,
+    RegisteredReconnectRole,
     WindowsSmartReconnectController,
 )
 from adapters.windows_pointer_sync import (
@@ -73,9 +82,14 @@ from domain.activity_schedule import (
     build_confirmed_activity_catalog,
 )
 from domain.character_store import CharacterStore
+from domain.character import CharacterImportance
 from domain.character_game_data_store import CharacterGameDataStore
+from domain.confirmed_activity_rules import (
+    CONFIRMED_ACTIVITY_RULE_EVENT,
+    ConfirmedActivityEvent,
+)
 from domain.game_shortcuts import CONFIRMED_GAME_SHORTCUTS
-from domain.progress import TAIPEI_TIMEZONE
+from domain.progress import ActivityInterruptionReason, TAIPEI_TIMEZONE
 from domain.progress_store import ActivityProgressStore
 from habit.service import ActivityOrderHabitService
 from habit.store import ActivityOrderHabitStore
@@ -135,9 +149,22 @@ from services.character_detail_view_service import CharacterDetailViewService
 from services.character_game_data_view_service import (
     CharacterGameDataViewService,
 )
+from services.character_game_data_update_service import (
+    CharacterGameDataUpdateService,
+)
+from services.character_game_data_capture_service import (
+    CharacterGameDataCaptureService,
+    RegisteredGameDataWindow,
+)
 from services.character_detail_choice_service import CharacterDetailChoiceService
 from services.character_note_service import CharacterNoteService
 from services.character_view_service import CharacterViewService
+from services.confirmed_activity_rule_monitor import (
+    ConfirmedActivityRuleMonitor,
+)
+from services.confirmed_activity_rule_service import (
+    ConfirmedActivityRuleService,
+)
 from services.event_bus import EventBus
 from services.event_subscription_scope import EventSubscriptionScope
 from services.farm_timer_monitor import FarmTimerMonitor
@@ -150,6 +177,8 @@ from services.farm_timer_service import (
 )
 from services.group_selection_service import (
     GroupSelectionService,
+    PlayerGroupChoice,
+    PlayerGroupMember,
     default_legacy_group_config_path,
 )
 from services.group_configuration_service import (
@@ -171,6 +200,12 @@ from services.group_role_status_service import (
     GROUP_ROLE_STATUS_CHANGED_EVENT,
     GroupRoleStatusChange,
     GroupRoleStatusService,
+    ROLE_STATUS_CHECK_DISABLED,
+    ROLE_STATUS_CLOSED,
+    ROLE_STATUS_DISCONNECTED,
+    ROLE_STATUS_FAILED,
+    ROLE_STATUS_OPEN,
+    ROLE_STATUS_RECONNECTING,
 )
 from services.group_window_launch_service import (
     GroupWindowLaunchResult,
@@ -207,6 +242,8 @@ from services.role_id_template_service import RoleIdTemplateService
 from services.smart_reconnect_monitor import (
     DEFAULT_SMART_RECONNECT_INTERVAL_MS,
     SmartReconnectMonitor,
+    SMART_RECONNECT_MODE_BALANCED,
+    normalize_smart_reconnect_mode,
     normalize_smart_reconnect_interval_ms,
 )
 from services.smart_reconnect_capture_settings_service import (
@@ -235,14 +272,25 @@ from services.target_window_contract_service import (
 )
 from services.true_event_card_service import TrueEventCardService
 from services.ui_callback_dispatcher import UiCallbackDispatcher
+from services.ui_font_service import (
+    DEFAULT_CONTENT_FONT_SIZE,
+    DEFAULT_SIDEBAR_FONT_SIZE,
+    DEFAULT_UI_FONT_ID,
+    UIFontService,
+    normalize_content_font_size,
+    normalize_sidebar_font_size,
+    normalize_ui_font_id,
+    resolve_ui_font_preferences,
+)
 from ui.home import HomeView
 from ui.home import (
     FeatureCardSettingsSaveResult,
     GroupManagementViewResult,
+    SmartReconnectToggleViewResult,
+    SyncToggleViewResult,
     UI_THEME_LABELS,
     theme_palette,
 )
-from ui.character_detail_window import CharacterDetailWindow
 from ui.builtin_card_preview_catalog import (
     BUILTIN_CARD_PREVIEW_PROFILE_ID,
     build_builtin_card_preview_catalog,
@@ -255,16 +303,25 @@ APP_TITLE = PRODUCT_NAME
 SELF_CHECK_ARGUMENT = "--self-check"
 TARGET_DESKTOP_VERIFY_ARGUMENT = "--verify-target-desktop"
 BACKGROUND_IMAGE_VERIFY_ARGUMENT_PREFIX = "--verify-background-image="
+MAIN_INSTANCE_MUTEX_NAME = r"Local\Limaple.Fu.MainInterface"
+WINDOWS_ERROR_ALREADY_EXISTS = 183
 TARGET_WINDOW_KEY = "target_window_keywords"
 TARGET_WINDOW_FINGERPRINT_KEY = "target_window_fingerprint"
 INPUT_POLICY_KEY = "input_policy"
 SMART_RECONNECT_ENABLED_KEY = "smart_reconnect_enabled"
 SMART_RECONNECT_CONSENT_KEY = "smart_reconnect_consent_v1"
+SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY = "smart_reconnect_auto_battle_enabled"
 SMART_RECONNECT_INTERVAL_MS_KEY = "disconnect_detect_interval_ms"
+SMART_RECONNECT_MODE_KEY = "smart_reconnect_mode"
+SMART_RECONNECT_STATUS_COLORS_KEY = "smart_reconnect_status_colors"
 SMART_RECONNECT_INTERVAL_MIGRATION_KEY = (
     "disconnect_detect_interval_default_v2"
 )
 UI_THEME_KEY = "ui_theme"
+SHOW_HINTS_KEY = "show_hints"
+UI_FONT_ID_KEY = "ui_font_id"
+UI_SIDEBAR_FONT_SIZE_KEY = "ui_sidebar_font_size"
+UI_CONTENT_FONT_SIZE_KEY = "ui_content_font_size"
 UI_THEME_CLASSIC_GOLD_MIGRATION_KEY = "ui_theme_classic_gold_migration_v1"
 CURRENT_GROUP_NAME_KEY = "current_group_name"
 REGISTRY_FILENAME = "window_registry.json"
@@ -274,7 +331,6 @@ OPERATION_RECORD_FILENAME = "operation_records.json"
 MANAGED_GAME_PROCESS_FILENAME = "managed_game_processes.json"
 OPERATION_RECORD_ARCHIVE_DIRNAME = "角色每日紀錄"
 DEFERRED_SYNC_STATE_FILENAME = "deferred_sync_operations.json"
-ROLE_ID_TEMPLATE_FILENAME = "role_id_templates.json"
 TARGET_DESKTOP_REPORT_FILENAME = "target_desktop_verification.json"
 BACKGROUND_IMAGE_VERIFY_REPORT_FILENAME = "background_image_verification.json"
 CHARACTER_FILENAME = "characters.json"
@@ -285,6 +341,7 @@ CARD_PREVIEW_SELECTION_FILENAME = "card_preview_selection.json"
 ACTIVITY_REMINDER_STATE_FILENAME = "activity_reminder_state.json"
 TRUE_EVENT_CARD_STATE_FILENAME = "true_event_card_state.json"
 FARM_TIMER_STATE_FILENAME = "farm_timers.json"
+CONFIRMED_ACTIVITY_RULE_STATE_FILENAME = "confirmed_activity_rules.json"
 ACTIVITY_ORDER_HABIT_FILENAME = "activity_order_habit.json"
 PLAYER_HABIT_FILENAME = "player_habits.json"
 SYNC_SELECTED_KEYS_KEY = "sync_selected_keys"
@@ -297,6 +354,8 @@ TIMED_CLICK_SETTINGS_KEY = "timed_click_settings"
 APP_ICON_PNG = Path("assets") / "flash_icon.png"
 APP_ICON_ICO = Path("assets") / "flash_icon.ico"
 RECONNECT_REFERENCE_DIR = Path("assets") / "reconnect_reference"
+OBSIDIAN_REFERENCE_DIR = Path("assets") / "game_data_reference" / "obsidian"
+UI_FONT_ASSET_DIR = Path("assets") / "ui_fonts"
 BACKGROUND_IMAGE_FILETYPES = (
     (
         "圖片與相機 RAW",
@@ -339,6 +398,134 @@ def resource_path(relative_path: Path) -> Path:
     if bundle_root:
         return Path(bundle_root) / relative_path
     return Path(__file__).resolve().parent / relative_path
+
+
+class MainInstanceLock:
+    """Retain one cross-process lock until complete application cleanup."""
+
+    def __init__(self, release_callback: Callable[[], object]) -> None:
+        self._release_callback = release_callback
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._release_callback()
+
+
+def acquire_main_instance_lock(
+    name: str = MAIN_INSTANCE_MUTEX_NAME,
+) -> MainInstanceLock | None:
+    """Return None when another ordinary UI process already owns the lock."""
+    if sys.platform != "win32":
+        return MainInstanceLock(lambda: None)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_bool,
+        ctypes.c_wchar_p,
+    )
+    create_mutex.restype = ctypes.c_void_p
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_bool
+    ctypes.set_last_error(0)
+    handle = create_mutex(None, False, name)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "無法建立主介面執行鎖。")
+    if ctypes.get_last_error() == WINDOWS_ERROR_ALREADY_EXISTS:
+        close_handle(handle)
+        return None
+    return MainInstanceLock(lambda: close_handle(handle))
+
+
+def close_startup_splash() -> None:
+    """Close the packaged startup splash safely and idempotently."""
+    try:
+        import pyi_splash  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    try:
+        is_alive = getattr(pyi_splash, "is_alive", None)
+        if callable(is_alive) and not is_alive():
+            return
+        close = getattr(pyi_splash, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
+def registered_game_data_target(
+    current_group_name: str | None,
+    selection: PlayerGroupChoice | None,
+    member: PlayerGroupMember | None,
+    window: WindowInfo | None,
+    screen_state: ReconnectScreenState,
+) -> RegisteredGameDataWindow | None:
+    """只將目前組別內唯一、完整且已登入的角色交給唯讀資料擷取。"""
+    if (
+        not isinstance(current_group_name, str)
+        or not current_group_name.strip()
+        or not isinstance(selection, PlayerGroupChoice)
+        or selection.name != current_group_name
+        or not isinstance(member, PlayerGroupMember)
+        or not isinstance(window, WindowInfo)
+        or screen_state is not ReconnectScreenState.CONNECTED
+    ):
+        return None
+    character_id = member.character_id.strip() if isinstance(member.character_id, str) else ""
+    role_id = member.role_id.strip() if isinstance(member.role_id, str) else ""
+    fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
+    if (
+        not character_id
+        or not role_id
+        or sum(item.entry_id == member.entry_id for item in selection.members) != 1
+        or sum(
+            isinstance(item.character_id, str)
+            and item.character_id.strip() == character_id
+            for item in selection.members
+        ) != 1
+        or sum(
+            isinstance(item.role_id, str)
+            and item.role_id.strip().casefold() == role_id.casefold()
+            for item in selection.members
+        ) != 1
+        or isinstance(window.handle, bool)
+        or window.handle <= 0
+        or isinstance(window.process_id, bool)
+        or not isinstance(window.process_id, int)
+        or window.process_id <= 0
+        or not isinstance(window.rect, tuple)
+        or len(window.rect) != 4
+        or not all(isinstance(value, int) and not isinstance(value, bool) for value in window.rect)
+        or window.rect[2] <= window.rect[0]
+        or window.rect[3] <= window.rect[1]
+        or window.visible is not True
+        or window.minimized is not False
+        or isinstance(window.thread_id, bool)
+        or not isinstance(window.thread_id, int)
+        or window.thread_id <= 0
+        or not isinstance(window.window_class, str)
+        or not window.window_class.strip()
+        or isinstance(window.process_lifecycle_token, bool)
+        or not isinstance(window.process_lifecycle_token, int)
+        or window.process_lifecycle_token <= 0
+        or fingerprint is None
+    ):
+        return None
+    return RegisteredGameDataWindow(
+        window_handle=window.handle,
+        character_id=character_id,
+        launch_fingerprint=fingerprint,
+        process_id=window.process_id,
+        rect=window.rect,
+        thread_id=window.thread_id,
+        window_class=window.window_class,
+        process_lifecycle_token=window.process_lifecycle_token,
+    )
 
 
 def apply_window_icon(window: Tk) -> None:
@@ -392,6 +579,474 @@ def _normalize_window_fingerprint(value: object) -> str | None:
     return normalize_launch_fingerprint(value)
 
 
+def apply_smart_reconnect_snapshot_transition(
+    enabled: bool,
+    controller: object,
+    monitor: object,
+    *,
+    start_monitor: Callable[[object], object],
+    stop_monitor: Callable[[object], object],
+) -> SmartReconnectToggleViewResult:
+    """Bind one run to the safe windows open at the enable click."""
+    prepare_snapshot = getattr(
+        controller,
+        "prepare_execution_snapshot",
+        None,
+    )
+    set_execution_enabled = getattr(
+        controller,
+        "set_execution_enabled",
+        None,
+    )
+    if not callable(prepare_snapshot) or not callable(set_execution_enabled):
+        return SmartReconnectToggleViewResult(False, False, "智慧重連控制器尚未正確設定，沒有啟用。")
+    if enabled:
+        prepared = prepare_snapshot()
+        if not bool(getattr(prepared, "success", False)):
+            set_execution_enabled(False)
+            message = getattr(prepared, "message", None)
+            return SmartReconnectToggleViewResult(
+                False,
+                False,
+                message.strip()
+                if isinstance(message, str) and message.strip()
+                else "目前遊戲視窗無法通過安全檢查，沒有啟用智慧重連。",
+            )
+        started = start_monitor(monitor)
+        if not bool(getattr(started, "success", False)):
+            set_execution_enabled(False)
+            return SmartReconnectToggleViewResult(False, False, "智慧重連監看服務未能啟動，沒有啟用。")
+        return SmartReconnectToggleViewResult(True, True, "智慧重連已開啟，正在安全監看。")
+    stopped = stop_monitor(monitor)
+    set_execution_enabled(False)
+    if bool(getattr(stopped, "success", False)):
+        return SmartReconnectToggleViewResult(True, False, "智慧重連已安全停止。")
+    return SmartReconnectToggleViewResult(False, False, "智慧重連監看服務未能停止，未變更設定。")
+
+
+def apply_smart_reconnect_auto_battle_setting(
+    enabled: bool,
+    controller: object,
+    config: object,
+) -> bool:
+    """保存子開關；智慧重連總開關仍是另一道必要執行閘。"""
+    setter = getattr(controller, "set_auto_battle_enabled", None)
+    save = getattr(config, "set", None)
+    if not callable(setter) or not callable(save):
+        return False
+    normalized = enabled is True
+    setter(normalized)
+    save(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY, normalized)
+    return True
+
+
+def normalize_smart_reconnect_auto_battle_enabled(value: object) -> bool:
+    """Keep an explicit player-off choice; missing or invalid values default on."""
+
+    return value if isinstance(value, bool) else True
+
+
+def resolve_registered_reconnect_roles(
+    characters: object,
+    registry_records: object,
+    groups: object,
+) -> tuple[RegisteredReconnectRole, ...]:
+    """Cross-check stable character and registry identities for reconnect."""
+
+    character_items = tuple(characters) if isinstance(characters, (list, tuple)) else ()
+    registry_items = (
+        tuple(registry_records)
+        if isinstance(registry_records, (list, tuple))
+        else ()
+    )
+    group_items = tuple(groups) if isinstance(groups, (list, tuple)) else ()
+    by_id = {
+        item.character_id: item
+        for item in character_items
+        if isinstance(getattr(item, "character_id", None), str)
+    }
+    registry_by_id: dict[str, list[object]] = {}
+    for item in registry_items:
+        character_id = getattr(item, "character_id", None)
+        if isinstance(character_id, str) and character_id.strip():
+            registry_by_id.setdefault(character_id.strip(), []).append(item)
+
+    values: dict[str, set[CharacterImportance]] = {}
+
+    def remember(role_id: object, importance: object) -> None:
+        if not isinstance(role_id, str) or not isinstance(
+            importance,
+            CharacterImportance,
+        ):
+            return
+        normalized = role_id.strip()
+        if not normalized:
+            return
+        values.setdefault(normalized.casefold(), set()).add(importance)
+
+    for character_id, character in by_id.items():
+        if character.importance is not CharacterImportance.PRIMARY:
+            continue
+        matches = registry_by_id.get(character_id, [])
+        if len(matches) != 1:
+            continue
+        record = matches[0]
+        if (
+            getattr(record, "display_name", None)
+            != character.display_name
+            or getattr(record, "role", None)
+            != CharacterImportance.PRIMARY.value
+        ):
+            continue
+        remember(character.display_name, CharacterImportance.PRIMARY)
+
+    for group in group_items:
+        for entry in tuple(getattr(group, "entries", ())):
+            character = by_id.get(getattr(entry, "entry_id", None))
+            if character is None:
+                continue
+            remember(getattr(entry, "role_id", None), character.importance)
+
+    return tuple(
+        RegisteredReconnectRole(role_id, next(iter(importances)))
+        for role_id, importances in sorted(values.items())
+        if len(importances) == 1
+    )
+
+
+def apply_auto_battle_after_game_launch(
+    game_was_launched: bool,
+    controller: object,
+    config: object,
+    home_view: object | None = None,
+) -> bool:
+    """Enable, persist, and reflect auto battle after one real app launch."""
+
+    if game_was_launched is not True:
+        return False
+    if not apply_smart_reconnect_auto_battle_setting(
+        True,
+        controller,
+        config,
+    ):
+        return False
+    update_view = getattr(
+        home_view,
+        "set_smart_reconnect_auto_battle_enabled",
+        None,
+    )
+    if callable(update_view):
+        update_view(True)
+    return True
+
+
+def group_window_launch_started_game(result: object) -> bool:
+    """Accept only a fully successful group operation that launched a game."""
+
+    return bool(
+        getattr(result, "success", None) is True
+        and getattr(result, "action", None) == "launch"
+        and getattr(result, "launched_count", 0) > 0
+    )
+
+
+def group_role_action_started_game(result: object) -> bool:
+    """Accept only a successful single-role launch, never an activation."""
+
+    return bool(
+        getattr(result, "success", None) is True
+        and getattr(result, "action", None) == "launched"
+    )
+
+
+def resolve_group_role_progress_subject_id(
+    change: object,
+    *,
+    group_launch_service: GroupLaunchService,
+    group_selection_service: GroupSelectionService,
+) -> str | None:
+    """Return one stable character subject for one verified group role."""
+    if not isinstance(change, GroupRoleStatusChange):
+        return None
+    group_name = change.group_name.strip()
+    fingerprint = normalize_launch_fingerprint(change.current.action_id)
+    if not group_name or fingerprint is None:
+        return None
+    try:
+        plan = group_launch_service.plan(group_name)
+        choices = group_selection_service.choices()
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(plan, GroupLaunchPlan) or not plan.ready:
+        return None
+    target = plan.target_for_fingerprint(fingerprint)
+    if target is None or not target.entry_id:
+        return None
+    if sum(
+        item.entry_id == target.entry_id
+        for item in plan.targets
+    ) != 1:
+        return None
+    matching_choices = tuple(
+        choice
+        for choice in choices
+        if isinstance(choice.name, str) and choice.name.strip() == group_name
+    )
+    if len(matching_choices) != 1:
+        return None
+    matching_members = tuple(
+        member
+        for member in matching_choices[0].members
+        if (
+            member.entry_id == target.entry_id
+            and isinstance(member.character_id, str)
+            and member.character_id.strip()
+        )
+    )
+    if len(matching_members) != 1:
+        return None
+    return matching_members[0].character_id.strip()
+
+
+def route_group_role_status_to_activity_progress(
+    change: object,
+    *,
+    activity_progress_service: ActivityProgressService | None,
+    subject_id_resolver: Callable[[GroupRoleStatusChange], str | None],
+    occurred_at: datetime,
+) -> tuple[object, ...]:
+    """Apply only verified game-role transitions to matching activity progress."""
+    if (
+        not isinstance(change, GroupRoleStatusChange)
+        or not isinstance(activity_progress_service, ActivityProgressService)
+        or occurred_at.tzinfo is None
+        or occurred_at.utcoffset() is None
+    ):
+        return ()
+    status = change.current.status
+    if status not in {
+        ROLE_STATUS_DISCONNECTED,
+        ROLE_STATUS_RECONNECTING,
+        ROLE_STATUS_CLOSED,
+        ROLE_STATUS_OPEN,
+    }:
+        return ()
+    try:
+        subject_id = subject_id_resolver(change)
+    except (KeyError, TypeError, ValueError):
+        return ()
+    if not isinstance(subject_id, str) or not subject_id.strip():
+        return ()
+    if status in {ROLE_STATUS_DISCONNECTED, ROLE_STATUS_RECONNECTING}:
+        return activity_progress_service.record_interruption(
+            subject_id,
+            ActivityInterruptionReason.DISCONNECTED,
+            occurred_at,
+        )
+    if status == ROLE_STATUS_CLOSED:
+        return activity_progress_service.record_interruption(
+            subject_id,
+            ActivityInterruptionReason.GAME_CLOSED,
+            occurred_at,
+        )
+    return activity_progress_service.clear_interruption(
+        subject_id,
+        occurred_at,
+    )
+
+
+def route_group_role_status_to_farm_timer(
+    change: object,
+    *,
+    farm_timer_service: FarmTimerService | None,
+    subject_id_resolver: Callable[[GroupRoleStatusChange], str | None],
+    occurred_at: datetime,
+) -> bool:
+    """只以既有可靠身分將遊戲關閉狀態交給農場計時。"""
+    if (
+        not isinstance(change, GroupRoleStatusChange)
+        or not isinstance(farm_timer_service, FarmTimerService)
+        or occurred_at.tzinfo is None
+        or occurred_at.utcoffset() is None
+    ):
+        return False
+    try:
+        subject_id = subject_id_resolver(change)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not isinstance(subject_id, str) or not subject_id.strip():
+        return False
+    return farm_timer_service.handle_role_status(
+        subject_id,
+        change.current.status,
+        occurred_at,
+    )
+
+
+def route_group_role_status_to_confirmed_activity_rules(
+    change: object,
+    *,
+    confirmed_activity_rule_service: ConfirmedActivityRuleService | None,
+    subject_id_resolver: Callable[[GroupRoleStatusChange], str | None],
+    occurred_at: datetime,
+) -> tuple[object, ...]:
+    """僅以可靠角色身分更新已定案活動的暫停與登入提示。"""
+    if (
+        not isinstance(change, GroupRoleStatusChange)
+        or not isinstance(
+            confirmed_activity_rule_service,
+            ConfirmedActivityRuleService,
+        )
+        or occurred_at.tzinfo is None
+        or occurred_at.utcoffset() is None
+    ):
+        return ()
+    try:
+        subject_id = subject_id_resolver(change)
+    except (KeyError, TypeError, ValueError):
+        return ()
+    if not isinstance(subject_id, str) or not subject_id.strip():
+        return ()
+    return confirmed_activity_rule_service.handle_role_status(
+        subject_id,
+        change.current.status,
+        occurred_at,
+    )
+
+
+def refresh_confirmed_activity_group_scope(
+    *,
+    workspace_service: WorkspaceService | None,
+    confirmed_activity_rule_service: ConfirmedActivityRuleService | None,
+    logger: LoggerService | None,
+) -> bool:
+    """只以目前工作區群組更新已定案活動的主動提醒範圍。"""
+    if not isinstance(workspace_service, WorkspaceService) or not isinstance(
+        confirmed_activity_rule_service,
+        ConfirmedActivityRuleService,
+    ):
+        return False
+    current_group = workspace_service.snapshot().current_group
+    try:
+        saved = (
+            confirmed_activity_rule_service.register_group(current_group)
+            if current_group is not None
+            else confirmed_activity_rule_service.clear_current_group()
+        )
+    except Exception as error:
+        if logger is not None:
+            logger.error(
+                "Confirmed activity group registration was isolated: "
+                f"{error}"
+            )
+        return False
+    if not saved and logger is not None:
+        logger.error("Confirmed activity group state could not be saved.")
+    return saved
+
+
+def handle_group_role_status_change(
+    change: object,
+    *,
+    activity_progress_service: ActivityProgressService | None,
+    subject_id_resolver: Callable[[GroupRoleStatusChange], str | None],
+    occurred_at: datetime,
+    logger: LoggerService | None,
+    on_role_status_card: Callable[[GroupRoleStatusChange], object] | None,
+    on_farm_timer_status: Callable[[GroupRoleStatusChange], object] | None = None,
+    on_confirmed_activity_status: (
+        Callable[[GroupRoleStatusChange], object] | None
+    ) = None,
+) -> tuple[object, ...]:
+    """Keep the existing role-status card independent from progress persistence."""
+    if not isinstance(change, GroupRoleStatusChange):
+        return ()
+    try:
+        progress_changes = route_group_role_status_to_activity_progress(
+            change,
+            activity_progress_service=activity_progress_service,
+            subject_id_resolver=subject_id_resolver,
+            occurred_at=occurred_at,
+        )
+    except Exception as error:
+        progress_changes = ()
+        if logger is not None:
+            try:
+                logger.error(
+                    "Activity progress interruption routing failed and was "
+                    f"isolated: {error}"
+                )
+            except Exception:
+                pass
+    for label, callback in (
+        ("Farm timer status routing", on_farm_timer_status),
+        ("Confirmed activity status routing", on_confirmed_activity_status),
+    ):
+        if callback is None:
+            continue
+        try:
+            callback(change)
+        except Exception as error:
+            if logger is not None:
+                try:
+                    logger.error(f"{label} failed and was isolated: {error}")
+                except Exception:
+                    pass
+    if on_role_status_card is not None:
+        on_role_status_card(change)
+    return progress_changes
+
+
+def _sync_scope_has_all_safe_windows(
+    expected_fingerprints: tuple[str, ...],
+    windows: tuple[WindowInfo, ...],
+) -> bool:
+    """Require one safe, unique window for every selected sync role."""
+    expected = frozenset(expected_fingerprints)
+    actual = tuple(
+        fingerprint
+        for window in windows
+        if (
+            fingerprint := normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+        ) is not None
+    )
+    return (
+        bool(expected)
+        and len(expected) == len(expected_fingerprints)
+        and len(actual) == len(expected)
+        and frozenset(actual) == expected
+    )
+
+
+def _connected_sync_fingerprints(
+    scoped_fingerprints: tuple[str, ...],
+    windows: tuple[WindowInfo, ...],
+) -> tuple[str, ...]:
+    """依組別固定順序保留目前唯一且已連線的安全身分。"""
+
+    normalized_scope = tuple(
+        fingerprint
+        for value in scoped_fingerprints
+        if (fingerprint := normalize_launch_fingerprint(value)) is not None
+    )
+    if len(normalized_scope) != len(set(normalized_scope)):
+        return ()
+    observed: dict[str, int] = {}
+    for window in windows:
+        fingerprint = normalize_launch_fingerprint(
+            getattr(window, "launch_fingerprint", None)
+        )
+        if fingerprint in normalized_scope:
+            observed[fingerprint] = observed.get(fingerprint, 0) + 1
+    return tuple(
+        fingerprint
+        for fingerprint in normalized_scope
+        if observed.get(fingerprint) == 1
+    )
+
+
 def build_services(
     root: Path | None = None,
     card_preview_catalog: CardPreviewCatalog | None = None,
@@ -401,6 +1056,7 @@ def build_services(
     paths = PathManager(root=root)
     logger = LoggerService(paths.log_file("flash.log"))
     config = ConfigManager(paths.config_file("settings.json"))
+    ui_font_service = UIFontService(resource_path(UI_FONT_ASSET_DIR))
     background_image_service = BackgroundImageService(
         config,
         paths.data_dir(),
@@ -430,11 +1086,22 @@ def build_services(
             INPUT_POLICY_KEY: WindowInputPolicy.ALL.value,
             SMART_RECONNECT_ENABLED_KEY: False,
             SMART_RECONNECT_CONSENT_KEY: False,
+            SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY: True,
             SMART_RECONNECT_INTERVAL_MS_KEY: (
                 DEFAULT_SMART_RECONNECT_INTERVAL_MS
             ),
+            SMART_RECONNECT_MODE_KEY: SMART_RECONNECT_MODE_BALANCED,
+            SMART_RECONNECT_STATUS_COLORS_KEY: {
+                "已開啟": "#26845B",
+                "重連中": "#B36A18",
+                "重連失敗": "#D64545",
+            },
             SMART_RECONNECT_INTERVAL_MIGRATION_KEY: True,
             UI_THEME_KEY: "classic_gold",
+            SHOW_HINTS_KEY: False,
+            UI_FONT_ID_KEY: DEFAULT_UI_FONT_ID,
+            UI_SIDEBAR_FONT_SIZE_KEY: DEFAULT_SIDEBAR_FONT_SIZE,
+            UI_CONTENT_FONT_SIZE_KEY: DEFAULT_CONTENT_FONT_SIZE,
             SYNC_SELECTED_KEYS_KEY: ["ESC"],
             SYNC_KEYS_COLLAPSED_KEY: True,
             GROUP_ROLE_DETAILS_EXPANDED_KEY: {},
@@ -453,6 +1120,14 @@ def build_services(
             },
         }
     )
+    saved_auto_battle = normalize_smart_reconnect_auto_battle_enabled(
+        config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY)
+    )
+    if config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY) is not saved_auto_battle:
+        config.set(
+            SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY,
+            saved_auto_battle,
+        )
     smart_reconnect_capture_settings_service = (
         SmartReconnectCaptureSettingsService(config)
     )
@@ -478,6 +1153,9 @@ def build_services(
         paths.data_dir() / CHARACTER_GAME_DATA_FILENAME
     )
     character_game_data_view_service = CharacterGameDataViewService(
+        character_game_data_store
+    )
+    character_game_data_update_service = CharacterGameDataUpdateService(
         character_game_data_store
     )
     characters = character_store.load()
@@ -517,10 +1195,7 @@ def build_services(
         synchronized_window_backend,
     )
     sync_calibration_backend = Win32SyncCalibrationBackend()
-    role_id_template_service = RoleIdTemplateService(
-        paths.data_dir() / ROLE_ID_TEMPLATE_FILENAME,
-        capture_backend=sync_calibration_backend,
-    )
+    role_id_template_service = RoleIdTemplateService()
     progress_store = ActivityProgressStore(
         paths.data_dir() / ACTIVITY_PROGRESS_FILENAME
     )
@@ -630,7 +1305,11 @@ def build_services(
         card_display_settings_resolution,
         on_changed=register_card_display_settings,
     )
-    card_coordinator = CardCoordinator(card_service, card_history_service)
+    card_coordinator = CardCoordinator(
+        card_service,
+        card_history_service,
+        decision_service,
+    )
     activity_reminder_service = ActivityReminderService(
         activity_schedule_catalog,
         card_coordinator,
@@ -671,10 +1350,24 @@ def build_services(
         state_path=paths.data_dir() / FARM_TIMER_STATE_FILENAME,
         record_callback=operation_record_store.append,
     )
+    confirmed_activity_rule_service = ConfirmedActivityRuleService(
+        card_coordinator,
+        state_path=(
+            paths.data_dir() / CONFIRMED_ACTIVITY_RULE_STATE_FILENAME
+        ),
+        event_bus=event_bus,
+    )
+
+    refresh_confirmed_activity_group_scope(
+        workspace_service=workspace_service,
+        confirmed_activity_rule_service=confirmed_activity_rule_service,
+        logger=logger,
+    )
 
     AppContext.register(PathManager, paths)
     AppContext.register(LoggerService, logger)
     AppContext.register(ConfigManager, config)
+    AppContext.register(UIFontService, ui_font_service)
     AppContext.register(
         SmartReconnectCaptureSettingsService,
         smart_reconnect_capture_settings_service,
@@ -702,6 +1395,10 @@ def build_services(
     AppContext.register(WindowRegistry, registry)
     AppContext.register(CharacterStore, character_store)
     AppContext.register(CharacterGameDataStore, character_game_data_store)
+    AppContext.register(
+        CharacterGameDataUpdateService,
+        character_game_data_update_service,
+    )
     AppContext.register(
         CharacterGameDataViewService,
         character_game_data_view_service,
@@ -769,6 +1466,10 @@ def build_services(
     )
     AppContext.register(TrueEventCardService, true_event_card_service)
     AppContext.register(FarmTimerService, farm_timer_service)
+    AppContext.register(
+        ConfirmedActivityRuleService,
+        confirmed_activity_rule_service,
+    )
 
     def role_name_for_fingerprint(fingerprint: str) -> str:
         state = workspace_service.snapshot()
@@ -806,15 +1507,86 @@ def build_services(
             else None
         )
 
-    def current_reconnect_targets():
-        return target_window_contract_service.reconnect_targets(
+    def current_sync_target_windows() -> tuple[WindowInfo, ...]:
+        if target_window_contract_service is None:
+            return ()
+        candidates = target_window_contract_service.reconnect_targets(
             current_group_name()
+        ).windows
+        if any(not isinstance(window, WindowInfo) for window in candidates):
+            return ()
+        requested = tuple(
+            fingerprint for window in candidates
+            if (fingerprint := normalize_launch_fingerprint(window.launch_fingerprint))
+            is not None
+        )
+        states = reconnect_controller.observe_screen_states(
+            requested, candidate_windows=candidates
+        )
+        return tuple(
+            window for window in candidates
+            if states.get(normalize_launch_fingerprint(window.launch_fingerprint))
+            is ReconnectScreenState.CONNECTED
         )
 
-    def current_sync_target_windows():
-        return target_window_contract_service.windows(current_group_name())
+    sync_screen_state_lock = Lock()
+    sync_screen_state_cache: dict[str, object] = {
+        "group_name": None,
+        "expires_at": 0.0,
+        "states": {},
+    }
+
+    def current_sync_screen_state(
+        fingerprint: str,
+    ) -> ReconnectScreenState:
+        normalized = normalize_launch_fingerprint(fingerprint)
+        if normalized is None:
+            return ReconnectScreenState.UNKNOWN
+        group_name = current_group_name()
+        now = monotonic()
+        with sync_screen_state_lock:
+            states = sync_screen_state_cache["states"]
+            if (
+                sync_screen_state_cache["group_name"] == group_name
+                and now < float(sync_screen_state_cache["expires_at"])
+                and isinstance(states, dict)
+            ):
+                return states.get(normalized, ReconnectScreenState.UNKNOWN)
+            candidates = (
+                target_window_contract_service.reconnect_targets(group_name).windows
+                if target_window_contract_service is not None else ()
+            )
+            requested = tuple(
+                candidate_fingerprint
+                for window in candidates
+                if (
+                    candidate_fingerprint := normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    )
+                ) is not None
+            )
+            observed = reconnect_controller.observe_screen_states(
+                requested,
+                candidate_windows=candidates,
+            )
+            sync_screen_state_cache.update(
+                {
+                    "group_name": group_name,
+                    "expires_at": now + 0.75,
+                    "states": observed,
+                }
+            )
+            return observed.get(normalized, ReconnectScreenState.UNKNOWN)
 
     AppContext.register(SyncOperationRecordStore, operation_record_store)
+
+    def registered_reconnect_roles() -> tuple[RegisteredReconnectRole, ...]:
+        return resolve_registered_reconnect_roles(
+            character_store.load(),
+            registry.all(),
+            group_configuration_service.groups(),
+        )
+
     reconnect_controller = WindowsSmartReconnectController.for_real_windows(
         reference_dir=resource_path(RECONNECT_REFERENCE_DIR),
         state_path=paths.data_dir() / RECONNECT_STATE_FILENAME,
@@ -822,8 +1594,13 @@ def build_services(
         capture_settings=(
             smart_reconnect_capture_settings_service.snapshot()
         ),
-        target_windows_provider=current_reconnect_targets,
+        require_expected_window_count=False,
         operation_gate=game_operation_gate,
+        auto_battle_enabled=(
+            normalize_smart_reconnect_auto_battle_enabled(
+                config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY)
+            )
+        ),
         failure_status_service=reconnect_failure_status_service,
         failure_record_callback=lambda role_name, detail: (
             operation_record_store.append(
@@ -832,7 +1609,88 @@ def build_services(
                 detail,
             )
         ),
+        registered_role_provider=registered_reconnect_roles,
     )
+
+    def registered_game_data_window(window_handle: int) -> RegisteredGameDataWindow | None:
+        group_name = current_group_name()
+        choice = group_selection_service.find(group_name)
+        if choice is None or target_window_contract_service is None:
+            return None
+        candidates = target_window_contract_service.reconnect_targets(
+            group_name
+        ).windows
+        matches = tuple(
+            window
+            for window in candidates
+            if isinstance(window, WindowInfo) and window.handle == window_handle
+        )
+        if len(matches) != 1:
+            return None
+        window = matches[0]
+        fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
+        group = group_configuration_service.group(group_name)
+        plan = group_launch_service.plan(group_name)
+        if (
+            fingerprint is None
+            or group is None
+            or not plan.ready
+        ):
+            return None
+        members = tuple(
+            member
+            for member in choice.members
+            if any(
+                entry.entry_id == member.entry_id
+                and (
+                    target := next(
+                        (
+                            item
+                            for item in plan.targets
+                            if str(item.shortcut_path.resolve(strict=False)).casefold()
+                            == str(entry.shortcut_path.resolve(strict=False)).casefold()
+                        ),
+                        None,
+                    )
+                ) is not None
+                and normalize_launch_fingerprint(target.fingerprint) == fingerprint
+                for entry in group.entries
+            )
+        )
+        if len(members) != 1:
+            return None
+        state = reconnect_controller.observe_screen_states(
+            (fingerprint,),
+            candidate_windows=(window,),
+        ).get(fingerprint, ReconnectScreenState.UNKNOWN)
+        return registered_game_data_target(
+            group_name,
+            choice,
+            members[0],
+            window,
+            state,
+        )
+
+    character_game_data_capture_service = None
+    try:
+        obsidian_recognizer = ObsidianPageRecognizer(
+            reference_dir=resource_path(OBSIDIAN_REFERENCE_DIR),
+        )
+        if not obsidian_recognizer.ready:
+            raise RuntimeError("黑曜石可靠參考圖不完整。")
+        character_game_data_capture_service = CharacterGameDataCaptureService(
+            Win32PrintWindowProvider(),
+            obsidian_recognizer,
+            character_game_data_update_service,
+            registered_game_data_window,
+        )
+    except Exception as error:
+        logger.warning(f"黑曜石唯讀資料擷取未啟用：{error}")
+    else:
+        AppContext.register(
+            CharacterGameDataCaptureService,
+            character_game_data_capture_service,
+        )
     ungrouped_window_service = UngroupedWindowService(
         group_configuration_service,
         shortcut_fingerprint_resolver,
@@ -843,6 +1701,9 @@ def build_services(
                 candidate_windows=windows,
             )
         ),
+    )
+    reconnect_controller.set_ungrouped_shortcut_provider(
+        ungrouped_window_service.shortcut_for
     )
     AppContext.register(UngroupedWindowService, ungrouped_window_service)
     deferred_sync_service = DeferredSyncOperationService(
@@ -882,6 +1743,7 @@ def build_services(
             window_backend=synchronized_window_backend,
             target_windows_provider=current_sync_target_windows,
             operation_gate=game_operation_gate,
+            require_expected_window_count=False,
             conflict_arbiter=sync_conflict_arbiter,
             deferred_service=deferred_sync_service,
             reconnecting_provider=(
@@ -894,11 +1756,7 @@ def build_services(
                     f"{operation}－{outcome}",
                 )
             ),
-            screen_state_provider=lambda fingerprint: (
-                reconnect_controller.observe_screen_states(
-                    (fingerprint,)
-                ).get(fingerprint)
-            ),
+            screen_state_provider=current_sync_screen_state,
         ),
     )
     AppContext.register(
@@ -907,6 +1765,7 @@ def build_services(
             window_backend=synchronized_window_backend,
             target_windows_provider=current_sync_target_windows,
             operation_gate=game_operation_gate,
+            require_expected_window_count=False,
             conflict_arbiter=sync_conflict_arbiter,
             deferred_service=deferred_sync_service,
             reconnecting_provider=(
@@ -919,11 +1778,7 @@ def build_services(
                     f"{operation}－{outcome}",
                 )
             ),
-            screen_state_provider=lambda fingerprint: (
-                reconnect_controller.observe_screen_states(
-                    (fingerprint,)
-                ).get(fingerprint)
-            ),
+            screen_state_provider=current_sync_screen_state,
         ),
     )
     AppContext.register(
@@ -979,6 +1834,9 @@ def build_services(
             logger=logger,
             monitor_interval_ms=normalize_smart_reconnect_interval_ms(
                 config.get(SMART_RECONNECT_INTERVAL_MS_KEY)
+            ),
+            monitor_mode=normalize_smart_reconnect_mode(
+                config.get(SMART_RECONNECT_MODE_KEY),
             ),
         ),
     )
@@ -1087,6 +1945,25 @@ def shutdown_smart_reconnect_monitor(
                 )
             except Exception:
                 pass
+
+
+def shutdown_ui_font_service(
+    logger: LoggerService | None = None,
+) -> bool:
+    """Release every process-private UI font before the logger closes."""
+    service = AppContext.get(UIFontService)
+    if service is None:
+        return True
+    try:
+        closed = service.close()
+    except Exception:
+        closed = False
+    if not closed and logger is not None:
+        try:
+            logger.error("私有介面字體資源未能完整解除。")
+        except Exception:
+            pass
+    return closed
 
 
 def shutdown_event_subscriptions(
@@ -1400,6 +2277,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window.deiconify()
 
     config = AppContext.get(ConfigManager)
+    ui_font_service = AppContext.get(UIFontService)
     input_controller = AppContext.get(WindowsInputSyncController)
     pointer_sync_controller = AppContext.get(
         WindowsPointerSyncController
@@ -1427,6 +2305,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     activity_reminder_service = AppContext.get(ActivityReminderService)
     true_event_card_service = AppContext.get(TrueEventCardService)
     farm_timer_service = AppContext.get(FarmTimerService)
+    confirmed_activity_rule_service = AppContext.get(
+        ConfirmedActivityRuleService
+    )
     card_display_settings_service = AppContext.get(CardDisplaySettingsService)
     card_preview_selection_store = AppContext.get(
         CardPreviewSelectionStore
@@ -1500,6 +2381,55 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     home_view: HomeView | None = None
     tray_controller: SystemTrayController | None = None
+
+    def current_workspace_group_name() -> str | None:
+        state = (
+            workspace_service.snapshot()
+            if workspace_service is not None
+            else None
+        )
+        return (
+            state.current_group.name
+            if state is not None and state.current_group is not None
+            else None
+        )
+
+    def current_sync_target_windows() -> tuple[WindowInfo, ...]:
+        """Return only registered targets currently confirmed as connected."""
+        if (
+            target_window_contract_service is None
+            or smart_reconnect_controller is None
+        ):
+            return ()
+        candidates = target_window_contract_service.reconnect_targets(
+            current_workspace_group_name()
+        ).windows
+        if any(not isinstance(candidate, WindowInfo) for candidate in candidates):
+            return ()
+        requested = tuple(
+            fingerprint
+            for candidate in candidates
+            if (
+                fingerprint := normalize_launch_fingerprint(
+                    candidate.launch_fingerprint
+                )
+            )
+            is not None
+        )
+        states = smart_reconnect_controller.observe_screen_states(
+            requested,
+            candidate_windows=candidates,
+        )
+        return tuple(
+            candidate
+            for candidate in candidates
+            if states.get(
+                normalize_launch_fingerprint(
+                    candidate.launch_fingerprint
+                )
+            )
+            is ReconnectScreenState.CONNECTED
+        )
 
     def mark_tray_operations_running() -> None:
         if tray_controller is not None:
@@ -1659,6 +2589,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def complete_group_window_launch(
         result: GroupWindowLaunchResult,
     ) -> None:
+        apply_auto_battle_after_game_launch(
+            group_window_launch_started_game(result),
+            smart_reconnect_controller,
+            config,
+            home_view,
+        )
         if (
             result.action == "stop"
             and operation_record_store is not None
@@ -1878,6 +2814,38 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         and config.get(UI_THEME_KEY) in UI_THEME_LABELS
         else "classic_gold"
     )
+    configured_show_hints = (
+        bool(config.get(SHOW_HINTS_KEY, False))
+        if config is not None
+        else False
+    )
+    configured_font_preferences = resolve_ui_font_preferences(
+        config.get(UI_FONT_ID_KEY) if config is not None else None,
+        (
+            config.get(UI_SIDEBAR_FONT_SIZE_KEY)
+            if config is not None
+            else None
+        ),
+        (
+            config.get(UI_CONTENT_FONT_SIZE_KEY)
+            if config is not None
+            else None
+        ),
+    )
+    if config is not None:
+        normalized_font_values = {
+            UI_FONT_ID_KEY: configured_font_preferences.font_id,
+            UI_SIDEBAR_FONT_SIZE_KEY: (
+                configured_font_preferences.sidebar_size
+            ),
+            UI_CONTENT_FONT_SIZE_KEY: (
+                configured_font_preferences.content_size
+            ),
+        }
+        try:
+            config.update_values(normalized_font_values)
+        except Exception:
+            logger.error("介面字體偏好無法寫入，這次仍使用安全預設值。")
     known_sync_keys = {
         shortcut.key for shortcut in CONFIRMED_GAME_SHORTCUTS
     }
@@ -1986,6 +2954,45 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if config is None or theme_name not in UI_THEME_LABELS:
             return False
         config.set(UI_THEME_KEY, theme_name)
+        return True
+
+    def change_show_hints(show: bool) -> bool:
+        if config is None:
+            return False
+        config.set(SHOW_HINTS_KEY, bool(show))
+        return True
+
+    def change_ui_font(font_id: str) -> bool:
+        normalized = normalize_ui_font_id(font_id)
+        if config is None or normalized != font_id:
+            return False
+        try:
+            config.set(UI_FONT_ID_KEY, normalized)
+        except Exception:
+            logger.error("介面字體偏好保存失敗。")
+            return False
+        return True
+
+    def change_sidebar_font_size(size: int) -> bool:
+        normalized = normalize_sidebar_font_size(size)
+        if config is None or normalized != size:
+            return False
+        try:
+            config.set(UI_SIDEBAR_FONT_SIZE_KEY, normalized)
+        except Exception:
+            logger.error("左側選單字級偏好保存失敗。")
+            return False
+        return True
+
+    def change_content_font_size(size: int) -> bool:
+        normalized = normalize_content_font_size(size)
+        if config is None or normalized != size:
+            return False
+        try:
+            config.set(UI_CONTENT_FONT_SIZE_KEY, normalized)
+        except Exception:
+            logger.error("內容區字級偏好保存失敗。")
+            return False
         return True
 
     def choose_background_source():
@@ -2237,20 +3244,84 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 pointer_sync_controller.set_controller_fingerprint(
                     scope.fingerprints[0]
                 )
-        if smart_reconnect_controller is not None:
-            smart_reconnect_controller.set_expected_windows(
-                choice.character_count
-            )
-            smart_reconnect_controller.set_group_launch_plan(plan)
         return plan
+
+    sync_connected_fingerprints: tuple[str, ...] | None = None
+
+    def apply_connected_sync_identity(
+        choice,
+        connected_windows: tuple[WindowInfo, ...] | None = None,
+    ) -> bool:
+        """Only the currently connected and already scoped windows may sync."""
+        if input_controller is None or pointer_sync_controller is None:
+            return False
+        scope = sync_scope_service.scope(choice.name) if sync_scope_service else None
+        if scope is None or not scope.ready:
+            return False
+        fingerprints = _connected_sync_fingerprints(
+            scope.fingerprints,
+            tuple(
+                connected_windows
+                if connected_windows is not None
+                else current_sync_target_windows()
+            ),
+        )
+        entries = scoped_group_entries(choice.name, scope.entry_ids)
+        if entries is None:
+            return False
+        settings_by_fingerprint = {
+            fingerprint: entry.sync_settings
+            for entry, fingerprint in zip(entries, scope.fingerprints)
+        }
+        settings = {
+            fingerprint: settings_by_fingerprint[fingerprint]
+            for fingerprint in fingerprints
+            if fingerprint in settings_by_fingerprint
+        }
+        if len(settings) != len(fingerprints):
+            return False
+        nonlocal sync_connected_fingerprints
+        if sync_connected_fingerprints == fingerprints:
+            return True
+        if not fingerprints:
+            for controller in (input_controller, pointer_sync_controller):
+                controller.set_allowed_fingerprints(())
+                controller.set_target_settings({})
+                controller.invalidate_scheduled()
+            sync_connected_fingerprints = fingerprints
+            return True
+        for controller in (input_controller, pointer_sync_controller):
+            controller.set_expected_windows(len(fingerprints))
+            controller.set_allowed_fingerprints(fingerprints)
+            controller.set_target_settings(settings)
+            controller.set_controller_fingerprint(fingerprints[0])
+        sync_connected_fingerprints = fingerprints
+        return True
+
+    def group_identity_failure_message(choice) -> str:
+        plan = selected_group_plan(choice)
+        if plan is None:
+            return "目前組別的遊戲視窗設定尚未完成；維持安全停止。"
+        scope = (
+            sync_scope_service.scope(choice.name)
+            if sync_scope_service is not None
+            else None
+        )
+        if scope is None or not scope.ready:
+            return "目前組別的同步範圍尚未安全確認；維持安全停止。"
+        scoped_entries = scoped_group_entries(choice.name, scope.entry_ids)
+        if scoped_entries is None:
+            return (
+                "目前組別因共用捷徑延伸到其他組別；其中角色在多組設定中"
+                "無法唯一對應遊戲視窗。為避免錯誤同步，維持安全停止。"
+            )
+        return "目前組別無法完整對應到唯一遊戲視窗；維持安全停止。"
 
     def clear_group_identity() -> None:
         if input_controller is not None:
             input_controller.set_allowed_fingerprints(None)
         if pointer_sync_controller is not None:
             pointer_sync_controller.set_allowed_fingerprints(None)
-        if smart_reconnect_controller is not None:
-            smart_reconnect_controller.set_group_launch_plan(None)
 
     def close_group_operation_gate() -> bool:
         return (
@@ -2406,6 +3477,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "組別身分無法完整重新綁定，未切換組別。",
             )
         reopen_group_operation_gate()
+        refresh_confirmed_activity_group_scope(
+            workspace_service=workspace_service,
+            confirmed_activity_rule_service=confirmed_activity_rule_service,
+            logger=logger,
+        )
         if group_role_status_service is not None:
             group_role_status_service.clear_cache()
         refresh_character_data(choice.name)
@@ -2440,34 +3516,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         if home_view is not None and sync_stopped:
             home_view.set_keyboard_sync_enabled(False)
-        reconnect_stopped = None
-        if smart_reconnect_monitor is not None:
-            reconnect_stopped = stop_service(
-                smart_reconnect_monitor,
-                timeout_seconds=1.0,
-            )
-            if home_view is not None and reconnect_stopped.success:
-                home_view.set_smart_reconnect_enabled(False)
-        if (
-            config is not None
-            and (
-                smart_reconnect_monitor is None
-                or reconnect_stopped.success
-            )
-        ):
-            config.update_values(
-                {
-                    SMART_RECONNECT_ENABLED_KEY: False,
-                    SMART_RECONNECT_CONSENT_KEY: False,
-                }
-            )
-        stopped = (
-            sync_stopped
-            and (
-                reconnect_stopped is None
-                or reconnect_stopped.success
-            )
-        )
+        # 智慧重連綁定的是啟用當下視窗快照；組別編修不得停止或重綁它。
+        stopped = sync_stopped
         if logger is not None and not stopped:
             logger.warning(
                 "Group configuration change was blocked because "
@@ -2542,6 +3592,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "組別身分無法完整重新綁定，設定未套用。",
             )
         reopen_group_operation_gate()
+        refresh_confirmed_activity_group_scope(
+            workspace_service=workspace_service,
+            confirmed_activity_rule_service=confirmed_activity_rule_service,
+            logger=logger,
+        )
         if group_role_status_service is not None:
             group_role_status_service.clear_cache()
         if operation_record_store is not None:
@@ -2953,35 +4008,74 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def add_ungrouped_window_to_group(
         fingerprint: str,
         group_name: str,
-    ) -> object:
-        if group_configuration_service is None:
-            return False
-        shortcut_path = ungrouped_window_service.shortcut_for(fingerprint)
+    ) -> GroupManagementViewResult:
+        current_name = current_group_name()
+        if (
+            group_configuration_service is None
+            or ungrouped_window_service is None
+        ):
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "未分組視窗服務尚未準備完成，沒有加入任何組別。",
+            )
+        try:
+            shortcut_path = ungrouped_window_service.shortcut_for(fingerprint)
+        except Exception:
+            shortcut_path = None
         if shortcut_path is None:
-            return "未分組視窗已變更，沒有加入任何組別。"
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "未分組視窗已變更，沒有加入任何組別。",
+            )
         if not stop_group_automation_for_configuration_change():
-            return "自動操作尚未完全停止，未加入角色。"
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "自動操作尚未完全停止，未加入角色。",
+            )
         try:
             added = group_configuration_service.add_shortcuts(
                 group_name,
                 (shortcut_path,),
             )
         except (SyncCycleError, GroupMasterLockedError) as error:
-            return error.player_message
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                error.player_message,
+            )
+        except Exception:
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "加入組別時發生錯誤，原本設定已保留。",
+            )
         if not added:
-            return "捷徑已在所選組別，沒有變更。"
-        refresh_character_data(group_name)
-        current_name = current_group_name()
+            return GroupManagementViewResult(
+                False,
+                current_name,
+                "捷徑已在所選組別，沒有變更。",
+            )
+        refresh_warning = False
+        try:
+            refresh_character_data(group_name)
+        except Exception:
+            refresh_warning = True
         refreshed = finish_group_management(current_name)
         if not refreshed.success:
-            return "捷徑已加入，但目前組別設定尚未重新套用。"
-        if home_view is not None:
-            home_view.refresh_group_entries()
-            home_view.refresh_group_sync_relations()
-            home_view.refresh_ungrouped_windows()
+            refresh_warning = True
         if operation_record_store is not None:
             operation_record_store.ensure_daily_file()
-        return f"{shortcut_path.name} 已加入 {group_name}。"
+        message = f"{shortcut_path.name} 已加入 {group_name}。"
+        if refresh_warning:
+            message += "目前組別顯示尚未完整重新套用，操作保持安全停止。"
+        return GroupManagementViewResult(
+            True,
+            refreshed.current_group_name,
+            message,
+        )
 
     def remove_group_shortcut(
         group_name: str,
@@ -3286,7 +4380,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def calibrate_role_id(
         group_name: str,
         entry_id: str,
-        role_id: str,
     ) -> str:
         if (
             role_id_template_service is None
@@ -3298,7 +4391,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return "無法唯一確認角色窗口，未校正角色ID。"
         result = role_id_template_service.calibrate(
             window_info.handle,
-            role_id,
+            entry_id=entry_id,
         )
         if result.success:
             group_configuration_service.set_role_id(
@@ -3318,7 +4411,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         window_info = unique_window_for_group_entry(group_name, entry_id)
         if window_info is None:
             return "無法唯一確認角色窗口，未讀取角色ID。"
-        result = role_id_template_service.read(window_info.handle)
+        result = role_id_template_service.read(
+            window_info.handle,
+            entry_id=entry_id,
+        )
         if result.success:
             group_configuration_service.set_role_id(
                 group_name,
@@ -3326,7 +4422,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 result.role_id,
             )
             refresh_group_sync_identity(group_name)
-            return f"已讀取角色ID：{result.role_id}"
+            return f"已讀取遊戲內角色ID：{result.role_id}"
         return result.message
 
     def add_group_sync_relation(
@@ -3493,15 +4589,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 parent=window,
             )
 
-        detail_window = CharacterDetailWindow(
-            window,
+        if home_view is None:
+            return
+        home_view.show_character_detail(
             detail,
             on_save_note=save_note,
             on_clear_note=clear_note,
             on_error=note_error,
         )
-        child = detail_window.open()
-        apply_window_icon(child)
 
     def refresh_character_data(group_name: str | None) -> None:
         if (
@@ -3562,10 +4657,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             and now < float(sync_source_handle_cache["expires_at"])
         ):
             return tuple(sync_source_handle_cache["handles"])
-        handles = tuple(
-            window.handle
-            for window in target_window_contract_service.windows(group_name)
-        )
+        connected_windows = current_sync_target_windows()
+        handles = tuple(window.handle for window in connected_windows)
+        if sync_session_state["enabled"] and group_selection_service is not None:
+            choice = group_selection_service.find(group_name)
+            if choice is not None:
+                apply_connected_sync_identity(choice, connected_windows)
         sync_source_handle_cache.update(
             {
                 "group_name": group_name,
@@ -3696,19 +4793,18 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             ),
         )
 
-    def change_keyboard_sync(enabled: bool) -> bool:
+    def change_keyboard_sync(enabled: bool) -> SyncToggleViewResult:
         if (
             keyboard_sync_monitor is None
             or mouse_sync_monitor is None
             or input_controller is None
             or pointer_sync_controller is None
         ):
-            messagebox.showerror(
-                "輔｜同步輸入",
+            return SyncToggleViewResult(
+                False,
+                False,
                 "同步輸入尚未正確設定，沒有啟用。",
-                parent=window,
             )
-            return False
         auto_click_service.invalidate_direct_sync()
         if not enabled:
             sync_session_state["enabled"] = False
@@ -3723,9 +4819,21 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 )
             # The shared execution gate is already closed, so no queued or
             # still-polling monitor can deliver another game input.
-            return True
+            return SyncToggleViewResult(
+                True,
+                False,
+                (
+                    "同步已停止。"
+                    if cleanup_stopped
+                    else "同步已停止；背景清理仍在完成中。"
+                ),
+            )
 
-        state = workspace_service.snapshot() if workspace_service is not None else None
+        state = (
+            workspace_service.snapshot()
+            if workspace_service is not None
+            else None
+        )
         group_name = (
             state.current_group.name
             if state is not None and state.current_group is not None
@@ -3736,90 +4844,82 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if group_selection_service is not None
             else None
         )
-        if choice is None or choice.character_count <= 1:
-            messagebox.showerror(
-                "輔｜同步輸入",
+        if choice is None:
+            return SyncToggleViewResult(
+                False,
+                False,
                 "請先選擇至少有 2 個視窗設定的組別；目前沒有啟用。",
-                parent=window,
             )
-            return False
-        plan = apply_group_identity(choice)
-        if plan is None:
-            messagebox.showerror(
-                "輔｜同步輸入",
-                "目前組別無法完整對應到唯一遊戲視窗；沒有啟用。",
-                parent=window,
+        if not apply_connected_sync_identity(choice):
+            return SyncToggleViewResult(
+                False,
+                False,
+                group_identity_failure_message(choice),
             )
-            return False
         if current_input_policy() is None:
-            messagebox.showerror(
-                "輔｜同步輸入",
+            return SyncToggleViewResult(
+                False,
+                False,
                 "允許範圍尚未正確設定；目前沒有啟用。",
-                parent=window,
             )
-            return False
         keyboard_started = start_service(keyboard_sync_monitor)
         mouse_started = start_service(mouse_sync_monitor)
         if not keyboard_started.success or not mouse_started.success:
             sync_session_state["enabled"] = False
             stop_service(keyboard_sync_monitor)
             stop_service(mouse_sync_monitor)
-            return False
+            failed_parts = "、".join(
+                name
+                for name, started in (
+                    ("鍵盤監看", keyboard_started),
+                    ("滑鼠監看", mouse_started),
+                )
+                if not started.success
+            )
+            return SyncToggleViewResult(
+                False,
+                False,
+                f"{failed_parts}未能啟動；同步沒有啟用。",
+            )
         sync_session_state["enabled"] = True
         if logger is not None:
             logger.info(
-                "Keyboard synchronization enabled; "
-                f"group={choice.name}; expected={choice.character_count}"
+                "Keyboard synchronization enabled for connected group windows; "
+                f"group={choice.name}"
             )
         mark_tray_operations_running()
-        return True
+        return SyncToggleViewResult(
+            True,
+            True,
+            "同步中｜同步左鍵、拖曳與已確認快捷鍵",
+        )
 
-    def change_smart_reconnect(enabled: bool) -> bool:
+    def change_smart_reconnect(
+        enabled: bool,
+    ) -> SmartReconnectToggleViewResult:
         if (
             config is None
             or smart_reconnect_monitor is None
             or smart_reconnect_controller is None
         ):
-            messagebox.showerror(
-                "輔｜智慧重連",
-                "智慧重連尚未正確設定；目前維持安全停止。",
-                parent=window,
+            return SmartReconnectToggleViewResult(
+                False,
+                False,
+                "智慧重連服務尚未正確設定，沒有啟用。",
             )
-            return False
         if enabled:
-            state = (
-                workspace_service.snapshot()
-                if workspace_service is not None
-                else None
+            transition = apply_smart_reconnect_snapshot_transition(
+                True,
+                smart_reconnect_controller,
+                smart_reconnect_monitor,
+                start_monitor=start_service,
+                stop_monitor=lambda _monitor: stop_service(
+                    smart_reconnect_monitor,
+                    timeout_seconds=1.0,
+                ),
             )
-            group_name = (
-                state.current_group.name
-                if state is not None and state.current_group is not None
-                else None
-            )
-            choice = (
-                group_selection_service.find(group_name)
-                if group_selection_service is not None
-                else None
-            )
-            if choice is None or choice.character_count <= 0:
-                messagebox.showerror(
-                    "輔｜智慧重連",
-                    "請先選擇已有視窗設定的組別；目前維持安全停止。",
-                    parent=window,
-                )
-                return False
-            plan = apply_group_identity(choice)
-            if plan is None:
-                messagebox.showerror(
-                    "輔｜智慧重連",
-                    "目前組別無法完整對應到唯一遊戲視窗；維持安全停止。",
-                    parent=window,
-                )
-                return False
-            started = start_service(smart_reconnect_monitor)
-            if not started.success:
-                return False
+            if not transition.success:
+                return transition
             config.update_values(
                 {
                     SMART_RECONNECT_ENABLED_KEY: True,
@@ -3829,13 +4929,19 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if logger is not None:
                 logger.info("Smart reconnect explicitly enabled by the player.")
             mark_tray_operations_running()
-            return True
+            return transition
 
-        stopped_result = stop_service(
+        transition = apply_smart_reconnect_snapshot_transition(
+            False,
+            smart_reconnect_controller,
             smart_reconnect_monitor,
-            timeout_seconds=1.0,
+            start_monitor=start_service,
+            stop_monitor=lambda _monitor: stop_service(
+                smart_reconnect_monitor,
+                timeout_seconds=1.0,
+            ),
         )
-        stopped = stopped_result.success
+        stopped = transition.success
         if stopped:
             config.update_values(
                 {
@@ -3848,7 +4954,17 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "Smart reconnect explicitly disabled by the player; "
                 f"worker_stopped={stopped}"
             )
-        return stopped
+        return transition
+
+    def change_smart_reconnect_auto_battle(enabled: bool) -> bool:
+        """子開關永遠不會自行開啟智慧重連總開關。"""
+        if config is None or smart_reconnect_controller is None:
+            return False
+        return apply_smart_reconnect_auto_battle_setting(
+            enabled,
+            smart_reconnect_controller,
+            config,
+        )
 
     def change_smart_reconnect_interval(interval_ms: int) -> bool:
         if config is None or smart_reconnect_monitor is None:
@@ -3867,6 +4983,34 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "Smart reconnect monitoring interval changed; "
                 f"interval_ms={normalized}"
             )
+        return True
+
+    def change_smart_reconnect_mode(mode: str) -> bool:
+        if config is None or smart_reconnect_monitor is None:
+            return False
+        normalized = normalize_smart_reconnect_mode(mode)
+        if not smart_reconnect_monitor.set_monitor_mode(normalized):
+            return False
+        config.set(SMART_RECONNECT_MODE_KEY, normalized)
+        if logger is not None:
+            logger.info(
+                "Smart reconnect monitoring mode changed; "
+                f"mode={normalized}"
+            )
+        return True
+
+    def change_smart_reconnect_status_colors(value: object) -> bool:
+        if config is None or not isinstance(value, dict):
+            return False
+        normalized: dict[str, str] = {}
+        for name in ("已開啟", "重連中", "重連失敗"):
+            color = value.get(name)
+            if not isinstance(color, str) or not re.fullmatch(
+                r"#[0-9A-Fa-f]{6}", color
+            ):
+                return False
+            normalized[name] = color.upper()
+        config.set(SMART_RECONNECT_STATUS_COLORS_KEY, normalized)
         return True
 
     def change_smart_reconnect_capture_modes(modes: object) -> bool:
@@ -4052,6 +5196,22 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if character_detail_view_service is not None
         else ()
     )
+
+    def activate_or_launch_group_role(action_id: str) -> object | None:
+        if group_role_status_service is None:
+            return None
+        result = group_role_status_service.activate_or_launch(
+            home_view.current_group_name if home_view is not None else None,
+            action_id,
+        )
+        apply_auto_battle_after_game_launch(
+            group_role_action_started_game(result),
+            smart_reconnect_controller,
+            config,
+            home_view,
+        )
+        return result
+
     home_view = HomeView(
         window,
         status,
@@ -4215,14 +5375,44 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         smart_reconnect_enabled=bool(
             status.get("smart_reconnect_enabled", False)
         ),
+        smart_reconnect_auto_battle_enabled=(
+            normalize_smart_reconnect_auto_battle_enabled(
+                config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY)
+                if config is not None
+                else None
+            )
+        ),
+        smart_reconnect_runtime_status=(
+            smart_reconnect_monitor.runtime_status
+            if smart_reconnect_monitor is not None
+            else None
+        ),
+        smart_reconnect_status_colors=(
+            config.get(SMART_RECONNECT_STATUS_COLORS_KEY)
+            if config is not None else None
+        ),
+        on_smart_reconnect_status_colors_change=(
+            change_smart_reconnect_status_colors
+        ),
         on_smart_reconnect_change=change_smart_reconnect,
+        on_smart_reconnect_auto_battle_change=(
+            change_smart_reconnect_auto_battle
+        ),
         smart_reconnect_interval_ms=(
             smart_reconnect_monitor.monitor_interval_ms
             if smart_reconnect_monitor is not None
             else DEFAULT_SMART_RECONNECT_INTERVAL_MS
         ),
+        smart_reconnect_mode=(
+            smart_reconnect_monitor.monitor_mode
+            if smart_reconnect_monitor is not None
+            else SMART_RECONNECT_MODE_BALANCED
+        ),
         on_smart_reconnect_interval_change=(
             change_smart_reconnect_interval
+        ),
+        on_smart_reconnect_mode_change=(
+            change_smart_reconnect_mode
         ),
         smart_reconnect_capture_modes=(
             smart_reconnect_capture_settings_service.snapshot().to_dict()
@@ -4247,10 +5437,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             else None
         ),
         on_group_role_action=(
-            lambda action_id: group_role_status_service.activate_or_launch(
-                home_view.current_group_name if home_view is not None else None,
-                action_id,
-            )
+            activate_or_launch_group_role
             if group_role_status_service is not None
             else None
         ),
@@ -4293,6 +5480,25 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         on_clear_habit_preferences=clear_habit_preferences,
         theme_name=configured_theme,
         on_theme_change=change_ui_theme,
+        show_hints=configured_show_hints,
+        on_show_hints_change=change_show_hints,
+        ui_font_choices=(
+            ui_font_service.choices
+            if ui_font_service is not None
+            else ()
+        ),
+        ui_font_id=configured_font_preferences.font_id,
+        sidebar_font_size=configured_font_preferences.sidebar_size,
+        content_font_size=configured_font_preferences.content_size,
+        ui_font_failure_message=(
+            ui_font_service.result.message
+            if ui_font_service is not None
+            and not ui_font_service.result.success
+            else ""
+        ),
+        on_ui_font_change=change_ui_font,
+        on_sidebar_font_size_change=change_sidebar_font_size,
+        on_content_font_size_change=change_content_font_size,
         feature_card_preference_provider=(
             feature_card_layout_service.preference
             if feature_card_layout_service is not None
@@ -4377,6 +5583,65 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     home_view.build()
     refresh_character_data(current_character_group)
+    closing = False
+    game_data_read_after_id: str | None = None
+    game_data_read_cursor = 0
+
+    def schedule_registered_obsidian_poll() -> None:
+        nonlocal game_data_read_after_id
+        if closing:
+            game_data_read_after_id = None
+            return
+        try:
+            game_data_read_after_id = window.after(
+                1500,
+                poll_registered_obsidian_once,
+            )
+        except TclError:
+            game_data_read_after_id = None
+
+    def poll_registered_obsidian_once() -> None:
+        nonlocal game_data_read_after_id, game_data_read_cursor
+        game_data_read_after_id = None
+        stage = "resolve_candidates"
+        candidate_index = -1
+        try:
+            capture_service = AppContext.get(CharacterGameDataCaptureService)
+            candidates = current_sync_target_windows()
+            if capture_service is not None and candidates:
+                candidate_index = game_data_read_cursor % len(candidates)
+                selected = candidates[candidate_index]
+                game_data_read_cursor += 1
+                home_view.set_game_data_read_status("安全讀取中")
+                stage = "capture"
+                result = capture_service.read(selected.handle)
+                if result.status.value in {"updated", "unchanged"}:
+                    if result.status.value == "updated":
+                        stage = "refresh"
+                        refresh_character_data(current_group_name())
+                    page = result.page.data if result.page is not None else None
+                    opened_page = getattr(page, "opened_page", None)
+                    home_view.set_game_data_read_status(
+                        f"已確認黑曜石第 {opened_page} 頁"
+                        if isinstance(opened_page, int) else "尚未安全讀取"
+                    )
+                else:
+                    home_view.set_game_data_read_status("尚未安全讀取")
+            else:
+                home_view.set_game_data_read_status("尚未安全讀取")
+        except Exception as error:
+            home_view.set_game_data_read_status("尚未安全讀取")
+            if logger is not None:
+                logger.error(
+                    "Obsidian read-only polling cycle failed safely; "
+                    f"error_type={type(error).__name__}; "
+                    f"stage={stage}; candidate_index={candidate_index}"
+                )
+        finally:
+            schedule_registered_obsidian_poll()
+
+    if AppContext.get(CharacterGameDataCaptureService) is not None:
+        schedule_registered_obsidian_poll()
     def activity_progress_changed_handler(change: object) -> None:
         def apply_change() -> None:
             home_view.refresh_activity_schedule()
@@ -4404,13 +5669,48 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         dispatch_to_main_window(apply_change)
 
     def group_role_status_changed_handler(change: object) -> None:
-        if (
-            true_event_card_service is not None
-            and isinstance(change, GroupRoleStatusChange)
-        ):
-            dispatch_to_main_window(
-                lambda: true_event_card_service.handle_role_status(change)
+        occurred_at = datetime.now(TAIPEI_TIMEZONE)
+        subject_id_resolver = (
+            lambda item: resolve_group_role_progress_subject_id(
+                item,
+                group_launch_service=group_launch_service,
+                group_selection_service=group_selection_service,
             )
+        )
+        handle_group_role_status_change(
+            change,
+            activity_progress_service=activity_progress_service,
+            subject_id_resolver=subject_id_resolver,
+            occurred_at=occurred_at,
+            logger=logger,
+            on_role_status_card=(
+                (
+                    lambda item: dispatch_to_main_window(
+                        lambda: true_event_card_service.handle_role_status(item)
+                    )
+                )
+                if true_event_card_service is not None
+                else None
+            ),
+            on_farm_timer_status=(
+                lambda item: route_group_role_status_to_farm_timer(
+                    item,
+                    farm_timer_service=farm_timer_service,
+                    subject_id_resolver=subject_id_resolver,
+                    occurred_at=occurred_at,
+                )
+            ),
+            on_confirmed_activity_status=(
+                lambda item: route_group_role_status_to_confirmed_activity_rules(
+                    item,
+                    confirmed_activity_rule_service=(
+                        confirmed_activity_rule_service
+                    ),
+                    subject_id_resolver=subject_id_resolver,
+                    occurred_at=occurred_at,
+                )
+            ),
+        )
 
     def farm_planting_confirmed_handler(event: object) -> None:
         if (
@@ -4425,6 +5725,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             and isinstance(event, FarmCompleted)
         ):
             dispatch_to_main_window(lambda: farm_timer_service.complete(event))
+
+    def confirmed_activity_rule_event_handler(event: object) -> None:
+        if (
+            confirmed_activity_rule_service is not None
+            and isinstance(event, ConfirmedActivityEvent)
+        ):
+            dispatch_to_main_window(
+                lambda: confirmed_activity_rule_service.handle(event)
+            )
 
     event_subscription_scope = (
         EventSubscriptionScope(event_bus)
@@ -4447,6 +5756,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         event_subscription_scope.subscribe(
             FARM_COMPLETED_EVENT,
             farm_completed_handler,
+        )
+        event_subscription_scope.subscribe(
+            CONFIRMED_ACTIVITY_RULE_EVENT,
+            confirmed_activity_rule_event_handler,
         )
     auto_click_service.subscribe(
         lambda snapshot: home_view.set_auto_click_running(
@@ -4478,16 +5791,95 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     start_service(group_launch_hotkey_monitor)
 
     def current_group_name() -> str | None:
-        state = (
-            workspace_service.snapshot()
-            if workspace_service is not None
-            else None
-        )
-        return (
-            state.current_group.name
-            if state is not None and state.current_group is not None
-            else None
-        )
+        return current_workspace_group_name()
+
+    role_id_auto_read_id: str | None = None
+    role_id_auto_read_cursor = 0
+
+    def auto_read_missing_role_id() -> None:
+        """只讀取一個可見且已進遊戲的空白角色名稱。"""
+        nonlocal role_id_auto_read_id, role_id_auto_read_cursor
+        try:
+            group_name = current_group_name()
+            if (
+                group_name is None
+                or group_configuration_service is None
+                or role_id_template_service is None
+                or smart_reconnect_controller is None
+            ):
+                return
+            group = group_configuration_service.group(group_name)
+            if group is None:
+                return
+            missing_entries = tuple(
+                entry
+                for entry in group.entries
+                if not entry.role_id.strip()
+            )
+            if not missing_entries:
+                return
+            entry = missing_entries[
+                role_id_auto_read_cursor % len(missing_entries)
+            ]
+            role_id_auto_read_cursor += 1
+            window_info = unique_window_for_group_entry(
+                group_name,
+                entry.entry_id,
+            )
+            if window_info is None or window_info.minimized:
+                return
+            fingerprint = normalize_launch_fingerprint(
+                window_info.launch_fingerprint
+            )
+            if fingerprint is None:
+                return
+            screen_state = smart_reconnect_controller.observe_screen_states(
+                (fingerprint,),
+                candidate_windows=(window_info,),
+            ).get(fingerprint)
+            if screen_state is not ReconnectScreenState.CONNECTED:
+                return
+            result = role_id_template_service.read_if_missing(
+                window_info.handle,
+                existing_role_id=entry.role_id,
+            )
+            if result.success:
+                latest_group = group_configuration_service.group(group_name)
+                latest_entry = (
+                    next(
+                        (
+                            item
+                            for item in latest_group.entries
+                            if item.entry_id == entry.entry_id
+                        ),
+                        None,
+                    )
+                    if latest_group is not None
+                    else None
+                )
+                if latest_entry is not None and not latest_entry.role_id.strip():
+                    saved = group_configuration_service.set_role_id(
+                        group_name,
+                        entry.entry_id,
+                        result.role_id,
+                    )
+                    if saved:
+                        refresh_group_sync_identity(group_name)
+                        home_view.refresh_group_entries()
+                        home_view.refresh_group_role_statuses()
+        except Exception:
+            if logger is not None:
+                logger.warning("自動讀取遊戲內角色名稱失敗。")
+        finally:
+            try:
+                role_id_auto_read_id = window.after(
+                    1000,
+                    auto_read_missing_role_id,
+                )
+            except TclError:
+                role_id_auto_read_id = None
+
+    auto_read_missing_role_id()
 
     player_habit_reminder_service = (
         PlayerHabitReminderService(
@@ -4557,11 +5949,26 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     if farm_timer_monitor is not None:
         start_service(farm_timer_monitor)
+    confirmed_activity_rule_monitor = (
+        ConfirmedActivityRuleMonitor(
+            confirmed_activity_rule_service,
+            window.after,
+            window.after_cancel,
+        )
+        if confirmed_activity_rule_service is not None
+        else None
+    )
+    if confirmed_activity_rule_monitor is not None:
+        start_service(confirmed_activity_rule_monitor)
 
     reconnect_status_refresh_id: str | None = None
 
     def refresh_reconnect_status() -> None:
         nonlocal reconnect_status_refresh_id
+        home_view.set_smart_reconnect_runtime_status(
+            smart_reconnect_monitor.runtime_status
+            if smart_reconnect_monitor is not None else None
+        )
         home_view.refresh_reconnect_failures()
         home_view.refresh_group_role_statuses()
         reconnect_status_refresh_id = window.after(
@@ -4666,6 +6073,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         stop_named("activity_reminder", activity_reminder_monitor)
         stop_named("activity_progress", activity_progress_monitor)
         stop_named("farm_timer", farm_timer_monitor)
+        stop_named(
+            "confirmed_activity_rules",
+            confirmed_activity_rule_monitor,
+        )
         stop_named("card_overlay", overlay_runtime)
         stop_named("keyboard_sync", keyboard_sync_monitor)
         stop_named("mouse_sync", mouse_sync_monitor)
@@ -4680,7 +6091,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             failures.append("event_subscriptions")
         return tuple(failures)
 
-    closing = False
+    def hide_window_to_tray() -> bool:
+        if tray_controller is not None and tray_controller.running:
+            tray_controller.hide()
+            return True
+        try:
+            window.iconify()
+        except TclError:
+            return False
+        return True
 
     def close_window() -> bool:
         nonlocal closing
@@ -4694,6 +6113,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if reconnect_status_refresh_id is not None:
             try:
                 window.after_cancel(reconnect_status_refresh_id)
+            except TclError:
+                pass
+        if game_data_read_after_id is not None:
+            try:
+                window.after_cancel(game_data_read_after_id)
+            except TclError:
+                pass
+        if role_id_auto_read_id is not None:
+            try:
+                window.after_cancel(role_id_auto_read_id)
             except TclError:
                 pass
         if failures:
@@ -4758,7 +6187,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         window.destroy()
         return True
 
-    window.protocol("WM_DELETE_WINDOW", close_window)
     tray_group_state = (
         workspace_service.snapshot()
         if workspace_service is not None
@@ -4784,6 +6212,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         logger.error(
             "System tray icon was not started; the main window remains usable."
         )
+    window.protocol("WM_DELETE_WINDOW", hide_window_to_tray)
     window._card_overlay_runtime = overlay_runtime
     window._card_expiry_monitor = expiry_monitor
     window._activity_reminder_monitor = activity_reminder_monitor
@@ -4874,7 +6303,7 @@ def verify_background_image_runtime(
     return (0 if payload["passed"] else 5), report_path
 
 
-def run(
+def _run_application(
     *,
     self_check_only: bool = False,
     target_desktop_verify_only: bool = False,
@@ -4885,6 +6314,12 @@ def run(
     logger: LoggerService | None = None
     operation_record_store: SyncOperationRecordStore | None = None
     try:
+        if (
+            self_check_only
+            or target_desktop_verify_only
+            or background_image_verify_path is not None
+        ):
+            close_startup_splash()
         configure_process_app_identity()
         paths, logger = build_services(root=root)
         operation_record_store = AppContext.get(SyncOperationRecordStore)
@@ -4949,11 +6384,28 @@ def run(
         if self_check_only:
             return 0 if bool(status.get("self_check_passed", False)) else 2
 
+        ui_font_service = AppContext.get(UIFontService)
+        if ui_font_service is not None:
+            try:
+                ui_font_result = ui_font_service.load_all()
+            except Exception:
+                ui_font_result = None
+            if ui_font_result is None:
+                logger.warning(
+                    "離線介面字體載入發生未預期錯誤，已使用系統預設字體。"
+                )
+            elif not ui_font_result.success:
+                logger.warning(
+                    f"{ui_font_result.message} 原因代碼={ui_font_result.code}"
+                )
+
         window = create_main_window(status, paths)
+        close_startup_splash()
         window.mainloop()
         logger.info(f"FLASH {MILESTONE} closed normally.")
         return 0
     except Exception as exc:
+        close_startup_splash()
         details = traceback.format_exc()
         if logger is not None:
             logger.error(f"FLASH startup failed: {exc}\n{details}")
@@ -5006,11 +6458,51 @@ def run(
                         try:
                             shutdown_external_adapter(logger)
                         finally:
-                            close_operation_record_store(
-                                operation_record_store,
-                                logger,
-                            )
-                            close_logger(logger)
+                            try:
+                                shutdown_ui_font_service(logger)
+                            finally:
+                                close_operation_record_store(
+                                    operation_record_store,
+                                    logger,
+                                )
+                                close_logger(logger)
+
+
+def run(
+    *,
+    self_check_only: bool = False,
+    target_desktop_verify_only: bool = False,
+    background_image_verify_path: Path | None = None,
+    root: Path | None = None,
+) -> int:
+    ordinary_ui = not (
+        self_check_only
+        or target_desktop_verify_only
+        or background_image_verify_path is not None
+    )
+    if not ordinary_ui:
+        try:
+            return _run_application(
+                self_check_only=self_check_only,
+                target_desktop_verify_only=target_desktop_verify_only,
+                background_image_verify_path=background_image_verify_path,
+                root=root,
+            )
+        finally:
+            close_startup_splash()
+    try:
+        instance_lock = acquire_main_instance_lock()
+    except OSError:
+        close_startup_splash()
+        return 1
+    if instance_lock is None:
+        close_startup_splash()
+        return 0
+    try:
+        return _run_application(root=root)
+    finally:
+        close_startup_splash()
+        instance_lock.release()
 
 
 def close_operation_record_store(

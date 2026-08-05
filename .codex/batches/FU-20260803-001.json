@@ -1,0 +1,729 @@
+{
+  "批次編號": "FU-20260803-001",
+  "來源": {
+    "任務": "輔｜SOL",
+    "識別碼": "019fc4bf-dff3-7542-96ee-c4c7e56475ee",
+    "雲端議題": 32,
+    "雲端合併請求": [
+      {
+        "編號": 9,
+        "用途": "FU-REQ-20260802-011 的未結束審查問題來源"
+      },
+      {
+        "編號": 17,
+        "用途": "FU-REQ-20260803-001 的前置證據"
+      }
+    ]
+  },
+  "本批需求編號": [
+    "FU-REQ-20260802-003",
+    "FU-REQ-20260802-004",
+    "FU-REQ-20260802-005",
+    "FU-REQ-20260802-006",
+    "FU-REQ-20260802-007",
+    "FU-REQ-20260802-008",
+    "FU-REQ-20260802-010",
+    "FU-REQ-20260802-011",
+    "FU-REQ-20260803-001",
+    "FU-REQ-20260803-002",
+    "FU-REQ-20260803-003",
+    "FU-REQ-20260803-004"
+  ],
+  "批次狀態": "本機驗證完成；待隔離分支提交與 Windows 雲端驗證",
+  "執行者": "泰拉",
+  "執行方式": "Codex 應用程式本機施工",
+  "付費外部介面": "禁止",
+  "泰拉角色權限": {
+    "雲端讀寫與驗證": "禁止",
+    "推送": "禁止",
+    "合併請求": "禁止",
+    "桌面更新": "禁止",
+    "正式發布": "禁止"
+  },
+  "後置交接": {
+    "負責者": "索爾",
+    "條件": "全部產品項目與一次受影響範圍測試完成，並在同一固定提交完成程式碼審查後。",
+    "允許": [
+      "推送隔離施工分支",
+      "觸發既有 Windows 雲端驗證",
+      "使用同一雲端成品備份並更新桌面",
+      "核對雜湊、捷徑、產品身分與十四項自我檢查"
+    ],
+    "禁止": ["新增工作流程", "主分支合併", "正式發布", "正式頻道更新"]
+  },
+  "完整回歸需要": true,
+  "Windows 驗證需要": true,
+  "正式發布需要": false,
+  "工作區": "C:\\Users\\USER\\Documents\\輔\\目前最終版\\目前程式",
+  "施工分支": "automation/fu-20260802-010-reconnect-role-data",
+  "原始固定提交": "e714eaad3ebb79a7aa5e41e664191bbac942a1cc",
+  "第零階段保全提交": "a6939904916e6504ab86fdc53ef0388748c1fa5e",
+  "2026-08-04使用者現場回饋": {
+    "狀態": "已完整寫入工作樹並完成本機直接驗證",
+    "完整紀錄": "docs/evidence/2026-08-04_現場試用回饋與遊戲資料畫面.md",
+    "最高優先": "智慧重連必須處理完整，且啟用時必須有明確提示",
+    "已確認": [
+      "整體字體需更直覺易讀並減少過多留白",
+      "組別設定改為目前介面內展開，不另開視窗",
+      "設定與收合不得覆蓋角色狀態或其他內容",
+      "今日活動需降低一次顯示量並改善字體與資訊密度",
+      "可用組別需減少常駐按鈕數量",
+      "角色名稱不可只誤讀成單字古，必須可靠讀取完整身分",
+      "四種遊戲資料頁實際開啟後必須能可靠讀取",
+      "設定頁補回玩家可能想記錄的習慣區塊",
+      "啟用智慧重連時必須有提示"
+    ],
+    "已實裝呈現": [
+      "智慧重連提示固定在共用頁首；已開啟、重連中、重連失敗三態使用可保存顏色，停用才隱藏",
+      "今日活動預設只顯示目前與下一項，其他活動及敘述設定在同卡展開",
+      "組別常駐列保留啟動、停止同步、管理組別與狀態，其餘操作收進同卡管理區"
+    ],
+    "遊戲資料證據索引": "assets/game_data_reference/README.md"
+  },
+  "2026-08-04完整施工授權": {
+    "固定基準": "a9dbabee861f16e5d5961b45b58b6a423d0ce5a4",
+    "功能範圍": [
+      "既有介面資訊層級、卡片內設定與收合控制列分離",
+      "今日活動精簡檢視、可用組別管理收納與既有玩家習慣資料入口",
+      "完整穩定角色身分讀取與既有可靠遊戲資料唯讀接線",
+      "僅已可靠登入角色的動態鍵盤與滑鼠同步集合",
+      "真實智慧重連監視結果的常駐文字狀態與可保存三色設定",
+      "既有智慧重連與重開安全路徑的直接反例複核",
+      "既有 Windows 驗證工作流程最低讀取權限與關閉憑證持久化"
+    ],
+    "允許檔案": [
+      ".codex/batches/FU-20260803-001.json",
+      ".github/workflows/既有Windows驗證工作流程檔",
+      "automation/codex_queue_runner/github_client.py", "tests/test_codex_queue_runner.py",
+      "main.py", "ui/home.py", "ui/相關既有介面模組",
+      "adapters/game_screen_recognizer.py", "adapters/windows_role_id_ocr.py", "adapters/windows_smart_reconnect.py", "adapters/windows_battle_restart.py", "adapters/既有同步模組",
+      "services/role_id_template_service.py", "services/character_game_data_相關服務", "services/smart_reconnect_相關服務", "services/target_window_contract_service.py", "services/既有同步範圍服務",
+      "domain/character_game_data.py", "domain/既有同步設定模組",
+      "tests/上述模組直接與受影響測試", "assets/game_data_reference/"
+    ],
+    "禁止範圍": ["新增遊戲輸入、猜測寵物天賦頁碼或欄位、猜測命魂或魂器資料、提交、推送、雲端觸發、封裝、桌面更新、主分支合併、正式發布"],
+    "完成條件": ["所有已確認產品項目完成後才集中執行最小與受影響測試", "未知遊戲資料在介面明確呈現且不保存為已讀", "同步與智慧重連安全閘不被削弱", "語法與差異範圍核對完成"],
+    "下一角色": "索爾隔離分支提交、Windows 雲端驗證與同一成品桌面交付"
+  },
+  "2026-08-05本機最終驗證": {
+    "固定基準": "a9dbabee861f16e5d5961b45b58b6a423d0ce5a4",
+    "受影響範圍": "十六個直接測試檔同一次執行，541 項通過、1 項略過",
+    "完整回歸": "雲端第一輪缺口修正後，本機 1576 項通過、2 項略過、5 項失敗",
+    "既有非本批失敗": [
+      "五項安裝測試因使用者目前仍在執行輔而由安裝器主動拒絕；本批未修改安裝器或其測試，乾淨 Windows 雲端環境負責最終驗證"
+    ],
+    "語法檢查": "adapters、services、ui、main.py 與 tests 全數通過",
+    "差異檢查": "通過；僅有既有換行格式提示",
+    "封裝資產": "完整黑曜石真圖保留為工作樹測試證據；Windows 成品只帶辨識執行期需要的第 1 至第 10 頁參考圖",
+    "十四項自我檢查": "隔離暫存資料根目錄執行，14 項全數通過",
+    "智慧重連直接證據": "監視器與 Windows 智慧重連直接專測已含來源撤銷、晚到結果、單角色重開、待重開恢復、身分衝突、視窗生命週期、遮蔽與未知畫面、單輪例外後續監視及停止路徑；安全等待與暫停重綁定顯示重連中，只有真實錯誤顯示重連失敗",
+    "雲端第一輪": "執行 30932674297 在完整測試階段揭露：兩項事件卡舊測試資料違反既有穩定身分排序；另有六項斷線辨識只在安裝文字辨識套件的雲端失敗，原因為核心『中斷』文字常數損壞。只修正測試資料矛盾與文字常數，未改事件卡產品排序規則；修正後相關四檔 87 項通過，完整本機回歸只剩使用中程序造成的五項安裝保護性阻擋",
+    "下一步": "提交目前完整工作樹至既有隔離分支，觸發既有 Windows 驗證；不合併主分支、不正式發布"
+  },
+  "索爾架構審查前置": {
+    "來源": "索爾對保全提交 a6939904916e6504ab86fdc53ef0388748c1fa5e 的架構審查",
+    "目前施工需求": ["FU-REQ-20260802-006 黑曜石子項"],
+    "後續保持鎖定需求": [
+      "FU-REQ-20260802-006 寵物天賦子項",
+      "FU-REQ-20260802-007",
+      "FU-REQ-20260803-002"
+    ],
+    "狀態": "第004、005號已通過索爾程式審查；第006號僅黑曜石子項已解鎖，寵物天賦仍保持鎖定",
+    "用途": "只記錄共同設計與只讀證據；實際施工所有權與直接測試僅填入目前解鎖的第006號黑曜石子項。",
+    "第004索爾程式審查固定提交": "a827a0f2f3562be59a8df51125ba0b8541c187b1",
+    "只讀核對證據": [
+      "VerifiedGameDataPage 目前仍由頁面辨識器攜帶 character_id，與只辨識頁面資料的固定架構衝突。",
+      "目前簽章快取鍵只有視窗、角色與資料種類；缺少呼叫端已提供的可靠邏輯頁身分。",
+      "黑曜石目前是單一 ObsidianSnapshot，更新會整體取代；其第一至第十頁集合規則屬第006號，保持待前置關卡。",
+      "目前更新服務以 load、合併、save 連續執行，但沒有序列鎖；背景併發可遺失另一筆更新。",
+      "全倉庫只有資料擷取服務定義與直接測試引用 CharacterGameDataCaptureService，沒有實際頁面辨識器或產品端建立／接線。"
+    ],
+    "施工後仍需交接的缺口": [
+      "現有範圍內沒有真實遊戲資料頁辨識器可供接線；本前置只完成安全擷取契約與保存層。",
+      "現有範圍外尚無將已註冊視窗與匿名啟動指紋解析為角色身分的產品端注入點；本前置只要求呼叫端提供已驗證綁定，未提供即拒絕。"
+    ],
+    "禁止範圍": [
+      "修改保全提交",
+      "從畫面、捷徑名稱、檔名、臨時標題或視窗順序猜測角色身分",
+      "清除未讀頁資料",
+      "遊戲輸入或自動切換頁面"
+    ],
+    "驗收": [
+      "頁面辨識器只產出頁面種類、可靠邏輯頁身分、內容與內容簽章；不產出角色識別",
+      "角色歸屬只由已登錄視窗與匿名啟動指紋可靠綁定提供；未可靠綁定即拒絕",
+      "共用部分更新不得清除未提供區域；讀取、合併、寫入經單一序列化入口保護",
+      "第006、007與20260803-002完成前，不加入任何資料頁具體辨識、頁集合、跨重啟內容判斷或提醒規則"
+    ]
+  },
+  "索爾程式審查阻擋項": {
+    "來源": "索爾對基準提交 df3babc 的角色名稱自動讀取程式審查",
+    "狀態": "已登記；待第003號完成後、FU-REQ-20260803-001 身分資料階段前修正",
+    "施工順序": "FU-REQ-20260803-004 只讀比對已完成；本項必須先於 FU-REQ-20260803-001 施工完成。",
+      "檔案所有權": [
+      "adapters/windows_role_id_ocr.py",
+      "services/role_id_template_service.py",
+      "services/role_id_auto_read_service.py",
+      "main.py",
+      "tests/test_role_id_template_service.py",
+      "tests/test_role_id_auto_read_service.py",
+      "tests/test_main_window_layout.py"
+    ],
+    "禁止範圍": [
+      "adapters/windows_smart_reconnect.py",
+      "遊戲輸入",
+      "工作流程",
+      "捷徑名稱、檔名、臨時標題或視窗順序的身分判斷",
+      "未經可靠觀測的角色名稱保存"
+    ],
+    "審查證據": [
+      "ROLE_ID_REGION=(86,50,320,63) 套用完整 Win32PrintWindow 畫面；舊可靠實作使用用戶區座標 (87,13,177,37)，倉庫真實參考圖目前裁切結果為黑色。",
+      "windows_role_id_ocr._text_from_result 丟棄辨識可信度；main.auto_read_missing_role_id 單次成功即永久保存。",
+      "main.auto_read_missing_role_id 由 window.after 每秒在介面執行緒同步執行畫面辨識、模型初始化與辨識。"
+    ],
+    "直接驗收": [
+      "以倉庫真實參考圖、非用戶區偏移與縮放變化驗證角色名稱裁切。",
+      "低可信度、前後不一致、視窗實例更換與已存在資料不覆寫均不保存。",
+      "單一有界背景工作者不重疊；過期結果與關閉後回呼不保存，介面回呼不被阻塞。"
+    ]
+  },
+  "全域禁止範圍": [
+    "FU-REQ-20260802-002",
+    "FU-REQ-20260802-009",
+    "FU-REQ-20260802-013",
+    "主分支合併",
+    "正式發布",
+    "正式頻道更新",
+    "桌面覆蓋",
+    "雲端讀寫",
+    "未確認功能",
+    "未列入本批的重構與測試標準"
+  ],
+  "階段": [
+    {
+      "編號": "第零階段",
+      "項目": "保全現況與四項資料既有差異",
+      "狀態": "已完成",
+      "檔案所有權": [
+        "domain/character_game_data.py",
+        "main.py",
+        "services/character_game_data_view_service.py",
+        "services/character_game_data_capture_service.py",
+        "services/character_game_data_update_service.py",
+        "tests/test_character_game_data.py",
+        "tests/test_main_character_registration.py",
+        "tests/test_character_game_data_capture_service.py",
+        "tests/test_character_game_data_update_service.py"
+      ],
+      "禁止範圍": ["其他未提交檔案", "雲端", "桌面", "正式發布"],
+      "最小測試": [
+        "tests/test_character_game_data.py",
+        "tests/test_main_character_registration.py",
+        "tests/test_character_game_data_capture_service.py",
+        "tests/test_character_game_data_update_service.py"
+      ],
+      "驗收": [
+        "現有差異僅在指定九個檔案",
+        "四項資料共用唯讀辨識與部分更新可保存",
+        "最小測試通過",
+        "建立本機保全提交"
+      ]
+    },
+    {
+      "編號": "FU-REQ-20260802-011",
+      "項目": "第九號合併請求七個未結束審查問題",
+      "狀態": "已驗證",
+      "來源合併請求": 9,
+      "來源固定提交": "60f3d06efc62a65c6cf558c7cec2ed4e0339b60b",
+      "候選修正提交": [
+        "ccd3ee02c50be94865b1990f41f9faa7ed5898ac",
+        "175700e007a7a27bb13c5035e8c632c5b4773d04",
+        "c747b74c71397539901904750a3bdda1989d0ce1",
+        "c1de4dd38c9ee69f45662cd0ab42694f78127c83"
+      ],
+      "檔案所有權": [
+        "services/target_window_contract_service.py",
+        "adapters/windows_smart_reconnect.py",
+        "main.py",
+        "ui/home.py",
+        "tests/test_windows_smart_reconnect.py",
+        "tests/test_api_contract_hardening.py",
+        "tests/test_main_input_sync.py",
+        "tests/test_home_sp3_layout.py",
+        "tests/test_main_target_window_event_flow.py",
+        "tests/test_target_window_status_presentation.py"
+      ],
+      "禁止範圍": ["上述以外產品檔案", "雲端", "桌面", "正式發布"],
+      "最小測試": [
+        "tests/test_api_contract_hardening.py::test_reconnect_targets_reject_incomplete_instance_before_capture",
+        "tests/test_windows_smart_reconnect.py::test_selected_group_missing_identity_prevents_false_connected_result",
+        "tests/test_windows_smart_reconnect.py::test_scoped_source_subset_without_failure_revokes_missing_evidence",
+        "tests/test_windows_smart_reconnect.py::test_source_subset_final_publish_removes_late_connected_evidence",
+        "tests/test_windows_smart_reconnect.py::test_observation_rejects_connected_state_after_source_generation_change",
+        "tests/test_windows_smart_reconnect.py::test_pending_reopen_keeps_incomplete_appeared_instance",
+        "tests/test_windows_smart_reconnect.py::test_pending_reopen_requires_unique_complete_instance_to_clear",
+        "tests/test_windows_smart_reconnect.py::test_pending_reopen_requires_non_duplicate_complete_instance_to_clear",
+        "tests/test_home_sp3_layout.py::test_successful_group_change_shows_warning_message",
+        "tests/test_main_input_sync.py::test_failed_group_change_clears_unbound_identity_before_reopening_gate"
+      ],
+      "本機驗證": "四個修正提交新增的十項精確測試全數通過。",
+      "索爾雲端結案證據": {
+        "第九號合併請求未結束審查討論": 0,
+        "第32號議題狀態": "STATUS: VERIFIED",
+        "第32號議題留言": 5160960543,
+        "主分支合併或發布": "未涉及"
+      },
+      "智慧重連嚴格本機複審": {
+        "固定基準": "a9dbabee861f16e5d5961b45b58b6a423d0ce5a4",
+        "狀態": "施工中：未提交",
+        "檔案所有權": [
+          "adapters/windows_smart_reconnect.py",
+          "tests/test_windows_smart_reconnect.py",
+          "adapters/game_screen_recognizer.py",
+          "tests/test_game_screen_recognizer.py",
+          "adapters/windows_battle_restart.py",
+          "tests/test_windows_battle_restart.py",
+          ".codex/batches/FU-20260803-001.json"
+        ],
+        "禁止範圍": [
+          "main.py",
+          "介面",
+          "待重開必須為新實例的疑點",
+          "其他智慧重連功能",
+          "提交、推送、雲端驗證、封裝、發布"
+        ],
+        "驗收": [
+          "不完整視窗實例在所有擷取路徑的最早共同邊界回傳未知，且不得擷取、辨識、可見性探測、記住路徑或送入遊戲輸入",
+          "同一指紋由完整實例替換成不完整實例時，撤銷已發布連線狀態與可信在線證據",
+          "全域模式的空集合或子集撤銷消失或不安全指紋，保留仍唯一完整的實例，並使同時被動觀測不得晚寫回連線",
+          "被動候選集合先驗證完整實例及控制碼、程序與指紋唯一性；衝突者不擷取並撤銷舊連線證據",
+          "擷取前後均以權威來源確認同一完整視窗實例；任何替換、缺失、衝突或列舉失敗均回傳未知並撤銷舊信任",
+          "兩幀動作確認、斷線起算與終局三幀均綁定完整視窗實例；替換後從第一幀與新的等待時間重算",
+          "待重開與失敗回報的所有重開入口先做集合安全檢查；不安全集合不得關閉或開啟捷徑",
+          "完成兩幀的完整實例一路帶到最終擷取、可見性、回應探測與滑鼠交付；任一欄變動即取消本次動作",
+          "未知、停用、非新鮮、無座標、簽章不完整、路由或設定變動均中斷動作證據，重新連續累積兩幀",
+          "擷取設定鎖與畫面狀態鎖不反向巢狀；事件屏障並行測試證明觀測、設定變更與點擊可有界完成，且設定變更後舊觀測不得晚寫回",
+          "一般連線與每個可操作畫面均逐區驗證結構與相似度；未知中央遮蔽、純色、不同遊戲背景與缺少任一必要區域皆未知且無點擊",
+          "被動請求角色缺失、不唯一或不完整時撤銷來源世代；任何晚到的舊狀態均不得覆寫未知",
+          "戰鬥斷線同樣須對同一完整實例滿足五秒等待；替換實例重新起算",
+          "選線、進入角色與關閉公告的三、十、五秒轉場等待由控制器強制，提前呼叫僅觀測不得點擊",
+          "停用執行先關閉閘門並清除所有未來遊戲變更授權；重新啟用必須重新累積完整證據",
+          "最終開啟捷徑前重新解析匿名啟動指紋；解析失敗、檔案替換或指紋不一致均不得開啟",
+          "不送未授權遊戲輸入、不修改主程式、介面、資產或其他功能"
+        ],
+        "最小測試": [
+          "tests/test_windows_smart_reconnect.py",
+          "tests/test_api_contract_hardening.py",
+          "tests/test_main_input_sync.py",
+          "tests/test_home_sp3_layout.py",
+          "tests/test_main_target_window_event_flow.py",
+          "tests/test_target_window_status_presentation.py",
+          "tests/test_game_screen_recognizer.py",
+          "tests/test_windows_battle_restart.py"
+        ],
+        "本次補強驗收": [
+          "來源撤銷同時清除可信擷取路徑與兩幀動作確認，恢復後必須重新累積連續安全證據",
+          "最終送入前每次重新列舉都驗證選定組別完整安全；任一角色缺失時不得對剩餘角色送入操作",
+          "斷線畫面每個必要區以黑、白及指定純色遮蔽時均回傳未知，不得退回已連線",
+          "完整斷線參考、暗色、比例縮放與替代斷線卡在已確認文字證據下仍回傳斷線",
+          "捷徑身分解析完成後、直接開啟前再次確認目標仍不存在；解析期間自行重開時零開啟"
+        ],
+        "本機驗證": {
+          "智慧重連核心": "216 項通過",
+          "重開安全邊界": "34 項通過",
+          "解析期間目標自行重開反例": "1 項通過；最後不存在檢查確實發生在身分解析之後",
+          "既有同步與狀態流程": "101 項通過",
+          "畫面結構反例與十四視窗時間": "14 項通過",
+          "完整畫面辨識": "39 項通過；7 項受本機缺少 rapidocr-onnxruntime 套件影響，無法執行正向文字辨識驗收"
+        }
+      },
+      "驗收": ["七個問題逐項有本機程式或測試證據", "候選修正提交均為目前提交祖先", "未改動允許範圍外檔案"]
+    },
+    {
+      "編號": "FU-REQ-20260803-004",
+      "項目": "同步器保存、視窗識別、縮小喚醒、組別啟動、位置還原、鍵盤同步與取消批量加入",
+      "狀態": "本機核對通過，無須恢復",
+      "比對來源提交": "673f86876dc88d43bd15809ca5d8b0c608291678",
+      "檔案所有權": ["tests/test_main_window_layout.py"],
+      "解鎖條件": "只讀比對後，僅將可由程式與直接測試證明的檔案寫入本批次單。",
+      "禁止範圍": ["未經比對證明的行為", "較新安全修正", "雲端", "桌面", "正式發布"],
+      "最小測試": [
+        "tests/test_main_input_sync.py::test_sync_key_collapsed_state_is_loaded_saved_and_wired_to_home",
+        "tests/test_main_input_sync.py::test_smart_reconnect_interval_uses_legacy_key_and_is_saved",
+        "tests/test_main_input_sync.py::test_smart_reconnect_capture_modes_use_one_formal_persistent_entrypoint",
+        "tests/test_group_window_launch_service.py::test_launches_only_missing_roles_and_restores_every_saved_position",
+        "tests/test_group_window_launch_service.py::test_unknown_existing_game_window_stops_before_launch",
+        "tests/test_group_window_launch_service.py::test_records_all_current_exact_window_positions_in_one_save",
+        "tests/test_windows_input_sync.py::test_all_policy_sends_b_to_foreground_background_and_minimized",
+        "tests/test_keyboard_sync_monitor.py::test_key_keeps_the_source_handle_captured_at_press_time",
+        "tests/test_windows_smart_reconnect.py::test_win32_mouse_minimized_click_restores_full_window_state",
+        "tests/test_main_window_layout.py::test_cancelled_bulk_shortcut_selection_has_no_side_effects",
+        "tests/test_group_configuration_service.py::test_export_and_import_round_trip_preserves_group_order_and_layout",
+        "tests/test_group_configuration_service.py::test_reorder_entries_is_atomic_persistent_and_keeps_main_identity",
+        "tests/test_group_configuration_service.py::test_saved_window_layout_survives_owned_configuration_reload",
+        "tests/test_group_configuration_service.py::test_each_group_keeps_one_unique_launch_hotkey",
+        "tests/test_group_configuration_service.py::test_sync_offset_delay_base_point_and_role_id_survive_reload"
+      ],
+      "取消批量加入直接證據": "檔案選擇取消時先回傳，不得停止自動操作、不得呼叫 add_shortcuts、不得寫入角色；多選只以一次 add_shortcuts 原子處理。",
+      "本機比對": "現行程式已保存同步設定；以啟動指紋與完整視窗身分處理目標；縮小視窗可安全還原；整組只啟動缺少角色並還原已保存位置；鍵盤保留按下瞬間來源；取消批量加入與完整重啟保存範圍已有直接測試。",
+      "本機驗證": "十五項最小測試全數通過。",
+      "驗收": ["不覆蓋較新安全修正", "只恢復可直接證明的既有行為", "十五項最小測試全數通過"]
+    },
+    {
+      "編號": "FU-REQ-20260802-003",
+      "項目": "唯一決策入口、共同優先順序與單一事件卡",
+      "狀態": "本機驗證通過",
+      "檔案所有權": [
+        "cards/lifecycle.py",
+        "cards/service.py",
+        "cards/view_state.py",
+        "decision/models.py",
+        "decision/service.py",
+        "services/card_coordinator.py",
+        "services/activity_reminder_service.py",
+        "services/farm_timer_service.py",
+        "services/player_habit_reminder_service.py",
+        "services/true_event_card_service.py",
+        "main.py",
+        "tests/test_decision_service.py",
+        "tests/test_card_service.py",
+        "tests/test_card_view_state.py",
+        "tests/test_card_coordinator.py",
+        "tests/test_activity_reminder_service.py",
+        "tests/test_farm_timer_service.py",
+        "tests/test_player_habit_reminder_service.py",
+        "tests/test_true_event_card_service.py"
+      ],
+      "核對證據": [
+        "所有產品 .show 呼叫僅有五處：活動提醒一處、農場一處、玩家習慣一處、真實事件兩處；均直接繞過 DecisionService。",
+        "DecisionService 只在 build_services 建立與登錄，沒有產品呼叫 decide。",
+        "施工前 DecisionCategory 為時間限制第二、損失風險第三，且缺少一般資訊第十層。",
+        "施工前 CardService 只以舊五層 CardPriorityTier 排序，未接收 DecisionCategory、剩餘時間或角色重要度。",
+        "恢復必須進第五層、一般資訊第十層、偏好建議第九層；不以舊五層反推。",
+        "來源僅能依既有具型別事件分類；無法由現有欄位證明的層級不施工猜測。",
+        "直接在 cards.lifecycle 模組頂層匯入 DecisionCategory 會因 cards 套件初始化反向載入未完成的 decision.models 而失敗；生命週期改以延後匯入保留 DecisionCategory 實型別。"
+      ],
+      "解鎖條件": "已完成全量 .show 呼叫點核對；施工僅限本階段檔案所有權。",
+      "禁止範圍": [
+        "遊戲操作授權",
+        "未定案事件規則",
+        "卡片視覺修改",
+        "以舊五層 CardPriorityTier 作為可見或等待佇列排序依據"
+      ],
+      "最小測試": [
+        "tests/test_decision_service.py",
+        "tests/test_card_service.py",
+        "tests/test_card_view_state.py",
+        "tests/test_card_coordinator.py",
+        "tests/test_activity_reminder_service.py",
+        "tests/test_farm_timer_service.py",
+        "tests/test_player_habit_reminder_service.py",
+        "tests/test_true_event_card_service.py"
+      ],
+      "本機驗證": "八個直接測試檔共五十五項通過；零個產品 .show 呼叫，唯一卡片寫入為 CardCoordinator 內部呼叫 CardService.upsert。",
+      "驗收": [
+        "固定順序為安全與斷線、損失風險、時間限制、玩家焦點、中斷恢復、組別核心進度、今日重要、可延後、習慣建議、一般資訊、保持安靜",
+        "每個來源以同一事件識別提交具型別 DecisionCandidate 與 GroupCard，且唯一入口強制兩者識別相同",
+        "DecisionService 每次提交只呼叫一次；保持安靜時移除既有同識別卡",
+        "DecisionService 保留十一層結果；CardService 的可見三張與等待佇列只接受前十個可呈現層級，依層級、剩餘時間、角色重要度、穩定事件識別排序",
+        "CardViewItem 從同一個已決策生命週期輸出可呈現層級 priority_level，不由 CardPriorityReason 反推",
+        "相同事件更新只更新同一張卡",
+        "不把 requires_player_action 造假；恢復、組別進度與今日重要沿用既有決策規則",
+        "來源只依斷線、恢復、農場損失或時間、活動排程時間與習慣建議等既有具型別事件證據分類；跨午夜活動以剩餘時間進第三層",
+        "決策與卡片入口不含遊戲輸入、點擊或啟動能力"
+      ]
+    },
+    {
+      "編號": "FU-REQ-20260802-004",
+      "項目": "共用唯讀且不干擾玩家的畫面辨識",
+      "狀態": "索爾程式審查通過",
+      "索爾審查固定提交": "a827a0f2f3562be59a8df51125ba0b8541c187b1",
+      "檔案所有權": [
+        "services/character_game_data_capture_service.py",
+        "services/character_game_data_update_service.py",
+        "tests/test_character_game_data_capture_service.py",
+        "tests/test_character_game_data_update_service.py"
+      ],
+      "解鎖條件": "第003號已通過索爾架構審查；本階段只實作共用擷取契約與保存層，不實作資料頁具體辨識規則。",
+      "禁止範圍": ["遊戲輸入", "未可靠辨識", "清除未讀資料"],
+      "最小測試": [
+        "tests/test_character_game_data_capture_service.py::test_recognizer_page_does_not_contain_character_identity",
+        "tests/test_character_game_data_capture_service.py::test_capture_rejects_missing_verified_window_binding",
+        "tests/test_character_game_data_capture_service.py::test_signature_cache_isolated_by_reliable_logical_page_identity",
+        "tests/test_character_game_data_capture_service.py::test_capture_reads_only_capture_provider",
+        "tests/test_character_game_data_capture_service.py::test_invalid_recognizer_result_is_not_saved_or_raised",
+        "tests/test_character_game_data_update_service.py::test_partial_pages_do_not_clear_unread_sections",
+        "tests/test_character_game_data_update_service.py::test_unprovided_sections_are_preserved",
+        "tests/test_character_game_data_update_service.py::test_update_serialization_prevents_concurrent_lost_updates"
+      ],
+      "本機驗證": "八項精確直接測試全數通過。",
+      "驗證命令紀錄": [
+        {
+          "類型": "驗證命令錯誤",
+          "程序編號": 11772,
+          "命令": "python -m pytest -q \\\\ ",
+          "原因": "PowerShell 將反斜線視為實際路徑參數，非換行續行符。",
+          "處置": "核對命令列相符後只終止該程序，回讀確認程序不存在；改用同一行精確測試清單。",
+          "產品結果": "不計入產品失敗"
+        }
+      ],
+      "驗收": [
+        "只更新呼叫端已可靠綁定的已註冊視窗與實際開啟頁面",
+        "一次只更新一個可靠區域時，其他既有未讀區域保持原值",
+        "併發讀取不遺失資料",
+        "不送輸入、不切前景、不切頁"
+      ]
+    },
+    {
+      "編號": "FU-REQ-20260802-005",
+      "項目": "活動共用狀態與中斷分流",
+      "狀態": "索爾程式審查通過",
+      "索爾審查固定基準": "a827a0f2f3562be59a8df51125ba0b8541c187b1",
+      "索爾獨立複驗": "八項精確直接測試 8 passed。",
+      "檔案所有權": [
+        "domain/progress.py",
+        "services/activity_progress_service.py",
+        "main.py",
+        "tests/test_domain_progress.py",
+        "tests/test_activity_progress_service.py",
+        "tests/test_main_activity_progress.py"
+      ],
+      "解鎖條件": "第004號已通過索爾程式審查；只處理共用中斷資料、精確角色身分映射與原子保存，不處理個別活動規則。",
+      "禁止範圍": [
+        "第四種活動狀態",
+        "個別活動完成畫面或每日規則猜測",
+        "全體或組別共用活動的身分映射猜測",
+        "遊戲操作"
+      ],
+      "最小測試": [
+        "tests/test_domain_progress.py::test_running_progress_preserves_interruption_at_daily_reset",
+        "tests/test_domain_progress.py::test_interruption_requires_running_progress",
+        "tests/test_activity_progress_service.py::test_role_interruption_updates_only_running_exact_subject_and_persists",
+        "tests/test_activity_progress_service.py::test_open_role_clears_only_exact_subject_interruption",
+        "tests/test_activity_progress_service.py::test_interruption_transition_saves_all_affected_progress_before_typed_changes",
+        "tests/test_main_activity_progress.py::test_group_role_subject_resolution_requires_unique_nonempty_registered_identity",
+        "tests/test_main_activity_progress.py::test_group_status_routes_disconnect_reconnect_closed_and_open",
+        "tests/test_main_activity_progress.py::test_non_group_or_unresolved_status_does_not_change_activity_progress"
+      ],
+      "本機驗證": "八項精確直接測試與六個檔案語法檢查全數通過。",
+      "驗收": [
+        "活動狀態只保留待命中、執行中、已完成；中斷以獨立具型別資料保存斷線或遊戲關閉與可靠發生時間",
+        "只修改精確且唯一對應到非空穩定 subject_id 的執行中進度；待命中、已完成與無可靠身分保持不變",
+        "重新開啟遊戲只清除中斷資料，保留執行中、開始時間、完成次數與當日歸屬",
+        "跨午夜的執行中進度保留中斷資料、開始時間與新日期；開始或完成活動清除舊中斷資料",
+        "一次原子保存全部受影響進度後才發布具型別變更；不送輸入、不點擊、不切換遊戲畫面"
+      ]
+    },
+    {
+      "編號": "FU-REQ-20260802-006",
+      "項目": "四頁寵物天賦與黑曜石",
+      "狀態": "索爾程式審查通過：黑曜石子項；寵物天賦完整文字定案與兩張可見區段 50–80 清楚原圖已保存，仍待其餘三頁原圖與可靠頁面映射",
+      "固定基準": "3ac1c15ffa75a7647acf936bd92c965a570a6017",
+      "索爾審查固定提交": "f97a77d3f55023f2d2c4721e68bb67dd738055bd",
+      "索爾獨立複驗": "限定五個測試檔共 44 項通過；語法、差異範圍、批次單、乾淨工作目錄與十張原圖雜湊核對通過。",
+      "子項範圍": "只處理黑曜石第 1 至第 10 頁的可靠唯讀辨識、每頁最新集合保存、唯讀摘要與封裝參考資產；不接主程式。",
+      "檔案所有權": [
+        ".codex/batches/FU-20260803-001.json",
+        "adapters/obsidian_page_recognizer.py",
+        "assets/game_data_reference/obsidian/",
+        "domain/character_game_data.py",
+        "services/character_game_data_update_service.py",
+        "services/character_game_data_view_service.py",
+        "FLASH.spec",
+        "tests/test_obsidian_page_recognizer.py",
+        "tests/test_character_game_data.py",
+        "tests/test_character_game_data_capture_service.py",
+        "tests/test_character_game_data_update_service.py",
+        "tests/test_app_icon.py"
+      ],
+      "原圖證據": [
+        {"頁碼": 1, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-67f95ff0-840a-440f-bf08-c794f31131fe.png", "SHA256": "ea613be92723ad5c50807d23df2495a0b9fad116c03d8472ff5d2e1a8ad6d86c"},
+        {"頁碼": 2, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-599d72f6-1a84-474e-b0ff-7200f765d706.png", "SHA256": "dcdcb69bbeda8cfdbe6dbc1b6ab8a1f90324d77f430de543d02a67a02fbaaea3"},
+        {"頁碼": 3, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-746792b5-9ece-437c-b19a-71d30df941a5.png", "SHA256": "bc7e1f115183e85bb53d72a6e8e81eaeb481e08ae748b34e0409c70285f7d29d"},
+        {"頁碼": 4, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-95d849da-6869-4e27-990b-915766b4e06f.png", "SHA256": "2c08443f0cb6f75a010c99aef6f5990cb37350698a3fd12d0e0e3f99254478be"},
+        {"頁碼": 5, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-aad8ae73-409d-4663-85b8-d2646f4d0bf8.png", "SHA256": "e39ab6ea14e2f45d1aada4adf652cee4085631b4be0bc9731a2163e705e80754"},
+        {"頁碼": 6, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-2f64ade5-d5a9-473b-985e-03086ca89e9b.png", "SHA256": "7202f50b8d342b2331eb84b5ebaf44bfefba8d3e00412e8279a45e4de2445dff"},
+        {"頁碼": 7, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-2971eea2-9536-45fc-9d8d-11eca876f1ad.png", "SHA256": "2793685803eeb0cec4b10268c066ac65b723128930f5c9de707d3e7db1fa8e36"},
+        {"頁碼": 8, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-503b5abf-918e-4176-9122-cc649d97ea68.png", "SHA256": "ebd472671034e0e700811926dd03f2d9a1d49ca967f4fd976257bba58581ecf7"},
+        {"頁碼": 9, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-4abbac88-ff39-4645-84af-1f2d54f221c5.png", "SHA256": "57642714dc8688c2eeccfd1d088e7165f4b8cfb127f7fbb74d18e2107224bcca"},
+        {"頁碼": 10, "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-c940e16a-b4de-4d47-bf3c-2c200c540077.png", "SHA256": "262924e496079e06beabccc68a85b91e839bc4405b69d6e839ced53001375582"}
+      ],
+      "寵物天賦證據保存": {
+        "需求編號": "FU-REQ-20260802-006",
+        "定案狀態": "CONFIRMED（已確認）",
+        "定案留言": 5154748162,
+        "定案連結": "https://github.com/limaple0324/FLASH/issues/32#issuecomment-5154748162",
+        "共用唯讀規則留言": 5154748040,
+        "共用唯讀規則連結": "https://github.com/limaple0324/FLASH/issues/32#issuecomment-5154748040",
+        "完整文字規則": "寵物天賦共有四頁；四頁皆讀取後才標示完整更新；每次只更新實際開啟且可靠的頁面；未讀頁不清除；未知不猜測；不自動切頁、升級、勾選或送出任何遊戲輸入",
+        "工作樹原圖": "assets/game_data_reference/pet_talent/visible_range_50_80.png",
+        "來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-e56011fe-3919-4676-b48e-6876096e1f77.png",
+        "SHA256": "cb5f678d79fb1ecbaf2293d5683ef98be9ee83c224d3953441fcec99dae74551",
+        "可確認": "標題寵物天賦、區段 50–80、天賦能量 22／850、屬性加成 0%、節點與等級、英靈點 1873、直接使用金子升級勾選框",
+        "第二張工作樹原圖": "assets/game_data_reference/pet_talent/visible_range_50_80_energy_24.png",
+        "第二張來源": "C:\\Users\\USER\\AppData\\Local\\Temp\\codex-clipboard-4aaf1c6f-8a2c-406b-af3b-462463782e22.png",
+        "第二張SHA256": "7338759005de0efe3edf0c655e73fcb8bd1fd580a5d32f5cdf330a293201af38",
+        "第二張可確認": "標題寵物天賦、同一可見區段 50–80、天賦能量 24／850、英靈點 1873；不推定內部頁碼",
+        "限制": "完整文字規則已找回；目前可復原的兩張清楚原圖都屬同一可見區段，尚不能自行映射成四頁中的內部頁碼；其餘三頁原圖未復原前不得猜測頁面映射或具體辨識規則"
+      },
+      "頁碼映射": "十張原圖依使用者已確認順序為第 1 至第 10 頁；執行期僅比較中央陣列形狀，不讀候選檔名、底部按鈕順序或單獨外框。",
+      "禁止範圍": [
+        "寵物天賦施工或猜測",
+        "第007號與第20260803-002號施工",
+        "main.py 與背景排程接線",
+        "右側格位屬性名稱或資源數字讀取",
+        "依整張色調、底部選取框或外框單獨推斷頁碼",
+        "提醒、自動點亮、鍵盤、滑鼠、切頁、切前景或任何遊戲輸入",
+        "雲端讀寫、推送、合併、封裝、桌面更新與正式發布"
+      ],
+      "最小測試": [
+        "tests/test_obsidian_page_recognizer.py",
+        "tests/test_character_game_data.py",
+        "tests/test_character_game_data_capture_service.py",
+        "tests/test_character_game_data_update_service.py",
+        "tests/test_app_icon.py"
+      ],
+      "驗收": [
+        "十張原圖逐一以中央形狀及選取階段／狀態共同確認為第 1 至第 10 頁，且打亂參考定義順序結果不變；第 1 至第 9 頁的「階段一」與「完成」必須各自通過獨立證據門檻後才保存同一原文「階段一／完成」，第 10 頁只保存「激活」",
+        "所有預期格位均可靠分類亮或灰，且每格須有校準的最低亮度與局部結構證據；模糊、缺格、純黑或單色遮蓋、同分、低可信度、空白圖、缺參考圖與階段／形狀矛盾一律未辨識",
+        "保存單頁的可見階段／狀態原文、已亮格、未亮格、具時區最後讀取時間與穩定中央形狀簽章；時間、星空動畫與右側數字不影響簽章",
+        "黑曜石以第 1 至第 10 頁最新快照集合保存；不同頁保留、同頁取代、舊單頁格式可讀、新格式往返且重複頁拒絕",
+        "唯讀摘要只統計已讀頁，不將未讀頁當成未亮零；封裝規格明列新參考目錄",
+        "全程不呼叫啟用、點擊、鍵盤、切頁、切前景或任何遊戲輸入"
+      ],
+      "本機驗證": "2026-08-03：限定五個測試檔共 44 項通過；語法檢查、範圍、批次單與十張原圖雜湊核對通過。",
+      "剩餘阻礙": ["寵物天賦完整文字定案已找回並保存；目前已保存兩張同一可見區段 50–80 清楚原圖，尚缺其餘三頁原圖與可靠頁面映射，保持待前置關卡。"]
+    },
+    {
+      "編號": "FU-REQ-20260802-007",
+      "項目": "命魂部分更新與魂器最新頁面",
+      "狀態": "待前置關卡；命魂背包與命魂總覽原圖已從舊任務復原，魂器複合原圖已保存，仍待其餘完整清楚頁面供可靠辨識",
+      "檔案所有權": [],
+      "解鎖條件": "先完成索爾架構審查前置，再以可靠頁面辨識證據核對後填入。",
+      "既有照片證據": {
+        "命魂": "舊任務 019f9e59-4caf-7c20-a627-e854a3b0998f 的命魂背包與命魂總覽原圖已從保存的影像資料復原至 assets/game_data_reference/life_soul/backpack_and_overview.png；SHA256 347f5ece79c9a41c880a5c3f9e85953f1e1f57ff24b12637ed31448e8ebff574",
+        "魂器": "含王族魂器介面的桌面複合原圖保存於 assets/game_data_reference/artifact/raw_desktop_composite.png；受其他視窗遮擋，只作來源證據"
+      },
+      "禁止範圍": ["跨角色歷史", "符文圖示辨識"],
+      "最小測試": [],
+      "驗收": ["命魂不清除另一頁", "魂器只保存實際開啟頁面最新資料"]
+    },
+    {
+      "編號": "FU-REQ-20260803-002",
+      "項目": "黑曜石與命魂背景低負擔讀取與提醒",
+      "狀態": "待前置關卡",
+      "檔案所有權": [],
+      "解鎖條件": "先完成索爾架構審查前置、共用唯讀辨識與兩項資料頁可靠讀取。",
+      "禁止範圍": ["自動切換", "自動點亮", "黑曜石提醒"],
+      "最小測試": [],
+      "驗收": ["只有內容變化才更新", "命魂可靠變更才提醒"]
+    },
+    {
+      "編號": "FU-REQ-20260802-008",
+      "項目": "已定案活動接入",
+      "狀態": "索爾程式審查通過",
+      "固定基準": "bd7f9df7623fc2bc6b547d8c15572892200d5de1",
+      "索爾程式審查證據": [
+        "十六個程式與測試檔語法檢查通過",
+        "九份指定直接測試 43 項通過，耗時 0.97 秒",
+        "差異檢查、批次檔解析、固定基準、實際範圍與批次所有權比對均通過",
+        "八項規則、跨午夜與重啟、目前組別範圍、原子保存與卡片、拒絕型別、路由隔離均有直接證據"
+      ],
+      "已定案活動": ["魔兵", "次元空間", "農場", "幻魔修練", "莊園第一輪", "魂器每日處理", "神修", "金票兌換"],
+    "檔案所有權": [
+        ".codex/batches/FU-20260803-001.json",
+        "domain/activity_schedule.py",
+        "services/activity_schedule_view_service.py",
+        "domain/confirmed_activity_rules.py",
+        "services/confirmed_activity_rule_service.py",
+        "services/confirmed_activity_rule_monitor.py",
+        "services/farm_timer_service.py",
+        "main.py",
+        "tests/test_activity_schedule_catalog.py",
+        "tests/test_activity_schedule_view_service.py",
+        "tests/test_activity_reminder_service.py",
+        "tests/test_farm_timer_service.py",
+        "tests/test_confirmed_activity_rules.py",
+        "tests/test_confirmed_activity_rule_service.py",
+        "tests/test_confirmed_activity_rule_monitor.py",
+        "tests/test_main_confirmed_activity_rules.py",
+        "tests/test_main_activity_progress.py"
+      ],
+      "解鎖條件": "固定基準與乾淨工作目錄已核對；第003、004、005號既有決策卡片入口與共用中斷狀態保持不繞過。",
+      "禁止範圍": [
+        "世界首領",
+        "守紀防重複",
+        "農場只關閉輔規則",
+        "莊園第二輪循環",
+        "除魔",
+        "探險",
+        "手動120副本",
+        "第006號寵物天賦",
+        "第007號",
+        "FU-REQ-20260803-001",
+        "FU-REQ-20260803-002",
+        "FU-REQ-20260803-003",
+        "角色名稱審查阻擋項",
+        "畫面辨識、座標、鍵盤、滑鼠、切頁、切前景與自動操作",
+        "雲端讀寫、推送、合併、封裝、桌面更新與正式發布"
+      ],
+      "最小測試": [
+        "tests/test_activity_schedule_catalog.py",
+        "tests/test_activity_schedule_view_service.py",
+        "tests/test_activity_reminder_service.py",
+        "tests/test_farm_timer_service.py",
+        "tests/test_confirmed_activity_rules.py",
+        "tests/test_confirmed_activity_rule_service.py",
+        "tests/test_confirmed_activity_rule_monitor.py",
+        "tests/test_main_confirmed_activity_rules.py",
+        "tests/test_main_activity_progress.py"
+      ],
+      "驗收": [
+        "八項規則與角色等級限制完整接入",
+        "每日歸屬、跨午夜與重啟往返",
+        "農場台北午夜：23:xx 種植，隔日達四十分鐘成熟且同一計時識別不重置",
+        "農場與幻魔分別符合斷線繼續、遊戲關閉暫停",
+        "禁止提醒活動不建立卡片，重複輪詢不重複卡片",
+        "幻魔五分鐘節流與金票十分鐘卡片",
+        "保存失敗時記憶體、事件與卡片都不變，包含本會出卡的魂器登入提示",
+        "次元樓層只接受非布林的整數一或二",
+        "活動路由失敗隔離且既有角色狀態卡不受阻"
+      ]
+    },
+    {
+      "編號": "FU-REQ-20260803-001",
+      "項目": "稱號與結拜唯讀資料及提醒",
+      "狀態": "待前置關卡",
+      "前置證據合併請求": 17,
+      "檔案所有權": [],
+      "解鎖條件": "先完成索爾程式審查阻擋項，再只讀核對匿名啟動指紋與可靠遊戲畫面資料接點後填入。",
+      "禁止範圍": ["捷徑名稱判斷", "檔名判斷"],
+      "最小測試": [],
+      "驗收": ["身分只依匿名啟動指紋與可靠遊戲畫面"]
+    },
+    {
+      "編號": "FU-REQ-20260803-003",
+      "項目": "自動戰鬥監測、提醒與偏好",
+      "狀態": "待前置關卡",
+      "檔案所有權": [],
+      "解鎖條件": "只讀核對可靠畫面辨識、玩家確認與既有控制接點後填入。",
+      "禁止範圍": ["未知畫面點擊", "未確認偏好保存"],
+      "最小測試": [],
+      "驗收": ["只有可靠辨識控制未啟動才可按下"]
+    },
+    {
+      "編號": "FU-REQ-20260802-010",
+      "項目": "同一提交的一次受影響範圍完整驗證與後置交接",
+      "狀態": "待全部前置完成",
+      "檔案所有權": [],
+      "禁止範圍": ["泰拉封裝", "泰拉桌面更新", "泰拉雲端驗證", "主分支合併", "正式發布", "正式頻道更新"],
+      "最小測試": ["一次執行本批已登記直接測試的聯集"],
+      "驗收": [
+        "同一固定提交完成一次受影響範圍測試",
+        "索爾完成程式碼審查後可推送隔離施工分支並觸發既有 Windows 雲端驗證",
+        "雲端通過後以同一成品備份並更新桌面",
+        "完成雜湊、捷徑、產品身分與十四項自我檢查",
+        "不合併主分支、不正式發布、不更新正式頻道"
+      ]
+    }
+  ]
+}

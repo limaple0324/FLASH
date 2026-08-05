@@ -5,10 +5,13 @@ import pytest
 
 from cards.models import GroupCard
 from cards.priority import CardPriorityReason
+from cards.lifecycle import CardPresentationOrder
 from cards.service import CardService
 from cards.view_state import CardViewState
+from decision.models import DecisionCategory
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.character import Character
+from domain.character import CharacterImportance
 from domain.group import CharacterGroup
 from main import build_services
 from services.app_context import AppContext
@@ -50,7 +53,16 @@ def test_empty_card_service_produces_empty_read_only_state():
 def test_snapshot_flattens_confirmed_card_information_for_ui():
     shown_at = datetime(2026, 7, 14, 1, 0, tzinfo=timezone.utc)
     cards = CardService()
-    cards.upsert(_card("guard-disconnected"), shown_at=shown_at)
+    cards.upsert(
+        _card("guard-disconnected"),
+        shown_at=shown_at,
+        presentation_order=CardPresentationOrder(
+            category=DecisionCategory.GENERAL_INFORMATION,
+            remaining_time=None,
+            character_importance=CharacterImportance.SECONDARY,
+            event_id="guard-disconnected",
+        ),
+    )
 
     state = CardViewStateService(cards).snapshot()
     item = state.cards[0]
@@ -61,6 +73,7 @@ def test_snapshot_flattens_confirmed_card_information_for_ui():
     assert item.affected_character_ids == ("120-old",)
     assert item.next_step == "返回競技場繼續守紀"
     assert item.priority_reason == "斷線"
+    assert item.priority_level == int(DecisionCategory.GENERAL_INFORMATION)
     assert item.shown_at == shown_at
     assert item.expires_at == shown_at + timedelta(seconds=30)
     assert state.to_dict()["cards"][0]["shown_at"] == shown_at.isoformat()

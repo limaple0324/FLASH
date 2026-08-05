@@ -86,6 +86,8 @@ class ActivityScheduleViewService:
         rule: ScheduledActivityRule,
         current: datetime,
     ) -> tuple[str, str]:
+        if rule.local_start is None:
+            return "尚無固定時間", "等待可信遊戲進度"
         occurrence = rule.occurrence_on(current.date())
         if occurrence is None:
             return "時間未確認", "尚未設定"
@@ -112,8 +114,7 @@ class ActivityScheduleViewService:
         ordered = sorted(
             rules,
             key=lambda rule: (
-                rule.local_start is None,
-                rule.local_start or datetime.max.time(),
+                rule.local_start or datetime.min.time(),
                 rule.activity_id,
             ),
         )

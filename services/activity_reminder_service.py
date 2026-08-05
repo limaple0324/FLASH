@@ -151,19 +151,24 @@ class ActivityReminderService:
                 activity=rule.definition,
                 current_progress=rule.definition.name,
                 requires_player_action=False,
-                priority_reason=CardPriorityReason.ACTIVITY,
+                priority_reason=CardPriorityReason.TIME_LIMIT,
                 name_only=True,
             )
             shown_at = local_now.astimezone(timezone.utc)
             lifetime = occurrence.astimezone(timezone.utc) - shown_at
             if lifetime <= timedelta(0):
                 continue
-            self._coordinator.show(
+            presented = self._coordinator.submit(
+                self._coordinator.candidate_for_card(
+                    card,
+                    remaining_time=lifetime,
+                ),
                 card,
                 shown_at=shown_at,
                 lifetime=lifetime,
             )
             self._emitted[card_id] = occurrence
             self._save_emitted()
-            shown.append(card)
+            if presented is not None:
+                shown.append(presented)
         return tuple(shown)

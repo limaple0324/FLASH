@@ -105,8 +105,16 @@ class PlayerHabitReminderService:
                 priority_reason=CardPriorityReason.PREFERENCE,
                 actions=HABIT_ACTIONS,
             )
-            self._coordinator.show(card, shown_at=now)
-            shown.append(card)
+            presented = self._coordinator.submit(
+                self._coordinator.candidate_for_card(
+                    card,
+                    suggestion_only=True,
+                ),
+                card,
+                shown_at=now,
+            )
+            if presented is not None:
+                shown.append(presented)
         return tuple(shown)
 
     def handle_action(

@@ -244,12 +244,13 @@ class TrueEventCardService:
             next_step=next_step,
             priority_reason=reason,
         )
-        self._coordinator.show(
+        presented = self._coordinator.submit(
+            self._coordinator.candidate_for_card(card),
             card,
             shown_at=occurred_at.astimezone(timezone.utc),
         )
         self._record(change.current.display_name, suffix)
-        return card
+        return presented
 
     def handle_activity_progress(
         self,
@@ -306,7 +307,17 @@ class TrueEventCardService:
             requires_player_action=False,
             priority_reason=CardPriorityReason.ACTIVITY,
         )
-        self._coordinator.show(card, shown_at=occurred_at)
+        presented = self._coordinator.submit(
+            self._coordinator.candidate_for_card(
+                card,
+                is_current_group_progress=(
+                    workspace.current_group is not None
+                    and group == workspace.current_group
+                ),
+            ),
+            card,
+            shown_at=occurred_at,
+        )
         role_name = next(
             (
                 character.display_name
@@ -316,4 +327,4 @@ class TrueEventCardService:
             change.current.subject_id,
         )
         self._record(role_name, current_progress)
-        return card
+        return presented

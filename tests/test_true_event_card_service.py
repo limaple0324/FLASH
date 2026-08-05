@@ -77,7 +77,7 @@ def _role_change(status, previous):
     )
 
 
-def test_disconnect_reconnect_and_interruption_use_one_card_and_one_history(tmp_path):
+def test_disconnect_reconnect_and_recovery_clears_one_card_but_keeps_history(tmp_path):
     service, cards, history, _group, _activity, records = _context(tmp_path)
     disconnected_at = datetime(2026, 7, 29, 1, 0, tzinfo=timezone.utc)
 
@@ -102,10 +102,8 @@ def test_disconnect_reconnect_and_interruption_use_one_card_and_one_history(tmp_
     assert disconnected.current_progress == "守紀－已中斷"
     assert duplicate is None
     assert reconnecting.card_id == disconnected.card_id
-    assert recovered.card_id == disconnected.card_id
-    assert recovered.priority_reason is CardPriorityReason.RECOVERY
-    assert recovered.current_progress == "守紀－可繼續"
-    assert cards.cards == (recovered,)
+    assert recovered is None
+    assert cards.cards == ()
     assert len(history.all()) == 1
     assert history.all()[0].priority_reason is CardPriorityReason.DISCONNECTION
     assert [item[2] for item in records] == ["斷線", "斷線", "已恢復"]
@@ -136,7 +134,7 @@ def test_disconnect_state_survives_restart_and_prevents_duplicate_card(tmp_path)
     assert cards.cards == ()
 
 
-def test_completion_event_is_deduplicated_across_restart(tmp_path):
+def test_completion_event_is_deduplicated_across_restart_when_kept_quiet(tmp_path):
     service, cards, _history, _group, activity, _records = _context(tmp_path)
     now = datetime(2026, 7, 29, 1, 0, tzinfo=timezone.utc)
     previous = ActivityProgress("guard", "role-a")
@@ -158,9 +156,9 @@ def test_completion_event_is_deduplicated_across_restart(tmp_path):
     first = service.handle_activity_progress(change)
     duplicate = service.handle_activity_progress(change)
 
-    assert first.current_progress == "守紀－完成第 1 次"
+    assert first is None
     assert duplicate is None
-    assert cards.cards == (first,)
+    assert cards.cards == ()
 
     reloaded_cards = CardService()
     reloaded = TrueEventCardService(
