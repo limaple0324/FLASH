@@ -1310,6 +1310,9 @@ class HomeView:
             if smart_reconnect_runtime_status in {"已開啟", "重連中", "重連失敗"}
             else None
         )
+        self._smart_reconnect_runtime_presentation: (
+            tuple[str | None, str, str, str] | None
+        ) = None
         default_status_colors = {"已開啟": SUCCESS, "重連中": WARNING, "重連失敗": "#D64545"}
         supplied_colors = smart_reconnect_status_colors or {}
         self.smart_reconnect_status_colors = {
@@ -2626,6 +2629,7 @@ class HomeView:
         root = Frame(self.parent, bg=BACKGROUND)
         root.pack(fill=BOTH, expand=True)
         self._root = root
+        self._smart_reconnect_runtime_presentation = None
         self._smart_reconnect_runtime_label = Label(
             root,
             text="",
@@ -5936,6 +5940,7 @@ class HomeView:
         self._refresh_smart_reconnect_controls()
 
     def set_smart_reconnect_runtime_status(self, value: object) -> None:
+        previous_status = self.smart_reconnect_runtime_status
         if value in {"已開啟", "重連中", "重連失敗"}:
             self.smart_reconnect_runtime_status = value
             self._last_smart_reconnect_runtime_status = value
@@ -5948,6 +5953,8 @@ class HomeView:
             )
         else:
             self.smart_reconnect_runtime_status = None
+        if self.smart_reconnect_runtime_status == previous_status:
+            return
         self._refresh_smart_reconnect_controls()
 
     def _save_smart_reconnect_status_colors(self) -> None:
@@ -6142,27 +6149,44 @@ class HomeView:
                     or getattr(self, "_smart_reconnect_failure_message", "")
                 ) else None
             )
-            runtime_label.configure(
-                text=(
-                    f"● 智慧重連：{status}｜{failure_message}"
-                    if status and failure_message
-                    else f"● 智慧重連：{status}"
-                    if status
-                    else ""
-                ),
-                bg=self.smart_reconnect_status_colors.get(status, SURFACE),
-                fg=(
-                    _status_text_color(
-                        self.smart_reconnect_status_colors.get(status, SURFACE)
-                    )
-                    if status else MUTED
-                ),
+            text = (
+                f"● 智慧重連：{status}｜{failure_message}"
+                if status and failure_message
+                else f"● 智慧重連：{status}"
+                if status
+                else ""
             )
-            if status:
-                runtime_label.pack_forget()
-                runtime_label.pack(before=self._body, fill=X)
-            else:
-                runtime_label.pack_forget()
+            background = self.smart_reconnect_status_colors.get(
+                status,
+                SURFACE,
+            )
+            foreground = (
+                _status_text_color(background) if status else MUTED
+            )
+            presentation = (status, text, background, foreground)
+            previous_presentation = getattr(
+                self,
+                "_smart_reconnect_runtime_presentation",
+                None,
+            )
+            if presentation != previous_presentation:
+                runtime_label.configure(
+                    text=text,
+                    bg=background,
+                    fg=foreground,
+                )
+                try:
+                    is_managed = bool(runtime_label.winfo_manager())
+                except Exception:
+                    is_managed = bool(
+                        previous_presentation
+                        and previous_presentation[0] is not None
+                    )
+                if status and not is_managed:
+                    runtime_label.pack(before=self._body, fill=X)
+                elif not status and is_managed:
+                    runtime_label.pack_forget()
+                self._smart_reconnect_runtime_presentation = presentation
 
     def _auto_click_settings(self) -> tuple[int, str, bool, int]:
         if (

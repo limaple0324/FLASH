@@ -124,11 +124,27 @@ class _ConfigureStub:
 
 
 class _RuntimeLabelStub(_ConfigureStub):
-    def pack_forget(self) -> None:
-        return None
+    def __init__(self):
+        super().__init__()
+        self.configure_calls: list[dict[str, object]] = []
+        self.pack_calls: list[dict[str, object]] = []
+        self.pack_forget_calls = 0
+        self.manager = "pack"
 
-    def pack(self, **_values) -> None:
-        return None
+    def configure(self, **values) -> None:
+        self.configure_calls.append(dict(values))
+        super().configure(**values)
+
+    def pack_forget(self) -> None:
+        self.pack_forget_calls += 1
+        self.manager = ""
+
+    def pack(self, **values) -> None:
+        self.pack_calls.append(dict(values))
+        self.manager = "pack"
+
+    def winfo_manager(self) -> str:
+        return self.manager
 
 
 def test_home_uses_the_same_smart_reconnect_interval_default() -> None:
@@ -599,6 +615,88 @@ def test_smart_reconnect_enable_and_disable_update_the_header_immediately() -> N
 
     view._toggle_smart_reconnect()
     assert refreshed[-1] == (False, None)
+
+
+def test_smart_reconnect_same_runtime_poll_does_not_refresh_controls() -> None:
+    view = object.__new__(HomeView)
+    view.smart_reconnect_enabled = True
+    view.smart_reconnect_runtime_status = "已開啟"
+    view._last_smart_reconnect_runtime_status = "已開啟"
+    view._smart_reconnect_failure_message = ""
+    refreshed: list[object] = []
+    view._refresh_smart_reconnect_controls = lambda: refreshed.append(
+        view.smart_reconnect_runtime_status
+    )
+
+    view.set_smart_reconnect_runtime_status("已開啟")
+    view.set_smart_reconnect_runtime_status(None)
+    view.set_smart_reconnect_runtime_status("已開啟")
+
+    assert refreshed == []
+
+    view.set_smart_reconnect_runtime_status("重連中")
+    view.set_smart_reconnect_runtime_status("重連中")
+
+    assert refreshed == ["重連中"]
+
+
+def test_smart_reconnect_header_only_updates_changed_presentation() -> None:
+    view = object.__new__(HomeView)
+    view.smart_reconnect_enabled = True
+    view.smart_reconnect_runtime_status = "已開啟"
+    view._last_smart_reconnect_runtime_status = "已開啟"
+    view._smart_reconnect_failure_message = ""
+    view.smart_reconnect_status_colors = {
+        "已開啟": "#26845B",
+        "重連中": "#B36A18",
+        "重連失敗": "#D64545",
+    }
+    view._smart_reconnect_runtime_presentation = None
+    view._refresh_smart_reconnect_capture_mode_status = lambda: None
+    view._smart_reconnect_button = None
+    view._smart_reconnect_label = None
+    runtime_label = _RuntimeLabelStub()
+    view._smart_reconnect_runtime_label = runtime_label
+    view._body = object()
+
+    view._refresh_smart_reconnect_controls()
+    view._refresh_smart_reconnect_controls()
+
+    assert len(runtime_label.configure_calls) == 1
+    assert runtime_label.pack_calls == []
+    assert runtime_label.pack_forget_calls == 0
+
+    view.smart_reconnect_runtime_status = "重連中"
+    view._last_smart_reconnect_runtime_status = "重連中"
+    view._refresh_smart_reconnect_controls()
+    view._refresh_smart_reconnect_controls()
+
+    assert len(runtime_label.configure_calls) == 2
+    assert runtime_label.pack_calls == []
+    assert runtime_label.pack_forget_calls == 0
+
+    view.smart_reconnect_status_colors["重連中"] = "#FFFFFF"
+    view._refresh_smart_reconnect_controls()
+
+    assert len(runtime_label.configure_calls) == 3
+    assert runtime_label.values["bg"] == "#FFFFFF"
+    assert runtime_label.pack_calls == []
+    assert runtime_label.pack_forget_calls == 0
+
+    view.smart_reconnect_enabled = False
+    view.smart_reconnect_runtime_status = None
+    view._refresh_smart_reconnect_controls()
+    view._refresh_smart_reconnect_controls()
+
+    assert len(runtime_label.configure_calls) == 4
+    assert runtime_label.pack_forget_calls == 1
+
+    view.smart_reconnect_enabled = True
+    view.smart_reconnect_runtime_status = "已開啟"
+    view._refresh_smart_reconnect_controls()
+
+    assert len(runtime_label.configure_calls) == 5
+    assert len(runtime_label.pack_calls) == 1
 
 
 def test_smart_reconnect_enable_failure_is_shown_in_card_and_header() -> None:
