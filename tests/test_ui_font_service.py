@@ -468,6 +468,11 @@ def test_main_lifecycle_settings_and_package_manifest_are_wired() -> None:
     assert "('assets/ui_fonts', 'assets/ui_fonts')" in spec_source
 
 
+def test_font_assets_are_marked_binary_to_preserve_license_hashes() -> None:
+    attributes = Path(".gitattributes").read_text(encoding="utf-8")
+    assert "assets/ui_fonts/** -text" in attributes
+
+
 @pytest.mark.skipif(
     sys.platform != "win32",
     reason="需要 Windows 程序私有字體介面",
