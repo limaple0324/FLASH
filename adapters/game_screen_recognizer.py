@@ -8,7 +8,7 @@ game pixels.
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import sys
 from typing import Any, Iterable
@@ -111,13 +111,158 @@ CHARACTER_SLOT_CLICK_POINTS: tuple[NormalizedPoint, ...] = (
 )
 CHARACTER_LEVEL_MAXIMUM_SCORE = 48.0
 CHARACTER_LEVEL_MINIMUM_MARGIN = 0.75
-CHARACTER_SELECTED_MINIMUM_SCORE = 100.0
-CHARACTER_SELECTED_MINIMUM_MARGIN = 60.0
+# The top edge remains a structural gate, but it is not used as the winner:
+# live Flash frames can brighten all three top strips at once.  Selection is
+# decided only from the bottom/left/right outer frame, outside role artwork and
+# text.  Every side must be present, the frame must be continuous at separated
+# anchors, and the combined winner must remain unique.
+CHARACTER_SELECTED_TOP_MINIMUM_SCORE = 100.0
+CHARACTER_SELECTED_SIDE_MINIMUM_SCORE = 75.0
+CHARACTER_SELECTED_SIDE_ANCHOR_MINIMUM_SCORE = 70.0
+CHARACTER_SELECTED_VERTICAL_ANCHOR_MINIMUM_SCORE = 75.0
+CHARACTER_SELECTED_COMBINED_MINIMUM_SCORE = 100.0
+CHARACTER_SELECTED_MINIMUM_MARGIN = 12.0
 CHARACTER_SELECTED_BORDER_REGIONS: tuple[NormalizedRect, ...] = (
     (0.285789474, 0.665, 0.422210526, 0.677872727),
     (0.433631579, 0.665, 0.564368421, 0.677872727),
     (0.585631579, 0.665, 0.716368421, 0.677872727),
 )
+_CHARACTER_SELECTED_HORIZONTAL_INSET = 0.003789474
+_CHARACTER_SELECTED_VERTICAL_INSET = 0.012872727
+_CHARACTER_SELECTED_SIDE_WIDTH = 0.008
+CHARACTER_SELECTED_SIDE_REGIONS: tuple[
+    tuple[NormalizedRect, NormalizedRect, NormalizedRect], ...
+] = tuple(
+    (
+        (
+            left + _CHARACTER_SELECTED_HORIZONTAL_INSET,
+            bottom - _CHARACTER_SELECTED_VERTICAL_INSET,
+            right - _CHARACTER_SELECTED_HORIZONTAL_INSET,
+            bottom,
+        ),
+        (
+            left,
+            top + _CHARACTER_SELECTED_VERTICAL_INSET,
+            left + _CHARACTER_SELECTED_SIDE_WIDTH,
+            bottom - _CHARACTER_SELECTED_VERTICAL_INSET,
+        ),
+        (
+            right - _CHARACTER_SELECTED_SIDE_WIDTH,
+            top + _CHARACTER_SELECTED_VERTICAL_INSET,
+            right,
+            bottom - _CHARACTER_SELECTED_VERTICAL_INSET,
+        ),
+    )
+    for left, top, right, bottom in CHARACTER_SLOT_REGIONS
+)
+CHARACTER_EMPTY_REFERENCE_SLOT_INDICES = (1, 2)
+CHARACTER_EMPTY_SLOT_MAXIMUM_SCORE = 30.0
+CHARACTER_EMPTY_SLOT_MAXIMUM_EDGE_SCORE = 20.0
+CHARACTER_SELECTION_FRAME_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.265, 0.615, 0.740, 0.665),
+    (0.265, 0.785, 0.740, 0.905),
+    (0.265, 0.615, 0.285, 0.905),
+    (0.720, 0.615, 0.740, 0.905),
+)
+CHARACTER_SELECTION_FRAME_MAXIMUM_SCORE = 38.0
+CHARACTER_SELECTION_FRAME_MAXIMUM_EDGE_SCORE = 65.0
+LINE_SELECTION_FRAME_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.378, 0.272, 0.625, 0.335),
+    (0.398, 0.335, 0.605, 0.740),
+    (0.445, 0.745, 0.555, 0.795),
+)
+LINE_SELECTION_FRAME_MAXIMUM_SCORE = 28.0
+LINE_SELECTION_FRAME_MAXIMUM_EDGE_SCORE = 50.0
+LOGIN_START_LIVE_REFERENCE_FILE = "17_login_start_live_capture.png"
+LOGIN_START_LIVE_MAXIMUM_WIDTH_DELTA = 0
+LOGIN_START_LIVE_MAXIMUM_HEIGHT_DELTA = 2
+CONNECTED_LIVE_REFERENCE_FILE = (
+    "auto_battle/normal_game_with_entry.png"
+)
+CONNECTED_LIVE_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.000, 0.000, 0.220, 0.180),
+    (0.760, 0.000, 1.000, 0.180),
+    (0.910, 0.170, 1.000, 0.750),
+)
+CONNECTED_LIVE_MAXIMUM_SCORE = 32.0
+CONNECTED_LIVE_MAXIMUM_EDGE_SCORE = 31.0
+CONNECTED_LIVE_CLIENT_TOP_RATIO = 38 / 629
+BATTLE_WAITING_REFERENCE_FILE = (
+    "auto_battle/enabled_battle_full_panel.png"
+)
+BATTLE_WAITING_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.000, 0.000, 0.250, 0.160),
+    (0.420, 0.000, 0.700, 0.160),
+    (0.880, 0.250, 1.000, 0.650),
+    (0.460, 0.780, 0.720, 1.000),
+)
+BATTLE_WAITING_MAXIMUM_SCORE = 15.0
+BATTLE_WAITING_MAXIMUM_EDGE_SCORE = 12.0
+BATTLE_WAITING_CLIENT_TOP_RATIO = 28 / 629
+CLIENT_REFERENCE_TOP_RADIUS_PIXELS = 2
+ACTIVITY_PANEL_LIVE_REFERENCE_FILE = "07_post_login_activity_popup.png"
+ACTIVITY_PANEL_LIVE_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.110, 0.130, 0.320, 0.242),
+    (0.340, 0.130, 0.660, 0.242),
+    (0.680, 0.130, 0.890, 0.242),
+    (0.108, 0.835, 0.895, 0.968),
+    (0.180, 0.280, 0.480, 0.780),
+    (0.520, 0.280, 0.820, 0.780),
+)
+ACTIVITY_PANEL_LIVE_MAXIMUM_SCORE = 18.0
+ACTIVITY_PANEL_LIVE_MAXIMUM_EDGE_SCORE = 24.0
+AUTO_DUNGEON_PANEL_LIVE_REFERENCE_FILE = (
+    "12_post_login_auto_dungeon_popup.png"
+)
+AUTO_DUNGEON_PANEL_LIVE_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.118, 0.135, 0.320, 0.235),
+    (0.340, 0.135, 0.660, 0.235),
+    (0.680, 0.135, 0.905, 0.235),
+    (0.118, 0.235, 0.145, 0.842),
+    (0.878, 0.235, 0.905, 0.842),
+    (0.180, 0.280, 0.480, 0.780),
+    (0.520, 0.280, 0.820, 0.780),
+)
+AUTO_DUNGEON_PANEL_LIVE_MAXIMUM_SCORE = 10.0
+AUTO_DUNGEON_PANEL_LIVE_MAXIMUM_EDGE_SCORE = 18.0
+CONNECTED_UNKNOWN_OVERLAY_REGION: NormalizedRect = (
+    0.250,
+    0.250,
+    0.750,
+    0.750,
+)
+CONNECTED_UNKNOWN_OVERLAY_MINIMUM_STDDEV = 8.0
+CONNECTED_UNKNOWN_OVERLAY_MINIMUM_EDGE_MEAN = 5.0
+ANONYMOUS_STRUCTURE_TILE_SIZE = (48, 24)
+ANONYMOUS_GENERAL_STRUCTURE_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.760, 0.000, 1.000, 0.180),
+    (0.910, 0.170, 1.000, 0.750),
+    (0.350, 0.780, 0.650, 1.000),
+    (0.650, 0.780, 1.000, 1.000),
+    (0.250, 0.250, 0.500, 0.750),
+    (0.500, 0.250, 0.750, 0.750),
+)
+ANONYMOUS_GENERAL_STRUCTURE_FILES = (
+    "anonymous_live_structure/general_scene_a.png",
+    "anonymous_live_structure/general_scene_b.png",
+    "anonymous_live_structure/general_scene_c.png",
+    "anonymous_live_structure/general_scene_d.png",
+    "anonymous_live_structure/legacy_normal.png",
+)
+ANONYMOUS_GENERAL_STRUCTURE_MAXIMUM_SCORE = 8.0
+ANONYMOUS_ACTIVITY_STRUCTURE_FILE = (
+    "anonymous_live_structure/activity_panel.png"
+)
+ANONYMOUS_ACTIVITY_STRUCTURE_MAXIMUM_SCORE = 3.0
+ANONYMOUS_DUNGEON_STRUCTURE_FILE = (
+    "anonymous_live_structure/auto_dungeon_panel.png"
+)
+ANONYMOUS_DUNGEON_STRUCTURE_MAXIMUM_SCORE = 1.5
+ANONYMOUS_BATTLE_STRUCTURE_FILES = (
+    "anonymous_live_structure/battle_waiting.png",
+    "anonymous_live_structure/legacy_battle.png",
+)
+ANONYMOUS_BATTLE_STRUCTURE_MAXIMUM_SCORE = 8.0
 BATTLE_REFERENCE_FILE = "13_battle_gameplay.png"
 BATTLE_CONTEXT_REGION: NormalizedRect = (0.73, 0.0, 1.0, 0.22)
 BATTLE_CONTEXT_MAXIMUM_SCORE = 28.0
@@ -161,6 +306,10 @@ DISCONNECT_REFERENCE_FILES: tuple[str, ...] = (
 GAMEPLAY_EVIDENCE_REFERENCE_FILES: tuple[str, ...] = (
     "06_connected_gameplay.png",
     BATTLE_REFERENCE_FILE,
+)
+LOGIN_START_REFERENCE_FILES: tuple[str, ...] = (
+    "02_login_start_screen.png",
+    LOGIN_START_LIVE_REFERENCE_FILE,
 )
 CONNECTED_CENTRAL_EVIDENCE_REGION: NormalizedRect = (
     0.400,
@@ -347,6 +496,7 @@ class ScreenRecognition:
     character_slot_index: int | None = None
     character_slot_selected: bool | None = None
     character_identity: str | None = None
+    character_target_key: str | None = None
     character_candidates: tuple[CharacterSelectionCandidate, ...] = ()
     battle_context: bool = False
 
@@ -408,9 +558,16 @@ class ReferenceScreenRecognizer:
                         for definition in self.definitions
                     ),
                     *DISCONNECT_REFERENCE_FILES,
+                    *LOGIN_START_REFERENCE_FILES,
                     *ROUTE_DIGIT_TEMPLATES.values(),
                     *CHARACTER_LEVEL_TEMPLATE_FILES.values(),
                     BATTLE_REFERENCE_FILE,
+                    CONNECTED_LIVE_REFERENCE_FILE,
+                    BATTLE_WAITING_REFERENCE_FILE,
+                    *ANONYMOUS_GENERAL_STRUCTURE_FILES,
+                    ANONYMOUS_ACTIVITY_STRUCTURE_FILE,
+                    ANONYMOUS_DUNGEON_STRUCTURE_FILE,
+                    *ANONYMOUS_BATTLE_STRUCTURE_FILES,
                 )
             )
         )
@@ -887,28 +1044,136 @@ class ReferenceScreenRecognizer:
         image: Image.Image,
     ) -> int | None:
         scores: list[tuple[float, int]] = []
-        for index, region in enumerate(
+        eligible_indices: set[int] = set()
+        for index, top_region in enumerate(
             CHARACTER_SELECTED_BORDER_REGIONS
         ):
-            crop = cls._crop(image, region).convert("RGB")
-            pixels = tuple(crop.get_flattened_data())
-            if not pixels:
+            top_score = cls._minimum_channel_mean(
+                cls._crop(image, top_region)
+            )
+            if top_score is None:
                 return None
-            score = sum(
-                min(red, green, blue)
-                for red, green, blue in pixels
-            ) / len(pixels)
-            scores.append((score, index))
+            side_scores: list[float] = []
+            side_segments: list[tuple[float, ...]] = []
+            for side_index, region in enumerate(
+                CHARACTER_SELECTED_SIDE_REGIONS[index]
+            ):
+                side = cls._crop(image, region)
+                score = cls._minimum_channel_mean(side)
+                segments = cls._selected_border_segment_scores(
+                    side,
+                    horizontal=side_index == 0,
+                )
+                if score is None or segments is None:
+                    return None
+                side_scores.append(score)
+                side_segments.append(segments)
+            combined = sum(side_scores) / len(side_scores)
+            scores.append((combined, index))
+            # The bottom edge must span all three separated anchors.  The
+            # vertical edges use their upper and middle anchors because the
+            # game's lower corner ornament is intentionally darker.
+            if (
+                top_score >= CHARACTER_SELECTED_TOP_MINIMUM_SCORE
+                and all(
+                    score >= CHARACTER_SELECTED_SIDE_MINIMUM_SCORE
+                    for score in side_scores
+                )
+                and all(
+                    score >= CHARACTER_SELECTED_SIDE_ANCHOR_MINIMUM_SCORE
+                    for score in side_segments[0]
+                )
+                and all(
+                    score
+                    >= CHARACTER_SELECTED_VERTICAL_ANCHOR_MINIMUM_SCORE
+                    for segments in side_segments[1:]
+                    for score in segments[:2]
+                )
+                and combined
+                >= CHARACTER_SELECTED_COMBINED_MINIMUM_SCORE
+            ):
+                eligible_indices.add(index)
+        if not scores:
+            return None
         scores.sort(reverse=True)
         winner_score, winner_index = scores[0]
         runner_up_score = scores[1][0]
         if (
-            winner_score < CHARACTER_SELECTED_MINIMUM_SCORE
+            winner_index not in eligible_indices
             or winner_score - runner_up_score
             < CHARACTER_SELECTED_MINIMUM_MARGIN
         ):
             return None
         return winner_index
+
+    @staticmethod
+    def _minimum_channel_mean(image: Image.Image) -> float | None:
+        pixels = tuple(image.convert("RGB").get_flattened_data())
+        if not pixels:
+            return None
+        return sum(min(red, green, blue) for red, green, blue in pixels) / len(
+            pixels
+        )
+
+    @classmethod
+    def _selected_border_segment_scores(
+        cls,
+        image: Image.Image,
+        *,
+        horizontal: bool,
+    ) -> tuple[float, float, float] | None:
+        span = image.width if horizontal else image.height
+        if span < 3:
+            return None
+        scores: list[float] = []
+        for index in range(3):
+            start = round(span * index / 3)
+            end = round(span * (index + 1) / 3)
+            box = (
+                (start, 0, end, image.height)
+                if horizontal
+                else (0, start, image.width, end)
+            )
+            score = cls._minimum_channel_mean(image.crop(box))
+            if score is None:
+                return None
+            scores.append(score)
+        return tuple(scores)
+
+    def _character_slot_is_empty(
+        self,
+        image: Image.Image,
+        slot_index: int,
+    ) -> bool:
+        """Recognize only a confirmed empty card, never an unreadable role."""
+
+        candidate = self._crop(
+            image,
+            CHARACTER_SLOT_REGIONS[slot_index],
+        ).convert("RGB")
+        reference = self._reference("05_character_selection.png")
+        for empty_index in CHARACTER_EMPTY_REFERENCE_SLOT_INDICES:
+            empty = ImageOps.fit(
+                self._crop(
+                    reference,
+                    CHARACTER_SLOT_REGIONS[empty_index],
+                ).convert("RGB"),
+                candidate.size,
+                method=Image.Resampling.BILINEAR,
+            )
+            colour_score = sum(
+                ImageStat.Stat(
+                    ImageChops.difference(candidate, empty)
+                ).mean
+            ) / 3.0
+            edge_score = self._edge_difference(candidate, empty)
+            if (
+                colour_score <= CHARACTER_EMPTY_SLOT_MAXIMUM_SCORE
+                and edge_score
+                <= CHARACTER_EMPTY_SLOT_MAXIMUM_EDGE_SCORE
+            ):
+                return True
+        return False
 
     def _character_selection_candidates(
         self,
@@ -923,12 +1188,21 @@ class ReferenceScreenRecognizer:
                 self._crop(image, level_region)
             )
             if signature is None:
-                continue
-            digit_count = len(self._level_glyph_signatures(signature))
-            level, _score = self._recognize_character_level(
-                image,
-                level_region,
-            )
+                if self._character_slot_is_empty(image, index):
+                    continue
+                # A visible occupied card whose level cannot be read remains
+                # an explicit unknown candidate.  It must be able to block a
+                # false "unique highest" decision.
+                digit_count = None
+                level = None
+            else:
+                digit_count = len(
+                    self._level_glyph_signatures(signature)
+                )
+                level, _score = self._recognize_character_level(
+                    image,
+                    level_region,
+                )
             identity = (
                 self._character_selection_identity(
                     image,
@@ -1080,6 +1354,162 @@ class ReferenceScreenRecognizer:
             ).mean[0]
         )
 
+    def _fixed_full_window_structure_score(
+        self,
+        candidate: Image.Image,
+        *,
+        reference_filename: str,
+        regions: tuple[NormalizedRect, ...],
+        maximum_score: float,
+        maximum_edge_score: float,
+    ) -> tuple[bool, float]:
+        """Require every fixed frame region to match one confirmed page."""
+        reference = self._reference(reference_filename)
+        scores = tuple(
+            self._region_score(candidate, reference, region)
+            for region in regions
+        )
+        edge_scores = tuple(
+            self._edge_difference(
+                self._crop(candidate, region),
+                self._crop(reference, region),
+            )
+            for region in regions
+        )
+        matched = bool(
+            all(score <= maximum_score for score in scores)
+            and all(
+                score <= maximum_edge_score
+                for score in edge_scores
+            )
+            and all(
+                self._region_has_nonuniform_structure(
+                    candidate,
+                    reference,
+                    region,
+                )
+                for region in regions
+            )
+        )
+        return matched, max((*scores, *edge_scores))
+
+    @classmethod
+    def _anonymous_structure_atlas(
+        cls,
+        candidate: Image.Image,
+        regions: tuple[NormalizedRect, ...],
+    ) -> Image.Image:
+        """Keep only blurred low-resolution layout, never readable game text."""
+
+        tile_width, tile_height = ANONYMOUS_STRUCTURE_TILE_SIZE
+        atlas = Image.new(
+            "L",
+            (tile_width, tile_height * len(regions)),
+        )
+        for index, region in enumerate(regions):
+            tile = (
+                cls._crop(candidate, region)
+                .convert("L")
+                .filter(ImageFilter.GaussianBlur(3))
+                .resize(
+                    ANONYMOUS_STRUCTURE_TILE_SIZE,
+                    Image.Resampling.BILINEAR,
+                )
+            )
+            atlas.paste(tile, (0, index * tile_height))
+        return atlas
+
+    def _anonymous_structure_score(
+        self,
+        candidate: Image.Image,
+        *,
+        reference_filename: str,
+        regions: tuple[NormalizedRect, ...],
+    ) -> float:
+        candidate_atlas = self._anonymous_structure_atlas(
+            candidate,
+            regions,
+        )
+        reference = self._reference(reference_filename).convert("L")
+        if candidate_atlas.size != reference.size:
+            return 255.0
+        return float(
+            ImageStat.Stat(
+                ImageChops.difference(candidate_atlas, reference)
+            ).mean[0]
+        )
+
+    def _matches_live_window_dimensions(
+        self,
+        candidate: Image.Image,
+    ) -> bool:
+        reference = self._reference(LOGIN_START_LIVE_REFERENCE_FILE)
+        return bool(
+            abs(candidate.width - reference.width)
+            <= LOGIN_START_LIVE_MAXIMUM_WIDTH_DELTA
+            and abs(candidate.height - reference.height)
+            <= LOGIN_START_LIVE_MAXIMUM_HEIGHT_DELTA
+        )
+
+    def _client_reference_structure_score(
+        self,
+        candidate: Image.Image,
+        *,
+        reference_filename: str,
+        regions: tuple[NormalizedRect, ...],
+        maximum_score: float,
+        maximum_edge_score: float,
+        client_top_ratio: float,
+    ) -> tuple[bool, float]:
+        """Match several client-only regions under a narrow title-bar search."""
+        reference = self._reference(reference_filename)
+        calibrated_top = round(candidate.height * client_top_ratio)
+        minimum_top = max(
+            1,
+            calibrated_top - CLIENT_REFERENCE_TOP_RADIUS_PIXELS,
+        )
+        maximum_top = min(
+            candidate.height - 2,
+            calibrated_top + CLIENT_REFERENCE_TOP_RADIUS_PIXELS,
+        )
+        best_score = 255.0
+        for top in range(minimum_top, maximum_top + 1):
+            client = ImageOps.fit(
+                candidate.crop((0, top, candidate.width, candidate.height)),
+                reference.size,
+                method=Image.Resampling.BILINEAR,
+            )
+            scores = tuple(
+                self._region_score(client, reference, region)
+                for region in regions
+            )
+            edge_scores = tuple(
+                self._edge_difference(
+                    self._crop(client, region),
+                    self._crop(reference, region),
+                )
+                for region in regions
+            )
+            score = max((*scores, *edge_scores))
+            best_score = min(best_score, score)
+            if (
+                all(value <= maximum_score for value in scores)
+                and all(
+                    value <= maximum_edge_score
+                    for value in edge_scores
+                )
+                and all(
+                    self._region_has_nonuniform_structure(
+                        client,
+                        reference,
+                        region,
+                    )
+                    for region in regions
+                )
+            ):
+                return True, score
+        return False, best_score
+
     def _region_is_closer_to_confirmed_references(
         self,
         candidate_region: Image.Image,
@@ -1140,6 +1570,38 @@ class ReferenceScreenRecognizer:
             self._crop(reference, region),
             region,
             CENTRAL_MODAL_REFERENCE_FILES,
+        )
+
+    def _connected_central_region_has_blocking_overlay(
+        self,
+        candidate: Image.Image,
+        reference: Image.Image,
+        *,
+        include_confirmed_modal: bool = True,
+    ) -> bool:
+        """Fail closed for known modals and broad unknown central masks."""
+
+        if (
+            include_confirmed_modal
+            and self._connected_central_region_has_confirmed_modal(
+                candidate,
+                reference,
+            )
+        ):
+            return True
+        central = self._crop(
+            candidate,
+            CONNECTED_UNKNOWN_OVERLAY_REGION,
+        ).convert("L")
+        statistics = ImageStat.Stat(central)
+        edge_mean = ImageStat.Stat(
+            central.filter(ImageFilter.FIND_EDGES)
+        ).mean[0]
+        return bool(
+            statistics.stddev[0]
+            < CONNECTED_UNKNOWN_OVERLAY_MINIMUM_STDDEV
+            or edge_mean
+            < CONNECTED_UNKNOWN_OVERLAY_MINIMUM_EDGE_MEAN
         )
 
     @staticmethod
@@ -1930,10 +2392,40 @@ class ReferenceScreenRecognizer:
         scored: list[
             tuple[float, ScreenTemplateDefinition, tuple[float, ...]]
         ] = []
-        for definition in self.definitions:
+        definitions_to_score = tuple(
+            candidate_definition
+            for definition in self.definitions
+            for candidate_definition in (
+                (
+                    definition,
+                    *(
+                        replace(definition, filename=filename)
+                        for filename in LOGIN_START_REFERENCE_FILES
+                        if filename != definition.filename
+                    ),
+                )
+                if definition.state is ReconnectScreenState.LOGIN_START
+                else (definition,)
+            )
+        )
+        for definition in definitions_to_score:
             if definition.state is ReconnectScreenState.DISCONNECTED:
                 continue
             reference = self._reference(definition.filename)
+            if (
+                definition.filename
+                == LOGIN_START_LIVE_REFERENCE_FILE
+                and (
+                    abs(candidate.width - reference.width)
+                    > LOGIN_START_LIVE_MAXIMUM_WIDTH_DELTA
+                    or abs(candidate.height - reference.height)
+                    > LOGIN_START_LIVE_MAXIMUM_HEIGHT_DELTA
+                )
+            ):
+                # The live capture is a strict fixed-size alternative.  A
+                # two-pixel frame-height variance is the only accepted live
+                # window decoration difference.  Width never floats.
+                continue
             candidate_ratio = candidate.width / candidate.height
             reference_ratio = reference.width / reference.height
             if abs(candidate_ratio - reference_ratio) > 0.12:
@@ -1996,13 +2488,79 @@ class ReferenceScreenRecognizer:
                 )
                 and (
                     item[1].state is not ReconnectScreenState.CONNECTED
-                    or not self._connected_central_region_has_confirmed_modal(
+                    or not self._connected_central_region_has_blocking_overlay(
                         candidate,
                         self._reference(item[1].filename),
                     )
                 )
             )
         ]
+        line_definition = next(
+            definition
+            for definition in self.definitions
+            if definition.state is ReconnectScreenState.LINE_SELECTION
+        )
+        live_window_dimensions = self._matches_live_window_dimensions(
+            candidate
+        )
+        if live_window_dimensions and not any(
+            item[1].state is ReconnectScreenState.LINE_SELECTION
+            for item in valid_scored
+        ):
+            line_frame_matches, line_frame_score = (
+                self._fixed_full_window_structure_score(
+                    candidate,
+                    reference_filename=line_definition.filename,
+                    regions=LINE_SELECTION_FRAME_REGIONS,
+                    maximum_score=LINE_SELECTION_FRAME_MAXIMUM_SCORE,
+                    maximum_edge_score=(
+                        LINE_SELECTION_FRAME_MAXIMUM_EDGE_SCORE
+                    ),
+                )
+            )
+            if line_frame_matches:
+                valid_scored.append(
+                    (
+                        line_frame_score,
+                        line_definition,
+                        tuple(0.0 for _region in line_definition.regions),
+                    )
+                )
+
+        character_definition = next(
+            definition
+            for definition in self.definitions
+            if definition.state
+            is ReconnectScreenState.CHARACTER_SELECTION
+        )
+        if live_window_dimensions and not any(
+            item[1].state is ReconnectScreenState.CHARACTER_SELECTION
+            for item in valid_scored
+        ):
+            character_frame_matches, character_frame_score = (
+                self._fixed_full_window_structure_score(
+                    candidate,
+                    reference_filename=character_definition.filename,
+                    regions=CHARACTER_SELECTION_FRAME_REGIONS,
+                    maximum_score=(
+                        CHARACTER_SELECTION_FRAME_MAXIMUM_SCORE
+                    ),
+                    maximum_edge_score=(
+                        CHARACTER_SELECTION_FRAME_MAXIMUM_EDGE_SCORE
+                    ),
+                )
+            )
+            if character_frame_matches:
+                valid_scored.append(
+                    (
+                        character_frame_score,
+                        character_definition,
+                        tuple(
+                            0.0
+                            for _region in character_definition.regions
+                        ),
+                    )
+                )
         character_candidates: tuple[CharacterSelectionCandidate, ...] = ()
         if any(
             item[1].state is ReconnectScreenState.CHARACTER_SELECTION
@@ -2022,7 +2580,179 @@ class ReferenceScreenRecognizer:
                     if item[1].state
                     is not ReconnectScreenState.CHARACTER_SELECTION
                 ]
+        if live_window_dimensions:
+            activity_panel_score = self._anonymous_structure_score(
+                candidate,
+                reference_filename=ANONYMOUS_ACTIVITY_STRUCTURE_FILE,
+                regions=ACTIVITY_PANEL_LIVE_REGIONS,
+            )
+            if (
+                activity_panel_score
+                <= ANONYMOUS_ACTIVITY_STRUCTURE_MAXIMUM_SCORE
+            ):
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=round(activity_panel_score, 3),
+                    click_point=None,
+                    reference_name=ANONYMOUS_ACTIVITY_STRUCTURE_FILE,
+                    battle_context=False,
+                )
+            auto_dungeon_panel_score = self._anonymous_structure_score(
+                candidate,
+                reference_filename=ANONYMOUS_DUNGEON_STRUCTURE_FILE,
+                regions=AUTO_DUNGEON_PANEL_LIVE_REGIONS,
+            )
+            if (
+                auto_dungeon_panel_score
+                <= ANONYMOUS_DUNGEON_STRUCTURE_MAXIMUM_SCORE
+            ):
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=round(auto_dungeon_panel_score, 3),
+                    click_point=None,
+                    reference_name=ANONYMOUS_DUNGEON_STRUCTURE_FILE,
+                    battle_context=False,
+                )
         if not valid_scored:
+            if not live_window_dimensions:
+                return ScreenRecognition(
+                    state=ReconnectScreenState.UNKNOWN,
+                    score=(
+                        round(
+                            min(scored, key=lambda item: item[0])[0],
+                            3,
+                        )
+                        if scored
+                        else None
+                    ),
+                    click_point=None,
+                    reference_name=None,
+                )
+            activity_panel_score = self._anonymous_structure_score(
+                candidate,
+                reference_filename=ANONYMOUS_ACTIVITY_STRUCTURE_FILE,
+                regions=ACTIVITY_PANEL_LIVE_REGIONS,
+            )
+            if (
+                activity_panel_score
+                <= ANONYMOUS_ACTIVITY_STRUCTURE_MAXIMUM_SCORE
+            ):
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=round(activity_panel_score, 3),
+                    click_point=None,
+                    reference_name=ANONYMOUS_ACTIVITY_STRUCTURE_FILE,
+                    battle_context=False,
+                )
+            auto_dungeon_panel_score = self._anonymous_structure_score(
+                candidate,
+                reference_filename=ANONYMOUS_DUNGEON_STRUCTURE_FILE,
+                regions=AUTO_DUNGEON_PANEL_LIVE_REGIONS,
+            )
+            if (
+                auto_dungeon_panel_score
+                <= ANONYMOUS_DUNGEON_STRUCTURE_MAXIMUM_SCORE
+            ):
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=round(auto_dungeon_panel_score, 3),
+                    click_point=None,
+                    reference_name=ANONYMOUS_DUNGEON_STRUCTURE_FILE,
+                    battle_context=False,
+                )
+            connected_matches, connected_score = (
+                self._client_reference_structure_score(
+                    candidate,
+                    reference_filename=CONNECTED_LIVE_REFERENCE_FILE,
+                    regions=CONNECTED_LIVE_REGIONS,
+                    maximum_score=CONNECTED_LIVE_MAXIMUM_SCORE,
+                    maximum_edge_score=(
+                        CONNECTED_LIVE_MAXIMUM_EDGE_SCORE
+                    ),
+                    client_top_ratio=(
+                        CONNECTED_LIVE_CLIENT_TOP_RATIO
+                    ),
+                )
+            )
+            general_structure_scores = tuple(
+                (
+                    self._anonymous_structure_score(
+                        candidate,
+                        reference_filename=filename,
+                        regions=ANONYMOUS_GENERAL_STRUCTURE_REGIONS,
+                    ),
+                    filename,
+                )
+                for filename in ANONYMOUS_GENERAL_STRUCTURE_FILES
+            )
+            general_structure_score, general_structure_file = min(
+                general_structure_scores
+            )
+            if (
+                connected_matches
+                and general_structure_score
+                <= ANONYMOUS_GENERAL_STRUCTURE_MAXIMUM_SCORE
+                and not self._connected_central_region_has_blocking_overlay(
+                    candidate,
+                    self._reference("06_connected_gameplay.png"),
+                    include_confirmed_modal=False,
+                )
+            ):
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=round(
+                        max(connected_score, general_structure_score),
+                        3,
+                    ),
+                    click_point=None,
+                    reference_name=general_structure_file,
+                    battle_context=False,
+                )
+            battle_waiting_matches, battle_waiting_score = (
+                self._client_reference_structure_score(
+                    candidate,
+                    reference_filename=BATTLE_WAITING_REFERENCE_FILE,
+                    regions=BATTLE_WAITING_REGIONS,
+                    maximum_score=BATTLE_WAITING_MAXIMUM_SCORE,
+                    maximum_edge_score=(
+                        BATTLE_WAITING_MAXIMUM_EDGE_SCORE
+                    ),
+                    client_top_ratio=(
+                        BATTLE_WAITING_CLIENT_TOP_RATIO
+                    ),
+                )
+            )
+            battle_structure_score, battle_structure_file = min(
+                (
+                    self._anonymous_structure_score(
+                        candidate,
+                        reference_filename=filename,
+                        regions=ANONYMOUS_GENERAL_STRUCTURE_REGIONS,
+                    ),
+                    filename,
+                )
+                for filename in ANONYMOUS_BATTLE_STRUCTURE_FILES
+            )
+            if (
+                battle_waiting_matches
+                and battle_structure_score
+                <= ANONYMOUS_BATTLE_STRUCTURE_MAXIMUM_SCORE
+                and not self._connected_central_region_has_blocking_overlay(
+                    candidate,
+                    self._reference(BATTLE_WAITING_REFERENCE_FILE),
+                    include_confirmed_modal=False,
+                )
+            ):
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=round(
+                        max(battle_waiting_score, battle_structure_score),
+                        3,
+                    ),
+                    click_point=None,
+                    reference_name=battle_structure_file,
+                    battle_context=True,
+                )
             return ScreenRecognition(
                 state=ReconnectScreenState.UNKNOWN,
                 score=(
@@ -2093,9 +2823,10 @@ class ReferenceScreenRecognizer:
         character_slot_selected = None
         click_point = definition.click_point
         if definition.state is ReconnectScreenState.LINE_SELECTION:
-            line_number, _route_score = self._recognize_route_number(candidate)
-            if line_number is None:
-                line_number = DEFAULT_LINE_NUMBER
+            # The chooser always opens with the already-confirmed default
+            # first line.  Displayed route text is diagnostic only and may
+            # describe a recommendation; it never authorizes another line.
+            line_number = DEFAULT_LINE_NUMBER
             click_point = LINE_ROUTE_CLICK_POINTS[line_number]
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
             character_candidates = self._character_selection_candidates(

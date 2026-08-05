@@ -1,6 +1,11 @@
 import threading
 
 import services.smart_reconnect_monitor as smart_reconnect_monitor_module
+from adapters.game_screen_recognizer import ScreenRecognition
+from adapters.windows_background_capture import CaptureSample
+from adapters.windows_smart_reconnect import WindowsSmartReconnectController
+from adapters.windows_window import WindowInfo
+from core.reconnect_policy import ReconnectScreenState
 from core.sp1_boundaries import OperationResult, ReconnectState
 from services.smart_reconnect_monitor import SmartReconnectMonitor
 
@@ -200,6 +205,100 @@ def test_runtime_status_treats_safe_wait_and_rebinding_pause_as_reconnecting():
             details={"failure_codes": ["operation_gate_closed"]},
         )
     )
+    assert monitor.runtime_status == "重連中"
+
+
+def test_fully_captured_partial_unknown_scan_reports_reconnecting() -> None:
+    windows = (
+        WindowInfo(
+            1,
+            "Adobe Flash Player",
+            True,
+            False,
+            (0, 0, 2, 2),
+            11,
+            "ShockwaveFlash",
+            "a" * 64,
+            21,
+            31,
+        ),
+        WindowInfo(
+            2,
+            "Adobe Flash Player",
+            True,
+            False,
+            (0, 0, 2, 2),
+            12,
+            "ShockwaveFlash",
+            "b" * 64,
+            22,
+            32,
+        ),
+    )
+
+    class Windows:
+        def list_windows(self):
+            return list(windows)
+
+        def foreground_handle(self):
+            return windows[0].handle
+
+        def top_window_at(self, _x, _y):
+            return windows[0].handle
+
+    class Capture:
+        def capture(self, _handle):
+            return CaptureSample(2, 2, bytes([0, 20, 80, 255] * 4), True)
+
+    class Recognizer:
+        def __init__(self):
+            self.states = [
+                ReconnectScreenState.CONNECTED,
+                ReconnectScreenState.UNKNOWN,
+            ]
+
+        def recognize_capture(self, _sample):
+            state = self.states.pop(0)
+            return ScreenRecognition(state, 1.0, None, state.value)
+
+    class Mouse:
+        def is_window(self, _handle):
+            return True
+
+        def probe_responsive(self, _handle, _timeout):
+            return True
+
+        def click_relative(self, *_args):
+            raise AssertionError("unknown screen must never deliver input")
+
+    controller = WindowsSmartReconnectController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=Windows(),
+        capture_provider=Capture(),
+        recognizer=Recognizer(),
+        mouse_backend=Mouse(),
+        primary_capture_is_trusted=True,
+        primary_capture_is_fresh_without_visibility=True,
+        require_expected_window_count=True,
+        auto_battle_enabled=False,
+    )
+    monitor = SmartReconnectMonitor(controller)
+    monitor._thread = type(
+        "AliveThread",
+        (),
+        {"is_alive": lambda self: True},
+    )()
+
+    result, _delay = monitor.run_once()
+
+    assert result.code == "reconnect.waiting"
+    assert result.details["captured_windows"] == 2
+    assert result.details["state_counts"] == {
+        "connected": 1,
+        "unknown": 1,
+    }
+    assert result.details["failure_codes"] == ["screen_unknown"]
     assert monitor.runtime_status == "重連中"
 
 

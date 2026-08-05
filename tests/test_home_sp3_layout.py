@@ -31,6 +31,7 @@ from services.smart_reconnect_monitor import (
 from ui.home import (
     FeatureCardSettingsSaveResult,
     GroupManagementViewResult,
+    SmartReconnectToggleViewResult,
     SyncToggleViewResult,
     UI_THEME_LABELS,
     HomeView,
@@ -122,12 +123,52 @@ class _ConfigureStub:
         self.values.update(values)
 
 
+class _RuntimeLabelStub(_ConfigureStub):
+    def pack_forget(self) -> None:
+        return None
+
+    def pack(self, **_values) -> None:
+        return None
+
+
 def test_home_uses_the_same_smart_reconnect_interval_default() -> None:
     parameter = inspect.signature(HomeView.__init__).parameters[
         "smart_reconnect_interval_ms"
     ]
 
     assert parameter.default == DEFAULT_SMART_RECONNECT_INTERVAL_MS
+
+
+def test_auto_battle_defaults_on_but_preserves_explicit_off() -> None:
+    parameter = inspect.signature(HomeView.__init__).parameters[
+        "smart_reconnect_auto_battle_enabled"
+    ]
+    assert parameter.default is True
+
+    assert HomeView(None, {}).smart_reconnect_auto_battle_enabled is True
+    assert HomeView(
+        None,
+        {},
+        smart_reconnect_auto_battle_enabled=False,
+    ).smart_reconnect_auto_battle_enabled is False
+    assert HomeView(
+        None,
+        {},
+        smart_reconnect_auto_battle_enabled=None,
+    ).smart_reconnect_auto_battle_enabled is True
+
+
+def test_programmatic_auto_battle_update_reflects_checkbox_only() -> None:
+    view = object.__new__(HomeView)
+    view.smart_reconnect_enabled = False
+    view.smart_reconnect_auto_battle_enabled = False
+    view._smart_reconnect_auto_battle_variable = _IntStub(0)
+
+    view.set_smart_reconnect_auto_battle_enabled(True)
+
+    assert view.smart_reconnect_auto_battle_enabled is True
+    assert view._smart_reconnect_auto_battle_variable.get() == 1
+    assert view.smart_reconnect_enabled is False
 
 
 def test_hints_are_opt_in_and_have_a_persistent_toggle() -> None:
@@ -558,6 +599,80 @@ def test_smart_reconnect_enable_and_disable_update_the_header_immediately() -> N
 
     view._toggle_smart_reconnect()
     assert refreshed[-1] == (False, None)
+
+
+def test_smart_reconnect_enable_failure_is_shown_in_card_and_header() -> None:
+    view = object.__new__(HomeView)
+    view.smart_reconnect_enabled = False
+    view.smart_reconnect_runtime_status = None
+    view._last_smart_reconnect_runtime_status = None
+    view._smart_reconnect_failure_message = ""
+    view.on_smart_reconnect_change = lambda _enabled: SmartReconnectToggleViewResult(
+        False,
+        False,
+        "目前遊戲視窗身分有衝突，沒有啟用智慧重連。",
+    )
+    refreshed: list[tuple[bool, object, str]] = []
+    view._refresh_smart_reconnect_controls = lambda: refreshed.append(
+        (
+            view.smart_reconnect_enabled,
+            view.smart_reconnect_runtime_status,
+            view._smart_reconnect_failure_message,
+        )
+    )
+
+    view._toggle_smart_reconnect()
+
+    assert refreshed[-1] == (
+        False,
+        "重連失敗",
+        "目前遊戲視窗身分有衝突，沒有啟用智慧重連。",
+    )
+
+
+def test_smart_reconnect_success_clears_previous_enable_failure() -> None:
+    view = object.__new__(HomeView)
+    view.smart_reconnect_enabled = False
+    view.smart_reconnect_runtime_status = "重連失敗"
+    view._last_smart_reconnect_runtime_status = "重連失敗"
+    view._smart_reconnect_failure_message = "先前失敗"
+    view.on_smart_reconnect_change = lambda _enabled: SmartReconnectToggleViewResult(
+        True,
+        True,
+        "智慧重連已開啟，正在安全監看。",
+    )
+    view._refresh_smart_reconnect_controls = lambda: None
+
+    view._toggle_smart_reconnect()
+
+    assert view.smart_reconnect_enabled is True
+    assert view._smart_reconnect_failure_message == ""
+    assert view.smart_reconnect_runtime_status == "已開啟"
+
+
+def test_smart_reconnect_header_keeps_the_short_chinese_failure_reason() -> None:
+    view = object.__new__(HomeView)
+    view.smart_reconnect_enabled = False
+    view.smart_reconnect_runtime_status = "重連失敗"
+    view._last_smart_reconnect_runtime_status = "重連失敗"
+    view._smart_reconnect_failure_message = "目前遊戲視窗身分有衝突"
+    view.smart_reconnect_status_colors = {"重連失敗": "#D64545"}
+    view._refresh_smart_reconnect_capture_mode_status = lambda: None
+    view._smart_reconnect_button = None
+    view._smart_reconnect_label = _ConfigureStub()
+    view._smart_reconnect_runtime_label = _RuntimeLabelStub()
+    view._body = object()
+
+    view._refresh_smart_reconnect_controls()
+    view.set_smart_reconnect_runtime_status(None)
+
+    assert "重連失敗" in view._smart_reconnect_runtime_label.values["text"]
+    assert "目前遊戲視窗身分有衝突" in (
+        view._smart_reconnect_runtime_label.values["text"]
+    )
+    assert "目前遊戲視窗身分有衝突" in (
+        view._smart_reconnect_label.values["text"]
+    )
 
 
 def test_invalid_runtime_status_preserves_legal_state_or_fails_closed() -> None:

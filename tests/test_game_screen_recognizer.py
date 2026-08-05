@@ -3,15 +3,21 @@ from pathlib import Path
 import shutil
 from time import perf_counter
 
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 import pytest
 
 from adapters.game_screen_recognizer import (
     BATTLE_CONTEXT_REGION,
     BATTLE_REFERENCE_FILE,
     BATTLE_SCREEN_EVIDENCE_REGION,
+    BATTLE_WAITING_REFERENCE_FILE,
     CHARACTER_ENTER_CLICK_POINT,
     CHARACTER_LEVEL_REGIONS,
+    CHARACTER_SELECTED_BORDER_REGIONS,
+    CHARACTER_SELECTED_SIDE_REGIONS,
+    CHARACTER_SLOT_REGIONS,
+    CONNECTED_LIVE_REFERENCE_FILE,
+    CONNECTED_UNKNOWN_OVERLAY_REGION,
     DEFAULT_LINE_NUMBER,
     DEFAULT_SCREEN_TEMPLATES,
     DISCONNECT_OVERLAY_REGION,
@@ -19,6 +25,7 @@ from adapters.game_screen_recognizer import (
     ROUTE_DIGIT_REFERENCE_REGION,
     ROUTE_PREFIX_SEARCH_REGION,
     LINE_ROUTE_CLICK_POINTS,
+    LINE_SELECTION_FRAME_REGIONS,
     ReferenceScreenRecognizer,
 )
 from adapters.windows_background_capture import CaptureSample
@@ -27,6 +34,181 @@ from core.reconnect_policy import ReconnectScreenState
 
 REFERENCE_DIR = Path("assets") / "reconnect_reference"
 FOURTEEN_WINDOW_RECOGNITION_LIMIT_SECONDS = 4.5
+
+
+def _full_window_with_client_reference(
+    filename: str,
+    *,
+    client_top: int,
+) -> Image.Image:
+    with Image.open(
+        REFERENCE_DIR / "17_login_start_live_capture.png"
+    ) as source:
+        candidate = source.convert("RGB")
+    with Image.open(REFERENCE_DIR / filename) as source:
+        client = source.convert("RGB").resize(
+            (candidate.width, candidate.height - client_top),
+            Image.Resampling.BILINEAR,
+        )
+    candidate.paste(client, (0, client_top))
+    return candidate
+
+
+def _live_battle_waiting_window() -> Image.Image:
+    candidate = _full_window_with_client_reference(
+        BATTLE_WAITING_REFERENCE_FILE,
+        client_top=28,
+    )
+    client = candidate.crop((0, 28, candidate.width, candidate.height))
+    panel_box = (
+        round(client.width * 0.73),
+        0,
+        client.width,
+        round(client.height * 0.23),
+    )
+    scene_patch = client.crop(
+        (
+            round(client.width * 0.38),
+            0,
+            round(client.width * 0.65),
+            round(client.height * 0.23),
+        )
+    ).resize(
+        (
+            panel_box[2] - panel_box[0],
+            panel_box[3] - panel_box[1],
+        ),
+        Image.Resampling.BILINEAR,
+    )
+    candidate.paste(scene_patch, (panel_box[0], 28))
+    return candidate
+
+
+_ANONYMOUS_GENERAL_TEST_REGIONS = (
+    (0.760, 0.000, 1.000, 0.180),
+    (0.910, 0.170, 1.000, 0.750),
+    (0.350, 0.780, 0.650, 1.000),
+    (0.650, 0.780, 1.000, 1.000),
+    (0.250, 0.250, 0.500, 0.750),
+    (0.500, 0.250, 0.750, 0.750),
+)
+_ANONYMOUS_ACTIVITY_TEST_REGIONS = (
+    (0.110, 0.130, 0.320, 0.242),
+    (0.340, 0.130, 0.660, 0.242),
+    (0.680, 0.130, 0.890, 0.242),
+    (0.108, 0.835, 0.895, 0.968),
+    (0.180, 0.280, 0.480, 0.780),
+    (0.520, 0.280, 0.820, 0.780),
+)
+_ANONYMOUS_DUNGEON_TEST_REGIONS = (
+    (0.118, 0.135, 0.320, 0.235),
+    (0.340, 0.135, 0.660, 0.235),
+    (0.680, 0.135, 0.905, 0.235),
+    (0.118, 0.235, 0.145, 0.842),
+    (0.878, 0.235, 0.905, 0.842),
+    (0.180, 0.280, 0.480, 0.780),
+    (0.520, 0.280, 0.820, 0.780),
+)
+_ANONYMOUS_TEST_RECIPES = {
+    "general_scene_a.png": (
+        _ANONYMOUS_GENERAL_TEST_REGIONS,
+        (0.25, 0.25, 1.0, 1.0, 1.0, 1.0),
+        300,
+        "general",
+    ),
+    "general_scene_b.png": (
+        _ANONYMOUS_GENERAL_TEST_REGIONS,
+        (0.20, 0.20, 1.0, 1.0, 1.0, 1.0),
+        200,
+        "general",
+    ),
+    "general_scene_c.png": (
+        _ANONYMOUS_GENERAL_TEST_REGIONS,
+        (0.20, 0.20, 1.0, 1.0, 1.0, 1.0),
+        300,
+        "general",
+    ),
+    "general_scene_d.png": (
+        _ANONYMOUS_GENERAL_TEST_REGIONS,
+        (0.20, 0.20, 1.0, 1.0, 1.0, 1.0),
+        300,
+        "general",
+    ),
+    "legacy_normal.png": (
+        _ANONYMOUS_GENERAL_TEST_REGIONS,
+        (0.10, 0.10, 1.0, 1.0, 1.0, 1.0),
+        200,
+        "general",
+    ),
+    "activity_panel.png": (
+        _ANONYMOUS_ACTIVITY_TEST_REGIONS,
+        (1.0,) * 6,
+        200,
+        "general",
+    ),
+    "auto_dungeon_panel.png": (
+        _ANONYMOUS_DUNGEON_TEST_REGIONS,
+        (1.0,) * 7,
+        200,
+        "general",
+    ),
+    "battle_waiting.png": (
+        _ANONYMOUS_GENERAL_TEST_REGIONS,
+        (1.0, 0.20, 0.20, 0.20, 1.0, 1.0),
+        300,
+        "battle",
+    ),
+    "legacy_battle.png": (
+        _ANONYMOUS_GENERAL_TEST_REGIONS,
+        (0.05, 0.05, 0.05, 0.05, 1.0, 1.0),
+        200,
+        "battle",
+    ),
+}
+
+
+def _test_pixel_box(image, region):
+    return (
+        round(image.width * region[0]),
+        round(image.height * region[1]),
+        round(image.width * region[2]),
+        round(image.height * region[3]),
+    )
+
+
+def _anonymous_full_window_skeleton(filename: str) -> Image.Image:
+    regions, blends, sharpness, base_kind = _ANONYMOUS_TEST_RECIPES[
+        filename
+    ]
+    candidate = (
+        _live_battle_waiting_window()
+        if base_kind == "battle"
+        else _full_window_with_client_reference(
+            CONNECTED_LIVE_REFERENCE_FILE,
+            client_top=38,
+        )
+    )
+    with Image.open(
+        REFERENCE_DIR / "anonymous_live_structure" / filename
+    ) as source:
+        atlas = source.convert("L")
+    for index, (region, blend) in enumerate(zip(regions, blends)):
+        box = _test_pixel_box(candidate, region)
+        tile = atlas.crop((0, index * 24, 48, (index + 1) * 24))
+        tile = tile.resize(
+            (box[2] - box[0], box[3] - box[1]),
+            Image.Resampling.NEAREST,
+        ).filter(
+            ImageFilter.UnsharpMask(
+                radius=3,
+                percent=sharpness,
+                threshold=0,
+            )
+        ).convert("RGB")
+        if blend < 1.0:
+            tile = Image.blend(candidate.crop(box), tile, blend)
+        candidate.paste(tile, box[:2])
+    return candidate
 
 
 def test_all_confirmed_full_window_references_are_present_and_unique():
@@ -46,6 +228,14 @@ def test_missing_disconnect_alternative_fails_ready_before_recognition(
     for source in REFERENCE_DIR.glob("*.png"):
         if source.name != missing_filename:
             shutil.copyfile(source, tmp_path / source.name)
+    shutil.copytree(
+        REFERENCE_DIR / "auto_battle",
+        tmp_path / "auto_battle",
+    )
+    shutil.copytree(
+        REFERENCE_DIR / "anonymous_live_structure",
+        tmp_path / "anonymous_live_structure",
+    )
 
     recognizer = ReferenceScreenRecognizer(tmp_path)
 
@@ -61,12 +251,171 @@ def test_all_user_reference_images_match_the_fixed_sha256_manifest():
         digest, filename = line.split(maxsplit=1)
         manifest[filename.strip()] = digest
 
-    images = sorted(REFERENCE_DIR.glob("*.png"))
+    images = sorted(
+        (
+            *REFERENCE_DIR.glob("*.png"),
+            *(REFERENCE_DIR / "anonymous_live_structure").glob("*.png"),
+        ),
+        key=lambda path: path.relative_to(REFERENCE_DIR).as_posix(),
+    )
 
-    assert len(images) == 19
-    assert set(manifest) == {image.name for image in images}
+    assert len(images) == 29
+    assert set(manifest) == {
+        image.relative_to(REFERENCE_DIR).as_posix()
+        for image in images
+    }
     for image in images:
-        assert hashlib.sha256(image.read_bytes()).hexdigest() == manifest[image.name]
+        name = image.relative_to(REFERENCE_DIR).as_posix()
+        assert hashlib.sha256(image.read_bytes()).hexdigest() == manifest[name]
+
+
+def test_anonymous_live_structure_references_cannot_preserve_readable_text():
+    images = sorted(
+        (REFERENCE_DIR / "anonymous_live_structure").glob("*.png")
+    )
+
+    assert len(images) == 9
+    for image_path in images:
+        with Image.open(image_path) as image:
+            assert image.mode == "L"
+            assert image.width == 48
+            assert image.height % 24 == 0
+            assert image.height <= 168
+
+
+@pytest.mark.parametrize("filename", tuple(_ANONYMOUS_TEST_RECIPES))
+def test_each_anonymous_structure_reaches_connected_through_public_entry(
+    filename,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    candidate = _anonymous_full_window_skeleton(filename)
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.CONNECTED
+    assert result.reference_name == f"anonymous_live_structure/{filename}"
+    assert result.click_point is None
+
+
+def _anonymous_negative_variant(
+    candidate: Image.Image,
+    filename: str,
+    mutation: str,
+) -> Image.Image:
+    width, height = candidate.size
+    if mutation == "offset":
+        changed = Image.new("RGB", candidate.size, "black")
+        changed.paste(candidate, (29, 19))
+        return changed
+    if mutation == "scaled":
+        changed = Image.new("RGB", candidate.size, "black")
+        smaller = candidate.resize(
+            (round(width * 0.78), round(height * 0.78)),
+            Image.Resampling.BILINEAR,
+        )
+        changed.paste(
+            smaller,
+            ((width - smaller.width) // 2, (height - smaller.height) // 2),
+        )
+        return changed
+    if mutation == "single_frame":
+        changed = Image.new("RGB", candidate.size, "black")
+        regions = _ANONYMOUS_TEST_RECIPES[filename][0]
+        box = _test_pixel_box(candidate, regions[0])
+        changed.paste(candidate.crop(box), box[:2])
+        return changed
+    if mutation == "local_crop":
+        crop = (
+            round(width * 0.16),
+            round(height * 0.16),
+            round(width * 0.84),
+            round(height * 0.84),
+        )
+        return candidate.crop(crop).resize(
+            candidate.size,
+            Image.Resampling.BILINEAR,
+        )
+    center = (
+        round(width * 0.25),
+        round(height * 0.25),
+        round(width * 0.75),
+        round(height * 0.75),
+    )
+    changed = candidate.copy()
+    if mutation == "unknown_center":
+        gradient = Image.merge(
+            "RGB",
+            (
+                Image.linear_gradient("L"),
+                Image.linear_gradient("L").transpose(
+                    Image.Transpose.FLIP_TOP_BOTTOM
+                ),
+                Image.linear_gradient("L").transpose(
+                    Image.Transpose.ROTATE_90
+                ),
+            ),
+        ).resize(
+            (center[2] - center[0], center[3] - center[1]),
+            Image.Resampling.BILINEAR,
+        )
+        changed.paste(gradient, center[:2])
+        return changed
+    if mutation == "collage":
+        collage = Image.new(
+            "RGB",
+            (center[2] - center[0], center[3] - center[1]),
+        )
+        half_width = collage.width // 2
+        half_height = collage.height // 2
+        source_boxes = (
+            (0, 0, width // 3, height // 3),
+            (width * 2 // 3, 0, width, height // 3),
+            (0, height * 2 // 3, width // 3, height),
+            (width * 2 // 3, height * 2 // 3, width, height),
+        )
+        target_points = (
+            (0, 0),
+            (half_width, 0),
+            (0, half_height),
+            (half_width, half_height),
+        )
+        for source_box, target_point in zip(source_boxes, target_points):
+            collage.paste(
+                candidate.crop(source_box).resize(
+                    (half_width, half_height),
+                    Image.Resampling.BILINEAR,
+                ),
+                target_point,
+            )
+        changed.paste(collage, center[:2])
+        return changed
+    raise AssertionError(f"unsupported mutation: {mutation}")
+
+
+@pytest.mark.parametrize("filename", tuple(_ANONYMOUS_TEST_RECIPES))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "collage",
+        "offset",
+        "scaled",
+        "unknown_center",
+        "single_frame",
+        "local_crop",
+    ),
+)
+def test_each_anonymous_structure_negative_fails_closed_through_public_entry(
+    filename,
+    mutation,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    candidate = _anonymous_full_window_skeleton(filename)
+    changed = _anonymous_negative_variant(candidate, filename, mutation)
+
+    result = recognizer.recognize_image(changed)
+
+    assert result.state is ReconnectScreenState.UNKNOWN
+    assert result.click_point is None
 
 
 def test_each_confirmed_reference_classifies_to_its_declared_state():
@@ -79,8 +428,8 @@ def test_each_confirmed_reference_classifies_to_its_declared_state():
         assert result.score == 0.0
         assert result.reference_name == definition.filename
         if definition.state is ReconnectScreenState.LINE_SELECTION:
-            assert result.line_number == 8
-            assert result.click_point == LINE_ROUTE_CLICK_POINTS[8]
+            assert result.line_number == DEFAULT_LINE_NUMBER == 1
+            assert result.click_point == LINE_ROUTE_CLICK_POINTS[1]
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
             assert result.character_level == 100
             assert result.character_importance is None
@@ -91,6 +440,185 @@ def test_each_confirmed_reference_classifies_to_its_declared_state():
             assert result.character_candidates[0].level == 100
         else:
             assert result.click_point == definition.click_point
+
+
+def test_live_login_reference_accepts_only_two_pixel_frame_height_delta():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(
+        REFERENCE_DIR / "17_login_start_live_capture.png"
+    ) as source:
+        original = source.convert("RGB")
+    accepted = original.resize(
+        (original.width, original.height + 2),
+        Image.Resampling.BILINEAR,
+    )
+    rejected = original.resize(
+        (original.width, original.height + 3),
+        Image.Resampling.BILINEAR,
+    )
+
+    accepted_result = recognizer.recognize_image(accepted)
+    rejected_result = recognizer.recognize_image(rejected)
+
+    assert accepted_result.state is ReconnectScreenState.LOGIN_START
+    assert rejected_result.state is ReconnectScreenState.UNKNOWN
+    assert rejected_result.click_point is None
+
+
+def test_live_line_dialog_requires_three_fixed_regions_and_uses_line_one():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(
+        REFERENCE_DIR / "17_login_start_live_capture.png"
+    ) as source:
+        candidate = source.convert("RGB")
+    with Image.open(
+        REFERENCE_DIR / "03_line_selection_dialog.png"
+    ) as source:
+        line_page = source.convert("RGB").resize(
+            candidate.size,
+            Image.Resampling.BILINEAR,
+        )
+    left = min(region[0] for region in LINE_SELECTION_FRAME_REGIONS)
+    top = min(region[1] for region in LINE_SELECTION_FRAME_REGIONS)
+    right = max(region[2] for region in LINE_SELECTION_FRAME_REGIONS)
+    bottom = max(region[3] for region in LINE_SELECTION_FRAME_REGIONS)
+    box = (
+        round(candidate.width * left),
+        round(candidate.height * top),
+        round(candidate.width * right),
+        round(candidate.height * bottom),
+    )
+    candidate.paste(line_page.crop(box), box[:2])
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.LINE_SELECTION
+    assert result.line_number == DEFAULT_LINE_NUMBER == 1
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[1]
+
+
+def test_live_connected_hud_is_zero_input_connected_evidence():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    candidate = _full_window_with_client_reference(
+        CONNECTED_LIVE_REFERENCE_FILE,
+        client_top=38,
+    )
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.CONNECTED
+    assert result.reference_name == (
+        "anonymous_live_structure/legacy_normal.png"
+    )
+    assert result.click_point is None
+    assert result.battle_context is False
+
+
+def test_live_battle_waiting_scene_is_zero_input_connected_evidence():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    candidate = _live_battle_waiting_window()
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.CONNECTED
+    assert result.reference_name == (
+        "anonymous_live_structure/legacy_battle.png"
+    )
+    assert result.click_point is None
+    assert result.battle_context is True
+
+
+@pytest.mark.parametrize("scene", ("general", "battle"))
+def test_live_connected_alternatives_reject_structured_unknown_central_overlay(
+    scene,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    candidate = (
+        _full_window_with_client_reference(
+            CONNECTED_LIVE_REFERENCE_FILE,
+            client_top=38,
+        )
+        if scene == "general"
+        else _live_battle_waiting_window()
+    )
+    left, top, right, bottom = CONNECTED_UNKNOWN_OVERLAY_REGION
+    box = (
+        round(candidate.width * left),
+        round(candidate.height * top),
+        round(candidate.width * right),
+        round(candidate.height * bottom),
+    )
+    overlay = Image.merge(
+        "RGB",
+        (
+            Image.linear_gradient("L"),
+            Image.linear_gradient("L").transpose(Image.Transpose.FLIP_TOP_BOTTOM),
+            Image.linear_gradient("L").transpose(Image.Transpose.ROTATE_90),
+        ),
+    ).resize(
+        (box[2] - box[0], box[3] - box[1]),
+        Image.Resampling.BILINEAR,
+    )
+    candidate.paste(overlay, box[:2])
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.UNKNOWN
+    assert result.click_point is None
+
+
+def test_live_connected_hud_never_overrides_confirmed_central_popup():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    candidate = _full_window_with_client_reference(
+        CONNECTED_LIVE_REFERENCE_FILE,
+        client_top=38,
+    )
+    popup_definition = next(
+        definition
+        for definition in DEFAULT_SCREEN_TEMPLATES
+        if definition.state
+        is ReconnectScreenState.POST_LOGIN_AUTO_DUNGEON
+    )
+    with Image.open(
+        REFERENCE_DIR / popup_definition.filename
+    ) as source:
+        popup = source.convert("RGB").resize(
+            candidate.size,
+            Image.Resampling.BILINEAR,
+        )
+    popup_box = (
+        round(candidate.width * 0.108),
+        round(candidate.height * 0.125),
+        round(candidate.width * 0.907),
+        round(candidate.height * 0.970),
+    )
+    candidate.paste(popup.crop(popup_box), popup_box[:2])
+    damaged_region = popup_definition.regions[0]
+    damaged_box = (
+        round(candidate.width * damaged_region[0]),
+        round(candidate.height * damaged_region[1]),
+        round(candidate.width * damaged_region[2]),
+        round(candidate.height * damaged_region[3]),
+    )
+    candidate.paste((29, 88, 111), damaged_box)
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is not ReconnectScreenState.CONNECTED
+    assert result.click_point is None
+
+
+def test_live_login_reference_is_strict_login_start_evidence():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    filename = "17_login_start_live_capture.png"
+
+    with Image.open(REFERENCE_DIR / filename) as image:
+        result = recognizer.recognize_image(image)
+
+    assert result.state is ReconnectScreenState.LOGIN_START
+    assert result.reference_name == filename
+    assert result.score == 0.0
+    assert result.click_point == (0.5, 0.786)
 
 
 def test_fourteen_connected_window_references_finish_within_time_limit():
@@ -235,6 +763,138 @@ def test_character_selection_target_only_uses_the_confirmed_selected_border():
     assert point == CHARACTER_ENTER_CLICK_POINT
 
 
+def _pixel_box(image, region):
+    return (
+        round(image.width * region[0]),
+        round(image.height * region[1]),
+        round(image.width * region[2]),
+        round(image.height * region[3]),
+    )
+
+
+def _paint_normalized_region(image, region, brightness):
+    image.paste(
+        (brightness, brightness, brightness),
+        _pixel_box(image, region),
+    )
+
+
+def _measured_three_card_selection_frame(
+    side_scores=(
+        (107, 116, 126),
+        (45, 84, 86),
+        (51, 89, 91),
+    ),
+):
+    """Rebuild the reported three-card frame from direct border metrics."""
+
+    with Image.open(
+        REFERENCE_DIR / "16_character_selection_report.png"
+    ) as source:
+        candidate = source.crop(
+            (0, 0, source.width // 2, source.height)
+        ).convert("RGB")
+    for region in CHARACTER_SELECTED_BORDER_REGIONS:
+        _paint_normalized_region(candidate, region, 145)
+    for regions, scores in zip(
+        CHARACTER_SELECTED_SIDE_REGIONS,
+        side_scores,
+    ):
+        for region, score in zip(regions, scores):
+            _paint_normalized_region(candidate, region, score)
+    return candidate
+
+
+def _paint_selected_side_segments(
+    image,
+    region,
+    *,
+    horizontal,
+    bright_segments,
+):
+    box = _pixel_box(image, region)
+    crop = Image.new("RGB", (box[2] - box[0], box[3] - box[1]), (40, 40, 40))
+    span = crop.width if horizontal else crop.height
+    for index in bright_segments:
+        start = round(span * index / 3)
+        end = round(span * (index + 1) / 3)
+        segment = (
+            (start, 0, end, crop.height)
+            if horizontal
+            else (0, start, crop.width, end)
+        )
+        crop.paste((180, 180, 180), segment)
+    image.paste(crop, box[:2])
+
+
+def test_character_selection_public_entry_keeps_two_roles_and_skips_empty_slot():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "05_character_selection.png") as source:
+        candidate = source.convert("RGB")
+    with Image.open(
+        REFERENCE_DIR / "16_character_selection_report.png"
+    ) as source:
+        report = source.convert("RGB")
+        reported = report.crop(
+            (report.width // 2, 0, report.width, report.height)
+        )
+    source_box = _pixel_box(reported, CHARACTER_SLOT_REGIONS[0])
+    target_box = _pixel_box(candidate, CHARACTER_SLOT_REGIONS[1])
+    candidate.paste(
+        reported.crop(source_box).resize(
+            (
+                target_box[2] - target_box[0],
+                target_box[3] - target_box[1],
+            ),
+            Image.Resampling.BILINEAR,
+        ),
+        target_box[:2],
+    )
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.CHARACTER_SELECTION
+    assert [
+        (item.level, item.digit_count, item.slot_index, item.selected)
+        for item in result.character_candidates
+    ] == [
+        (100, 3, 0, True),
+        (120, 3, 1, False),
+    ]
+
+
+def test_visible_unreadable_character_card_remains_a_blocking_candidate():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "05_character_selection.png") as source:
+        candidate = source.convert("RGB")
+    source_box = _pixel_box(candidate, CHARACTER_SLOT_REGIONS[0])
+    target_box = _pixel_box(candidate, CHARACTER_SLOT_REGIONS[1])
+    candidate.paste(
+        candidate.crop(source_box).resize(
+            (
+                target_box[2] - target_box[0],
+                target_box[3] - target_box[1],
+            ),
+            Image.Resampling.BILINEAR,
+        ),
+        target_box[:2],
+    )
+    candidate.paste(
+        (0, 0, 0),
+        _pixel_box(candidate, CHARACTER_LEVEL_REGIONS[1]),
+    )
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.CHARACTER_SELECTION
+    assert any(
+        item.slot_index == 1
+        and item.level is None
+        and item.digit_count is None
+        for item in result.character_candidates
+    )
+
+
 def test_character_selection_target_does_not_guess_when_no_border_is_unique(
     monkeypatch,
 ):
@@ -293,6 +953,163 @@ def test_user_reported_character_selection_keeps_real_levels_and_border():
     assert right_result.character_slot_index == 2
     assert right_result.character_slot_selected is True
     assert right_result.click_point == CHARACTER_ENTER_CLICK_POINT
+
+
+def test_public_character_entry_keeps_unique_highest_above_two_digit_unknowns():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(
+        REFERENCE_DIR / "16_character_selection_report.png"
+    ) as source:
+        candidate = source.crop(
+            (0, 0, source.width // 2, source.height)
+        ).convert("RGB")
+    for region in CHARACTER_SELECTED_BORDER_REGIONS:
+        candidate.paste((80, 80, 80), _pixel_box(candidate, region))
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.CHARACTER_SELECTION
+    assert result.click_point is None
+    assert [
+        (item.level, item.digit_count, item.slot_index, item.selected)
+        for item in result.character_candidates
+    ] == [
+        (None, 2, 0, False),
+        (100, 3, 1, False),
+        (None, 2, 2, False),
+    ]
+
+
+def test_selected_character_uses_all_three_measured_outer_frame_sides():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    candidate = _measured_three_card_selection_frame()
+
+    result = recognizer.recognize_image(candidate)
+
+    assert result.state is ReconnectScreenState.CHARACTER_SELECTION
+    assert result.character_slot_index == 0
+    assert result.character_slot_selected is True
+    assert result.click_point == CHARACTER_ENTER_CLICK_POINT
+    assert [item.selected for item in result.character_candidates] == [
+        True,
+        False,
+        False,
+    ]
+
+
+@pytest.mark.parametrize(
+    "side_scores",
+    (
+        ((125, 60, 60), (45, 84, 86), (51, 89, 91)),
+        ((125, 125, 60), (45, 84, 86), (51, 89, 91)),
+        ((116, 116, 116), (116, 116, 116), (116, 116, 116)),
+    ),
+    ids=("one-side", "two-sides", "three-way-tie"),
+)
+def test_selected_character_rejects_incomplete_or_tied_outer_frames(
+    side_scores,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    candidate = _measured_three_card_selection_frame(side_scores)
+
+    assert recognizer._selected_character_slot_index(candidate) is None
+    assert recognizer._character_selection_target(candidate) == (
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize("damage", ("local-collage", "occlusion"))
+def test_selected_character_rejects_local_collage_and_occlusion(damage):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    candidate = _measured_three_card_selection_frame(
+        ((125, 125, 125), (45, 84, 86), (51, 89, 91))
+    )
+    if damage == "local-collage":
+        patterns = ((0, 1), (0, 2), (1, 2))
+        for index, (region, bright_segments) in enumerate(
+            zip(CHARACTER_SELECTED_SIDE_REGIONS[0], patterns)
+        ):
+            _paint_selected_side_segments(
+                candidate,
+                region,
+                horizontal=index == 0,
+                bright_segments=bright_segments,
+            )
+    else:
+        region = CHARACTER_SELECTED_SIDE_REGIONS[0][0]
+        box = _pixel_box(candidate, region)
+        third = (box[2] - box[0]) // 3
+        candidate.paste(
+            (0, 0, 0),
+            (box[0] + third, box[1], box[0] + third * 2, box[3]),
+        )
+
+    assert recognizer._selected_character_slot_index(candidate) is None
+    assert recognizer._character_selection_target(candidate) == (
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize("transform", ("offset", "scaled"))
+def test_selected_character_rejects_shifted_or_scaled_frame(transform):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    with Image.open(REFERENCE_DIR / "05_character_selection.png") as source:
+        original = source.convert("RGB")
+    candidate = Image.new("RGB", original.size, (0, 0, 0))
+    if transform == "offset":
+        candidate.paste(original, (18, 12))
+    else:
+        resized = original.resize(
+            (round(original.width * 0.96), round(original.height * 0.96)),
+            Image.Resampling.BILINEAR,
+        )
+        candidate.paste(
+            resized,
+            (
+                (original.width - resized.width) // 2,
+                (original.height - resized.height) // 2,
+            ),
+        )
+
+    assert recognizer._selected_character_slot_index(candidate) is None
+    assert recognizer._character_selection_target(candidate) == (
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def test_new_frame_enters_only_after_same_slot_has_unique_three_side_border():
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    unselected = _measured_three_card_selection_frame(
+        ((45, 84, 86), (45, 84, 86), (51, 89, 91))
+    )
+    selected = _measured_three_card_selection_frame(
+        ((45, 84, 86), (107, 116, 126), (51, 89, 91))
+    )
+
+    before = recognizer.recognize_image(unselected)
+    after = recognizer.recognize_image(selected)
+
+    target_before = next(
+        item for item in before.character_candidates if item.slot_index == 1
+    )
+    assert target_before.level == 100
+    assert target_before.selected is False
+    assert before.click_point is None
+    assert after.character_slot_index == target_before.slot_index
+    assert after.character_slot_selected is True
+    assert after.click_point == CHARACTER_ENTER_CLICK_POINT
 
 
 def test_user_reported_timeout_and_disconnect_are_actionable():
@@ -875,7 +1692,7 @@ def test_every_actionable_template_has_a_safe_client_relative_point():
         assert 0.0 <= y <= 1.0
 
 
-def test_line_selection_uses_recent_route_seven_instead_of_top_line():
+def test_line_selection_keeps_confirmed_default_line_one():
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
     with Image.open(REFERENCE_DIR / "03_line_selection_dialog.png") as source:
         candidate = source.convert("RGB")
@@ -902,8 +1719,8 @@ def test_line_selection_uses_recent_route_seven_instead_of_top_line():
     result = recognizer.recognize_image(candidate)
 
     assert result.state is ReconnectScreenState.LINE_SELECTION
-    assert result.line_number == 7
-    assert result.click_point == LINE_ROUTE_CLICK_POINTS[7]
+    assert result.line_number == DEFAULT_LINE_NUMBER == 1
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[1]
 
 
 def test_route_number_follows_centered_prefix_when_character_name_shifts():
@@ -1020,8 +1837,8 @@ def test_line_selection_modal_takes_priority_over_login_background(monkeypatch):
     result = recognizer.recognize_image(line_reference)
 
     assert result.state is ReconnectScreenState.LINE_SELECTION
-    assert result.line_number == 8
-    assert result.click_point == LINE_ROUTE_CLICK_POINTS[8]
+    assert result.line_number == DEFAULT_LINE_NUMBER == 1
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[1]
 
 
 def test_invalid_lower_score_does_not_mask_valid_connected_match(monkeypatch):

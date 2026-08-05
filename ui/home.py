@@ -506,6 +506,15 @@ class SyncToggleViewResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SmartReconnectToggleViewResult:
+    """回傳智慧重連啟停的實際結果，供卡片顯示失敗原因。"""
+
+    success: bool
+    enabled: bool
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
 class FeatureCardSettingsSaveResult:
     succeeded: bool
     message: str
@@ -925,7 +934,7 @@ class HomeView:
         characters: Iterable[PlayerCharacterView] = (),
         character_choices: Iterable[PlayerCharacterDetailChoice] = (),
         smart_reconnect_enabled: bool = False,
-        smart_reconnect_auto_battle_enabled: bool = False,
+        smart_reconnect_auto_battle_enabled: bool = True,
         smart_reconnect_runtime_status: str | None = None,
         smart_reconnect_status_colors: Mapping[str, str] | None = None,
         on_smart_reconnect_status_colors_change: (
@@ -1290,9 +1299,12 @@ class HomeView:
         ) = None
         self.smart_reconnect_enabled = bool(smart_reconnect_enabled)
         self.smart_reconnect_auto_battle_enabled = (
-            smart_reconnect_auto_battle_enabled is True
+            smart_reconnect_auto_battle_enabled
+            if isinstance(smart_reconnect_auto_battle_enabled, bool)
+            else True
         )
         self.smart_reconnect_runtime_status = smart_reconnect_runtime_status
+        self._smart_reconnect_failure_message = ""
         self._last_smart_reconnect_runtime_status = (
             smart_reconnect_runtime_status
             if smart_reconnect_runtime_status in {"已開啟", "重連中", "重連失敗"}
@@ -5902,11 +5914,25 @@ class HomeView:
 
     def set_smart_reconnect_enabled(self, enabled: bool) -> None:
         self.smart_reconnect_enabled = bool(enabled)
-        if self.smart_reconnect_enabled and self.smart_reconnect_runtime_status not in {"已開啟", "重連中", "重連失敗"}:
+        if self.smart_reconnect_enabled:
             self.smart_reconnect_runtime_status = "已開啟"
             self._last_smart_reconnect_runtime_status = "已開啟"
+            self._smart_reconnect_failure_message = ""
         elif not self.smart_reconnect_enabled:
             self.smart_reconnect_runtime_status = None
+            self._smart_reconnect_failure_message = ""
+        self._refresh_smart_reconnect_controls()
+
+    def set_smart_reconnect_enable_failure(self, message: object) -> None:
+        """Show a real enable failure without pretending monitoring started."""
+        self.smart_reconnect_enabled = False
+        self.smart_reconnect_runtime_status = "重連失敗"
+        self._last_smart_reconnect_runtime_status = "重連失敗"
+        self._smart_reconnect_failure_message = (
+            message.strip()
+            if isinstance(message, str) and message.strip()
+            else "智慧重連未能啟用，已維持安全停止。"
+        )
         self._refresh_smart_reconnect_controls()
 
     def set_smart_reconnect_runtime_status(self, value: object) -> None:
@@ -5915,6 +5941,11 @@ class HomeView:
             self._last_smart_reconnect_runtime_status = value
         elif self.smart_reconnect_enabled:
             self.smart_reconnect_runtime_status = self._last_smart_reconnect_runtime_status or "重連失敗"
+        elif getattr(self, "_smart_reconnect_failure_message", ""):
+            self.smart_reconnect_runtime_status = (
+                self._last_smart_reconnect_runtime_status
+                or "重連失敗"
+            )
         else:
             self.smart_reconnect_runtime_status = None
         self._refresh_smart_reconnect_controls()
@@ -6026,7 +6057,18 @@ class HomeView:
         if self.on_smart_reconnect_change is None:
             return
         accepted = self.on_smart_reconnect_change(desired)
+        if isinstance(accepted, SmartReconnectToggleViewResult):
+            if not accepted.success:
+                if desired:
+                    self.set_smart_reconnect_enable_failure(accepted.message)
+                return
+            self.set_smart_reconnect_enabled(accepted.enabled)
+            return
         if accepted is False:
+            if desired:
+                self.set_smart_reconnect_enable_failure(
+                    "智慧重連未能啟用，已維持安全停止。"
+                )
             return
         self.set_smart_reconnect_enabled(desired)
 
@@ -6038,7 +6080,23 @@ class HomeView:
             if variable is not None:
                 variable.set(1 if self.smart_reconnect_auto_battle_enabled else 0)
             return
-        self.smart_reconnect_auto_battle_enabled = desired
+        self.set_smart_reconnect_auto_battle_enabled(desired)
+
+    def set_smart_reconnect_auto_battle_enabled(
+        self,
+        enabled: bool,
+    ) -> None:
+        """Reflect one persisted child-switch value without toggling the master."""
+
+        normalized = enabled is not False
+        self.smart_reconnect_auto_battle_enabled = normalized
+        variable = getattr(
+            self,
+            "_smart_reconnect_auto_battle_variable",
+            None,
+        )
+        if variable is not None:
+            variable.set(1 if normalized else 0)
 
     def _refresh_smart_reconnect_controls(self) -> None:
         self._refresh_smart_reconnect_capture_mode_status()
@@ -6058,18 +6116,40 @@ class HomeView:
                 text=(
                     "● 自動監看中｜依目前狀態安全重試"
                     if self.smart_reconnect_enabled
+                    else f"● {getattr(self, '_smart_reconnect_failure_message', '')}"
+                    if getattr(self, "_smart_reconnect_failure_message", "")
                     else "● 安全停止｜不會點擊遊戲視窗"
                 ),
-                fg=SUCCESS if self.smart_reconnect_enabled else MUTED,
+                fg=(
+                    SUCCESS
+                    if self.smart_reconnect_enabled
+                    else "#D64545"
+                    if getattr(self, "_smart_reconnect_failure_message", "")
+                    else MUTED
+                ),
             )
         runtime_label = getattr(self, "_smart_reconnect_runtime_label", None)
         if runtime_label is not None:
+            failure_message = getattr(
+                self,
+                "_smart_reconnect_failure_message",
+                "",
+            )
             status = (
                 self.smart_reconnect_runtime_status
-                if self.smart_reconnect_enabled else None
+                if (
+                    self.smart_reconnect_enabled
+                    or getattr(self, "_smart_reconnect_failure_message", "")
+                ) else None
             )
             runtime_label.configure(
-                text=(f"● 智慧重連：{status}" if status else ""),
+                text=(
+                    f"● 智慧重連：{status}｜{failure_message}"
+                    if status and failure_message
+                    else f"● 智慧重連：{status}"
+                    if status
+                    else ""
+                ),
                 bg=self.smart_reconnect_status_colors.get(status, SURFACE),
                 fg=(
                     _status_text_color(

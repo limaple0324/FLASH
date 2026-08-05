@@ -385,8 +385,10 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
     """Refresh minimized Flash windows without taking foreground focus.
 
     A minimized legacy projector can keep returning its pre-modal PrintWindow
-    frame. This provider briefly restores it without activation, captures the
-    fresh frame, and returns it to the minimized state in ``finally``.
+    frame. This provider briefly restores it without activation, uses the
+    guarded temporary-reveal plus visible-desktop-pixel path for a fresh frame,
+    and returns it to the minimized state in ``finally``. Passive PrintWindow
+    pixels are never accepted by this provider.
     """
 
     SW_SHOWNOACTIVATE = 4
@@ -397,6 +399,7 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
         self,
         *,
         paint_settle_seconds: float = 0.75,
+        fresh_capture_provider: WindowCaptureProvider | None = None,
         process_lifecycle_provider: (
             Callable[[int], int | None] | None
         ) = None,
@@ -406,6 +409,21 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
             process_lifecycle_provider
             or _default_process_lifecycle_token
         )
+        self._fresh_capture_provider = (
+            fresh_capture_provider
+            or Win32TemporarilyRevealedCaptureProvider(
+                process_lifecycle_provider=(
+                    self._process_lifecycle_provider
+                )
+            )
+        )
+        self._last_failure_stage: str | None = None
+
+    @property
+    def last_failure_stage(self) -> str | None:
+        """Return one anonymous fail-closed stage from the latest capture."""
+
+        return self._last_failure_stage
 
     @staticmethod
     def _window_placement(user32, hwnd) -> _WINDOWPLACEMENT | None:
@@ -526,8 +544,79 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
         except OSError:
             return False
 
+    @classmethod
+    def _trusted_minimized_neighbor_restoration(
+        cls,
+        user32,
+        hwnd,
+        *,
+        previous_handle: int,
+        next_handle: int,
+        previous_instance: _WindowInstanceCredential | None,
+        next_instance: _WindowInstanceCredential | None,
+        lifecycle_provider: Callable[[int], int | None],
+    ) -> bool:
+        """Trust unchanged neighbours when Windows preserves either edge.
+
+        Restoring or minimizing one window can reorder other live windows.
+        Both original neighbour instances must still be current.  With two
+        original neighbours, either exact adjacent edge is sufficient; with
+        one original neighbour, that sole edge remains mandatory.
+        """
+
+        state = Win32TemporarilyRevealedCaptureProvider
+        try:
+            if not state._reference_instances_are_current(
+                user32,
+                previous_handle=previous_handle,
+                next_handle=next_handle,
+                previous_instance=previous_instance,
+                next_instance=next_instance,
+                lifecycle_provider=lifecycle_provider,
+            ):
+                return False
+            previous_restored = bool(
+                previous_handle
+                and state._handle_value(
+                    user32.GetWindow(hwnd, state.GW_HWNDPREV)
+                )
+                == previous_handle
+            )
+            next_restored = bool(
+                next_handle
+                and state._handle_value(
+                    user32.GetWindow(hwnd, state.GW_HWNDNEXT)
+                )
+                == next_handle
+            )
+            # The adjacency reads above are another Win32 call boundary.  A
+            # captured neighbour can be destroyed and its HWND reused after
+            # the first identity barrier but before the relationship result
+            # is trusted.  Revalidate both original instances immediately
+            # before returning any successful restoration verdict.
+            if not state._reference_instances_are_current(
+                user32,
+                previous_handle=previous_handle,
+                next_handle=next_handle,
+                previous_instance=previous_instance,
+                next_instance=next_instance,
+                lifecycle_provider=lifecycle_provider,
+            ):
+                return False
+            if previous_handle and next_handle:
+                return previous_restored or next_restored
+            if previous_handle:
+                return previous_restored
+            if next_handle:
+                return next_restored
+            return True
+        except OSError:
+            return False
+
     def capture(self, window_handle: int) -> CaptureSample | None:
+        self._last_failure_stage = None
         if os.name != "nt" or not window_handle:
+            self._last_failure_stage = "platform_or_target_invalid"
             return None
 
         user32, _gdi32 = self._libraries()
@@ -550,11 +639,13 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                     and user32.IsIconic(hwnd)
                 )
             except OSError:
+                self._last_failure_stage = "window_snapshot_failed"
                 return None
             if not is_valid_minimized_window:
                 # The caller's earlier window snapshot is stale. This provider
                 # can only prove freshness when it owns the complete minimized
                 # -> no-activate restore -> capture -> minimized transition.
+                self._last_failure_stage = "window_not_minimized"
                 return None
             try:
                 target_instance = state._window_instance_credential(
@@ -575,12 +666,14 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                     user32.GetWindow(hwnd, state.GW_HWNDNEXT)
                 )
             except OSError:
+                self._last_failure_stage = "window_state_read_failed"
                 return None
             if (
                 target_instance is None
                 or minimized_rect is None
                 or original_placement is None
             ):
+                self._last_failure_stage = "target_instance_incomplete"
                 return None
             process_id = target_instance.process_id
             original_foreground_instance = (
@@ -615,6 +708,7 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                 or (previous_handle and previous_instance is None)
                 or (next_handle and next_instance is None)
             ):
+                self._last_failure_stage = "restore_reference_incomplete"
                 return None
             placement_signature = self._placement_signature(
                 original_placement
@@ -631,9 +725,11 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                         target_instance,
                         self._process_lifecycle_provider,
                     ):
+                        self._last_failure_stage = "target_instance_changed"
                         return None
                     user32.ShowWindow(hwnd, self.SW_SHOWNOACTIVATE)
                 except OSError:
+                    self._last_failure_stage = "temporary_restore_failed"
                     return None
                 temporarily_restored = not bool(user32.IsIconic(hwnd))
                 current_placement = self._window_placement(user32, hwnd)
@@ -651,6 +747,7 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                     current_foreground != original_foreground
                     or not foreground_preserved
                 ):
+                    self._last_failure_stage = "foreground_changed"
                     return None
                 if (
                     not temporarily_restored
@@ -667,9 +764,11 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                     or self._placement_signature(current_placement)
                     != placement_signature
                 ):
+                    self._last_failure_stage = "restored_state_changed"
                     return None
                 restored_rect = state._window_rect(user32, hwnd)
                 if restored_rect is None:
+                    self._last_failure_stage = "restored_rect_unavailable"
                     return None
                 if self._paint_settle_seconds:
                     time.sleep(self._paint_settle_seconds)
@@ -696,9 +795,12 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                     or current_foreground != original_foreground
                     or not foreground_preserved
                 ):
+                    self._last_failure_stage = "pre_capture_barrier_failed"
                     return None
                 try:
-                    sample = super().capture(window_handle)
+                    sample = self._fresh_capture_provider.capture(
+                        window_handle
+                    )
                 except OSError:
                     sample = None
                 current_foreground = state._handle_value(
@@ -727,6 +829,7 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                     or not foreground_preserved
                 ):
                     sample = None
+                    self._last_failure_stage = "fresh_capture_failed"
             finally:
                 if (
                     temporarily_restored
@@ -792,31 +895,29 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                                     )
                                 )
                                 if restore_plan is None:
-                                    restored = False
+                                    pass
                                 else:
                                     (
                                         insert_after,
                                         _verify_relation,
                                         anchor_instance,
                                     ) = restore_plan
-                                    restored = (
-                                        state._set_window_position_if_instances_current(
-                                            user32,
-                                            hwnd,
-                                            insert_after=insert_after,
-                                            target_instance=target_instance,
-                                            previous_handle=previous_handle,
-                                            next_handle=next_handle,
-                                            previous_instance=previous_instance,
-                                            next_instance=next_instance,
-                                            anchor_instance=anchor_instance,
-                                            lifecycle_provider=(
-                                                self._process_lifecycle_provider
-                                            ),
-                                        )
+                                    state._set_window_position_if_instances_current(
+                                        user32,
+                                        hwnd,
+                                        insert_after=insert_after,
+                                        target_instance=target_instance,
+                                        previous_handle=previous_handle,
+                                        next_handle=next_handle,
+                                        previous_instance=previous_instance,
+                                        next_instance=next_instance,
+                                        anchor_instance=anchor_instance,
+                                        lifecycle_provider=(
+                                            self._process_lifecycle_provider
+                                        ),
                                     )
                         except OSError:
-                            restored = False
+                            pass
                     restored = bool(
                         restored
                         and self._minimized_window_was_restored(
@@ -829,16 +930,14 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                             expected_instance=target_instance,
                             lifecycle_provider=self._process_lifecycle_provider,
                         )
-                        and self._both_neighbor_relations_are_restored(
+                        and self._trusted_minimized_neighbor_restoration(
                             user32,
                             hwnd,
                             previous_handle=previous_handle,
                             next_handle=next_handle,
                             previous_instance=previous_instance,
                             next_instance=next_instance,
-                            lifecycle_provider=(
-                                self._process_lifecycle_provider
-                            ),
+                            lifecycle_provider=self._process_lifecycle_provider,
                         )
                     )
                     try:
@@ -858,7 +957,14 @@ class Win32RecoveringPrintWindowProvider(Win32PrintWindowProvider):
                     except OSError:
                         foreground_preserved = False
                     restored = bool(restored and foreground_preserved)
-            return sample if restored else None
+                    if not restored:
+                        self._last_failure_stage = "restoration_barrier_failed"
+            if sample is not None and restored:
+                self._last_failure_stage = None
+                return sample
+            if self._last_failure_stage is None:
+                self._last_failure_stage = "fresh_capture_failed"
+            return None
 
 
 class Win32VisibleRegionCaptureProvider:

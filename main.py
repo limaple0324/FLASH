@@ -38,7 +38,6 @@ from adapters.windows_launch_fingerprint import (
 )
 from adapters.windows_smart_reconnect import (
     ReconnectRuntimeStateStore,
-    RegisteredReconnectRole,
     WindowsSmartReconnectController,
 )
 from adapters.windows_pointer_sync import (
@@ -285,6 +284,7 @@ from ui.home import HomeView
 from ui.home import (
     FeatureCardSettingsSaveResult,
     GroupManagementViewResult,
+    SmartReconnectToggleViewResult,
     SyncToggleViewResult,
     UI_THEME_LABELS,
     theme_palette,
@@ -575,6 +575,118 @@ def _normalize_window_keywords(value: object) -> list[str]:
 
 def _normalize_window_fingerprint(value: object) -> str | None:
     return normalize_launch_fingerprint(value)
+
+
+def apply_smart_reconnect_snapshot_transition(
+    enabled: bool,
+    controller: object,
+    monitor: object,
+    *,
+    start_monitor: Callable[[object], object],
+    stop_monitor: Callable[[object], object],
+) -> SmartReconnectToggleViewResult:
+    """Bind one run to the safe windows open at the enable click."""
+    prepare_snapshot = getattr(
+        controller,
+        "prepare_execution_snapshot",
+        None,
+    )
+    set_execution_enabled = getattr(
+        controller,
+        "set_execution_enabled",
+        None,
+    )
+    if not callable(prepare_snapshot) or not callable(set_execution_enabled):
+        return SmartReconnectToggleViewResult(False, False, "智慧重連控制器尚未正確設定，沒有啟用。")
+    if enabled:
+        prepared = prepare_snapshot()
+        if not bool(getattr(prepared, "success", False)):
+            set_execution_enabled(False)
+            message = getattr(prepared, "message", None)
+            return SmartReconnectToggleViewResult(
+                False,
+                False,
+                message.strip()
+                if isinstance(message, str) and message.strip()
+                else "目前遊戲視窗無法通過安全檢查，沒有啟用智慧重連。",
+            )
+        started = start_monitor(monitor)
+        if not bool(getattr(started, "success", False)):
+            set_execution_enabled(False)
+            return SmartReconnectToggleViewResult(False, False, "智慧重連監看服務未能啟動，沒有啟用。")
+        return SmartReconnectToggleViewResult(True, True, "智慧重連已開啟，正在安全監看。")
+    stopped = stop_monitor(monitor)
+    set_execution_enabled(False)
+    if bool(getattr(stopped, "success", False)):
+        return SmartReconnectToggleViewResult(True, False, "智慧重連已安全停止。")
+    return SmartReconnectToggleViewResult(False, False, "智慧重連監看服務未能停止，未變更設定。")
+
+
+def apply_smart_reconnect_auto_battle_setting(
+    enabled: bool,
+    controller: object,
+    config: object,
+) -> bool:
+    """保存子開關；智慧重連總開關仍是另一道必要執行閘。"""
+    setter = getattr(controller, "set_auto_battle_enabled", None)
+    save = getattr(config, "set", None)
+    if not callable(setter) or not callable(save):
+        return False
+    normalized = enabled is True
+    setter(normalized)
+    save(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY, normalized)
+    return True
+
+
+def normalize_smart_reconnect_auto_battle_enabled(value: object) -> bool:
+    """Keep an explicit player-off choice; missing or invalid values default on."""
+
+    return value if isinstance(value, bool) else True
+
+
+def apply_auto_battle_after_game_launch(
+    game_was_launched: bool,
+    controller: object,
+    config: object,
+    home_view: object | None = None,
+) -> bool:
+    """Enable, persist, and reflect auto battle after one real app launch."""
+
+    if game_was_launched is not True:
+        return False
+    if not apply_smart_reconnect_auto_battle_setting(
+        True,
+        controller,
+        config,
+    ):
+        return False
+    update_view = getattr(
+        home_view,
+        "set_smart_reconnect_auto_battle_enabled",
+        None,
+    )
+    if callable(update_view):
+        update_view(True)
+    return True
+
+
+def group_window_launch_started_game(result: object) -> bool:
+    """Accept only a fully successful group operation that launched a game."""
+
+    return bool(
+        getattr(result, "success", None) is True
+        and getattr(result, "action", None) == "launch"
+        and getattr(result, "launched_count", 0) > 0
+    )
+
+
+def group_role_action_started_game(result: object) -> bool:
+    """Accept only a successful single-role launch, never an activation."""
+
+    return bool(
+        getattr(result, "success", None) is True
+        and getattr(result, "action", None) == "launched"
+    )
 
 
 def resolve_group_role_progress_subject_id(
@@ -904,7 +1016,7 @@ def build_services(
             INPUT_POLICY_KEY: WindowInputPolicy.ALL.value,
             SMART_RECONNECT_ENABLED_KEY: False,
             SMART_RECONNECT_CONSENT_KEY: False,
-            SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY: False,
+            SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY: True,
             SMART_RECONNECT_INTERVAL_MS_KEY: (
                 DEFAULT_SMART_RECONNECT_INTERVAL_MS
             ),
@@ -938,6 +1050,14 @@ def build_services(
             },
         }
     )
+    saved_auto_battle = normalize_smart_reconnect_auto_battle_enabled(
+        config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY)
+    )
+    if config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY) is not saved_auto_battle:
+        config.set(
+            SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY,
+            saved_auto_battle,
+        )
     smart_reconnect_capture_settings_service = (
         SmartReconnectCaptureSettingsService(config)
     )
@@ -1317,39 +1437,6 @@ def build_services(
             else None
         )
 
-    def registered_reconnect_roles():
-        profiles = {
-            character.character_id: character
-            for character in character_store.load()
-        }
-        roles_by_id: dict[
-            str,
-            tuple[RegisteredReconnectRole, ...],
-        ] = {}
-        for choice in group_selection_service.choices():
-            for member in choice.members:
-                if not member.role_id or member.character_id is None:
-                    continue
-                profile = profiles.get(member.character_id)
-                if profile is None:
-                    continue
-                try:
-                    role = RegisteredReconnectRole(
-                        member.role_id,
-                        profile.importance,
-                    )
-                except (TypeError, ValueError):
-                    continue
-                key = role.role_id.casefold()
-                roles_by_id[key] = tuple(
-                    dict.fromkeys((*roles_by_id.get(key, ()), role))
-                )
-        return tuple(
-            matches[0]
-            for matches in roles_by_id.values()
-            if len(matches) == 1
-        )
-
     def current_sync_target_windows() -> tuple[WindowInfo, ...]:
         if target_window_contract_service is None:
             return ()
@@ -1430,10 +1517,11 @@ def build_services(
             smart_reconnect_capture_settings_service.snapshot()
         ),
         require_expected_window_count=False,
-        registered_role_provider=registered_reconnect_roles,
         operation_gate=game_operation_gate,
         auto_battle_enabled=(
-            config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY) is True
+            normalize_smart_reconnect_auto_battle_enabled(
+                config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY)
+            )
         ),
         failure_status_service=reconnect_failure_status_service,
         failure_record_callback=lambda role_name, detail: (
@@ -2419,6 +2507,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     def complete_group_window_launch(
         result: GroupWindowLaunchResult,
     ) -> None:
+        apply_auto_battle_after_game_launch(
+            group_window_launch_started_game(result),
+            smart_reconnect_controller,
+            config,
+            home_view,
+        )
         if (
             result.action == "stop"
             and operation_record_store is not None
@@ -3340,34 +3434,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         if home_view is not None and sync_stopped:
             home_view.set_keyboard_sync_enabled(False)
-        reconnect_stopped = None
-        if smart_reconnect_monitor is not None:
-            reconnect_stopped = stop_service(
-                smart_reconnect_monitor,
-                timeout_seconds=1.0,
-            )
-            if home_view is not None and reconnect_stopped.success:
-                home_view.set_smart_reconnect_enabled(False)
-        if (
-            config is not None
-            and (
-                smart_reconnect_monitor is None
-                or reconnect_stopped.success
-            )
-        ):
-            config.update_values(
-                {
-                    SMART_RECONNECT_ENABLED_KEY: False,
-                    SMART_RECONNECT_CONSENT_KEY: False,
-                }
-            )
-        stopped = (
-            sync_stopped
-            and (
-                reconnect_stopped is None
-                or reconnect_stopped.success
-            )
-        )
+        # 智慧重連綁定的是啟用當下視窗快照；組別編修不得停止或重綁它。
+        stopped = sync_stopped
         if logger is not None and not stopped:
             logger.warning(
                 "Group configuration change was blocked because "
@@ -4744,23 +4812,32 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             "同步中｜同步左鍵、拖曳與已確認快捷鍵",
         )
 
-    def change_smart_reconnect(enabled: bool) -> bool:
+    def change_smart_reconnect(
+        enabled: bool,
+    ) -> SmartReconnectToggleViewResult:
         if (
             config is None
             or smart_reconnect_monitor is None
             or smart_reconnect_controller is None
         ):
-            messagebox.showerror(
-                "輔｜智慧重連",
-                "智慧重連尚未正確設定；目前維持安全停止。",
-                parent=window,
+            return SmartReconnectToggleViewResult(
+                False,
+                False,
+                "智慧重連服務尚未正確設定，沒有啟用。",
             )
-            return False
         if enabled:
-            smart_reconnect_controller.set_group_launch_plan(None)
-            started = start_service(smart_reconnect_monitor)
-            if not started.success:
-                return False
+            transition = apply_smart_reconnect_snapshot_transition(
+                True,
+                smart_reconnect_controller,
+                smart_reconnect_monitor,
+                start_monitor=start_service,
+                stop_monitor=lambda _monitor: stop_service(
+                    smart_reconnect_monitor,
+                    timeout_seconds=1.0,
+                ),
+            )
+            if not transition.success:
+                return transition
             config.update_values(
                 {
                     SMART_RECONNECT_ENABLED_KEY: True,
@@ -4770,13 +4847,19 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if logger is not None:
                 logger.info("Smart reconnect explicitly enabled by the player.")
             mark_tray_operations_running()
-            return True
+            return transition
 
-        stopped_result = stop_service(
+        transition = apply_smart_reconnect_snapshot_transition(
+            False,
+            smart_reconnect_controller,
             smart_reconnect_monitor,
-            timeout_seconds=1.0,
+            start_monitor=start_service,
+            stop_monitor=lambda _monitor: stop_service(
+                smart_reconnect_monitor,
+                timeout_seconds=1.0,
+            ),
         )
-        stopped = stopped_result.success
+        stopped = transition.success
         if stopped:
             config.update_values(
                 {
@@ -4789,16 +4872,17 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "Smart reconnect explicitly disabled by the player; "
                 f"worker_stopped={stopped}"
             )
-        return stopped
+        return transition
 
     def change_smart_reconnect_auto_battle(enabled: bool) -> bool:
         """子開關永遠不會自行開啟智慧重連總開關。"""
         if config is None or smart_reconnect_controller is None:
             return False
-        normalized = enabled is True
-        smart_reconnect_controller.set_auto_battle_enabled(normalized)
-        config.set(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY, normalized)
-        return True
+        return apply_smart_reconnect_auto_battle_setting(
+            enabled,
+            smart_reconnect_controller,
+            config,
+        )
 
     def change_smart_reconnect_interval(interval_ms: int) -> bool:
         if config is None or smart_reconnect_monitor is None:
@@ -5030,6 +5114,22 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if character_detail_view_service is not None
         else ()
     )
+
+    def activate_or_launch_group_role(action_id: str) -> object | None:
+        if group_role_status_service is None:
+            return None
+        result = group_role_status_service.activate_or_launch(
+            home_view.current_group_name if home_view is not None else None,
+            action_id,
+        )
+        apply_auto_battle_after_game_launch(
+            group_role_action_started_game(result),
+            smart_reconnect_controller,
+            config,
+            home_view,
+        )
+        return result
+
     home_view = HomeView(
         window,
         status,
@@ -5194,8 +5294,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             status.get("smart_reconnect_enabled", False)
         ),
         smart_reconnect_auto_battle_enabled=(
-            config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY) is True
-            if config is not None else False
+            normalize_smart_reconnect_auto_battle_enabled(
+                config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY)
+                if config is not None
+                else None
+            )
         ),
         smart_reconnect_runtime_status=(
             smart_reconnect_monitor.runtime_status
@@ -5252,10 +5355,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             else None
         ),
         on_group_role_action=(
-            lambda action_id: group_role_status_service.activate_or_launch(
-                home_view.current_group_name if home_view is not None else None,
-                action_id,
-            )
+            activate_or_launch_group_role
             if group_role_status_service is not None
             else None
         ),
