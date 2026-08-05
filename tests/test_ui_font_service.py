@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import gc
 import json
+import subprocess
 import sys
 from pathlib import Path
 from tkinter import Button, Label, TclError, Tk, font as tkfont
@@ -470,7 +471,21 @@ def test_main_lifecycle_settings_and_package_manifest_are_wired() -> None:
 
 def test_font_assets_are_marked_binary_to_preserve_license_hashes() -> None:
     attributes = Path(".gitattributes").read_text(encoding="utf-8")
-    assert "assets/ui_fonts/** -text" in attributes
+    assert "assets/ui_fonts/** -text -whitespace" in attributes
+
+
+def test_chenyu_license_index_blob_matches_the_original_bytes() -> None:
+    path = "assets/ui_fonts/chenyu_luoyan/license.txt"
+    blob = subprocess.check_output(
+        ["git", "show", f":{path}"],
+        cwd=Path.cwd(),
+    )
+    expected = (Path.cwd() / path).read_bytes()
+    assert blob == expected
+    assert len(blob) == 4506
+    assert hashlib.sha256(blob).hexdigest() == (
+        "393732512d2658fa5841dfaad325e002ccb6755b9037a818500434c0a5c4a6d1"
+    )
 
 
 @pytest.mark.skipif(
