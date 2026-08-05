@@ -2,6 +2,7 @@ from pathlib import Path
 from dataclasses import replace
 import hashlib
 import json
+import pytest
 
 from PIL import Image
 
@@ -19,6 +20,12 @@ from services.smart_reconnect_capture_settings_service import SmartReconnectCapt
 
 
 ROOT = Path("assets/reconnect_reference/auto_battle")
+BATTLE_AUTO_SOURCE = Path(
+    r"C:\Users\USER\AppData\Local\Temp\codex-clipboard-7dbb2ee0-ea3b-4e81-9bc8-20d77470a266.png"
+)
+BATTLE_AUTO_SOURCE_SHA256 = (
+    "61c7408b3ecc44c47fd4cf63c8399ac5d95ab8ca625320a8e032820f075975a7"
+)
 
 
 def test_four_saved_images_are_offline_and_fail_closed() -> None:
@@ -40,6 +47,59 @@ def test_four_saved_images_are_offline_and_fail_closed() -> None:
     assert not evidence.enabled and not evidence.disabled
 
 
+def test_enabled_panel_is_same_size_background_independent_but_not_partial() -> None:
+    recognizer = AutoBattleRecognizer(ROOT)
+    varied = _enabled_battle_frame(
+        (1336, 858),
+        background_variant=True,
+    )
+    evidence = recognizer.read(varied)
+
+    assert evidence.enabled is True
+    assert evidence.disabled is False
+
+    panel_box = (
+        round(varied.width * 0.738),
+        0,
+        varied.width,
+        round(varied.height * 0.22),
+    )
+    collage = Image.new("RGB", varied.size, "#112233")
+    collage.paste(varied.crop(panel_box), panel_box[:2])
+    assert recognizer.read(collage).enabled is False
+
+    panel_only = varied.crop(panel_box).resize(
+        varied.size,
+        Image.Resampling.BILINEAR,
+    )
+    assert recognizer.read(panel_only).enabled is False
+
+
+def test_every_loaded_or_derived_auto_battle_asset_has_source_traceability() -> None:
+    records = json.loads((ROOT / "source_records.json").read_text(encoding="utf-8"))[
+        "records"
+    ]
+    by_file = {item["file"]: item for item in records}
+    required = {
+        "disabled_red_x_with_context.png",
+        "entry_icon.png",
+        "battle_auto_button.png",
+        "battle_manual_auto_structure.png",
+        "enabled_full_panel.png",
+        "enabled_battle_full_panel.png",
+        "enabled_start_full_panel.png",
+    }
+
+    assert required <= set(by_file)
+    for filename in required:
+        path = ROOT / filename
+        record = by_file[filename]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == record["sha256"]
+        with Image.open(path) as image:
+            assert image.size == (record["width"], record["height"])
+    assert not (ROOT / BATTLE_AUTO_SOURCE.name).exists()
+
+
 def test_red_x_requires_current_full_image_box_in_approved_search_area() -> None:
     recognizer = AutoBattleRecognizer(ROOT)
     with Image.open(ROOT / "disabled_red_x_with_context.png") as image:
@@ -59,8 +119,11 @@ class _ConnectedRecognizer:
     def __init__(
         self,
         state=ReconnectScreenState.CONNECTED,
+        *,
+        battle_context=False,
     ):
         self.state = state
+        self.battle_context = battle_context
 
     def recognize_capture(self, _sample):
         return ScreenRecognition(
@@ -68,6 +131,7 @@ class _ConnectedRecognizer:
             1.0,
             None,
             self.state.value,
+            battle_context=self.battle_context,
         )
 
 
@@ -140,20 +204,65 @@ def _red_x_full_sample():
     return _sample(frame)
 
 
+def _battle_button_frame():
+    frame = Image.new("RGB", (1336, 858), "#112233")
+    with Image.open(ROOT / "battle_auto_button.png") as image:
+        frame.paste(image.convert("RGB"), (1148, 498))
+    return frame
+
+
+def _enabled_battle_frame(size=(900, 600), *, background_variant=False):
+    with Image.open(ROOT / "enabled_battle_full_panel.png") as image:
+        enabled = image.convert("RGB").resize(
+            size,
+            Image.Resampling.BILINEAR,
+        )
+    if background_variant:
+        with Image.open(ROOT / "enabled_full_panel.png") as image:
+            changed = image.convert("RGB").resize(
+                size,
+                Image.Resampling.BILINEAR,
+            )
+        panel_box = (
+            round(size[0] * 0.738),
+            0,
+            size[0],
+            round(size[1] * 0.22),
+        )
+        changed.paste(enabled.crop(panel_box), panel_box[:2])
+        enabled = changed
+    return enabled
+
+
+def _enabled_battle_sample(size=(900, 600), *, background_variant=False):
+    return _sample(
+        _enabled_battle_frame(
+            size,
+            background_variant=background_variant,
+        )
+    )
+
+
 def _controller(
     frames,
     *,
     monotonic_clock=None,
     general_state=ReconnectScreenState.CONNECTED,
+    battle_context=False,
 ):
-    window = WindowInfo(1, "Adobe Flash Player", True, False, (0, 0, 900, 600), 2, "ShockwaveFlash", "a" * 64, 3, 4)
+    width = frames[0].width if frames else 900
+    height = frames[0].height if frames else 600
+    window = WindowInfo(1, "Adobe Flash Player", True, False, (0, 0, width, height), 2, "ShockwaveFlash", "a" * 64, 3, 4)
     mouse = _Mouse()
     capture = _Capture(frames, clock=monotonic_clock)
     clock = monotonic_clock or (lambda: 0.0)
     controller = WindowsSmartReconnectController(
         expected_windows=1, title_keywords=("Adobe Flash Player",),
         window_backend=_Windows(window), capture_provider=capture,
-        recognizer=_ConnectedRecognizer(general_state), mouse_backend=mouse,
+        recognizer=_ConnectedRecognizer(
+            general_state,
+            battle_context=battle_context,
+        ), mouse_backend=mouse,
         primary_capture_is_trusted=True,
         primary_capture_is_fresh_without_visibility=True,
         execution_enabled=False, require_expected_window_count=False,
@@ -169,8 +278,7 @@ def _controller(
 def test_connected_auto_battle_clicks_once_then_requires_third_panel() -> None:
     with Image.open(ROOT / "disabled_red_x_with_context.png") as i: template = i.convert("RGB")
     first = Image.new("RGB", (900, 600), "#112233"); first.paste(template, (810, 500))
-    with Image.open(ROOT / "enabled_battle_full_panel.png") as i: enabled = i.convert("RGB")
-    controller, window, mouse = _controller([_sample(first), _sample(enabled)])
+    controller, window, mouse = _controller([_sample(first), _enabled_battle_sample()])
     assert controller._run_auto_battle_for_connected(window, "a" * 64, WindowInstanceToken.from_window(window), _sample(first), "visible", 0, controller._source_state_generation)
     assert len(mouse.clicks) == 1
 
@@ -201,9 +309,8 @@ def test_auto_battle_preclick_generation_token_route_and_revision_changes_never_
 def test_auto_battle_postclick_source_or_identity_change_is_not_success() -> None:
     with Image.open(ROOT / "disabled_red_x_with_context.png") as i: template = i.convert("RGB")
     frame = Image.new("RGB", (900, 600), "#112233"); frame.paste(template, (810, 500))
-    with Image.open(ROOT / "enabled_battle_full_panel.png") as i: enabled = i.convert("RGB")
     for change_identity in (False, True):
-        controller, window, mouse = _controller([_sample(frame), _sample(enabled)])
+        controller, window, mouse = _controller([_sample(frame), _enabled_battle_sample()])
         def revoke():
             if change_identity: controller._window_backend.window = replace(window, process_id=99)
             else: controller._source_state_generation += 1
@@ -261,7 +368,6 @@ def test_activation_snapshot_preserves_saved_auto_battle_sub_switch() -> None:
 def test_three_role_auto_battle_only_delivers_to_confirmed_role() -> None:
     with Image.open(ROOT / "disabled_red_x_with_context.png") as i: template = i.convert("RGB")
     red_x = Image.new("RGB", (900, 600), "#112233"); red_x.paste(template, (810, 500))
-    with Image.open(ROOT / "enabled_battle_full_panel.png") as i: enabled = i.convert("RGB")
     alpha = WindowInfo(1, "Adobe Flash Player", True, False, (0, 0, 900, 600), 2, "ShockwaveFlash", "a" * 64, 3, 4)
     beta = WindowInfo(2, "Adobe Flash Player", True, False, (0, 0, 900, 600), 5, "ShockwaveFlash", "b" * 64, 6, 7)
     gamma = WindowInfo(3, "Adobe Flash Player", True, False, (0, 0, 900, 600), 8, "ShockwaveFlash", "c" * 64, 9, 10)
@@ -269,7 +375,7 @@ def test_three_role_auto_battle_only_delivers_to_confirmed_role() -> None:
     mouse = _Mouse()
     controller = WindowsSmartReconnectController(
         expected_windows=3, title_keywords=("Adobe Flash Player",), window_backend=backend,
-        capture_provider=_Capture([_sample(red_x), _sample(enabled)]), recognizer=_ConnectedRecognizer(),
+        capture_provider=_Capture([_sample(red_x), _enabled_battle_sample()]), recognizer=_ConnectedRecognizer(),
         mouse_backend=mouse, primary_capture_is_trusted=True, primary_capture_is_fresh_without_visibility=True,
         execution_enabled=False, require_expected_window_count=False, auto_battle_enabled=True,
         auto_battle_recognizer=AutoBattleRecognizer(ROOT),
@@ -300,9 +406,8 @@ def test_three_role_auto_battle_only_delivers_to_confirmed_role() -> None:
 def test_public_reconnect_auto_battle_success_and_revision_changes_fail_closed() -> None:
     with Image.open(ROOT / "disabled_red_x_with_context.png") as i: template = i.convert("RGB")
     red_x = Image.new("RGB", (900, 600), "#112233"); red_x.paste(template, (810, 500))
-    with Image.open(ROOT / "enabled_battle_full_panel.png") as i: enabled = i.convert("RGB")
     for change_on, expected_clicks in ((0, 1), (2, 0), (3, 1)):
-        controller, _window, mouse = _controller([_sample(red_x), _sample(red_x), _sample(enabled)])
+        controller, _window, mouse = _controller([_sample(red_x), _sample(red_x), _enabled_battle_sample()])
         if change_on:
             controller._capture_provider.after = lambda call: (
                 controller.set_capture_settings(SmartReconnectCaptureSettings(visible=False))
@@ -318,11 +423,9 @@ def test_public_scan_finishes_three_frame_auto_battle_without_next_cycle() -> No
         template = image.convert("RGB")
     disabled = Image.new("RGB", (900, 600), "#112233")
     disabled.paste(template, (810, 500))
-    with Image.open(ROOT / "enabled_battle_full_panel.png") as image:
-        enabled = image.convert("RGB")
     now = 125.0
     controller, _window, mouse = _controller(
-        [_sample(disabled), _sample(disabled), _sample(enabled)],
+        [_sample(disabled), _sample(disabled), _enabled_battle_sample()],
         monotonic_clock=lambda: now,
     )
     capture = controller._capture_provider
@@ -336,17 +439,15 @@ def test_public_scan_finishes_three_frame_auto_battle_without_next_cycle() -> No
     diagnostics = result.details["capture_diagnostics"]
     assert [item["stage"] for item in diagnostics] == [
         "scan",
-        "auto_battle_second_frame",
-        "auto_battle_third_frame",
+        "auto_battle_normal-red-x_second_frame",
+        "auto_battle_normal-red-x_third_frame",
     ]
 
 
 def test_public_unknown_gameplay_uses_exact_auto_battle_evidence_only() -> None:
     disabled = _red_x_full_sample()
-    with Image.open(ROOT / "enabled_battle_full_panel.png") as image:
-        enabled = _sample(image.convert("RGB"))
     controller, _window, mouse = _controller(
-        [disabled, disabled, enabled],
+        [disabled, disabled, _enabled_battle_sample()],
         general_state=ReconnectScreenState.UNKNOWN,
     )
 
@@ -374,10 +475,8 @@ def test_public_unknown_gameplay_with_unknown_auto_evidence_never_clicks() -> No
 
 
 def test_public_unknown_enabled_panel_is_confirmed_without_click() -> None:
-    with Image.open(ROOT / "enabled_battle_full_panel.png") as image:
-        enabled = _sample(image.convert("RGB"))
     controller, _window, mouse = _controller(
-        [enabled],
+        [_enabled_battle_sample()],
         general_state=ReconnectScreenState.UNKNOWN,
     )
 
@@ -613,3 +712,217 @@ def test_public_reconnect_duplicate_identity_never_delivers_auto_battle_click() 
     controller.reconnect()
     assert mouse.clicks == []
     assert not controller._auto_battle_evidence
+
+
+@pytest.mark.skipif(
+    not BATTLE_AUTO_SOURCE.is_file(),
+    reason="私密實機來源只留在提供者本機",
+)
+def test_private_battle_auto_button_source_has_exact_hash_and_box() -> None:
+    assert hashlib.sha256(BATTLE_AUTO_SOURCE.read_bytes()).hexdigest() == (
+        BATTLE_AUTO_SOURCE_SHA256
+    )
+    recognizer = AutoBattleRecognizer(ROOT)
+    with Image.open(BATTLE_AUTO_SOURCE) as image:
+        evidence = recognizer.read(image.convert("RGB"))
+
+    assert image.size == (1336, 858)
+    assert evidence.enabled is False
+    assert evidence.disabled is False
+    assert evidence.battle_button_box == (1148, 498, 1272, 546)
+    assert evidence.battle_button_center == (1210.0, 522.0)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("partial", "offset", "scaled", "cropped"),
+)
+def test_battle_auto_button_incomplete_variants_fail_closed(mutation) -> None:
+    frame = _battle_button_frame()
+    if mutation == "partial":
+        frame.paste("#112233", (1210, 498, 1272, 546))
+    elif mutation == "offset":
+        shifted = Image.new("RGB", frame.size, "#112233")
+        shifted.paste(frame.crop((1148, 498, 1272, 546)), (900, 300))
+        frame = shifted
+    elif mutation == "scaled":
+        changed = Image.new("RGB", frame.size, "#112233")
+        button = frame.crop((1148, 498, 1272, 546)).resize((100, 39))
+        changed.paste(button, (1148, 498))
+        frame = changed
+    else:
+        frame = frame.crop((80, 60, 1250, 800)).resize((1336, 858))
+
+    evidence = AutoBattleRecognizer(ROOT).read(frame)
+
+    assert evidence.battle_button_box is None
+    assert evidence.enabled is False
+
+
+def test_battle_button_absent_first_frame_retries_within_two_seconds() -> None:
+    now = [0.0]
+    blank = _sample(Image.new("RGB", (1336, 858), "#112233"))
+    controller, _window, mouse = _controller(
+        [blank],
+        monotonic_clock=lambda: now[0],
+        battle_context=True,
+    )
+
+    first = controller.reconnect()
+
+    assert first.details["next_check_seconds"] <= 2
+    assert mouse.clicks == []
+    assert "a" * 64 in controller._auto_battle_button_windows
+
+    controller._capture_provider.frames.extend(
+        [
+            _sample(_battle_button_frame()),
+            _sample(_battle_button_frame()),
+            _enabled_battle_sample((1336, 858)),
+        ]
+    )
+    now[0] = 1.5
+    confirmed = controller.reconnect()
+
+    assert confirmed.details["clicked_windows"] == 0
+    assert len(mouse.clicks) == 1
+    assert mouse.clicks[0][0] == 1
+    assert mouse.clicks[0][1] == pytest.approx(
+        (1210 / 1336, 522 / 858)
+    )
+    assert controller._capture_provider.calls == 4
+    assert "a" * 64 not in controller._auto_battle_button_windows
+    assert "a" * 64 in controller._auto_battle_confirmed_instances
+
+
+def test_battle_button_window_expires_at_twenty_four_seconds() -> None:
+    now = [0.0]
+    blank = _sample(Image.new("RGB", (1336, 858), "#112233"))
+    controller, _window, mouse = _controller(
+        [blank],
+        monotonic_clock=lambda: now[0],
+        battle_context=True,
+    )
+    controller.reconnect()
+
+    controller._capture_provider.frames.extend(
+        [_sample(_battle_button_frame())]
+    )
+    now[0] = 24.0
+    result = controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert mouse.clicks == []
+    assert "a" * 64 not in controller._auto_battle_button_windows
+
+
+def test_normal_red_x_remains_first_priority() -> None:
+    disabled = _red_x_full_sample()
+    controller, _window, mouse = _controller(
+        [disabled, disabled, _enabled_battle_sample()],
+        battle_context=False,
+    )
+
+    controller.reconnect()
+
+    assert len(mouse.clicks) == 1
+    assert any(
+        item[2] == "normal-red-x"
+        for item in controller._auto_battle_attempted_actions
+    )
+    assert all(
+        item[2] != "battle-button"
+        for item in controller._auto_battle_attempted_actions
+    )
+
+
+def test_normal_confirmation_suppresses_later_battle_button() -> None:
+    controller, window, mouse = _controller([])
+    instance = WindowInstanceToken.from_window(window)
+    enabled = _enabled_battle_sample()
+
+    assert controller._run_auto_battle_for_connected(
+        window,
+        "a" * 64,
+        instance,
+        enabled,
+        "visible",
+        0,
+        controller._source_state_generation,
+        first_battle_context=False,
+    )
+    assert controller._run_auto_battle_for_connected(
+        window,
+        "a" * 64,
+        instance,
+        _sample(_battle_button_frame()),
+        "visible",
+        0,
+        controller._source_state_generation,
+        first_battle_context=True,
+    )
+
+    assert mouse.clicks == []
+    assert controller._capture_provider.calls == 0
+
+
+def test_normal_incomplete_then_battle_button_completes_same_scan() -> None:
+    now = [0.0]
+    controller, window, mouse = _controller(
+        [
+            _sample(_battle_button_frame()),
+            _enabled_battle_sample((1336, 858)),
+        ],
+        monotonic_clock=lambda: now[0],
+        battle_context=True,
+    )
+    instance = WindowInstanceToken.from_window(window)
+    normal_unknown = _sample(Image.new("RGB", (900, 600), "#112233"))
+
+    assert not controller._run_auto_battle_for_connected(
+        window,
+        "a" * 64,
+        instance,
+        normal_unknown,
+        "visible",
+        0,
+        controller._source_state_generation,
+        first_battle_context=False,
+    )
+    now[0] = 1.0
+    assert controller._run_auto_battle_for_connected(
+        window,
+        "a" * 64,
+        instance,
+        _sample(_battle_button_frame()),
+        "visible",
+        0,
+        controller._source_state_generation,
+        first_battle_context=True,
+    )
+
+    assert len(mouse.clicks) == 1
+    assert controller._capture_provider.calls == 2
+
+
+def test_auto_battle_switch_or_source_revoke_clears_second_entry_authority() -> None:
+    controller, window, mouse = _controller([])
+    fingerprint = "a" * 64
+    instance = WindowInstanceToken.from_window(window)
+    key = (instance, "visible", 0, controller._source_state_generation)
+    controller._auto_battle_confirmed_instances[fingerprint] = key
+    controller.set_auto_battle_enabled(False)
+
+    assert controller._auto_battle_confirmed_instances == {}
+    assert controller._auto_battle_button_windows == {}
+    assert mouse.clicks == []
+
+    controller.set_auto_battle_enabled(True)
+    controller._auto_battle_confirmed_instances[fingerprint] = key
+    controller._revoke_source_failure_evidence(
+        frozenset((fingerprint,)),
+        refresh_source_generation=True,
+    )
+
+    assert controller._auto_battle_confirmed_instances == {}
+    assert mouse.clicks == []

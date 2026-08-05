@@ -214,10 +214,42 @@ class UngroupedWindowService:
         normalized = normalize_launch_fingerprint(fingerprint)
         if normalized is None:
             return None
-        for item in self.snapshot():
-            if item.fingerprint == normalized:
-                return item.shortcut_path
-        return None
+        shortcut_paths = self._candidate_shortcuts()
+        group_paths = self._group_shortcuts()
+        all_paths = tuple(dict.fromkeys((*shortcut_paths, *group_paths)))
+        fingerprints = self._fingerprints_for(all_paths)
+        unique_shortcuts = self._unique_paths_by_fingerprint(
+            {
+                path: value
+                for path, value in fingerprints.items()
+                if path in shortcut_paths
+            }
+        )
+        grouped = {
+            value
+            for path, value in fingerprints.items()
+            if path in group_paths
+        }
+        path = unique_shortcuts.get(normalized)
+        if path is None or normalized in grouped:
+            return None
+        try:
+            windows = tuple(self._window_backend.list_windows())
+        except Exception:
+            return None
+        matches = tuple(
+            window
+            for window in windows
+            if all(
+                keyword in window.title.casefold()
+                for keyword in self._title_keywords
+            )
+            and normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+            == normalized
+        )
+        return path if len(matches) == 1 else None
 
     @classmethod
     def _status_for(cls, state: object) -> str:

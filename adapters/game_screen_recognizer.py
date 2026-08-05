@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
+import re
 import sys
 from typing import Any, Iterable
 
@@ -49,7 +50,9 @@ ROUTE_DIGIT_TEMPLATES = {
     7: "10_route_digit_7.png",
     8: "11_route_digit_8.png",
 }
-DEFAULT_LINE_NUMBER = 1
+RECENT_LOGIN_ROUTE_PATTERN = re.compile(
+    r"(?:線路|线路|路線|路线)[:：]?([1-8])"
+)
 LINE_ROUTE_CLICK_POINTS: dict[int, NormalizedPoint] = {
     1: (0.500, 0.327),
     2: (0.500, 0.385),
@@ -60,6 +63,29 @@ LINE_ROUTE_CLICK_POINTS: dict[int, NormalizedPoint] = {
     7: (0.500, 0.665),
     8: (0.500, 0.722),
 }
+LINE_SELECTION_CLIENT_TOP_RATIO = 45 / 938
+RECENT_LOGIN_STATUS_REGION: NormalizedRect = (
+    0.398,
+    0.292,
+    0.625,
+    0.336,
+)
+LINE_BUTTON_ROW_REGIONS: tuple[NormalizedRect, ...] = tuple(
+    (0.402, top / 938, 0.598, bottom / 938)
+    for top, bottom in (
+        (320, 360),
+        (370, 412),
+        (420, 463),
+        (471, 514),
+        (522, 565),
+        (573, 616),
+        (624, 667),
+        (675, 718),
+    )
+)
+LINE_LIST_SCROLL_POINT: NormalizedPoint = (0.500, 0.530)
+LINE_SCROLL_DOWN_DELTA = -120
+LINE_SCROLL_UP_DELTA = 120
 POPUP_TITLE_REGIONS: dict[ReconnectScreenState, NormalizedRect] = {
     ReconnectScreenState.POST_LOGIN_ACTIVITY: (0.400, 0.130, 0.600, 0.190),
     ReconnectScreenState.POST_LOGIN_RECOMMENDATION: (
@@ -154,6 +180,49 @@ CHARACTER_SELECTED_SIDE_REGIONS: tuple[
         ),
     )
     for left, top, right, bottom in CHARACTER_SLOT_REGIONS
+)
+PRIMARY_ROLE_SELECTION_SIZE = (1344, 850)
+PRIMARY_ROLE_SELECTION_EVIDENCE_FILE = (
+    "anonymous_live_structure/primary_role_selection.png"
+)
+# The user-confirmed three-card capture is client-only (no Windows title bar),
+# so its selected-card frame has a separately calibrated, exact-size geometry.
+PRIMARY_ROLE_SELECTED_BORDER_REGIONS: tuple[NormalizedRect, ...] = tuple(
+    (
+        (left + 8) / 1344,
+        575 / 850,
+        (right - 8) / 1344,
+        585 / 850,
+    )
+    for left, right in ((375, 575), (578, 778), (780, 980))
+)
+PRIMARY_ROLE_SELECTED_SIDE_REGIONS: tuple[
+    tuple[NormalizedRect, NormalizedRect, NormalizedRect], ...
+] = tuple(
+    (
+        (
+            (left + 8) / 1344,
+            667 / 850,
+            (right - 8) / 1344,
+            677 / 850,
+        ),
+        (left / 1344, 585 / 850, (left + 8) / 1344, 667 / 850),
+        ((right - 8) / 1344, 585 / 850, right / 1344, 667 / 850),
+    )
+    for left, right in ((375, 575), (578, 778), (780, 980))
+)
+PRIMARY_ROLE_CARD_STRUCTURE_REGIONS: tuple[NormalizedRect, ...] = tuple(
+    (left / 1344, 535 / 850, (left + 200) / 1344, 685 / 850)
+    for left in (375, 578, 780)
+)
+PRIMARY_ROLE_CARD_STRUCTURE_TILE_OFFSET = 2
+PRIMARY_ROLE_CARD_STRUCTURE_MAXIMUM_SCORE = 20.0
+PRIMARY_ROLE_CARD_STRUCTURE_MINIMUM_MARGIN = 3.0
+PRIMARY_ROLE_SELECTION_FRAME_MAXIMUM_SCORE = 45.0
+PRIMARY_ROLE_CARD_IDENTITIES: tuple[str | None, ...] = (
+    "120古",
+    None,
+    "120福",
 )
 CHARACTER_EMPTY_REFERENCE_SLOT_INDICES = (1, 2)
 CHARACTER_EMPTY_SLOT_MAXIMUM_SCORE = 30.0
@@ -250,6 +319,18 @@ ANONYMOUS_GENERAL_STRUCTURE_FILES = (
     "anonymous_live_structure/legacy_normal.png",
 )
 ANONYMOUS_GENERAL_STRUCTURE_MAXIMUM_SCORE = 8.0
+ANONYMOUS_GENERAL_HUD_STRUCTURE_FILE = (
+    "anonymous_live_structure/general_hud.png"
+)
+ANONYMOUS_GENERAL_HUD_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.000, 0.000, 0.220, 0.180),
+    (0.800, 0.000, 1.000, 0.140),
+    (0.910, 0.140, 1.000, 0.720),
+    (0.000, 0.900, 0.480, 1.000),
+    (0.480, 0.780, 0.780, 1.000),
+    (0.780, 0.720, 1.000, 1.000),
+)
+ANONYMOUS_GENERAL_HUD_MAXIMUM_SCORE = 8.0
 ANONYMOUS_ACTIVITY_STRUCTURE_FILE = (
     "anonymous_live_structure/activity_panel.png"
 )
@@ -263,6 +344,45 @@ ANONYMOUS_BATTLE_STRUCTURE_FILES = (
     "anonymous_live_structure/legacy_battle.png",
 )
 ANONYMOUS_BATTLE_STRUCTURE_MAXIMUM_SCORE = 8.0
+POST_DISCONNECT_WAITING_REFERENCE_FILE = (
+    "anonymous_live_structure/post_disconnect_waiting.png"
+)
+POST_DISCONNECT_WAITING_SIZE = (895, 605)
+POST_DISCONNECT_WAITING_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.000, 0.058, 0.360, 0.500),
+    (0.640, 0.058, 1.000, 0.420),
+    (0.390, 0.455, 0.640, 0.615),
+    (0.620, 0.410, 1.000, 0.875),
+    (0.000, 0.615, 0.500, 1.000),
+    (0.500, 0.855, 1.000, 1.000),
+)
+POST_DISCONNECT_WAITING_MAXIMUM_SCORE = 4.0
+MANUAL_AUTO_BATTLE_STRUCTURE_FILE = (
+    "auto_battle/battle_manual_auto_structure.png"
+)
+MANUAL_AUTO_BATTLE_SIZE = (1336, 858)
+MANUAL_AUTO_BATTLE_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.000, 0.580, 0.430, 0.780),
+    (0.000, 0.780, 0.480, 1.000),
+    (0.480, 0.720, 0.720, 1.000),
+    (0.720, 0.720, 0.940, 1.000),
+    (0.840, 0.150, 0.970, 0.420),
+    (0.840, 0.420, 0.970, 0.670),
+)
+MANUAL_AUTO_BATTLE_MAXIMUM_SCORE = 4.0
+WORLD_MAP_REGIONS: tuple[NormalizedRect, ...] = (
+    (0.000, 0.000, 1.000, 0.120),
+    (0.000, 0.120, 0.160, 0.450),
+    (0.840, 0.120, 1.000, 0.880),
+    (0.000, 0.820, 1.000, 1.000),
+    (0.180, 0.120, 0.500, 0.780),
+    (0.500, 0.120, 0.820, 0.780),
+)
+WORLD_MAP_STRUCTURES: tuple[tuple[str, tuple[int, int]], ...] = (
+    ("anonymous_live_structure/world_map_a.png", (873, 560)),
+    ("anonymous_live_structure/world_map_b.png", (887, 561)),
+)
+WORLD_MAP_MAXIMUM_SCORE = 2.0
 BATTLE_REFERENCE_FILE = "13_battle_gameplay.png"
 BATTLE_CONTEXT_REGION: NormalizedRect = (0.73, 0.0, 1.0, 0.22)
 BATTLE_CONTEXT_MAXIMUM_SCORE = 28.0
@@ -499,6 +619,9 @@ class ScreenRecognition:
     character_target_key: str | None = None
     character_candidates: tuple[CharacterSelectionCandidate, ...] = ()
     battle_context: bool = False
+    recent_line_present: bool | None = None
+    recent_login_role: str | None = None
+    line_scroll_delta: int = 0
 
     @property
     def recognized(self) -> bool:
@@ -561,6 +684,7 @@ class ReferenceScreenRecognizer:
                     *LOGIN_START_REFERENCE_FILES,
                     *ROUTE_DIGIT_TEMPLATES.values(),
                     *CHARACTER_LEVEL_TEMPLATE_FILES.values(),
+                    PRIMARY_ROLE_SELECTION_EVIDENCE_FILE,
                     BATTLE_REFERENCE_FILE,
                     CONNECTED_LIVE_REFERENCE_FILE,
                     BATTLE_WAITING_REFERENCE_FILE,
@@ -568,6 +692,10 @@ class ReferenceScreenRecognizer:
                     ANONYMOUS_ACTIVITY_STRUCTURE_FILE,
                     ANONYMOUS_DUNGEON_STRUCTURE_FILE,
                     *ANONYMOUS_BATTLE_STRUCTURE_FILES,
+                    POST_DISCONNECT_WAITING_REFERENCE_FILE,
+                    ANONYMOUS_GENERAL_HUD_STRUCTURE_FILE,
+                    MANUAL_AUTO_BATTLE_STRUCTURE_FILE,
+                    *(filename for filename, _size in WORLD_MAP_STRUCTURES),
                 )
             )
         )
@@ -802,6 +930,18 @@ class ReferenceScreenRecognizer:
         self,
         candidate: Image.Image,
     ) -> tuple[int | None, float | None]:
+        recent_text = self._recent_login_text(candidate)
+        if recent_text:
+            route_values = {
+                int(value)
+                for value in RECENT_LOGIN_ROUTE_PATTERN.findall(recent_text)
+            }
+            if len(route_values) == 1:
+                return next(iter(route_values)), 0.0
+            if re.search(r"(?:線路|线路|路線|路线)", recent_text):
+                # A visible route label that is ambiguous or contradictory is
+                # never allowed to fall through to a different visual digit.
+                return None, 255.0
         digit_crop = self._route_digit_crop(candidate)
         if digit_crop is None:
             return None, None
@@ -830,6 +970,163 @@ class ReferenceScreenRecognizer:
         if score > 65.0 or runner_up - score < 8.0:
             return None, round(score, 3)
         return route_number, round(score, 3)
+
+    def _recent_login_information_present(
+        self,
+        candidate: Image.Image,
+    ) -> bool:
+        """Distinguish an absent recent-login row from unreadable text."""
+
+        region = self._crop(candidate, RECENT_LOGIN_STATUS_REGION)
+        return self._binary_text(region).getbbox() is not None
+
+    def _recent_login_text(self, candidate: Image.Image) -> str:
+        return self._read_line_button_text(
+            self._crop(candidate, RECENT_LOGIN_STATUS_REGION)
+        )
+
+    def _read_line_button_text(self, image: Image.Image) -> str:
+        """Read one complete list row with the packaged local OCR model."""
+
+        reader = self._disconnect_reader()
+        if reader is None:
+            return ""
+        prepared = ImageOps.autocontrast(image.convert("L")).convert("RGB")
+        border = 8
+        canvas = Image.new(
+            "RGB",
+            (prepared.width + border * 2, prepared.height + border * 2),
+            "white",
+        )
+        canvas.paste(prepared, (border, border))
+        try:
+            from numpy import asarray
+
+            result, _elapsed = reader(
+                asarray(
+                    canvas.resize(
+                        (canvas.width * 3, canvas.height * 3),
+                        Image.Resampling.NEAREST,
+                    )
+                )
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return ""
+        return "".join(
+            item[0]
+            for item in result
+            if isinstance(item, (list, tuple))
+            and item
+            and isinstance(item[0], str)
+        ).replace(" ", "")
+
+    def _visible_line_buttons(
+        self,
+        candidate: Image.Image,
+    ) -> tuple[tuple[int, NormalizedPoint], ...]:
+        matches: list[tuple[int, NormalizedPoint]] = []
+        client_height = candidate.height * (
+            1.0 - LINE_SELECTION_CLIENT_TOP_RATIO
+        )
+        if client_height <= 1:
+            return ()
+        for region in LINE_BUTTON_ROW_REGIONS:
+            text = self._read_line_button_text(self._crop(candidate, region))
+            values = {
+                int(value)
+                for value in re.findall(r"(?<!\d)([1-8])(?:線|线)", text)
+            }
+            if len(values) != 1:
+                continue
+            number = next(iter(values))
+            centre_y = candidate.height * ((region[1] + region[3]) / 2)
+            client_y = (
+                centre_y
+                - candidate.height * LINE_SELECTION_CLIENT_TOP_RATIO
+            ) / client_height
+            matches.append(
+                (
+                    number,
+                    (0.500, max(0.0, min(1.0, client_y))),
+                )
+            )
+        unique = {
+            number: point
+            for number, point in matches
+            if sum(1 for value, _point in matches if value == number) == 1
+        }
+        return tuple(sorted(unique.items()))
+
+    def _recent_login_role(self, candidate: Image.Image) -> str | None:
+        text = self._recent_login_text(candidate)
+        match = re.search(
+            r"(?:角色|角色名)[:：]?([^,，。;；]+)",
+            text,
+        )
+        if match is None:
+            return None
+        value = match.group(1).strip(" .。…")
+        return value if len(value) >= 2 else None
+
+    def _line_selection_target(
+        self,
+        candidate: Image.Image,
+        *,
+        exact_reference_match: bool,
+    ) -> tuple[
+        int | None,
+        NormalizedPoint | None,
+        bool,
+        str | None,
+        int,
+    ]:
+        route_number, route_score = self._recognize_route_number(candidate)
+        recent_present = self._recent_login_information_present(candidate)
+        if route_number is None:
+            if recent_present:
+                # Existing but ambiguous text is never treated as absence.
+                return None, None, True, self._recent_login_role(candidate), 0
+            route_number = 1
+
+        visible = self._visible_line_buttons(candidate)
+        target_points = tuple(
+            point for number, point in visible if number == route_number
+        )
+        if len(target_points) == 1:
+            return (
+                route_number,
+                target_points[0],
+                recent_present,
+                self._recent_login_role(candidate),
+                0,
+            )
+        if not recent_present and route_number == 1:
+            # The explicit absence fallback is the only fixed-line rule.
+            return (
+                1,
+                LINE_ROUTE_CLICK_POINTS[1],
+                False,
+                None,
+                0,
+            )
+
+        visible_numbers = tuple(number for number, _point in visible)
+        scroll_delta = 0
+        if visible_numbers and route_number > max(visible_numbers):
+            scroll_delta = LINE_SCROLL_DOWN_DELTA
+        elif visible_numbers and route_number < min(visible_numbers):
+            scroll_delta = LINE_SCROLL_UP_DELTA
+        elif exact_reference_match and route_number == 8:
+            # The confirmed full-window reference itself proves that recent
+            # line 8 is requested while only rows through line 7 are visible.
+            scroll_delta = LINE_SCROLL_DOWN_DELTA
+        return (
+            route_number,
+            None,
+            recent_present,
+            self._recent_login_role(candidate),
+            scroll_delta,
+        )
 
     @staticmethod
     def _level_signature(image: Image.Image) -> Image.Image | None:
@@ -1043,11 +1340,15 @@ class ReferenceScreenRecognizer:
         cls,
         image: Image.Image,
     ) -> int | None:
+        if image.size == PRIMARY_ROLE_SELECTION_SIZE:
+            top_regions = PRIMARY_ROLE_SELECTED_BORDER_REGIONS
+            side_regions = PRIMARY_ROLE_SELECTED_SIDE_REGIONS
+        else:
+            top_regions = CHARACTER_SELECTED_BORDER_REGIONS
+            side_regions = CHARACTER_SELECTED_SIDE_REGIONS
         scores: list[tuple[float, int]] = []
         eligible_indices: set[int] = set()
-        for index, top_region in enumerate(
-            CHARACTER_SELECTED_BORDER_REGIONS
-        ):
+        for index, top_region in enumerate(top_regions):
             top_score = cls._minimum_channel_mean(
                 cls._crop(image, top_region)
             )
@@ -1056,7 +1357,7 @@ class ReferenceScreenRecognizer:
             side_scores: list[float] = []
             side_segments: list[tuple[float, ...]] = []
             for side_index, region in enumerate(
-                CHARACTER_SELECTED_SIDE_REGIONS[index]
+                side_regions[index]
             ):
                 side = cls._crop(image, region)
                 score = cls._minimum_channel_mean(side)
@@ -1105,6 +1406,82 @@ class ReferenceScreenRecognizer:
         ):
             return None
         return winner_index
+
+    def _primary_role_selection_identities(
+        self,
+        image: Image.Image,
+    ) -> tuple[str | None, ...] | None:
+        """Resolve only the exact user-confirmed three-card composition."""
+
+        if image.size != PRIMARY_ROLE_SELECTION_SIZE:
+            return None
+        frame_matches, _score = self._fixed_full_window_structure_score(
+            image,
+            reference_filename="05_character_selection.png",
+            regions=CHARACTER_SELECTION_FRAME_REGIONS,
+            maximum_score=PRIMARY_ROLE_SELECTION_FRAME_MAXIMUM_SCORE,
+            maximum_edge_score=(
+                CHARACTER_SELECTION_FRAME_MAXIMUM_EDGE_SCORE
+            ),
+        )
+        if not frame_matches:
+            return None
+        candidate_atlas = self._anonymous_structure_atlas(
+            image,
+            PRIMARY_ROLE_CARD_STRUCTURE_REGIONS,
+        )
+        reference = self._reference(
+            PRIMARY_ROLE_SELECTION_EVIDENCE_FILE
+        ).convert("L")
+        tile_width, tile_height = ANONYMOUS_STRUCTURE_TILE_SIZE
+        reference_tiles = tuple(
+            reference.crop(
+                (
+                    0,
+                    (PRIMARY_ROLE_CARD_STRUCTURE_TILE_OFFSET + index)
+                    * tile_height,
+                    tile_width,
+                    (PRIMARY_ROLE_CARD_STRUCTURE_TILE_OFFSET + index + 1)
+                    * tile_height,
+                )
+            )
+            for index in range(3)
+        )
+        for index in range(3):
+            candidate_tile = candidate_atlas.crop(
+                (
+                    0,
+                    index * tile_height,
+                    tile_width,
+                    (index + 1) * tile_height,
+                )
+            )
+            scores = sorted(
+                (
+                    float(
+                        ImageStat.Stat(
+                            ImageChops.difference(
+                                candidate_tile,
+                                reference_tile,
+                            )
+                        ).mean[0]
+                    ),
+                    reference_index,
+                )
+                for reference_index, reference_tile in enumerate(
+                    reference_tiles
+                )
+            )
+            best_score, best_index = scores[0]
+            if (
+                best_index != index
+                or best_score
+                > PRIMARY_ROLE_CARD_STRUCTURE_MAXIMUM_SCORE
+                or scores[1][0] - best_score
+                < PRIMARY_ROLE_CARD_STRUCTURE_MINIMUM_MARGIN
+            ):
+                return None
+        return PRIMARY_ROLE_CARD_IDENTITIES
 
     @staticmethod
     def _minimum_channel_mean(image: Image.Image) -> float | None:
@@ -1182,6 +1559,11 @@ class ReferenceScreenRecognizer:
         read_identity: bool = False,
     ) -> tuple[CharacterSelectionCandidate, ...]:
         selected_slot = self._selected_character_slot_index(image)
+        confirmed_identities = (
+            self._primary_role_selection_identities(image)
+            if read_identity
+            else None
+        )
         choices: list[CharacterSelectionCandidate] = []
         for index, level_region in enumerate(CHARACTER_LEVEL_REGIONS):
             signature = self._level_signature(
@@ -1203,14 +1585,16 @@ class ReferenceScreenRecognizer:
                     image,
                     level_region,
                 )
-            identity = (
-                self._character_selection_identity(
-                    image,
-                    CHARACTER_NAME_REGIONS[index],
+            identity = None
+            if read_identity:
+                identity = (
+                    confirmed_identities[index]
+                    if confirmed_identities is not None
+                    else self._character_selection_identity(
+                        image,
+                        CHARACTER_NAME_REGIONS[index],
+                    )
                 )
-                if read_identity
-                else None
-            )
             choices.append(
                 CharacterSelectionCandidate(
                     level=level,
@@ -1438,6 +1822,31 @@ class ReferenceScreenRecognizer:
                 ImageChops.difference(candidate_atlas, reference)
             ).mean[0]
         )
+
+    def _world_map_structure_match(
+        self,
+        candidate: Image.Image,
+    ) -> tuple[float, str] | None:
+        """Accept only either complete user-confirmed full map layout."""
+
+        scores = tuple(
+            (
+                self._anonymous_structure_score(
+                    candidate,
+                    reference_filename=filename,
+                    regions=WORLD_MAP_REGIONS,
+                ),
+                filename,
+            )
+            for filename, size in WORLD_MAP_STRUCTURES
+            if candidate.size == size
+        )
+        if not scores:
+            return None
+        score, filename = min(scores)
+        if score > WORLD_MAP_MAXIMUM_SCORE:
+            return None
+        return score, filename
 
     def _matches_live_window_dimensions(
         self,
@@ -1716,6 +2125,23 @@ class ReferenceScreenRecognizer:
         return (
             self._battle_context_score(candidate)
             <= BATTLE_CONTEXT_MAXIMUM_SCORE
+            or self._manual_auto_battle_context_matches(candidate)
+        )
+
+    def _manual_auto_battle_context_matches(
+        self,
+        candidate: Image.Image,
+    ) -> bool:
+        if candidate.size != MANUAL_AUTO_BATTLE_SIZE:
+            return False
+        score = self._anonymous_structure_score(
+            candidate,
+            reference_filename=MANUAL_AUTO_BATTLE_STRUCTURE_FILE,
+            regions=MANUAL_AUTO_BATTLE_REGIONS,
+        )
+        return bool(
+            score <= MANUAL_AUTO_BATTLE_MAXIMUM_SCORE
+            and self._battle_screen_has_structure(candidate)
         )
 
     @staticmethod
@@ -2323,6 +2749,39 @@ class ReferenceScreenRecognizer:
                 reference_name=None,
             )
 
+        # This exact waiting layout is read-only connected battle evidence.
+        # Recognition alone never authorizes a restart: the controller may
+        # restart only when the confirmed disconnect frame itself retained
+        # the approved battle context.
+        if candidate.size == POST_DISCONNECT_WAITING_SIZE:
+            waiting_score = self._anonymous_structure_score(
+                candidate,
+                reference_filename=POST_DISCONNECT_WAITING_REFERENCE_FILE,
+                regions=POST_DISCONNECT_WAITING_REGIONS,
+            )
+            if waiting_score <= POST_DISCONNECT_WAITING_MAXIMUM_SCORE:
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=round(waiting_score, 3),
+                    click_point=None,
+                    reference_name=POST_DISCONNECT_WAITING_REFERENCE_FILE,
+                    battle_context=True,
+                )
+
+        if self._manual_auto_battle_context_matches(candidate):
+            manual_battle_score = self._anonymous_structure_score(
+                candidate,
+                reference_filename=MANUAL_AUTO_BATTLE_STRUCTURE_FILE,
+                regions=MANUAL_AUTO_BATTLE_REGIONS,
+            )
+            return ScreenRecognition(
+                state=ReconnectScreenState.CONNECTED,
+                score=round(manual_battle_score, 3),
+                click_point=None,
+                reference_name=MANUAL_AUTO_BATTLE_STRUCTURE_FILE,
+                battle_context=True,
+            )
+
         # Full-window comparisons are used only as a fail-closed tie-breaker.
         # Keep one candidate signature for the entire recognition pass; the
         # fixed reference signatures are cached below so this safety check does
@@ -2533,7 +2992,12 @@ class ReferenceScreenRecognizer:
             if definition.state
             is ReconnectScreenState.CHARACTER_SELECTION
         )
-        if live_window_dimensions and not any(
+        primary_role_selection_matches = bool(
+            self._primary_role_selection_identities(candidate) is not None
+        )
+        if (
+            live_window_dimensions or primary_role_selection_matches
+        ) and not any(
             item[1].state is ReconnectScreenState.CHARACTER_SELECTION
             for item in valid_scored
         ):
@@ -2543,7 +3007,9 @@ class ReferenceScreenRecognizer:
                     reference_filename=character_definition.filename,
                     regions=CHARACTER_SELECTION_FRAME_REGIONS,
                     maximum_score=(
-                        CHARACTER_SELECTION_FRAME_MAXIMUM_SCORE
+                        PRIMARY_ROLE_SELECTION_FRAME_MAXIMUM_SCORE
+                        if primary_role_selection_matches
+                        else CHARACTER_SELECTION_FRAME_MAXIMUM_SCORE
                     ),
                     maximum_edge_score=(
                         CHARACTER_SELECTION_FRAME_MAXIMUM_EDGE_SCORE
@@ -2580,6 +3046,39 @@ class ReferenceScreenRecognizer:
                     if item[1].state
                     is not ReconnectScreenState.CHARACTER_SELECTION
                 ]
+        if not valid_scored:
+            world_map_match = self._world_map_structure_match(candidate)
+            if world_map_match is not None:
+                world_map_score, world_map_file = world_map_match
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=round(world_map_score, 3),
+                    click_point=None,
+                    reference_name=world_map_file,
+                    battle_context=False,
+                )
+
+            general_hud_score = self._anonymous_structure_score(
+                candidate,
+                reference_filename=ANONYMOUS_GENERAL_HUD_STRUCTURE_FILE,
+                regions=ANONYMOUS_GENERAL_HUD_REGIONS,
+            )
+            if (
+                general_hud_score
+                <= ANONYMOUS_GENERAL_HUD_MAXIMUM_SCORE
+                and not self._connected_central_region_has_blocking_overlay(
+                    candidate,
+                    self._reference(CONNECTED_LIVE_REFERENCE_FILE),
+                    include_confirmed_modal=True,
+                )
+            ):
+                return ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=round(general_hud_score, 3),
+                    click_point=None,
+                    reference_name=ANONYMOUS_GENERAL_HUD_STRUCTURE_FILE,
+                    battle_context=False,
+                )
         if live_window_dimensions:
             activity_panel_score = self._anonymous_structure_score(
                 candidate,
@@ -2821,13 +3320,25 @@ class ReferenceScreenRecognizer:
         character_importance = None
         character_slot_index = None
         character_slot_selected = None
+        character_candidates: tuple[CharacterSelectionCandidate, ...] = ()
+        recent_line_present = None
+        recent_login_role = None
+        line_scroll_delta = 0
         click_point = definition.click_point
         if definition.state is ReconnectScreenState.LINE_SELECTION:
-            # The chooser always opens with the already-confirmed default
-            # first line.  Displayed route text is diagnostic only and may
-            # describe a recommendation; it never authorizes another line.
-            line_number = DEFAULT_LINE_NUMBER
-            click_point = LINE_ROUTE_CLICK_POINTS[line_number]
+            (
+                line_number,
+                click_point,
+                recent_line_present,
+                recent_login_role,
+                line_scroll_delta,
+            ) = self._line_selection_target(
+                candidate,
+                exact_reference_match=(
+                    definition.filename == "03_line_selection_dialog.png"
+                    and score <= 1.0
+                ),
+            )
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
             character_candidates = self._character_selection_candidates(
                 candidate,
@@ -2854,6 +3365,9 @@ class ReferenceScreenRecognizer:
             character_slot_index=character_slot_index,
             character_slot_selected=character_slot_selected,
             character_candidates=character_candidates,
+            recent_line_present=recent_line_present,
+            recent_login_role=recent_login_role,
+            line_scroll_delta=line_scroll_delta,
         )
 
     def recognize_capture(self, sample: CaptureSample | None) -> ScreenRecognition:

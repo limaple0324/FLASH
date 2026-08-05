@@ -10,6 +10,8 @@ from adapters.windows_pointer_sync import WindowsPointerSyncController
 from adapters.windows_smart_reconnect import WindowsSmartReconnectController
 from config.config_manager import ConfigManager
 from core.sp1_boundaries import SmartReconnectBoundary
+from core.window_registry import CharacterWindowRecord
+from domain.character import Character, CharacterImportance
 from main import (
     GAME_TIME_AUTO_UPDATE_KEY,
     GAME_TIME_OFFSET_MS_KEY,
@@ -30,12 +32,14 @@ from main import (
     apply_smart_reconnect_auto_battle_setting,
     apply_smart_reconnect_snapshot_transition,
     normalize_smart_reconnect_auto_battle_enabled,
+    resolve_registered_reconnect_roles,
     group_role_action_started_game,
     group_window_launch_started_game,
     stop_input_sync_pair,
 )
 from services.app_context import AppContext
 from services.smart_reconnect_monitor import SmartReconnectMonitor
+from services.ungrouped_window_service import UngroupedWindowService
 from services.smart_reconnect_capture_settings_service import (
     SMART_RECONNECT_CAPTURE_MODES_KEY,
     SmartReconnectCaptureSettings,
@@ -52,6 +56,70 @@ from services.game_operation_gate import GameOperationGate
 class _SyncWindow:
     def __init__(self, fingerprint: str) -> None:
         self.launch_fingerprint = fingerprint
+
+
+def test_registered_reconnect_roles_cross_check_all_confirmed_primary_records():
+    names = (
+        "120古",
+        "120靈",
+        "120射",
+        "120福",
+        "120獵",
+        "亞洛",
+        "160帥",
+        "大排",
+        "和尚",
+        "餐廳",
+    )
+    characters = tuple(
+        Character(
+            f"id-{index}",
+            name,
+            120 if name.startswith("120") else 160,
+            CharacterImportance.PRIMARY,
+        )
+        for index, name in enumerate(names)
+    )
+    registry = tuple(
+        CharacterWindowRecord(
+            character.character_id,
+            character.display_name,
+            role="主號",
+        )
+        for character in characters
+    )
+
+    result = resolve_registered_reconnect_roles(
+        characters,
+        registry,
+        (),
+    )
+
+    assert {item.role_id for item in result} == set(names)
+    assert all(
+        item.importance is CharacterImportance.PRIMARY
+        for item in result
+    )
+
+
+def test_registered_primary_requires_character_and_registry_identity_agreement():
+    characters = (
+        Character(
+            "id-fu",
+            "120福",
+            120,
+            CharacterImportance.PRIMARY,
+        ),
+    )
+    mismatched = (
+        CharacterWindowRecord("id-fu", "120古", role="主號"),
+    )
+
+    assert resolve_registered_reconnect_roles(
+        characters,
+        mismatched,
+        (),
+    ) == ()
 
 
 def test_sync_scope_requires_every_safe_window_with_matching_identity():
@@ -456,6 +524,21 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
         == SmartReconnectCaptureSettings()
     )
     assert reconnect.capture_settings == SmartReconnectCaptureSettings()
+
+
+def test_build_services_wires_registered_primary_and_unique_ungrouped_shortcut(
+    tmp_path,
+):
+    build_services(root=tmp_path)
+
+    reconnect = AppContext.get(WindowsSmartReconnectController)
+    ungrouped = AppContext.get(UngroupedWindowService)
+    shortcut_provider = reconnect._ungrouped_shortcut_provider
+
+    assert callable(reconnect._registered_role_provider)
+    assert shortcut_provider is not None
+    assert shortcut_provider.__self__ is ungrouped
+    assert shortcut_provider.__func__ is UngroupedWindowService.shortcut_for
 
 
 def test_build_services_preserves_explicit_saved_auto_battle_off(tmp_path):

@@ -38,6 +38,7 @@ from adapters.windows_launch_fingerprint import (
 )
 from adapters.windows_smart_reconnect import (
     ReconnectRuntimeStateStore,
+    RegisteredReconnectRole,
     WindowsSmartReconnectController,
 )
 from adapters.windows_pointer_sync import (
@@ -81,6 +82,7 @@ from domain.activity_schedule import (
     build_confirmed_activity_catalog,
 )
 from domain.character_store import CharacterStore
+from domain.character import CharacterImportance
 from domain.character_game_data_store import CharacterGameDataStore
 from domain.confirmed_activity_rules import (
     CONFIRMED_ACTIVITY_RULE_EVENT,
@@ -642,6 +644,74 @@ def normalize_smart_reconnect_auto_battle_enabled(value: object) -> bool:
     """Keep an explicit player-off choice; missing or invalid values default on."""
 
     return value if isinstance(value, bool) else True
+
+
+def resolve_registered_reconnect_roles(
+    characters: object,
+    registry_records: object,
+    groups: object,
+) -> tuple[RegisteredReconnectRole, ...]:
+    """Cross-check stable character and registry identities for reconnect."""
+
+    character_items = tuple(characters) if isinstance(characters, (list, tuple)) else ()
+    registry_items = (
+        tuple(registry_records)
+        if isinstance(registry_records, (list, tuple))
+        else ()
+    )
+    group_items = tuple(groups) if isinstance(groups, (list, tuple)) else ()
+    by_id = {
+        item.character_id: item
+        for item in character_items
+        if isinstance(getattr(item, "character_id", None), str)
+    }
+    registry_by_id: dict[str, list[object]] = {}
+    for item in registry_items:
+        character_id = getattr(item, "character_id", None)
+        if isinstance(character_id, str) and character_id.strip():
+            registry_by_id.setdefault(character_id.strip(), []).append(item)
+
+    values: dict[str, set[CharacterImportance]] = {}
+
+    def remember(role_id: object, importance: object) -> None:
+        if not isinstance(role_id, str) or not isinstance(
+            importance,
+            CharacterImportance,
+        ):
+            return
+        normalized = role_id.strip()
+        if not normalized:
+            return
+        values.setdefault(normalized.casefold(), set()).add(importance)
+
+    for character_id, character in by_id.items():
+        if character.importance is not CharacterImportance.PRIMARY:
+            continue
+        matches = registry_by_id.get(character_id, [])
+        if len(matches) != 1:
+            continue
+        record = matches[0]
+        if (
+            getattr(record, "display_name", None)
+            != character.display_name
+            or getattr(record, "role", None)
+            != CharacterImportance.PRIMARY.value
+        ):
+            continue
+        remember(character.display_name, CharacterImportance.PRIMARY)
+
+    for group in group_items:
+        for entry in tuple(getattr(group, "entries", ())):
+            character = by_id.get(getattr(entry, "entry_id", None))
+            if character is None:
+                continue
+            remember(getattr(entry, "role_id", None), character.importance)
+
+    return tuple(
+        RegisteredReconnectRole(role_id, next(iter(importances)))
+        for role_id, importances in sorted(values.items())
+        if len(importances) == 1
+    )
 
 
 def apply_auto_battle_after_game_launch(
@@ -1509,6 +1579,14 @@ def build_services(
             return observed.get(normalized, ReconnectScreenState.UNKNOWN)
 
     AppContext.register(SyncOperationRecordStore, operation_record_store)
+
+    def registered_reconnect_roles() -> tuple[RegisteredReconnectRole, ...]:
+        return resolve_registered_reconnect_roles(
+            character_store.load(),
+            registry.all(),
+            group_configuration_service.groups(),
+        )
+
     reconnect_controller = WindowsSmartReconnectController.for_real_windows(
         reference_dir=resource_path(RECONNECT_REFERENCE_DIR),
         state_path=paths.data_dir() / RECONNECT_STATE_FILENAME,
@@ -1531,6 +1609,7 @@ def build_services(
                 detail,
             )
         ),
+        registered_role_provider=registered_reconnect_roles,
     )
 
     def registered_game_data_window(window_handle: int) -> RegisteredGameDataWindow | None:
@@ -1622,6 +1701,9 @@ def build_services(
                 candidate_windows=windows,
             )
         ),
+    )
+    reconnect_controller.set_ungrouped_shortcut_provider(
+        ungrouped_window_service.shortcut_for
     )
     AppContext.register(UngroupedWindowService, ungrouped_window_service)
     deferred_sync_service = DeferredSyncOperationService(
