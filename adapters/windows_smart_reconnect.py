@@ -2376,6 +2376,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._activation_snapshot_source_fingerprints: (
             dict[str, str] | None
         ) = None
+        self._activation_snapshot_direct_identity_collisions: (
+            frozenset[str]
+        ) = frozenset()
         self._initial_login_authorizations: dict[
             str,
             _InitialLoginAuthorization,
@@ -3924,6 +3927,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._activation_snapshot_source_fingerprints = (
                 source_fingerprints
             )
+            self._activation_snapshot_direct_identity_collisions = frozenset()
             self._pending_reopen_fingerprints.clear()
             self._reopen_retry_after.clear()
             self._auto_battle_evidence.clear()
@@ -4146,6 +4150,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._force_login_timeout_attempts.clear()
             self._activation_snapshot_instances = None
             self._activation_snapshot_source_fingerprints = None
+            self._activation_snapshot_direct_identity_collisions = frozenset()
             self._allowed_fingerprints = None
             self._group_launch_plan = None
             self._runtime_scope_token = None
@@ -4779,6 +4784,40 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def _candidate_windows(self) -> tuple[WindowInfo, ...]:
         return self._candidate_window_set()[0]
 
+    def _activation_direct_identity_collisions(
+        self,
+        windows: Iterable[WindowInfo],
+    ) -> frozenset[str]:
+        """Find new collisions against a snapshot's single direct identity."""
+
+        snapshot = self._activation_snapshot_instances
+        sources = self._activation_snapshot_source_fingerprints
+        if snapshot is None or sources is None or set(sources) != set(snapshot):
+            return frozenset()
+        source_counts: Counter[str] = Counter()
+        for window in windows:
+            if not isinstance(window, WindowInfo):
+                continue
+            source_fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+            if (
+                source_fingerprint is not None
+                and WindowInstanceToken.from_window(window) is not None
+            ):
+                source_counts[source_fingerprint] += 1
+        snapshot_source_counts = Counter(sources.values())
+        return frozenset(
+            source_fingerprint
+            for source_fingerprint, count in source_counts.items()
+            if (
+                count > 1
+                and source_fingerprint in snapshot
+                and sources.get(source_fingerprint) == source_fingerprint
+                and snapshot_source_counts[source_fingerprint] == 1
+            )
+        )
+
     def _bind_activation_snapshot_window_set(
         self,
         windows: Iterable[WindowInfo],
@@ -4788,9 +4827,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         sources = self._activation_snapshot_source_fingerprints
         candidates = tuple(windows)
         if snapshot is None:
+            self._activation_snapshot_direct_identity_collisions = frozenset()
             return candidates, blocked_fingerprints
         if sources is None or set(sources) != set(snapshot):
+            self._activation_snapshot_direct_identity_collisions = frozenset(
+                snapshot
+            )
             return (), frozenset(snapshot)
+        self._activation_snapshot_direct_identity_collisions = (
+            self._activation_direct_identity_collisions(candidates)
+        )
 
         bound: list[WindowInfo] = []
         used: set[str] = set()
@@ -6803,6 +6849,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             source_failures,
             blocked_fingerprints,
         ) = self._candidate_window_set()
+        direct_identity_collisions = (
+            self._activation_snapshot_direct_identity_collisions
+        )
         isolated_source_block = (
             self._source_failure_isolated_to_blocked_windows(
                 source_failures,
@@ -8323,6 +8372,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         # never shares a role's two-frame evidence with any other role.
         if execute and self.auto_battle_execution_allowed():
             for window, fingerprint, item in recognized:
+                if fingerprint in direct_identity_collisions:
+                    # The activation snapshot still identifies the original
+                    # window, but a new second live instance claiming its
+                    # direct source identity makes an automatic click unsafe.
+                    self._auto_battle_evidence.pop(fingerprint, None)
+                    self._auto_battle_button_windows.pop(fingerprint, None)
+                    self._auto_battle_confirmed_instances.pop(
+                        fingerprint,
+                        None,
+                    )
+                    continue
                 if item.state not in _AUTO_BATTLE_GENERAL_STATES:
                     continue
                 instance_and_route = fresh_capture_instances.get(fingerprint)
