@@ -1050,12 +1050,10 @@ class ReferenceScreenRecognizer:
                     (0.500, max(0.0, min(1.0, client_y))),
                 )
             )
-        unique = {
-            number: point
-            for number, point in matches
-            if sum(1 for value, _point in matches if value == number) == 1
-        }
-        return tuple(sorted(unique.items()))
+        # Keep every candidate here.  The caller must see a duplicated row
+        # number and fail closed instead of silently treating one duplicate as
+        # a unique target or a reason to scroll the list.
+        return tuple(sorted(matches))
 
     def _recent_login_role(self, candidate: Image.Image) -> str | None:
         text = self._recent_login_text(candidate)
@@ -1089,6 +1087,20 @@ class ReferenceScreenRecognizer:
             route_number = 1
 
         visible = self._visible_line_buttons(candidate)
+        if any(
+            sum(1 for value, _point in visible if value == number) != 1
+            for number, _point in visible
+        ):
+            # More than one candidate for any numbered row is ambiguous.  It
+            # cannot authorize a click or a wheel action, including recent
+            # route 8 below the viewport.
+            return (
+                route_number,
+                None,
+                recent_present,
+                self._recent_login_role(candidate),
+                0,
+            )
         target_points = tuple(
             point for number, point in visible if number == route_number
         )
@@ -1116,9 +1128,11 @@ class ReferenceScreenRecognizer:
             scroll_delta = LINE_SCROLL_DOWN_DELTA
         elif visible_numbers and route_number < min(visible_numbers):
             scroll_delta = LINE_SCROLL_UP_DELTA
-        elif exact_reference_match and route_number == 8:
-            # The confirmed full-window reference itself proves that recent
-            # line 8 is requested while only rows through line 7 are visible.
+        elif route_number == 8:
+            # Line 8 is the final numbered route, so a uniquely read recent
+            # route 8 can only be below the current viewport when no numbered
+            # row was read.  Keep scrolling down; never substitute another
+            # visible row or the line-1 fallback.
             scroll_delta = LINE_SCROLL_DOWN_DELTA
         return (
             route_number,

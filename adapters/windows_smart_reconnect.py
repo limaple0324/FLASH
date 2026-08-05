@@ -110,6 +110,13 @@ AUTO_BATTLE_RECHECK_SECONDS = 2
 RECONNECT_TOTAL_BUDGET_SECONDS = 60.0
 START_GAME_BUDGET_SECONDS = 60.0
 TIMING_DIAGNOSTIC_LIMIT = 256
+_ISOLATABLE_TARGET_WINDOW_FAILURE_CODES = frozenset(
+    {
+        "shortcut_identity_unresolved",
+        "window_identity_duplicate",
+        "window_instance_incomplete",
+    }
+)
 
 
 class ScreenRecognizer(Protocol):
@@ -2366,6 +2373,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._activation_snapshot_instances: (
             dict[str, WindowInstanceToken] | None
         ) = None
+        self._activation_snapshot_source_fingerprints: (
+            dict[str, str] | None
+        ) = None
         self._initial_login_authorizations: dict[
             str,
             _InitialLoginAuthorization,
@@ -2415,6 +2425,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             _ActionConfirmation,
         ] = {}
         self._battle_restart_attempts: dict[
+            str,
+            _BattleRestartEvent,
+        ] = {}
+        # One delivered timeout confirmation may not be repeated merely
+        # because capture routing, settings, or source generation changes.
+        # The event is intentionally bound only to immutable window-session
+        # facts; geometry and capture details remain final-delivery gates.
+        self._force_login_timeout_attempts: dict[
             str,
             _BattleRestartEvent,
         ] = {}
@@ -3382,6 +3400,96 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         return resolved
 
     @staticmethod
+    def _activation_monitor_fingerprint(
+        source_fingerprint: str,
+        instance: WindowInstanceToken,
+    ) -> str:
+        """Derive one activation-local identity from immutable window facts."""
+
+        encoded = json.dumps(
+            (
+                "smart-reconnect-activation-v1",
+                source_fingerprint,
+                instance.handle,
+                instance.process_id,
+                instance.thread_id,
+                instance.window_class,
+                instance.process_lifecycle_token,
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _activation_snapshot_candidate_instances(
+        cls,
+        windows: Iterable[WindowInfo],
+    ) -> tuple[
+        dict[str, tuple[WindowInfo, WindowInstanceToken]],
+        dict[str, str],
+        int,
+    ]:
+        """Isolate incomplete instances and disambiguate shared executables."""
+
+        candidates = tuple(windows)
+        parsed: list[tuple[WindowInfo, str, WindowInstanceToken]] = []
+        for window in candidates:
+            if not isinstance(window, WindowInfo) or not window.visible:
+                continue
+            source_fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+            instance = WindowInstanceToken.from_window(window)
+            if source_fingerprint is None or instance is None:
+                continue
+            parsed.append((window, source_fingerprint, instance))
+
+        handle_counts = Counter(item[2].handle for item in parsed)
+        process_counts = Counter(item[2].process_id for item in parsed)
+        safe = tuple(
+            item
+            for item in parsed
+            if handle_counts[item[2].handle] == 1
+            and process_counts[item[2].process_id] == 1
+        )
+        source_counts = Counter(item[1] for item in safe)
+        provisional = tuple(
+            (
+                (
+                    source_fingerprint
+                    if source_counts[source_fingerprint] == 1
+                    else cls._activation_monitor_fingerprint(
+                        source_fingerprint,
+                        instance,
+                    )
+                ),
+                window,
+                source_fingerprint,
+                instance,
+            )
+            for window, source_fingerprint, instance in safe
+        )
+        monitor_counts = Counter(item[0] for item in provisional)
+        resolved: dict[
+            str,
+            tuple[WindowInfo, WindowInstanceToken],
+        ] = {}
+        source_fingerprints: dict[str, str] = {}
+        for monitor_fingerprint, window, source_fingerprint, instance in provisional:
+            if monitor_counts[monitor_fingerprint] != 1:
+                continue
+            resolved[monitor_fingerprint] = (
+                replace(
+                    window,
+                    launch_fingerprint=monitor_fingerprint,
+                ),
+                instance,
+            )
+            source_fingerprints[monitor_fingerprint] = source_fingerprint
+        return resolved, source_fingerprints, len(candidates) - len(resolved)
+
+    @staticmethod
     def _candidate_collections_overlap(
         supplied: dict[str, tuple[WindowInfo, WindowInstanceToken]],
         authority_windows: Iterable[WindowInfo],
@@ -3401,6 +3509,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if handle in supplied_handles:
                 return True
         return False
+
+    @staticmethod
+    def _source_failure_isolated_to_blocked_windows(
+        failure_codes: tuple[str, ...],
+        blocked_fingerprints: frozenset[str],
+    ) -> bool:
+        """Allow only explicitly identified target-local failures to isolate."""
+
+        normalized = tuple(
+            normalize_launch_fingerprint(fingerprint)
+            for fingerprint in blocked_fingerprints
+        )
+        return bool(normalized) and all(
+            fingerprint is not None for fingerprint in normalized
+        ) and all(
+            isinstance(code, str)
+            and code in _ISOLATABLE_TARGET_WINDOW_FAILURE_CODES
+            for code in failure_codes
+        )
 
     def observe_screen_states(
         self,
@@ -3747,13 +3874,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 source_failures,
                 blocked_fingerprints,
             ) = self._candidate_window_set()
-            if source_failures:
+            isolated_source_block = (
+                self._source_failure_isolated_to_blocked_windows(
+                    source_failures,
+                    blocked_fingerprints,
+                )
+            )
+            if source_failures and not isolated_source_block:
                 return self._snapshot_failure(
                     "reconnect.snapshot_source_failed",
                     "目前無法安全讀取遊戲視窗，沒有啟用智慧重連。",
                     source_failures[0],
                 )
-            if blocked_fingerprints:
+            if blocked_fingerprints and not isolated_source_block:
                 return self._snapshot_failure(
                     "reconnect.snapshot_identity_blocked",
                     "目前遊戲視窗身分有衝突，沒有啟用智慧重連。",
@@ -3765,19 +3898,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     "目前沒有可安全監看的遊戲視窗，沒有啟用智慧重連。",
                     "snapshot_empty",
                 )
-            if any(
-                not isinstance(window, WindowInfo) or not window.visible
-                for window in candidate_windows
-            ):
-                return self._snapshot_failure(
-                    "reconnect.snapshot_incomplete",
-                    "目前有不完整的遊戲視窗，沒有啟用智慧重連。",
-                    "window_not_visible",
-                )
-            complete_instances = self._unique_complete_candidate_instances(
+            (
+                complete_instances,
+                source_fingerprints,
+                isolated_window_count,
+            ) = self._activation_snapshot_candidate_instances(
                 candidate_windows
             )
-            if complete_instances is None:
+            if not complete_instances:
                 return self._snapshot_failure(
                     "reconnect.snapshot_identity_unsafe",
                     "目前遊戲視窗不完整或身分重複，沒有啟用智慧重連。",
@@ -3793,6 +3921,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 for fingerprint, (_window, instance)
                 in complete_instances.items()
             }
+            self._activation_snapshot_source_fingerprints = (
+                source_fingerprints
+            )
             self._pending_reopen_fingerprints.clear()
             self._reopen_retry_after.clear()
             self._auto_battle_evidence.clear()
@@ -3825,6 +3956,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 {
                     "failure_codes": [],
                     "window_count": len(complete_instances),
+                    "isolated_window_count": (
+                        isolated_window_count + len(blocked_fingerprints)
+                    ),
                 },
             )
 
@@ -3942,6 +4076,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 | set(self._trusted_connected_evidence)
                 | set(self._recent_login_role_ids)
                 | set(self._auto_battle_confirmed_instances)
+                | set(self._force_login_timeout_attempts)
                 | self._primary_entry_authorized
                 | self._primary_connected_fingerprints
                 | {
@@ -3974,6 +4109,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 self._trusted_connected_evidence,
                 self._recent_login_role_ids,
                 self._auto_battle_confirmed_instances,
+                self._force_login_timeout_attempts,
             ):
                 for fingerprint in removed:
                     mapping.pop(fingerprint, None)
@@ -4007,7 +4143,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._primary_connected_fingerprints.clear()
             self._reconnect_timing_flows.clear()
             self._initial_login_authorizations.clear()
+            self._force_login_timeout_attempts.clear()
             self._activation_snapshot_instances = None
+            self._activation_snapshot_source_fingerprints = None
             self._allowed_fingerprints = None
             self._group_launch_plan = None
             self._runtime_scope_token = None
@@ -4641,6 +4779,109 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def _candidate_windows(self) -> tuple[WindowInfo, ...]:
         return self._candidate_window_set()[0]
 
+    def _bind_activation_snapshot_window_set(
+        self,
+        windows: Iterable[WindowInfo],
+        blocked_fingerprints: frozenset[str],
+    ) -> tuple[tuple[WindowInfo, ...], frozenset[str]]:
+        snapshot = self._activation_snapshot_instances
+        sources = self._activation_snapshot_source_fingerprints
+        candidates = tuple(windows)
+        if snapshot is None:
+            return candidates, blocked_fingerprints
+        if sources is None or set(sources) != set(snapshot):
+            return (), frozenset(snapshot)
+
+        bound: list[WindowInfo] = []
+        used: set[str] = set()
+        unmatched: list[tuple[WindowInfo, str, WindowInstanceToken]] = []
+        for window in candidates:
+            if not isinstance(window, WindowInfo):
+                continue
+            source_fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+            instance = WindowInstanceToken.from_window(window)
+            if source_fingerprint is None or instance is None:
+                continue
+            if source_fingerprint in snapshot:
+                monitor_fingerprint = source_fingerprint
+                candidate_source_fingerprint = sources.get(
+                    monitor_fingerprint
+                )
+            else:
+                monitor_fingerprint = self._activation_monitor_fingerprint(
+                    source_fingerprint,
+                    instance,
+                )
+                candidate_source_fingerprint = source_fingerprint
+            expected = snapshot.get(monitor_fingerprint)
+            if (
+                expected is None
+                or sources.get(monitor_fingerprint)
+                != candidate_source_fingerprint
+                or monitor_fingerprint in used
+                or not self._same_live_instance_identity(expected, instance)
+            ):
+                unmatched.append(
+                    (window, candidate_source_fingerprint, instance)
+                )
+                continue
+            used.add(monitor_fingerprint)
+            bound.append(
+                replace(
+                    window,
+                    launch_fingerprint=monitor_fingerprint,
+                )
+            )
+
+        missing = set(snapshot) - used
+        for source_fingerprint in set(sources.values()):
+            replacement_candidates = tuple(
+                item for item in unmatched if item[1] == source_fingerprint
+            )
+            replacement_targets = tuple(
+                monitor_fingerprint
+                for monitor_fingerprint in missing
+                if sources.get(monitor_fingerprint) == source_fingerprint
+                and self._has_reconnect_session(monitor_fingerprint)
+            )
+            if (
+                len(replacement_candidates) != 1
+                or len(replacement_targets) != 1
+            ):
+                continue
+            window, _source_fingerprint, _instance = replacement_candidates[0]
+            monitor_fingerprint = replacement_targets[0]
+            bound.append(
+                replace(
+                    window,
+                    launch_fingerprint=monitor_fingerprint,
+                )
+            )
+            used.add(monitor_fingerprint)
+            missing.discard(monitor_fingerprint)
+        mapped_blocked = frozenset(
+            {
+                monitor_fingerprint
+                for monitor_fingerprint, source_fingerprint in sources.items()
+                if (
+                    monitor_fingerprint in blocked_fingerprints
+                    or source_fingerprint in blocked_fingerprints
+                )
+            }
+            | {
+                normalized
+                for item in blocked_fingerprints
+                if (
+                    (normalized := normalize_launch_fingerprint(item))
+                    is not None
+                    and normalized not in sources.values()
+                )
+            }
+        )
+        return tuple(bound), mapped_blocked
+
     def _candidate_window_set(
         self,
     ) -> tuple[
@@ -4652,12 +4893,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             try:
                 provided = self._target_windows_provider()
                 if isinstance(provided, ResolvedTargetWindows):
-                    return (
-                        provided.windows,
-                        provided.failure_codes,
-                        provided.blocked_fingerprints,
+                    windows, blocked = (
+                        self._bind_activation_snapshot_window_set(
+                            provided.windows,
+                            provided.blocked_fingerprints,
+                        )
                     )
-                return tuple(provided), (), frozenset()
+                    return windows, provided.failure_codes, blocked
+                windows, blocked = self._bind_activation_snapshot_window_set(
+                    tuple(provided),
+                    frozenset(),
+                )
+                return windows, (), blocked
             except Exception:
                 return (
                     (),
@@ -4665,18 +4912,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     frozenset(),
                 )
         try:
-            return (
-                tuple(
-                    window
-                    for window in self._window_backend.list_windows()
-                    if all(
-                        keyword in window.title.casefold()
-                        for keyword in self._keywords
-                    )
-                ),
-                (),
+            windows = tuple(
+                window
+                for window in self._window_backend.list_windows()
+                if all(
+                    keyword in window.title.casefold()
+                    for keyword in self._keywords
+                )
+            )
+            windows, blocked = self._bind_activation_snapshot_window_set(
+                windows,
                 frozenset(),
             )
+            return windows, (), blocked
         except Exception:
             return (), ("window_enumeration_failed",), frozenset()
 
@@ -4694,21 +4942,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if snapshot is None:
             return candidate_windows, blocked_fingerprints, ()
         allowed = frozenset(snapshot)
-        scoped_candidates = tuple(
-            window
-            for window in candidate_windows
-            if normalize_launch_fingerprint(window.launch_fingerprint)
-            in allowed
-        )
         scoped_blocked = frozenset(
             fingerprint
             for fingerprint in blocked_fingerprints
             if fingerprint in allowed
         )
+        scoped_candidates = tuple(
+            window
+            for window in candidate_windows
+            if (
+                (fingerprint := normalize_launch_fingerprint(
+                    window.launch_fingerprint
+                ))
+                in allowed
+                and fingerprint not in scoped_blocked
+            )
+        )
         complete_instances = self._unique_complete_candidate_instances(
             scoped_candidates
         )
-        if complete_instances is None or scoped_blocked:
+        if complete_instances is None:
             self._initial_login_authorizations.clear()
             self._revoke_source_failure_evidence(
                 allowed,
@@ -4888,8 +5141,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         provider = self._ungrouped_shortcut_provider
         if provider is None:
             return None
+        source_fingerprint = (
+            self._activation_snapshot_source_fingerprints or {}
+        ).get(fingerprint, fingerprint)
         try:
-            candidate = provider(fingerprint)
+            candidate = provider(source_fingerprint)
         except (OSError, RuntimeError, TypeError, ValueError):
             return None
         if not isinstance(candidate, Path):
@@ -4927,6 +5183,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._terminal_evidence.pop(fingerprint, None)
         self._recent_login_role_ids.pop(fingerprint, None)
         self._battle_restart_attempts.pop(fingerprint, None)
+        self._force_login_timeout_attempts.pop(fingerprint, None)
         self._clear_action_confirmation(fingerprint)
 
     def _clear_reconnect_authority(
@@ -5629,6 +5886,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             for item in blocked_fingerprints
             if allowed is None or item in allowed
         )
+        isolated_source_block = (
+            self._source_failure_isolated_to_blocked_windows(
+                failures,
+                blocked_fingerprints,
+            )
+        )
         instances = self._unique_complete_candidate_instances(
             scoped_candidates
         )
@@ -5641,8 +5904,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
         if (
             expected_instance is None
-            or failures
-            or scoped_blocked_fingerprints
+            or (failures and not isolated_source_block)
+            or fingerprint in scoped_blocked_fingerprints
             or instances is None
             or group_failures
         ):
@@ -6540,6 +6803,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             source_failures,
             blocked_fingerprints,
         ) = self._candidate_window_set()
+        isolated_source_block = (
+            self._source_failure_isolated_to_blocked_windows(
+                source_failures,
+                blocked_fingerprints,
+            )
+        )
         (
             candidate_windows,
             blocked_fingerprints,
@@ -6580,8 +6849,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if source_failure_affected_fingerprints:
             if (
                 self._allowed_fingerprints is not None
-                and not source_failures
-                and not blocked_fingerprints
+                and (
+                    not source_failures
+                    or isolated_source_block
+                )
             ):
                 # A planned role that is temporarily absent is not a new
                 # source-authority failure. Mark only that role UNKNOWN while
@@ -6611,8 +6882,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         now = self._monotonic_clock()
         group_failures = self._group_failures(windows)
         source_identity_unsafe = bool(
-            source_failures
-            or blocked_fingerprints
+            (source_failures and not isolated_source_block)
+            or (blocked_fingerprints and not isolated_source_block)
             or snapshot_failures
             or self._unique_complete_candidate_instances(
                 candidate_windows
@@ -6856,6 +7127,38 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     capture_route,
                 )
                 auto_battle_capture_samples[fingerprint] = sample
+                timeout_event = _BattleRestartEvent.from_instance(instance)
+                previous_timeout_event = (
+                    self._force_login_timeout_attempts.get(fingerprint)
+                )
+                if previous_timeout_event is not None:
+                    if previous_timeout_event != timeout_event:
+                        # A complete window-session replacement is the only
+                        # identity change that can start a separate timeout
+                        # event without first proving the old dialog gone.
+                        self._force_login_timeout_attempts.pop(
+                            fingerprint,
+                            None,
+                        )
+                        retry = self._action_retry_after.get(fingerprint)
+                        if (
+                            retry is not None
+                            and retry[0]
+                            is ReconnectScreenState.FORCE_LOGIN_TIMEOUT
+                        ):
+                            self._action_retry_after.pop(fingerprint, None)
+                    elif recognition.state not in {
+                        ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+                        ReconnectScreenState.UNKNOWN,
+                        ReconnectScreenState.CHECK_DISABLED,
+                    }:
+                        # A fresh recognized non-timeout frame proves this
+                        # dialog event ended.  A later timeout may then form
+                        # new two-frame evidence.
+                        self._force_login_timeout_attempts.pop(
+                            fingerprint,
+                            None,
+                        )
                 if recognition.state is ReconnectScreenState.LINE_SELECTION:
                     recent_role = self._complete_role_identity(
                         recognition.recent_login_role
@@ -6985,6 +7288,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 recognition,
             )
             if (
+                recognition.state is ReconnectScreenState.FORCE_LOGIN_TIMEOUT
+                and instance is not None
+                and self._force_login_timeout_attempts.get(fingerprint)
+                == _BattleRestartEvent.from_instance(instance)
+            ):
+                # The same dialog is still present.  Its first confirmed
+                # delivery was final even if capture authority changed later.
+                self._clear_action_confirmation(fingerprint)
+                recognition = replace(recognition, click_point=None)
+            if (
                 recognition.state is ReconnectScreenState.CHARACTER_SELECTION
                 and recognition.click_point is None
             ):
@@ -7007,10 +7320,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     and previous_state[0] == instance
                     and previous_state[1] is not recognition.state
                 ):
-                    # A real state transition is the readiness signal.  Do
-                    # not keep sleeping merely because an older screen had a
-                    # conservative fallback deadline.
-                    self._flow_pause_until.pop(fingerprint, None)
+                    preserve_login_cooldown = bool(
+                        previous_state[1]
+                        in {
+                            ReconnectScreenState.DISCONNECTED,
+                            ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+                        }
+                        and recognition.state
+                        is ReconnectScreenState.FORCE_LOGIN_START
+                    )
+                    if not preserve_login_cooldown:
+                        # Other proven state transitions are readiness
+                        # signals and can continue immediately.
+                        self._flow_pause_until.pop(fingerprint, None)
                 if instance is None:
                     self._action_state_since.pop(fingerprint, None)
                 else:
@@ -7817,9 +8139,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         item.state
                         is ReconnectScreenState.FORCE_LOGIN_TIMEOUT
                     ):
+                        self._force_login_timeout_attempts[fingerprint] = (
+                            _BattleRestartEvent.from_instance(
+                                confirmed_instance
+                            )
+                        )
                         self._flow_pause_until[fingerprint] = (
                             mutation_completed_at
-                            + self._policy.retry_interval_seconds
+                            + self._policy.force_login_wait_seconds
                         )
                     elif (
                         item.state is ReconnectScreenState.LINE_SELECTION

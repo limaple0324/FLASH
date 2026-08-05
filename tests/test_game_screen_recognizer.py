@@ -2355,6 +2355,37 @@ def test_public_line_selection_scrolls_without_clicking_another_visible_row(
     assert result.line_scroll_delta == -120
 
 
+def test_public_line_selection_duplicate_candidates_never_scroll_or_click(
+    monkeypatch,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    monkeypatch.setattr(
+        recognizer,
+        "_recent_login_text",
+        lambda _candidate: "最近一次登入資訊 線路:8",
+    )
+    monkeypatch.setattr(
+        recognizer,
+        "_recent_login_information_present",
+        lambda _candidate: True,
+    )
+    monkeypatch.setattr(
+        recognizer,
+        "_visible_line_buttons",
+        lambda _candidate: (
+            (8, (0.5, 0.60)),
+            (8, (0.5, 0.72)),
+        ),
+    )
+    with Image.open(REFERENCE_DIR / "03_line_selection_dialog.png") as source:
+        result = recognizer.recognize_image(source.convert("RGB"))
+
+    assert result.state is ReconnectScreenState.LINE_SELECTION
+    assert result.line_number == 8
+    assert result.click_point is None
+    assert result.line_scroll_delta == 0
+
+
 def test_line_selection_ambiguous_recent_text_never_defaults_to_line_one(
     monkeypatch,
 ):
@@ -2500,7 +2531,7 @@ def test_line_selection_modal_takes_priority_over_login_background(monkeypatch):
     assert result.line_number == 8
     assert result.recent_line_present is True
     assert result.click_point is None
-    assert result.line_scroll_delta == 0
+    assert result.line_scroll_delta == -120
 
 
 def test_invalid_lower_score_does_not_mask_valid_connected_match(monkeypatch):
