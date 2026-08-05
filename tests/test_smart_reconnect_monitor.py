@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 import services.smart_reconnect_monitor as smart_reconnect_monitor_module
 from adapters.game_screen_recognizer import ScreenRecognition
 from adapters.windows_background_capture import CaptureSample
@@ -49,6 +51,16 @@ class RecordingLogger:
 
     def error(self, message):
         self.error_messages.append(message)
+
+
+class NotifyingInfoLogger(RecordingLogger):
+    def __init__(self):
+        super().__init__()
+        self.info_recorded = threading.Event()
+
+    def info(self, message):
+        super().info(message)
+        self.info_recorded.set()
 
 
 class BlockingBoundary(FakeBoundary):
@@ -173,6 +185,200 @@ def test_runtime_status_separates_waiting_recovery_from_real_failure():
             },
         )
     )
+    assert monitor.runtime_status == "重連失敗"
+
+
+def test_runtime_status_reproduces_real_partial_reconnect_sequence():
+    monitor = SmartReconnectMonitor(
+        FakeBoundary([]),
+        fallback_delay_seconds=20,
+    )
+    monitor._thread = type(
+        "AliveThread",
+        (),
+        {"is_alive": lambda self: True},
+    )()
+    sequence = (
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                "connected_windows": 8,
+                "unknown_windows": 2,
+                "state_counts": {
+                    "connected": 8,
+                    "disconnected": 2,
+                    "unknown": 2,
+                },
+                "failure_codes": ["screen_unknown"],
+            },
+        ),
+        OperationResult(
+            True,
+            "reconnect.progressed_with_isolation",
+            details={
+                "connected_windows": 8,
+                "unknown_windows": 2,
+                "clicked_windows": 2,
+                "state_counts": {
+                    "connected": 8,
+                    "disconnected": 2,
+                    "unknown": 2,
+                },
+                "failure_codes": ["screen_unknown"],
+            },
+        ),
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                "connected_windows": 0,
+                "unknown_windows": 12,
+                "state_counts": {"unknown": 12},
+                "failure_codes": ["capture_failed", "screen_unknown"],
+            },
+        ),
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                "connected_windows": 8,
+                "unknown_windows": 2,
+                "state_counts": {
+                    "connected": 8,
+                    "character_selection": 1,
+                    "reconnecting": 1,
+                    "unknown": 2,
+                },
+                "failure_codes": ["screen_unknown"],
+            },
+        ),
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                "connected_windows": 10,
+                "unknown_windows": 2,
+                "state_counts": {"connected": 10, "unknown": 2},
+                "failure_codes": ["screen_unknown"],
+            },
+        ),
+    )
+
+    for now, result in enumerate(sequence):
+        monitor._set_runtime_status(result, now=float(now * 2))
+        assert monitor.runtime_status == "重連中"
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    (
+        "capture_failed",
+        "snapshot_identity_collision",
+        "target_window_provider_failed",
+        "click_delivery_uncertain",
+    ),
+)
+def test_runtime_status_does_not_hide_real_safety_failure(failure_code):
+    monitor = SmartReconnectMonitor(FakeBoundary([]))
+    monitor._thread = type(
+        "AliveThread",
+        (),
+        {"is_alive": lambda self: True},
+    )()
+
+    monitor._set_runtime_status(
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                "state_counts": {"unknown": 1},
+                "failure_codes": [failure_code],
+            },
+        ),
+        now=100.0,
+    )
+
+    assert monitor.runtime_status == "重連失敗"
+
+
+def test_repeated_recovery_state_does_not_refresh_progress_deadline():
+    monitor = SmartReconnectMonitor(
+        FakeBoundary([]),
+        fallback_delay_seconds=10,
+    )
+    monitor._thread = type(
+        "AliveThread",
+        (),
+        {"is_alive": lambda self: True},
+    )()
+    monitor._set_runtime_status(
+        OperationResult(
+            True,
+            "reconnect.progressed_with_isolation",
+            details={
+                "connected_windows": 8,
+                "clicked_windows": 1,
+                "state_counts": {"connected": 8, "disconnected": 1},
+                "failure_codes": ["screen_unknown"],
+            },
+        ),
+        now=0.0,
+    )
+
+    failure = OperationResult(
+        False,
+        "reconnect.waiting",
+        details={
+            "connected_windows": 0,
+            "unknown_windows": 11,
+            "state_counts": {"disconnected": 1, "unknown": 11},
+            "failure_codes": ["capture_failed", "screen_unknown"],
+        },
+    )
+    monitor._set_runtime_status(failure, now=9.0)
+    assert monitor.runtime_status == "重連中"
+
+    monitor._set_runtime_status(failure, now=11.0)
+    assert monitor.runtime_status == "重連失敗"
+
+
+def test_real_safety_failure_is_immediate_during_recovery_grace():
+    monitor = SmartReconnectMonitor(
+        FakeBoundary([]),
+        fallback_delay_seconds=10,
+    )
+    monitor._thread = type(
+        "AliveThread",
+        (),
+        {"is_alive": lambda self: True},
+    )()
+    monitor._set_runtime_status(
+        OperationResult(
+            True,
+            "reconnect.progressed_with_isolation",
+            details={
+                "connected_windows": 8,
+                "clicked_windows": 1,
+                "state_counts": {"connected": 8, "disconnected": 1},
+                "failure_codes": ["screen_unknown"],
+            },
+        ),
+        now=0.0,
+    )
+
+    monitor._set_runtime_status(
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                "state_counts": {"disconnected": 1},
+                "failure_codes": ["snapshot_identity_collision"],
+            },
+        ),
+        now=1.0,
+    )
+
     assert monitor.runtime_status == "重連失敗"
 
 
@@ -556,6 +762,139 @@ def test_start_and_stop_are_idempotent():
     assert monitor.running is False
     assert boundary.execution_changes[0] is True
     assert boundary.execution_changes[-1] is False
+
+
+def test_start_reports_reconnecting_while_first_scan_is_warming_up():
+    boundary = BlockingBoundary()
+    monitor = SmartReconnectMonitor(boundary)
+
+    assert monitor.start() is True
+    assert boundary.started.wait(1) is True
+    assert monitor.runtime_status == "重連中"
+
+    boundary.release.set()
+    assert monitor.stop(timeout_seconds=1) is True
+
+
+def test_first_capture_failure_after_start_fails_without_fake_grace():
+    failure = OperationResult(
+        False,
+        "reconnect.waiting",
+        details={
+            "connected_windows": 0,
+            "unknown_windows": 12,
+            "state_counts": {"unknown": 12},
+            "failure_codes": ["capture_failed", "screen_unknown"],
+            "next_check_seconds": 60,
+        },
+    )
+    logger = NotifyingInfoLogger()
+    monitor = SmartReconnectMonitor(
+        FakeBoundary([failure]),
+        logger=logger,
+        fallback_delay_seconds=60,
+    )
+
+    assert monitor.start() is True
+    assert logger.info_recorded.wait(1) is True
+    assert monitor.runtime_status == "重連失敗"
+    assert monitor.stop(timeout_seconds=1) is True
+
+
+def test_first_connected_count_sets_baseline_before_real_increase_progresses():
+    initial_failure = OperationResult(
+        False,
+        "reconnect.waiting",
+        details={
+            "connected_windows": 5,
+            "unknown_windows": 7,
+            "state_counts": {"connected": 5, "unknown": 7},
+            "failure_codes": ["capture_failed", "screen_unknown"],
+            "next_check_seconds": 60,
+        },
+    )
+    increased = OperationResult(
+        False,
+        "reconnect.waiting",
+        details={
+            "connected_windows": 6,
+            "unknown_windows": 6,
+            "state_counts": {"connected": 6, "unknown": 6},
+            "failure_codes": ["capture_failed", "screen_unknown"],
+            "next_check_seconds": 60,
+        },
+    )
+
+    class GatedIncreaseBoundary(FakeBoundary):
+        def __init__(self):
+            super().__init__([initial_failure, increased])
+            self.allow_second_result = threading.Event()
+
+        def reconnect(self):
+            if self.calls == 1:
+                self.allow_second_result.wait(2)
+            return super().reconnect()
+
+    boundary = GatedIncreaseBoundary()
+    logger = NotifyingInfoLogger()
+    monitor = SmartReconnectMonitor(
+        boundary,
+        logger=logger,
+        fallback_delay_seconds=60,
+    )
+
+    assert monitor.start() is True
+    assert logger.info_recorded.wait(1) is True
+    assert monitor.runtime_status == "重連失敗"
+
+    logger.info_recorded.clear()
+    boundary.allow_second_result.set()
+    assert monitor.set_monitor_interval_ms(2500) is True
+    assert logger.info_recorded.wait(1) is True
+    assert monitor.runtime_status == "重連中"
+    assert monitor.stop(timeout_seconds=1) is True
+
+
+def test_stop_and_restart_do_not_reuse_previous_recovery_progress():
+    progressed = OperationResult(
+        True,
+        "reconnect.progressed_with_isolation",
+        details={
+            "connected_windows": 8,
+            "clicked_windows": 1,
+            "state_counts": {"connected": 8, "disconnected": 1},
+            "failure_codes": ["screen_unknown"],
+            "next_check_seconds": 60,
+        },
+    )
+    failure = OperationResult(
+        False,
+        "reconnect.waiting",
+        details={
+            "connected_windows": 9,
+            "unknown_windows": 3,
+            "state_counts": {"connected": 9, "unknown": 3},
+            "failure_codes": ["capture_failed", "screen_unknown"],
+            "next_check_seconds": 60,
+        },
+    )
+    logger = NotifyingInfoLogger()
+    monitor = SmartReconnectMonitor(
+        FakeBoundary([progressed, failure]),
+        logger=logger,
+        fallback_delay_seconds=60,
+    )
+
+    assert monitor.start() is True
+    assert logger.info_recorded.wait(1) is True
+    assert monitor.runtime_status == "重連中"
+    assert monitor.stop(timeout_seconds=1) is True
+
+    logger.info_recorded.clear()
+    assert monitor.start() is True
+    assert logger.info_recorded.wait(1) is True
+    assert monitor.runtime_status == "重連失敗"
+    assert monitor.stop(timeout_seconds=1) is True
 
 
 def test_one_cycle_exception_marks_failure_then_monitor_continues_and_stops():

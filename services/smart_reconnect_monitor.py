@@ -24,6 +24,16 @@ SMART_RECONNECT_MONITOR_MODES = (
 SMART_RECONNECT_STATUS_ENABLED = "已開啟"
 SMART_RECONNECT_STATUS_RECONNECTING = "重連中"
 SMART_RECONNECT_STATUS_FAILED = "重連失敗"
+_RECOVERY_RESULT_CODES = frozenset(
+    {
+        "reconnect.waiting",
+        "reconnect.progressed",
+        "reconnect.progressed_with_isolation",
+    }
+)
+_TRANSIENT_RECOVERY_FAILURE_CODES = frozenset(
+    {"capture_failed", "screen_unknown"}
+)
 
 
 def normalize_smart_reconnect_interval_ms(
@@ -89,6 +99,8 @@ class SmartReconnectMonitor:
         self._disconnected_without_progress_reported = False
         self._fully_connected_stable_from: float | None = None
         self._runtime_status: str | None = None
+        self._runtime_recovery_progress_at: float | None = None
+        self._runtime_connected_high_watermark: int | None = None
 
     @property
     def running(self) -> bool:
@@ -110,42 +122,121 @@ class SmartReconnectMonitor:
         with self._lock:
             return self._runtime_status if self.running else None
 
-    def _set_runtime_status(self, result: OperationResult) -> None:
+    def _set_runtime_status(
+        self,
+        result: OperationResult,
+        *,
+        now: float | None = None,
+    ) -> None:
+        if now is None:
+            now = time.monotonic()
         details = result.details or {}
         failure_codes = details.get("failure_codes")
         normalized_failure_codes = (
-            tuple(str(item) for item in failure_codes)
+            frozenset(str(item) for item in failure_codes)
             if isinstance(failure_codes, (list, tuple))
-            else ()
-        )
-        has_failure = (
-            bool(normalized_failure_codes)
-        )
-        safely_waiting = (
-            result.code == "reconnect.waiting"
-            and normalized_failure_codes in ((), ("screen_unknown",))
+            else frozenset()
         )
         safely_paused_for_rebinding = (
             result.code == "reconnect.operation_paused"
-            and normalized_failure_codes == ("operation_gate_closed",)
+            and normalized_failure_codes == {"operation_gate_closed"}
         )
-        recovering = self._contains_recovery_states(details) or any(
+        safe_unknown_wait = (
+            result.code == "reconnect.waiting"
+            and normalized_failure_codes.issubset({"screen_unknown"})
+        )
+        terminal_failure_codes = (
+            normalized_failure_codes
+            - _TRANSIENT_RECOVERY_FAILURE_CODES
+        )
+        recovering = self._contains_recovery_states(details)
+        execution_progress = any(
             self._has_positive_count(details, name)
-            for name in ("actionable_windows", "clicked_windows", "restarted_windows")
+            for name in ("clicked_windows", "restarted_windows")
         )
-        if safely_waiting or safely_paused_for_rebinding:
+        connected_windows = details.get("connected_windows")
+        connected_count = (
+            connected_windows
+            if isinstance(connected_windows, int)
+            and not isinstance(connected_windows, bool)
+            and connected_windows >= 0
+            else None
+        )
+        with self._lock:
+            previous_progress_at = self._runtime_recovery_progress_at
+            previous_connected_high = self._runtime_connected_high_watermark
+        if connected_count is None:
+            connected_increased = False
+            observed_connected_high = previous_connected_high
+        elif previous_connected_high is None:
+            connected_increased = False
+            observed_connected_high = connected_count
+        else:
+            connected_increased = connected_count > previous_connected_high
+            observed_connected_high = max(
+                previous_connected_high,
+                connected_count,
+            )
+        controller_progressed = result.code in {
+            "reconnect.progressed",
+            "reconnect.progressed_with_isolation",
+        }
+        recovery_progress = bool(
+            result.code in _RECOVERY_RESULT_CODES
+            and (
+                controller_progressed
+                or execution_progress
+                or connected_increased
+            )
+        )
+        recent_recovery_progress = bool(
+            previous_progress_at is not None
+            and now - previous_progress_at <= self._fallback_delay_seconds
+        )
+        transient_failure_during_recovery = bool(
+            result.code == "reconnect.waiting"
+            and normalized_failure_codes
+            and normalized_failure_codes.issubset(
+                _TRANSIENT_RECOVERY_FAILURE_CODES
+            )
+            and recent_recovery_progress
+        )
+        is_full_health = self._is_fully_connected_healthy(result)
+        next_connected_high = observed_connected_high
+        if is_full_health:
+            status = SMART_RECONNECT_STATUS_ENABLED
+            next_progress_at = None
+        elif safely_paused_for_rebinding:
             status = SMART_RECONNECT_STATUS_RECONNECTING
-        elif not result.success and has_failure:
+            next_progress_at = previous_progress_at
+        elif terminal_failure_codes:
             status = SMART_RECONNECT_STATUS_FAILED
-        elif recovering:
+            next_progress_at = previous_progress_at
+        elif recovery_progress:
             status = SMART_RECONNECT_STATUS_RECONNECTING
-        elif not result.success:
+            next_progress_at = now
+        elif (
+            safe_unknown_wait
+            or transient_failure_during_recovery
+            or (
+                result.code in _RECOVERY_RESULT_CODES
+                and recovering
+                and not normalized_failure_codes
+            )
+        ):
+            status = SMART_RECONNECT_STATUS_RECONNECTING
+            next_progress_at = previous_progress_at
+        elif not result.success or normalized_failure_codes:
             status = SMART_RECONNECT_STATUS_FAILED
+            next_progress_at = previous_progress_at
         else:
             status = SMART_RECONNECT_STATUS_ENABLED
+            next_progress_at = None
         with self._lock:
             if self.running:
                 self._runtime_status = status
+                self._runtime_recovery_progress_at = next_progress_at
+                self._runtime_connected_high_watermark = next_connected_high
 
     def set_monitor_mode(self, value: object) -> bool:
         normalized = normalize_smart_reconnect_mode(value)
@@ -350,8 +441,8 @@ class SmartReconnectMonitor:
     def run_once(self) -> tuple[OperationResult, float]:
         result = self._boundary.reconnect()
         details = result.details or {}
-        self._set_runtime_status(result)
         now = time.monotonic()
+        self._set_runtime_status(result, now=now)
 
         delay = self._safe_delay(result, self._fallback_delay_seconds)
         is_full_health = self._is_fully_connected_healthy(result)
@@ -428,6 +519,8 @@ class SmartReconnectMonitor:
                 delay = self._fallback_delay_seconds
                 with self._lock:
                     self._runtime_status = SMART_RECONNECT_STATUS_FAILED
+                    self._runtime_recovery_progress_at = None
+                    self._runtime_connected_high_watermark = None
                 if self._logger is not None:
                     self._logger.error(
                         "Smart reconnect monitor cycle failed safely; "
@@ -452,7 +545,9 @@ class SmartReconnectMonitor:
                 execution_switch(True)
             self._stop_event.clear()
             self._settings_changed_event.clear()
-            self._runtime_status = SMART_RECONNECT_STATUS_ENABLED
+            self._runtime_status = SMART_RECONNECT_STATUS_RECONNECTING
+            self._runtime_recovery_progress_at = None
+            self._runtime_connected_high_watermark = None
             self._thread = threading.Thread(
                 target=self._run,
                 name="FLASH-SmartReconnect",
@@ -467,6 +562,8 @@ class SmartReconnectMonitor:
                 self._stop_event.set()
                 self._settings_changed_event.set()
                 self._runtime_status = None
+                self._runtime_recovery_progress_at = None
+                self._runtime_connected_high_watermark = None
                 return False
             return True
 
@@ -492,5 +589,7 @@ class SmartReconnectMonitor:
                 if self._thread is thread:
                     self._thread = None
                     self._runtime_status = None
+                    self._runtime_recovery_progress_at = None
+                    self._runtime_connected_high_watermark = None
         return stopped
 
