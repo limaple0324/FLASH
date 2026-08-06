@@ -765,12 +765,13 @@ def _world_map_negative_variant(
     "source_path,source_size,source_sha256,reference_name",
     WORLD_MAP_SOURCES,
 )
-def test_private_full_world_maps_are_connected_and_zero_input(
+def test_private_full_world_maps_do_not_prove_normal_connection(
     source_path,
     source_size,
     source_sha256,
     reference_name,
 ):
+    del reference_name
     if not source_path.is_file():
         pytest.skip("本機私密來源不存在")
     assert hashlib.sha256(source_path.read_bytes()).hexdigest() == source_sha256
@@ -779,8 +780,7 @@ def test_private_full_world_maps_are_connected_and_zero_input(
         assert source.size == source_size
         result = recognizer.recognize_image(source.convert("RGB"))
 
-    assert result.state is ReconnectScreenState.CONNECTED
-    assert result.reference_name == reference_name
+    assert result.state is ReconnectScreenState.UNKNOWN
     assert result.click_point is None
 
 

@@ -370,19 +370,6 @@ MANUAL_AUTO_BATTLE_REGIONS: tuple[NormalizedRect, ...] = (
     (0.840, 0.420, 0.970, 0.670),
 )
 MANUAL_AUTO_BATTLE_MAXIMUM_SCORE = 4.0
-WORLD_MAP_REGIONS: tuple[NormalizedRect, ...] = (
-    (0.000, 0.000, 1.000, 0.120),
-    (0.000, 0.120, 0.160, 0.450),
-    (0.840, 0.120, 1.000, 0.880),
-    (0.000, 0.820, 1.000, 1.000),
-    (0.180, 0.120, 0.500, 0.780),
-    (0.500, 0.120, 0.820, 0.780),
-)
-WORLD_MAP_STRUCTURES: tuple[tuple[str, tuple[int, int]], ...] = (
-    ("anonymous_live_structure/world_map_a.png", (873, 560)),
-    ("anonymous_live_structure/world_map_b.png", (887, 561)),
-)
-WORLD_MAP_MAXIMUM_SCORE = 2.0
 BATTLE_REFERENCE_FILE = "13_battle_gameplay.png"
 BATTLE_CONTEXT_REGION: NormalizedRect = (0.73, 0.0, 1.0, 0.22)
 BATTLE_CONTEXT_MAXIMUM_SCORE = 28.0
@@ -695,7 +682,6 @@ class ReferenceScreenRecognizer:
                     POST_DISCONNECT_WAITING_REFERENCE_FILE,
                     ANONYMOUS_GENERAL_HUD_STRUCTURE_FILE,
                     MANUAL_AUTO_BATTLE_STRUCTURE_FILE,
-                    *(filename for filename, _size in WORLD_MAP_STRUCTURES),
                 )
             )
         )
@@ -1836,31 +1822,6 @@ class ReferenceScreenRecognizer:
                 ImageChops.difference(candidate_atlas, reference)
             ).mean[0]
         )
-
-    def _world_map_structure_match(
-        self,
-        candidate: Image.Image,
-    ) -> tuple[float, str] | None:
-        """Accept only either complete user-confirmed full map layout."""
-
-        scores = tuple(
-            (
-                self._anonymous_structure_score(
-                    candidate,
-                    reference_filename=filename,
-                    regions=WORLD_MAP_REGIONS,
-                ),
-                filename,
-            )
-            for filename, size in WORLD_MAP_STRUCTURES
-            if candidate.size == size
-        )
-        if not scores:
-            return None
-        score, filename = min(scores)
-        if score > WORLD_MAP_MAXIMUM_SCORE:
-            return None
-        return score, filename
 
     def _matches_live_window_dimensions(
         self,
@@ -3061,17 +3022,6 @@ class ReferenceScreenRecognizer:
                     is not ReconnectScreenState.CHARACTER_SELECTION
                 ]
         if not valid_scored:
-            world_map_match = self._world_map_structure_match(candidate)
-            if world_map_match is not None:
-                world_map_score, world_map_file = world_map_match
-                return ScreenRecognition(
-                    state=ReconnectScreenState.CONNECTED,
-                    score=round(world_map_score, 3),
-                    click_point=None,
-                    reference_name=world_map_file,
-                    battle_context=False,
-                )
-
             general_hud_score = self._anonymous_structure_score(
                 candidate,
                 reference_filename=ANONYMOUS_GENERAL_HUD_STRUCTURE_FILE,
