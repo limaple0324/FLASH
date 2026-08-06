@@ -1052,6 +1052,33 @@ class ReferenceScreenRecognizer:
         value = match.group(1).strip(" .。…")
         return value if len(value) >= 2 else None
 
+    @staticmethod
+    def _default_line_rows_are_anchored(
+        visible: tuple[tuple[int, NormalizedPoint], ...],
+    ) -> bool:
+        """Require two independent rows before using the fixed list geometry."""
+
+        if len(visible) < 2:
+            return False
+        numbers = tuple(number for number, _point in visible)
+        if len(set(numbers)) != len(numbers):
+            return False
+        expected_rows = tuple(
+            sorted(point[1] for point in LINE_ROUTE_CLICK_POINTS.values())
+        )
+        minimum_row_spacing = min(
+            right - left
+            for left, right in zip(expected_rows, expected_rows[1:])
+        )
+        anchor_tolerance = minimum_row_spacing / 4.0
+        return all(
+            number in LINE_ROUTE_CLICK_POINTS
+            and abs(
+                point[1] - LINE_ROUTE_CLICK_POINTS[number][1]
+            ) <= anchor_tolerance
+            for number, point in visible
+        )
+
     def _line_selection_target(
         self,
         candidate: Image.Image,
@@ -1105,6 +1132,24 @@ class ReferenceScreenRecognizer:
                 LINE_ROUTE_CLICK_POINTS[1],
                 False,
                 None,
+                0,
+            )
+
+        if (
+            recent_present
+            and route_number in LINE_ROUTE_CLICK_POINTS
+            and route_number != 8
+            and self._default_line_rows_are_anchored(visible)
+        ):
+            # The accepted line-selection frame, the unique recent route, and
+            # two independently read rows all agree with the fixed list
+            # geometry.  Use the existing route point instead of repeatedly
+            # scrolling a target that is already visible.
+            return (
+                route_number,
+                LINE_ROUTE_CLICK_POINTS[route_number],
+                True,
+                self._recent_login_role(candidate),
                 0,
             )
 

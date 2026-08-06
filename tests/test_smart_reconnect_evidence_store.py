@@ -65,6 +65,16 @@ LIVE_LINE_SEVEN_NO_ACTION = (
 LIVE_LINE_SEVEN_NO_ACTION_SHA256 = (
     "d4ae2c2091eab0914f19149adada1460746724ed51a6a5229ad530de88480aa5"
 )
+LIVE_LINE_SEVEN_SCROLL_LOOP = (
+    Path(__file__).parent
+    / "fixtures"
+    / "smart_reconnect"
+    / "live_failures"
+    / "20260806T033525Z-line-seven-scroll-loop.jsonl"
+)
+LIVE_LINE_SEVEN_SCROLL_LOOP_SHA256 = (
+    "f6bcd86a7556bb4583baec0e340589b3063093c526d86073196640385cd87f33"
+)
 
 
 class _Clock:
@@ -567,6 +577,31 @@ def test_real_line_seven_no_action_replays_as_incomplete() -> None:
         for record in observations
     ) == 145
     assert not any(record.get("record_type") == "action" for record in records)
+
+
+def test_real_line_seven_scroll_loop_replays_as_failed() -> None:
+    assert hashlib.sha256(LIVE_LINE_SEVEN_SCROLL_LOOP.read_bytes()).hexdigest() == (
+        LIVE_LINE_SEVEN_SCROLL_LOOP_SHA256
+    )
+
+    validator = SmartReconnectReplayValidator()
+    records = validator.load(LIVE_LINE_SEVEN_SCROLL_LOOP)
+    report = validator.validate(LIVE_LINE_SEVEN_SCROLL_LOOP)
+
+    assert report.source_commit == "2e7ec17f000e06a0a870001ed3eb90023f9171c0"
+    assert report.event_count == 263
+    assert report.window_count == 9
+    assert report.recovered_cycles == 0
+    assert report.pending_actions == 0
+    assert report.session_duration_ms == 109_156
+    assert sum(
+        record.get("record_type") == "action"
+        and record.get("action") == "scroll_line_list"
+        for record in records
+    ) == 10
+    assert "duplicate_stage_action" in {
+        finding.code for finding in report.findings
+    }
 
 
 def test_replay_rejects_unknown_click_duplicate_and_missing_proof(tmp_path: Path) -> None:

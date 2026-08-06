@@ -2168,7 +2168,9 @@ def test_every_actionable_template_has_a_safe_client_relative_point():
         assert 0.0 <= y <= 1.0
 
 
-def test_line_selection_does_not_replace_recent_line_with_first_line():
+def test_line_selection_uses_recorded_visible_anchors_for_recent_line_seven(
+    monkeypatch,
+):
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
     with Image.open(REFERENCE_DIR / "03_line_selection_dialog.png") as source:
         candidate = source.convert("RGB")
@@ -2192,13 +2194,48 @@ def test_line_selection_does_not_replace_recent_line_with_first_line():
             )
         candidate.paste(replacement, route_box)
 
+    monkeypatch.setattr(
+        recognizer,
+        "_visible_line_buttons",
+        lambda _candidate: (
+            (1, (0.500, 0.330347)),
+            (5, (0.500, 0.558231)),
+        ),
+    )
     result = recognizer.recognize_image(candidate)
 
     assert result.state is ReconnectScreenState.LINE_SELECTION
     assert result.line_number == 7
     assert result.recent_line_present is True
-    assert result.click_point is None
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[7]
     assert result.line_scroll_delta == 0
+
+
+def test_line_selection_one_visible_anchor_never_authorizes_fixed_row(
+    monkeypatch,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    monkeypatch.setattr(
+        recognizer,
+        "_recognize_route_number",
+        lambda _candidate: (7, 0.0),
+    )
+    monkeypatch.setattr(
+        recognizer,
+        "_recent_login_information_present",
+        lambda _candidate: True,
+    )
+    monkeypatch.setattr(
+        recognizer,
+        "_visible_line_buttons",
+        lambda _candidate: ((1, (0.500, 0.330347)),),
+    )
+    with Image.open(REFERENCE_DIR / "03_line_selection_dialog.png") as source:
+        result = recognizer.recognize_image(source.convert("RGB"))
+
+    assert result.state is ReconnectScreenState.LINE_SELECTION
+    assert result.line_number == 7
+    assert result.click_point is None
 
 
 def test_route_number_follows_centered_prefix_when_character_name_shifts():
