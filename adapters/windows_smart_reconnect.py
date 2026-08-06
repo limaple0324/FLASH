@@ -6057,17 +6057,21 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._group_launch_plan is None
             and self._target_identity_provider is not None
             and target_identity is not None
-            and item.recent_line_present is False
             and target_identity.original_line_number
             in LINE_ROUTE_CLICK_POINTS
         ):
-            line_number = target_identity.original_line_number
-            return replace(
-                item,
-                line_number=line_number,
-                click_point=LINE_ROUTE_CLICK_POINTS[line_number],
-                line_scroll_delta=0,
-            )
+            if (
+                item.line_number
+                != target_identity.original_line_number
+                or item.click_point is None
+                or item.line_scroll_delta
+            ):
+                return replace(
+                    item,
+                    click_point=None,
+                    line_scroll_delta=0,
+                )
+            return item
         if (
             item.line_scroll_delta in {-120, 120}
             and item.recent_line_present is True

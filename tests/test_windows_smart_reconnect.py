@@ -9158,7 +9158,7 @@ def test_stable_target_change_at_delivery_check_cancels_input():
     assert fixture.mouse.clicks == []
 
 
-def test_stable_target_saved_line_is_delivered_and_remembered():
+def test_stable_target_saved_line_never_replaces_visible_different_line():
     raw = ScreenRecognition(
         ReconnectScreenState.LINE_SELECTION,
         0.0,
@@ -9188,6 +9188,41 @@ def test_stable_target_saved_line_is_delivered_and_remembered():
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+    assert saved_lines == []
+
+
+def test_stable_target_saved_line_accepts_same_uniquely_visible_line():
+    raw = ScreenRecognition(
+        ReconnectScreenState.LINE_SELECTION,
+        0.0,
+        (0.5, 0.722),
+        "line-selection",
+        line_number=8,
+        recent_line_present=True,
+        recent_login_role=None,
+    )
+    window = make_window(1)
+    target = _stable_target_identity(window, line_number=8)
+    saved_lines = []
+    fixture = make_controller(
+        [4],
+        windows=[window],
+        expected_windows=1,
+        recognizer=RecognitionByMarker({4: raw}),
+        target_identity_provider=lambda _fingerprint: target,
+        verified_line_recorder=lambda fingerprint, character_id, line: (
+            saved_lines.append((fingerprint, character_id, line)) or True
+        ),
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
     assert result.details["clicked_windows"] == 1
     assert fixture.mouse.clicks == [(1, (0.5, 0.722))]
     assert saved_lines == [
@@ -9195,15 +9230,16 @@ def test_stable_target_saved_line_is_delivered_and_remembered():
     ]
 
 
-def test_stable_target_saved_line_does_not_override_ambiguous_recent_line():
+def test_stable_target_saved_line_without_visible_point_is_zero_input():
     raw = ScreenRecognition(
         ReconnectScreenState.LINE_SELECTION,
         0.0,
         None,
         "line-selection",
-        line_number=None,
+        line_number=8,
         recent_line_present=True,
         recent_login_role=None,
+        line_scroll_delta=-120,
     )
     window = make_window(1)
     target = _stable_target_identity(window, line_number=8)
@@ -9263,10 +9299,10 @@ def test_stable_target_evidence_uses_target_without_role_name_in_signature():
         ScreenRecognition(
             ReconnectScreenState.LINE_SELECTION,
             0.0,
-            (0.5, 0.327),
+            (0.5, 0.722),
             "line-selection",
-            line_number=1,
-            recent_line_present=False,
+            line_number=8,
+            recent_line_present=True,
         ),
         target_identity=target,
     )
