@@ -251,6 +251,9 @@ from services.smart_reconnect_capture_settings_service import (
     SmartReconnectCaptureSettings,
     SmartReconnectCaptureSettingsService,
 )
+from services.smart_reconnect_target_identity_service import (
+    SmartReconnectTargetIdentityService,
+)
 from services.sync_scope_service import SyncScopeService
 from services.sync_conflict_arbiter import SyncConflictArbiter
 from services.deferred_sync_operation_service import (
@@ -326,6 +329,7 @@ UI_THEME_CLASSIC_GOLD_MIGRATION_KEY = "ui_theme_classic_gold_migration_v1"
 CURRENT_GROUP_NAME_KEY = "current_group_name"
 REGISTRY_FILENAME = "window_registry.json"
 RECONNECT_STATE_FILENAME = "smart_reconnect_state.json"
+RECONNECT_TARGET_IDENTITY_FILENAME = "smart_reconnect_target_identity.json"
 GROUP_CONFIGURATION_FILENAME = "group_configuration.json"
 OPERATION_RECORD_FILENAME = "operation_records.json"
 MANAGED_GAME_PROCESS_FILENAME = "managed_game_processes.json"
@@ -1179,6 +1183,15 @@ def build_services(
         shortcut_fingerprint_resolver,
         legacy_layout_config_path=legacy_group_config_path,
     )
+    smart_reconnect_target_identity_service = (
+        SmartReconnectTargetIdentityService(
+            group_configuration_service.groups,
+            shortcut_fingerprint_resolver,
+            character_store.load,
+            registry.all,
+            paths.data_dir() / RECONNECT_TARGET_IDENTITY_FILENAME,
+        )
+    )
     sync_scope_service = SyncScopeService(
         group_configuration_service,
         shortcut_fingerprint_resolver,
@@ -1416,6 +1429,10 @@ def build_services(
         group_configuration_service,
     )
     AppContext.register(GroupLaunchService, group_launch_service)
+    AppContext.register(
+        SmartReconnectTargetIdentityService,
+        smart_reconnect_target_identity_service,
+    )
     AppContext.register(SyncScopeService, sync_scope_service)
     AppContext.register(
         Win32WindowBackend,
@@ -1610,6 +1627,15 @@ def build_services(
             )
         ),
         registered_role_provider=registered_reconnect_roles,
+        target_identity_provider=(
+            smart_reconnect_target_identity_service.target_for
+        ),
+        verified_slot_recorder=(
+            smart_reconnect_target_identity_service.remember_verified_slot
+        ),
+        verified_line_recorder=(
+            smart_reconnect_target_identity_service.remember_verified_line
+        ),
     )
 
     def registered_game_data_window(window_handle: int) -> RegisteredGameDataWindow | None:

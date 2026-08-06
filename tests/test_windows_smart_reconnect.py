@@ -49,6 +49,9 @@ from services.smart_reconnect_evidence_store import (
     RuntimeSourceIdentity,
     SmartReconnectEvidenceRecorder,
 )
+from services.smart_reconnect_target_identity_service import (
+    SmartReconnectTargetIdentity,
+)
 from services.target_window_contract_service import ResolvedTargetWindows
 
 
@@ -1496,6 +1499,9 @@ def make_controller(
     require_expected_window_count=True,
     recognizer=None,
     registered_role_provider=None,
+    target_identity_provider=None,
+    verified_slot_recorder=None,
+    verified_line_recorder=None,
     ungrouped_shortcut_provider=None,
     evidence_recorder=None,
     evidence_required=False,
@@ -1562,6 +1568,9 @@ def make_controller(
             failure_record_callback=failure_record_callback,
             target_windows_provider=target_windows_provider,
             registered_role_provider=registered_role_provider,
+            target_identity_provider=target_identity_provider,
+            verified_slot_recorder=verified_slot_recorder,
+            verified_line_recorder=verified_line_recorder,
             operation_gate=operation_gate,
             evidence_recorder=evidence_recorder,
             evidence_required=evidence_required,
@@ -1668,6 +1677,9 @@ def _single_window_character_fixture(
     *,
     clock=None,
     registered_role_provider=None,
+    target_identity_provider=None,
+    verified_slot_recorder=None,
+    verified_line_recorder=None,
 ):
     if clock is None:
         clock = lambda: 0.0
@@ -1685,6 +1697,9 @@ def _single_window_character_fixture(
         execution_enabled=True,
         monotonic_clock=clock,
         registered_role_provider=registered_role_provider,
+        target_identity_provider=target_identity_provider,
+        verified_slot_recorder=verified_slot_recorder,
+        verified_line_recorder=verified_line_recorder,
     )
     return Fixture(controller, capture, mouse), window
 
@@ -1697,6 +1712,25 @@ class _CharacterSequenceRecognizer:
     def recognize_capture(self, _sample):
         self.calls += 1
         return _character_recognition(self.provider(self.calls))
+
+
+def _stable_target_identity(
+    window,
+    *,
+    character_id="character-1",
+    role_aliases=("AlphaHero",),
+    importance=CharacterImportance.SECONDARY,
+    slot_index=None,
+    line_number=None,
+):
+    return SmartReconnectTargetIdentity(
+        window.launch_fingerprint,
+        character_id,
+        role_aliases,
+        importance,
+        original_slot_index=slot_index,
+        original_line_number=line_number,
+    )
 
 
 def test_read_only_check_detects_reconnect_need_without_clicking():
@@ -8665,6 +8699,493 @@ def test_character_selection_rejects_different_slot_after_selection_click():
 
     assert result.details["clicked_windows"] == 0
     assert fixture.mouse.clicks == [(1, target.click_point)]
+
+
+@pytest.mark.parametrize("provider_mode", ("missing", "failure"))
+def test_stable_target_provider_failure_never_falls_back_to_registered_role(
+    provider_mode,
+):
+    selected = CharacterSelectionCandidate(
+        160,
+        CharacterImportance.PRIMARY,
+        2,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+
+    def target_provider(_fingerprint):
+        if provider_mode == "failure":
+            raise RuntimeError("target provider failed")
+        return None
+
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(lambda _call: (selected,)),
+        registered_role_provider=lambda: (
+            RegisteredReconnectRole(
+                "AlphaHero",
+                CharacterImportance.PRIMARY,
+            ),
+        ),
+        target_identity_provider=target_provider,
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+
+
+def test_stable_target_exact_alias_uses_two_stages_and_remembers_slot():
+    now = [0.0]
+    other = CharacterSelectionCandidate(
+        120,
+        None,
+        0,
+        False,
+        (0.355, 0.706),
+        digit_count=3,
+        identity="OtherRole",
+    )
+    target_candidate = CharacterSelectionCandidate(
+        160,
+        None,
+        2,
+        False,
+        (0.651, 0.706),
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    selected = replace(
+        target_candidate,
+        selected=True,
+        click_point=CHARACTER_ENTER_CLICK_POINT,
+        identity="Alpha…",
+    )
+    phase = ["select"]
+    saved_slots = []
+    recognizer = _CharacterSequenceRecognizer(
+        lambda _call: (
+            (other, target_candidate)
+            if phase[0] == "select"
+            else (other, selected)
+        )
+    )
+    fixture, window = _single_window_character_fixture(
+        recognizer,
+        clock=lambda: now[0],
+        target_identity_provider=lambda _fingerprint: (
+            _stable_target_identity(window)
+        ),
+        verified_slot_recorder=lambda fingerprint, character_id, slot: (
+            saved_slots.append((fingerprint, character_id, slot)) or True
+        ),
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    selected_slot = fixture.controller.reconnect()
+    pending = fixture.controller._character_selection_targets[
+        window.launch_fingerprint
+    ]
+    phase[0] = "enter"
+    now[0] = 10.0
+    fixture.controller.reconnect()
+    entered = fixture.controller.reconnect()
+
+    assert selected_slot.details["clicked_windows"] == 1
+    assert pending.target.character_id == "character-1"
+    assert entered.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [
+        (1, target_candidate.click_point),
+        (1, CHARACTER_ENTER_CLICK_POINT),
+    ]
+    assert saved_slots == [
+        (window.launch_fingerprint, "character-1", 2),
+    ]
+
+
+def test_stable_target_saved_slot_rejects_readable_identity_conflict():
+    selected = CharacterSelectionCandidate(
+        160,
+        None,
+        2,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="BetaHero",
+    )
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(lambda _call: (selected,)),
+        target_identity_provider=lambda _fingerprint: (
+            _stable_target_identity(window, slot_index=2)
+        ),
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+
+
+def test_stable_target_single_selected_unknown_alias_remembers_slot():
+    selected = CharacterSelectionCandidate(
+        None,
+        None,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=None,
+        identity=None,
+    )
+    saved_slots = []
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(lambda _call: (selected,)),
+        target_identity_provider=lambda _fingerprint: (
+            _stable_target_identity(window)
+        ),
+        verified_slot_recorder=lambda fingerprint, character_id, slot: (
+            saved_slots.append((fingerprint, character_id, slot)) or True
+        ),
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(1, CHARACTER_ENTER_CLICK_POINT)]
+    assert saved_slots == [
+        (window.launch_fingerprint, "character-1", 1),
+    ]
+
+
+def test_stable_target_multiple_unknown_aliases_are_zero_input():
+    selected = CharacterSelectionCandidate(
+        160,
+        None,
+        0,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity=None,
+    )
+    other = CharacterSelectionCandidate(
+        120,
+        None,
+        1,
+        False,
+        (0.500, 0.706),
+        digit_count=3,
+        identity=None,
+    )
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(lambda _call: (selected, other)),
+        target_identity_provider=lambda _fingerprint: (
+            _stable_target_identity(window)
+        ),
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+
+
+def test_stable_target_change_after_slot_click_blocks_enter():
+    now = [0.0]
+    target_candidate = CharacterSelectionCandidate(
+        160,
+        None,
+        2,
+        False,
+        (0.651, 0.706),
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    selected = replace(
+        target_candidate,
+        selected=True,
+        click_point=CHARACTER_ENTER_CLICK_POINT,
+        identity="Alpha…",
+    )
+    phase = ["select"]
+    current_target = [None]
+    recognizer = _CharacterSequenceRecognizer(
+        lambda _call: (
+            (target_candidate,)
+            if phase[0] == "select"
+            else (selected,)
+        )
+    )
+    fixture, window = _single_window_character_fixture(
+        recognizer,
+        clock=lambda: now[0],
+        target_identity_provider=lambda _fingerprint: current_target[0],
+    )
+    current_target[0] = _stable_target_identity(window)
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    current_target[0] = replace(
+        current_target[0],
+        original_line_number=8,
+    )
+    phase[0] = "enter"
+    now[0] = 10.0
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == [(1, target_candidate.click_point)]
+
+
+def test_stable_target_second_stage_rejects_duplicate_full_alias():
+    now = [0.0]
+    target_candidate = CharacterSelectionCandidate(
+        160,
+        None,
+        2,
+        False,
+        (0.651, 0.706),
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    selected = replace(
+        target_candidate,
+        selected=True,
+        click_point=CHARACTER_ENTER_CLICK_POINT,
+        identity="Alpha…",
+    )
+    duplicate = replace(
+        target_candidate,
+        slot_index=1,
+        click_point=(0.500, 0.706),
+    )
+    phase = ["select"]
+    recognizer = _CharacterSequenceRecognizer(
+        lambda _call: (
+            (target_candidate,)
+            if phase[0] == "select"
+            else (selected, duplicate)
+        )
+    )
+    fixture, window = _single_window_character_fixture(
+        recognizer,
+        clock=lambda: now[0],
+        target_identity_provider=lambda _fingerprint: (
+            _stable_target_identity(window)
+        ),
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    phase[0] = "enter"
+    now[0] = 10.0
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == [(1, target_candidate.click_point)]
+
+
+def test_stable_target_change_at_delivery_check_cancels_input():
+    selected = CharacterSelectionCandidate(
+        160,
+        None,
+        2,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    window = make_window(1)
+    current_target = [_stable_target_identity(window)]
+    mouse = FakeMouseBackend()
+
+    def change_target_before_delivery(_handle, _timeout_ms):
+        current_target[0] = replace(
+            current_target[0],
+            original_line_number=8,
+        )
+        return True
+
+    mouse.probe_responsive = change_target_before_delivery
+    fixture = make_controller(
+        [5],
+        windows=[window],
+        expected_windows=1,
+        mouse=mouse,
+        recognizer=_CharacterSequenceRecognizer(
+            lambda _call: (selected,)
+        ),
+        target_identity_provider=lambda _fingerprint: current_target[0],
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+
+
+def test_stable_target_saved_line_is_delivered_and_remembered():
+    raw = ScreenRecognition(
+        ReconnectScreenState.LINE_SELECTION,
+        0.0,
+        (0.5, 0.327),
+        "line-selection",
+        line_number=1,
+        recent_line_present=False,
+        recent_login_role=None,
+    )
+    window = make_window(1)
+    target = _stable_target_identity(window, line_number=8)
+    saved_lines = []
+    fixture = make_controller(
+        [4],
+        windows=[window],
+        expected_windows=1,
+        recognizer=RecognitionByMarker({4: raw}),
+        target_identity_provider=lambda _fingerprint: target,
+        verified_line_recorder=lambda fingerprint, character_id, line: (
+            saved_lines.append((fingerprint, character_id, line)) or True
+        ),
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(1, (0.5, 0.722))]
+    assert saved_lines == [
+        (window.launch_fingerprint, "character-1", 8),
+    ]
+
+
+def test_stable_target_saved_line_does_not_override_ambiguous_recent_line():
+    raw = ScreenRecognition(
+        ReconnectScreenState.LINE_SELECTION,
+        0.0,
+        None,
+        "line-selection",
+        line_number=None,
+        recent_line_present=True,
+        recent_login_role=None,
+    )
+    window = make_window(1)
+    target = _stable_target_identity(window, line_number=8)
+    fixture = make_controller(
+        [4],
+        windows=[window],
+        expected_windows=1,
+        recognizer=RecognitionByMarker({4: raw}),
+        target_identity_provider=lambda _fingerprint: target,
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+    assert fixture.mouse.scrolls == []
+
+
+def test_stable_target_evidence_uses_target_without_role_name_in_signature():
+    selected = CharacterSelectionCandidate(
+        160,
+        None,
+        2,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    raw = _character_recognition((selected,))
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(lambda _call: (selected,)),
+        target_identity_provider=lambda _fingerprint: (
+            _stable_target_identity(window, line_number=8)
+        ),
+    )
+    target = _stable_target_identity(window, line_number=8)
+    instance = WindowInstanceToken.from_window(window)
+    transformed = fixture.controller._recognition_for_session_action(
+        window.launch_fingerprint,
+        raw,
+        target_identity=target,
+        instance=instance,
+        capture_route="primary",
+        capture_settings_revision=0,
+        source_state_generation=0,
+    )
+    transformed = fixture.controller._recognition_for_target_identity_scope(
+        transformed,
+        target,
+    )
+    line = fixture.controller._recognition_for_preferred_line(
+        window.launch_fingerprint,
+        ScreenRecognition(
+            ReconnectScreenState.LINE_SELECTION,
+            0.0,
+            (0.5, 0.327),
+            "line-selection",
+            line_number=1,
+            recent_line_present=False,
+        ),
+        target_identity=target,
+    )
+    line = fixture.controller._recognition_for_target_identity_scope(
+        line,
+        target,
+    )
+
+    assert fixture.controller._original_role_verified_for_evidence(
+        window.launch_fingerprint,
+        transformed,
+    ) is True
+    assert fixture.controller._original_line_verified_for_evidence(
+        window.launch_fingerprint,
+        line,
+    ) is True
+    assert "AlphaHero" not in repr(
+        fixture.controller._action_signature(transformed)
+    )
+    assert "character-1" not in repr(
+        fixture.controller._action_signature(transformed)
+    )
 
 
 def test_planned_level_is_blocked_by_unknown_three_digit_competitor(tmp_path):

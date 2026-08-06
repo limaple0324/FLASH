@@ -39,6 +39,9 @@ from main import (
 )
 from services.app_context import AppContext
 from services.smart_reconnect_monitor import SmartReconnectMonitor
+from services.smart_reconnect_target_identity_service import (
+    SmartReconnectTargetIdentityService,
+)
 from services.ungrouped_window_service import UngroupedWindowService
 from services.smart_reconnect_capture_settings_service import (
     SMART_RECONNECT_CAPTURE_MODES_KEY,
@@ -532,10 +535,26 @@ def test_build_services_wires_registered_primary_and_unique_ungrouped_shortcut(
     build_services(root=tmp_path)
 
     reconnect = AppContext.get(WindowsSmartReconnectController)
+    target_identity = AppContext.get(SmartReconnectTargetIdentityService)
     ungrouped = AppContext.get(UngroupedWindowService)
     shortcut_provider = reconnect._ungrouped_shortcut_provider
 
     assert callable(reconnect._registered_role_provider)
+    assert reconnect._target_identity_provider.__self__ is target_identity
+    assert (
+        reconnect._target_identity_provider.__func__
+        is SmartReconnectTargetIdentityService.target_for
+    )
+    assert reconnect._verified_slot_recorder.__self__ is target_identity
+    assert (
+        reconnect._verified_slot_recorder.__func__
+        is SmartReconnectTargetIdentityService.remember_verified_slot
+    )
+    assert reconnect._verified_line_recorder.__self__ is target_identity
+    assert (
+        reconnect._verified_line_recorder.__func__
+        is SmartReconnectTargetIdentityService.remember_verified_line
+    )
     assert shortcut_provider is not None
     assert shortcut_provider.__self__ is ungrouped
     assert shortcut_provider.__func__ is UngroupedWindowService.shortcut_for

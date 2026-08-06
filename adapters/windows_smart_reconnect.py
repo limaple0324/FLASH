@@ -67,6 +67,10 @@ from services.smart_reconnect_capture_settings_service import (
 from services.smart_reconnect_evidence_store import (
     SmartReconnectEvidenceRecorder,
 )
+from services.smart_reconnect_target_identity_service import (
+    SmartReconnectTargetIdentity,
+    normalize_reconnect_role_alias,
+)
 from services.target_window_contract_service import ResolvedTargetWindows
 
 
@@ -1894,6 +1898,16 @@ class _ActionConfirmation:
 
 
 @dataclass(frozen=True, slots=True)
+class _PendingTargetCharacterSelection:
+    candidate: CharacterSelectionCandidate
+    target: SmartReconnectTargetIdentity
+    instance: WindowInstanceToken
+    capture_route: str
+    capture_settings_revision: int
+    source_state_generation: int
+
+
+@dataclass(frozen=True, slots=True)
 class _BattleRestartEvent:
     handle: int
     process_id: int
@@ -2248,6 +2262,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         registered_role_provider: (
             Callable[[], Iterable[RegisteredReconnectRole]] | None
         ) = None,
+        target_identity_provider: (
+            Callable[[str], SmartReconnectTargetIdentity | None] | None
+        ) = None,
+        verified_slot_recorder: (
+            Callable[[str, str, int], object] | None
+        ) = None,
+        verified_line_recorder: (
+            Callable[[str, str, int], object] | None
+        ) = None,
         operation_gate: GameOperationGate | None = None,
         auto_battle_enabled: bool = True,
         auto_battle_recognizer: AutoBattleRecognizer | None = None,
@@ -2363,7 +2386,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._character_selection_pending: set[str] = set()
         self._character_selection_targets: dict[
             str,
-            CharacterSelectionCandidate,
+            CharacterSelectionCandidate | _PendingTargetCharacterSelection,
         ] = {}
         self._action_state_since: dict[
             str,
@@ -2409,6 +2432,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         ):
             raise TypeError("registered_role_provider must be callable")
         self._registered_role_provider = registered_role_provider
+        for callback, name in (
+            (target_identity_provider, "target_identity_provider"),
+            (verified_slot_recorder, "verified_slot_recorder"),
+            (verified_line_recorder, "verified_line_recorder"),
+        ):
+            if callback is not None and not callable(callback):
+                raise TypeError(f"{name} must be callable or None")
+        self._target_identity_provider = target_identity_provider
+        self._verified_slot_recorder = verified_slot_recorder
+        self._verified_line_recorder = verified_line_recorder
         self._operation_gate = operation_gate
         # This is deliberately independent of execution permission.  Both
         # gates must be open before any future auto-battle mutation can occur.
@@ -2483,6 +2516,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         registered_role_provider: (
             Callable[[], Iterable[RegisteredReconnectRole]] | None
         ) = None,
+        target_identity_provider: (
+            Callable[[str], SmartReconnectTargetIdentity | None] | None
+        ) = None,
+        verified_slot_recorder: (
+            Callable[[str, str, int], object] | None
+        ) = None,
+        verified_line_recorder: (
+            Callable[[str, str, int], object] | None
+        ) = None,
         operation_gate: GameOperationGate | None = None,
         capture_settings: SmartReconnectCaptureSettings | None = None,
         require_expected_window_count: bool = True,
@@ -2537,6 +2579,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             failure_record_callback=failure_record_callback,
             target_windows_provider=target_windows_provider,
             registered_role_provider=registered_role_provider,
+            target_identity_provider=target_identity_provider,
+            verified_slot_recorder=verified_slot_recorder,
+            verified_line_recorder=verified_line_recorder,
             operation_gate=operation_gate,
             auto_battle_enabled=auto_battle_enabled,
             auto_battle_recognizer=AutoBattleRecognizer(
@@ -3421,7 +3466,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return None
         if item.line_scroll_delta:
             return None
-        preferred = self._preferred_line_numbers.get(fingerprint)
+        target = self._target_identity_for_fingerprint(fingerprint)
+        preferred = (
+            target.original_line_number
+            if target is not None
+            else self._preferred_line_numbers.get(fingerprint)
+        )
         return bool(
             item.line_number in LINE_ROUTE_CLICK_POINTS
             and (
@@ -3440,6 +3490,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or item.character_slot_selected is not True
         ):
             return None
+        target_identity = self._target_identity_for_fingerprint(fingerprint)
+        if target_identity is not None:
+            return bool(
+                isinstance(item.character_target_key, str)
+                and item.character_target_key
+                == self._target_identity_action_key(target_identity)
+            )
         target = self._target_for_fingerprint(fingerprint)
         if (
             target is None
@@ -5818,6 +5875,111 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 )
         return tuple(accepted), scoped_blocked, tuple(failures)
 
+    def _target_identity_for_fingerprint(
+        self,
+        fingerprint: str,
+    ) -> SmartReconnectTargetIdentity | None:
+        provider = self._target_identity_provider
+        if self._group_launch_plan is not None or provider is None:
+            return None
+        source_fingerprint = (
+            self._activation_snapshot_source_fingerprints or {}
+        ).get(fingerprint, fingerprint)
+        try:
+            target = provider(source_fingerprint)
+        except Exception:
+            return None
+        if (
+            not isinstance(target, SmartReconnectTargetIdentity)
+            or target.fingerprint != source_fingerprint
+        ):
+            return None
+        return target
+
+    @staticmethod
+    def _target_identity_action_key(
+        target: SmartReconnectTargetIdentity,
+    ) -> str:
+        aliases_digest = hashlib.sha256(
+            "\0".join(target.role_aliases).encode("utf-8")
+        ).hexdigest()
+        payload = (
+            target.fingerprint,
+            target.character_id,
+            aliases_digest,
+            target.importance.value,
+            target.original_slot_index,
+            target.original_line_number,
+        )
+        digest = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+        return f"target:{digest}"
+
+    def _target_identity_action_is_current(
+        self,
+        fingerprint: str,
+        item: ScreenRecognition,
+    ) -> bool:
+        if self._group_launch_plan is not None:
+            return True
+        if self._target_identity_provider is None:
+            return True
+        return self._current_target_identity_for_action(
+            fingerprint,
+            item,
+        ) is not None
+
+    def _current_target_identity_for_action(
+        self,
+        fingerprint: str,
+        item: ScreenRecognition,
+    ) -> SmartReconnectTargetIdentity | None:
+        target = self._target_identity_for_fingerprint(fingerprint)
+        if (
+            target is None
+            or item.character_target_key
+            != self._target_identity_action_key(target)
+        ):
+            return None
+        return target
+
+    @staticmethod
+    def _record_verified_target_value(
+        recorder: Callable[[str, str, int], object] | None,
+        target: SmartReconnectTargetIdentity,
+        value: int,
+    ) -> bool:
+        if recorder is None:
+            return True
+        try:
+            return recorder(
+                target.fingerprint,
+                target.character_id,
+                value,
+            ) is True
+        except Exception:
+            return False
+
+    def _recognition_for_target_identity_scope(
+        self,
+        item: ScreenRecognition,
+        target: SmartReconnectTargetIdentity | None,
+    ) -> ScreenRecognition:
+        if self._group_launch_plan is not None:
+            return item
+        if self._target_identity_provider is None:
+            return item
+        if target is None:
+            return replace(
+                item,
+                click_point=None,
+                character_target_key=None,
+                line_scroll_delta=0,
+            )
+        return replace(
+            item,
+            character_target_key=self._target_identity_action_key(target),
+        )
+
     def _target_for_fingerprint(self, fingerprint: str):
         plan = self._group_launch_plan
         return (
@@ -5885,10 +6047,27 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self,
         fingerprint: str,
         item: ScreenRecognition,
+        *,
+        target_identity: SmartReconnectTargetIdentity | None = None,
     ) -> ScreenRecognition:
         """Authorize only the line shown by the current game frame."""
         if item.state is not ReconnectScreenState.LINE_SELECTION:
             return item
+        if (
+            self._group_launch_plan is None
+            and self._target_identity_provider is not None
+            and target_identity is not None
+            and item.recent_line_present is False
+            and target_identity.original_line_number
+            in LINE_ROUTE_CLICK_POINTS
+        ):
+            line_number = target_identity.original_line_number
+            return replace(
+                item,
+                line_number=line_number,
+                click_point=LINE_ROUTE_CLICK_POINTS[line_number],
+                line_scroll_delta=0,
+            )
         if (
             item.line_scroll_delta in {-120, 120}
             and item.recent_line_present is True
@@ -6246,16 +6425,156 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return None
         return primary[0], CharacterImportance.PRIMARY
 
+    @staticmethod
+    def _complete_target_candidate_identity(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        if "..." in value or "…" in value:
+            return None
+        return normalize_reconnect_role_alias(value)
+
+    def _stable_target_character_is_safe(
+        self,
+        fingerprint: str,
+        item: ScreenRecognition,
+        target: SmartReconnectTargetIdentity | None,
+        *,
+        instance: WindowInstanceToken | None,
+        capture_route: str | None,
+        capture_settings_revision: int | None,
+        source_state_generation: int | None,
+    ) -> ScreenRecognition | None:
+        if target is None:
+            return None
+        candidates = tuple(item.character_candidates)
+        pending = self._character_selection_targets.get(fingerprint)
+        action_key = self._target_identity_action_key(target)
+        if pending is not None:
+            if (
+                not isinstance(pending, _PendingTargetCharacterSelection)
+                or pending.target != target
+                or instance != pending.instance
+                or capture_route != pending.capture_route
+                or capture_settings_revision
+                != pending.capture_settings_revision
+                or source_state_generation
+                != pending.source_state_generation
+            ):
+                return None
+            selected = tuple(candidate for candidate in candidates if candidate.selected)
+            if (
+                len(selected) != 1
+                or selected[0].slot_index != pending.candidate.slot_index
+            ):
+                return None
+            candidate = selected[0]
+            complete_identity = self._complete_target_candidate_identity(
+                candidate.identity
+            )
+            if (
+                complete_identity is not None
+                and complete_identity not in target.role_aliases
+            ):
+                return None
+            if any(
+                other.slot_index != candidate.slot_index
+                and self._complete_target_candidate_identity(
+                    other.identity
+                ) in target.role_aliases
+                for other in candidates
+            ):
+                return None
+            return self._candidate_result(
+                item,
+                candidate,
+                target.importance,
+                action_key,
+            )
+
+        if not candidates:
+            return None
+        exact_alias_matches = tuple(
+            candidate
+            for candidate in candidates
+            if self._complete_target_candidate_identity(candidate.identity)
+            in target.role_aliases
+        )
+        saved_slot = target.original_slot_index
+        if saved_slot is not None:
+            slot_matches = tuple(
+                candidate
+                for candidate in candidates
+                if candidate.slot_index == saved_slot
+            )
+            if len(slot_matches) != 1:
+                return None
+            candidate = slot_matches[0]
+            if any(
+                match.slot_index != saved_slot for match in exact_alias_matches
+            ):
+                return None
+            complete_identity = self._complete_target_candidate_identity(
+                candidate.identity
+            )
+            if (
+                complete_identity is not None
+                and complete_identity not in target.role_aliases
+            ):
+                return None
+        elif len(exact_alias_matches) == 1:
+            candidate = exact_alias_matches[0]
+        elif (
+            not exact_alias_matches
+            and len(candidates) == 1
+            and candidates[0].selected
+        ):
+            candidate = candidates[0]
+            complete_identity = self._complete_target_candidate_identity(
+                candidate.identity
+            )
+            if (
+                complete_identity is not None
+                and complete_identity not in target.role_aliases
+            ):
+                return None
+        else:
+            return None
+        if candidate.selected:
+            selected = tuple(item for item in candidates if item.selected)
+            if len(selected) != 1 or selected[0].slot_index != candidate.slot_index:
+                return None
+        return self._candidate_result(
+            item,
+            candidate,
+            target.importance,
+            action_key,
+        )
+
     def _character_target_is_safe(
         self,
         fingerprint: str,
         item: ScreenRecognition,
         *,
         initial_login_authorized: bool = False,
+        target_identity: SmartReconnectTargetIdentity | None = None,
+        instance: WindowInstanceToken | None = None,
+        capture_route: str | None = None,
+        capture_settings_revision: int | None = None,
+        source_state_generation: int | None = None,
     ) -> ScreenRecognition | None:
         """Choose only the uniquely proven registered primary role."""
         target = self._target_for_fingerprint(fingerprint)
         plan = self._group_launch_plan
+        if plan is None and self._target_identity_provider is not None:
+            return self._stable_target_character_is_safe(
+                fingerprint,
+                item,
+                target_identity,
+                instance=instance,
+                capture_route=capture_route,
+                capture_settings_revision=capture_settings_revision,
+                source_state_generation=source_state_generation,
+            )
         candidates = tuple(item.character_candidates)
         identity = (
             item.character_identity.strip().casefold()
@@ -6268,6 +6587,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
         reconnect_session = self._has_reconnect_session(fingerprint)
         if pending_target is not None:
+            if isinstance(pending_target, _PendingTargetCharacterSelection):
+                return None
             selected_candidates = tuple(
                 candidate
                 for candidate in candidates
@@ -6607,6 +6928,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         recognition: ScreenRecognition,
         *,
         initial_login_authorized: bool = False,
+        target_identity: SmartReconnectTargetIdentity | None = None,
+        instance: WindowInstanceToken | None = None,
+        capture_route: str | None = None,
+        capture_settings_revision: int | None = None,
+        source_state_generation: int | None = None,
     ) -> ScreenRecognition:
         if (
             recognition.state is ReconnectScreenState.LOGIN_START
@@ -6625,6 +6951,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 fingerprint,
                 recognition,
                 initial_login_authorized=initial_login_authorized,
+                target_identity=target_identity,
+                instance=instance,
+                capture_route=capture_route,
+                capture_settings_revision=capture_settings_revision,
+                source_state_generation=source_state_generation,
             )
             if role_target is None:
                 return replace(recognition, click_point=None)
@@ -6787,14 +7118,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 state=ReconnectScreenState.FORCE_LOGIN_START,
                 click_point=FORCE_LOGIN_CLICK_POINT,
             )
+        target_identity = self._target_identity_for_fingerprint(fingerprint)
         current = self._recognition_for_session_action(
             fingerprint,
             recognition,
             initial_login_authorized=initial_login_authorized,
+            target_identity=target_identity,
+            instance=expected_instance,
+            capture_route=current_route,
+            capture_settings_revision=expected_capture_settings_revision,
+            source_state_generation=expected_source_state_generation,
         )
         current = self._recognition_for_preferred_line(
             fingerprint,
             current,
+            target_identity=target_identity,
+        )
+        current = self._recognition_for_target_identity_scope(
+            current,
+            target_identity,
         )
         if self._action_signature(current) != self._action_signature(expected):
             return None
@@ -8186,14 +8528,27 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     state=ReconnectScreenState.FORCE_LOGIN_START,
                     click_point=FORCE_LOGIN_CLICK_POINT,
                 )
+            target_identity = self._target_identity_for_fingerprint(
+                fingerprint
+            )
             recognition = self._recognition_for_session_action(
                 fingerprint,
                 recognition,
                 initial_login_authorized=initial_login_authorized,
+                target_identity=target_identity,
+                instance=instance,
+                capture_route=capture_route,
+                capture_settings_revision=capture_settings_revision,
+                source_state_generation=scan_source_state_generation,
             )
             recognition = self._recognition_for_preferred_line(
                 fingerprint,
                 recognition,
+                target_identity=target_identity,
+            )
+            recognition = self._recognition_for_target_identity_scope(
+                recognition,
+                target_identity,
             )
             if (
                 recognition.state is ReconnectScreenState.FORCE_LOGIN_TIMEOUT
@@ -8691,6 +9046,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             lambda: (
                                 self._action_confirmations.get(fingerprint)
                                 == confirmation
+                                and self._target_identity_action_is_current(
+                                    fingerprint,
+                                    item,
+                                )
                                 and (
                                     (
                                         self._group_launch_plan is plan
@@ -8997,6 +9356,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                                 expected_source_state_generation=(
                                     confirmation.source_state_generation
                                 ),
+                                additional_authorization_check=(
+                                    lambda: self._target_identity_action_is_current(
+                                        fingerprint,
+                                        item,
+                                    )
+                                ),
                             )
                         )
                         if not permitted:
@@ -9229,10 +9594,63 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         self._preferred_line_numbers[fingerprint] = (
                             item.line_number
                         )
+                        if (
+                            self._group_launch_plan is None
+                            and self._target_identity_provider is not None
+                        ):
+                            target_after_delivery = (
+                                self._current_target_identity_for_action(
+                                    fingerprint,
+                                    item,
+                                )
+                            )
+                            if (
+                                target_after_delivery is None
+                                or not self._record_verified_target_value(
+                                    self._verified_line_recorder,
+                                    target_after_delivery,
+                                    item.line_number,
+                                )
+                            ):
+                                failures.append(
+                                    "target_identity_state_persistence_failed"
+                                )
                     if item.state is ReconnectScreenState.CHARACTER_SELECTION:
                         if item.character_slot_selected is True:
-                            if (
-                                item.character_importance
+                            target_after_delivery = (
+                                self._current_target_identity_for_action(
+                                    fingerprint,
+                                    item,
+                                )
+                                if (
+                                    self._group_launch_plan is None
+                                    and self._target_identity_provider
+                                    is not None
+                                )
+                                else None
+                            )
+                            stable_target_verified = bool(
+                                target_after_delivery is not None
+                                and isinstance(
+                                    item.character_slot_index,
+                                    int,
+                                )
+                                and not isinstance(
+                                    item.character_slot_index,
+                                    bool,
+                                )
+                                and self._record_verified_target_value(
+                                    self._verified_slot_recorder,
+                                    target_after_delivery,
+                                    item.character_slot_index,
+                                )
+                            )
+                            if stable_target_verified or (
+                                (
+                                    self._group_launch_plan is not None
+                                    or self._target_identity_provider is None
+                                )
+                                and item.character_importance
                                 is CharacterImportance.PRIMARY
                                 and isinstance(
                                     item.character_target_key,
@@ -9247,6 +9665,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                                 self._primary_entry_authorized.discard(
                                     fingerprint
                                 )
+                                if (
+                                    self._group_launch_plan is None
+                                    and self._target_identity_provider
+                                    is not None
+                                ):
+                                    failures.append(
+                                        "target_identity_state_persistence_failed"
+                                    )
                             self._character_selection_pending.discard(
                                 fingerprint
                             )
@@ -9274,12 +9700,44 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                                     self._candidate_from_recognition(item)
                                 )
                             if pending_target is not None:
-                                self._character_selection_pending.add(
-                                    fingerprint
-                                )
-                                self._character_selection_targets[
-                                    fingerprint
-                                ] = pending_target
+                                pending_value: (
+                                    CharacterSelectionCandidate
+                                    | _PendingTargetCharacterSelection
+                                ) = pending_target
+                                if (
+                                    self._group_launch_plan is None
+                                    and self._target_identity_provider
+                                    is not None
+                                ):
+                                    target_after_delivery = (
+                                        self._current_target_identity_for_action(
+                                            fingerprint,
+                                            item,
+                                        )
+                                    )
+                                    if (
+                                        target_after_delivery is None
+                                        or initial_capture_route is None
+                                    ):
+                                        pending_target = None
+                                    else:
+                                        pending_value = (
+                                            _PendingTargetCharacterSelection(
+                                                pending_target,
+                                                target_after_delivery,
+                                                confirmed_instance,
+                                                initial_capture_route,
+                                                capture_settings_revision,
+                                                confirmation.source_state_generation,
+                                            )
+                                        )
+                                if pending_target is not None:
+                                    self._character_selection_pending.add(
+                                        fingerprint
+                                    )
+                                    self._character_selection_targets[
+                                        fingerprint
+                                    ] = pending_value
                     elif item.state in {
                         ReconnectScreenState.POST_LOGIN_ACTIVITY,
                         ReconnectScreenState.POST_LOGIN_RECOMMENDATION,
