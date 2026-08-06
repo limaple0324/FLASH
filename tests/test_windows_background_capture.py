@@ -1528,6 +1528,7 @@ def test_revealed_capture_restores_z_order_without_activation_or_movement(
     original_rect = user32.rects[user32.target]
 
     assert provider.capture(user32.target) is expected
+    assert provider.last_failure_stage is None
 
     assert visible.handles == [user32.target]
     assert user32.z_order == original_order
@@ -1596,6 +1597,7 @@ def test_revealed_capture_restores_z_order_when_capture_fails(monkeypatch):
     original_order = list(user32.z_order)
 
     assert provider.capture(user32.target) is None
+    assert provider.last_failure_stage == "fresh_capture_failed"
 
     assert visible.handles == [user32.target]
     assert user32.z_order == original_order
@@ -1616,6 +1618,7 @@ def test_revealed_capture_fails_closed_without_target_lifecycle(
     monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
 
     assert provider.capture(user32.target) is None
+    assert provider.last_failure_stage == "target_snapshot_failed"
 
     assert visible.handles == []
     assert user32.position_calls == []
@@ -1636,6 +1639,7 @@ def test_revealed_capture_fails_closed_without_foreground_lifecycle(
     monkeypatch.setattr(provider, "_libraries", lambda: (user32, object()))
 
     assert provider.capture(user32.target) is None
+    assert provider.last_failure_stage == "restore_reference_incomplete"
 
     assert visible.handles == []
     assert user32.position_calls == []
@@ -1650,6 +1654,7 @@ def test_revealed_capture_rejects_raise_failure_without_capturing(monkeypatch):
     original_order = list(user32.z_order)
 
     assert provider.capture(user32.target) is None
+    assert provider.last_failure_stage == "temporary_raise_failed"
 
     assert visible.handles == []
     assert user32.z_order == original_order
@@ -1768,6 +1773,7 @@ def test_revealed_capture_does_not_override_concurrent_user_focus(
     original_order = list(user32.z_order)
 
     assert provider.capture(user32.target) is None
+    assert provider.last_failure_stage == "foreground_changed"
 
     assert visible.handles == []
     assert user32.z_order == original_order
@@ -1833,6 +1839,7 @@ def test_revealed_capture_discards_sample_when_z_order_restore_fails(
     provider = reveal_provider(user32, visible, monkeypatch)
 
     assert provider.capture(user32.target) is None
+    assert provider.last_failure_stage == "restoration_barrier_failed"
 
     assert visible.handles == [user32.target]
     assert len(user32.position_calls) == 3

@@ -35,6 +35,16 @@ LIVE_SOURCE_GENERATION_FAILURE = (
 LIVE_SOURCE_GENERATION_FAILURE_SHA256 = (
     "cf68b7fe1e4f01043a7ec3aa08918a48cff9d9db8d71e8937ed3b849904b4cbd"
 )
+LIVE_OBSCURED_CAPTURE_TIMEOUT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "smart_reconnect"
+    / "live_failures"
+    / "20260806T022926Z-obscured-capture-timeout.jsonl"
+)
+LIVE_OBSCURED_CAPTURE_TIMEOUT_SHA256 = (
+    "39398aa8c3b36cc65105db4646d391421299589d1a4013653b2d7886dbbbd408"
+)
 
 
 class _Clock:
@@ -449,6 +459,36 @@ def test_real_source_generation_failure_replays_as_incomplete() -> None:
     assert "unknown_not_retried" in finding_codes
     assert "reconnect_cycle_incomplete" in finding_codes
     assert "flow_action_missing" in finding_codes
+    assert all(cycle.accepted is False for cycle in report.cycles)
+
+
+def test_real_obscured_capture_timeout_replays_as_incomplete() -> None:
+    assert hashlib.sha256(LIVE_OBSCURED_CAPTURE_TIMEOUT.read_bytes()).hexdigest() == (
+        LIVE_OBSCURED_CAPTURE_TIMEOUT_SHA256
+    )
+
+    validator = SmartReconnectReplayValidator()
+    records = validator.load(LIVE_OBSCURED_CAPTURE_TIMEOUT)
+    report = validator.validate(LIVE_OBSCURED_CAPTURE_TIMEOUT)
+    observations = [
+        record
+        for record in records
+        if record.get("record_type") == "observation"
+    ]
+
+    assert report.source_commit == "e8ec61a70f7855df85917d1ed840d4c679c99538"
+    assert report.event_count == 229
+    assert report.window_count == 9
+    assert report.recovered_cycles == 0
+    assert report.pending_actions == 0
+    assert sum(
+        record.get("failure_reason") == "capture_failed"
+        for record in observations
+    ) == 93
+    assert sum(
+        record.get("record_type") == "action"
+        for record in records
+    ) == 6
     assert all(cycle.accepted is False for cycle in report.cycles)
 
 

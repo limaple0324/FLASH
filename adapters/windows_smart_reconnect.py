@@ -3567,13 +3567,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         elif recognition.state is ReconnectScreenState.CHECK_DISABLED:
             rejection_gate = "capture_path_disabled"
         elif sample is None or not getattr(sample, "api_succeeded", False):
+            diagnostic_provider = (
+                self._active_refresh_capture_provider
+                if capture_route == CAPTURE_ROUTE_MINIMIZED
+                else (
+                    self._obscured_capture_provider
+                    if capture_route == CAPTURE_ROUTE_OBSCURED
+                    else None
+                )
+            )
             provider_stage = (
                 getattr(
-                    self._active_refresh_capture_provider,
+                    diagnostic_provider,
                     "last_failure_stage",
                     None,
                 )
-                if capture_route == CAPTURE_ROUTE_MINIMIZED
+                if diagnostic_provider is not None
                 else None
             )
             rejection_gate = (

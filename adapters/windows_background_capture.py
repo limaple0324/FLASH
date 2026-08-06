@@ -1335,6 +1335,17 @@ class Win32TemporarilyRevealedCaptureProvider:
             0.0,
             float(paint_settle_seconds),
         )
+        self._last_failure_stage: str | None = None
+
+    @property
+    def last_failure_stage(self) -> str | None:
+        """Return the latest anonymous fail-closed stage."""
+
+        return self._last_failure_stage
+
+    def _fail(self, stage: str) -> None:
+        self._last_failure_stage = stage
+        return None
 
     @staticmethod
     def _libraries():
@@ -1803,8 +1814,9 @@ class Win32TemporarilyRevealedCaptureProvider:
         return False
 
     def capture(self, window_handle: int) -> CaptureSample | None:
+        self._last_failure_stage = None
         if os.name != "nt" or not window_handle:
-            return None
+            return self._fail("platform_or_target_invalid")
 
         user32, _gdi32 = self._libraries()
         self._configure(user32)
@@ -1816,7 +1828,7 @@ class Win32TemporarilyRevealedCaptureProvider:
                 or not user32.IsWindowVisible(hwnd)
                 or user32.IsIconic(hwnd)
             ):
-                return None
+                return self._fail("target_not_revealable")
             target_instance = self._window_instance_credential(
                 user32,
                 hwnd,
@@ -1824,7 +1836,7 @@ class Win32TemporarilyRevealedCaptureProvider:
             )
             original_rect = self._window_rect(user32, hwnd)
             if target_instance is None or original_rect is None:
-                return None
+                return self._fail("target_snapshot_failed")
             process_id = target_instance.process_id
             was_topmost = self._is_topmost(user32, hwnd)
             original_foreground = self._handle_value(
@@ -1868,7 +1880,7 @@ class Win32TemporarilyRevealedCaptureProvider:
                 or (previous_handle and previous_instance is None)
                 or (next_handle and next_instance is None)
             ):
-                return None
+                return self._fail("restore_reference_incomplete")
             raised = False
             restored = False
             sample: CaptureSample | None = None
@@ -1880,7 +1892,7 @@ class Win32TemporarilyRevealedCaptureProvider:
                         target_instance,
                         self._process_lifecycle_provider,
                     ):
-                        return None
+                        return self._fail("target_instance_changed")
                     raised = (
                         self._set_window_position_if_instances_current(
                             user32,
@@ -1900,7 +1912,7 @@ class Win32TemporarilyRevealedCaptureProvider:
                 except OSError:
                     raised = False
                 if not raised:
-                    return None
+                    return self._fail("temporary_raise_failed")
                 current_foreground = self._handle_value(
                     user32.GetForegroundWindow()
                 )
@@ -1915,7 +1927,7 @@ class Win32TemporarilyRevealedCaptureProvider:
                     current_foreground != original_foreground
                     or not foreground_preserved
                 ):
-                    return None
+                    return self._fail("foreground_changed")
                 if self._paint_settle_seconds:
                     time.sleep(self._paint_settle_seconds)
                 if not self._same_live_normal_window(
@@ -1927,7 +1939,7 @@ class Win32TemporarilyRevealedCaptureProvider:
                     expected_instance=target_instance,
                     lifecycle_provider=self._process_lifecycle_provider,
                 ):
-                    return None
+                    return self._fail("revealed_target_changed")
                 current_foreground = self._handle_value(
                     user32.GetForegroundWindow()
                 )
@@ -1942,7 +1954,7 @@ class Win32TemporarilyRevealedCaptureProvider:
                     current_foreground != original_foreground
                     or not foreground_preserved
                 ):
-                    return None
+                    return self._fail("foreground_changed")
                 try:
                     sample = self._visible_provider.capture(window_handle)
                 except OSError:
@@ -1957,10 +1969,11 @@ class Win32TemporarilyRevealedCaptureProvider:
                     original_instance=original_foreground_instance,
                     lifecycle_provider=self._process_lifecycle_provider,
                 )
-                if (
-                    sample is None
-                    or not sample.api_succeeded
-                    or not self._same_live_normal_window(
+                if sample is None or not sample.api_succeeded:
+                    self._last_failure_stage = "fresh_capture_failed"
+                    sample = None
+                else:
+                    target_still_current = self._same_live_normal_window(
                         user32,
                         hwnd,
                         process_id=process_id,
@@ -1969,10 +1982,17 @@ class Win32TemporarilyRevealedCaptureProvider:
                         expected_instance=target_instance,
                         lifecycle_provider=self._process_lifecycle_provider,
                     )
-                    or current_foreground != original_foreground
-                    or not foreground_preserved
-                ):
-                    sample = None
+                    if not target_still_current:
+                        self._last_failure_stage = (
+                            "target_changed_after_capture"
+                        )
+                        sample = None
+                    elif (
+                        current_foreground != original_foreground
+                        or not foreground_preserved
+                    ):
+                        self._last_failure_stage = "foreground_changed"
+                        sample = None
             finally:
                 target_is_current = self._same_window_instance(
                     user32,
@@ -2111,7 +2131,17 @@ class Win32TemporarilyRevealedCaptureProvider:
                         lifecycle_provider=self._process_lifecycle_provider,
                     )
                     restored = bool(restored and foreground_preserved)
-            return sample if restored else None
+                    if (
+                        not restored
+                        and self._last_failure_stage != "foreground_changed"
+                    ):
+                        self._last_failure_stage = "restoration_barrier_failed"
+            if sample is not None and restored:
+                self._last_failure_stage = None
+                return sample
+            if self._last_failure_stage is None:
+                self._last_failure_stage = "fresh_capture_failed"
+            return None
 
 
 class WindowsBackgroundCaptureBackend:
