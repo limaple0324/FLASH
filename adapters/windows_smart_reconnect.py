@@ -2302,6 +2302,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._state = ReconnectState.DISCONNECTED
         self._last_result: ReconnectBatchResult | None = None
         self._execution_enabled = threading.Event()
+        self._execution_scan_active = threading.Event()
+        self._execution_scan_thread_id: int | None = None
         if execution_enabled:
             if self._record_evidence_monitoring_state(True):
                 self._execution_enabled.set()
@@ -4118,6 +4120,20 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         }
         if not requested:
             return {}
+        # Passive UI/synchronization readers are not an execution authority.
+        # While a reconnect transaction is active they must not capture,
+        # wait, or advance the source generation used by its final input gate.
+        with self._source_authority_lock:
+            foreign_execution_scan_active = bool(
+                self._execution_scan_active.is_set()
+                and self._execution_scan_thread_id
+                != threading.get_ident()
+            )
+        if foreign_execution_scan_active:
+            return {
+                fingerprint: ReconnectScreenState.UNKNOWN
+                for fingerprint in requested
+            }
         _settings, observation_revision = self._capture_settings_snapshot()
         supplied = (
             tuple(candidate_windows)
@@ -4174,10 +4190,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             # invalidate this entire passive source before its first capture.
             # Advancing the generation prevents an older observer from later
             # publishing any stale state over this UNKNOWN result.
-            self._revoke_source_failure_evidence(
+            self._revoke_passive_observation_failure(
                 frozenset(requested),
-                revoke_runtime_authority=True,
-                refresh_source_generation=True,
             )
             return {
                 fingerprint: ReconnectScreenState.UNKNOWN
@@ -4250,10 +4264,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     in by_fingerprint.items()
                 )
             ):
-                self._revoke_source_failure_evidence(
+                self._revoke_passive_observation_failure(
                     frozenset(requested),
-                    revoke_runtime_authority=True,
-                    refresh_source_generation=True,
                 )
                 return {
                     fingerprint: ReconnectScreenState.UNKNOWN
@@ -4330,6 +4342,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             )
                 self._last_screen_states.update(observed)
         return observed
+
+    def _revoke_passive_observation_failure(
+        self,
+        fingerprints: frozenset[str],
+    ) -> bool:
+        """Revoke only when no execution scan owns the source generation."""
+
+        with self._source_authority_lock:
+            if (
+                self._execution_scan_active.is_set()
+                and self._execution_scan_thread_id
+                != threading.get_ident()
+            ):
+                return False
+            self._revoke_source_failure_evidence(
+                fingerprints,
+                revoke_runtime_authority=True,
+                refresh_source_generation=True,
+            )
+            return True
 
     def reconnecting_fingerprints(self) -> frozenset[str]:
         # This path is queried by high-frequency input synchronizers. Return
@@ -7626,7 +7658,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         # running. Keep reconnect state internally consistent without holding
         # the shared game-operation gate during this read-only work.
         with self._scan_lock:
-            return self._scan_locked(execute=execute)
+            if execute:
+                with self._source_authority_lock:
+                    self._execution_scan_active.set()
+                    self._execution_scan_thread_id = threading.get_ident()
+            try:
+                return self._scan_locked(execute=execute)
+            finally:
+                if execute:
+                    with self._source_authority_lock:
+                        self._execution_scan_thread_id = None
+                        self._execution_scan_active.clear()
 
     def _scan_locked(self, *, execute: bool) -> ReconnectBatchResult:
         with self._capture_settings_lock:

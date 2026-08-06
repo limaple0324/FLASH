@@ -25,6 +25,16 @@ from services.smart_reconnect_evidence_store import (
 
 COMMIT = "a" * 40
 AUTHORITY = "c" * 64
+LIVE_SOURCE_GENERATION_FAILURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "smart_reconnect"
+    / "live_failures"
+    / "20260806T014703Z-source-generation-cancelled.jsonl"
+)
+LIVE_SOURCE_GENERATION_FAILURE_SHA256 = (
+    "cf68b7fe1e4f01043a7ec3aa08918a48cff9d9db8d71e8937ed3b849904b4cbd"
+)
 
 
 class _Clock:
@@ -418,6 +428,28 @@ def test_replay_accepts_one_full_anonymous_recovery_lifecycle(tmp_path: Path) ->
     assert report.cycles[0].total_elapsed_ms is not None
     assert report.cycles[0].total_elapsed_ms <= SMART_RECONNECT_DEADLINE_MS
     assert report.cycles[0].accepted is True
+
+
+def test_real_source_generation_failure_replays_as_incomplete() -> None:
+    assert hashlib.sha256(LIVE_SOURCE_GENERATION_FAILURE.read_bytes()).hexdigest() == (
+        LIVE_SOURCE_GENERATION_FAILURE_SHA256
+    )
+
+    report = SmartReconnectReplayValidator().validate(
+        LIVE_SOURCE_GENERATION_FAILURE
+    )
+    finding_codes = {finding.code for finding in report.findings}
+
+    assert report.source_commit == "34bfadcbb7441da69ed718572445591fd1f444ac"
+    assert report.event_count == 892
+    assert report.window_count == 9
+    assert report.recovered_cycles == 0
+    assert report.pending_actions == 0
+    assert report.session_duration_ms == 181_203
+    assert "unknown_not_retried" in finding_codes
+    assert "reconnect_cycle_incomplete" in finding_codes
+    assert "flow_action_missing" in finding_codes
+    assert all(cycle.accepted is False for cycle in report.cycles)
 
 
 def test_replay_rejects_unknown_click_duplicate_and_missing_proof(tmp_path: Path) -> None:

@@ -6551,6 +6551,134 @@ def test_reconnecting_snapshot_does_not_wait_for_long_scan_lock():
     assert worker.is_alive() is False
 
 
+def test_passive_observer_cannot_revoke_an_active_reconnect_scan(
+    monkeypatch,
+):
+    window = make_window(1)
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.reconnect()
+
+    scan_capturing = threading.Event()
+    release_scan = threading.Event()
+    original_capture = fixture.controller._capture_and_recognize
+
+    def capture_with_barrier(*args, **kwargs):
+        if (
+            threading.current_thread().name == "reconnect-worker"
+            and not scan_capturing.is_set()
+        ):
+            scan_capturing.set()
+            assert release_scan.wait(1)
+        return original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fixture.controller,
+        "_capture_and_recognize",
+        capture_with_barrier,
+    )
+    reconnect_results = []
+    worker = threading.Thread(
+        name="reconnect-worker",
+        target=lambda: reconnect_results.append(
+            fixture.controller.reconnect()
+        ),
+    )
+    generation_before = fixture.controller._source_state_generation
+    worker.start()
+    assert scan_capturing.wait(1) is True
+
+    conflicting_geometry = replace(
+        window,
+        rect=(10, 10, 910, 610),
+    )
+    started = time.monotonic()
+    observed = fixture.controller.observe_screen_states(
+        (window.launch_fingerprint,),
+        candidate_windows=(conflicting_geometry,),
+    )
+    elapsed = time.monotonic() - started
+
+    assert observed == {
+        window.launch_fingerprint: ReconnectScreenState.UNKNOWN,
+    }
+    assert elapsed < 0.1
+    assert fixture.controller._source_state_generation == generation_before
+
+    release_scan.set()
+    worker.join(1)
+
+    assert worker.is_alive() is False
+    assert reconnect_results[0].details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(window.handle, (0.5, 0.5))]
+
+
+def test_queued_execution_scan_cannot_replace_active_scan_owner(monkeypatch):
+    fixture = make_controller([1])
+    fixture.controller.reconnect()
+    baseline = fixture.controller.last_result
+    assert baseline is not None
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    release_second = threading.Event()
+    worker_ids = {}
+
+    def staged_scan(*, execute):
+        assert execute is True
+        if threading.current_thread().name == "first-execution-scan":
+            first_entered.set()
+            assert release_first.wait(1)
+        else:
+            second_entered.set()
+            assert release_second.wait(1)
+        return baseline
+
+    monkeypatch.setattr(fixture.controller, "_scan_locked", staged_scan)
+
+    def run_scan(worker_name):
+        worker_ids[worker_name] = threading.get_ident()
+        fixture.controller.reconnect()
+
+    first = threading.Thread(
+        name="first-execution-scan",
+        target=run_scan,
+        args=("first",),
+    )
+    second = threading.Thread(
+        name="second-execution-scan",
+        target=run_scan,
+        args=("second",),
+    )
+    first.start()
+    assert first_entered.wait(1) is True
+    second.start()
+    deadline = time.monotonic() + 1
+    while "second" not in worker_ids and time.monotonic() < deadline:
+        time.sleep(0.001)
+
+    assert worker_ids["second"] != worker_ids["first"]
+    assert second_entered.is_set() is False
+    assert fixture.controller._execution_scan_thread_id == worker_ids["first"]
+
+    release_first.set()
+    first.join(1)
+    assert first.is_alive() is False
+    assert second_entered.wait(1) is True
+    assert fixture.controller._execution_scan_thread_id == worker_ids["second"]
+
+    release_second.set()
+    second.join(1)
+
+    assert second.is_alive() is False
+    assert fixture.controller._execution_scan_active.is_set() is False
+    assert fixture.controller._execution_scan_thread_id is None
+
+
 def test_busy_operation_gate_does_not_charge_retry_or_deliver_click():
     gate = GameOperationGate()
     fixture = make_controller([2, 1], operation_gate=gate)
