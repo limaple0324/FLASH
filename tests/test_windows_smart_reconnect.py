@@ -8812,6 +8812,109 @@ def test_stable_target_exact_alias_uses_two_stages_and_remembers_slot():
     ]
 
 
+@pytest.mark.parametrize("short_alias", ("甲", "甲乙"))
+@pytest.mark.parametrize("saved_slot", (None, 2))
+def test_stable_target_first_stage_rejects_short_complete_alias(
+    short_alias,
+    saved_slot,
+):
+    selected = saved_slot is not None
+    candidate = CharacterSelectionCandidate(
+        160,
+        None,
+        2,
+        selected,
+        (
+            CHARACTER_ENTER_CLICK_POINT
+            if selected
+            else (0.651, 0.706)
+        ),
+        digit_count=3,
+        identity=short_alias,
+    )
+    saved_slots = []
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(lambda _call: (candidate,)),
+        target_identity_provider=lambda _fingerprint: (
+            _stable_target_identity(
+                window,
+                role_aliases=(short_alias,),
+                slot_index=saved_slot,
+            )
+        ),
+        verified_slot_recorder=lambda fingerprint, character_id, slot: (
+            saved_slots.append((fingerprint, character_id, slot)) or True
+        ),
+    )
+    fingerprint = window.launch_fingerprint
+    fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+    assert saved_slots == []
+    assert fingerprint not in fixture.controller._character_selection_targets
+
+
+@pytest.mark.parametrize("short_alias", ("甲", "甲乙"))
+def test_stable_target_second_stage_rejects_short_complete_alias(
+    short_alias,
+):
+    now = [0.0]
+    candidate = CharacterSelectionCandidate(
+        160,
+        None,
+        2,
+        False,
+        (0.651, 0.706),
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    selected = replace(
+        candidate,
+        selected=True,
+        click_point=CHARACTER_ENTER_CLICK_POINT,
+        identity=short_alias,
+    )
+    phase = ["select"]
+    saved_slots = []
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(
+            lambda _call: (
+                (candidate,)
+                if phase[0] == "select"
+                else (selected,)
+            )
+        ),
+        clock=lambda: now[0],
+        target_identity_provider=lambda _fingerprint: (
+            _stable_target_identity(
+                window,
+                role_aliases=("AlphaHero", short_alias),
+            )
+        ),
+        verified_slot_recorder=lambda fingerprint, character_id, slot: (
+            saved_slots.append((fingerprint, character_id, slot)) or True
+        ),
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    phase[0] = "enter"
+    now[0] = 10.0
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == [(1, candidate.click_point)]
+    assert saved_slots == []
+
+
 def test_stable_target_saved_slot_rejects_readable_identity_conflict():
     selected = CharacterSelectionCandidate(
         160,

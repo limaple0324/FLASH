@@ -6431,7 +6431,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return None
         if "..." in value or "…" in value:
             return None
-        return normalize_reconnect_role_alias(value)
+        normalized = normalize_reconnect_role_alias(value)
+        if normalized is None or len(normalized) < 3:
+            return None
+        return normalized
+
+    @staticmethod
+    def _short_complete_target_candidate_identity(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        if "..." in value or "…" in value:
+            return False
+        normalized = normalize_reconnect_role_alias(value)
+        return normalized is not None and len(normalized) < 3
 
     def _stable_target_character_is_safe(
         self,
@@ -6468,6 +6480,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             ):
                 return None
             candidate = selected[0]
+            if self._short_complete_target_candidate_identity(
+                candidate.identity
+            ):
+                return None
             complete_identity = self._complete_target_candidate_identity(
                 candidate.identity
             )
@@ -6509,6 +6525,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if len(slot_matches) != 1:
                 return None
             candidate = slot_matches[0]
+            if self._short_complete_target_candidate_identity(
+                candidate.identity
+            ):
+                return None
             if any(
                 match.slot_index != saved_slot for match in exact_alias_matches
             ):
@@ -6529,6 +6549,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             and candidates[0].selected
         ):
             candidate = candidates[0]
+            if self._short_complete_target_candidate_identity(
+                candidate.identity
+            ):
+                return None
             complete_identity = self._complete_target_candidate_identity(
                 candidate.identity
             )
