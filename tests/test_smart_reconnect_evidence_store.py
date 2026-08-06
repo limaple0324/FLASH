@@ -45,6 +45,16 @@ LIVE_OBSCURED_CAPTURE_TIMEOUT = (
 LIVE_OBSCURED_CAPTURE_TIMEOUT_SHA256 = (
     "39398aa8c3b36cc65105db4646d391421299589d1a4013653b2d7886dbbbd408"
 )
+LIVE_PASSIVE_CAPTURE_MISLABELED = (
+    Path(__file__).parent
+    / "fixtures"
+    / "smart_reconnect"
+    / "live_failures"
+    / "20260806T025057Z-passive-capture-mislabeled.jsonl"
+)
+LIVE_PASSIVE_CAPTURE_MISLABELED_SHA256 = (
+    "4a6d04fb20c36ba60809e77c8a3812e89e5db7e9b824d00e1ebd3844c28aa6d2"
+)
 
 
 class _Clock:
@@ -490,6 +500,35 @@ def test_real_obscured_capture_timeout_replays_as_incomplete() -> None:
         for record in records
     ) == 6
     assert all(cycle.accepted is False for cycle in report.cycles)
+
+
+def test_real_passive_capture_mislabel_replays_as_incomplete() -> None:
+    assert hashlib.sha256(LIVE_PASSIVE_CAPTURE_MISLABELED.read_bytes()).hexdigest() == (
+        LIVE_PASSIVE_CAPTURE_MISLABELED_SHA256
+    )
+
+    validator = SmartReconnectReplayValidator()
+    records = validator.load(LIVE_PASSIVE_CAPTURE_MISLABELED)
+    report = validator.validate(LIVE_PASSIVE_CAPTURE_MISLABELED)
+    observations = [
+        record
+        for record in records
+        if record.get("record_type") == "observation"
+    ]
+
+    assert report.source_commit == "b4a34a8f6cca5c8a90576b312085a9e727932549"
+    assert report.event_count == 188
+    assert report.window_count == 9
+    assert report.recovered_cycles == 0
+    assert sum(
+        record.get("failure_reason") == "capture_failed"
+        for record in observations
+    ) == 95
+    assert not any(
+        record.get("failure_reason")
+        not in {None, "capture_failed", "screen_unknown"}
+        for record in observations
+    )
 
 
 def test_replay_rejects_unknown_click_duplicate_and_missing_proof(tmp_path: Path) -> None:

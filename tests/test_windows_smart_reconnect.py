@@ -4908,6 +4908,37 @@ def test_obscured_failure_stage_is_preserved_in_capture_diagnostics():
     assert fixture.mouse.clicks == []
 
 
+def test_passive_obscured_withholding_is_not_a_capture_failure():
+    window = make_window(1)
+    visible = FakeCaptureProvider({1: None})
+    obscured = FakeCaptureProvider({1: None})
+    obscured.last_failure_stage = "foreground_changed"
+    fixture = make_controller(
+        [1],
+        windows=[window],
+        expected_windows=1,
+        visible_capture_provider=visible,
+        obscured_capture_provider=obscured,
+        primary_capture_is_trusted=False,
+        window_backend=ObscuredWindowBackend([window]),
+    )
+    fixture.controller._begin_capture_diagnostics([window])
+
+    observed = fixture.controller.observe_screen_states(
+        [window.launch_fingerprint]
+    )
+
+    assert observed == {
+        window.launch_fingerprint: ReconnectScreenState.UNKNOWN,
+    }
+    assert [
+        item.rejection_gate
+        for item in fixture.controller.anonymous_capture_diagnostics()
+    ] == ["passive_capture_withheld"]
+    assert obscured.calls == []
+    assert fixture.mouse.clicks == []
+
+
 def test_passive_observation_never_temporarily_reveals_obscured_window():
     window = make_window(1)
     visible = FakeCaptureProvider({1: None})
