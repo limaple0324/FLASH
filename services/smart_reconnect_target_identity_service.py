@@ -141,6 +141,7 @@ class SmartReconnectTargetIdentityService:
         groups: tuple[GroupConfiguration, ...],
         characters: tuple[Character, ...],
         records: tuple[CharacterWindowRecord, ...],
+        shortcut_sources: tuple[tuple[object, ...], ...],
     ) -> tuple[object, ...]:
         return (
             tuple(
@@ -174,7 +175,32 @@ class SmartReconnectTargetIdentityService:
                 )
                 for item in records
             ),
+            shortcut_sources,
         )
+
+    @staticmethod
+    def _shortcut_source_signature(
+        paths: tuple[Path, ...],
+    ) -> tuple[tuple[object, ...], ...]:
+        """Return a cheap identity that changes when a shortcut is rewritten."""
+
+        result: list[tuple[object, ...]] = []
+        for path in paths:
+            try:
+                status = path.stat()
+            except OSError:
+                result.append((str(path), None))
+                continue
+            result.append(
+                (
+                    str(path),
+                    status.st_size,
+                    status.st_mtime_ns,
+                    getattr(status, "st_ctime_ns", None),
+                    getattr(status, "st_ino", None),
+                )
+            )
+        return tuple(result)
 
     def _load_state(self) -> dict[str, _SavedTargetState]:
         try:
@@ -265,9 +291,6 @@ class SmartReconnectTargetIdentityService:
             for item in self._items(self._registry_provider)
             if isinstance(item, CharacterWindowRecord)
         )
-        signature = self._signature(groups, characters, records)
-        if signature == self._source_signature:
-            return
         paths = tuple(
             dict.fromkeys(
                 entry.shortcut_path.resolve(strict=False)
@@ -275,6 +298,14 @@ class SmartReconnectTargetIdentityService:
                 for entry in group.entries
             )
         )
+        signature = self._signature(
+            groups,
+            characters,
+            records,
+            self._shortcut_source_signature(paths),
+        )
+        if signature == self._source_signature:
+            return
         try:
             resolved = self._resolver.resolve(paths)
         except (OSError, RuntimeError, TypeError, ValueError):
@@ -290,6 +321,9 @@ class SmartReconnectTargetIdentityService:
             for path, value in resolved.items()
             if isinstance(path, Path)
         }
+        resolution_complete = all(
+            normalized_by_path.get(path) is not None for path in paths
+        )
         characters_by_id: dict[str, list[Character]] = {}
         records_by_id: dict[str, list[CharacterWindowRecord]] = {}
         for character in characters:
@@ -362,7 +396,10 @@ class SmartReconnectTargetIdentityService:
                 original_line_number=line_number,
             )
         self._targets = targets
-        self._source_signature = signature
+        # The PowerShell resolver deliberately reports operational failures as
+        # an empty or partial mapping.  Keep successful targets usable, but do
+        # not make that incomplete result sticky: the next lookup must retry.
+        self._source_signature = signature if resolution_complete else None
 
     def target_for(self, fingerprint: object) -> SmartReconnectTargetIdentity | None:
         normalized = normalize_launch_fingerprint(fingerprint)

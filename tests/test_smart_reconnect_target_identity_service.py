@@ -297,3 +297,38 @@ def test_changed_group_sources_refresh_the_cached_fingerprint_index(tmp_path):
     assert service.target_for(FINGERPRINT) is None
     assert service.target_for(OTHER_FINGERPRINT) is not None
     assert resolver.calls == 2
+
+
+def test_rewritten_shortcut_refreshes_the_cached_fingerprint_index(tmp_path):
+    shortcut = tmp_path / "role.lnk"
+    shortcut.write_bytes(b"first-shortcut-content")
+    resolver = StaticShortcutResolver({shortcut.resolve(): FINGERPRINT})
+    service = make_service(
+        tmp_path,
+        (make_group("one", (make_entry(shortcut),)),),
+        resolver,
+    )
+
+    assert service.target_for(FINGERPRINT) is not None
+    shortcut.write_bytes(b"rewritten-shortcut-content-with-new-identity")
+    resolver.values[shortcut.resolve()] = OTHER_FINGERPRINT
+
+    assert service.target_for(FINGERPRINT) is None
+    assert service.target_for(OTHER_FINGERPRINT) is not None
+    assert resolver.calls == 2
+
+
+def test_incomplete_resolver_result_is_retried_instead_of_cached(tmp_path):
+    shortcut = tmp_path / "role.lnk"
+    resolver = StaticShortcutResolver({})
+    service = make_service(
+        tmp_path,
+        (make_group("one", (make_entry(shortcut),)),),
+        resolver,
+    )
+
+    assert service.target_for(FINGERPRINT) is None
+    resolver.values[shortcut.resolve()] = FINGERPRINT
+
+    assert service.target_for(FINGERPRINT) is not None
+    assert resolver.calls == 2
