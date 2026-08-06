@@ -3131,6 +3131,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         capture_route: str | None,
         rejection_gate: str | None,
         expected_source_state_generation: int | None,
+        scan_duration_ms: int | None,
     ) -> None:
         recorder = self._evidence_recorder
         if recorder is None or self._evidence_recording_failed:
@@ -3205,6 +3206,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 overlapped_by_game_window=(
                     self._window_overlaps_monitored_window(window)
                 ),
+                scan_duration_ms=scan_duration_ms,
             )
         except (OSError, TypeError, ValueError):
             self._mark_evidence_failure()
@@ -3544,6 +3546,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         capture_route: str | None,
         execution_requested: bool,
         expected_source_state_generation: int | None,
+        scan_duration_ms: int | None,
     ) -> None:
         with self._capture_diagnostic_lock:
             window_index = self._capture_diagnostic_window_indices.get(
@@ -3635,6 +3638,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             capture_route=capture_route,
             rejection_gate=rejection_gate,
             expected_source_state_generation=expected_source_state_generation,
+            scan_duration_ms=scan_duration_ms,
         )
 
     def _capture_and_recognize(
@@ -3651,6 +3655,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         bool,
         str | None,
     ]:
+        scan_started = time.perf_counter()
         result = self._capture_and_recognize_unobserved(
             window,
             fingerprint,
@@ -3658,6 +3663,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             expected_source_state_generation=(
                 expected_source_state_generation
             ),
+        )
+        scan_duration_ms = max(
+            0,
+            round((time.perf_counter() - scan_started) * 1000),
         )
         sample, recognition, fresh_capture, capture_route = result
         self._record_capture_diagnostic(
@@ -3672,6 +3681,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             expected_source_state_generation=(
                 expected_source_state_generation
             ),
+            scan_duration_ms=scan_duration_ms,
         )
         return result
 

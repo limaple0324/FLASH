@@ -25,6 +25,9 @@ from core.reconnect_policy import ReconnectAction, ReconnectScreenState
 SMART_RECONNECT_EVIDENCE_SCHEMA_VERSION = 3
 SMART_RECONNECT_EVIDENCE_DIRNAME = "smart_reconnect_evidence"
 SMART_RECONNECT_DEADLINE_MS = 60_000
+SMART_RECONNECT_STAGE_RESPONSE_TARGET_MS = 2_000
+SMART_RECONNECT_PROGRAM_OVERHEAD_TARGET_MS = 10_000
+SMART_RECONNECT_TIME_BASELINE_MIN_CYCLES = 5
 FORMAL_ACCEPTANCE_MIN_WINDOWS = 14
 FORMAL_ACCEPTANCE_MIN_CYCLES = 100
 FORMAL_ACCEPTANCE_MIN_DURATION_MS = 8 * 60 * 60 * 1000
@@ -186,6 +189,21 @@ class SmartReconnectReplayReport:
 
 
 @dataclass(frozen=True, slots=True)
+class ReplayStageTiming:
+    stage: str
+    state_episode: int
+    started_elapsed_ms: int
+    finished_elapsed_ms: int
+    scan_duration_ms: int | None
+    recognition_upper_bound_ms: int | None
+    post_recognition_action_ms: int
+    program_response_upper_bound_ms: int | None
+    next_stage: str | None
+    next_stage_started_elapsed_ms: int | None
+    transition_wait_ms: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class ReplayCycleResult:
     window_id: str
     cycle: int
@@ -193,6 +211,12 @@ class ReplayCycleResult:
     finished_elapsed_ms: int | None
     total_elapsed_ms: int | None
     stage_times_ms: tuple[tuple[str, int], ...]
+    stage_timings: tuple[ReplayStageTiming, ...]
+    program_overhead_upper_bound_ms: int | None
+    transition_wait_ms: int | None
+    sixty_second_target_met: bool | None
+    stage_response_target_met: bool
+    program_overhead_target_met: bool
     fallback_capture_used: bool
     fallback_recognition_used: bool
     window_state_restored: bool
@@ -416,6 +440,7 @@ class SmartReconnectEvidenceRecorder:
         self._last_observation_key: dict[str, tuple[object, ...]] = {}
         self._same_observation_count: dict[str, int] = {}
         self._last_observation_written_at: dict[str, float] = {}
+        self._last_observation_attempt_at: dict[str, float] = {}
         self._line_verified: dict[str, bool | None] = {}
         self._role_verified: dict[str, bool | None] = {}
         self._auto_battle_verified: dict[str, bool | None] = {}
@@ -437,6 +462,16 @@ class SmartReconnectEvidenceRecorder:
                 "acceptance_eligible_source": source_identity.acceptance_eligible,
                 "auto_battle_required": self._auto_battle_required,
                 "reconnect_deadline_ms": SMART_RECONNECT_DEADLINE_MS,
+                "reconnect_deadline_enforced": False,
+                "stage_response_target_ms": (
+                    SMART_RECONNECT_STAGE_RESPONSE_TARGET_MS
+                ),
+                "program_overhead_target_ms": (
+                    SMART_RECONNECT_PROGRAM_OVERHEAD_TARGET_MS
+                ),
+                "time_baseline_min_cycles": (
+                    SMART_RECONNECT_TIME_BASELINE_MIN_CYCLES
+                ),
                 "formal_acceptance_min_windows": FORMAL_ACCEPTANCE_MIN_WINDOWS,
                 "formal_acceptance_min_cycles": FORMAL_ACCEPTANCE_MIN_CYCLES,
                 "formal_acceptance_min_cycles_per_window": (
@@ -547,6 +582,7 @@ class SmartReconnectEvidenceRecorder:
         recognition_basis: object = None,
         other_window_foreground: bool = False,
         overlapped_by_game_window: bool = False,
+        scan_duration_ms: object = None,
     ) -> int | None:
         normalized_state = _safe_code(state, fallback=ReconnectScreenState.UNKNOWN.value)
         if normalized_state not in {item.value for item in ReconnectScreenState}:
@@ -590,10 +626,27 @@ class SmartReconnectEvidenceRecorder:
                     features and sum(features[16:]) > 0
                 )
         normalized_score = _normalized_score(score)
+        normalized_scan_duration_ms = (
+            max(0, round(float(scan_duration_ms)))
+            if isinstance(scan_duration_ms, (int, float))
+            and not isinstance(scan_duration_ms, bool)
+            and math.isfinite(float(scan_duration_ms))
+            and float(scan_duration_ms) >= 0
+            else None
+        )
         with self._lock:
             window_id = self._window_id(str(raw_window_key))
             previous_state = self._previous_state.get(window_id)
             now = float(self._monotonic_clock())
+            previous_attempt_at = self._last_observation_attempt_at.get(
+                window_id
+            )
+            scan_interval_ms = (
+                max(0, round((now - previous_attempt_at) * 1000))
+                if previous_attempt_at is not None
+                else None
+            )
+            self._last_observation_attempt_at[window_id] = now
             if previous_state != normalized_state:
                 self._state_episodes[window_id] = (
                     self._state_episodes.get(window_id, 0) + 1
@@ -724,6 +777,8 @@ class SmartReconnectEvidenceRecorder:
                 "fresh": fresh is True,
                 "identity_verified": identity_verified is True,
                 "recognition_score": normalized_score,
+                "scan_duration_ms": normalized_scan_duration_ms,
+                "scan_interval_ms": scan_interval_ms,
                 "reference_code": safe_reference,
                 "failure_reason": safe_failure,
                 "original_line_verified": self._line_verified.get(window_id),
@@ -1179,6 +1234,23 @@ class SmartReconnectReplayValidator:
             findings.append(ReplayFinding("schema_version_mismatch"))
         if header.get("reconnect_deadline_ms") != SMART_RECONNECT_DEADLINE_MS:
             findings.append(ReplayFinding("reconnect_deadline_mismatch"))
+        if header.get("reconnect_deadline_enforced") not in {None, False}:
+            findings.append(ReplayFinding("reconnect_deadline_mode_mismatch"))
+        if header.get(
+            "stage_response_target_ms",
+            SMART_RECONNECT_STAGE_RESPONSE_TARGET_MS,
+        ) != SMART_RECONNECT_STAGE_RESPONSE_TARGET_MS:
+            findings.append(ReplayFinding("stage_response_target_mismatch"))
+        if header.get(
+            "program_overhead_target_ms",
+            SMART_RECONNECT_PROGRAM_OVERHEAD_TARGET_MS,
+        ) != SMART_RECONNECT_PROGRAM_OVERHEAD_TARGET_MS:
+            findings.append(ReplayFinding("program_overhead_target_mismatch"))
+        if header.get(
+            "time_baseline_min_cycles",
+            SMART_RECONNECT_TIME_BASELINE_MIN_CYCLES,
+        ) != SMART_RECONNECT_TIME_BASELINE_MIN_CYCLES:
+            findings.append(ReplayFinding("time_baseline_requirement_mismatch"))
         if (
             header.get("formal_acceptance_min_cycles_per_window")
             != FORMAL_ACCEPTANCE_MIN_CYCLES_PER_WINDOW
@@ -1684,8 +1756,22 @@ class SmartReconnectReplayValidator:
             disconnect_context = str(
                 ordered_items[first_disconnect].get("scene_context", "unknown")
             )
-            started_elapsed = int(
+            disconnect_observation_elapsed = int(
                 ordered_items[first_disconnect].get("elapsed_ms", 0)
+            )
+            disconnect_scan_interval = ordered_items[first_disconnect].get(
+                "scan_interval_ms"
+            )
+            started_elapsed = max(
+                0,
+                disconnect_observation_elapsed
+                - (
+                    int(disconnect_scan_interval)
+                    if isinstance(disconnect_scan_interval, int)
+                    and not isinstance(disconnect_scan_interval, bool)
+                    and disconnect_scan_interval >= 0
+                    else 0
+                ),
             )
             stage_times: list[tuple[str, int]] = []
             stage_positions: list[int] = []
@@ -1887,6 +1973,12 @@ class SmartReconnectReplayValidator:
                     break
             finished_elapsed: int | None = None
             total_elapsed: int | None = None
+            stage_timing_results: list[ReplayStageTiming] = []
+            program_overhead_upper_bound: int | None = None
+            transition_wait: int | None = None
+            sixty_second_target_met: bool | None = None
+            stage_response_target_met = False
+            program_overhead_target_met = False
             if confirmed_connected_pair is not None:
                 finished_elapsed = int(
                     confirmed_connected_pair[1].get("elapsed_ms", 0)
@@ -1927,6 +2019,237 @@ class SmartReconnectReplayValidator:
                         finished_elapsed - started_elapsed,
                     )
                 )
+
+                for action_record in cycle_actions:
+                    action_sequence = int(action_record.get("sequence", 0))
+                    action_state = str(action_record.get("state", ""))
+                    action_episode = int(
+                        action_record.get("state_episode", -1)
+                    )
+                    first_stage_observation = next(
+                        (
+                            observation
+                            for observation in ordered_items[first_disconnect:]
+                            if observation.get("state") == action_state
+                            and int(observation.get("state_episode", -1))
+                            == action_episode
+                            and int(observation.get("sequence", 0))
+                            < action_sequence
+                        ),
+                        None,
+                    )
+                    if first_stage_observation is None:
+                        continue
+                    action_elapsed = int(
+                        action_record.get("elapsed_ms", 0)
+                    )
+                    stage_started = int(
+                        first_stage_observation.get("elapsed_ms", 0)
+                    )
+                    scan_duration = first_stage_observation.get(
+                        "scan_duration_ms"
+                    )
+                    normalized_scan_duration = (
+                        int(scan_duration)
+                        if isinstance(scan_duration, int)
+                        and not isinstance(scan_duration, bool)
+                        and scan_duration >= 0
+                        else None
+                    )
+                    scan_interval = first_stage_observation.get(
+                        "scan_interval_ms"
+                    )
+                    recognition_upper_bound = (
+                        int(scan_interval)
+                        if isinstance(scan_interval, int)
+                        and not isinstance(scan_interval, bool)
+                        and scan_interval >= 0
+                        else None
+                    )
+                    post_recognition_action = max(
+                        0,
+                        action_elapsed - stage_started,
+                    )
+                    program_response_upper_bound = (
+                        recognition_upper_bound + post_recognition_action
+                        if recognition_upper_bound is not None
+                        else None
+                    )
+                    next_stage_observation = next(
+                        (
+                            observation
+                            for observation in ordered_items
+                            if int(observation.get("sequence", 0))
+                            > action_sequence
+                            and observation.get("state")
+                            not in {
+                                action_state,
+                                ReconnectScreenState.UNKNOWN.value,
+                            }
+                        ),
+                        None,
+                    )
+                    next_stage_elapsed = (
+                        int(next_stage_observation.get("elapsed_ms", 0))
+                        if next_stage_observation is not None
+                        else None
+                    )
+                    stage_timing_results.append(
+                        ReplayStageTiming(
+                            stage=action_state,
+                            state_episode=action_episode,
+                            started_elapsed_ms=stage_started,
+                            finished_elapsed_ms=action_elapsed,
+                            scan_duration_ms=normalized_scan_duration,
+                            recognition_upper_bound_ms=(
+                                recognition_upper_bound
+                            ),
+                            post_recognition_action_ms=(
+                                post_recognition_action
+                            ),
+                            program_response_upper_bound_ms=(
+                                program_response_upper_bound
+                            ),
+                            next_stage=(
+                                str(next_stage_observation.get("state"))
+                                if next_stage_observation is not None
+                                else None
+                            ),
+                            next_stage_started_elapsed_ms=(
+                                next_stage_elapsed
+                            ),
+                            transition_wait_ms=(
+                                max(0, next_stage_elapsed - action_elapsed)
+                                if next_stage_elapsed is not None
+                                else None
+                            ),
+                        )
+                    )
+
+                first_connected, second_connected = confirmed_connected_pair
+                connected_started = int(
+                    first_connected.get("elapsed_ms", 0)
+                )
+                connected_finished = int(
+                    second_connected.get("elapsed_ms", 0)
+                )
+                connected_scan_duration = first_connected.get(
+                    "scan_duration_ms"
+                )
+                normalized_connected_scan_duration = (
+                    int(connected_scan_duration)
+                    if isinstance(connected_scan_duration, int)
+                    and not isinstance(connected_scan_duration, bool)
+                    and connected_scan_duration >= 0
+                    else None
+                )
+                connected_scan_interval = first_connected.get(
+                    "scan_interval_ms"
+                )
+                connected_recognition_upper_bound = (
+                    int(connected_scan_interval)
+                    if isinstance(connected_scan_interval, int)
+                    and not isinstance(connected_scan_interval, bool)
+                    and connected_scan_interval >= 0
+                    else None
+                )
+                connected_confirmation_ms = max(
+                    0,
+                    connected_finished - connected_started,
+                )
+                connected_program_upper_bound = (
+                    connected_recognition_upper_bound
+                    + connected_confirmation_ms
+                    if connected_recognition_upper_bound is not None
+                    else None
+                )
+                stage_timing_results.append(
+                    ReplayStageTiming(
+                        stage="connected_confirmation",
+                        state_episode=int(
+                            second_connected.get("state_episode", -1)
+                        ),
+                        started_elapsed_ms=connected_started,
+                        finished_elapsed_ms=connected_finished,
+                        scan_duration_ms=(
+                            normalized_connected_scan_duration
+                        ),
+                        recognition_upper_bound_ms=(
+                            connected_recognition_upper_bound
+                        ),
+                        post_recognition_action_ms=(
+                            connected_confirmation_ms
+                        ),
+                        program_response_upper_bound_ms=(
+                            connected_program_upper_bound
+                        ),
+                        next_stage=None,
+                        next_stage_started_elapsed_ms=None,
+                        transition_wait_ms=None,
+                    )
+                )
+                timing_evidence_complete = all(
+                    item.program_response_upper_bound_ms is not None
+                    for item in stage_timing_results
+                )
+                program_overhead_upper_bound = (
+                    sum(
+                        int(item.program_response_upper_bound_ms)
+                        for item in stage_timing_results
+                        if item.program_response_upper_bound_ms is not None
+                    )
+                    if timing_evidence_complete
+                    else None
+                )
+                transition_wait = (
+                    max(
+                        0,
+                        total_elapsed - program_overhead_upper_bound,
+                    )
+                    if program_overhead_upper_bound is not None
+                    else None
+                )
+                sixty_second_target_met = bool(
+                    total_elapsed <= SMART_RECONNECT_DEADLINE_MS
+                )
+                stage_response_target_met = bool(
+                    timing_evidence_complete
+                    and all(
+                        int(item.program_response_upper_bound_ms)
+                        <= SMART_RECONNECT_STAGE_RESPONSE_TARGET_MS
+                        for item in stage_timing_results
+                        if item.program_response_upper_bound_ms is not None
+                    )
+                )
+                program_overhead_target_met = bool(
+                    program_overhead_upper_bound is not None
+                    and program_overhead_upper_bound
+                    <= SMART_RECONNECT_PROGRAM_OVERHEAD_TARGET_MS
+                )
+                if not timing_evidence_complete:
+                    findings.append(
+                        ReplayFinding(
+                            "program_timing_evidence_missing",
+                            None,
+                            key[0],
+                        )
+                    )
+                if not stage_response_target_met:
+                    findings.append(
+                        ReplayFinding(
+                            "stage_response_target_exceeded",
+                            None,
+                            key[0],
+                        )
+                    )
+                if not program_overhead_target_met:
+                    findings.append(
+                        ReplayFinding(
+                            "program_overhead_target_exceeded",
+                            None,
+                            key[0],
+                        )
+                    )
             elif connected_candidates:
                 findings.append(
                     ReplayFinding("connected_confirmation_invalid", None, key[0])
@@ -1949,14 +2272,6 @@ class SmartReconnectReplayValidator:
             if obstacle_names:
                 findings.append(
                     ReplayFinding("external_obstacle_cycle_excluded", None, key[0])
-                )
-            deadline_valid = bool(
-                total_elapsed is not None
-                and total_elapsed <= SMART_RECONNECT_DEADLINE_MS
-            )
-            if total_elapsed is not None and not deadline_valid and not obstacle_names:
-                findings.append(
-                    ReplayFinding("reconnect_deadline_exceeded", None, key[0])
                 )
             line_ok = line_verified.get(key, False)
             role_ok = role_verified.get(key, False)
@@ -2006,7 +2321,8 @@ class SmartReconnectReplayValidator:
                 stages_valid
                 and actions_valid
                 and confirmed_connected_pair is not None
-                and deadline_valid
+                and stage_response_target_met
+                and program_overhead_target_met
                 and not obstacle_names
                 and line_ok
                 and role_ok
@@ -2023,6 +2339,16 @@ class SmartReconnectReplayValidator:
                     finished_elapsed_ms=finished_elapsed,
                     total_elapsed_ms=total_elapsed,
                     stage_times_ms=tuple(stage_times),
+                    stage_timings=tuple(stage_timing_results),
+                    program_overhead_upper_bound_ms=(
+                        program_overhead_upper_bound
+                    ),
+                    transition_wait_ms=transition_wait,
+                    sixty_second_target_met=sixty_second_target_met,
+                    stage_response_target_met=stage_response_target_met,
+                    program_overhead_target_met=(
+                        program_overhead_target_met
+                    ),
                     fallback_capture_used=fallback_capture,
                     fallback_recognition_used=fallback_recognition,
                     window_state_restored=restored_ok,

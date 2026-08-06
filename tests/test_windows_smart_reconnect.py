@@ -2520,6 +2520,7 @@ def test_unknown_screen_is_recorded_without_input(tmp_path):
     assert any(
         record.get("record_type") == "observation"
         and record.get("state") == "unknown"
+        and isinstance(record.get("scan_duration_ms"), int)
         for record in records
     )
     assert not any(record.get("record_type") == "action" for record in records)

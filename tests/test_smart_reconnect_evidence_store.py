@@ -15,6 +15,9 @@ from services.smart_reconnect_evidence_store import (
     RuntimeSourceIdentity,
     SMART_RECONNECT_DEADLINE_MS,
     SMART_RECONNECT_EVIDENCE_SCHEMA_VERSION,
+    SMART_RECONNECT_PROGRAM_OVERHEAD_TARGET_MS,
+    SMART_RECONNECT_STAGE_RESPONSE_TARGET_MS,
+    SMART_RECONNECT_TIME_BASELINE_MIN_CYCLES,
     SmartReconnectEvidenceRecorder,
     SmartReconnectReplayReport,
     SmartReconnectReplayValidator,
@@ -127,8 +130,9 @@ def _observe(
     scene_context: str = "general",
     raw_window_key: str = "private-launch-fingerprint",
     pixels: bytes | None = None,
+    advance_seconds: float = 0.1,
 ) -> int | None:
-    clock.advance()
+    clock.advance(advance_seconds)
     return recorder.record_observation(
         raw_window_key=raw_window_key,
         state=state,
@@ -151,6 +155,7 @@ def _observe(
         recognition_basis=(
             "cross_map_fixed_ui" if state == "connected" else None
         ),
+        scan_duration_ms=10,
     )
 
 
@@ -225,6 +230,7 @@ def _two_proofs_and_action(
     clicked: bool = True,
     input_channel: str = "window_message",
     restoration_verified: bool | None = True,
+    delay_before_action: float = 0.0,
 ) -> None:
     signature = hashlib.sha256(f"{state}:{action}".encode()).hexdigest()
     _observe(
@@ -245,6 +251,7 @@ def _two_proofs_and_action(
         scene_context=scene_context,
     )
     _prove(recorder, state, signature, raw_window_key=raw_window_key)
+    clock.advance(delay_before_action)
     _action(
         recorder,
         state=state,
@@ -332,7 +339,18 @@ def _record_full_lifecycle(
     raw_window_key: str = "private-launch-fingerprint",
     disconnect_action_override: str | None = None,
     timeout_retries: int = 0,
+    program_delay_by_state: dict[str, float] | None = None,
+    initial_scan_baseline: bool = True,
 ) -> None:
+    program_delays = program_delay_by_state or {}
+    if initial_scan_baseline:
+        _observe(
+            recorder,
+            monotonic,
+            "connected",
+            value=1,
+            raw_window_key=raw_window_key,
+        )
     disconnect_action = disconnect_action_override or (
         "restart_window"
         if scene_context == "battle"
@@ -349,6 +367,7 @@ def _record_full_lifecycle(
         clicked=scene_context != "battle",
         input_channel=("window_control" if scene_context == "battle" else "window_message"),
         restoration_verified=(None if scene_context == "battle" else True),
+        delay_before_action=program_delays.get("disconnected", 0.0),
     )
     if scene_context == "battle":
         recorder.record_verification(
@@ -373,6 +392,7 @@ def _record_full_lifecycle(
         action="start_game",
         value=20,
         raw_window_key=raw_window_key,
+        delay_before_action=program_delays.get("login_start", 0.0),
     )
     _two_proofs_and_action(
         recorder,
@@ -381,6 +401,7 @@ def _record_full_lifecycle(
         action="force_login",
         value=30,
         raw_window_key=raw_window_key,
+        delay_before_action=program_delays.get("force_login_start", 0.0),
     )
     for retry in range(timeout_retries):
         _two_proofs_and_action(
@@ -390,6 +411,10 @@ def _record_full_lifecycle(
             action="confirm_force_login_timeout",
             value=34 + retry * 2,
             raw_window_key=raw_window_key,
+            delay_before_action=program_delays.get(
+                "force_login_timeout",
+                0.0,
+            ),
         )
         _two_proofs_and_action(
             recorder,
@@ -398,6 +423,10 @@ def _record_full_lifecycle(
             action="force_login",
             value=35 + retry * 2,
             raw_window_key=raw_window_key,
+            delay_before_action=program_delays.get(
+                "force_login_start",
+                0.0,
+            ),
         )
     _two_proofs_and_action(
         recorder,
@@ -407,6 +436,7 @@ def _record_full_lifecycle(
         value=40,
         original_line=True,
         raw_window_key=raw_window_key,
+        delay_before_action=program_delays.get("line_selection", 0.0),
     )
     _two_proofs_and_action(
         recorder,
@@ -416,6 +446,10 @@ def _record_full_lifecycle(
         value=50,
         original_role=True,
         raw_window_key=raw_window_key,
+        delay_before_action=program_delays.get(
+            "character_selection",
+            0.0,
+        ),
     )
     _two_proofs_and_action(
         recorder,
@@ -424,8 +458,23 @@ def _record_full_lifecycle(
         action="close_announcement",
         value=60,
         raw_window_key=raw_window_key,
+        delay_before_action=program_delays.get(
+            "post_login_activity",
+            0.0,
+        ),
     )
-    monotonic.advance(delay_before_connected)
+    remaining_game_wait = max(0.0, delay_before_connected)
+    while remaining_game_wait > 0:
+        wait_step = min(1.0, remaining_game_wait)
+        _observe(
+            recorder,
+            monotonic,
+            "reconnecting",
+            value=65,
+            raw_window_key=raw_window_key,
+            advance_seconds=wait_step,
+        )
+        remaining_game_wait -= wait_step
     if auto_action:
         _two_proofs_and_action(
             recorder,
@@ -435,6 +484,7 @@ def _record_full_lifecycle(
             value=70,
             auto_battle=True,
             raw_window_key=raw_window_key,
+            delay_before_action=program_delays.get("connected", 0.0),
         )
     else:
         recorder.record_verification(
@@ -458,6 +508,21 @@ def test_replay_accepts_one_full_anonymous_recovery_lifecycle(tmp_path: Path) ->
     recorder, _wall, monotonic = _recorder(tmp_path)
     _record_full_lifecycle(recorder, monotonic)
 
+    header = SmartReconnectReplayValidator().load(recorder.path)[0]
+    assert header["reconnect_deadline_enforced"] is False
+    assert (
+        header["stage_response_target_ms"]
+        == SMART_RECONNECT_STAGE_RESPONSE_TARGET_MS
+    )
+    assert (
+        header["program_overhead_target_ms"]
+        == SMART_RECONNECT_PROGRAM_OVERHEAD_TARGET_MS
+    )
+    assert (
+        header["time_baseline_min_cycles"]
+        == SMART_RECONNECT_TIME_BASELINE_MIN_CYCLES
+    )
+
     report = SmartReconnectReplayValidator().validate(recorder.path)
     assert report.findings == ()
     assert report.pending_actions == 0
@@ -468,6 +533,17 @@ def test_replay_accepts_one_full_anonymous_recovery_lifecycle(tmp_path: Path) ->
     assert report.cycles[0].total_elapsed_ms is not None
     assert report.cycles[0].total_elapsed_ms <= SMART_RECONNECT_DEADLINE_MS
     assert report.cycles[0].accepted is True
+    assert all(
+        timing.scan_duration_ms == 10
+        and timing.recognition_upper_bound_ms is not None
+        and timing.program_response_upper_bound_ms is not None
+        for timing in report.cycles[0].stage_timings
+    )
+    assert (
+        report.cycles[0].program_overhead_upper_bound_ms
+        + report.cycles[0].transition_wait_ms
+        == report.cycles[0].total_elapsed_ms
+    )
 
 
 def test_real_source_generation_failure_replays_as_incomplete() -> None:
@@ -662,7 +738,7 @@ def test_replay_rejects_dirty_source_and_private_keys(tmp_path: Path) -> None:
     }
 
 
-def test_replay_rejects_recovery_completed_after_sixty_seconds(
+def test_replay_reports_sixty_second_target_without_rejecting_normal_game_wait(
     tmp_path: Path,
 ) -> None:
     recorder, _wall, monotonic = _recorder(tmp_path)
@@ -672,12 +748,82 @@ def test_replay_rejects_recovery_completed_after_sixty_seconds(
         delay_before_connected=61.0,
     )
     report = SmartReconnectReplayValidator().validate(recorder.path)
-    assert "reconnect_deadline_exceeded" in {
+    assert "reconnect_deadline_exceeded" not in {
+        item.code for item in report.findings
+    }
+    cycle = report.cycles[0]
+    assert report.recovered_cycles == 1
+    assert cycle.accepted is True
+    assert cycle.total_elapsed_ms > SMART_RECONNECT_DEADLINE_MS
+    assert cycle.sixty_second_target_met is False
+    assert cycle.stage_response_target_met is True
+    assert cycle.program_overhead_target_met is True
+    assert cycle.program_overhead_upper_bound_ms is not None
+    assert (
+        cycle.program_overhead_upper_bound_ms
+        <= SMART_RECONNECT_PROGRAM_OVERHEAD_TARGET_MS
+    )
+    assert cycle.transition_wait_ms is not None
+    assert cycle.transition_wait_ms > SMART_RECONNECT_DEADLINE_MS
+
+
+def test_replay_rejects_program_response_and_overhead_above_targets(
+    tmp_path: Path,
+) -> None:
+    recorder, _wall, monotonic = _recorder(tmp_path)
+    _record_full_lifecycle(
+        recorder,
+        monotonic,
+        program_delay_by_state={
+            "disconnected": 2.1,
+            "login_start": 2.1,
+            "force_login_start": 2.1,
+            "line_selection": 2.1,
+            "character_selection": 2.1,
+        },
+    )
+
+    report = SmartReconnectReplayValidator().validate(recorder.path)
+    cycle = report.cycles[0]
+    assert {
+        "stage_response_target_exceeded",
+        "program_overhead_target_exceeded",
+    } <= {item.code for item in report.findings}
+    assert report.recovered_cycles == 0
+    assert cycle.accepted is False
+    assert cycle.stage_response_target_met is False
+    assert cycle.program_overhead_target_met is False
+    assert any(
+        timing.program_response_upper_bound_ms is not None
+        and timing.program_response_upper_bound_ms
+        > SMART_RECONNECT_STAGE_RESPONSE_TARGET_MS
+        for timing in cycle.stage_timings
+    )
+    assert cycle.program_overhead_upper_bound_ms is not None
+    assert (
+        cycle.program_overhead_upper_bound_ms
+        > SMART_RECONNECT_PROGRAM_OVERHEAD_TARGET_MS
+    )
+
+
+def test_replay_rejects_cycle_without_scan_timing_baseline(
+    tmp_path: Path,
+) -> None:
+    recorder, _wall, monotonic = _recorder(tmp_path)
+    _record_full_lifecycle(
+        recorder,
+        monotonic,
+        initial_scan_baseline=False,
+    )
+
+    report = SmartReconnectReplayValidator().validate(recorder.path)
+    cycle = report.cycles[0]
+    assert "program_timing_evidence_missing" in {
         item.code for item in report.findings
     }
     assert report.recovered_cycles == 0
-    assert report.cycles[0].accepted is False
-    assert report.cycles[0].total_elapsed_ms > SMART_RECONNECT_DEADLINE_MS
+    assert cycle.accepted is False
+    assert cycle.program_overhead_upper_bound_ms is None
 
 
 def test_external_obstacle_is_separate_and_excludes_cycle_from_acceptance(
