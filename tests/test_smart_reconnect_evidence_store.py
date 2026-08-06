@@ -78,6 +78,16 @@ LIVE_LINE_SEVEN_SCROLL_LOOP = (
 LIVE_LINE_SEVEN_SCROLL_LOOP_SHA256 = (
     "f6bcd86a7556bb4583baec0e340589b3063093c526d86073196640385cd87f33"
 )
+LIVE_CHARACTER_SELECTION_TIMEOUT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "smart_reconnect"
+    / "live_failures"
+    / "20260806T043703Z-single-window-character-selection-timeout.jsonl"
+)
+LIVE_CHARACTER_SELECTION_TIMEOUT_SHA256 = (
+    "c54ce4adfcb9a0bf0ac2fa9a378f0c79e43e374ceab31a23ba6651cb2d1b3d57"
+)
 
 
 class _Clock:
@@ -678,6 +688,46 @@ def test_real_line_seven_scroll_loop_replays_as_failed() -> None:
     assert "duplicate_stage_action" in {
         finding.code for finding in report.findings
     }
+
+
+def test_real_single_window_character_selection_timeout_is_preserved() -> None:
+    assert hashlib.sha256(LIVE_CHARACTER_SELECTION_TIMEOUT.read_bytes()).hexdigest() == (
+        LIVE_CHARACTER_SELECTION_TIMEOUT_SHA256
+    )
+
+    validator = SmartReconnectReplayValidator()
+    records = validator.load(LIVE_CHARACTER_SELECTION_TIMEOUT)
+    report = validator.validate(LIVE_CHARACTER_SELECTION_TIMEOUT)
+    observations = [
+        record
+        for record in records
+        if record.get("record_type") == "observation"
+    ]
+    actions = [
+        record
+        for record in records
+        if record.get("record_type") == "action"
+    ]
+
+    assert report.source_commit == "937b6ccc784199aaa2ff70e8ce22e4f886a6867e"
+    assert report.event_count == 19
+    assert report.window_count == 1
+    assert report.recovered_cycles == 0
+    assert report.pending_actions == 0
+    assert report.session_duration_ms == 90_203
+    assert [record.get("action") for record in actions] == [
+        "select_default_line",
+        "force_login",
+    ]
+    assert sum(
+        record.get("state") == "character_selection"
+        for record in observations
+    ) == 2
+    assert not any(
+        record.get("state") == "character_selection"
+        and record.get("record_type") == "action"
+        for record in records
+    )
 
 
 def test_replay_rejects_unknown_click_duplicate_and_missing_proof(tmp_path: Path) -> None:
