@@ -202,6 +202,17 @@ class SmartReconnectTargetIdentityService:
             )
         return tuple(result)
 
+    @staticmethod
+    def _aliases_conflict(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        shared = 0
+        for left_character, right_character in zip(left, right):
+            if left_character != right_character:
+                break
+            shared += 1
+        return shared >= 3
+
     def _load_state(self) -> dict[str, _SavedTargetState]:
         try:
             payload = json.loads(self._state_path.read_text(encoding="utf-8"))
@@ -374,6 +385,25 @@ class SmartReconnectTargetIdentityService:
                 else:
                     current[2].update(aliases)
 
+        aliases_by_character: dict[str, set[str]] = {}
+        for by_character in candidates.values():
+            for character_id, (_character, _record, aliases) in (
+                by_character.items()
+            ):
+                aliases_by_character.setdefault(character_id, set()).update(
+                    aliases
+                )
+        conflicting_characters: set[str] = set()
+        character_aliases = tuple(sorted(aliases_by_character.items()))
+        for index, (left_id, left_aliases) in enumerate(character_aliases):
+            for right_id, right_aliases in character_aliases[index + 1 :]:
+                if any(
+                    self._aliases_conflict(left, right)
+                    for left in left_aliases
+                    for right in right_aliases
+                ):
+                    conflicting_characters.update((left_id, right_id))
+
         targets: dict[str, SmartReconnectTargetIdentity] = {}
         for fingerprint, by_character in candidates.items():
             if fingerprint in blocked_fingerprints or len(by_character) != 1:
@@ -381,6 +411,8 @@ class SmartReconnectTargetIdentityService:
             character_id, (character, _record, aliases) = next(
                 iter(by_character.items())
             )
+            if character_id in conflicting_characters:
+                continue
             saved = self._saved.get(fingerprint)
             slot_index = None
             line_number = None

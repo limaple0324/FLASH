@@ -72,11 +72,13 @@ def make_character(
 def make_record(
     character_id: str = CHARACTER_ID,
     display_name: str = "登記主號",
+    *,
+    aliases=("舊別名",),
 ):
     return CharacterWindowRecord(
         character_id,
         display_name,
-        aliases=("舊別名",),
+        aliases=aliases,
         role=CharacterImportance.PRIMARY.value,
     )
 
@@ -332,3 +334,140 @@ def test_incomplete_resolver_result_is_retried_instead_of_cached(tmp_path):
 
     assert service.target_for(FINGERPRINT) is not None
     assert resolver.calls == 2
+
+
+def test_same_complete_alias_blocks_every_fingerprint_for_both_characters(
+    tmp_path,
+):
+    first = tmp_path / "one.lnk"
+    second = tmp_path / "two.lnk"
+    resolver = StaticShortcutResolver(
+        {first.resolve(): FINGERPRINT, second.resolve(): OTHER_FINGERPRINT}
+    )
+    service = make_service(
+        tmp_path,
+        (
+            make_group(
+                "one",
+                (
+                    make_entry(first, role_id="甲主號"),
+                    make_entry(
+                        second,
+                        entry_id="character-2",
+                        role_id="乙主號",
+                    ),
+                ),
+            ),
+        ),
+        resolver,
+        characters=(make_character(), make_character("character-2", "次要角色")),
+        records=(
+            make_record(aliases=("完整共用別名",)),
+            make_record(
+                "character-2",
+                "次要角色",
+                aliases=("完整共用別名",),
+            ),
+        ),
+    )
+
+    assert service.target_for(FINGERPRINT) is None
+    assert service.target_for(OTHER_FINGERPRINT) is None
+
+
+def test_shared_three_character_alias_prefix_blocks_both_characters(tmp_path):
+    first = tmp_path / "one.lnk"
+    second = tmp_path / "two.lnk"
+    resolver = StaticShortcutResolver(
+        {first.resolve(): FINGERPRINT, second.resolve(): OTHER_FINGERPRINT}
+    )
+    service = make_service(
+        tmp_path,
+        (
+            make_group(
+                "one",
+                (
+                    make_entry(first, role_id="甲主號"),
+                    make_entry(
+                        second,
+                        entry_id="character-2",
+                        role_id="乙主號",
+                    ),
+                ),
+            ),
+        ),
+        resolver,
+        characters=(make_character(), make_character("character-2", "次要角色")),
+        records=(
+            make_record(aliases=("共同角甲",)),
+            make_record(
+                "character-2",
+                "次要角色",
+                aliases=("共同角乙",),
+            ),
+        ),
+    )
+
+    assert service.target_for(FINGERPRINT) is None
+    assert service.target_for(OTHER_FINGERPRINT) is None
+
+
+def test_same_character_aliases_across_fingerprints_do_not_conflict(tmp_path):
+    first = tmp_path / "one.lnk"
+    second = tmp_path / "two.lnk"
+    resolver = StaticShortcutResolver(
+        {first.resolve(): FINGERPRINT, second.resolve(): OTHER_FINGERPRINT}
+    )
+    service = make_service(
+        tmp_path,
+        (
+            make_group(
+                "one",
+                (
+                    make_entry(first),
+                    make_entry(second),
+                ),
+            ),
+        ),
+        resolver,
+    )
+
+    assert service.target_for(FINGERPRINT) is not None
+    assert service.target_for(OTHER_FINGERPRINT) is not None
+
+
+def test_distinct_aliases_keep_both_character_targets_available(tmp_path):
+    first = tmp_path / "one.lnk"
+    second = tmp_path / "two.lnk"
+    resolver = StaticShortcutResolver(
+        {first.resolve(): FINGERPRINT, second.resolve(): OTHER_FINGERPRINT}
+    )
+    service = make_service(
+        tmp_path,
+        (
+            make_group(
+                "one",
+                (
+                    make_entry(first, role_id="甲主號"),
+                    make_entry(
+                        second,
+                        entry_id="character-2",
+                        role_id="乙主號",
+                    ),
+                ),
+            ),
+        ),
+        resolver,
+        characters=(make_character(), make_character("character-2", "次要角色")),
+        records=(
+            make_record(aliases=("北方甲",)),
+            make_record(
+                "character-2",
+                "次要角色",
+                aliases=("南方乙",),
+            ),
+        ),
+    )
+
+    assert service.target_for(FINGERPRINT) is not None
+    assert service.target_for(OTHER_FINGERPRINT) is not None
