@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -62,6 +63,9 @@ from services.reconnect_failure_status_service import (
 )
 from services.smart_reconnect_capture_settings_service import (
     SmartReconnectCaptureSettings,
+)
+from services.smart_reconnect_evidence_store import (
+    SmartReconnectEvidenceRecorder,
 )
 from services.target_window_contract_service import ResolvedTargetWindows
 
@@ -2247,6 +2251,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         operation_gate: GameOperationGate | None = None,
         auto_battle_enabled: bool = True,
         auto_battle_recognizer: AutoBattleRecognizer | None = None,
+        evidence_recorder: SmartReconnectEvidenceRecorder | None = None,
+        evidence_required: bool = False,
+        evidence_initialization_failed: bool = False,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -2279,7 +2286,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._capture_settings_revision = 0
         self._capture_diagnostic_lock = threading.RLock()
         self._capture_diagnostic_window_indices: dict[str, int] = {}
+        self._capture_diagnostic_windows: tuple[WindowInfo, ...] = ()
+        self._capture_diagnostic_foreground_handle: int | None = None
         self._capture_diagnostics: tuple[CaptureDiagnostic, ...] = ()
+        self._evidence_recorder = evidence_recorder
+        self._evidence_required = bool(evidence_required)
+        self._evidence_recording_failed = bool(
+            evidence_initialization_failed
+        )
         self._recognizer = recognizer
         self._mouse_backend = mouse_backend
         self._policy = policy or ReconnectPolicy()
@@ -2289,7 +2303,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._last_result: ReconnectBatchResult | None = None
         self._execution_enabled = threading.Event()
         if execution_enabled:
-            self._execution_enabled.set()
+            if self._record_evidence_monitoring_state(True):
+                self._execution_enabled.set()
         # Source revocation must serialize with the actual backend delivery.
         # It intentionally has its own lock so the final delivery boundary
         # never nests the screen-state and capture-settings locks in opposite
@@ -2470,11 +2485,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         capture_settings: SmartReconnectCaptureSettings | None = None,
         require_expected_window_count: bool = True,
         auto_battle_enabled: bool = True,
+        evidence_recorder: SmartReconnectEvidenceRecorder | None = None,
     ) -> "WindowsSmartReconnectController":
         window_backend = (
             window_backend
             or Win32WindowBackend(PowerShellLaunchFingerprintResolver())
         )
+        evidence_initialization_failed = False
+        if evidence_recorder is None:
+            evidence_root = (
+                state_path.parent
+                if state_path is not None
+                else Path(tempfile.gettempdir()) / "flash_smart_reconnect_runtime"
+            )
+            try:
+                evidence_recorder = SmartReconnectEvidenceRecorder.for_runtime(
+                    evidence_root,
+                    auto_battle_required=auto_battle_enabled is not False,
+                )
+            except (OSError, TypeError, ValueError):
+                evidence_initialization_failed = True
         return cls(
             expected_windows=expected_windows,
             title_keywords=title_keywords,
@@ -2510,6 +2540,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             auto_battle_recognizer=AutoBattleRecognizer(
                 reference_dir / "auto_battle"
             ),
+            evidence_recorder=evidence_recorder,
+            evidence_required=True,
+            evidence_initialization_failed=evidence_initialization_failed,
         )
 
     @property
@@ -2789,8 +2822,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self,
         windows: Iterable[WindowInfo],
     ) -> None:
+        window_items = tuple(windows)
         indices: dict[str, int] = {}
-        for index, window in enumerate(windows, start=1):
+        for index, window in enumerate(window_items, start=1):
             fingerprint = normalize_launch_fingerprint(
                 window.launch_fingerprint
             )
@@ -2798,6 +2832,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 indices[fingerprint] = index
         with self._capture_diagnostic_lock:
             self._capture_diagnostic_window_indices = indices
+            self._capture_diagnostic_windows = window_items
+            try:
+                self._capture_diagnostic_foreground_handle = (
+                    self._window_backend.foreground_handle()
+                )
+            except (AttributeError, OSError):
+                self._capture_diagnostic_foreground_handle = None
             self._capture_diagnostics = ()
 
     def anonymous_capture_diagnostics(
@@ -2969,9 +3010,530 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             flow.stage_started_at = now
             flow.cycle += 1
 
+    def _evidence_available(self) -> bool:
+        return bool(
+            not self._evidence_recording_failed
+            and (
+                self._evidence_recorder is not None
+                or not self._evidence_required
+            )
+        )
+
+    def _mark_evidence_failure(self) -> None:
+        self._evidence_recording_failed = True
+
+    def _record_evidence_monitoring_state(self, enabled: bool) -> bool:
+        recorder = self._evidence_recorder
+        if recorder is None:
+            return not self._evidence_required
+        try:
+            recorder.record_monitoring_state(enabled)
+        except (OSError, TypeError, ValueError):
+            self._mark_evidence_failure()
+            return False
+        return True
+
+    @staticmethod
+    def _rectangles_overlap(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> bool:
+        return bool(
+            max(first[0], second[0]) < min(first[2], second[2])
+            and max(first[1], second[1]) < min(first[3], second[3])
+        )
+
+    def _window_overlaps_monitored_window(self, window: WindowInfo) -> bool:
+        with self._capture_diagnostic_lock:
+            windows = self._capture_diagnostic_windows
+        return any(
+            item.handle != window.handle
+            and self._rectangles_overlap(window.rect, item.rect)
+            for item in windows
+            if isinstance(item, WindowInfo)
+        )
+
+    def _evidence_presentation_state(
+        self,
+        window: WindowInfo,
+        capture_route: str | None,
+    ) -> str:
+        if window.minimized:
+            return "minimized"
+        if capture_route == CAPTURE_ROUTE_VISIBLE:
+            return "visible"
+        if capture_route != CAPTURE_ROUTE_OBSCURED or not window.visible:
+            return "unknown"
+        left, top, right, bottom = window.rect
+        width = right - left
+        height = bottom - top
+        if width <= 1 or height <= 1:
+            return "unknown"
+        visible_points = 0
+        tested_points = 0
+        try:
+            for relative_x, relative_y in (
+                (0.15, 0.15),
+                (0.50, 0.15),
+                (0.85, 0.15),
+                (0.15, 0.50),
+                (0.50, 0.50),
+                (0.85, 0.50),
+                (0.15, 0.85),
+                (0.50, 0.85),
+                (0.85, 0.85),
+            ):
+                x = left + max(0, min(width - 1, round(width * relative_x)))
+                y = top + max(0, min(height - 1, round(height * relative_y)))
+                top_handle = self._window_backend.top_window_at(x, y)
+                if top_handle is None:
+                    return "unknown"
+                tested_points += 1
+                if top_handle == window.handle:
+                    visible_points += 1
+        except (AttributeError, OSError):
+            return "unknown"
+        if tested_points <= 0:
+            return "unknown"
+        if visible_points == 0:
+            return "fully_obscured"
+        if visible_points < tested_points:
+            return "partially_obscured"
+        return "visible"
+
+    @staticmethod
+    def _recognition_evidence_basis(
+        recognition: ScreenRecognition,
+    ) -> str | None:
+        if recognition.state is ReconnectScreenState.CONNECTED:
+            if (
+                recognition.reference_name
+                == "anonymous_live_structure/general_hud.png"
+            ):
+                return "cross_map_fixed_ui"
+            if isinstance(recognition.reference_name, str):
+                return "legacy_or_map_specific"
+            return "unresolved"
+        if recognition.state is ReconnectScreenState.UNKNOWN:
+            return "unresolved"
+        return "workflow_screen"
+
+    def _record_evidence_observation(
+        self,
+        *,
+        window: WindowInfo,
+        fingerprint: str,
+        sample: object | None,
+        recognition: ScreenRecognition,
+        fresh_capture: bool,
+        capture_route: str | None,
+        rejection_gate: str | None,
+        expected_source_state_generation: int | None,
+    ) -> None:
+        recorder = self._evidence_recorder
+        if recorder is None or self._evidence_recording_failed:
+            return
+        pixels = (
+            sample.pixels
+            if isinstance(sample, CaptureSample) and sample.api_succeeded
+            else None
+        )
+        width = (
+            int(sample.width)
+            if isinstance(sample, CaptureSample) and sample.api_succeeded
+            else None
+        )
+        height = (
+            int(sample.height)
+            if isinstance(sample, CaptureSample) and sample.api_succeeded
+            else None
+        )
+        instance = WindowInstanceToken.from_window(window)
+        identity_verified = bool(
+            instance is not None
+            and self._source_authority_is_current(
+                expected_source_state_generation
+            )
+        )
+        with self._capture_diagnostic_lock:
+            foreground_handle = self._capture_diagnostic_foreground_handle
+        try:
+            recorder.record_observation(
+                raw_window_key=fingerprint,
+                state=recognition.state.value,
+                capture_method=capture_route,
+                width=width,
+                height=height,
+                pixels=pixels,
+                fresh=fresh_capture,
+                identity_verified=identity_verified,
+                score=recognition.score,
+                reference_code=recognition.reference_name,
+                failure_reason=rejection_gate,
+                recognition_method="reference_screen_primary",
+                fallback_capture_used=(
+                    capture_route
+                    in {CAPTURE_ROUTE_OBSCURED, CAPTURE_ROUTE_MINIMIZED}
+                ),
+                fallback_recognition_used=False,
+                presentation_state=self._evidence_presentation_state(
+                    window,
+                    capture_route,
+                ),
+                scene_context=(
+                    "battle"
+                    if recognition.battle_context
+                    else (
+                        "general"
+                        if recognition.state
+                        in {
+                            ReconnectScreenState.CONNECTED,
+                            ReconnectScreenState.DISCONNECTED,
+                        }
+                        else "unknown"
+                    )
+                ),
+                recognition_basis=self._recognition_evidence_basis(
+                    recognition
+                ),
+                other_window_foreground=(
+                    foreground_handle is not None
+                    and foreground_handle != window.handle
+                ),
+                overlapped_by_game_window=(
+                    self._window_overlaps_monitored_window(window)
+                ),
+            )
+        except (OSError, TypeError, ValueError):
+            self._mark_evidence_failure()
+
+    def _record_evidence_decision(
+        self,
+        *,
+        fingerprint: str,
+        item: ScreenRecognition,
+        instance: WindowInstanceToken,
+        capture_route: str,
+        capture_settings_revision: int,
+        source_state_generation: int,
+    ) -> bool:
+        recorder = self._evidence_recorder
+        if recorder is None:
+            return not self._evidence_required
+        if self._evidence_recording_failed:
+            return False
+        identity_verified = bool(
+            self._source_authority_is_current(source_state_generation)
+            and self._current_action_window(instance, fingerprint) is not None
+        )
+        signature = hashlib.sha256(
+            repr(self._action_signature(item)).encode("utf-8")
+        ).hexdigest()
+        authority_signature = self._evidence_authority_signature(
+            instance,
+            capture_route,
+            capture_settings_revision,
+            source_state_generation,
+        )
+        try:
+            recorder.record_decision_evidence(
+                raw_window_key=fingerprint,
+                state=item.state.value,
+                decision_signature=signature,
+                capture_method=capture_route,
+                identity_verified=identity_verified,
+                authority_signature=authority_signature,
+            )
+        except (OSError, TypeError, ValueError):
+            self._mark_evidence_failure()
+            return False
+        return identity_verified
+
+    def _record_reopen_absence_evidence(
+        self,
+        *,
+        fingerprint: str,
+        instance: WindowInstanceToken,
+        target: GroupLaunchTarget,
+        capture_route: str,
+        capture_settings_revision: int,
+        source_state_generation: int,
+    ) -> tuple[bool, tuple[WindowInfo, ...], str | None]:
+        recorder = self._evidence_recorder
+        if recorder is None:
+            return (not self._evidence_required, (), None)
+        if self._evidence_recording_failed:
+            return False, (), None
+        authority_signature = self._evidence_authority_signature(
+            instance,
+            capture_route,
+            capture_settings_revision,
+            source_state_generation,
+        )
+        decision_signature = hashlib.sha256(
+            repr(
+                (
+                    "reopen_window",
+                    fingerprint,
+                    instance,
+                    target.fingerprint,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        latest_candidates: tuple[WindowInfo, ...] = ()
+        for _ in range(2):
+            (
+                latest_candidates,
+                source_failures,
+                blocked_fingerprints,
+            ) = self._candidate_window_set()
+            matching = tuple(
+                window
+                for window in latest_candidates
+                if normalize_launch_fingerprint(window.launch_fingerprint)
+                == fingerprint
+            )
+            identity_verified = bool(
+                self._source_authority_is_current(source_state_generation)
+                and fingerprint not in blocked_fingerprints
+                and not source_failures
+                and not matching
+                and target.fingerprint == fingerprint
+                and self._activation_snapshot_instances is not None
+                and self._activation_snapshot_instances.get(fingerprint)
+                == instance
+            )
+            try:
+                recorder.record_absence_evidence(
+                    raw_window_key=fingerprint,
+                    state=ReconnectScreenState.RECONNECTING.value,
+                    decision_signature=decision_signature,
+                    identity_verified=identity_verified,
+                    shortcut_identity_verified=(
+                        target.fingerprint == fingerprint
+                    ),
+                    target_absent=not matching,
+                    authority_signature=authority_signature,
+                )
+            except (OSError, TypeError, ValueError):
+                self._mark_evidence_failure()
+                return False, (), None
+            if not identity_verified:
+                return False, latest_candidates, authority_signature
+        return True, latest_candidates, authority_signature
+
+    def _evidence_action_name(
+        self,
+        item: ScreenRecognition,
+        *,
+        line_scroll: bool = False,
+    ) -> str:
+        if line_scroll:
+            return "scroll_line_list"
+        if (
+            item.state is ReconnectScreenState.CHARACTER_SELECTION
+            and item.character_slot_selected is False
+        ):
+            return "select_role_slot"
+        return self._policy.decide(item.state).action.value
+
+    def _begin_evidence_action(
+        self,
+        *,
+        fingerprint: str,
+        item: ScreenRecognition,
+        action: str,
+        instance: WindowInstanceToken,
+        capture_route: str,
+        capture_settings_revision: int,
+        source_state_generation: int,
+        input_channel: str = "window_message",
+        identity_verified_override: bool | None = None,
+    ) -> tuple[bool, int | None, str | None]:
+        if item.state in {
+            ReconnectScreenState.UNKNOWN,
+            ReconnectScreenState.CHECK_DISABLED,
+        }:
+            return False, None, None
+        recorder = self._evidence_recorder
+        if recorder is None:
+            return (not self._evidence_required, None, None)
+        if self._evidence_recording_failed:
+            return False, None, None
+        identity_verified = (
+            identity_verified_override
+            if type(identity_verified_override) is bool
+            else bool(
+                self._current_action_window(instance, fingerprint) is not None
+            )
+        )
+        authority_signature = self._evidence_authority_signature(
+            instance,
+            capture_route,
+            capture_settings_revision,
+            source_state_generation,
+        )
+        try:
+            sequence = recorder.record_action_intent(
+                raw_window_key=fingerprint,
+                state=item.state.value,
+                action=action,
+                identity_verified=identity_verified,
+                input_channel=input_channel,
+                authority_signature=authority_signature,
+            )
+        except (OSError, TypeError, ValueError):
+            self._mark_evidence_failure()
+            return False, None, None
+        return identity_verified, sequence, authority_signature
+
+    @staticmethod
+    def _evidence_authority_signature(
+        instance: WindowInstanceToken,
+        capture_route: str,
+        capture_settings_revision: int,
+        source_state_generation: int,
+    ) -> str:
+        payload = (
+            instance.handle,
+            instance.process_id,
+            instance.thread_id,
+            instance.window_class,
+            instance.rect,
+            instance.minimized,
+            instance.process_lifecycle_token,
+            capture_route,
+            capture_settings_revision,
+            source_state_generation,
+        )
+        return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+    def _original_line_verified_for_evidence(
+        self,
+        fingerprint: str,
+        item: ScreenRecognition,
+    ) -> bool | None:
+        if item.state is not ReconnectScreenState.LINE_SELECTION:
+            return None
+        if item.line_scroll_delta:
+            return None
+        preferred = self._preferred_line_numbers.get(fingerprint)
+        return bool(
+            item.line_number in LINE_ROUTE_CLICK_POINTS
+            and (
+                item.line_number == preferred
+                or item.recent_line_present is True
+            )
+        )
+
+    def _original_role_verified_for_evidence(
+        self,
+        fingerprint: str,
+        item: ScreenRecognition,
+    ) -> bool | None:
+        if (
+            item.state is not ReconnectScreenState.CHARACTER_SELECTION
+            or item.character_slot_selected is not True
+        ):
+            return None
+        target = self._target_for_fingerprint(fingerprint)
+        if (
+            target is None
+            or not isinstance(item.character_target_key, str)
+        ):
+            return False
+        return bool(
+            item.character_target_key.strip().casefold()
+            == target.role_id.strip().casefold()
+        )
+
+    def _finish_evidence_action(
+        self,
+        *,
+        fingerprint: str,
+        item: ScreenRecognition,
+        action: str,
+        intent_sequence: int | None,
+        allowed: bool,
+        performed: bool,
+        clicked: bool,
+        identity_verified: bool,
+        restoration_verified: bool | None,
+        failure_reason: str | None,
+        auto_battle_panel_verified: bool | None = None,
+        authority_signature: str | None = None,
+        input_channel: str = "window_message",
+    ) -> None:
+        recorder = self._evidence_recorder
+        if recorder is None or self._evidence_recording_failed:
+            return
+        try:
+            recorder.record_action(
+                raw_window_key=fingerprint,
+                state=item.state.value,
+                action=action,
+                allowed=allowed,
+                performed=performed,
+                clicked=clicked,
+                identity_verified=identity_verified,
+                restoration_verified=restoration_verified,
+                failure_reason=failure_reason,
+                original_line_verified=(
+                    self._original_line_verified_for_evidence(
+                        fingerprint,
+                        item,
+                    )
+                ),
+                original_role_verified=(
+                    self._original_role_verified_for_evidence(
+                        fingerprint,
+                        item,
+                    )
+                ),
+                auto_battle_panel_verified=auto_battle_panel_verified,
+                input_channel=input_channel,
+                intent_sequence=intent_sequence,
+                authority_signature=authority_signature,
+            )
+        except (OSError, TypeError, ValueError):
+            self._mark_evidence_failure()
+
+    def _record_auto_battle_panel_verification(
+        self,
+        *,
+        fingerprint: str,
+        instance: WindowInstanceToken,
+        sample: object | None,
+    ) -> bool:
+        recorder = self._evidence_recorder
+        if recorder is None:
+            return not self._evidence_required
+        if self._evidence_recording_failed:
+            return False
+        if (
+            not isinstance(sample, CaptureSample)
+            or not sample.api_succeeded
+            or not isinstance(sample.pixels, bytes)
+            or self._current_action_window(instance, fingerprint) is None
+        ):
+            return False
+        try:
+            recorder.record_verification(
+                raw_window_key=fingerprint,
+                identity_verified=True,
+                verification_basis="complete_auto_battle_panel",
+                evidence_signature=hashlib.sha256(sample.pixels).hexdigest(),
+                auto_battle_panel_verified=True,
+            )
+        except (OSError, TypeError, ValueError):
+            self._mark_evidence_failure()
+            return False
+        return True
+
     def _record_capture_diagnostic(
         self,
         *,
+        window: WindowInfo,
         fingerprint: str,
         stage: str,
         sample: object | None,
@@ -3045,6 +3607,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 *self._capture_diagnostics[-63:],
                 diagnostic,
             )
+        self._record_evidence_observation(
+            window=window,
+            fingerprint=fingerprint,
+            sample=sample,
+            recognition=recognition,
+            fresh_capture=fresh_capture,
+            capture_route=capture_route,
+            rejection_gate=rejection_gate,
+            expected_source_state_generation=expected_source_state_generation,
+        )
 
     def _capture_and_recognize(
         self,
@@ -3070,6 +3642,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
         sample, recognition, fresh_capture, capture_route = result
         self._record_capture_diagnostic(
+            window=window,
             fingerprint=fingerprint,
             stage=diagnostic_stage,
             sample=sample,
@@ -3866,6 +4439,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def prepare_execution_snapshot(self) -> OperationResult:
         """Lock this activation to the complete game windows open right now."""
         with self._scan_lock:
+            if not self._evidence_available():
+                return self._snapshot_failure(
+                    "reconnect.snapshot_evidence_unavailable",
+                    "智慧重連匿名紀錄無法使用，已停止所有自動操作。",
+                    "evidence_recording_unavailable",
+                )
             if self._execution_allowed():
                 return self._snapshot_failure(
                     "reconnect.snapshot_execution_open",
@@ -4128,12 +4707,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def set_execution_enabled(self, enabled: bool) -> None:
         """Allow an active scan to stop before its next game-changing click."""
         if enabled:
+            if not self._record_evidence_monitoring_state(True):
+                self._execution_enabled.clear()
+                return
             self._execution_enabled.set()
             return
         # Close the gate before waiting for an active scan.  Its next final
         # authorization check must fail even while the remaining revocation is
         # waiting for the scan's read-only work to finish.
         self._execution_enabled.clear()
+        self._record_evidence_monitoring_state(False)
         with self._scan_lock:
             # A later enable is a new session, never permission to resume an
             # old click, reopen, flow pause, terminal, or capture-route grant.
@@ -4443,6 +5026,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 else None
             )
 
+        (
+            evidence_ready,
+            evidence_intent,
+            evidence_authority,
+        ) = self._begin_evidence_action(
+            fingerprint=fingerprint,
+            item=second_item,
+            action="auto_battle_click",
+            instance=instance,
+            capture_route=capture_route,
+            capture_settings_revision=capture_settings_revision,
+            source_state_generation=source_state_generation,
+        )
+        if not evidence_ready:
+            self._auto_battle_evidence.pop(fingerprint, None)
+            return False, False
         permitted, delivered = self._run_game_mutation(
             "auto-battle-click",
             deliver,
@@ -4468,11 +5067,51 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or not isinstance(delivered, MouseClickResult)
             or not delivered.delivered
         ):
+            self._finish_evidence_action(
+                fingerprint=fingerprint,
+                item=second_item,
+                action="auto_battle_click",
+                intent_sequence=evidence_intent,
+                allowed=permitted,
+                performed=bool(permitted and attempted),
+                clicked=bool(
+                    isinstance(delivered, MouseClickResult)
+                    and delivered.delivered
+                ),
+                identity_verified=True,
+                restoration_verified=(
+                    delivered.restored
+                    if isinstance(delivered, MouseClickResult)
+                    else None
+                ),
+                failure_reason=(
+                    delivered.failure_code
+                    if isinstance(delivered, MouseClickResult)
+                    and delivered.failure_code is not None
+                    else "auto_battle_delivery_failed"
+                ),
+                auto_battle_panel_verified=False,
+                authority_signature=evidence_authority,
+            )
             self._auto_battle_evidence.pop(fingerprint, None)
             return False, attempted
 
         current = self._current_action_window(instance, fingerprint)
         if current is None:
+            self._finish_evidence_action(
+                fingerprint=fingerprint,
+                item=second_item,
+                action="auto_battle_click",
+                intent_sequence=evidence_intent,
+                allowed=True,
+                performed=True,
+                clicked=True,
+                identity_verified=False,
+                restoration_verified=delivered.restored,
+                failure_reason="post_action_identity_changed",
+                auto_battle_panel_verified=False,
+                authority_signature=evidence_authority,
+            )
             self._auto_battle_evidence.pop(fingerprint, None)
             return False, True
         (
@@ -4511,6 +5150,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
         )
         self._auto_battle_evidence.pop(fingerprint, None)
+        self._finish_evidence_action(
+            fingerprint=fingerprint,
+            item=second_item,
+            action="auto_battle_click",
+            intent_sequence=evidence_intent,
+            allowed=True,
+            performed=True,
+            clicked=True,
+            identity_verified=bool(
+                self._current_action_window(instance, fingerprint)
+                is not None
+            ),
+            restoration_verified=delivered.restored,
+            failure_reason=(
+                None if confirmed else "auto_battle_panel_not_confirmed"
+            ),
+            auto_battle_panel_verified=confirmed,
+            authority_signature=evidence_authority,
+        )
         return confirmed, True
 
     def _run_auto_battle_for_connected(
@@ -4563,6 +5221,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._auto_battle_confirmed_instances.pop(fingerprint, None)
         first = self._auto_battle_evidence_for_sample(first_sample)
         if first.enabled:
+            if not self._record_auto_battle_panel_verification(
+                fingerprint=fingerprint,
+                instance=instance,
+                sample=first_sample,
+            ):
+                self._auto_battle_button_windows.pop(fingerprint, None)
+                self._auto_battle_confirmed_instances.pop(fingerprint, None)
+                return False
             self._auto_battle_button_windows.pop(fingerprint, None)
             self._auto_battle_confirmed_instances[fingerprint] = (
                 confirmation_key
@@ -4667,7 +5333,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
     def _execution_allowed(self) -> bool:
         """Read the stop gate immediately before every mutating backend call."""
-        return self._execution_enabled.is_set()
+        return bool(
+            self._execution_enabled.is_set()
+            and self._evidence_available()
+        )
 
     def _run_game_mutation(
         self,
@@ -5254,6 +5923,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         source_state_generation: int,
     ) -> bool:
         if instance is None or capture_route is None:
+            self._clear_action_confirmation(fingerprint)
+            return False
+        if not self._source_authority_is_current(source_state_generation):
+            self._clear_action_confirmation(fingerprint)
+            return False
+        if not self._record_evidence_decision(
+            fingerprint=fingerprint,
+            item=item,
+            instance=instance,
+            capture_route=capture_route,
+            capture_settings_revision=capture_settings_revision,
+            source_state_generation=source_state_generation,
+        ):
             self._clear_action_confirmation(fingerprint)
             return False
         # A source revoke has to break both existing and concurrently captured
@@ -6156,6 +6838,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         capture_route: str | None = None,
         expected_source_state_generation: int | None = None,
     ) -> BattleRestartResult:
+        if self._evidence_required:
+            # This legacy helper has no current screen, no two-frame decision
+            # evidence and no pre-action window proof.  Keep monitoring and
+            # retrying fresh capture, but never mutate from this path.
+            return BattleRestartResult(
+                False,
+                "restart_evidence_missing",
+            )
         if expected_source_state_generation is None:
             expected_source_state_generation = (
                 self._source_state_generation_snapshot()
@@ -6762,10 +7452,72 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 self._report_reconnect_failure(None)
                 continue
 
+            evidence_item = ScreenRecognition(
+                ReconnectScreenState.RECONNECTING,
+                None,
+                None,
+                "pending_reopen",
+            )
+            evidence_intent: int | None = None
+            evidence_authority: str | None = None
+            evidence_candidates = candidate_windows
+            if self._evidence_recorder is not None or self._evidence_required:
+                snapshot = self._activation_snapshot_instances
+                evidence_instance = (
+                    snapshot.get(fingerprint)
+                    if snapshot is not None
+                    else None
+                )
+                if evidence_instance is None or capture_route is None:
+                    failures.append("reopen_evidence_identity_missing")
+                    continue
+                (
+                    absence_ready,
+                    fresh_absence_candidates,
+                    evidence_authority,
+                ) = self._record_reopen_absence_evidence(
+                    fingerprint=fingerprint,
+                    instance=evidence_instance,
+                    target=target,
+                    capture_route=capture_route,
+                    capture_settings_revision=(
+                        expected_capture_settings_revision
+                    ),
+                    source_state_generation=(
+                        expected_source_state_generation
+                    ),
+                )
+                if not absence_ready:
+                    failures.append("reopen_absence_evidence_missing")
+                    continue
+                evidence_candidates = fresh_absence_candidates
+                (
+                    evidence_ready,
+                    evidence_intent,
+                    intent_authority,
+                ) = self._begin_evidence_action(
+                    fingerprint=fingerprint,
+                    item=evidence_item,
+                    action="reopen_window",
+                    instance=evidence_instance,
+                    capture_route=capture_route,
+                    capture_settings_revision=(
+                        expected_capture_settings_revision
+                    ),
+                    source_state_generation=(
+                        expected_source_state_generation
+                    ),
+                    input_channel="window_control",
+                    identity_verified_override=True,
+                )
+                if not evidence_ready or intent_authority != evidence_authority:
+                    failures.append("evidence_recording_unavailable")
+                    continue
+
             permitted, mutation_result = self._run_game_mutation(
                 "smart-reconnect-reopen",
                 lambda: self._run_authorized_backend_call(
-                    lambda: retry_open(target, candidate_windows),
+                    lambda: retry_open(target, evidence_candidates),
                     expected_capture_settings_revision=(
                         expected_capture_settings_revision
                     ),
@@ -6781,6 +7533,41 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 expected_source_state_generation=(
                     expected_source_state_generation
                 ),
+            )
+            evidence_reopen_result = (
+                mutation_result
+                if isinstance(mutation_result, BattleRestartResult)
+                else None
+            )
+            self._finish_evidence_action(
+                fingerprint=fingerprint,
+                item=evidence_item,
+                action="reopen_window",
+                intent_sequence=evidence_intent,
+                allowed=permitted,
+                performed=bool(
+                    evidence_reopen_result is not None
+                    and evidence_reopen_result.shortcut_open_requested
+                ),
+                clicked=False,
+                identity_verified=True,
+                restoration_verified=None,
+                failure_reason=(
+                    evidence_reopen_result.failure_code
+                    if evidence_reopen_result is not None
+                    and evidence_reopen_result.failure_code is not None
+                    else (
+                        "authorization_revoked"
+                        if not permitted
+                        else (
+                            "reopen_result_invalid"
+                            if evidence_reopen_result is None
+                            else None
+                        )
+                    )
+                ),
+                authority_signature=evidence_authority,
+                input_channel="window_control",
             )
             if not permitted or not isinstance(
                 mutation_result,
@@ -7020,6 +7807,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 and not self._persist_runtime_state()
             ):
                 failures.append("reconnect_state_persistence_failed")
+            if not self._evidence_available():
+                failures.append("evidence_recording_unavailable")
             result = ReconnectBatchResult(
                 expected_windows=self._expected_windows,
                 discovered_windows=len(windows),
@@ -7777,6 +8566,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     failures.append("battle_restart_identity_unresolved")
                     self._report_reconnect_failure(None)
                     continue
+                (
+                    evidence_ready,
+                    evidence_intent,
+                    evidence_authority,
+                ) = self._begin_evidence_action(
+                    fingerprint=fingerprint,
+                    item=item,
+                    action="restart_window",
+                    instance=instance,
+                    capture_route=capture_route,
+                    capture_settings_revision=capture_settings_revision,
+                    source_state_generation=(
+                        confirmation.source_state_generation
+                    ),
+                    input_channel="window_control",
+                )
+                if not evidence_ready:
+                    failures.append("evidence_recording_unavailable")
+                    self._clear_action_confirmation(fingerprint)
+                    continue
                 battle_restart_attempted = True
 
                 def restart_confirmed_battle_window():
@@ -7855,6 +8664,44 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     expected_source_state_generation=(
                         confirmation.source_state_generation
                     ),
+                )
+                evidence_restart_result = (
+                    mutation_result
+                    if isinstance(mutation_result, BattleRestartResult)
+                    else None
+                )
+                self._finish_evidence_action(
+                    fingerprint=fingerprint,
+                    item=item,
+                    action="restart_window",
+                    intent_sequence=evidence_intent,
+                    allowed=permitted,
+                    performed=bool(
+                        evidence_restart_result is not None
+                        and (
+                            evidence_restart_result.window_closed
+                            or evidence_restart_result.shortcut_open_requested
+                        )
+                    ),
+                    clicked=False,
+                    identity_verified=True,
+                    restoration_verified=None,
+                    failure_reason=(
+                        evidence_restart_result.failure_code
+                        if evidence_restart_result is not None
+                        and evidence_restart_result.failure_code is not None
+                        else (
+                            "authorization_revoked"
+                            if not permitted
+                            else (
+                                "restart_result_invalid"
+                                if evidence_restart_result is None
+                                else None
+                            )
+                        )
+                    ),
+                    authority_signature=evidence_authority,
+                    input_channel="window_control",
                 )
                 if not permitted or not isinstance(
                     mutation_result,
@@ -8099,6 +8946,33 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             ),
                         )
 
+                evidence_action = self._evidence_action_name(
+                    item,
+                    line_scroll=is_line_scroll,
+                )
+                (
+                    evidence_ready,
+                    evidence_intent,
+                    evidence_authority,
+                ) = (
+                    self._begin_evidence_action(
+                        fingerprint=fingerprint,
+                        item=item,
+                        action=evidence_action,
+                        instance=confirmed_instance,
+                        capture_route=initial_capture_route,
+                        capture_settings_revision=(
+                            capture_settings_revision
+                        ),
+                        source_state_generation=(
+                            confirmation.source_state_generation
+                        ),
+                    )
+                )
+                if not evidence_ready:
+                    failures.append("evidence_recording_unavailable")
+                    self._clear_action_confirmation(fingerprint)
+                    continue
                 permitted, mutation_result = self._run_game_mutation(
                     "smart-reconnect-click",
                     deliver_click,
@@ -8109,6 +8983,60 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     expected_source_state_generation=(
                         confirmation.source_state_generation
                     ),
+                )
+                evidence_delivery_state = (
+                    mutation_result[0]
+                    if isinstance(mutation_result, tuple)
+                    and len(mutation_result) == 2
+                    else None
+                )
+                evidence_click_result = (
+                    mutation_result[1]
+                    if isinstance(mutation_result, tuple)
+                    and len(mutation_result) == 2
+                    and isinstance(mutation_result[1], MouseClickResult)
+                    else None
+                )
+                self._finish_evidence_action(
+                    fingerprint=fingerprint,
+                    item=item,
+                    action=evidence_action,
+                    intent_sequence=evidence_intent,
+                    allowed=permitted,
+                    performed=(
+                        permitted
+                        and evidence_click_result is not None
+                        and (
+                            evidence_click_result.delivered
+                            or evidence_click_result.delivery_uncertain
+                        )
+                    ),
+                    clicked=bool(
+                        evidence_click_result is not None
+                        and evidence_click_result.delivered
+                    ),
+                    identity_verified=True,
+                    restoration_verified=(
+                        evidence_click_result.restored
+                        if evidence_click_result is not None
+                        else None
+                    ),
+                    failure_reason=(
+                        evidence_click_result.failure_code
+                        if evidence_click_result is not None
+                        and evidence_click_result.failure_code is not None
+                        else (
+                            str(evidence_delivery_state)
+                            if evidence_delivery_state is not None
+                            and evidence_delivery_state != "delivered"
+                            else (
+                                "authorization_revoked"
+                                if not permitted
+                                else None
+                            )
+                        )
+                    ),
+                    authority_signature=evidence_authority,
                 )
                 if not permitted or not isinstance(mutation_result, tuple):
                     self._clear_action_confirmation(fingerprint)
@@ -8495,6 +9423,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 failures.append("capture_mode_disabled")
             next_check_seconds = self._policy.retry_interval_seconds
 
+        if not self._evidence_available():
+            failures.append("evidence_recording_unavailable")
         result = ReconnectBatchResult(
             expected_windows=self._expected_windows,
             discovered_windows=len(windows),

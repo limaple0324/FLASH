@@ -45,6 +45,10 @@ from services.reconnect_failure_status_service import (
 from services.smart_reconnect_capture_settings_service import (
     SmartReconnectCaptureSettings,
 )
+from services.smart_reconnect_evidence_store import (
+    RuntimeSourceIdentity,
+    SmartReconnectEvidenceRecorder,
+)
 from services.target_window_contract_service import ResolvedTargetWindows
 
 
@@ -1493,6 +1497,9 @@ def make_controller(
     recognizer=None,
     registered_role_provider=None,
     ungrouped_shortcut_provider=None,
+    evidence_recorder=None,
+    evidence_required=False,
+    evidence_initialization_failed=False,
 ):
     if clock is None:
         default_time = [-5.0]
@@ -1556,6 +1563,11 @@ def make_controller(
             target_windows_provider=target_windows_provider,
             registered_role_provider=registered_role_provider,
             operation_gate=operation_gate,
+            evidence_recorder=evidence_recorder,
+            evidence_required=evidence_required,
+            evidence_initialization_failed=(
+                evidence_initialization_failed
+            ),
         )
     if group_launch_plan is not None:
         controller.set_group_launch_plan(group_launch_plan)
@@ -2446,6 +2458,108 @@ def test_global_reconnect_handles_a_confirmed_disconnect_without_a_group():
         window.handle,
     ]
     assert fixture.mouse.clicks == [(window.handle, (0.5, 0.5))]
+
+
+def _test_evidence_recorder(tmp_path, *, auto_battle_required=False):
+    return SmartReconnectEvidenceRecorder(
+        tmp_path / "evidence",
+        source_identity=RuntimeSourceIdentity(
+            "1" * 40,
+            False,
+            "test",
+        ),
+        auto_battle_required=auto_battle_required,
+        session_id="1" * 24,
+    )
+
+
+def _read_evidence_records(recorder):
+    return tuple(
+        json.loads(line)
+        for line in recorder.path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+
+
+def test_required_evidence_initialization_failure_blocks_execution():
+    window = make_window(1)
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        evidence_required=True,
+        evidence_initialization_failed=True,
+    )
+
+    prepared = fixture.controller.prepare_execution_snapshot()
+    result = fixture.controller.reconnect()
+
+    assert prepared.success is False
+    assert prepared.code == "reconnect.snapshot_evidence_unavailable"
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+
+
+def test_unknown_screen_is_recorded_without_input(tmp_path):
+    recorder = _test_evidence_recorder(tmp_path)
+    window = make_window(1)
+    fixture = make_controller(
+        [255],
+        windows=[window],
+        expected_windows=1,
+        evidence_recorder=recorder,
+        evidence_required=True,
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    result = fixture.controller.reconnect()
+    records = _read_evidence_records(recorder)
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+    assert any(
+        record.get("record_type") == "observation"
+        and record.get("state") == "unknown"
+        for record in records
+    )
+    assert not any(record.get("record_type") == "action" for record in records)
+
+
+def test_confirmed_disconnect_records_durable_intent_and_result(tmp_path):
+    recorder = _test_evidence_recorder(tmp_path)
+    window = make_window(1)
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        evidence_recorder=recorder,
+        evidence_required=True,
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+    records = _read_evidence_records(recorder)
+
+    assert result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(window.handle, (0.5, 0.5))]
+    intents = tuple(
+        record
+        for record in records
+        if record.get("record_type") == "action_intent"
+        and record.get("action") == "confirm_disconnect"
+    )
+    actions = tuple(
+        record
+        for record in records
+        if record.get("record_type") == "action"
+        and record.get("action") == "confirm_disconnect"
+    )
+    assert len(intents) == 1
+    assert len(actions) == 1
+    assert actions[0]["intent_sequence"] == intents[0]["sequence"]
+    assert actions[0]["clicked"] is True
+    assert actions[0]["identity_verified"] is True
 
 
 def test_global_reconnect_does_not_act_on_manual_login_without_disconnect():
