@@ -204,7 +204,9 @@ def test_role_id_is_automatically_read_only_for_connected_missing_roles():
     assert "screen_state is not ReconnectScreenState.CONNECTED" in function_source
     assert "role_id_template_service.read_if_missing(" in function_source
     assert "existing_role_id=entry.role_id" in function_source
-    assert "group_configuration_service.set_role_id(" in function_source
+    assert "commit_role_id(" in function_source
+    assert "only_if_missing=True" in function_source
+    assert "group_configuration_service.set_role_id(" not in function_source
     assert "entry.display_name" not in function_source
     assert "window.after(" in function_source
     assert "window.after_cancel(role_id_auto_read_id)" in source
@@ -247,8 +249,13 @@ def test_cancelled_bulk_shortcut_selection_has_no_side_effects():
     assert cancel_end < body.count("\n") + add_group_shortcuts.lineno
     assert body.index("if not selected:") < body.index(
         "stop_group_automation_for_configuration_change()"
-    ) < body.index("group_configuration_service.add_shortcuts(")
-    assert body.count("group_configuration_service.add_shortcuts(") == 1
+    ) < body.index("def mutation(candidate):")
+    assert body.index("def mutation(candidate):") < body.index(
+        "candidate.add_shortcuts("
+    )
+    assert body.count("candidate.add_shortcuts(") == 1
+    assert "group_configuration_service.add_shortcuts(" not in body
+    assert "finish_group_management(mutation)" in body
     assert "tuple(Path(path) for path in selected)" in body
     assert "set_role_id(" not in body
 

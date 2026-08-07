@@ -42,6 +42,33 @@ def test_same_source_reuses_verified_cache_and_publishes_atomically(
     assert (tmp_path / "dist" / "FLASH.exe").read_bytes() == b"verified"
 
 
+def test_cache_staging_component_stays_short_for_windows_paths(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _source(tmp_path)
+    staging_names = []
+
+    def executor(_root, dist_dir, _work_dir):
+        dist_dir.mkdir(parents=True)
+        (dist_dir / "FLASH.exe").write_bytes(b"verified")
+
+    cache_dir = tmp_path / ".build-cache"
+    original_mkdir = Path.mkdir
+
+    def record_staging_name(path, *args, **kwargs):
+        if path.parent == cache_dir and path.name.startswith(".tmp-"):
+            staging_names.append(path.name)
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", record_staging_name)
+    BuildCoordinator(tmp_path, executor=executor).build()
+
+    assert len(staging_names) == 1
+    assert len(staging_names[0]) == len(".tmp-") + 32
+    assert source_digest(tmp_path) not in staging_names[0]
+
+
 def test_source_change_during_build_keeps_existing_formal_output(
     tmp_path: Path,
 ) -> None:
