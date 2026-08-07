@@ -542,7 +542,12 @@ class SmartReconnectMonitor:
                 None,
             )
             if callable(execution_switch):
-                execution_switch(True)
+                execution_started = execution_switch(True)
+                if execution_started is False:
+                    self._runtime_status = None
+                    self._runtime_recovery_progress_at = None
+                    self._runtime_connected_high_watermark = None
+                    return False
             self._stop_event.clear()
             self._settings_changed_event.clear()
             self._runtime_status = SMART_RECONNECT_STATUS_RECONNECTING

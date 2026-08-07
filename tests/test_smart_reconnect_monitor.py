@@ -5,11 +5,70 @@ import pytest
 import services.smart_reconnect_monitor as smart_reconnect_monitor_module
 from adapters.game_screen_recognizer import ScreenRecognition
 from adapters.windows_background_capture import CaptureSample
-from adapters.windows_smart_reconnect import WindowsSmartReconnectController
+from adapters.windows_smart_reconnect import (
+    WindowInstanceToken,
+    WindowsSmartReconnectController,
+)
 from adapters.windows_window import WindowInfo
 from core.reconnect_policy import ReconnectScreenState
+from core.smart_reconnect_authorization import (
+    ReconnectAuthorizationTarget,
+    ReconnectLaunchMode,
+    ReconnectSourceIdentity,
+    ShortcutFileIdentity,
+    ShortcutSeal,
+)
 from core.sp1_boundaries import OperationResult, ReconnectState
+from domain.character import CharacterImportance
+from services.smart_reconnect_authorization_coordinator import (
+    SmartReconnectAuthorizationCoordinator,
+)
 from services.smart_reconnect_monitor import SmartReconnectMonitor
+
+
+class MonitorAuthorizationPreparation:
+    def __init__(self, coordinator, windows):
+        self.authorization_coordinator = coordinator
+        self._windows = tuple(windows)
+
+    def prepare(self, *, launch_mode):
+        assert launch_mode is ReconnectLaunchMode.IDENTITY_BOUND
+        targets = tuple(
+            ReconnectAuthorizationTarget(
+                fingerprint=window.launch_fingerprint,
+                instance=WindowInstanceToken.from_window(window),
+                character_id=f"monitor-character-{index}",
+                role_aliases=(f"{index:03x}-monitor-role",),
+                importance=(
+                    CharacterImportance.PRIMARY
+                    if index == 1
+                    else CharacterImportance.SECONDARY
+                ),
+                original_slot_index=(index - 1) % 3,
+                original_line_number=1,
+                shortcut_seal=ShortcutSeal(
+                    ShortcutFileIdentity(
+                        f"C:/FLASH_TEST/monitor-role-{index}.lnk",
+                        1,
+                        index,
+                    ),
+                    f"{index:064x}",
+                    window.launch_fingerprint,
+                ),
+            )
+            for index, window in enumerate(self._windows, start=1)
+        )
+        return self.authorization_coordinator.publish(
+            ReconnectSourceIdentity(
+                identity_generation=1,
+                config_revision=1,
+                group_id="monitor-test-group",
+                group_name="monitor-test-group",
+                character_ids=tuple(target.character_id for target in targets),
+            ),
+            launch_mode,
+            targets,
+        )
 
 
 class FakeBoundary:
@@ -77,6 +136,12 @@ class BlockingBoundary(FakeBoundary):
             "reconnect.connected",
             details={"next_check_seconds": 5},
         )
+
+
+class RejectedExecutionBoundary(FakeBoundary):
+    def set_execution_enabled(self, enabled):
+        super().set_execution_enabled(enabled)
+        return enabled is not True
 
 
 def healthy_connected_details(*, next_check_seconds=5, windows=2):
@@ -477,10 +542,13 @@ def test_fully_captured_partial_unknown_scan_reports_reconnecting() -> None:
         def click_relative(self, *_args):
             raise AssertionError("unknown screen must never deliver input")
 
+    backend = Windows()
+    authorization = SmartReconnectAuthorizationCoordinator()
+    preparation = MonitorAuthorizationPreparation(authorization, windows)
     controller = WindowsSmartReconnectController(
         expected_windows=2,
         title_keywords=("Adobe Flash Player",),
-        window_backend=Windows(),
+        window_backend=backend,
         capture_provider=Capture(),
         recognizer=Recognizer(),
         mouse_backend=Mouse(),
@@ -488,7 +556,12 @@ def test_fully_captured_partial_unknown_scan_reports_reconnecting() -> None:
         primary_capture_is_fresh_without_visibility=True,
         require_expected_window_count=True,
         auto_battle_enabled=False,
+        execution_enabled=False,
+        authorization_coordinator=authorization,
+        preparation_service=preparation,
     )
+    assert controller.prepare_execution_snapshot().success is True
+    controller.set_execution_enabled(True)
     monitor = SmartReconnectMonitor(controller)
     monitor._thread = type(
         "AliveThread",
@@ -762,6 +835,16 @@ def test_start_and_stop_are_idempotent():
     assert monitor.running is False
     assert boundary.execution_changes[0] is True
     assert boundary.execution_changes[-1] is False
+
+
+def test_monitor_does_not_start_when_current_authorization_was_revoked():
+    boundary = RejectedExecutionBoundary([])
+    monitor = SmartReconnectMonitor(boundary)
+
+    assert monitor.start() is False
+    assert monitor.running is False
+    assert monitor.runtime_status is None
+    assert boundary.execution_changes == [True]
 
 
 def test_start_reports_reconnecting_while_first_scan_is_warming_up():

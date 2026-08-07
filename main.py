@@ -1784,6 +1784,11 @@ def build_services(
         ),
         require_expected_window_count=False,
         operation_gate=game_operation_gate,
+        authorization_coordinator=(
+            smart_reconnect_authorization_coordinator
+        ),
+        preparation_service=smart_reconnect_preparation_service,
+        shortcut_seal_resolver=shortcut_seal_resolver,
         auto_battle_enabled=(
             normalize_smart_reconnect_auto_battle_enabled(
                 config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY)
@@ -2142,6 +2147,12 @@ def shutdown_smart_reconnect_monitor(
                 )
             except Exception:
                 pass
+    finally:
+        coordinator = AppContext.get(
+            SmartReconnectAuthorizationCoordinator
+        )
+        if coordinator is not None:
+            coordinator.stop()
 
 
 def shutdown_ui_font_service(

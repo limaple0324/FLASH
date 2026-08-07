@@ -16,6 +16,17 @@ from adapters.windows_smart_reconnect import (
 from adapters.windows_window import WindowInfo
 from adapters.game_screen_recognizer import ScreenRecognition
 from core.reconnect_policy import ReconnectScreenState
+from core.smart_reconnect_authorization import (
+    ReconnectAuthorizationTarget,
+    ReconnectLaunchMode,
+    ReconnectSourceIdentity,
+    ShortcutFileIdentity,
+    ShortcutSeal,
+)
+from domain.character import CharacterImportance
+from services.smart_reconnect_authorization_coordinator import (
+    SmartReconnectAuthorizationCoordinator,
+)
 from services.smart_reconnect_capture_settings_service import SmartReconnectCaptureSettings
 
 
@@ -142,6 +153,64 @@ class _Windows:
     def top_window_at(self, _x, _y): return self.window.handle
 
 
+class _AuthorizationPreparation:
+    def __init__(self, coordinator, window_backend):
+        self.authorization_coordinator = coordinator
+        self._window_backend = window_backend
+        self._generation = 1
+
+    def prepare(self, *, launch_mode):
+        assert launch_mode is ReconnectLaunchMode.IDENTITY_BOUND
+        windows = tuple(self._window_backend.list_windows())
+        targets = []
+        for index, window in enumerate(windows, start=1):
+            instance = WindowInstanceToken.from_window(window)
+            if instance is None:
+                return None
+            targets.append(
+                ReconnectAuthorizationTarget(
+                    fingerprint=window.launch_fingerprint,
+                    instance=instance,
+                    character_id=f"auto-character-{index}",
+                    role_aliases=(f"{index:03x}-auto-role",),
+                    importance=(
+                        CharacterImportance.PRIMARY
+                        if index == 1
+                        else CharacterImportance.SECONDARY
+                    ),
+                    original_slot_index=(index - 1) % 3,
+                    original_line_number=1,
+                    shortcut_seal=ShortcutSeal(
+                        ShortcutFileIdentity(
+                            f"C:/FLASH_TEST/auto-role-{index}.lnk",
+                            1,
+                            index,
+                        ),
+                        f"{index:064x}",
+                        window.launch_fingerprint,
+                    ),
+                )
+            )
+        source = ReconnectSourceIdentity(
+            identity_generation=self._generation,
+            config_revision=1,
+            group_id="auto-battle-test-group",
+            group_name="auto-battle-test-group",
+            character_ids=tuple(target.character_id for target in targets),
+        )
+        self._generation += 1
+        return self.authorization_coordinator.publish(
+            source,
+            launch_mode,
+            tuple(targets),
+        )
+
+
+def _authorization_services(window_backend):
+    coordinator = SmartReconnectAuthorizationCoordinator()
+    return coordinator, _AuthorizationPreparation(coordinator, window_backend)
+
+
 class _Capture:
     def __init__(self, frames, after=None, clock=None):
         self.frames = list(frames)
@@ -256,9 +325,11 @@ def _controller(
     mouse = _Mouse()
     capture = _Capture(frames, clock=monotonic_clock)
     clock = monotonic_clock or (lambda: 0.0)
+    backend = _Windows(window)
+    authorization, preparation = _authorization_services(backend)
     controller = WindowsSmartReconnectController(
         expected_windows=1, title_keywords=("Adobe Flash Player",),
-        window_backend=_Windows(window), capture_provider=capture,
+        window_backend=backend, capture_provider=capture,
         recognizer=_ConnectedRecognizer(
             general_state,
             battle_context=battle_context,
@@ -268,6 +339,8 @@ def _controller(
         execution_enabled=False, require_expected_window_count=False,
         monotonic_clock=clock,
         auto_battle_enabled=True, auto_battle_recognizer=AutoBattleRecognizer(ROOT),
+        authorization_coordinator=authorization,
+        preparation_service=preparation,
     )
     prepared = controller.prepare_execution_snapshot()
     assert prepared.success is True
@@ -345,6 +418,7 @@ def test_auto_battle_single_frame_and_total_switch_cannot_reuse_old_evidence() -
     controller.set_execution_enabled(False)
     assert controller.auto_battle_enabled is True
     assert not controller.auto_battle_execution_allowed()
+    assert controller.prepare_execution_snapshot().success is True
     controller.set_execution_enabled(True)
     assert not controller._auto_battle_evidence
     assert controller.auto_battle_execution_allowed()
@@ -373,12 +447,15 @@ def test_three_role_auto_battle_only_delivers_to_confirmed_role() -> None:
     gamma = WindowInfo(3, "Adobe Flash Player", True, False, (0, 0, 900, 600), 8, "ShockwaveFlash", "c" * 64, 9, 10)
     backend = _Windows(alpha); backend.list_windows = lambda: [alpha, beta, gamma]
     mouse = _Mouse()
+    authorization, preparation = _authorization_services(backend)
     controller = WindowsSmartReconnectController(
         expected_windows=3, title_keywords=("Adobe Flash Player",), window_backend=backend,
         capture_provider=_Capture([_sample(red_x), _enabled_battle_sample()]), recognizer=_ConnectedRecognizer(),
         mouse_backend=mouse, primary_capture_is_trusted=True, primary_capture_is_fresh_without_visibility=True,
         execution_enabled=False, require_expected_window_count=False, auto_battle_enabled=True,
         auto_battle_recognizer=AutoBattleRecognizer(ROOT),
+        authorization_coordinator=authorization,
+        preparation_service=preparation,
     )
     prepared = controller.prepare_execution_snapshot()
     assert prepared.success is True
@@ -630,6 +707,7 @@ def test_four_window_diagnostics_are_anonymous_hash_only_records() -> None:
     backend = _Windows(windows[0])
     backend.list_windows = lambda: list(windows)
     capture = _Capture([frame] * 4)
+    authorization, preparation = _authorization_services(backend)
     controller = WindowsSmartReconnectController(
         expected_windows=4,
         title_keywords=("Adobe Flash Player",),
@@ -639,10 +717,14 @@ def test_four_window_diagnostics_are_anonymous_hash_only_records() -> None:
         mouse_backend=_Mouse(),
         primary_capture_is_trusted=True,
         primary_capture_is_fresh_without_visibility=True,
-        execution_enabled=True,
+        execution_enabled=False,
         require_expected_window_count=False,
         auto_battle_enabled=False,
+        authorization_coordinator=authorization,
+        preparation_service=preparation,
     )
+    assert controller.prepare_execution_snapshot().success is True
+    controller.set_execution_enabled(True)
 
     result = controller.reconnect()
 
@@ -680,6 +762,7 @@ def test_eight_minimized_windows_use_only_active_fresh_capture_path() -> None:
     backend.list_windows = lambda: list(windows)
     passive = _ForbiddenCapture()
     active = _Capture([frame] * 8)
+    authorization, preparation = _authorization_services(backend)
     controller = WindowsSmartReconnectController(
         expected_windows=8,
         title_keywords=("Adobe Flash Player",),
@@ -688,10 +771,14 @@ def test_eight_minimized_windows_use_only_active_fresh_capture_path() -> None:
         active_refresh_capture_provider=active,
         recognizer=_ConnectedRecognizer(),
         mouse_backend=_Mouse(),
-        execution_enabled=True,
+        execution_enabled=False,
         require_expected_window_count=False,
         auto_battle_enabled=False,
+        authorization_coordinator=authorization,
+        preparation_service=preparation,
     )
+    assert controller.prepare_execution_snapshot().success is True
+    controller.set_execution_enabled(True)
 
     result = controller.reconnect()
 
@@ -720,18 +807,24 @@ def test_minimized_restore_failure_exposes_only_anonymous_stage() -> None:
         301,
     )
     active = _FailedStageCapture("restoration_barrier_failed")
+    backend = _Windows(window)
+    authorization, preparation = _authorization_services(backend)
     controller = WindowsSmartReconnectController(
         expected_windows=1,
         title_keywords=("Adobe Flash Player",),
-        window_backend=_Windows(window),
+        window_backend=backend,
         capture_provider=_ForbiddenCapture(),
         active_refresh_capture_provider=active,
         recognizer=_ConnectedRecognizer(),
         mouse_backend=_Mouse(),
-        execution_enabled=True,
+        execution_enabled=False,
         require_expected_window_count=False,
         auto_battle_enabled=False,
+        authorization_coordinator=authorization,
+        preparation_service=preparation,
     )
+    assert controller.prepare_execution_snapshot().success is True
+    controller.set_execution_enabled(True)
 
     result = controller.reconnect()
 

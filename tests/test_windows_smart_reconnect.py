@@ -35,6 +35,13 @@ from adapters.windows_smart_reconnect import (
 )
 from adapters.windows_window import WindowInfo
 from core.reconnect_policy import ReconnectScreenState
+from core.smart_reconnect_authorization import (
+    ReconnectAuthorizationTarget,
+    ReconnectLaunchMode,
+    ReconnectSourceIdentity,
+    ShortcutFileIdentity,
+    ShortcutSeal,
+)
 from core.sp1_boundaries import ReconnectState
 from domain.character import CharacterImportance
 from services.game_operation_gate import GameOperationGate
@@ -44,6 +51,9 @@ from services.reconnect_failure_status_service import (
 )
 from services.smart_reconnect_capture_settings_service import (
     SmartReconnectCaptureSettings,
+)
+from services.smart_reconnect_authorization_coordinator import (
+    SmartReconnectAuthorizationCoordinator,
 )
 from services.smart_reconnect_evidence_store import (
     RuntimeSourceIdentity,
@@ -1468,11 +1478,95 @@ class FakeBattleRestarter:
         )
 
 
+class FakeClosedBattleRestarter(FakeBattleRestarter):
+    """Model a verified close whose first shortcut open did not complete."""
+
+    def restart(self, window, target):
+        self.calls.append((window, target))
+        return BattleRestartResult(
+            False,
+            "battle_shortcut_open_failed",
+            window_closed=True,
+        )
+
+
 @dataclass
 class Fixture:
     controller: WindowsSmartReconnectController
     capture: FakeCaptureProvider
     mouse: FakeMouseBackend
+    authorization: SmartReconnectAuthorizationCoordinator | None = None
+    preparation: "FakeAuthorizationPreparation | None" = None
+
+
+class FakeAuthorizationPreparation:
+    def __init__(self, coordinator, source, targets, target_provider=None):
+        self.authorization_coordinator = coordinator
+        self._source = source
+        self._targets = tuple(targets)
+        self._target_provider = target_provider
+        self._generation = source.identity_generation
+
+    def prepare(self, *, launch_mode):
+        assert launch_mode is ReconnectLaunchMode.IDENTITY_BOUND
+        source = replace(
+            self._source,
+            identity_generation=self._generation,
+        )
+        self._generation += 1
+        targets = (
+            tuple(self._target_provider(self._targets))
+            if self._target_provider is not None
+            else self._targets
+        )
+        return self.authorization_coordinator.publish(
+            source,
+            launch_mode,
+            targets,
+        )
+
+
+def _authorization_targets_for_current_windows(
+    targets,
+    window_backend,
+    target_windows_provider,
+):
+    raw = (
+        target_windows_provider()
+        if target_windows_provider is not None
+        else window_backend.list_windows()
+    )
+    if isinstance(raw, ResolvedTargetWindows):
+        if raw.failure_codes or raw.blocked_fingerprints:
+            raise ValueError("authorization window source is unsafe")
+        windows = tuple(raw.windows)
+    else:
+        windows = tuple(raw)
+    target_fingerprints = frozenset(
+        target.fingerprint
+        for target in targets
+    )
+    scoped_windows = tuple(
+        window
+        for window in windows
+        if window.launch_fingerprint in target_fingerprints
+    )
+    resolved = []
+    for target in targets:
+        matches = tuple(
+            window
+            for window in scoped_windows
+            if window.launch_fingerprint == target.fingerprint
+        )
+        if len(matches) != 1:
+            raise ValueError("authorization window source is incomplete")
+        instance = WindowInstanceToken.from_window(matches[0])
+        if instance is None:
+            raise ValueError("authorization window instance is incomplete")
+        resolved.append(replace(target, instance=instance))
+    if len(scoped_windows) != len(resolved):
+        raise ValueError("authorization window source has extra identities")
+    return tuple(resolved)
 
 
 def make_controller(
@@ -1482,6 +1576,7 @@ def make_controller(
     expected_windows=2,
     points=None,
     mouse=None,
+    primary_capture_provider=None,
     clock=None,
     state_path=None,
     battle_markers=(),
@@ -1506,6 +1601,9 @@ def make_controller(
     evidence_recorder=None,
     evidence_required=False,
     evidence_initialization_failed=False,
+    authorization_original_line_number=1,
+    authorization_missing_last_target=False,
+    authorization_target_identities=None,
 ):
     if clock is None:
         default_time = [-5.0]
@@ -1514,8 +1612,13 @@ def make_controller(
             default_time[0] += 5.0
             return default_time[0]
 
-    windows = windows or [make_window(1), make_window(2)]
-    capture = FakeCaptureProvider(
+    if windows is None:
+        windows = [
+            make_window(index)
+            for index in range(1, expected_windows + 1)
+        ]
+    controller_window_backend = window_backend or FakeWindowBackend(windows)
+    capture = primary_capture_provider or FakeCaptureProvider(
         {window.handle: marker for window, marker in zip(windows, screen_states)}
     )
     if recognizer is None:
@@ -1548,10 +1651,160 @@ def make_controller(
             battle_markers=battle_markers,
         )
     mouse = mouse or FakeMouseBackend()
+    authorization_coordinator = SmartReconnectAuthorizationCoordinator()
+    authorization_targets = []
+    for index, window in enumerate(windows, start=1):
+        fingerprint = window.launch_fingerprint
+        instance = WindowInstanceToken.from_window(window)
+        authorization_identity = (
+            authorization_target_identities.get(fingerprint)
+            if authorization_target_identities is not None
+            else None
+        )
+        if (
+            authorization_identity is None
+            and target_identity_provider is not None
+        ):
+            try:
+                candidate_identity = target_identity_provider(fingerprint)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                candidate_identity = None
+            if (
+                isinstance(candidate_identity, SmartReconnectTargetIdentity)
+                and candidate_identity.fingerprint == fingerprint
+                and candidate_identity.original_slot_index is not None
+                and candidate_identity.original_line_number is not None
+            ):
+                authorization_identity = candidate_identity
+            else:
+                authorization_targets = []
+                break
+        plan_target = (
+            group_launch_plan.target_for_fingerprint(fingerprint)
+            if group_launch_plan is not None
+            else None
+        )
+        if instance is None:
+            authorization_targets = []
+            break
+        if (
+            authorization_identity is not None
+            and authorization_identity.fingerprint != fingerprint
+        ):
+            authorization_targets = []
+            break
+        character_id = (
+            authorization_identity.character_id
+            if authorization_identity is not None
+            else (
+                plan_target.entry_id
+                if plan_target is not None and plan_target.entry_id
+                else f"test-character-{index}"
+            )
+        )
+        role_aliases = (
+            authorization_identity.role_aliases
+            if authorization_identity is not None
+            else (
+                plan_target.role_id
+                if (
+                    len(windows) == 1
+                    and plan_target is not None
+                    and plan_target.role_id
+                )
+                else f"{index:03x}-test-identity"
+            ,)
+        )
+        importance = (
+            authorization_identity.importance
+            if authorization_identity is not None
+            else (
+                plan_target.importance
+                if plan_target is not None
+                and plan_target.importance is not None
+                else CharacterImportance.PRIMARY
+            )
+        )
+        original_slot_index = (
+            authorization_identity.original_slot_index
+            if authorization_identity is not None
+            else (index - 1) % 3
+        )
+        original_line_number = (
+            authorization_identity.original_line_number
+            if authorization_identity is not None
+            else authorization_original_line_number
+        )
+        shortcut_path = str(
+            plan_target.shortcut_path
+            if plan_target is not None
+            else Path.cwd() / ".pytest-shortcuts" / f"{index}.lnk"
+        )
+        try:
+            authorization_targets.append(
+                ReconnectAuthorizationTarget(
+                    fingerprint=fingerprint,
+                    instance=instance,
+                    character_id=character_id,
+                    role_aliases=role_aliases,
+                    importance=importance,
+                    original_slot_index=original_slot_index,
+                    original_line_number=original_line_number,
+                    shortcut_seal=ShortcutSeal(
+                        file_identity=ShortcutFileIdentity(
+                            normalized_path=shortcut_path,
+                            volume_serial_number=1,
+                            file_index=index,
+                        ),
+                        content_sha256=f"{index:064x}",
+                        launch_fingerprint=fingerprint,
+                    ),
+                )
+            )
+        except (TypeError, ValueError):
+            authorization_targets = []
+            break
+    if require_expected_window_count and len(windows) != expected_windows:
+        authorization_targets = []
+    expected_character_ids = tuple(
+        target.character_id
+        for target in authorization_targets
+        if target.character_id is not None
+    )
+    if authorization_missing_last_target and authorization_targets:
+        authorization_targets = authorization_targets[:-1]
+    preparation_service = None
+    if authorization_targets:
+        try:
+            authorization_source = ReconnectSourceIdentity(
+                    identity_generation=1,
+                    config_revision=1,
+                    group_id="test-group-id",
+                    group_name=(
+                        group_launch_plan.group_name
+                        if group_launch_plan is not None
+                        else "test-group"
+                    ),
+                    character_ids=expected_character_ids,
+                )
+            preparation_service = FakeAuthorizationPreparation(
+                authorization_coordinator,
+                authorization_source,
+                tuple(authorization_targets),
+                target_provider=lambda targets: (
+                    _authorization_targets_for_current_windows(
+                        targets,
+                        controller_window_backend,
+                        target_windows_provider,
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            preparation_service = None
     controller = WindowsSmartReconnectController(
             expected_windows=expected_windows,
             title_keywords=("Adobe Flash Player",),
-            window_backend=window_backend or FakeWindowBackend(windows),
+            window_backend=controller_window_backend,
             capture_provider=capture,
             visible_capture_provider=visible_capture_provider,
             obscured_capture_provider=obscured_capture_provider,
@@ -1561,7 +1814,7 @@ def make_controller(
             mouse_backend=mouse,
             monotonic_clock=clock,
             state_path=state_path,
-            execution_enabled=True,
+            execution_enabled=False,
             require_expected_window_count=require_expected_window_count,
             battle_restarter=battle_restarter,
             failure_status_service=failure_status_service,
@@ -1572,22 +1825,31 @@ def make_controller(
             verified_slot_recorder=verified_slot_recorder,
             verified_line_recorder=verified_line_recorder,
             operation_gate=operation_gate,
+            authorization_coordinator=authorization_coordinator,
+            preparation_service=preparation_service,
             evidence_recorder=evidence_recorder,
             evidence_required=evidence_required,
             evidence_initialization_failed=(
                 evidence_initialization_failed
             ),
         )
-    if group_launch_plan is not None:
-        controller.set_group_launch_plan(group_launch_plan)
     if ungrouped_shortcut_provider is not None:
         controller.set_ungrouped_shortcut_provider(
             ungrouped_shortcut_provider
         )
+    if preparation_service is not None:
+        prepared = controller.prepare_execution_snapshot()
+        if prepared.success:
+            controller._initial_login_authorizations.clear()
+            if group_launch_plan is not None:
+                controller.set_group_launch_plan(group_launch_plan)
+            controller.set_execution_enabled(True)
     return Fixture(
         controller=controller,
         capture=capture,
         mouse=mouse,
+        authorization=authorization_coordinator,
+        preparation=preparation_service,
     )
 
 
@@ -1684,24 +1946,115 @@ def _single_window_character_fixture(
     if clock is None:
         clock = lambda: 0.0
     window = make_window(1)
-    capture = FakeCaptureProvider({window.handle: 5})
-    mouse = FakeMouseBackend()
-    controller = WindowsSmartReconnectController(
+    authorization_identity = None
+    authorization_missing = False
+    if target_identity_provider is not None:
+        try:
+            candidate_identity = target_identity_provider(
+                window.launch_fingerprint
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            candidate_identity = None
+        if (
+            isinstance(candidate_identity, SmartReconnectTargetIdentity)
+            and candidate_identity.fingerprint == window.launch_fingerprint
+            and candidate_identity.original_slot_index is not None
+            and candidate_identity.original_line_number is not None
+        ):
+            authorization_identity = candidate_identity
+        else:
+            authorization_missing = True
+    elif registered_role_provider is not None:
+        try:
+            registered_roles = tuple(registered_role_provider())
+        except (OSError, RuntimeError, TypeError, ValueError):
+            registered_roles = ()
+        primaries = tuple(
+            role
+            for role in registered_roles
+            if (
+                isinstance(role, RegisteredReconnectRole)
+                and role.importance is CharacterImportance.PRIMARY
+            )
+        )
+        candidates = ()
+        if len(primaries) == 1 and isinstance(
+            recognizer,
+            _CharacterSequenceRecognizer,
+        ):
+            try:
+                candidates = tuple(recognizer.provider(1))
+            except (OSError, RuntimeError, TypeError, ValueError):
+                candidates = ()
+        role_matches = tuple(
+            candidate
+            for candidate in candidates
+            if (
+                isinstance(candidate, CharacterSelectionCandidate)
+                and isinstance(candidate.identity, str)
+                and candidate.identity.strip().casefold()
+                == primaries[0].role_id.casefold()
+            )
+        ) if len(primaries) == 1 else ()
+        if len(role_matches) == 1:
+            authorization_identity = _stable_target_identity(
+                window,
+                character_id=f"registered:{primaries[0].role_id}",
+                role_aliases=(primaries[0].role_id,),
+                importance=primaries[0].importance,
+                slot_index=role_matches[0].slot_index,
+                line_number=1,
+            )
+        else:
+            authorization_missing = True
+    else:
+        authorization_identity = _stable_target_identity(
+            window,
+            character_id="test-character-1",
+            role_aliases=("001-test-identity",),
+            importance=CharacterImportance.PRIMARY,
+            slot_index=0,
+            line_number=1,
+        )
+    fixture = make_controller(
+        [5],
+        windows=[window],
         expected_windows=1,
-        title_keywords=("Adobe Flash Player",),
-        window_backend=FakeWindowBackend([window]),
-        capture_provider=capture,
-        primary_capture_is_trusted=True,
+        clock=clock,
         recognizer=recognizer,
-        mouse_backend=mouse,
-        execution_enabled=True,
-        monotonic_clock=clock,
         registered_role_provider=registered_role_provider,
         target_identity_provider=target_identity_provider,
         verified_slot_recorder=verified_slot_recorder,
         verified_line_recorder=verified_line_recorder,
+        authorization_target_identities=(
+            {window.launch_fingerprint: authorization_identity}
+            if authorization_identity is not None
+            else None
+        ),
+        authorization_missing_last_target=authorization_missing,
     )
-    return Fixture(controller, capture, mouse), window
+    return fixture, window
+
+
+def make_bound_pending_reopen_fixture(tmp_path):
+    windows = [make_window(1), make_window(2)]
+    restarter = FakeClosedBattleRestarter()
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
+        expected_windows=2,
+        battle_markers={2},
+        battle_restarter=restarter,
+        group_launch_plan=make_group_plan(tmp_path, windows, "120"),
+        failure_status_service=ReconnectFailureStatusService(),
+    )
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    missing = windows[0].launch_fingerprint
+    assert missing in fixture.controller._pending_reopen_fingerprints
+    assert missing in fixture.controller._pending_reopen_authorizations
+    fixture.controller._window_backend.windows = [windows[1]]
+    return fixture, windows, restarter
 
 
 class _CharacterSequenceRecognizer:
@@ -1720,11 +2073,16 @@ def _stable_target_identity(
     character_id="character-1",
     role_aliases=("AlphaHero",),
     importance=CharacterImportance.SECONDARY,
-    slot_index=None,
-    line_number=None,
+    slot_index=2,
+    line_number=1,
 ):
+    fingerprint = (
+        window
+        if isinstance(window, str)
+        else window.launch_fingerprint
+    )
     return SmartReconnectTargetIdentity(
-        window.launch_fingerprint,
+        fingerprint,
         character_id,
         role_aliases,
         importance,
@@ -1752,16 +2110,13 @@ def test_read_only_check_detects_reconnect_need_without_clicking():
 
 def test_selected_group_identity_excludes_other_open_flash_windows():
     windows = [make_window(1), make_window(2), make_window(3)]
-    selected = {
-        windows[0].launch_fingerprint,
-        windows[2].launch_fingerprint,
-    }
+    selected_windows = [windows[0], windows[2]]
     fixture = make_controller(
-        [2, 1, 4],
-        windows=windows,
+        [2, 4],
+        windows=selected_windows,
+        expected_windows=2,
+        window_backend=FakeWindowBackend(windows),
     )
-    fixture.controller.set_expected_windows(2)
-    fixture.controller.set_allowed_fingerprints(selected)
 
     first = fixture.controller.reconnect()
     result = fixture.controller.reconnect()
@@ -1775,7 +2130,7 @@ def test_selected_group_identity_excludes_other_open_flash_windows():
     ]
 
 
-def test_selected_group_missing_identity_blocks_confirmed_open_role_action():
+def test_selected_group_change_revokes_stale_action_before_full_reprepare():
     windows = [make_window(1), make_window(2)]
     fixture = make_controller([2, 1], windows=windows)
     fixture.controller.set_allowed_fingerprints(
@@ -1792,10 +2147,10 @@ def test_selected_group_missing_identity_blocks_confirmed_open_role_action():
     assert result.success is False
     assert result.code == "reconnect.waiting"
     assert result.details["expected_windows"] == 2
-    assert result.details["discovered_windows"] == 1
+    assert result.details["discovered_windows"] == 2
     assert result.details["all_connected"] is False
-    assert "group_identity_set_mismatch" in result.details["failure_codes"]
-    assert fixture.capture.calls == [1, 1]
+    assert result.details["failure_codes"] == []
+    assert fixture.capture.calls == [1, 1, 2]
     assert fixture.mouse.clicks == []
     assert fixture.mouse.expected_process_ids == []
     assert fixture.mouse.instance_tokens == []
@@ -1845,12 +2200,15 @@ def test_isolated_target_source_failure_prevents_false_connected_result():
     assert result.success is False
     assert result.code == "reconnect.waiting"
     assert result.details["all_connected"] is False
-    assert result.details["connected_windows"] == 1
-    assert "window_identity_duplicate" in result.details["failure_codes"]
+    assert result.details["connected_windows"] == 0
+    assert result.details["failure_codes"] == [
+        "authorization_batch_unavailable"
+    ]
+    assert fixture.authorization.current_authorization() is None
     assert fixture.mouse.clicks == []
 
 
-def test_single_blocked_source_window_isolated_while_healthy_window_recovers():
+def test_single_blocked_source_window_rejects_the_entire_batch():
     now = [0.0]
     healthy = make_window(1, fingerprint="a" * 64)
     blocked = make_window(2, fingerprint="b" * 64)
@@ -1874,15 +2232,21 @@ def test_single_blocked_source_window_isolated_while_healthy_window_recovers():
     now[0] = 5.0
     recovered = fixture.controller.reconnect()
 
-    assert prepared.success is True
-    assert prepared.details["window_count"] == 1
-    assert prepared.details["isolated_window_count"] == 1
+    assert prepared.success is False
+    assert prepared.details["failure_codes"] == [
+        "authorization_batch_unavailable"
+    ]
     assert first.details["clicked_windows"] == 0
-    assert recovered.details["clicked_windows"] == 1
-    assert fixture.capture.calls == [healthy.handle, healthy.handle, healthy.handle]
-    assert fixture.mouse.clicks == [(healthy.handle, (0.5, 0.5))]
-    assert blocked.handle not in fixture.capture.calls
-    assert all(handle != blocked.handle for handle, _point in fixture.mouse.clicks)
+    assert recovered.details["clicked_windows"] == 0
+    assert first.details["failure_codes"] == [
+        "authorization_batch_unavailable"
+    ]
+    assert recovered.details["failure_codes"] == [
+        "authorization_batch_unavailable"
+    ]
+    assert fixture.capture.calls == []
+    assert fixture.mouse.clicks == []
+    assert fixture.authorization.current_authorization() is None
 
 
 def test_offline_target_source_failure_prevents_false_connected_result():
@@ -1908,10 +2272,13 @@ def test_offline_target_source_failure_prevents_false_connected_result():
     assert result.success is False
     assert result.code == "reconnect.waiting"
     assert result.details["all_connected"] is False
-    assert result.details["connected_windows"] == 1
-    assert "window_offline" in result.details["failure_codes"]
-    assert result.details["next_check_seconds"] == 5
+    assert result.details["connected_windows"] == 0
+    assert result.details["failure_codes"] == [
+        "authorization_batch_unavailable"
+    ]
+    assert result.details["next_check_seconds"] == 60
     assert fixture.mouse.clicks == []
+    assert fixture.authorization.current_authorization() is None
 
 
 @pytest.mark.parametrize(
@@ -1921,7 +2288,7 @@ def test_offline_target_source_failure_prevents_false_connected_result():
         ((), True),
     ),
 )
-def test_scoped_source_failure_revokes_only_affected_connected_evidence(
+def test_scoped_source_failure_revokes_the_complete_authorization_batch(
     failure_codes,
     block_missing,
 ):
@@ -1955,16 +2322,15 @@ def test_scoped_source_failure_revokes_only_affected_connected_evidence(
 
     assert result.details["all_connected"] is False
     assert fixture.controller.role_screen_states() == {
-        windows[0].launch_fingerprint: ReconnectScreenState.CONNECTED,
+        windows[0].launch_fingerprint: ReconnectScreenState.UNKNOWN,
         affected: ReconnectScreenState.UNKNOWN,
     }
-    assert set(fixture.controller._trusted_connected_evidence) == {
-        windows[0].launch_fingerprint
-    }
+    assert fixture.controller._trusted_connected_evidence == {}
     assert fixture.mouse.clicks == []
+    assert fixture.authorization.current_authorization() is None
 
 
-def test_scoped_source_subset_without_failure_revokes_missing_evidence():
+def test_scoped_source_subset_without_failure_revokes_complete_batch():
     windows = [make_window(1), make_window(2)]
     selected = frozenset(
         window.launch_fingerprint
@@ -1990,18 +2356,17 @@ def test_scoped_source_subset_without_failure_revokes_missing_evidence():
     result = fixture.controller.reconnect()
 
     assert result.details["all_connected"] is False
-    assert result.details["source_missing_windows"] == 1
+    assert result.details["source_missing_windows"] == 2
     assert fixture.controller.role_screen_states() == {
-        windows[0].launch_fingerprint: ReconnectScreenState.CONNECTED,
+        windows[0].launch_fingerprint: ReconnectScreenState.UNKNOWN,
         missing: ReconnectScreenState.UNKNOWN,
     }
-    assert set(fixture.controller._trusted_connected_evidence) == {
-        windows[0].launch_fingerprint
-    }
+    assert fixture.controller._trusted_connected_evidence == {}
     assert fixture.mouse.clicks == []
+    assert fixture.authorization.current_authorization() is None
 
 
-def test_scoped_source_subset_without_failure_keeps_source_generation():
+def test_scoped_source_subset_without_failure_advances_source_generation():
     windows = [make_window(1), make_window(2)]
     selected = frozenset(window.launch_fingerprint for window in windows)
     provider_state = {"value": ResolvedTargetWindows(tuple(windows))}
@@ -2020,12 +2385,13 @@ def test_scoped_source_subset_without_failure_keeps_source_generation():
     result = fixture.controller.reconnect()
 
     assert result.details["all_connected"] is False
-    assert result.details["source_missing_windows"] == 1
-    assert fixture.controller._source_state_generation == generation_before
+    assert result.details["source_missing_windows"] == 2
+    assert fixture.controller._source_state_generation > generation_before
     assert fixture.controller.role_screen_states() == {
-        windows[0].launch_fingerprint: ReconnectScreenState.CONNECTED,
+        windows[0].launch_fingerprint: ReconnectScreenState.UNKNOWN,
         missing: ReconnectScreenState.UNKNOWN,
     }
+    assert fixture.authorization.current_authorization() is None
 
 
 def test_source_subset_final_publish_removes_late_connected_evidence(
@@ -2071,7 +2437,7 @@ def test_source_subset_final_publish_removes_late_connected_evidence(
     result = fixture.controller.reconnect()
 
     assert result.details["all_connected"] is False
-    assert result.details["source_missing_windows"] == 1
+    assert result.details["source_missing_windows"] == 2
     assert missing not in fixture.controller._trusted_connected_evidence
     assert fixture.controller.role_screen_states()[missing] == (
         ReconnectScreenState.UNKNOWN
@@ -2215,7 +2581,7 @@ def test_global_empty_source_revokes_missing_connected_evidence():
     assert fixture.capture.calls == [window.handle]
 
 
-def test_global_source_subset_revokes_only_missing_connected_evidence():
+def test_global_source_subset_revokes_complete_connected_batch():
     windows = [make_window(1), make_window(2)]
     provider_state = {"value": ResolvedTargetWindows(tuple(windows))}
     fixture = make_controller(
@@ -2232,18 +2598,15 @@ def test_global_source_subset_revokes_only_missing_connected_evidence():
     result = fixture.controller.reconnect()
 
     assert connected.code == "reconnect.connected"
-    assert result.details["source_missing_windows"] == 1
+    assert result.details["source_missing_windows"] == 2
     assert fixture.controller.role_screen_states() == {
-        windows[0].launch_fingerprint: ReconnectScreenState.CONNECTED,
+        windows[0].launch_fingerprint: ReconnectScreenState.UNKNOWN,
         windows[1].launch_fingerprint: ReconnectScreenState.UNKNOWN,
     }
-    assert set(fixture.controller._trusted_connected_evidence) == {
-        windows[0].launch_fingerprint,
-    }
+    assert fixture.controller._trusted_connected_evidence == {}
     assert fixture.controller._source_state_generation > generation_before
-    assert fixture.capture.calls == [window.handle for window in windows] + [
-        windows[0].handle,
-    ]
+    assert fixture.capture.calls == [window.handle for window in windows]
+    assert fixture.authorization.current_authorization() is None
 
 
 def test_global_source_revocation_rejects_late_passive_connected_state(
@@ -2454,8 +2817,11 @@ def test_source_failure_blocks_final_click_for_a_selected_group():
     assert result.success is False
     assert result.code == "reconnect.waiting"
     assert result.details["clicked_windows"] == 0
-    assert "unidentified_candidate_window" in result.details["failure_codes"]
+    assert result.details["failure_codes"] == [
+        "authorization_batch_unavailable"
+    ]
     assert fixture.mouse.clicks == []
+    assert fixture.authorization.current_authorization() is None
     assert windows[0].launch_fingerprint not in (
         fixture.controller._action_confirmations
     )
@@ -2468,7 +2834,9 @@ def test_unscoped_incomplete_window_set_still_fails_before_capture():
     result = fixture.controller.reconnect()
 
     assert result.success is False
-    assert "window_count_mismatch" in result.details["failure_codes"]
+    assert result.details["failure_codes"] == [
+        "authorization_batch_unavailable"
+    ]
     assert fixture.capture.calls == []
     assert fixture.mouse.clicks == []
 
@@ -2750,9 +3118,8 @@ def test_candidate_importance_without_registered_identity_is_not_authority():
     assert mouse.clicks == []
 
 
-def test_global_reconnect_uses_the_saved_main_role_for_a_highest_level_tie():
+def test_global_reconnect_uses_the_authorized_main_role_for_a_level_tie():
     window = make_window(1)
-    capture = FakeCaptureProvider({window.handle: 5})
     mouse = FakeMouseBackend()
     candidates = (
         CharacterSelectionCandidate(
@@ -2783,15 +3150,12 @@ def test_global_reconnect_uses_the_saved_main_role_for_a_highest_level_tie():
                 character_candidates=candidates,
             )
 
-    controller = WindowsSmartReconnectController(
+    fixture = make_controller(
+        [5],
+        windows=[window],
         expected_windows=14,
-        title_keywords=("Adobe Flash Player",),
-        window_backend=FakeWindowBackend([window]),
-        capture_provider=capture,
         recognizer=TiedLevelRecognizer(),
-        mouse_backend=mouse,
-        execution_enabled=True,
-        primary_capture_is_trusted=True,
+        mouse=mouse,
         require_expected_window_count=False,
         registered_role_provider=lambda: (
             RegisteredReconnectRole(
@@ -2803,7 +3167,18 @@ def test_global_reconnect_uses_the_saved_main_role_for_a_highest_level_tie():
                 CharacterImportance.PRIMARY,
             ),
         ),
+        authorization_target_identities={
+            window.launch_fingerprint: _stable_target_identity(
+                window,
+                character_id="main-character",
+                role_aliases=("角色甲",),
+                importance=CharacterImportance.PRIMARY,
+                slot_index=1,
+                line_number=1,
+            )
+        },
     )
+    controller = fixture.controller
     controller._pending_reconnect_fingerprints.add(window.launch_fingerprint)
 
     controller.reconnect()
@@ -2960,16 +3335,17 @@ def test_battle_disconnect_without_unique_target_retries_short_and_zero_input():
         [2, 1],
         battle_markers={2},
         battle_restarter=restarter,
+        authorization_missing_last_target=True,
     )
 
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
     assert result.success is False
-    assert "battle_restart_identity_unresolved" in result.details["failure_codes"]
+    assert "authorization_batch_unavailable" in result.details["failure_codes"]
     assert result.details["restarted_windows"] == 0
     assert result.details["clicked_windows"] == 0
-    assert result.details["next_check_seconds"] == 2
+    assert result.details["next_check_seconds"] == 60
     assert fixture.mouse.clicks == []
     assert restarter.calls == []
 
@@ -3023,69 +3399,28 @@ def test_unknown_battle_identity_uses_group_unknown_status():
         battle_markers={2},
         battle_restarter=FakeBattleRestarter(),
         failure_status_service=statuses,
+        authorization_missing_last_target=True,
     )
 
     fixture.controller.reconnect()
     fixture.controller.reconnect()
 
-    assert statuses.messages() == (
-        "目前組別中的未知角色－重連失敗",
-    )
+    assert statuses.messages() == ()
 
 
-def test_missing_reopen_retries_immediately_without_touching_other_roles(
-    tmp_path,
-):
-    now = [0.0]
-    windows = [make_window(1), make_window(2)]
-    plan = GroupLaunchPlan(
-        "120",
-        targets=(
-            GroupLaunchTarget(
-                1,
-                "120古",
-                tmp_path / "first.lnk",
-                windows[0].launch_fingerprint,
-            ),
-            GroupLaunchTarget(
-                2,
-                "120靈",
-                tmp_path / "second.lnk",
-                windows[1].launch_fingerprint,
-            ),
-        ),
-    )
-    restarter = FakeBattleRestarter()
-    fixture = make_controller(
-        [2, 1],
-        windows=windows,
-        clock=lambda: now[0],
-        battle_markers={2},
-        battle_restarter=restarter,
-        group_launch_plan=plan,
-        failure_status_service=ReconnectFailureStatusService(),
-    )
+def test_bound_missing_reopen_opens_once_then_requires_full_reprepare(tmp_path):
+    fixture, windows, restarter = make_bound_pending_reopen_fixture(tmp_path)
 
-    fixture.controller.reconnect()
-    now[0] = 5.0
-    first = fixture.controller.reconnect()
-    assert first.details["restarted_windows"] == 1
-    fixture.controller._window_backend.windows = [windows[1]]
+    reopened = fixture.controller.reconnect()
+    after_old_batch_was_revoked = fixture.controller.reconnect()
 
-    now[0] = 6.0
-    before = fixture.controller.reconnect()
-    now[0] = 7.0
-    retry = fixture.controller.reconnect()
-    now[0] = 8.0
-    no_duplicate = fixture.controller.reconnect()
-    now[0] = 9.0
-    next_retry = fixture.controller.reconnect()
-
-    assert before.details["restarted_windows"] == 0
-    assert retry.details["restarted_windows"] == 1
-    assert no_duplicate.details["restarted_windows"] == 0
-    assert next_retry.details["restarted_windows"] == 1
-    assert len(restarter.reopen_calls) == 2
+    assert reopened.details["restarted_windows"] == 1
+    assert len(restarter.reopen_calls) == 1
+    assert restarter.reopen_calls[0][1] == (windows[1],)
+    assert fixture.authorization.current_authorization() is None
+    assert after_old_batch_was_revoked.details["restarted_windows"] == 0
+    assert after_old_batch_was_revoked.details["clicked_windows"] == 0
+    assert len(restarter.reopen_calls) == 1
 
 
 def test_failed_battle_restart_is_attempted_once_until_new_disconnect_event(
@@ -3294,16 +3629,22 @@ def test_known_role_failure_restarts_without_status_service(tmp_path):
 def test_target_provider_failure_blocks_direct_role_restart(tmp_path):
     window = make_window(1)
     restarter = FakeBattleRestarter()
+    source_failed = [False]
+
+    def target_windows():
+        if source_failed[0]:
+            raise RuntimeError("target source failed")
+        return (window,)
+
     fixture = make_controller(
         [1],
         windows=[window],
         expected_windows=1,
         battle_restarter=restarter,
         group_launch_plan=make_group_plan(tmp_path, [window], "120"),
-        target_windows_provider=lambda: (_ for _ in ()).throw(
-            RuntimeError("target source failed")
-        ),
+        target_windows_provider=target_windows,
     )
+    source_failed[0] = True
 
     fixture.controller._report_reconnect_failure(window.launch_fingerprint)
 
@@ -3314,20 +3655,26 @@ def test_target_provider_failure_blocks_direct_role_restart(tmp_path):
 def test_target_provider_failure_blocks_pending_role_reopen(tmp_path):
     window = make_window(1)
     restarter = FakeBattleRestarter()
+    source_failed = [False]
+
+    def target_windows():
+        if source_failed[0]:
+            raise RuntimeError("target source failed")
+        return (window,)
+
     fixture = make_controller(
         [1],
         windows=[window],
         expected_windows=1,
         battle_restarter=restarter,
         group_launch_plan=make_group_plan(tmp_path, [window], "120"),
-        target_windows_provider=lambda: (_ for _ in ()).throw(
-            RuntimeError("target source failed")
-        ),
+        target_windows_provider=target_windows,
     )
     fixture.controller._pending_reopen_fingerprints.add(
         window.launch_fingerprint
     )
     fixture.controller._reopen_retry_after[window.launch_fingerprint] = 0.0
+    source_failed[0] = True
 
     result = fixture.controller.reconnect()
 
@@ -3439,15 +3786,14 @@ def test_confirm_keeps_disconnect_wait_then_advances_on_new_states():
     assert before_force.details["clicked_windows"] == 0
     assert force.details["clicked_windows"] == 1
     assert before_followup.details["clicked_windows"] == 0
-    assert followup.details["clicked_windows"] == 1
+    assert followup.details["clicked_windows"] == 0
     assert fixture.mouse.clicks == [
         (1, (0.5, 0.5)),
         (1, (0.505, 0.856)),
-        (1, (0.5, 0.327)),
     ]
 
 
-def test_same_group_disconnect_context_and_pause_survive_restart(tmp_path):
+def test_same_group_restart_does_not_restore_old_input_authority(tmp_path):
     state_path = tmp_path / "smart_reconnect_state.json"
     now = [1000.0]
     windows = [make_window(1), make_window(2)]
@@ -3482,7 +3828,7 @@ def test_same_group_disconnect_context_and_pause_survive_restart(tmp_path):
 
     assert before_deadline.details["state_counts"] == {
         "connected": 1,
-        "force_login_start": 1,
+        "login_start": 1,
     }
     assert before_deadline.details["clicked_windows"] == 0
     assert second.mouse.clicks == []
@@ -3490,8 +3836,8 @@ def test_same_group_disconnect_context_and_pause_survive_restart(tmp_path):
     now[0] = 1015.0
     after_deadline = second.controller.reconnect()
 
-    assert after_deadline.details["clicked_windows"] == 1
-    assert second.mouse.clicks == [(1, (0.505, 0.856))]
+    assert after_deadline.details["clicked_windows"] == 0
+    assert second.mouse.clicks == []
 
 
 @pytest.mark.parametrize("legacy_version", range(1, 6))
@@ -3533,14 +3879,18 @@ def test_legacy_reconnect_authority_is_cleared_before_controller_can_act(
     assert fixture.mouse.clicks == []
     migrated = json.loads(state_path.read_text(encoding="utf-8"))
     assert migrated["version"] == ReconnectRuntimeStateStore.VERSION
-    assert migrated["scope_token"] is None
+    assert isinstance(migrated["scope_token"], str)
+    assert len(migrated["scope_token"]) == 64
+    assert migrated["scope_token"] != "a" * 64
     assert migrated["pending_fingerprints"] == []
     assert migrated["active_fingerprints"] == []
     assert migrated["flow_pause_until"] == {}
     assert fingerprint not in state_path.read_text(encoding="utf-8")
 
 
-def test_timeout_flow_pause_survives_controller_restart(tmp_path):
+def test_timeout_flow_pause_does_not_restore_input_authority_after_restart(
+    tmp_path,
+):
     state_path = tmp_path / "smart_reconnect_state.json"
     now = [1000.0]
     windows = [make_window(1), make_window(2)]
@@ -3583,11 +3933,13 @@ def test_timeout_flow_pause_survives_controller_restart(tmp_path):
     after_deadline = second.controller.reconnect()
 
     assert before_deadline.details["clicked_windows"] == 0
-    assert after_deadline.details["clicked_windows"] == 1
-    assert second.mouse.clicks == [(1, (0.505, 0.856))]
+    assert after_deadline.details["clicked_windows"] == 0
+    assert second.mouse.clicks == []
 
 
-def test_popup_automation_context_survives_controller_restart(tmp_path):
+def test_popup_automation_context_does_not_restore_authority_after_restart(
+    tmp_path,
+):
     state_path = tmp_path / "smart_reconnect_state.json"
     now = [1000.0]
     windows = [make_window(1), make_window(2)]
@@ -3618,8 +3970,9 @@ def test_popup_automation_context_survives_controller_restart(tmp_path):
     second.controller.reconnect()
     result = second.controller.reconnect()
 
-    assert result.code == "reconnect.progressed"
-    assert second.mouse.clicks == [(1, (0.86, 0.12))]
+    assert result.code == "reconnect.waiting"
+    assert result.details["clicked_windows"] == 0
+    assert second.mouse.clicks == []
 
 
 def test_connected_screen_revokes_popup_and_manual_login_authorization(tmp_path):
@@ -3876,7 +4229,6 @@ def test_stable_force_login_rechecks_every_final_authority(authority_change):
 def test_disconnected_flow_restores_game_with_login_and_character_selection():
     now = [0.0]
     windows = [make_window(1), make_window(2)]
-    capture = FakeCaptureProvider({1: 2, 2: 1})
     mouse = FakeMouseBackend()
 
     class DisconnectFlowRecognizer:
@@ -3933,23 +4285,40 @@ def test_disconnected_flow_restores_game_with_login_and_character_selection():
             )
 
     recognizer = DisconnectFlowRecognizer()
-    controller = WindowsSmartReconnectController(
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
         expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
-        window_backend=FakeWindowBackend(windows),
-        capture_provider=capture,
-        primary_capture_is_trusted=True,
         recognizer=recognizer,
-        mouse_backend=mouse,
-        execution_enabled=True,
-        monotonic_clock=lambda: now[0],
+        mouse=mouse,
+        clock=lambda: now[0],
         registered_role_provider=lambda: (
             RegisteredReconnectRole(
                 "160帥",
                 CharacterImportance.PRIMARY,
             ),
         ),
+        authorization_target_identities={
+            windows[0].launch_fingerprint: _stable_target_identity(
+                windows[0],
+                character_id="primary-character",
+                role_aliases=("160帥",),
+                importance=CharacterImportance.PRIMARY,
+                slot_index=2,
+                line_number=1,
+            ),
+            windows[1].launch_fingerprint: _stable_target_identity(
+                windows[1],
+                character_id="secondary-character",
+                role_aliases=("secondary-role",),
+                importance=CharacterImportance.SECONDARY,
+                slot_index=0,
+                line_number=1,
+            ),
+        },
     )
+    controller = fixture.controller
+    capture = fixture.capture
 
     # First frame of disconnected.
     controller.reconnect()
@@ -3988,7 +4357,7 @@ def test_disconnected_flow_restores_game_with_login_and_character_selection():
 
     # Simulate three fresh connected frames and confirm auto-reconnection end.
     complete_with_fresh_connected_frames(
-        Fixture(controller=controller, capture=capture, mouse=mouse),
+        fixture,
         now=now,
     )
     finish = controller.reconnect()
@@ -4001,7 +4370,6 @@ def test_disconnected_flow_restores_game_with_login_and_character_selection():
 
 def test_character_selection_confirms_exact_role_before_entering_game(tmp_path):
     windows = [make_window(1), make_window(2)]
-    capture = FakeCaptureProvider({1: 5, 2: 1})
     mouse = FakeMouseBackend()
     now = [0.0]
 
@@ -4030,39 +4398,51 @@ def test_character_selection_confirms_exact_role_before_entering_game(tmp_path):
                 character_slot_index=2,
                 character_slot_selected=self.selected,
                 character_identity="160主",
+                character_candidates=(
+                    CharacterSelectionCandidate(
+                        160,
+                        CharacterImportance.PRIMARY,
+                        2,
+                        self.selected,
+                        (
+                            CHARACTER_ENTER_CLICK_POINT
+                            if self.selected
+                            else (0.651, 0.706)
+                        ),
+                        digit_count=3,
+                        identity="160主",
+                    ),
+                ),
             )
 
     recognizer = CharacterSequenceRecognizer()
-    controller = WindowsSmartReconnectController(
+    fixture = make_controller(
+        [5, 1],
+        windows=windows,
         expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
-        window_backend=FakeWindowBackend(windows),
-        capture_provider=capture,
-        primary_capture_is_trusted=True,
         recognizer=recognizer,
-        mouse_backend=mouse,
-        execution_enabled=True,
-        monotonic_clock=lambda: now[0],
-    )
-    controller.set_group_launch_plan(
-        GroupLaunchPlan(
-            "160",
-            targets=(
-                GroupLaunchTarget(
-                    1,
-                    "160主",
-                    tmp_path / "160.lnk",
-                    windows[0].launch_fingerprint,
-                ),
-                GroupLaunchTarget(
-                    2,
-                    "160副",
-                    tmp_path / "160-2.lnk",
-                    windows[1].launch_fingerprint,
-                ),
+        mouse=mouse,
+        clock=lambda: now[0],
+        authorization_target_identities={
+            windows[0].launch_fingerprint: _stable_target_identity(
+                windows[0],
+                character_id="primary-character",
+                role_aliases=("160主",),
+                importance=CharacterImportance.PRIMARY,
+                slot_index=2,
+                line_number=1,
             ),
-        )
+            windows[1].launch_fingerprint: _stable_target_identity(
+                windows[1],
+                character_id="secondary-character",
+                role_aliases=("副角色二",),
+                importance=CharacterImportance.SECONDARY,
+                slot_index=0,
+                line_number=1,
+            ),
+        },
     )
+    controller = fixture.controller
     controller._pending_reconnect_fingerprints.add(
         windows[0].launch_fingerprint
     )
@@ -4205,7 +4585,7 @@ def test_activation_snapshot_rejects_empty_and_all_incomplete_windows():
     empty.controller.set_execution_enabled(False)
     empty.controller._window_backend.windows = []
     assert empty.controller.prepare_execution_snapshot().code == (
-        "reconnect.snapshot_empty"
+        "reconnect.snapshot_identity_unsafe"
     )
 
     fingerprint = "a" * 64
@@ -4218,9 +4598,10 @@ def test_activation_snapshot_rejects_empty_and_all_incomplete_windows():
     )
     duplicate.controller.set_execution_enabled(False)
     duplicate_result = duplicate.controller.prepare_execution_snapshot()
-    assert duplicate_result.success is True
-    assert duplicate_result.details["window_count"] == 2
-    assert len(duplicate.controller._allowed_fingerprints) == 2
+    assert duplicate_result.success is False
+    assert duplicate_result.details["failure_codes"] == [
+        "authorization_batch_unavailable"
+    ]
 
     incomplete = make_controller(
         [1],
@@ -4233,7 +4614,7 @@ def test_activation_snapshot_rejects_empty_and_all_incomplete_windows():
     )
 
 
-def test_activation_snapshot_isolates_one_incomplete_shared_executable_window():
+def test_activation_snapshot_rejects_one_incomplete_member_of_shared_batch():
     now = [0.0]
     shared_fingerprint = "e" * 64
     windows = [
@@ -4254,13 +4635,13 @@ def test_activation_snapshot_isolates_one_incomplete_shared_executable_window():
     now[0] = 5.0
     result = fixture.controller.reconnect()
 
-    assert prepared.success is True
-    assert prepared.details["window_count"] == 14
-    assert prepared.details["isolated_window_count"] == 1
-    assert len(fixture.controller._allowed_fingerprints) == 14
-    assert 15 not in fixture.capture.calls
-    assert result.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
+    assert prepared.success is False
+    assert prepared.details["failure_codes"] == [
+        "authorization_batch_unavailable"
+    ]
+    assert result.details["clicked_windows"] == 0
+    assert fixture.capture.calls == []
+    assert fixture.mouse.clicks == []
 
 
 def test_activation_snapshot_authorizes_known_login_only_after_two_frames():
@@ -4280,7 +4661,7 @@ def test_activation_snapshot_authorizes_known_login_only_after_two_frames():
 @pytest.mark.parametrize(
     ("marker", "expected_point"),
     (
-        (4, (0.5, 0.327)),
+        (4, None),
         (6, (0.86, 0.12)),
     ),
 )
@@ -4294,8 +4675,12 @@ def test_activation_snapshot_authorizes_known_initial_flow_screens(
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert result.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(1, expected_point)]
+    if expected_point is None:
+        assert result.details["clicked_windows"] == 0
+        assert fixture.mouse.clicks == []
+    else:
+        assert result.details["clicked_windows"] == 1
+        assert fixture.mouse.clicks == [(1, expected_point)]
 
 
 def test_activation_snapshot_unknown_and_single_login_frame_never_click():
@@ -4400,7 +4785,7 @@ def test_snapshot_replacement_requires_existing_reconnect_session():
     assert accepted.details["discovered_windows"] == 1
 
 
-def test_snapshot_ignores_new_same_executable_window_without_blocking_original():
+def test_snapshot_duplicate_source_identity_revokes_the_complete_batch():
     fingerprint = "a" * 64
     original = make_window(1, fingerprint=fingerprint)
     collision = make_window(2, fingerprint=fingerprint)
@@ -4416,10 +4801,11 @@ def test_snapshot_ignores_new_same_executable_window_without_blocking_original()
 
     result = fixture.controller.reconnect()
 
-    assert result.details["discovered_windows"] == 1
-    assert result.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(original.handle, (0.505, 0.856))]
-    assert all(handle != collision.handle for handle, _point in fixture.mouse.clicks)
+    assert result.details["discovered_windows"] == 0
+    assert result.details["clicked_windows"] == 0
+    assert "snapshot_identity_collision" in result.details["failure_codes"]
+    assert fixture.mouse.clicks == []
+    assert fixture.authorization.current_authorization() is None
 
 
 def test_stop_revokes_snapshot_and_initial_login_authorization():
@@ -4437,7 +4823,7 @@ def test_stop_revokes_snapshot_and_initial_login_authorization():
     assert fixture.mouse.clicks == []
 
 
-def test_snapshot_battle_without_unique_ungrouped_shortcut_never_restarts(tmp_path):
+def test_snapshot_battle_with_sealed_group_target_restarts_that_target(tmp_path):
     window = make_window(1, fingerprint="a" * 64)
     restarter = FakeBattleRestarter()
     fixture = make_controller(
@@ -4453,11 +4839,11 @@ def test_snapshot_battle_without_unique_ungrouped_shortcut_never_restarts(tmp_pa
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert "battle_restart_identity_unresolved" in result.details[
-        "failure_codes"
-    ]
-    assert result.details["restarted_windows"] == 0
-    assert restarter.calls == []
+    assert result.details["failure_codes"] == []
+    assert result.details["restarted_windows"] == 1
+    assert len(restarter.calls) == 1
+    assert restarter.calls[0][0].handle == window.handle
+    assert restarter.calls[0][1].fingerprint == window.launch_fingerprint
     assert restarter.reopen_calls == []
 
 
@@ -4534,6 +4920,7 @@ def test_recent_line_target_change_requires_two_new_matching_frames():
     fixture = make_controller(
         [4, 1],
         recognizer=MutableRecentLineRecognizer(),
+        authorization_original_line_number=8,
     )
     fingerprint = make_window(1).launch_fingerprint
     fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
@@ -4572,10 +4959,45 @@ def test_real_obscured_provider_is_used_only_by_active_reconnect(
     monkeypatch,
 ):
     window = make_window(1)
+    coordinator = SmartReconnectAuthorizationCoordinator()
+    target = ReconnectAuthorizationTarget(
+        fingerprint=window.launch_fingerprint,
+        instance=WindowInstanceToken.from_window(window),
+        character_id="capture-character",
+        role_aliases=("capture-role",),
+        importance=CharacterImportance.PRIMARY,
+        original_slot_index=0,
+        original_line_number=1,
+        shortcut_seal=ShortcutSeal(
+            file_identity=ShortcutFileIdentity(
+                normalized_path=str(
+                    Path.cwd() / ".pytest-shortcuts" / "capture.lnk"
+                ),
+                volume_serial_number=1,
+                file_index=1,
+            ),
+            content_sha256="1" * 64,
+            launch_fingerprint=window.launch_fingerprint,
+        ),
+    )
+    preparation = FakeAuthorizationPreparation(
+        coordinator,
+        ReconnectSourceIdentity(
+            identity_generation=1,
+            config_revision=1,
+            group_id="capture-group",
+            group_name="capture-group",
+            character_ids=("capture-character",),
+        ),
+        (target,),
+    )
     controller = WindowsSmartReconnectController.for_real_windows(
         reference_dir=Path("assets") / "reconnect_reference",
         expected_windows=1,
         window_backend=ObscuredWindowBackend([window]),
+        authorization_coordinator=coordinator,
+        preparation_service=preparation,
+        auto_battle_enabled=False,
     )
     visible = FakeCaptureProvider({window.handle: None})
     obscured = FakeCaptureProvider({window.handle: 1})
@@ -4613,6 +5035,7 @@ def test_real_obscured_provider_is_used_only_by_active_reconnect(
     }
     assert obscured.calls == []
 
+    assert controller.prepare_execution_snapshot().success is True
     controller.set_execution_enabled(True)
     result = controller.reconnect()
 
@@ -4673,6 +5096,7 @@ def test_saved_line_history_never_overrides_current_recent_line(
         [4, 1],
         state_path=state_path,
         recognizer=RecentLineEightRecognizer(),
+        authorization_original_line_number=8,
     )
     fingerprint = make_window(1).launch_fingerprint
     fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
@@ -4698,16 +5122,15 @@ def test_fresh_visible_capture_wins_without_running_stale_primary_capture():
             255: ReconnectScreenState.UNKNOWN,
         }
     )
-    controller = WindowsSmartReconnectController(
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
         expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
-        window_backend=FakeWindowBackend(windows),
-        capture_provider=primary,
+        primary_capture_provider=primary,
         visible_capture_provider=visible,
         recognizer=recognizer,
-        mouse_backend=FakeMouseBackend(),
-        execution_enabled=True,
     )
+    controller = fixture.controller
 
     result = controller.reconnect()
 
@@ -4735,16 +5158,16 @@ def test_visible_unknown_fails_closed_instead_of_using_stale_disconnect():
         points={2: (0.5, 0.5)},
     )
     mouse = FakeMouseBackend()
-    controller = WindowsSmartReconnectController(
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
         expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
-        window_backend=FakeWindowBackend(windows),
-        capture_provider=primary,
+        primary_capture_provider=primary,
         visible_capture_provider=visible,
         recognizer=recognizer,
-        mouse_backend=mouse,
-        execution_enabled=True,
+        mouse=mouse,
     )
+    controller = fixture.controller
 
     controller.reconnect()
     result = controller.reconnect()
@@ -4772,17 +5195,18 @@ def test_obscured_window_never_trusts_stale_background_disconnect():
         points={2: (0.5, 0.5)},
     )
     mouse = FakeMouseBackend()
-    controller = WindowsSmartReconnectController(
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
         expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
         window_backend=ObscuredWindowBackend(windows),
-        capture_provider=primary,
+        primary_capture_provider=primary,
         visible_capture_provider=visible,
         active_refresh_capture_provider=active_refresh,
         recognizer=recognizer,
-        mouse_backend=mouse,
-        execution_enabled=True,
+        mouse=mouse,
     )
+    controller = fixture.controller
 
     controller.reconnect()
     result = controller.reconnect()
@@ -5393,9 +5817,12 @@ def test_force_login_timeout_rearms_only_after_leave_or_new_window_session():
     now[0] = 30.0
     fixture.controller.reconnect()
     now[0] = 35.0
+    rebound_first_frame = fixture.controller.reconnect()
+    now[0] = 40.0
     replacement_event = fixture.controller.reconnect()
 
     assert second_event.details["clicked_windows"] == 1
+    assert rebound_first_frame.details["clicked_windows"] == 0
     assert replacement_event.details["clicked_windows"] == 1
     assert fixture.mouse.clicks == [
         (original.handle, (0.5, 0.57)),
@@ -5441,7 +5868,9 @@ def test_group_identity_failure_aborts_before_capture_or_click():
     assert result.code == "reconnect.waiting"
     assert fixture.capture.calls == []
     assert fixture.mouse.clicks == []
-    assert "fingerprint_missing_or_duplicate" in result.details["failure_codes"]
+    assert result.details["failure_codes"] == [
+        "authorization_batch_unavailable"
+    ]
     assert result.details["validated_windows"] == 0
 
 
@@ -5576,35 +6005,49 @@ def test_known_shortcut_role_selects_its_unique_level_instead_of_leftmost(
                 character_candidates=candidates,
             )
 
-    controller = WindowsSmartReconnectController(
-        expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
-        window_backend=FakeWindowBackend(windows),
-        capture_provider=capture,
-        primary_capture_is_trusted=True,
-        recognizer=CandidateRecognizer(),
-        mouse_backend=mouse,
-        execution_enabled=True,
-    )
-    controller.set_group_launch_plan(
-        GroupLaunchPlan(
-            "混合",
-            targets=(
-                GroupLaunchTarget(
-                    1,
-                    "120古",
-                    tmp_path / "120古.lnk",
-                    windows[0].launch_fingerprint,
-                ),
-                GroupLaunchTarget(
-                    2,
-                    "160靈",
-                    tmp_path / "160靈.lnk",
-                    windows[1].launch_fingerprint,
-                ),
+    plan = GroupLaunchPlan(
+        "混合",
+        targets=(
+            GroupLaunchTarget(
+                1,
+                "120古",
+                tmp_path / "120古.lnk",
+                windows[0].launch_fingerprint,
             ),
-        )
+            GroupLaunchTarget(
+                2,
+                "160靈",
+                tmp_path / "160靈.lnk",
+                windows[1].launch_fingerprint,
+            ),
+        ),
     )
+    fixture = make_controller(
+        [5, 1],
+        windows=windows,
+        expected_windows=2,
+        primary_capture_provider=capture,
+        recognizer=CandidateRecognizer(),
+        mouse=mouse,
+        group_launch_plan=plan,
+        authorization_target_identities={
+            windows[0].launch_fingerprint: _stable_target_identity(
+                windows[0],
+                character_id="character-120",
+                role_aliases=("120古",),
+                importance=CharacterImportance.PRIMARY,
+                slot_index=1,
+            ),
+            windows[1].launch_fingerprint: _stable_target_identity(
+                windows[1],
+                character_id="character-160",
+                role_aliases=("160靈",),
+                importance=CharacterImportance.SECONDARY,
+                slot_index=2,
+            ),
+        },
+    )
+    controller = fixture.controller
     controller._pending_reconnect_fingerprints.add(
         windows[0].launch_fingerprint
     )
@@ -5616,7 +6059,7 @@ def test_known_shortcut_role_selects_its_unique_level_instead_of_leftmost(
     assert mouse.clicks == [(1, (0.500, 0.706))]
 
 
-def test_user_reported_selection_requires_registered_role_and_retains_match(
+def test_unprepared_user_reported_selection_never_restores_input_authority(
     tmp_path,
 ):
     windows = [make_window(1), make_window(2)]
@@ -5748,8 +6191,8 @@ def test_user_reported_selection_requires_registered_role_and_retains_match(
     right.reconnect()
     right_result = right.reconnect()
 
-    assert right_result.details["clicked_windows"] == 1
-    assert right_mouse.clicks == [(1, (0.353, 0.854))]
+    assert right_result.details["clicked_windows"] == 0
+    assert right_mouse.clicks == []
 
 
 def test_duplicate_target_level_never_guesses_a_character_slot(tmp_path):
@@ -6102,21 +6545,13 @@ def test_capture_settings_change_revokes_pending_reopen(
     tmp_path,
     monkeypatch,
 ):
-    windows = [make_window(1), make_window(2)]
-    restarter = FakeBattleRestarter()
-    fixture = make_controller(
-        [1],
-        windows=[windows[1]],
-        expected_windows=2,
-        battle_restarter=restarter,
-        group_launch_plan=make_group_plan(tmp_path, windows, "120"),
-    )
+    fixture, windows, restarter = make_bound_pending_reopen_fixture(tmp_path)
     fingerprint = windows[0].launch_fingerprint
-    fixture.controller._pending_reopen_fingerprints.add(fingerprint)
-    fixture.controller._reopen_retry_after[fingerprint] = 0.0
     changed = [False]
 
-    def change_settings_before_reopen():
+    original_backend_call = fixture.controller._run_authorized_backend_call
+
+    def change_settings_before_reopen(callback, **kwargs):
         if not changed[0]:
             changed[0] = True
             fixture.controller.set_capture_settings(
@@ -6126,24 +6561,24 @@ def test_capture_settings_change_revokes_pending_reopen(
                     minimized=False,
                 )
             )
-        return True
+        return original_backend_call(callback, **kwargs)
 
     monkeypatch.setattr(
         fixture.controller,
-        "_execution_allowed",
+        "_run_authorized_backend_call",
         change_settings_before_reopen,
     )
 
     result = fixture.controller.reconnect()
 
+    assert changed == [True]
     assert result.details["restarted_windows"] == 0
     assert restarter.reopen_calls == []
     assert fingerprint not in fixture.controller._pending_reopen_fingerprints
-    assert fingerprint not in fixture.controller._reopen_retry_after
-    assert fingerprint not in fixture.controller.reconnecting_fingerprints()
+    assert fixture.controller._pending_reopen_authorizations == {}
 
 
-def test_temporarily_missing_role_clears_only_its_first_frame_confirmation():
+def test_temporarily_missing_role_revokes_the_complete_batch_confirmation():
     windows = [make_window(1), make_window(2)]
     fixture = make_controller([2, 1], windows=windows)
     fixture.controller.set_allowed_fingerprints(
@@ -6156,7 +6591,9 @@ def test_temporarily_missing_role_clears_only_its_first_frame_confirmation():
     missing = fixture.controller.reconnect()
     assert missing.code == "reconnect.waiting"
     assert missing.details["all_connected"] is False
-    assert missing.details["source_missing_windows"] == 1
+    assert missing.details["source_missing_windows"] == 2
+    assert fixture.authorization.current_authorization() is None
+    assert fixture.controller._action_confirmations == {}
     fixture.controller._window_backend.windows = windows
     restored = fixture.controller.reconnect()
 
@@ -6167,7 +6604,7 @@ def test_temporarily_missing_role_clears_only_its_first_frame_confirmation():
     assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
 
 
-def test_temporarily_missing_role_keeps_its_transition_wait_deadline():
+def test_temporarily_missing_role_revokes_its_old_transition_wait_deadline():
     windows = [make_window(1), make_window(2)]
     current_time = [0.0]
     fixture = make_controller(
@@ -6183,18 +6620,21 @@ def test_temporarily_missing_role_keeps_its_transition_wait_deadline():
     current_time[0] = 2.0
     fixture.controller.reconnect()
 
-    assert fixture.controller._flow_pause_until[fingerprint] == 10.0
+    assert fingerprint not in fixture.controller._flow_pause_until
+    assert fixture.authorization.current_authorization() is None
 
     fixture.controller._window_backend.windows = windows
     current_time[0] = 5.0
+    prepared = activate_current_window_snapshot(fixture)
+    assert prepared.success is True
     assert fixture.controller._action_wait_seconds(
         fingerprint,
         ReconnectScreenState.LOGIN_START,
         current_time[0],
-    ) == 5
+    ) == 0
 
 
-def test_failed_missing_role_reopen_blocks_open_disconnected_role_action(
+def test_unprepared_missing_role_blocks_open_disconnected_role_action(
     tmp_path,
 ):
     windows = [make_window(1), make_window(2)]
@@ -6234,8 +6674,8 @@ def test_failed_missing_role_reopen_blocks_open_disconnected_role_action(
     assert first.code == "reconnect.waiting"
     assert result.success is False
     assert result.code == "reconnect.waiting"
-    assert "battle_restart_failed" in result.details["failure_codes"]
-    assert fixture.capture.calls == [2, 2]
+    assert "authorization_batch_unavailable" in result.details["failure_codes"]
+    assert fixture.capture.calls == []
     assert fixture.mouse.clicks == []
     assert restarter.calls == []
 
@@ -6277,9 +6717,9 @@ def test_pending_missing_reopen_target_never_reports_all_connected(tmp_path):
     assert result.success is False
     assert result.code == "reconnect.waiting"
     assert result.details["all_connected"] is False
-    assert result.details["connected_windows"] == 1
-    assert result.details["next_check_seconds"] == 30
-    assert "reconnect_target_missing" in result.details["failure_codes"]
+    assert result.details["connected_windows"] == 0
+    assert result.details["next_check_seconds"] == 60
+    assert "authorization_batch_unavailable" in result.details["failure_codes"]
     assert fixture.mouse.clicks == []
 
 
@@ -6301,7 +6741,7 @@ def test_pending_reopen_keeps_incomplete_appeared_instance(tmp_path):
     result = fixture.controller.reconnect()
 
     assert result.code == "reconnect.waiting"
-    assert "window_instance_incomplete" in result.details["failure_codes"]
+    assert "authorization_batch_unavailable" in result.details["failure_codes"]
     assert missing in fixture.controller._pending_reopen_fingerprints
     assert fixture.controller._reopen_retry_after[missing] == 0.0
     assert restarter.reopen_calls == []
@@ -6327,7 +6767,7 @@ def test_pending_reopen_requires_unique_complete_instance_to_clear(tmp_path):
     result = fixture.controller.reconnect()
 
     assert result.code == "reconnect.waiting"
-    assert "window_instance_incomplete" in result.details["failure_codes"]
+    assert "authorization_batch_unavailable" in result.details["failure_codes"]
     assert missing in fixture.controller._pending_reopen_fingerprints
     assert fixture.controller._reopen_retry_after[missing] == 0.0
     assert restarter.reopen_calls == []
@@ -6354,7 +6794,7 @@ def test_pending_reopen_requires_non_duplicate_complete_instance_to_clear(
     result = fixture.controller.reconnect()
 
     assert result.code == "reconnect.waiting"
-    assert "fingerprint_missing_or_duplicate" in (
+    assert "authorization_batch_unavailable" in (
         result.details["failure_codes"]
     )
     assert missing in fixture.controller._pending_reopen_fingerprints
@@ -6405,7 +6845,7 @@ def test_duplicate_identity_never_triggers_missing_role_reopen(tmp_path):
     fixture.controller._report_reconnect_failure(blocked)
 
     assert result.code == "reconnect.waiting"
-    assert "battle_reopen_identity_unsafe" in result.details["failure_codes"]
+    assert "authorization_batch_unavailable" in result.details["failure_codes"]
     assert restarter.calls == []
     assert restarter.reopen_calls == []
     assert fixture.mouse.clicks == []
@@ -6461,10 +6901,9 @@ def test_switching_group_revokes_old_sessions_and_blocks_incomplete_new_group(
 
     assert first.code == "reconnect.waiting"
     assert result.code == "reconnect.waiting"
-    assert fixture.controller.reconnecting_fingerprints() == frozenset(
-        {second_group[0].launch_fingerprint}
-    )
-    assert fixture.capture.calls == [3, 3]
+    assert fixture.controller.reconnecting_fingerprints() == frozenset()
+    assert fixture.authorization.current_authorization() is None
+    assert fixture.capture.calls == []
     assert fixture.mouse.clicks == []
 
 
@@ -6830,12 +7269,12 @@ def test_click_preflight_rejects_reused_handle_with_different_process():
 
     capture = ReusingCapture({1: 2, 2: 1})
     mouse = FakeMouseBackend()
-    controller = WindowsSmartReconnectController(
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
         expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
         window_backend=backend,
-        capture_provider=capture,
-        primary_capture_is_trusted=True,
+        primary_capture_provider=capture,
         recognizer=FakeRecognizer(
             {
                 1: ReconnectScreenState.CONNECTED,
@@ -6843,10 +7282,10 @@ def test_click_preflight_rejects_reused_handle_with_different_process():
             },
             points={2: (0.5, 0.5)},
         ),
-        mouse_backend=mouse,
-        monotonic_clock=clock,
-        execution_enabled=True,
+        mouse=mouse,
+        clock=clock,
     )
+    controller = fixture.controller
 
     controller.reconnect()
     result = controller.reconnect()
@@ -6873,7 +7312,7 @@ def test_click_preflight_requires_complete_instance_token(window):
     result = fixture.controller.reconnect()
 
     assert result.details["clicked_windows"] == 0
-    assert "window_instance_incomplete" in (
+    assert "authorization_batch_unavailable" in (
         result.details["failure_codes"]
     )
     assert fixture.capture.calls == []
@@ -6905,12 +7344,12 @@ def test_click_delivery_rechecks_identity_after_fresh_recapture():
 
     capture = ReusingAfterFreshCapture({1: 2, 2: 1})
     mouse = FakeMouseBackend()
-    controller = WindowsSmartReconnectController(
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
         expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
         window_backend=backend,
-        capture_provider=capture,
-        primary_capture_is_trusted=True,
+        primary_capture_provider=capture,
         recognizer=FakeRecognizer(
             {
                 1: ReconnectScreenState.CONNECTED,
@@ -6918,10 +7357,10 @@ def test_click_delivery_rechecks_identity_after_fresh_recapture():
             },
             points={2: (0.5, 0.5)},
         ),
-        mouse_backend=mouse,
-        monotonic_clock=clock,
-        execution_enabled=True,
+        mouse=mouse,
+        clock=clock,
     )
+    controller = fixture.controller
 
     controller.reconnect()
     result = controller.reconnect()
@@ -6963,12 +7402,12 @@ def test_click_delivery_binds_fresh_recognition_to_full_instance_token(
 
     capture = RebuildingAfterFreshCapture({1: 2, 2: 1})
     mouse = FakeMouseBackend()
-    controller = WindowsSmartReconnectController(
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
         expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
         window_backend=backend,
-        capture_provider=capture,
-        primary_capture_is_trusted=True,
+        primary_capture_provider=capture,
         recognizer=FakeRecognizer(
             {
                 1: ReconnectScreenState.CONNECTED,
@@ -6976,10 +7415,10 @@ def test_click_delivery_binds_fresh_recognition_to_full_instance_token(
             },
             points={2: (0.5, 0.5)},
         ),
-        mouse_backend=mouse,
-        monotonic_clock=iter(float(value) for value in range(0, 200, 5)).__next__,
-        execution_enabled=True,
+        mouse=mouse,
+        clock=iter(float(value) for value in range(0, 200, 5)).__next__,
     )
+    controller = fixture.controller
 
     controller.reconnect()
     result = controller.reconnect()
@@ -7016,12 +7455,11 @@ def test_click_preflight_rejects_screen_that_changed_after_scan():
 
     capture = TransitioningCapture()
     mouse = FakeMouseBackend()
-    controller = WindowsSmartReconnectController(
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
         expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
-        window_backend=FakeWindowBackend(windows),
-        capture_provider=capture,
-        primary_capture_is_trusted=True,
+        primary_capture_provider=capture,
         recognizer=FakeRecognizer(
             {
                 1: ReconnectScreenState.CONNECTED,
@@ -7030,10 +7468,10 @@ def test_click_preflight_rejects_screen_that_changed_after_scan():
             },
             points={2: (0.5, 0.5), 3: (0.5, 0.8)},
         ),
-        mouse_backend=mouse,
-        monotonic_clock=clock,
-        execution_enabled=True,
+        mouse=mouse,
+        clock=clock,
     )
+    controller = fixture.controller
 
     controller.reconnect()
     result = controller.reconnect()
@@ -7553,6 +7991,14 @@ def test_action_confirmation_and_disconnect_wait_restart_for_new_instance(
     backend.windows = [replacement]
     fixture.capture.states[replacement.handle] = 2
 
+    if replacement_kind == "same_fingerprint":
+        prepared = activate_current_window_snapshot(fixture)
+        assert prepared.success is True
+    else:
+        fixture.authorization.begin_reprepare()
+        fixture.controller._authorization_batch = None
+        fixture.controller._preparation = None
+
     now[0] = 10.0
     second = fixture.controller.reconnect()
     now[0] = 14.999
@@ -7562,8 +8008,15 @@ def test_action_confirmation_and_disconnect_wait_restart_for_new_instance(
 
     assert second.details["clicked_windows"] == 0
     assert third.details["clicked_windows"] == 0
-    assert fourth.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(replacement.handle, (0.5, 0.5))]
+    if replacement_kind == "same_fingerprint":
+        assert fourth.details["clicked_windows"] == 1
+        assert fixture.mouse.clicks == [(replacement.handle, (0.5, 0.5))]
+    else:
+        assert fourth.details["clicked_windows"] == 0
+        assert "authorization_batch_unavailable" in fourth.details[
+            "failure_codes"
+        ]
+        assert fixture.mouse.clicks == []
 
 
 def test_terminal_completion_restarts_three_frame_evidence_for_replaced_instance():
@@ -7591,6 +8044,11 @@ def test_terminal_completion_restarts_three_frame_evidence_for_replaced_instance
     fixture.controller.reconnect()
     backend.windows = [replacement]
     fixture.capture.states[replacement.handle] = 11
+    prepared = activate_current_window_snapshot(fixture)
+    assert prepared.success is True
+    fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
+    fixture.controller._primary_entry_authorized.add(fingerprint)
+    fixture.controller._terminal_ready_after[fingerprint] = 0.0
     now[0] = 5.0
     first_replacement = fixture.controller.reconnect()
     fixture.capture.states[replacement.handle] = 12
@@ -7631,12 +8089,13 @@ def test_pending_reopen_and_failure_report_reject_unsafe_live_collection(
     fixture.controller._report_reconnect_failure(fingerprint)
 
     assert result.details["restarted_windows"] == 0
-    assert fingerprint in fixture.controller._pending_reopen_fingerprints
+    assert fingerprint not in fixture.controller._pending_reopen_fingerprints
+    assert fixture.authorization.current_authorization() is None
     assert restarter.reopen_calls == []
     assert restarter.calls == []
 
 
-def test_safe_missing_role_keeps_pending_reopen_retry_available(tmp_path):
+def test_unprepared_missing_role_never_opens_a_shortcut(tmp_path):
     missing = make_window(1)
     present = make_window(2)
     restarter = FakeBattleRestarter()
@@ -7653,8 +8112,9 @@ def test_safe_missing_role_keeps_pending_reopen_retry_available(tmp_path):
 
     result = fixture.controller.reconnect()
 
-    assert result.details["restarted_windows"] == 1
-    assert len(restarter.reopen_calls) == 1
+    assert "authorization_batch_unavailable" in result.details["failure_codes"]
+    assert result.details["restarted_windows"] == 0
+    assert restarter.reopen_calls == []
 
 
 @pytest.mark.parametrize(
@@ -7932,20 +8392,10 @@ def test_source_revocation_before_pending_reopen_blocks_old_scan(
     tmp_path,
     monkeypatch,
 ):
-    missing = make_window(1)
-    present = make_window(2)
-    restarter = FakeBattleRestarter()
-    fixture = make_controller(
-        [1],
-        windows=[present],
-        expected_windows=2,
-        battle_restarter=restarter,
-        group_launch_plan=make_group_plan(tmp_path, [missing, present]),
-    )
+    fixture, windows, restarter = make_bound_pending_reopen_fixture(tmp_path)
+    missing, present = windows
     missing_fingerprint = missing.launch_fingerprint
     present_fingerprint = present.launch_fingerprint
-    fixture.controller._pending_reopen_fingerprints.add(missing_fingerprint)
-    fixture.controller._reopen_retry_after[missing_fingerprint] = 0.0
     original_backend_call = fixture.controller._run_authorized_backend_call
     revoked = []
 
@@ -8154,6 +8604,8 @@ def test_battle_restart_replacement_restarts_disconnect_wait(tmp_path):
     fixture.controller.reconnect()
     backend.windows = [replacement]
     fixture.capture.states[replacement.handle] = 2
+    prepared = activate_current_window_snapshot(fixture)
+    assert prepared.success is True
     now[0] = 5.0
     first_replacement = fixture.controller.reconnect()
     now[0] = 9.999
@@ -8183,11 +8635,32 @@ def test_transition_waits_are_controller_authorization_gates(
 ):
     now = [0.0]
     window = make_window(1)
+    recognizer = None
+    if initial_marker == 4:
+        recognizer = RecognitionByMarker(
+            {
+                4: ScreenRecognition(
+                    ReconnectScreenState.LINE_SELECTION,
+                    0.0,
+                    (0.5, 0.327),
+                    "line-selection",
+                    line_number=1,
+                    recent_line_present=True,
+                ),
+                5: ScreenRecognition(
+                    ReconnectScreenState.CHARACTER_SELECTION,
+                    0.0,
+                    (0.35, 0.85),
+                    "character-selection",
+                ),
+            }
+        )
     fixture = make_controller(
         [initial_marker],
         windows=[window],
         expected_windows=1,
         clock=lambda: now[0],
+        recognizer=recognizer,
     )
     fingerprint = window.launch_fingerprint
     fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
@@ -8741,7 +9214,7 @@ def test_stable_target_provider_failure_never_falls_back_to_registered_role(
     assert fixture.mouse.clicks == []
 
 
-def test_stable_target_exact_alias_uses_two_stages_and_remembers_slot():
+def test_stable_target_exact_alias_uses_immutable_batch_slot_in_two_stages():
     now = [0.0]
     other = CharacterSelectionCandidate(
         120,
@@ -8780,7 +9253,7 @@ def test_stable_target_exact_alias_uses_two_stages_and_remembers_slot():
         recognizer,
         clock=lambda: now[0],
         target_identity_provider=lambda _fingerprint: (
-            _stable_target_identity(window)
+            _stable_target_identity(_fingerprint)
         ),
         verified_slot_recorder=lambda fingerprint, character_id, slot: (
             saved_slots.append((fingerprint, character_id, slot)) or True
@@ -8807,9 +9280,7 @@ def test_stable_target_exact_alias_uses_two_stages_and_remembers_slot():
         (1, target_candidate.click_point),
         (1, CHARACTER_ENTER_CLICK_POINT),
     ]
-    assert saved_slots == [
-        (window.launch_fingerprint, "character-1", 2),
-    ]
+    assert saved_slots == []
 
 
 @pytest.mark.parametrize("short_alias", ("甲", "甲乙"))
@@ -8837,7 +9308,7 @@ def test_stable_target_first_stage_rejects_short_complete_alias(
         _CharacterSequenceRecognizer(lambda _call: (candidate,)),
         target_identity_provider=lambda _fingerprint: (
             _stable_target_identity(
-                window,
+                _fingerprint,
                 role_aliases=(short_alias,),
                 slot_index=saved_slot,
             )
@@ -8891,7 +9362,7 @@ def test_stable_target_second_stage_rejects_short_complete_alias(
         clock=lambda: now[0],
         target_identity_provider=lambda _fingerprint: (
             _stable_target_identity(
-                window,
+                _fingerprint,
                 role_aliases=("AlphaHero", short_alias),
             )
         ),
@@ -8928,7 +9399,7 @@ def test_stable_target_saved_slot_rejects_readable_identity_conflict():
     fixture, window = _single_window_character_fixture(
         _CharacterSequenceRecognizer(lambda _call: (selected,)),
         target_identity_provider=lambda _fingerprint: (
-            _stable_target_identity(window, slot_index=2)
+            _stable_target_identity(_fingerprint, slot_index=2)
         ),
     )
     fixture.controller._pending_reconnect_fingerprints.add(
@@ -8942,7 +9413,7 @@ def test_stable_target_saved_slot_rejects_readable_identity_conflict():
     assert fixture.mouse.clicks == []
 
 
-def test_stable_target_single_selected_unknown_alias_remembers_slot():
+def test_immutable_target_rejects_a_different_selected_unknown_slot():
     selected = CharacterSelectionCandidate(
         None,
         None,
@@ -8956,7 +9427,7 @@ def test_stable_target_single_selected_unknown_alias_remembers_slot():
     fixture, window = _single_window_character_fixture(
         _CharacterSequenceRecognizer(lambda _call: (selected,)),
         target_identity_provider=lambda _fingerprint: (
-            _stable_target_identity(window)
+            _stable_target_identity(_fingerprint)
         ),
         verified_slot_recorder=lambda fingerprint, character_id, slot: (
             saved_slots.append((fingerprint, character_id, slot)) or True
@@ -8969,11 +9440,9 @@ def test_stable_target_single_selected_unknown_alias_remembers_slot():
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert result.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(1, CHARACTER_ENTER_CLICK_POINT)]
-    assert saved_slots == [
-        (window.launch_fingerprint, "character-1", 1),
-    ]
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+    assert saved_slots == []
 
 
 def test_stable_target_multiple_unknown_aliases_are_zero_input():
@@ -8998,7 +9467,7 @@ def test_stable_target_multiple_unknown_aliases_are_zero_input():
     fixture, window = _single_window_character_fixture(
         _CharacterSequenceRecognizer(lambda _call: (selected, other)),
         target_identity_provider=lambda _fingerprint: (
-            _stable_target_identity(window)
+            _stable_target_identity(_fingerprint)
         ),
     )
     fixture.controller._pending_reconnect_fingerprints.add(
@@ -9012,7 +9481,7 @@ def test_stable_target_multiple_unknown_aliases_are_zero_input():
     assert fixture.mouse.clicks == []
 
 
-def test_stable_target_change_after_slot_click_blocks_enter():
+def test_authorization_revocation_after_slot_click_blocks_enter():
     now = [0.0]
     target_candidate = CharacterSelectionCandidate(
         160,
@@ -9031,6 +9500,11 @@ def test_stable_target_change_after_slot_click_blocks_enter():
     )
     phase = ["select"]
     current_target = [None]
+
+    def target_provider(fingerprint):
+        if current_target[0] is None:
+            current_target[0] = _stable_target_identity(fingerprint)
+        return current_target[0]
     recognizer = _CharacterSequenceRecognizer(
         lambda _call: (
             (target_candidate,)
@@ -9041,9 +9515,8 @@ def test_stable_target_change_after_slot_click_blocks_enter():
     fixture, window = _single_window_character_fixture(
         recognizer,
         clock=lambda: now[0],
-        target_identity_provider=lambda _fingerprint: current_target[0],
+        target_identity_provider=target_provider,
     )
-    current_target[0] = _stable_target_identity(window)
     fixture.controller._pending_reconnect_fingerprints.add(
         window.launch_fingerprint
     )
@@ -9054,6 +9527,9 @@ def test_stable_target_change_after_slot_click_blocks_enter():
         current_target[0],
         original_line_number=8,
     )
+    fixture.authorization.begin_reprepare()
+    fixture.controller._authorization_batch = None
+    fixture.controller._preparation = None
     phase[0] = "enter"
     now[0] = 10.0
     fixture.controller.reconnect()
@@ -9097,7 +9573,7 @@ def test_stable_target_second_stage_rejects_duplicate_full_alias():
         recognizer,
         clock=lambda: now[0],
         target_identity_provider=lambda _fingerprint: (
-            _stable_target_identity(window)
+            _stable_target_identity(_fingerprint)
         ),
     )
     fixture.controller._pending_reconnect_fingerprints.add(
@@ -9115,7 +9591,7 @@ def test_stable_target_second_stage_rejects_duplicate_full_alias():
     assert fixture.mouse.clicks == [(1, target_candidate.click_point)]
 
 
-def test_stable_target_change_at_delivery_check_cancels_input():
+def test_mutable_target_change_does_not_replace_the_immutable_batch():
     selected = CharacterSelectionCandidate(
         160,
         None,
@@ -9154,8 +9630,8 @@ def test_stable_target_change_at_delivery_check_cancels_input():
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert result.details["clicked_windows"] == 0
-    assert fixture.mouse.clicks == []
+    assert result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(1, CHARACTER_ENTER_CLICK_POINT)]
 
 
 def test_stable_target_saved_line_never_replaces_visible_different_line():
@@ -9225,9 +9701,7 @@ def test_stable_target_saved_line_accepts_same_uniquely_visible_line():
 
     assert result.details["clicked_windows"] == 1
     assert fixture.mouse.clicks == [(1, (0.5, 0.722))]
-    assert saved_lines == [
-        (window.launch_fingerprint, "character-1", 8),
-    ]
+    assert saved_lines == []
 
 
 def test_stable_target_saved_line_without_visible_point_is_zero_input():
@@ -9276,7 +9750,7 @@ def test_stable_target_evidence_uses_target_without_role_name_in_signature():
     fixture, window = _single_window_character_fixture(
         _CharacterSequenceRecognizer(lambda _call: (selected,)),
         target_identity_provider=lambda _fingerprint: (
-            _stable_target_identity(window, line_number=8)
+            _stable_target_identity(_fingerprint, line_number=8)
         ),
     )
     target = _stable_target_identity(window, line_number=8)
@@ -9327,7 +9801,7 @@ def test_stable_target_evidence_uses_target_without_role_name_in_signature():
     )
 
 
-def test_planned_level_is_blocked_by_unknown_three_digit_competitor(tmp_path):
+def test_immutable_planned_slot_is_not_replaced_by_unknown_competitor(tmp_path):
     target = CharacterSelectionCandidate(
         120,
         None,
@@ -9368,8 +9842,8 @@ def test_planned_level_is_blocked_by_unknown_three_digit_competitor(tmp_path):
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert result.details["clicked_windows"] == 0
-    assert fixture.mouse.clicks == []
+    assert result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(1, target.click_point)]
 
 
 # 第十輪後的直接測試只保留最新明確規格：最近線路、唯一已註冊主號、
@@ -9453,7 +9927,7 @@ def _registered_roles():
     )
 
 
-def test_fifteen_shared_executable_windows_scroll_two_line_eights_independently():
+def test_fifteen_duplicate_source_identities_are_rejected_as_one_batch():
     now = [0.0]
     shared_fingerprint = "f" * 64
     windows = [
@@ -9533,36 +10007,19 @@ def test_fifteen_shared_executable_windows_scroll_two_line_eights_independently(
     prepared = activate_current_window_snapshot(fixture)
     monitor_fingerprints = fixture.controller._allowed_fingerprints
 
-    assert prepared.success is True
-    assert prepared.details["window_count"] == 15
-    assert prepared.details["isolated_window_count"] == 0
-    assert monitor_fingerprints is not None
-    assert len(monitor_fingerprints) == 15
-    assert all(len(value) == 64 for value in monitor_fingerprints)
-    assert shared_fingerprint not in monitor_fingerprints
-
-    fixture.controller.reconnect()
-    scrolled = fixture.controller.reconnect()
-
-    assert fixture.mouse.scrolls == [
-        (1, (0.5, 0.530), -120),
-        (2, (0.5, 0.530), -120),
+    assert prepared.success is False
+    assert prepared.code == "reconnect.snapshot_identity_unsafe"
+    assert prepared.details["failure_codes"] == [
+        "authorization_batch_unavailable"
     ]
-    assert fixture.mouse.clicks == []
-    assert scrolled.details["clicked_windows"] == 2
+    assert monitor_fingerprints is None
 
-    now[0] = 2.0
-    fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert fixture.mouse.clicks == [
-        (1, (0.5, 0.722)),
-        (2, (0.5, 0.722)),
-    ]
-    assert result.details["clicked_windows"] == 2
-    assert now[0] < 60.0
-    assert all(point != (0.5, 0.327) for _handle, point in fixture.mouse.clicks)
-    assert all(handle in {1, 2} for handle, _point in fixture.mouse.clicks)
+    assert result.details["clicked_windows"] == 0
+    assert "authorization_batch_unavailable" in result.details["failure_codes"]
+    assert fixture.mouse.scrolls == []
+    assert fixture.mouse.clicks == []
 
     fixture.controller.set_execution_enabled(False)
 
@@ -9590,8 +10047,8 @@ def test_recent_line_absence_alone_falls_back_to_line_one():
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert result.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(1, (0.5, 0.327))]
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
     assert fixture.mouse.scrolls == []
 
 
@@ -9736,6 +10193,16 @@ def test_public_reconnect_uses_real_three_slot_primary_then_fresh_selected_frame
                 CharacterImportance.PRIMARY,
             ),
         ),
+        authorization_target_identities={
+            window.launch_fingerprint: _stable_target_identity(
+                window,
+                character_id="registered:120福",
+                role_aliases=("120福",),
+                importance=CharacterImportance.PRIMARY,
+                slot_index=2,
+                line_number=1,
+            ),
+        },
     )
     fixture.controller._pending_reconnect_fingerprints.add(
         window.launch_fingerprint
@@ -9753,7 +10220,7 @@ def test_public_reconnect_uses_real_three_slot_primary_then_fresh_selected_frame
 
 
 @pytest.mark.parametrize("conflict", ("multiple_primary", "recent_role"))
-def test_primary_identity_conflict_is_zero_input_and_retriable(conflict):
+def test_primary_identity_inputs_follow_only_the_immutable_batch(conflict):
     providers = {
         "multiple_primary": lambda: (
             RegisteredReconnectRole(
@@ -9781,17 +10248,22 @@ def test_primary_identity_conflict_is_zero_input_and_retriable(conflict):
     fixture.controller.reconnect()
     first = fixture.controller.reconnect()
 
-    assert first.details["clicked_windows"] == 0
-    assert fixture.mouse.clicks == []
-    assert fingerprint not in fixture.controller._character_selection_targets
+    if conflict == "multiple_primary":
+        assert first.details["clicked_windows"] == 0
+        assert fixture.mouse.clicks == []
+        assert fingerprint not in fixture.controller._character_selection_targets
 
-    fixture.controller._registered_role_provider = _registered_roles
-    fixture.controller._recent_login_role_ids[fingerprint] = "120福"
-    fixture.controller.reconnect()
-    recovered = fixture.controller.reconnect()
+        fixture.controller._registered_role_provider = _registered_roles
+        fixture.controller._recent_login_role_ids[fingerprint] = "120福"
+        fixture.controller.reconnect()
+        recovered = fixture.controller.reconnect()
 
-    assert recovered.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(1, (0.651, 0.706))]
+        assert recovered.details["clicked_windows"] == 0
+        assert fixture.mouse.clicks == []
+        assert fixture.authorization.current_authorization() is None
+    else:
+        assert first.details["clicked_windows"] == 1
+        assert fixture.mouse.clicks == [(1, (0.651, 0.706))]
 
 
 def _locked_reconnect_recognitions():
@@ -9862,6 +10334,10 @@ def _advance_locked_reconnect_to_connected(
         )
         backend.windows[0] = replacement
         fixture.capture.states[replacement_handle] = 23
+        now[0] = 5.5
+        rebound = fixture.controller.reconnect()
+        assert rebound.details["clicked_windows"] == 0
+        assert rebound.details["restarted_windows"] == 0
     active_handle = replacement_handle
 
     for marker, first_time, second_time in (
@@ -9895,6 +10371,32 @@ def _three_window_reconnect_fixture(tmp_path, *, battle):
     restarter = FakeBattleRestarter()
     shortcut = tmp_path / "only-a.lnk"
     shortcut.write_bytes(b"shortcut")
+    authorization_target_identities = {
+        windows[0].launch_fingerprint: _stable_target_identity(
+            windows[0],
+            character_id="character-a",
+            role_aliases=("120福",),
+            importance=CharacterImportance.PRIMARY,
+            slot_index=2,
+            line_number=8,
+        ),
+        windows[1].launch_fingerprint: _stable_target_identity(
+            windows[1],
+            character_id="character-b",
+            role_aliases=("002-test-identity",),
+            importance=CharacterImportance.SECONDARY,
+            slot_index=0,
+            line_number=1,
+        ),
+        windows[2].launch_fingerprint: _stable_target_identity(
+            windows[2],
+            character_id="character-c",
+            role_aliases=("003-test-identity",),
+            importance=CharacterImportance.SECONDARY,
+            slot_index=1,
+            line_number=1,
+        ),
+    }
     fixture = make_controller(
         [22 if battle else 21, 1, 1],
         windows=windows,
@@ -9907,6 +10409,7 @@ def _three_window_reconnect_fixture(tmp_path, *, battle):
             shortcut if fingerprint == "a" * 64 else None
         ),
         window_backend=backend,
+        authorization_target_identities=authorization_target_identities,
     )
     fixture.controller.set_auto_battle_enabled(False)
     assert activate_current_window_snapshot(fixture).success is True

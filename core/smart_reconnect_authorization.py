@@ -320,11 +320,72 @@ class ReconnectAuthorizationBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class ReconnectActionContext:
+    """Immutable evidence naming exactly one target in one authorization batch."""
+
+    authorization_epoch: int
+    batch_id: str
+    source_generation: int
+    fingerprint: str
+    character_id: str
+    instance: WindowInstanceToken
+    launch_mode: ReconnectLaunchMode
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.authorization_epoch, bool)
+            or not isinstance(self.authorization_epoch, int)
+            or self.authorization_epoch <= 0
+            or isinstance(self.source_generation, bool)
+            or not isinstance(self.source_generation, int)
+            or self.source_generation < 0
+        ):
+            raise ValueError("action context generations are invalid")
+        batch_id = _required_text(self.batch_id, "batch_id")
+        fingerprint = _normalized_sha256(self.fingerprint)
+        character_id = _required_text(self.character_id, "character_id")
+        if fingerprint is None:
+            raise ValueError("action context fingerprint must be complete SHA-256")
+        if not isinstance(self.instance, WindowInstanceToken):
+            raise TypeError("action context instance must be WindowInstanceToken")
+        if not isinstance(self.launch_mode, ReconnectLaunchMode):
+            raise TypeError("action context launch_mode must be ReconnectLaunchMode")
+        object.__setattr__(self, "batch_id", batch_id)
+        object.__setattr__(self, "fingerprint", fingerprint)
+        object.__setattr__(self, "character_id", character_id)
+
+    @classmethod
+    def from_batch_target(
+        cls,
+        batch: ReconnectAuthorizationBatch,
+        target: ReconnectAuthorizationTarget,
+    ) -> "ReconnectActionContext":
+        if not isinstance(batch, ReconnectAuthorizationBatch):
+            raise TypeError("batch must be ReconnectAuthorizationBatch")
+        if not isinstance(target, ReconnectAuthorizationTarget):
+            raise TypeError("target must be ReconnectAuthorizationTarget")
+        if batch.target_for(target.fingerprint) != target or target.character_id is None:
+            raise ValueError("target does not belong to the authorization batch")
+        return cls(
+            authorization_epoch=batch.epoch,
+            batch_id=batch.batch_id,
+            source_generation=batch.source.source_generation,
+            fingerprint=target.fingerprint,
+            character_id=target.character_id,
+            instance=target.instance,
+            launch_mode=batch.launch_mode,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ReconnectFrameWitness:
     authorization_epoch: int
     batch_id: str
     source_generation: int
+    fingerprint: str
+    character_id: str
     instance: WindowInstanceToken
+    launch_mode: ReconnectLaunchMode
     phase: ReconnectEvidencePhase
     frame_sha256: str
     observed_at_ns: int
@@ -344,13 +405,21 @@ class ReconnectFrameWitness:
             raise ValueError("frame witness generations and time are invalid")
         if not isinstance(self.instance, WindowInstanceToken):
             raise TypeError("instance must be WindowInstanceToken")
+        if not isinstance(self.launch_mode, ReconnectLaunchMode):
+            raise TypeError("launch_mode must be ReconnectLaunchMode")
         if not isinstance(self.phase, ReconnectEvidencePhase):
             raise TypeError("phase must be ReconnectEvidencePhase")
         batch_id = _required_text(self.batch_id, "batch_id")
+        fingerprint = _normalized_sha256(self.fingerprint)
+        character_id = _required_text(self.character_id, "character_id")
         digest = _normalized_sha256(self.frame_sha256)
+        if fingerprint is None:
+            raise ValueError("frame fingerprint must be complete SHA-256")
         if digest is None:
             raise ValueError("frame digest must be complete SHA-256")
         object.__setattr__(self, "batch_id", batch_id)
+        object.__setattr__(self, "fingerprint", fingerprint)
+        object.__setattr__(self, "character_id", character_id)
         object.__setattr__(self, "frame_sha256", digest)
 
 
@@ -368,6 +437,7 @@ def _required_text(value: object, field: str) -> str:
 
 
 __all__ = [
+    "ReconnectActionContext",
     "ReconnectAuthorizationBatch",
     "ReconnectAuthorizationTarget",
     "ReconnectEvidencePhase",
