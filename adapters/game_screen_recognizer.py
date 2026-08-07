@@ -396,7 +396,10 @@ DISCONNECT_TEXT_WITHIN_OVERLAY: NormalizedRect = (
     ((505 / 936) - DISCONNECT_OVERLAY_REGION[1])
     / (DISCONNECT_OVERLAY_REGION[3] - DISCONNECT_OVERLAY_REGION[1]),
 )
-DISCONNECT_TEXT_THRESHOLD = 160
+# The confirmed normal-map capture loses the final strokes of the traditional
+# ``斷`` glyph above 150, which makes the local model read it as a different
+# word.  Keep the exact-word gate; only preserve those verified glyph strokes.
+DISCONNECT_TEXT_THRESHOLD = 150
 DISCONNECT_TEXT_SCALE = 3
 DISCONNECT_TEXT_PADDING = 8
 # The second confirmed disconnect screenshot has the same state but a

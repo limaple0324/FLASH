@@ -3399,11 +3399,35 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         input_channel: str = "window_message",
         identity_verified_override: bool | None = None,
     ) -> tuple[bool, int | None, str | None]:
-        if item.state in {
-            ReconnectScreenState.UNKNOWN,
-            ReconnectScreenState.CHECK_DISABLED,
-        }:
+        if item.state is ReconnectScreenState.CHECK_DISABLED:
             return False, None, None
+        if item.state is ReconnectScreenState.UNKNOWN:
+            specialized_evidence = self._auto_battle_evidence.get(
+                fingerprint
+            )
+            confirmation = self._action_confirmations.get(fingerprint)
+            if (
+                not isinstance(specialized_evidence, tuple)
+                or len(specialized_evidence) != 5
+                or specialized_evidence[:4]
+                != (
+                    instance,
+                    capture_route,
+                    capture_settings_revision,
+                    source_state_generation,
+                )
+                or confirmation is None
+                or confirmation.instance != instance
+                or confirmation.capture_route != capture_route
+                or confirmation.capture_settings_revision
+                != capture_settings_revision
+                or confirmation.source_state_generation
+                != source_state_generation
+                or confirmation.signature != self._action_signature(item)
+                or confirmation.consecutive_frames
+                < ACTION_CONFIRMATION_FRAMES
+            ):
+                return False, None, None
         recorder = self._evidence_recorder
         if recorder is None:
             return (not self._evidence_required, None, None)

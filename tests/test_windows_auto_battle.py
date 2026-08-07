@@ -459,6 +459,51 @@ def test_public_unknown_gameplay_uses_exact_auto_battle_evidence_only() -> None:
     assert "screen_unknown" in result.details["failure_codes"]
 
 
+@pytest.mark.parametrize("change_kind", ("source", "identity"))
+def test_public_unknown_auto_battle_rechecks_authority_before_input(
+    change_kind,
+) -> None:
+    disabled = _red_x_full_sample()
+    controller, window, mouse = _controller(
+        [disabled, disabled, _enabled_battle_sample()],
+        general_state=ReconnectScreenState.UNKNOWN,
+    )
+
+    def change_after_second_frame(call):
+        if call != 2:
+            return
+        if change_kind == "source":
+            controller._source_state_generation += 1
+        else:
+            controller._window_backend.window = replace(
+                window,
+                process_id=99,
+            )
+
+    controller._capture_provider.after = change_after_second_frame
+
+    controller.reconnect()
+
+    assert controller._capture_provider.calls == 2
+    assert mouse.clicks == []
+    assert not controller._auto_battle_evidence
+
+
+def test_public_check_disabled_never_uses_auto_battle_evidence() -> None:
+    disabled = _red_x_full_sample()
+    controller, _window, mouse = _controller(
+        [disabled, disabled, _enabled_battle_sample()],
+        general_state=ReconnectScreenState.CHECK_DISABLED,
+    )
+
+    result = controller.reconnect()
+
+    assert controller._capture_provider.calls == 1
+    assert mouse.clicks == []
+    assert result.details["state_counts"] == {"check_disabled": 1}
+    assert not controller._auto_battle_evidence
+
+
 def test_public_unknown_gameplay_with_unknown_auto_evidence_never_clicks() -> None:
     with Image.open(ROOT / "normal_game_with_entry.png") as image:
         unknown = _sample(image.convert("RGB"))
