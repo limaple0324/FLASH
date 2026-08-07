@@ -679,3 +679,239 @@ def test_memory_rollback_runs_in_reverse_resource_order() -> None:
         coordinator.execute(prepare)
     assert restore_order == ["character", "group"]
     assert first == second == {"value": "old"}
+
+
+def test_stage_delete_removes_existing_file_after_validation(tmp_path: Path) -> None:
+    coordinator = IdentityDataTransactionCoordinator()
+    path = tmp_path / "obsolete.bin"
+    path.write_bytes(b"legacy")
+
+    coordinator.execute(
+        lambda transaction: transaction.stage_delete(
+            IdentityDataResource.CHARACTER_DATA,
+            path,
+            lambda original: original == b"legacy",
+        )
+    )
+
+    assert path.exists() is False
+
+
+def test_stage_delete_is_reversed_when_a_later_publish_fails(tmp_path: Path) -> None:
+    coordinator = IdentityDataTransactionCoordinator()
+    path = tmp_path / "primary.bin"
+    path.write_bytes(b"original")
+    state = {"value": "old"}
+
+    def prepare(transaction) -> None:
+        transaction.stage_delete(
+            IdentityDataResource.CHARACTER_DATA,
+            path,
+            lambda original: original == b"original",
+        )
+        transaction.stage_memory(
+            IdentityDataResource.CURRENT_GROUP,
+            _memory_snapshot(state),
+            lambda: (_ for _ in ()).throw(RuntimeError("publish failed")),
+            _memory_restore(state),
+        )
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        coordinator.execute(prepare)
+    assert path.read_bytes() == b"original"
+
+
+def test_stage_delete_of_missing_file_remains_missing_after_rollback(tmp_path: Path) -> None:
+    coordinator = IdentityDataTransactionCoordinator()
+    path = tmp_path / "never-created.bin"
+    state = {"value": "old"}
+
+    def prepare(transaction) -> None:
+        transaction.stage_delete(
+            IdentityDataResource.CHARACTER_DATA,
+            path,
+            lambda original: original is None,
+        )
+        transaction.stage_memory(
+            IdentityDataResource.CURRENT_GROUP,
+            _memory_snapshot(state),
+            lambda: (_ for _ in ()).throw(RuntimeError("publish failed")),
+            _memory_restore(state),
+        )
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        coordinator.execute(prepare)
+    assert path.exists() is False
+
+
+def test_require_transaction_rejects_a_transaction_from_another_coordinator() -> None:
+    owner = IdentityDataTransactionCoordinator()
+    other = IdentityDataTransactionCoordinator()
+
+    with pytest.raises(IdentityTransactionStageError, match="coordinator"):
+        owner.execute(lambda transaction: other.require_transaction(transaction))
+
+
+def test_same_resource_file_stages_commit_in_stage_order_and_rollback_in_reverse(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    coordinator = IdentityDataTransactionCoordinator()
+    staged_first = tmp_path / "z-backup.bin"
+    staged_second = tmp_path / "a-primary.bin"
+    staged_first.write_bytes(b"z-old")
+    staged_second.write_bytes(b"a-old")
+    state = {"value": "old"}
+    events: list[str] = []
+    real_replace = transaction_module.os.replace
+
+    def record_replace(source, destination) -> None:
+        source_name = Path(source).name
+        if ".candidate-" in source_name:
+            events.append(f"commit:{Path(destination).name}")
+        elif ".rollback-" in source_name:
+            events.append(f"rollback:{Path(destination).name}")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(transaction_module.os, "replace", record_replace)
+
+    def prepare(transaction) -> None:
+        _stage_file(
+            transaction,
+            IdentityDataResource.CHARACTER_DATA,
+            staged_first,
+            b"z-new",
+        )
+        _stage_file(
+            transaction,
+            IdentityDataResource.CHARACTER_DATA,
+            staged_second,
+            b"a-new",
+        )
+        transaction.stage_memory(
+            IdentityDataResource.CURRENT_GROUP,
+            _memory_snapshot(state),
+            lambda: (_ for _ in ()).throw(RuntimeError("publish failed")),
+            _memory_restore(state),
+        )
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        coordinator.execute(prepare)
+
+    assert events == [
+        "commit:z-backup.bin",
+        "commit:a-primary.bin",
+        "rollback:a-primary.bin",
+        "rollback:z-backup.bin",
+    ]
+
+
+@pytest.mark.parametrize("validation", [False, RuntimeError("delete validator failed")])
+def test_stage_delete_validation_failure_has_no_side_effects_and_is_reusable(
+    tmp_path: Path,
+    monkeypatch,
+    validation: object,
+) -> None:
+    coordinator = IdentityDataTransactionCoordinator()
+    path = tmp_path / "primary.bin"
+    path.write_bytes(b"original")
+    temporary_writes: list[object] = []
+    real_mkstemp = transaction_module.tempfile.mkstemp
+
+    def validator(original: bytes | None) -> bool:
+        if isinstance(validation, BaseException):
+            raise validation
+        return bool(validation)
+
+    def record_mkstemp(*args, **kwargs):
+        temporary_writes.append((args, kwargs))
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(transaction_module.tempfile, "mkstemp", record_mkstemp)
+    expected = RuntimeError if isinstance(validation, BaseException) else IdentityTransactionValidationError
+
+    with pytest.raises(expected):
+        coordinator.execute(
+            lambda transaction: transaction.stage_delete(
+                IdentityDataResource.CHARACTER_DATA, path, validator
+            )
+        )
+
+    assert path.read_bytes() == b"original"
+    assert temporary_writes == []
+    coordinator.execute(lambda transaction: None)
+
+
+@pytest.mark.parametrize("delete_first", [False, True])
+def test_stage_file_and_delete_cannot_target_the_same_path(
+    tmp_path: Path,
+    delete_first: bool,
+) -> None:
+    coordinator = IdentityDataTransactionCoordinator()
+    path = tmp_path / "shared.bin"
+    path.write_bytes(b"old")
+
+    def prepare(transaction) -> None:
+        stage_file = lambda: _stage_file(
+            transaction, IdentityDataResource.CHARACTER_DATA, path, b"new"
+        )
+        stage_delete = lambda: transaction.stage_delete(
+            IdentityDataResource.CHARACTER_DATA, path, lambda original: True
+        )
+        first, second = (stage_delete, stage_file) if delete_first else (stage_file, stage_delete)
+        first()
+        second()
+
+    with pytest.raises(IdentityTransactionStageError, match="duplicate file"):
+        coordinator.execute(prepare)
+    assert path.read_bytes() == b"old"
+
+
+def test_require_transaction_rejects_sealed_transaction_from_same_coordinator() -> None:
+    coordinator = IdentityDataTransactionCoordinator()
+    escaped: list[object] = []
+    coordinator.execute(lambda transaction: escaped.append(transaction))
+
+    with pytest.raises(IdentityTransactionStageError, match="active transaction"):
+        coordinator.execute(
+            lambda current: coordinator.require_transaction(escaped[0])  # type: ignore[arg-type]
+        )
+
+
+def test_stage_delete_rollback_failure_blocks_and_preserves_both_errors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    coordinator = IdentityDataTransactionCoordinator()
+    path = tmp_path / "primary.bin"
+    path.write_bytes(b"original")
+    state = {"value": "old"}
+    real_replace = transaction_module.os.replace
+
+    def fail_delete_restore(source, destination) -> None:
+        if ".rollback-" in Path(source).name and Path(destination) == path:
+            raise PermissionError("delete restore failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(transaction_module.os, "replace", fail_delete_restore)
+
+    def prepare(transaction) -> None:
+        transaction.stage_delete(
+            IdentityDataResource.CHARACTER_DATA,
+            path,
+            lambda original: original == b"original",
+        )
+        transaction.stage_memory(
+            IdentityDataResource.CURRENT_GROUP,
+            _memory_snapshot(state),
+            lambda: (_ for _ in ()).throw(RuntimeError("publish failed")),
+            _memory_restore(state),
+        )
+
+    with pytest.raises(IdentityTransactionRollbackError) as captured:
+        coordinator.execute(prepare)
+    assert str(captured.value.original_error) == "publish failed"
+    assert [str(error) for error in captured.value.rollback_errors] == [
+        "delete restore failed"
+    ]
+    assert coordinator.is_blocked is True

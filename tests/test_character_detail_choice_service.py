@@ -12,13 +12,16 @@ from services.character_detail_view_service import (
     PlayerCharacterDetail,
 )
 from services.character_view_service import CharacterViewService
+from services.identity_data_transaction_coordinator import IdentityDataTransactionCoordinator
 
 
 def _detail_service(tmp_path) -> CharacterDetailViewService:
     registry = WindowRegistry()
     registry.register_character("char-a", "同名角色", group="甲組", note="甲的備註")
     registry.register_character("char-b", "同名角色", group="乙組", note="乙的備註")
-    return CharacterDetailViewService(CharacterViewService(registry, ()))
+    return CharacterDetailViewService(
+        CharacterViewService(registry, (), IdentityDataTransactionCoordinator())
+    )
 
 
 def test_choices_bind_duplicate_names_to_exact_stable_identities(tmp_path) -> None:
@@ -48,7 +51,9 @@ def test_choices_bind_duplicate_names_to_exact_stable_identities(tmp_path) -> No
 def test_choice_resolves_latest_note_when_opened_again(tmp_path) -> None:
     registry = WindowRegistry()
     registry.register_character("char-a", "角色甲", note="原本備註")
-    details = CharacterDetailViewService(CharacterViewService(registry, ()))
+    details = CharacterDetailViewService(
+        CharacterViewService(registry, (), IdentityDataTransactionCoordinator())
+    )
     selected = []
     choice = CharacterDetailChoiceService(
         details,

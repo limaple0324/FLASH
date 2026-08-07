@@ -10,6 +10,7 @@ from services.card_coordinator import CardCoordinator
 from services.card_history_service import CardHistoryService
 from services.confirmed_activity_rule_service import ConfirmedActivityRuleService
 from services.group_role_status_service import ROLE_STATUS_OPEN
+from services.identity_data_transaction_coordinator import IdentityDataTransactionCoordinator
 from workspace.models import WorkspaceState
 from workspace.service import WorkspaceService
 
@@ -37,7 +38,10 @@ def test_group_switch_registers_only_current_workspace_group_for_reminders(
 ):
     group_a = _group("group-a", "role-a")
     group_b = _group("group-b", "role-b")
-    workspace = WorkspaceService(WorkspaceState(current_group=group_a))
+    workspace = WorkspaceService(
+        IdentityDataTransactionCoordinator(),
+        WorkspaceState(current_group=group_a),
+    )
     cards = CardService()
     service = _service(tmp_path, cards)
     opened_at = datetime(2026, 8, 3, 11, 59, tzinfo=TAIPEI_TIMEZONE)

@@ -244,6 +244,73 @@ class WindowRegistry:
     def all(self) -> tuple[CharacterWindowRecord, ...]:
         return tuple(self._records[key] for key in sorted(self._records))
 
+    def clone_runtime(self) -> "WindowRegistry":
+        """Clone the exact in-process registry, including trusted live fields."""
+        clone = WindowRegistry()
+        clone.replace_runtime(self)
+        return clone
+
+    def replace_runtime(self, source: "WindowRegistry") -> None:
+        """Validate one complete runtime candidate and publish it exactly once."""
+        if not isinstance(source, WindowRegistry):
+            raise TypeError("source must be a WindowRegistry.")
+        candidate: dict[str, CharacterWindowRecord] = {}
+        for key, record in source._records.items():
+            self._validate_runtime_record(key, record)
+            if key in candidate:
+                raise ValueError(f"Duplicate character ID in registry: {key}")
+            candidate[key] = record
+        self._records = candidate
+
+    @classmethod
+    def _validate_runtime_record(
+        cls,
+        key: object,
+        record: object,
+    ) -> None:
+        if not isinstance(key, str) or not isinstance(record, CharacterWindowRecord):
+            raise TypeError("Runtime registry entries must contain character records.")
+        normalized_id = cls._normalize_character_id(key)
+        if key != normalized_id or record.character_id != key:
+            raise ValueError("Runtime registry key must match the character identity.")
+        if record.display_name != cls._clean(record.display_name, "display_name"):
+            raise ValueError("Runtime display name must already be normalized.")
+        if (
+            not isinstance(record.aliases, tuple)
+            or any(not isinstance(alias, str) for alias in record.aliases)
+        ):
+            raise TypeError("Runtime aliases must be a tuple of strings.")
+        if any(not alias.strip() for alias in record.aliases):
+            raise ValueError("Runtime aliases must not be empty.")
+        if len(record.aliases) != len(set(record.aliases)):
+            raise ValueError("Runtime aliases must not contain duplicates.")
+        for field_name in ("group", "role", "note", "created_at_utc", "window_class", "last_seen_utc"):
+            value = getattr(record, field_name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"Runtime {field_name} must be a string or None.")
+        if not isinstance(record.locked, bool) or not isinstance(record.confirmed, bool):
+            raise TypeError("Runtime boolean fields must be bool values.")
+        for field_name in ("handle", "process_id"):
+            value = getattr(record, field_name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"Runtime {field_name} must be a positive integer or None.")
+        if record.rect is not None:
+            if (
+                not isinstance(record.rect, tuple)
+                or len(record.rect) != 4
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in record.rect)
+            ):
+                raise TypeError("Runtime rect must be a four-integer tuple or None.")
+            left, top, right, bottom = record.rect
+            if right <= left or bottom <= top:
+                raise ValueError("Runtime rect must have positive width and height.")
+        if not isinstance(record.health, WindowHealth):
+            raise TypeError("Runtime health must be WindowHealth.")
+        if record.confirmed and record.handle is None:
+            raise ValueError("A confirmed runtime record must have a live handle.")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.SCHEMA_VERSION,

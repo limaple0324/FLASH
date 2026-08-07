@@ -24,6 +24,9 @@ from services.character_game_data_capture_service import (
 )
 from services.character_view_service import CharacterViewService, PlayerCharacterView
 from services.group_selection_service import PlayerGroupChoice, PlayerGroupMember
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
 
 
 _FINGERPRINT = "a" * 64
@@ -98,8 +101,15 @@ def test_build_services_loads_character_profiles_into_read_only_view(tmp_path) -
         role="古",
         note="守紀優先",
     )
-    WindowRegistryStore(tmp_path / "data" / "window_registry.json").save(registry)
-    CharacterStore(tmp_path / "data" / CHARACTER_FILENAME).save(
+    coordinator = IdentityDataTransactionCoordinator()
+    WindowRegistryStore(
+        tmp_path / "data" / "window_registry.json",
+        coordinator,
+    ).save(registry)
+    CharacterStore(
+        tmp_path / "data" / CHARACTER_FILENAME,
+        coordinator,
+    ).save(
         (
             Character(
                 "same-character",
@@ -153,7 +163,10 @@ def test_build_services_isolates_corrupt_character_profiles(tmp_path) -> None:
 def test_build_services_registers_confirmed_game_data_sections(tmp_path) -> None:
     registry = WindowRegistry()
     registry.register_character("char-a", "角色甲", group="14支")
-    WindowRegistryStore(tmp_path / "data" / "window_registry.json").save(registry)
+    WindowRegistryStore(
+        tmp_path / "data" / "window_registry.json",
+        IdentityDataTransactionCoordinator(),
+    ).save(registry)
 
     build_services(root=tmp_path)
 

@@ -1,12 +1,26 @@
 import json
 
 from core.window_registry import WindowRegistry
-from services.group_configuration_service import GroupConfigurationService
+from services.group_configuration_service import (
+    GroupConfigurationService as _GroupConfigurationService,
+)
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
 from services.group_selection_service import (
     GroupSelectionService,
     PlayerGroupChoice,
     default_legacy_group_config_path,
 )
+
+
+class GroupConfigurationService(_GroupConfigurationService):
+    def __init__(self, path, *, legacy_config_path=None):
+        super().__init__(
+            path,
+            IdentityDataTransactionCoordinator(),
+            legacy_config_path=legacy_config_path,
+        )
 
 
 def _legacy_file(tmp_path):

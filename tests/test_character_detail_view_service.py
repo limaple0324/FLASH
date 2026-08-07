@@ -9,6 +9,7 @@ from services.character_detail_view_service import (
     PlayerCharacterDetail,
 )
 from services.character_view_service import CharacterViewService
+from services.identity_data_transaction_coordinator import IdentityDataTransactionCoordinator
 
 
 def _service(tmp_path) -> CharacterDetailViewService:
@@ -28,7 +29,13 @@ def _service(tmp_path) -> CharacterDetailViewService:
             CharacterImportance.PRIMARY,
         ),
     )
-    return CharacterDetailViewService(CharacterViewService(registry, profiles))
+    return CharacterDetailViewService(
+        CharacterViewService(
+            registry,
+            profiles,
+            IdentityDataTransactionCoordinator(),
+        )
+    )
 
 
 def test_detail_snapshot_contains_only_confirmed_player_fields(tmp_path) -> None:
@@ -55,7 +62,9 @@ def test_control_layer_can_pair_detail_with_stable_identity(tmp_path) -> None:
 def test_get_by_identity_returns_latest_note(tmp_path) -> None:
     registry = WindowRegistry()
     registry.register_character("char-a", "角色甲", note="原本備註")
-    service = CharacterDetailViewService(CharacterViewService(registry, ()))
+    service = CharacterDetailViewService(
+        CharacterViewService(registry, (), IdentityDataTransactionCoordinator())
+    )
 
     registry.set_note("char-a", "更新後備註")
 
@@ -68,7 +77,9 @@ def test_control_pairing_does_not_guess_from_duplicate_display_names(
     registry = WindowRegistry()
     registry.register_character("char-a", "同名角色", group="甲組", note="甲的備註")
     registry.register_character("char-b", "同名角色", group="乙組", note="乙的備註")
-    service = CharacterDetailViewService(CharacterViewService(registry, ()))
+    service = CharacterDetailViewService(
+        CharacterViewService(registry, (), IdentityDataTransactionCoordinator())
+    )
 
     paired = service.all_with_identities()
 

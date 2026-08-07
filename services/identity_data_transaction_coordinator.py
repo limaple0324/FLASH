@@ -90,6 +90,17 @@ class _FileStage:
 
 
 @dataclass(frozen=True)
+class _DeleteStage:
+    resource: IdentityDataResource
+    path: Path
+    normalized_path: str
+    validator: Callable[[bytes | None], object]
+    original_exists: bool
+    original: bytes | None
+    sequence: int
+
+
+@dataclass(frozen=True)
 class _MemoryStage:
     resource: IdentityDataResource
     apply: Callable[[], object]
@@ -110,7 +121,7 @@ class IdentityDataTransaction:
     def __init__(self, coordinator: IdentityDataTransactionCoordinator) -> None:
         self._coordinator = coordinator
         self._accepting = True
-        self._files: list[_FileStage] = []
+        self._file_operations: list[_FileStage | _DeleteStage] = []
         self._memories: list[_MemoryStage] = []
         self._whole_validator: Callable[[], object] | None = None
         self._file_targets: set[str] = set()
@@ -131,20 +142,37 @@ class IdentityDataTransaction:
         if not isinstance(candidate_bytes, bytes):
             raise IdentityTransactionStageError("candidate_bytes must be immutable bytes")
 
-        target = Path(path).absolute()
-        normalized = os.path.normcase(os.path.abspath(os.fspath(target)))
-        if normalized in self._file_targets:
-            raise IdentityTransactionStageError(f"duplicate file target: {target}")
-
-        original_exists = target.exists()
-        original = target.read_bytes() if original_exists else None
-        self._file_targets.add(normalized)
-        self._files.append(
+        target, normalized, original_exists, original = self._snapshot_file_target(path)
+        self._file_operations.append(
             _FileStage(
                 resource=resource,
                 path=target,
                 normalized_path=normalized,
                 candidate=candidate_bytes,
+                validator=validator,
+                original_exists=original_exists,
+                original=original,
+                sequence=self._next_sequence(),
+            )
+        )
+
+    def stage_delete(
+        self,
+        resource: IdentityDataResource,
+        path: str | os.PathLike[str],
+        validator: Callable[[bytes | None], object],
+    ) -> None:
+        self._assert_accepting()
+        self._require_resource(resource)
+        if not callable(validator):
+            raise IdentityTransactionStageError("delete validator must be callable")
+
+        target, normalized, original_exists, original = self._snapshot_file_target(path)
+        self._file_operations.append(
+            _DeleteStage(
+                resource=resource,
+                path=target,
+                normalized_path=normalized,
                 validator=validator,
                 original_exists=original_exists,
                 original=original,
@@ -194,10 +222,20 @@ class IdentityDataTransaction:
         self._accepting = False
 
     def _assert_accepting(self) -> None:
-        if not self._accepting or not self._coordinator._is_current_owner():
-            raise IdentityTransactionStageError(
-                "transaction stages may only be added by the active prepare callback"
-            )
+        self._coordinator.require_transaction(self)
+
+    def _snapshot_file_target(
+        self,
+        path: str | os.PathLike[str],
+    ) -> tuple[Path, str, bool, bytes | None]:
+        target = Path(path).absolute()
+        normalized = os.path.normcase(os.path.abspath(os.fspath(target)))
+        if normalized in self._file_targets:
+            raise IdentityTransactionStageError(f"duplicate file target: {target}")
+        original_exists = target.exists()
+        original = target.read_bytes() if original_exists else None
+        self._file_targets.add(normalized)
+        return target, normalized, original_exists, original
 
     @staticmethod
     def _require_resource(resource: IdentityDataResource) -> None:
@@ -209,12 +247,11 @@ class IdentityDataTransaction:
         self._sequence += 1
         return sequence
 
-    def _ordered_files(self) -> list[_FileStage]:
+    def _ordered_file_operations(self) -> list[_FileStage | _DeleteStage]:
         return sorted(
-            self._files,
+            self._file_operations,
             key=lambda stage: (
                 _RESOURCE_INDEX[stage.resource],
-                stage.normalized_path,
                 stage.sequence,
             ),
         )
@@ -241,6 +278,7 @@ class IdentityDataTransactionCoordinator:
         self._closing = False
         self._closed = False
         self._rollback_failure: IdentityTransactionRollbackError | None = None
+        self._current_transaction: IdentityDataTransaction | None = None
 
     def execute(
         self,
@@ -251,6 +289,8 @@ class IdentityDataTransactionCoordinator:
         self._begin_operation(write=True)
         try:
             transaction = IdentityDataTransaction(self)
+            with self._condition:
+                self._current_transaction = transaction
             try:
                 result = prepare(transaction)
             finally:
@@ -264,7 +304,48 @@ class IdentityDataTransactionCoordinator:
                 self._rollback_failure = failure
             raise
         finally:
+            with self._condition:
+                self._current_transaction = None
             self._end_operation()
+
+    def require_transaction(self, transaction: IdentityDataTransaction) -> None:
+        if (
+            not isinstance(transaction, IdentityDataTransaction)
+            or transaction._coordinator is not self
+        ):
+            raise IdentityTransactionStageError(
+                "transaction belongs to a different coordinator"
+            )
+        with self._condition:
+            if (
+                not self._active
+                or self._owner_thread_id != threading.get_ident()
+                or self._current_transaction is not transaction
+                or not transaction._accepting
+            ):
+                raise IdentityTransactionStageError(
+                    "transaction is not the active transaction in prepare"
+                )
+
+    def require_active_transaction_owner(self) -> None:
+        """Reject transaction-only memory publication from every other caller."""
+        with self._condition:
+            if (
+                not self._active
+                or self._owner_thread_id != threading.get_ident()
+                or self._current_transaction is None
+            ):
+                raise IdentityTransactionStageError(
+                    "caller does not own the active identity transaction"
+                )
+
+    def read_consistent(self, reader: Callable[[], _RESULT]) -> _RESULT:
+        """Read or update auxiliary memory without crossing an identity write."""
+        if not callable(reader):
+            raise TypeError("reader must be callable")
+        if self._is_current_owner():
+            return reader()
+        return self.snapshot(reader)
 
     def snapshot(self, reader: Callable[[], _RESULT]) -> _RESULT:
         if not callable(reader):
@@ -347,13 +428,18 @@ class IdentityDataTransactionCoordinator:
             return self._active and self._owner_thread_id == threading.get_ident()
 
     def _commit(self, transaction: IdentityDataTransaction) -> None:
-        files = transaction._ordered_files()
+        operations = transaction._ordered_file_operations()
         memories = transaction._ordered_memories()
 
-        for stage in files:
-            if stage.validator(stage.candidate) is False:
+        for stage in operations:
+            validation_result = (
+                stage.validator(stage.candidate)
+                if isinstance(stage, _FileStage)
+                else stage.validator(stage.original)
+            )
+            if validation_result is False:
                 raise IdentityTransactionValidationError(
-                    f"candidate validator rejected {stage.path}"
+                    f"file-operation validator rejected {stage.path}"
                 )
         if (
             transaction._whole_validator is not None
@@ -365,7 +451,9 @@ class IdentityDataTransactionCoordinator:
 
         candidates: list[_CandidateFile] = []
         try:
-            for stage in files:
+            for stage in operations:
+                if not isinstance(stage, _FileStage):
+                    continue
                 candidates.append(
                     _CandidateFile(
                         stage=stage,
@@ -378,14 +466,21 @@ class IdentityDataTransactionCoordinator:
             self._cleanup_candidates(candidates)
             raise
 
-        touched_files: list[_FileStage] = []
+        candidate_by_sequence = {
+            candidate.stage.sequence: candidate for candidate in candidates
+        }
+        touched_files: list[_FileStage | _DeleteStage] = []
         touched_memories: list[_MemoryStage] = []
         try:
-            for candidate in candidates:
+            for stage in operations:
                 # Record before replace because an operating-system failure can be
                 # reported after the destination has already changed.
-                touched_files.append(candidate.stage)
-                os.replace(candidate.temporary_path, candidate.stage.path)
+                touched_files.append(stage)
+                if isinstance(stage, _FileStage):
+                    candidate = candidate_by_sequence[stage.sequence]
+                    os.replace(candidate.temporary_path, stage.path)
+                else:
+                    self._unlink_if_present(stage.path)
             for stage in memories:
                 # The current memory stage is included so a partial mutation that
                 # raises is restored along with every earlier publication.
@@ -404,7 +499,7 @@ class IdentityDataTransactionCoordinator:
 
     def _rollback(
         self,
-        touched_files: list[_FileStage],
+        touched_files: list[_FileStage | _DeleteStage],
         touched_memories: list[_MemoryStage],
     ) -> list[BaseException]:
         errors: list[BaseException] = []

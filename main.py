@@ -159,6 +159,11 @@ from services.character_game_data_capture_service import (
 from services.character_detail_choice_service import CharacterDetailChoiceService
 from services.character_note_service import CharacterNoteService
 from services.character_view_service import CharacterViewService
+from services.current_group_publication_service import (
+    CurrentGroupPublicationNotificationError,
+    CurrentGroupPublicationPlan,
+    CurrentGroupPublicationService,
+)
 from services.confirmed_activity_rule_monitor import (
     ConfirmedActivityRuleMonitor,
 )
@@ -182,10 +187,14 @@ from services.group_selection_service import (
     default_legacy_group_config_path,
 )
 from services.group_configuration_service import (
-    GroupHotkeyConflictError,
+    GroupConfiguration,
     GroupMasterLockedError,
     GroupConfigurationService,
     SyncCycleError,
+)
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransaction,
+    IdentityDataTransactionCoordinator,
 )
 from services.group_character_registration_service import (
     GroupCharacterRegistrationService,
@@ -1051,12 +1060,73 @@ def _connected_sync_fingerprints(
     )
 
 
+def _player_group_choice_for_configuration(
+    group: GroupConfiguration,
+) -> PlayerGroupChoice:
+    return PlayerGroupChoice(
+        group_id=group.group_id,
+        name=group.name,
+        character_count=len(group.entries),
+        members=tuple(
+            PlayerGroupMember(
+                entry_id=entry.entry_id,
+                display_name=entry.display_name,
+                role=entry.role,
+                role_id=entry.role_id or None,
+                character_id=entry.entry_id,
+            )
+            for entry in group.entries
+        ),
+    )
+
+
+def _require_group_choice_matches_configuration(
+    choice: PlayerGroupChoice,
+    group: GroupConfiguration,
+) -> None:
+    choice_signature = (
+        choice.group_id,
+        choice.name,
+        tuple(member.entry_id for member in choice.members),
+    )
+    group_signature = (
+        group.group_id,
+        group.name,
+        tuple(entry.entry_id for entry in group.entries),
+    )
+    if choice_signature != group_signature:
+        raise RuntimeError("selected group identity changed before publication")
+
+
+def _rebuild_group_input_identity(
+    choice: PlayerGroupChoice | None,
+    apply_identity: Callable[[PlayerGroupChoice], object | None],
+    clear_identity: Callable[[], None],
+) -> bool:
+    """Rebuild committed input identity, clearing every partial failure."""
+    if choice is None:
+        clear_identity()
+        return True
+    try:
+        ready = apply_identity(choice) is not None
+    except Exception:
+        ready = False
+    if not ready:
+        clear_identity()
+    return ready
+
+
 def build_services(
     root: Path | None = None,
     card_preview_catalog: CardPreviewCatalog | None = None,
 ):
     """Create, load, and register the cumulative SP1+SP2 services."""
     AppContext.clear()
+    identity_data_transaction_coordinator = IdentityDataTransactionCoordinator()
+    AppContext.register(
+        IdentityDataTransactionCoordinator,
+        identity_data_transaction_coordinator,
+    )
     paths = PathManager(root=root)
     logger = LoggerService(paths.log_file("flash.log"))
     config = ConfigManager(paths.config_file("settings.json"))
@@ -1148,11 +1218,19 @@ def build_services(
     )
     event_bus = EventBus(logger=logger)
     target_window_state_service = TargetWindowStateService(event_bus, logger)
-    card_display_settings_resolution = resolve_card_display_settings(config.data)
+    card_display_settings_resolution = resolve_card_display_settings(
+        config.snapshot()
+    )
 
-    registry_store = WindowRegistryStore(paths.data_dir() / REGISTRY_FILENAME)
+    registry_store = WindowRegistryStore(
+        paths.data_dir() / REGISTRY_FILENAME,
+        identity_data_transaction_coordinator,
+    )
     registry = registry_store.load()
-    character_store = CharacterStore(paths.data_dir() / CHARACTER_FILENAME)
+    character_store = CharacterStore(
+        paths.data_dir() / CHARACTER_FILENAME,
+        identity_data_transaction_coordinator,
+    )
     character_game_data_store = CharacterGameDataStore(
         paths.data_dir() / CHARACTER_GAME_DATA_FILENAME
     )
@@ -1171,6 +1249,7 @@ def build_services(
     shortcut_fingerprint_resolver = PowerShellShortcutFingerprintResolver()
     group_configuration_service = GroupConfigurationService(
         paths.data_dir() / GROUP_CONFIGURATION_FILENAME,
+        identity_data_transaction_coordinator,
         legacy_config_path=legacy_group_config_path,
     )
     group_selection_service = GroupSelectionService(
@@ -1244,38 +1323,81 @@ def build_services(
         registry_store,
         character_store,
         group_configuration_service,
+        identity_data_transaction_coordinator,
     )
-    if initial_group_choice is not None:
-        characters = group_character_registration_service.ensure_group(
-            initial_group_choice.name,
-            characters,
-        )
     character_view_service = CharacterViewService(
         registry,
         characters,
+        identity_data_transaction_coordinator,
         confirmed_group_orders=CONFIRMED_GROUP_ORDERS,
     )
-    character_detail_view_service = CharacterDetailViewService(
-        character_view_service,
-        character_game_data_view_service,
-    )
-    character_note_service = CharacterNoteService(registry, registry_store)
     workspace_service = WorkspaceService(
+        identity_data_transaction_coordinator,
         WorkspaceState(
-            current_group=(
-                group_selection_service.workspace_group(
-                    initial_group_choice,
-                    characters,
-                )
-                if initial_group_choice is not None
-                else None
-            ),
             next_step=(
                 "查看目前需要注意的內容"
                 if initial_group_choice is not None
                 else "選擇組別"
             ),
         )
+    )
+    current_group_publication_service = CurrentGroupPublicationService(
+        config,
+        workspace_service,
+        identity_data_transaction_coordinator,
+        current_group_name_key=CURRENT_GROUP_NAME_KEY,
+    )
+    if initial_group_choice is not None:
+        def prepare_initial_group(transaction: IdentityDataTransaction):
+            result = group_character_registration_service.stage_ensure_group(
+                transaction,
+                initial_group_choice.name,
+                character_view_service.profiles_in_transaction(transaction),
+            )
+            group = result.group
+            if group is None:
+                registry_identities = tuple(
+                    member.entry_id for member in initial_group_choice.members
+                )
+                if (
+                    not registry_identities
+                    or len(registry_identities) != len(set(registry_identities))
+                    or any(
+                        member.character_id != member.entry_id
+                        for member in initial_group_choice.members
+                    )
+                ):
+                    raise RuntimeError(
+                        "initial group has no complete stable identity source"
+                    )
+                group_name = initial_group_choice.name
+            else:
+                _require_group_choice_matches_configuration(
+                    initial_group_choice,
+                    group,
+                )
+                group_name = group.name
+            character_view_service.stage_replace(transaction, result.profiles)
+            return CurrentGroupPublicationPlan(
+                group_name,
+                group_selection_service.workspace_group(
+                    initial_group_choice,
+                    result.profiles,
+                ),
+                result.profiles,
+            )
+
+        characters = current_group_publication_service.execute(
+            prepare_initial_group
+        ).result
+    character_detail_view_service = CharacterDetailViewService(
+        character_view_service,
+        character_game_data_view_service,
+    )
+    character_note_service = CharacterNoteService(
+        registry,
+        registry_store,
+        identity_data_transaction_coordinator,
     )
     card_history_store = CardHistoryStore(paths.data_dir() / CARD_HISTORY_FILENAME)
     card_history_service = CardHistoryService(card_history_store)
@@ -1461,6 +1583,10 @@ def build_services(
     AppContext.register(PlayerHabitStore, player_habit_store)
     AppContext.register(PlayerHabitPreferenceService, player_habit_service)
     AppContext.register(WorkspaceService, workspace_service)
+    AppContext.register(
+        CurrentGroupPublicationService,
+        current_group_publication_service,
+    )
     AppContext.register(CardHistoryStore, card_history_store)
     AppContext.register(CardHistoryService, card_history_service)
     AppContext.register(CardService, card_service)
@@ -2043,6 +2169,27 @@ def shutdown_sync_controllers(
     return stopped
 
 
+def shutdown_identity_data_transactions(
+    logger: LoggerService | None = None,
+) -> bool:
+    """Wait for the active identity transaction, then reject every new write."""
+    coordinator = AppContext.get(IdentityDataTransactionCoordinator)
+    if coordinator is None:
+        return True
+    try:
+        closed = coordinator.close_and_wait()
+    except Exception:
+        closed = False
+    if not closed and logger is not None:
+        try:
+            logger.error(
+                "Identity data transactions did not close cleanly before exit."
+            )
+        except Exception:
+            pass
+    return closed
+
+
 def registry_status() -> dict[str, object]:
     registry = AppContext.get(WindowRegistry)
     store = AppContext.get(WindowRegistryStore)
@@ -2303,6 +2450,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window.deiconify()
 
     config = AppContext.get(ConfigManager)
+    identity_data_transaction_coordinator = AppContext.get(
+        IdentityDataTransactionCoordinator
+    )
+    current_group_publication_service = AppContext.get(
+        CurrentGroupPublicationService
+    )
     ui_font_service = AppContext.get(UIFontService)
     input_controller = AppContext.get(WindowsInputSyncController)
     pointer_sync_controller = AppContext.get(
@@ -2385,7 +2538,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     character_view_service = AppContext.get(CharacterViewService)
     character_detail_view_service = AppContext.get(CharacterDetailViewService)
     character_note_service = AppContext.get(CharacterNoteService)
-    character_store = AppContext.get(CharacterStore)
     group_character_registration_service = AppContext.get(
         GroupCharacterRegistrationService
     )
@@ -2917,6 +3069,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             configured_feature_hotkeys=configured_feature_hotkeys,
             feature_hotkeys_config_key=FEATURE_HOTKEYS_KEY,
             group_configuration_service=group_configuration_service,
+            coordinator=identity_data_transaction_coordinator,
             error_logger=logger.error,
         )
         if (
@@ -2942,38 +3095,19 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         return True
 
     def change_feature_hotkey(feature: str, hotkey: str) -> bool:
-        if feature not in configured_feature_hotkeys:
+        if feature_card_settings_batch_service is None:
             return False
-        normalized = normalize_feature_hotkey(hotkey)
-        if normalized and any(
-            value == normalized
-            for name, value in configured_feature_hotkeys.items()
-            if name != feature
-        ):
+        result = feature_card_settings_batch_service.change_feature_hotkey(
+            feature,
+            hotkey,
+        )
+        if not result.succeeded:
             messagebox.showerror(
                 "輔｜快捷鍵",
-                "這個快捷鍵已用於另一項功能，請選擇不同按鍵。",
+                result.message,
                 parent=window,
             )
             return False
-        if (
-            normalized
-            and group_configuration_service is not None
-            and normalized
-            in group_configuration_service.launch_hotkeys().values()
-        ):
-            messagebox.showerror(
-                "輔｜快捷鍵",
-                "這個快捷鍵已用於整組啟動，請選擇不同按鍵。",
-                parent=window,
-            )
-            return False
-        configured_feature_hotkeys[feature] = normalized
-        if config is not None:
-            config.set(
-                FEATURE_HOTKEYS_KEY,
-                dict(configured_feature_hotkeys),
-            )
         return True
 
     def change_ui_theme(theme_name: str) -> bool:
@@ -3127,6 +3261,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             role_row_opacity=role_row_opacity,
         )
 
+    def character_profiles_snapshot():
+        if (
+            identity_data_transaction_coordinator is None
+            or character_view_service is None
+        ):
+            return ()
+        return identity_data_transaction_coordinator.execute(
+            character_view_service.profiles_in_transaction
+        )
+
     def selected_group_plan(choice) -> GroupLaunchPlan | None:
         if group_launch_service is None:
             return None
@@ -3138,11 +3282,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return None
         profiles = {
             character.character_id: character
-            for character in (
-                character_store.load()
-                if character_store is not None
-                else ()
-            )
+            for character in character_profiles_snapshot()
         }
         members = {
             member.entry_id: member
@@ -3360,29 +3500,53 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             game_operation_gate.reopen()
 
     def restore_group_identity(choice) -> bool:
-        try:
-            if choice is None:
-                clear_group_identity()
-                return True
-            return apply_group_identity(choice) is not None
-        except Exception:
-            return False
+        return _rebuild_group_input_identity(
+            choice,
+            apply_group_identity,
+            clear_group_identity,
+        )
 
-    def restore_published_group(
-        previous_group,
-        previous_next_step: str,
-        previous_config_name,
-    ) -> bool:
-        try:
-            config.set(
-                CURRENT_GROUP_NAME_KEY,
-                previous_config_name,
+    def require_complete_registry_choice(choice: PlayerGroupChoice) -> None:
+        identities = tuple(member.entry_id for member in choice.members)
+        if (
+            not identities
+            or len(identities) != len(set(identities))
+            or any(
+                member.character_id != member.entry_id
+                for member in choice.members
             )
-            workspace_service.set_current_group(previous_group)
-            workspace_service.set_next_step(previous_next_step)
-            return True
-        except Exception:
-            return False
+        ):
+            raise RuntimeError("group has no complete stable identity source")
+
+    def publication_plan_for_choice(
+        transaction: IdentityDataTransaction,
+        choice: PlayerGroupChoice,
+        expected_group: GroupConfiguration | None,
+    ) -> CurrentGroupPublicationPlan[tuple]:
+        if (
+            group_character_registration_service is None
+            or character_view_service is None
+            or group_selection_service is None
+        ):
+            raise RuntimeError("group publication services are unavailable")
+        result = group_character_registration_service.stage_ensure_group(
+            transaction,
+            choice.name,
+            character_view_service.profiles_in_transaction(transaction),
+        )
+        actual_group = result.group
+        if actual_group != expected_group:
+            raise RuntimeError("group changed after input identity preview")
+        if actual_group is None:
+            require_complete_registry_choice(choice)
+        else:
+            _require_group_choice_matches_configuration(choice, actual_group)
+        character_view_service.stage_replace(transaction, result.profiles)
+        return CurrentGroupPublicationPlan(
+            choice.name,
+            group_selection_service.workspace_group(choice, result.profiles),
+            result.profiles,
+        )
 
     def change_input_policy(value: str) -> None:
         policy = normalize_input_policy(value)
@@ -3396,29 +3560,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         auto_click_service.stop()
         config.set(INPUT_POLICY_KEY, policy.value)
         status["input_policy"] = policy.value
-
-    def workspace_group_for_choice(choice):
-        profiles = (
-            character_store.load()
-            if character_store is not None
-            else ()
-        )
-        if group_character_registration_service is not None:
-            profiles = group_character_registration_service.ensure_group(
-                choice.name,
-                profiles,
-            )
-        if character_view_service is not None:
-            character_view_service.replace_characters(profiles)
-        refreshed_choice = (
-            group_selection_service.find(choice.name)
-            if group_selection_service is not None
-            else None
-        )
-        return group_selection_service.workspace_group(
-            refreshed_choice or choice,
-            tuple(profiles),
-        )
 
     def change_group(name: str) -> GroupManagementViewResult:
         current_workspace = workspace_service.snapshot()
@@ -3454,9 +3595,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "目前操作尚未安全停止，未切換組別。",
             )
         old_choice = group_selection_service.find(current_name)
-        old_config_name = config.get(
-            CURRENT_GROUP_NAME_KEY,
-            current_name or "",
+        expected_group = (
+            group_configuration_service.group(choice.name)
+            if group_configuration_service is not None
+            else None
         )
         try:
             automation_stopped = (
@@ -3473,15 +3615,23 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "自動操作尚未完全停止，未切換組別。",
             )
         try:
-            selected_workspace_group = workspace_group_for_choice(choice)
-            identity_ready = apply_group_identity(choice) is not None
-            if not identity_ready:
-                clear_group_identity()
-            config.set(CURRENT_GROUP_NAME_KEY, choice.name)
-            workspace_service.set_current_group(
-                selected_workspace_group
+            identity_ready = _rebuild_group_input_identity(
+                choice,
+                apply_group_identity,
+                clear_group_identity,
             )
-            workspace_service.set_next_step("查看目前需要注意的內容")
+            if current_group_publication_service is None:
+                raise RuntimeError("current group publication is unavailable")
+            current_group_publication_service.execute(
+                lambda transaction: publication_plan_for_choice(
+                    transaction,
+                    choice,
+                    expected_group,
+                )
+            )
+        except CurrentGroupPublicationNotificationError as error:
+            if logger is not None:
+                logger.error(str(error))
         except Exception:
             rollback_ready = restore_group_identity(old_choice)
             if not rollback_ready:
@@ -3490,27 +3640,31 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                     rollback_ready = True
                 except Exception:
                     rollback_ready = False
-            publication_restored = restore_published_group(
-                current_group,
-                current_workspace.next_step,
-                old_config_name,
-            )
-            if rollback_ready and publication_restored:
+            if rollback_ready:
                 reopen_group_operation_gate()
             return GroupManagementViewResult(
                 False,
                 current_name,
                 "組別身分無法完整重新綁定，未切換組別。",
             )
+        try:
+            workspace_service.set_next_step("查看目前需要注意的內容")
+        except Exception as error:
+            if logger is not None:
+                logger.error(f"Workspace next-step update failed: {error}")
         reopen_group_operation_gate()
-        refresh_confirmed_activity_group_scope(
-            workspace_service=workspace_service,
-            confirmed_activity_rule_service=confirmed_activity_rule_service,
-            logger=logger,
-        )
-        if group_role_status_service is not None:
-            group_role_status_service.clear_cache()
-        refresh_character_data(choice.name)
+        try:
+            refresh_confirmed_activity_group_scope(
+                workspace_service=workspace_service,
+                confirmed_activity_rule_service=confirmed_activity_rule_service,
+                logger=logger,
+            )
+            if group_role_status_service is not None:
+                group_role_status_service.clear_cache()
+            refresh_character_data(choice.name)
+        except Exception as error:
+            if logger is not None:
+                logger.error(f"Committed group UI refresh failed: {error}")
         if not identity_ready:
             return GroupManagementViewResult(
                 True,
@@ -3551,85 +3705,208 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         return stopped
 
-    def finish_group_management(
-        selected_name: str | None,
-    ) -> GroupManagementViewResult:
+    class _GroupMutationRejected(RuntimeError):
+        pass
+
+    def finish_group_management(mutation):
         if (
             group_selection_service is None
+            or group_configuration_service is None
+            or group_character_registration_service is None
+            or character_view_service is None
+            or current_group_publication_service is None
             or workspace_service is None
             or config is None
         ):
-            return GroupManagementViewResult(
-                False,
+            return (
+                GroupManagementViewResult(
+                    False,
+                    None,
+                    "組別資料尚未準備完成。",
+                ),
                 None,
-                "組別資料尚未準備完成。",
             )
-        choice = (
-            group_selection_service.find(selected_name)
-            if selected_name is not None
-            else None
-        )
         current_workspace = workspace_service.snapshot()
         current_group = current_workspace.current_group
         current_name = (
             current_group.name if current_group is not None else None
         )
         old_choice = group_selection_service.find(current_name)
-        old_config_name = config.get(
-            CURRENT_GROUP_NAME_KEY,
-            current_name or "",
-        )
         if not close_group_operation_gate():
-            return GroupManagementViewResult(
-                False,
-                current_name,
-                "目前操作尚未安全停止，組別設定未套用。",
+            return (
+                GroupManagementViewResult(
+                    False,
+                    current_name,
+                    "目前操作尚未安全停止，組別設定未套用。",
+                ),
+                None,
             )
         try:
-            if choice is not None:
-                selected_workspace_group = workspace_group_for_choice(choice)
-                if apply_group_identity(choice) is None:
-                    raise RuntimeError("group_identity_unresolved")
-            else:
-                clear_group_identity()
-                selected_workspace_group = None
-            config.set(
-                CURRENT_GROUP_NAME_KEY,
-                choice.name if choice is not None else "",
-            )
-            workspace_service.set_current_group(selected_workspace_group)
-            workspace_service.set_next_step(
-                "查看目前需要注意的內容"
-                if choice is not None
-                else "選擇組別"
+            clear_group_identity()
+
+            def prepare_group_mutation(transaction: IdentityDataTransaction):
+                payload, selected_group, affected_groups, detachments = (
+                    group_configuration_service.stage_candidate(
+                        transaction,
+                        mutation,
+                    )
+                )
+                if selected_group is not None and not isinstance(
+                    selected_group,
+                    GroupConfiguration,
+                ):
+                    raise TypeError("mutation selected group is invalid")
+                affected_groups = tuple(affected_groups)
+                if any(
+                    not isinstance(group, GroupConfiguration)
+                    for group in affected_groups
+                ):
+                    raise TypeError("mutation affected groups are invalid")
+                affected_names = tuple(
+                    group.name for group in affected_groups
+                )
+                if len(affected_names) != len(set(affected_names)):
+                    raise ValueError("mutation affected groups are duplicated")
+                if (
+                    selected_group is not None
+                    and selected_group.name not in set(affected_names)
+                ):
+                    raise ValueError(
+                        "selected group must be one affected candidate"
+                    )
+                profiles = character_view_service.profiles_in_transaction(
+                    transaction
+                )
+                registration = (
+                    group_character_registration_service.stage_reconcile(
+                        transaction,
+                        profiles=profiles,
+                        group_names=affected_names,
+                        detachments=detachments,
+                        group_overrides=affected_groups,
+                    )
+                )
+                if selected_group is not None:
+                    if registration.groups != affected_groups:
+                        raise RuntimeError(
+                            "group candidate changed during registration"
+                        )
+                    choice = _player_group_choice_for_configuration(
+                        selected_group
+                    )
+                    _require_group_choice_matches_configuration(
+                        choice,
+                        selected_group,
+                    )
+                    workspace_group = group_selection_service.workspace_group(
+                        choice,
+                        registration.profiles,
+                    )
+                    group_name = selected_group.name
+                else:
+                    choice = None
+                    workspace_group = None
+                    group_name = ""
+                character_view_service.stage_replace(
+                    transaction,
+                    registration.profiles,
+                )
+                return CurrentGroupPublicationPlan(
+                    group_name,
+                    workspace_group,
+                    (payload, choice),
+                )
+
+            try:
+                publication = current_group_publication_service.execute(
+                    prepare_group_mutation
+                )
+            except CurrentGroupPublicationNotificationError as error:
+                publication = error.result
+                if logger is not None:
+                    logger.error(str(error))
+        except _GroupMutationRejected as error:
+            restored = restore_group_identity(old_choice)
+            if restored:
+                reopen_group_operation_gate()
+            return (
+                GroupManagementViewResult(False, current_name, str(error)),
+                None,
             )
         except Exception:
-            rollback_ready = restore_group_identity(old_choice)
-            publication_restored = restore_published_group(
-                current_group,
-                current_workspace.next_step,
-                old_config_name,
-            )
-            if rollback_ready and publication_restored:
+            restored = restore_group_identity(old_choice)
+            if restored:
                 reopen_group_operation_gate()
-            return GroupManagementViewResult(
-                False,
-                current_name,
-                "組別身分無法完整重新綁定，設定未套用。",
+            return (
+                GroupManagementViewResult(
+                    False,
+                    current_name,
+                    "組別資料交易失敗，原本設定已完整保留。",
+                ),
+                None,
             )
+
+        payload, _transaction_choice = publication.result
+        published_name = publication.group_name or None
+        try:
+            workspace_service.set_next_step(
+                "查看目前需要注意的內容"
+                if published_name is not None
+                else "選擇組別"
+            )
+        except Exception as error:
+            if logger is not None:
+                logger.error(f"Workspace next-step update failed: {error}")
+
+        identity_ready = published_name is None
+        if published_name is None:
+            _rebuild_group_input_identity(
+                None,
+                apply_group_identity,
+                clear_group_identity,
+            )
+        else:
+            committed_choice = group_selection_service.find(published_name)
+            committed_group = group_configuration_service.group(published_name)
+            if committed_choice is not None and committed_group is not None:
+                try:
+                    _require_group_choice_matches_configuration(
+                        committed_choice,
+                        committed_group,
+                    )
+                    identity_ready = _rebuild_group_input_identity(
+                        committed_choice,
+                        apply_group_identity,
+                        clear_group_identity,
+                    )
+                except Exception:
+                    identity_ready = False
+            if not identity_ready:
+                clear_group_identity()
         reopen_group_operation_gate()
-        refresh_confirmed_activity_group_scope(
-            workspace_service=workspace_service,
-            confirmed_activity_rule_service=confirmed_activity_rule_service,
-            logger=logger,
-        )
-        if group_role_status_service is not None:
-            group_role_status_service.clear_cache()
-        if operation_record_store is not None:
-            operation_record_store.ensure_daily_file()
-        return GroupManagementViewResult(
-            True,
-            choice.name if choice is not None else None,
+        try:
+            refresh_confirmed_activity_group_scope(
+                workspace_service=workspace_service,
+                confirmed_activity_rule_service=confirmed_activity_rule_service,
+                logger=logger,
+            )
+            if group_role_status_service is not None:
+                group_role_status_service.clear_cache()
+            if operation_record_store is not None:
+                operation_record_store.ensure_daily_file()
+            refresh_character_data(published_name)
+        except Exception as error:
+            if logger is not None:
+                logger.error(f"Committed group UI refresh failed: {error}")
+        message = None
+        if published_name is not None and not identity_ready:
+            message = (
+                "組別設定已套用；此組視窗身分尚未完整，"
+                "同步與智慧重連已保持停用。"
+            )
+        return (
+            GroupManagementViewResult(True, published_name, message),
+            payload,
         )
 
     def group_configuration_stop_failure(
@@ -3640,16 +3917,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             current_name,
             "自動操作尚未完全停止，組別設定未變更。",
         )
-
-    def detach_group_entries(
-        group_name: str,
-        entry_ids,
-    ) -> None:
-        if group_character_registration_service is not None:
-            group_character_registration_service.detach_entries(
-                group_name,
-                entry_ids,
-            )
 
     def create_group(name: str) -> GroupManagementViewResult:
         if group_configuration_service is None:
@@ -3668,13 +3935,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         if not stop_group_automation_for_configuration_change():
             return group_configuration_stop_failure(current_name)
-        if not group_configuration_service.create_group(name):
-            return GroupManagementViewResult(
-                False,
-                current_name,
-                "已有相同名稱的組別。",
-            )
-        return finish_group_management(name)
+        def mutation(candidate):
+            if not candidate.create_group(name):
+                raise _GroupMutationRejected("已有相同名稱的組別。")
+            group = candidate.group(name)
+            return True, group, (group,), ()
+
+        result, _payload = finish_group_management(mutation)
+        return result
 
     def rename_group(
         old_name: str,
@@ -3685,19 +3953,26 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 False,
                 old_name,
                 "組別設定尚未準備完成。",
-            )
+        )
         if not stop_group_automation_for_configuration_change():
             return group_configuration_stop_failure(old_name)
-        if not group_configuration_service.rename_group(
-            old_name,
-            new_name,
-        ):
-            return GroupManagementViewResult(
-                False,
-                old_name,
-                "名稱沒有變更，或已有相同名稱的組別。",
-            )
-        return finish_group_management(new_name)
+        def mutation(candidate):
+            previous = candidate.group(old_name)
+            if not candidate.rename_group(old_name, new_name):
+                raise _GroupMutationRejected(
+                    "名稱沒有變更，或已有相同名稱的組別。"
+                )
+            detachments = (
+                (
+                    old_name,
+                    tuple(entry.entry_id for entry in previous.entries),
+                ),
+            ) if previous is not None else ()
+            group = candidate.group(new_name)
+            return True, group, (group,), detachments
+
+        result, _payload = finish_group_management(mutation)
+        return result
 
     def delete_group(name: str) -> GroupManagementViewResult:
         if (
@@ -3709,24 +3984,27 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 name,
                 "組別設定尚未準備完成。",
             )
-        group = group_configuration_service.group(name)
-        removed_entry_ids = (
-            tuple(entry.entry_id for entry in group.entries)
-            if group is not None
-            else ()
-        )
         if not stop_group_automation_for_configuration_change():
             return group_configuration_stop_failure(name)
-        if not group_configuration_service.delete_group(name):
-            return GroupManagementViewResult(
-                False,
-                name,
-                "找不到要刪除的組別。",
+        def mutation(candidate):
+            previous = candidate.group(name)
+            if previous is None or not candidate.delete_group(name):
+                raise _GroupMutationRejected("找不到要刪除的組別。")
+            remaining = candidate.groups()
+            detachments = (
+                (
+                    name,
+                    tuple(entry.entry_id for entry in previous.entries),
+                ),
             )
-        detach_group_entries(name, removed_entry_ids)
-        choices = group_selection_service.choices()
-        selected = choices[0].name if choices else None
-        return finish_group_management(selected)
+            selected_group = remaining[0] if remaining else None
+            affected_groups = (
+                (selected_group,) if selected_group is not None else ()
+            )
+            return True, selected_group, affected_groups, detachments
+
+        result, _payload = finish_group_management(mutation)
+        return result
 
     def move_group(
         name: str,
@@ -3737,16 +4015,17 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 False,
                 name,
                 "組別設定尚未準備完成。",
-            )
+        )
         if not stop_group_automation_for_configuration_change():
             return group_configuration_stop_failure(name)
-        if not group_configuration_service.move_group(name, direction):
-            return GroupManagementViewResult(
-                False,
-                name,
-                "目前已在最上方或最下方。",
-            )
-        return finish_group_management(name)
+        def mutation(candidate):
+            if not candidate.move_group(name, direction):
+                raise _GroupMutationRejected("目前已在最上方或最下方。")
+            group = candidate.group(name)
+            return True, group, (group,), ()
+
+        result, _payload = finish_group_management(mutation)
+        return result
 
     def export_group_configuration() -> object:
         if group_configuration_service is None:
@@ -3796,63 +4075,68 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             and workspace_snapshot.current_group is not None
             else None
         )
-        previous_entries = {
-            group.name: frozenset(
-                entry.entry_id for entry in group.entries
-            )
-            for group in group_configuration_service.groups()
-        }
         if not stop_group_automation_for_configuration_change():
             return group_configuration_stop_failure(current_name)
-        try:
-            imported_names = (
-                group_configuration_service.import_configuration(
+        def mutation(candidate):
+            previous_entries = {
+                group.name: frozenset(
+                    entry.entry_id for entry in group.entries
+                )
+                for group in candidate.groups()
+            }
+            try:
+                imported_names = candidate.import_configuration(
                     Path(selected),
                     reserved_hotkeys=(
                         configured_feature_hotkeys.values()
                     ),
                 )
-            )
-        except SyncCycleError:
-            return GroupManagementViewResult(
-                False,
-                current_name,
-                SyncCycleError.player_message,
-            )
-        except (OSError, UnicodeError, ValueError) as error:
-            if logger is not None:
-                logger.warning(
-                    f"Group configuration import failed: {error}"
+            except SyncCycleError as error:
+                raise _GroupMutationRejected(error.player_message) from error
+            except (OSError, UnicodeError, ValueError) as error:
+                if logger is not None:
+                    logger.warning(
+                        f"Group configuration import failed: {error}"
+                    )
+                raise _GroupMutationRejected(
+                    "組別設定無法匯入，原本設定已保留。"
+                ) from error
+            current_entries = {
+                group.name: frozenset(
+                    entry.entry_id for entry in group.entries
                 )
-            return GroupManagementViewResult(
-                False,
-                current_name,
-                "組別設定無法匯入，原本設定已保留。",
-            )
-        for old_group_name, old_entry_ids in previous_entries.items():
-            current_group = group_configuration_service.group(
-                old_group_name
-            )
-            current_entry_ids = (
-                frozenset(
-                    entry.entry_id for entry in current_group.entries
+                for group in candidate.groups()
+            }
+            detachments = tuple(
+                (
+                    old_group_name,
+                    tuple(
+                        old_entry_ids
+                        - current_entries.get(old_group_name, frozenset())
+                    ),
                 )
-                if current_group is not None
-                else frozenset()
+                for old_group_name, old_entry_ids in previous_entries.items()
+                if old_entry_ids
+                - current_entries.get(old_group_name, frozenset())
             )
-            detach_group_entries(
-                old_group_name,
-                old_entry_ids - current_entry_ids,
+            selected_name = (
+                current_name
+                if current_name is not None
+                and candidate.group(current_name) is not None
+                else (imported_names[0] if imported_names else None)
             )
-        selected_name = (
-            current_name
-            if current_name is not None
-            and group_configuration_service.group(current_name) is not None
-            else imported_names[0]
-        )
-        result = finish_group_management(selected_name)
+            return (
+                imported_names,
+                candidate.group(selected_name) if selected_name else None,
+                candidate.groups(),
+                detachments,
+            )
+
+        result, imported_names = finish_group_management(mutation)
+        if not result.success:
+            return result
         return GroupManagementViewResult(
-            result.success,
+            True,
             result.current_group_name,
             f"已匯入 {len(imported_names)} 個組別；同名組別已更新。",
         )
@@ -3867,19 +4151,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group_name: str,
         hotkey: str,
     ) -> object:
-        if group_configuration_service is None:
+        if feature_card_settings_batch_service is None:
             return "組別設定尚未準備完成。"
-        normalized = normalize_feature_hotkey(hotkey)
-        if normalized and normalized in configured_feature_hotkeys.values():
-            return "無法設定：這個快捷鍵已被其他功能使用"
-        try:
-            group_configuration_service.set_launch_hotkey(
+        result = (
+            feature_card_settings_batch_service.change_group_launch_hotkey(
                 group_name,
-                normalized,
+                hotkey,
             )
-        except GroupHotkeyConflictError:
-            return GroupHotkeyConflictError.player_message
-        return None
+        )
+        return None if result.succeeded else result.message
 
     def save_feature_card_settings(
         *,
@@ -3962,16 +4242,20 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return "整組啟動正在進行中，未變更角色順序。"
         if not stop_group_automation_for_configuration_change():
             return "自動操作尚未完全停止，未變更角色順序。"
-        try:
-            changed = group_configuration_service.reorder_group_entries(
-                group_name,
-                entry_ids,
-            )
-        except GroupMasterLockedError:
-            return GroupMasterLockedError.player_message
-        if not changed:
-            return "角色順序沒有變更。"
-        result = finish_group_management(group_name)
+        def mutation(candidate):
+            try:
+                changed = candidate.reorder_group_entries(
+                    group_name,
+                    entry_ids,
+                )
+            except GroupMasterLockedError as error:
+                raise _GroupMutationRejected(error.player_message) from error
+            if not changed:
+                raise _GroupMutationRejected("角色順序沒有變更。")
+            group = candidate.group(group_name)
+            return True, group, (group,), ()
+
+        result, _payload = finish_group_management(mutation)
         if result.success and operation_record_store is not None:
             operation_record_store.append(
                 "組別設定",
@@ -4015,20 +4299,31 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return False
         if not stop_group_automation_for_configuration_change():
             return "自動操作尚未完全停止，未加入角色。"
+        def mutation(candidate):
+            try:
+                added = candidate.add_shortcuts(
+                    group_name,
+                    tuple(Path(path) for path in selected),
+                )
+            except (SyncCycleError, GroupMasterLockedError) as error:
+                raise _GroupMutationRejected(error.player_message) from error
+            if not added:
+                raise _GroupMutationRejected("角色沒有變更。")
+            group = candidate.group(group_name)
+            return added, group, (group,), ()
+
+        result, added = finish_group_management(mutation)
+        if not result.success:
+            return result.message or False
         try:
-            added = group_configuration_service.add_shortcuts(
-                group_name,
-                tuple(Path(path) for path in selected),
-            )
-        except (SyncCycleError, GroupMasterLockedError) as error:
-            return error.player_message
-        if added:
-            finish_group_management(group_name)
-        if home_view is not None:
-            home_view.refresh_group_entries()
-            home_view.refresh_group_sync_relations()
-        if operation_record_store is not None:
-            operation_record_store.ensure_daily_file()
+            if home_view is not None:
+                home_view.refresh_group_entries()
+                home_view.refresh_group_sync_relations()
+            if operation_record_store is not None:
+                operation_record_store.ensure_daily_file()
+        except Exception as error:
+            if logger is not None:
+                logger.error(f"Committed group refresh failed: {error}")
         return bool(added)
 
     def add_ungrouped_window_to_group(
@@ -4061,42 +4356,51 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 current_name,
                 "自動操作尚未完全停止，未加入角色。",
             )
-        try:
-            added = group_configuration_service.add_shortcuts(
-                group_name,
-                (shortcut_path,),
+        def mutation(candidate):
+            try:
+                added = candidate.add_shortcuts(
+                    group_name,
+                    (shortcut_path,),
+                )
+            except (SyncCycleError, GroupMasterLockedError) as error:
+                raise _GroupMutationRejected(error.player_message) from error
+            except Exception as error:
+                raise _GroupMutationRejected(
+                    "加入組別時發生錯誤，原本設定已保留。"
+                ) from error
+            if not added:
+                raise _GroupMutationRejected(
+                    "捷徑已在所選組別，沒有變更。"
+                )
+            changed_group = candidate.group(group_name)
+            selected_group = (
+                candidate.group(current_name)
+                if current_name is not None
+                else None
             )
-        except (SyncCycleError, GroupMasterLockedError) as error:
-            return GroupManagementViewResult(
-                False,
-                current_name,
-                error.player_message,
+            affected_groups = tuple(
+                group
+                for group in (changed_group, selected_group)
+                if group is not None
             )
-        except Exception:
-            return GroupManagementViewResult(
-                False,
-                current_name,
-                "加入組別時發生錯誤，原本設定已保留。",
-            )
-        if not added:
-            return GroupManagementViewResult(
-                False,
-                current_name,
-                "捷徑已在所選組別，沒有變更。",
-            )
-        refresh_warning = False
-        try:
-            refresh_character_data(group_name)
-        except Exception:
-            refresh_warning = True
-        refreshed = finish_group_management(current_name)
+            if len(affected_groups) == 2 and (
+                affected_groups[0].name == affected_groups[1].name
+            ):
+                affected_groups = affected_groups[:1]
+            return added, selected_group, affected_groups, ()
+
+        refreshed, added = finish_group_management(mutation)
         if not refreshed.success:
-            refresh_warning = True
+            return refreshed
         if operation_record_store is not None:
-            operation_record_store.ensure_daily_file()
+            try:
+                operation_record_store.ensure_daily_file()
+            except Exception as error:
+                if logger is not None:
+                    logger.error(f"Committed group record refresh failed: {error}")
         message = f"{shortcut_path.name} 已加入 {group_name}。"
-        if refresh_warning:
-            message += "目前組別顯示尚未完整重新套用，操作保持安全停止。"
+        if refreshed.message:
+            message += refreshed.message
         return GroupManagementViewResult(
             True,
             refreshed.current_group_name,
@@ -4109,37 +4413,49 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     ) -> object:
         if group_configuration_service is None:
             return False
-        group = group_configuration_service.group(group_name)
-        removed_entry = (
-            next(
-                (
-                    entry
-                    for entry in group.entries
-                    if entry.entry_id == entry_id
-                ),
-                None,
-            )
-            if group is not None
-            else None
-        )
         if not stop_group_automation_for_configuration_change():
             return "自動操作尚未完全停止，未移除角色。"
-        try:
-            removed = group_configuration_service.remove_shortcut(
-                group_name,
-                entry_id,
+        def mutation(candidate):
+            group = candidate.group(group_name)
+            removed_entry = (
+                next(
+                    (
+                        entry
+                        for entry in group.entries
+                        if entry.entry_id == entry_id
+                    ),
+                    None,
+                )
+                if group is not None
+                else None
             )
-        except GroupMasterLockedError:
-            return GroupMasterLockedError.player_message
-        if removed and removed_entry is not None:
-            detach_group_entries(group_name, (removed_entry.entry_id,))
-            finish_group_management(group_name)
-        if removed and home_view is not None:
-            home_view.refresh_group_entries()
-            home_view.refresh_group_sync_relations()
-        if removed and operation_record_store is not None:
-            operation_record_store.ensure_daily_file()
-        return removed
+            try:
+                removed = candidate.remove_shortcut(group_name, entry_id)
+            except GroupMasterLockedError as error:
+                raise _GroupMutationRejected(error.player_message) from error
+            if not removed or removed_entry is None:
+                raise _GroupMutationRejected("找不到要移除的角色。")
+            selected_group = candidate.group(group_name)
+            return (
+                True,
+                selected_group,
+                (selected_group,),
+                ((group_name, (removed_entry.entry_id,)),),
+            )
+
+        result, removed = finish_group_management(mutation)
+        if not result.success:
+            return result.message or False
+        try:
+            if home_view is not None:
+                home_view.refresh_group_entries()
+                home_view.refresh_group_sync_relations()
+            if operation_record_store is not None:
+                operation_record_store.ensure_daily_file()
+        except Exception as error:
+            if logger is not None:
+                logger.error(f"Committed group refresh failed: {error}")
+        return bool(removed)
 
     def set_group_main(
         group_name: str,
@@ -4149,18 +4465,20 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             return False
         if not stop_group_automation_for_configuration_change():
             return "自動操作尚未完全停止，未變更主窗口。"
-        try:
-            changed = group_configuration_service.set_main_entry(
-                group_name,
-                entry_id,
-            )
-        except (SyncCycleError, GroupMasterLockedError) as error:
-            return error.player_message
-        if changed:
-            finish_group_management(group_name)
-        if changed and group_role_status_service is not None:
-            group_role_status_service.clear_cache()
-        return changed
+        def mutation(candidate):
+            try:
+                changed = candidate.set_main_entry(group_name, entry_id)
+            except (SyncCycleError, GroupMasterLockedError) as error:
+                raise _GroupMutationRejected(error.player_message) from error
+            if not changed:
+                raise _GroupMutationRejected("主窗口沒有變更。")
+            group = candidate.group(group_name)
+            return True, group, (group,), ()
+
+        result, changed = finish_group_management(mutation)
+        if not result.success:
+            return result.message or False
+        return bool(changed)
 
     def clear_group(
         group_name: str,
@@ -4171,30 +4489,33 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 group_name,
                 "組別設定尚未準備完成。",
             )
-        group = group_configuration_service.group(group_name)
-        removed_entry_ids = (
-            tuple(entry.entry_id for entry in group.entries)
-            if group is not None
-            else ()
-        )
         if not stop_group_automation_for_configuration_change():
             return group_configuration_stop_failure(group_name)
-        try:
-            changed = group_configuration_service.clear_group(group_name)
-        except GroupMasterLockedError:
-            return GroupManagementViewResult(
-                False,
-                group_name,
-                GroupMasterLockedError.player_message,
+        def mutation(candidate):
+            group = candidate.group(group_name)
+            removed_entry_ids = (
+                tuple(entry.entry_id for entry in group.entries)
+                if group is not None
+                else ()
             )
-        if not changed:
-            return GroupManagementViewResult(
-                False,
-                group_name,
-                "目前組別沒有可清空的角色。",
+            try:
+                changed = candidate.clear_group(group_name)
+            except GroupMasterLockedError as error:
+                raise _GroupMutationRejected(error.player_message) from error
+            if not changed:
+                raise _GroupMutationRejected(
+                    "目前組別沒有可清空的角色。"
+                )
+            selected_group = candidate.group(group_name)
+            return (
+                True,
+                selected_group,
+                (selected_group,),
+                ((group_name, removed_entry_ids),),
             )
-        detach_group_entries(group_name, removed_entry_ids)
-        return finish_group_management(group_name)
+
+        result, _payload = finish_group_management(mutation)
+        return result
 
     def unique_window_for_group_entry(
         group_name: str,
@@ -4403,6 +4724,74 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         refresh_group_sync_identity(group_name)
         return "已清除角色偏移與延遲；同步已安全停止。"
 
+    def commit_role_id(
+        group_name: str,
+        entry_id: str,
+        role_id: str,
+        *,
+        only_if_missing: bool = False,
+    ) -> tuple[GroupManagementViewResult, bool]:
+        current_name = current_group_name()
+        if not stop_group_automation_for_configuration_change():
+            return (
+                GroupManagementViewResult(
+                    False,
+                    current_name,
+                    "自動操作尚未完全停止，未保存角色ID。",
+                ),
+                False,
+            )
+
+        def mutation(candidate):
+            target_group = candidate.group(group_name)
+            if target_group is None:
+                raise _GroupMutationRejected("找不到角色所屬組別。")
+            target_entry = next(
+                (
+                    entry
+                    for entry in target_group.entries
+                    if entry.entry_id == entry_id
+                ),
+                None,
+            )
+            if target_entry is None:
+                raise _GroupMutationRejected("找不到要保存角色ID的角色。")
+            selected_group = (
+                candidate.group(current_name)
+                if current_name is not None
+                else None
+            )
+            if current_name is not None and selected_group is None:
+                raise _GroupMutationRejected(
+                    "目前組別缺少完整群組身分，未保存角色ID。"
+                )
+            changed = False
+            if not only_if_missing or not target_entry.role_id.strip():
+                changed = candidate.set_role_id(
+                    group_name,
+                    entry_id,
+                    role_id,
+                )
+            changed_group = candidate.group(group_name)
+            selected_group = (
+                candidate.group(current_name)
+                if current_name is not None
+                else None
+            )
+            affected_groups = tuple(
+                group
+                for group in (changed_group, selected_group)
+                if group is not None
+            )
+            if len(affected_groups) == 2 and (
+                affected_groups[0].name == affected_groups[1].name
+            ):
+                affected_groups = affected_groups[:1]
+            return changed, selected_group, affected_groups, ()
+
+        result, changed = finish_group_management(mutation)
+        return result, bool(changed) if result.success else False
+
     def calibrate_role_id(
         group_name: str,
         entry_id: str,
@@ -4420,12 +4809,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             entry_id=entry_id,
         )
         if result.success:
-            group_configuration_service.set_role_id(
+            committed, _changed = commit_role_id(
                 group_name,
                 entry_id,
                 result.role_id,
             )
-            refresh_group_sync_identity(group_name)
+            if not committed.success:
+                return committed.message or "角色ID未保存。"
+            if committed.message:
+                return f"{result.message}{committed.message}"
         return result.message
 
     def read_role_id(group_name: str, entry_id: str) -> str:
@@ -4442,13 +4834,15 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             entry_id=entry_id,
         )
         if result.success:
-            group_configuration_service.set_role_id(
+            committed, _changed = commit_role_id(
                 group_name,
                 entry_id,
                 result.role_id,
             )
-            refresh_group_sync_identity(group_name)
-            return f"已讀取遊戲內角色ID：{result.role_id}"
+            if not committed.success:
+                return committed.message or "角色ID未保存。"
+            message = f"已讀取遊戲內角色ID：{result.role_id}"
+            return f"{message}{committed.message or ''}"
         return result.message
 
     def add_group_sync_relation(
@@ -4630,16 +5024,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             or character_detail_view_service is None
         ):
             return
-        if (
-            group_name
-            and character_store is not None
-            and group_character_registration_service is not None
-        ):
-            profiles = group_character_registration_service.ensure_group(
-                group_name,
-                character_store.load(),
-            )
-            character_view_service.replace_characters(profiles)
         if home_view is None:
             return
         choices = CharacterDetailChoiceService(
@@ -5884,13 +6268,13 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                     else None
                 )
                 if latest_entry is not None and not latest_entry.role_id.strip():
-                    saved = group_configuration_service.set_role_id(
+                    committed, saved = commit_role_id(
                         group_name,
                         entry.entry_id,
                         result.role_id,
+                        only_if_missing=True,
                     )
-                    if saved:
-                        refresh_group_sync_identity(group_name)
+                    if committed.success and saved:
                         home_view.refresh_group_entries()
                         home_view.refresh_group_role_statuses()
         except Exception:
@@ -6473,25 +6857,28 @@ def _run_application(
                     shutdown_event_subscriptions(logger)
                 finally:
                     try:
-                        save_registry(logger)
-                    except Exception:
-                        if logger is not None:
-                            logger.error(
-                                "Registry final save failed:\n"
-                                f"{traceback.format_exc()}"
-                            )
+                        shutdown_external_adapter(logger)
                     finally:
                         try:
-                            shutdown_external_adapter(logger)
+                            save_registry(logger)
+                        except Exception:
+                            if logger is not None:
+                                logger.error(
+                                    "Registry final save failed:\n"
+                                    f"{traceback.format_exc()}"
+                                )
                         finally:
                             try:
-                                shutdown_ui_font_service(logger)
+                                shutdown_identity_data_transactions(logger)
                             finally:
-                                close_operation_record_store(
-                                    operation_record_store,
-                                    logger,
-                                )
-                                close_logger(logger)
+                                try:
+                                    shutdown_ui_font_service(logger)
+                                finally:
+                                    close_operation_record_store(
+                                        operation_record_store,
+                                        logger,
+                                    )
+                                    close_logger(logger)
 
 
 def run(

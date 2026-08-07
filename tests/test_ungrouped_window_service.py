@@ -2,8 +2,22 @@ from pathlib import Path
 
 from adapters.windows_window import WindowInfo
 from core.reconnect_policy import ReconnectScreenState
-from services.group_configuration_service import GroupConfigurationService
+from services.group_configuration_service import (
+    GroupConfigurationService as _GroupConfigurationService,
+)
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
 from services.ungrouped_window_service import UngroupedWindowService
+
+
+class GroupConfigurationService(_GroupConfigurationService):
+    def __init__(self, path, *, legacy_config_path=None):
+        super().__init__(
+            path,
+            IdentityDataTransactionCoordinator(),
+            legacy_config_path=legacy_config_path,
+        )
 
 
 def _shortcut(directory: Path, name: str) -> Path:

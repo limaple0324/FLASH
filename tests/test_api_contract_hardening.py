@@ -24,8 +24,13 @@ from services.data_contract_migration_service import (
     DataContractMigrationService,
 )
 from services.event_bus import EventBus
-from services.group_configuration_service import GroupConfigurationService
+from services.group_configuration_service import (
+    GroupConfigurationService as _GroupConfigurationService,
+)
 from services.game_operation_gate import GameOperationGate
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
 from services.group_selection_service import GroupSelectionService
 from services.keyboard_sync_monitor import Win32KeyboardStateBackend
 from services.lifecycle_contract import (
@@ -38,6 +43,15 @@ from services.sync_scope_service import SyncScopeService
 from services.target_window_contract_service import (
     TargetWindowContractService,
 )
+
+
+class GroupConfigurationService(_GroupConfigurationService):
+    def __init__(self, path, *, legacy_config_path=None):
+        super().__init__(
+            path,
+            IdentityDataTransactionCoordinator(),
+            legacy_config_path=legacy_config_path,
+        )
 
 
 class _Resolver:

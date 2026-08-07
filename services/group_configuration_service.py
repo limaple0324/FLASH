@@ -6,9 +6,9 @@ import hashlib
 import json
 import os
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping, TypeVar
 
 from domain.sync_target_settings import (
     MAX_SYNC_DELAY_MS,
@@ -22,6 +22,15 @@ from services.group_launch_service import (
     CONFIRMED_GROUP_ORDERS,
     SavedWindowPlacement,
 )
+from services.identity_data_transaction_coordinator import (
+    IdentityDataResource,
+    IdentityDataTransaction,
+    IdentityDataTransactionCoordinator,
+    IdentityTransactionValidationError,
+)
+
+
+_RESULT = TypeVar("_RESULT")
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +67,28 @@ class GroupConfiguration:
 class GroupSyncMemberChoice:
     entry_id: str
     label: str
+
+
+@dataclass(frozen=True, slots=True)
+class _GroupState:
+    groups: list[dict[str, object]]
+    sync_edges: dict[str, list[str]]
+    root_extras: dict[str, object]
+    migration_backup_path: Path | None = None
+    corrupt_backup_path: Path | None = None
+    recovered_from_backup: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _InitializationPlan:
+    state: _GroupState
+    write_primary: bool
+    expected_primary_exists: bool
+    expected_primary_content: bytes | None = None
+    corrupt_content: bytes | None = None
+    corrupt_path: Path | None = None
+    evidence_path: Path | None = None
+    evidence_content: bytes | None = None
 
 
 class SyncCycleError(ValueError):
@@ -122,22 +153,97 @@ class GroupConfigurationService:
     def __init__(
         self,
         path: Path,
+        coordinator: IdentityDataTransactionCoordinator,
         *,
         legacy_config_path: Path | None = None,
     ) -> None:
+        if not isinstance(coordinator, IdentityDataTransactionCoordinator):
+            raise TypeError("coordinator must be an IdentityDataTransactionCoordinator")
         self.path = Path(path)
+        self._coordinator = coordinator
         self._legacy_config_path = (
             Path(legacy_config_path)
             if legacy_config_path is not None
             else None
         )
-        self._groups: list[dict[str, object]] = []
-        self._sync_edges: dict[str, list[str]] = {}
-        self._root_extras: dict[str, object] = {}
-        self.migration_backup_path: Path | None = None
-        self.corrupt_backup_path: Path | None = None
-        self.recovered_from_backup = False
+        self._state = _GroupState([], {}, {})
         self._load_or_import()
+
+    @property
+    def coordinator(self) -> IdentityDataTransactionCoordinator:
+        return self._coordinator
+
+    @property
+    def _groups(self) -> list[dict[str, object]]:
+        return self._state.groups
+
+    @_groups.setter
+    def _groups(self, value: list[dict[str, object]]) -> None:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            raise RuntimeError("live group state requires a transaction")
+        self._state = replace(self._state, groups=value)
+
+    @property
+    def _sync_edges(self) -> dict[str, list[str]]:
+        return self._state.sync_edges
+
+    @_sync_edges.setter
+    def _sync_edges(self, value: dict[str, list[str]]) -> None:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            raise RuntimeError("live group state requires a transaction")
+        self._state = replace(self._state, sync_edges=value)
+
+    @property
+    def _root_extras(self) -> dict[str, object]:
+        return self._state.root_extras
+
+    @_root_extras.setter
+    def _root_extras(self, value: dict[str, object]) -> None:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            raise RuntimeError("live group state requires a transaction")
+        self._state = replace(self._state, root_extras=value)
+
+    @property
+    def migration_backup_path(self) -> Path | None:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._coordinator.snapshot(
+                lambda: self._state.migration_backup_path
+            )
+        return self._state.migration_backup_path
+
+    @migration_backup_path.setter
+    def migration_backup_path(self, value: Path | None) -> None:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            raise RuntimeError("live group state requires a transaction")
+        self._state = replace(self._state, migration_backup_path=value)
+
+    @property
+    def corrupt_backup_path(self) -> Path | None:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._coordinator.snapshot(
+                lambda: self._state.corrupt_backup_path
+            )
+        return self._state.corrupt_backup_path
+
+    @corrupt_backup_path.setter
+    def corrupt_backup_path(self, value: Path | None) -> None:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            raise RuntimeError("live group state requires a transaction")
+        self._state = replace(self._state, corrupt_backup_path=value)
+
+    @property
+    def recovered_from_backup(self) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._coordinator.snapshot(
+                lambda: self._state.recovered_from_backup
+            )
+        return self._state.recovered_from_backup
+
+    @recovered_from_backup.setter
+    def recovered_from_backup(self, value: bool) -> None:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            raise RuntimeError("live group state requires a transaction")
+        self._state = replace(self._state, recovered_from_backup=value)
 
     @classmethod
     def _safe_extra_value(cls, value: object) -> object:
@@ -435,12 +541,24 @@ class GroupConfigurationService:
                 seen.add(hotkey)
 
     @staticmethod
-    def _read_json(path: Path | None) -> Mapping[str, object] | None:
-        if path is None or not path.is_file():
+    def _read_json(
+        path: Path | None,
+        *,
+        suppress_io_errors: bool = False,
+    ) -> Mapping[str, object] | None:
+        if path is None:
             return None
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+            content = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            if suppress_io_errors:
+                return None
+            raise
+        try:
+            payload = json.loads(content.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
             return None
         return payload if isinstance(payload, Mapping) else None
 
@@ -452,42 +570,6 @@ class GroupConfigurationService:
             candidate = path.with_name(path.name + f"{label}.{index}")
             index += 1
         return candidate
-
-    @staticmethod
-    def _write_bytes_atomic(path: Path, data: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".tmp")
-        try:
-            with temporary.open("wb") as file:
-                file.write(data)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-    @classmethod
-    def _write_json_atomic(
-        cls,
-        path: Path,
-        payload: Mapping[str, object],
-    ) -> None:
-        data = (
-            json.dumps(
-                payload,
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n"
-        ).encode("utf-8")
-        cls._write_bytes_atomic(path, data)
-
-    def _preserve_owned_file(self, label: str) -> Path | None:
-        if not self.path.is_file():
-            return None
-        backup = self._next_sidecar_path(self.path, label)
-        self._write_bytes_atomic(backup, self.path.read_bytes())
-        return backup
 
     @classmethod
     def _payload_version(
@@ -516,7 +598,8 @@ class GroupConfigurationService:
         )
         self._groups = self._clean_groups(payload)
         self._sync_edges = self._clean_sync_edges(
-            payload.get("sync_edges")
+            payload.get("sync_edges"),
+            groups=self._groups,
         )
 
     @classmethod
@@ -540,28 +623,79 @@ class GroupConfigurationService:
         return changed
 
     def _load_or_import(self) -> None:
+        migration_plan = self._coordinator.execute(
+            self._prepare_initialization
+        )
+        if migration_plan is not None:
+            self._coordinator.execute(
+                lambda transaction: self._stage_initialization_activity(
+                    transaction,
+                    migration_plan,
+                )
+            )
+
+    def _prepare_initialization(
+        self,
+        transaction: IdentityDataTransaction,
+    ) -> _InitializationPlan | None:
+        self._coordinator.require_transaction(transaction)
         current_exists = self.path.is_file()
+        current_content = self.path.read_bytes() if current_exists else None
         current = self._read_json(self.path)
+
         if current is not None:
             version = self._payload_version(current, allow_legacy=False)
             if version is not None:
-                self._load_payload(current)
-                changed = self._merge_legacy_data()
+                candidate = _GroupConfigurationCandidate(
+                    self,
+                    _GroupState([], {}, {}),
+                )
+                candidate._load_payload(current)
+                candidate._merge_legacy_data()
+                changed = self._canonical_json(current) != self._canonical_json(
+                    self._payload_for_state(candidate._state)
+                )
                 if version < self.SCHEMA_VERSION:
-                    self.migration_backup_path = self._preserve_owned_file(
-                        ".pre-migration"
+                    assert current_content is not None
+                    evidence_path = self._next_sidecar_path(
+                        self.path,
+                        ".pre-migration",
                     )
-                    changed = True
-                if changed:
-                    self._save()
-                return
+                    candidate.migration_backup_path = evidence_path
+                    plan = _InitializationPlan(
+                        state=self._state_copy(candidate._state),
+                        write_primary=True,
+                        expected_primary_exists=True,
+                        expected_primary_content=current_content,
+                        evidence_path=evidence_path,
+                        evidence_content=current_content,
+                    )
+                    self._stage_migration_evidence(transaction, plan)
+                    return plan
+                plan = _InitializationPlan(
+                    state=self._state_copy(candidate._state),
+                    write_primary=changed,
+                    expected_primary_exists=True,
+                    expected_primary_content=current_content,
+                )
+                self._stage_initialization_activity(transaction, plan)
+                return None
 
-        if current_exists:
-            self.corrupt_backup_path = self._next_sidecar_path(
-                self.path,
-                ".corrupt",
-            )
-            os.replace(self.path, self.corrupt_backup_path)
+        corrupt_content = current_content if current_exists else None
+        corrupt_path = (
+            self._next_sidecar_path(self.path, ".corrupt")
+            if corrupt_content is not None
+            else None
+        )
+        candidate = _GroupConfigurationCandidate(
+            self,
+            _GroupState(
+                [],
+                {},
+                {},
+                corrupt_backup_path=corrupt_path,
+            ),
+        )
 
         backup = self._read_json(self.backup_path)
         if backup is not None:
@@ -570,24 +704,110 @@ class GroupConfigurationService:
                 allow_legacy=False,
             )
             if backup_version is not None:
-                self._load_payload(backup)
-                self.recovered_from_backup = True
-                self._save()
-                return
+                candidate._load_payload(backup)
+                candidate.corrupt_backup_path = corrupt_path
+                candidate.recovered_from_backup = True
+                plan = _InitializationPlan(
+                    state=self._state_copy(candidate._state),
+                    write_primary=True,
+                    expected_primary_exists=current_exists,
+                    expected_primary_content=current_content,
+                    corrupt_content=corrupt_content,
+                    corrupt_path=corrupt_path,
+                )
+                self._stage_initialization_activity(transaction, plan)
+                return None
 
         legacy = self._read_json(self._legacy_config_path)
         if legacy is not None:
-            self._load_payload(legacy)
-        if self._groups:
-            self.migration_backup_path = self._next_sidecar_path(
+            candidate._load_payload(legacy)
+            candidate.corrupt_backup_path = corrupt_path
+        if candidate._groups and corrupt_content is None:
+            evidence_path = self._next_sidecar_path(
                 self.path,
                 ".pre-migration",
             )
-            self._write_json_atomic(
-                self.migration_backup_path,
-                self._payload(),
+            candidate.migration_backup_path = evidence_path
+            evidence_content = self._serialize_state(candidate._state)
+            plan = _InitializationPlan(
+                state=self._state_copy(candidate._state),
+                write_primary=True,
+                expected_primary_exists=False,
+                evidence_path=evidence_path,
+                evidence_content=evidence_content,
             )
-            self._save()
+            self._stage_migration_evidence(transaction, plan)
+            return plan
+
+        plan = _InitializationPlan(
+            state=self._state_copy(candidate._state),
+            write_primary=bool(candidate._groups),
+            expected_primary_exists=current_exists,
+            expected_primary_content=current_content,
+            corrupt_content=corrupt_content,
+            corrupt_path=corrupt_path,
+        )
+        self._stage_initialization_activity(transaction, plan)
+        return None
+
+    def _stage_migration_evidence(
+        self,
+        transaction: IdentityDataTransaction,
+        plan: _InitializationPlan,
+    ) -> None:
+        self._coordinator.require_transaction(transaction)
+        if plan.evidence_path is None or plan.evidence_content is None:
+            raise ValueError("migration evidence is incomplete")
+        plan.evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        transaction.stage_file(
+            IdentityDataResource.GROUP_SETTINGS,
+            plan.evidence_path,
+            plan.evidence_content,
+            lambda value, expected=plan.evidence_content: value == expected,
+        )
+
+    def _stage_initialization_activity(
+        self,
+        transaction: IdentityDataTransaction,
+        plan: _InitializationPlan,
+    ) -> None:
+        self._coordinator.require_transaction(transaction)
+        current_exists = self.path.is_file()
+        current_content = self.path.read_bytes() if current_exists else None
+        if (
+            current_exists != plan.expected_primary_exists
+            or current_content != plan.expected_primary_content
+        ):
+            raise RuntimeError(
+                "group configuration changed during initialization"
+            )
+
+        if plan.corrupt_path is not None:
+            if plan.corrupt_content is None:
+                raise ValueError("corrupt recovery evidence is incomplete")
+            plan.corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+            transaction.stage_file(
+                IdentityDataResource.GROUP_SETTINGS,
+                plan.corrupt_path,
+                plan.corrupt_content,
+                lambda value, expected=plan.corrupt_content: value == expected,
+            )
+
+        if plan.write_primary:
+            self._stage_state(transaction, plan.state)
+            return
+        if plan.corrupt_content is not None:
+            transaction.stage_delete(
+                IdentityDataResource.GROUP_SETTINGS,
+                self.path,
+                lambda value, expected=plan.corrupt_content: value == expected,
+            )
+        if plan.state != self._state:
+            self._stage_state(
+                transaction,
+                plan.state,
+                include_primary=False,
+            )
 
     def _merge_legacy_data(self) -> bool:
         legacy = self._read_json(self._legacy_config_path)
@@ -659,19 +879,22 @@ class GroupConfigurationService:
                     changed = True
         return changed
 
-    def _known_entry_ids(self) -> set[str]:
+    @staticmethod
+    def _known_entry_ids(
+        groups: Iterable[Mapping[str, object]],
+    ) -> set[str]:
         return {
             str(entry["entry_id"])
-            for group in self._groups
+            for group in groups
             for entry in group["launch_entries"]
         }
 
+    @staticmethod
     def _implicit_sync_edges(
-        self,
-        groups: Iterable[Mapping[str, object]] | None = None,
+        groups: Iterable[Mapping[str, object]],
     ) -> dict[str, list[str]]:
         edges: dict[str, list[str]] = {}
-        for group in groups if groups is not None else self._groups:
+        for group in groups:
             raw_entries = group.get("launch_entries")
             if not isinstance(raw_entries, list) or len(raw_entries) < 2:
                 continue
@@ -690,28 +913,32 @@ class GroupConfigurationService:
                     targets.append(member)
         return edges
 
+    @classmethod
     def _combined_sync_edges(
-        self,
+        cls,
         *,
-        explicit: Mapping[str, Iterable[str]] | None = None,
-        groups: Iterable[Mapping[str, object]] | None = None,
+        explicit: Mapping[str, Iterable[str]],
+        groups: Iterable[Mapping[str, object]],
     ) -> dict[str, list[str]]:
-        combined = self._implicit_sync_edges(groups)
-        for source, raw_targets in (
-            explicit.items()
-            if explicit is not None
-            else self._sync_edges.items()
-        ):
+        combined = cls._implicit_sync_edges(groups)
+        for source, raw_targets in explicit.items():
             targets = combined.setdefault(source, [])
             for target in raw_targets:
                 if target != source and target not in targets:
                     targets.append(target)
         return combined
 
-    def _clean_sync_edges(self, value: object) -> dict[str, list[str]]:
+    @classmethod
+    def _clean_sync_edges(
+        cls,
+        value: object,
+        *,
+        groups: Iterable[Mapping[str, object]],
+    ) -> dict[str, list[str]]:
         if not isinstance(value, Mapping):
             return {}
-        known = self._known_entry_ids()
+        group_snapshot = tuple(groups)
+        known = cls._known_entry_ids(group_snapshot)
         edges: dict[str, list[str]] = {}
         for raw_source, raw_targets in value.items():
             if (
@@ -731,32 +958,251 @@ class GroupConfigurationService:
             )
             if targets:
                 edges[raw_source] = list(targets)
-        if self._has_cycle(self._combined_sync_edges(explicit=edges)):
+        if cls._has_cycle(
+            cls._combined_sync_edges(
+                explicit=edges,
+                groups=group_snapshot,
+            )
+        ):
             return {}
         return edges
 
-    def _payload(self) -> dict[str, object]:
+    @classmethod
+    def _payload_for_state(cls, state: _GroupState) -> dict[str, object]:
         return {
-            **deepcopy(self._root_extras),
-            "schema_version": self.SCHEMA_VERSION,
-            "groups": self._groups,
-            "sync_edges": self._sync_edges,
+            **deepcopy(state.root_extras),
+            "schema_version": cls.SCHEMA_VERSION,
+            "groups": deepcopy(state.groups),
+            "sync_edges": deepcopy(state.sync_edges),
         }
+
+    @staticmethod
+    def _canonical_json(value: object) -> bytes:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def _payload(self) -> dict[str, object]:
+        return self._payload_for_state(self._state)
 
     @property
     def backup_path(self) -> Path:
         return self.path.with_name(self.path.name + ".bak")
 
-    def _save(self) -> None:
-        current = self._read_json(self.path)
-        if current is not None:
-            self._write_bytes_atomic(
-                self.backup_path,
-                self.path.read_bytes(),
+    @staticmethod
+    def _state_copy(state: _GroupState) -> _GroupState:
+        return deepcopy(state)
+
+    def _install_state(self, state: _GroupState) -> None:
+        self._state = self._state_copy(state)
+
+    @classmethod
+    def _serialize_state(cls, state: _GroupState) -> bytes:
+        return (
+            json.dumps(
+                cls._payload_for_state(state),
+                ensure_ascii=False,
+                indent=2,
             )
-        self._write_json_atomic(self.path, self._payload())
+            + "\n"
+        ).encode("utf-8")
+
+    @classmethod
+    def _validate_state_bytes(
+        cls,
+        content: bytes,
+        expected: bytes,
+        state: _GroupState,
+    ) -> bool:
+        payload = json.loads(content.decode("utf-8"))
+        if not isinstance(payload, Mapping):
+            return False
+        return content == expected and cls._payload_version(
+            payload,
+            allow_legacy=False,
+        ) == cls.SCHEMA_VERSION and cls._validate_candidate_state(state)
+
+    @classmethod
+    def _validate_candidate_state(cls, state: _GroupState) -> bool:
+        if (
+            not isinstance(state, _GroupState)
+            or not isinstance(state.groups, list)
+            or not isinstance(state.sync_edges, dict)
+            or not isinstance(state.root_extras, dict)
+            or not isinstance(state.recovered_from_backup, bool)
+            or (
+                state.migration_backup_path is not None
+                and not isinstance(state.migration_backup_path, Path)
+            )
+            or (
+                state.corrupt_backup_path is not None
+                and not isinstance(state.corrupt_backup_path, Path)
+            )
+        ):
+            return False
+        payload = cls._payload_for_state(state)
+        if cls._safe_extras(payload, cls._ROOT_FIELDS) != state.root_extras:
+            return False
+        seen_names: set[str] = set()
+        seen_group_ids: set[str] = set()
+        seen_hotkeys: set[str] = set()
+        for group in state.groups:
+            if not isinstance(group, Mapping):
+                return False
+            name = cls._clean_name(group.get("name"))
+            group_id = group.get("group_id")
+            entries = group.get("launch_entries")
+            hotkey = group.get("launch_hotkey")
+            if (
+                name is None
+                or group.get("name") != name
+                or name.casefold() in seen_names
+                or not isinstance(group_id, str)
+                or cls._clean_group_id(group_id, name) != group_id
+                or group_id in seen_group_ids
+                or not isinstance(entries, list)
+                or not isinstance(hotkey, str)
+                or normalize_feature_hotkey(hotkey) != hotkey
+                or (hotkey and hotkey in seen_hotkeys)
+                or not isinstance(group.get("master_locked"), bool)
+                or not isinstance(
+                    group.get("entry_order_customized"),
+                    bool,
+                )
+            ):
+                return False
+            seen_names.add(name.casefold())
+            seen_group_ids.add(group_id)
+            if hotkey:
+                seen_hotkeys.add(hotkey)
+
+            seen_entries: set[str] = set()
+            main_count = 0
+            for entry in entries:
+                cleaned_entry = cls._clean_entry(entry)
+                if cleaned_entry is None:
+                    return False
+                entry_id = entry.get("entry_id")
+                role = entry.get("role")
+                if (
+                    not isinstance(entry_id, str)
+                    or entry_id in seen_entries
+                    or cleaned_entry["entry_id"] != entry_id
+                    or cleaned_entry["path"] != entry.get("path")
+                    or cleaned_entry["role"] != role
+                ):
+                    return False
+                seen_entries.add(entry_id)
+                if role == "主窗口":
+                    main_count += 1
+            if entries and main_count != 1:
+                return False
+
+        known = cls._known_entry_ids(state.groups)
+        for source, targets in state.sync_edges.items():
+            if (
+                not isinstance(source, str)
+                or source not in known
+                or not isinstance(targets, list)
+                or any(
+                    not isinstance(target, str)
+                    or target not in known
+                    or target == source
+                    for target in targets
+                )
+                or len(targets) != len(set(targets))
+            ):
+                return False
+        return not cls._has_cycle(
+            cls._combined_sync_edges(
+                explicit=state.sync_edges,
+                groups=state.groups,
+            )
+        )
+
+    def _stage_state(
+        self,
+        transaction: IdentityDataTransaction,
+        state: _GroupState,
+        *,
+        include_primary: bool = True,
+    ) -> None:
+        self._coordinator.require_transaction(transaction)
+        candidate = self._state_copy(state)
+        if not self._validate_candidate_state(candidate):
+            raise IdentityTransactionValidationError(
+                "invalid group configuration candidate"
+            )
+        if include_primary:
+            content = self._serialize_state(candidate)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            current = self._read_json(self.path)
+            if current is not None:
+                previous = self.path.read_bytes()
+                transaction.stage_file(
+                    IdentityDataResource.GROUP_SETTINGS,
+                    self.backup_path,
+                    previous,
+                    lambda value, expected=previous: value == expected,
+                )
+            transaction.stage_file(
+                IdentityDataResource.GROUP_SETTINGS,
+                self.path,
+                content,
+                lambda value, expected=content: self._validate_state_bytes(
+                    value,
+                    expected,
+                    candidate,
+                ),
+            )
+        transaction.stage_memory(
+            IdentityDataResource.GROUP_SETTINGS,
+            lambda: self._state_copy(self._state),
+            lambda candidate=candidate: self._install_state(candidate),
+            self._restore_state,
+        )
+
+    def _restore_state(self, state: object) -> None:
+        if not isinstance(state, _GroupState):
+            raise TypeError("invalid group-state snapshot")
+        self._state = self._state_copy(state)
+
+    def stage_candidate(
+        self,
+        transaction: IdentityDataTransaction,
+        mutation: Callable[[_GroupConfigurationCandidate], _RESULT],
+    ) -> _RESULT:
+        self._coordinator.require_transaction(transaction)
+        if not callable(mutation):
+            raise TypeError("mutation must be callable")
+        original = self._state_copy(self._state)
+        candidate = _GroupConfigurationCandidate(self, original)
+        result = mutation(candidate)
+        proposed = self._state_copy(candidate._state)
+        if candidate._save_requested and proposed != original:
+            self._stage_state(transaction, proposed)
+        return result
+
+    def _mutate(
+        self,
+        mutation: Callable[[_GroupConfigurationCandidate], _RESULT],
+    ) -> _RESULT:
+        return self._coordinator.execute(
+            lambda transaction: self.stage_candidate(transaction, mutation)
+        )
+
+    def _save(self) -> None:
+        raise RuntimeError("owned group data must be staged through stage_candidate")
 
     def groups(self) -> tuple[GroupConfiguration, ...]:
+        if isinstance(self, _GroupConfigurationCandidate):
+            return self._groups_unlocked()
+        return self._coordinator.snapshot(self._groups_unlocked)
+
+    def _groups_unlocked(self) -> tuple[GroupConfiguration, ...]:
         result: list[GroupConfiguration] = []
         for raw_group in self._groups:
             name = str(raw_group["name"])
@@ -825,15 +1271,33 @@ class GroupConfigurationService:
         return tuple(result)
 
     def group(self, name: object) -> GroupConfiguration | None:
+        if isinstance(self, _GroupConfigurationCandidate):
+            return self._group_unlocked(name)
+        return self._coordinator.snapshot(lambda: self._group_unlocked(name))
+
+    def group_in_transaction(
+        self,
+        transaction: IdentityDataTransaction,
+        name: object,
+    ) -> GroupConfiguration | None:
+        """Read one group while the caller owns this coordinator transaction."""
+        if isinstance(self, _GroupConfigurationCandidate):
+            raise TypeError("candidate group state does not accept live transactions")
+        self._coordinator.require_transaction(transaction)
+        return self._group_unlocked(name)
+
+    def _group_unlocked(self, name: object) -> GroupConfiguration | None:
         cleaned = self._clean_name(name)
         if cleaned is None:
             return None
         return next(
-            (group for group in self.groups() if group.name == cleaned),
+            (group for group in self._groups_unlocked() if group.name == cleaned),
             None,
         )
 
     def create_group(self, name: object) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(lambda candidate: candidate.create_group(name))
         cleaned = self._clean_name(name)
         if cleaned is None:
             raise ValueError("group name is invalid.")
@@ -860,6 +1324,10 @@ class GroupConfigurationService:
         group_name: object,
         locked: object,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.set_master_locked(group_name, locked)
+            )
         cleaned = self._clean_name(group_name)
         if cleaned is None or not isinstance(locked, bool):
             return False
@@ -893,6 +1361,10 @@ class GroupConfigurationService:
         group_name: object,
         hotkey: object,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.set_launch_hotkey(group_name, hotkey)
+            )
         cleaned = self._clean_name(group_name)
         if cleaned is None:
             return False
@@ -927,13 +1399,22 @@ class GroupConfigurationService:
         return True
 
     def launch_hotkeys(self) -> dict[str, str]:
+        if isinstance(self, _GroupConfigurationCandidate):
+            return self._launch_hotkeys_unlocked()
+        return self._coordinator.read_consistent(self._launch_hotkeys_unlocked)
+
+    def _launch_hotkeys_unlocked(self) -> dict[str, str]:
         return {
             group.name: group.launch_hotkey
-            for group in self.groups()
+            for group in self._groups_unlocked()
             if group.launch_hotkey
         }
 
     def rename_group(self, old_name: object, new_name: object) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.rename_group(old_name, new_name)
+            )
         old_cleaned = self._clean_name(old_name)
         new_cleaned = self._clean_name(new_name)
         if old_cleaned is None or new_cleaned is None:
@@ -960,6 +1441,8 @@ class GroupConfigurationService:
         return True
 
     def delete_group(self, name: object) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(lambda candidate: candidate.delete_group(name))
         cleaned = self._clean_name(name)
         if cleaned is None:
             return False
@@ -994,6 +1477,10 @@ class GroupConfigurationService:
         return True
 
     def move_group(self, name: object, direction: int) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.move_group(name, direction)
+            )
         cleaned = self._clean_name(name)
         if cleaned is None or direction not in {-1, 1}:
             return False
@@ -1022,6 +1509,13 @@ class GroupConfigurationService:
         group_name: object,
         entry_ids: object,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.reorder_group_entries(
+                    group_name,
+                    entry_ids,
+                )
+            )
         cleaned = self._clean_name(group_name)
         if cleaned is None or not isinstance(entry_ids, tuple):
             return False
@@ -1072,6 +1566,13 @@ class GroupConfigurationService:
         group_name: object,
         placements: Mapping[Path, SavedWindowPlacement],
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.update_saved_placements(
+                    group_name,
+                    placements,
+                )
+            )
         cleaned = self._clean_name(group_name)
         if cleaned is None:
             return False
@@ -1135,6 +1636,17 @@ class GroupConfigurationService:
         offset_y: object,
         delay_ms: object,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.set_sync_target_settings(
+                    group_name,
+                    entry_id,
+                    offset_enabled=offset_enabled,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
+                    delay_ms=delay_ms,
+                )
+            )
         cleaned = self._clean_name(group_name)
         if (
             cleaned is None
@@ -1191,6 +1703,13 @@ class GroupConfigurationService:
         group_name: object,
         entry_id: object,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.clear_sync_target_settings(
+                    group_name,
+                    entry_id,
+                )
+            )
         return self.set_sync_target_settings(
             group_name,
             entry_id,
@@ -1205,6 +1724,10 @@ class GroupConfigurationService:
         group_name: object,
         point: tuple[int, int] | None,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.set_sync_base_point(group_name, point)
+            )
         cleaned = self._clean_name(group_name)
         if cleaned is None:
             return False
@@ -1248,6 +1771,14 @@ class GroupConfigurationService:
         entry_id: object,
         role_id: object,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.set_role_id(
+                    group_name,
+                    entry_id,
+                    role_id,
+                )
+            )
         cleaned = self._clean_name(group_name)
         normalized_role_id = self._clean_role_id(role_id)
         if (
@@ -1294,12 +1825,21 @@ class GroupConfigurationService:
         path = Path(destination)
         if path.suffix.casefold() != ".json":
             raise ValueError("configuration export must be a JSON file.")
+        if self._is_owned_configuration_path(path):
+            raise ValueError(
+                "configuration export destination is managed identity data."
+            )
+        payload = (
+            self._payload()
+            if isinstance(self, _GroupConfigurationCandidate)
+            else self._coordinator.snapshot(self._payload)
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(path.suffix + ".tmp")
         try:
             temp_path.write_text(
                 json.dumps(
-                    self._payload(),
+                    payload,
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -1311,14 +1851,51 @@ class GroupConfigurationService:
             temp_path.unlink(missing_ok=True)
         return path
 
+    def _is_owned_configuration_path(self, path: Path) -> bool:
+        candidate = path.resolve(strict=False)
+        owned = self.path.resolve(strict=False)
+        normalized_candidate = os.path.normcase(os.fspath(candidate))
+        managed_exact_paths = [owned]
+        if self._legacy_config_path is not None:
+            managed_exact_paths.append(
+                self._legacy_config_path.resolve(strict=False)
+            )
+        if any(
+            normalized_candidate == os.path.normcase(os.fspath(managed))
+            for managed in managed_exact_paths
+        ):
+            return True
+        if os.path.normcase(os.fspath(candidate.parent)) != os.path.normcase(
+            os.fspath(owned.parent)
+        ):
+            return False
+        managed_prefixes = (
+            owned.name + ".bak",
+            owned.name + ".pre-migration",
+            owned.name + ".corrupt",
+        )
+        normalized_name = os.path.normcase(candidate.name)
+        return any(
+            normalized_name == os.path.normcase(prefix)
+            or normalized_name.startswith(os.path.normcase(prefix + "."))
+            for prefix in managed_prefixes
+        )
+
     def import_configuration(
         self,
         source: Path,
         *,
         reserved_hotkeys: Iterable[object] = (),
     ) -> tuple[str, ...]:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.import_configuration(
+                    source,
+                    reserved_hotkeys=reserved_hotkeys,
+                )
+            )
         path = Path(source)
-        payload = self._read_json(path)
+        payload = self._read_json(path, suppress_io_errors=True)
         if payload is None:
             raise ValueError("configuration import is invalid.")
         imported_groups = self._clean_groups(payload)
@@ -1402,11 +1979,17 @@ class GroupConfigurationService:
         self._groups = proposed_groups
         self._sync_edges = proposed_edges
         self._root_extras = proposed_root_extras
-        imported_edges = self._clean_sync_edges(payload.get("sync_edges"))
+        imported_edges = self._clean_sync_edges(
+            payload.get("sync_edges"),
+            groups=proposed_groups,
+        )
         for source_id, targets in imported_edges.items():
             proposed_edges[source_id] = list(targets)
         if self._has_cycle(
-            self._combined_sync_edges(explicit=proposed_edges)
+            self._combined_sync_edges(
+                explicit=proposed_edges,
+                groups=proposed_groups,
+            )
         ):
             self._groups = original_groups
             self._sync_edges = original_edges
@@ -1427,6 +2010,10 @@ class GroupConfigurationService:
         group_name: object,
         paths: Iterable[Path],
     ) -> tuple[GroupConfigurationEntry, ...]:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.add_shortcuts(group_name, paths)
+            )
         cleaned = self._clean_name(group_name)
         if cleaned is None:
             raise ValueError("group_name is invalid.")
@@ -1471,7 +2058,12 @@ class GroupConfigurationService:
             existing.add(entry_id)
             added_ids.append(entry_id)
         if added_ids:
-            if self._has_cycle(self._combined_sync_edges()):
+            if self._has_cycle(
+                self._combined_sync_edges(
+                    explicit=self._sync_edges,
+                    groups=self._groups,
+                )
+            ):
                 del entries[-len(added_ids):]
                 raise SyncCycleError(SyncCycleError.player_message)
             self._save()
@@ -1487,6 +2079,10 @@ class GroupConfigurationService:
         group_name: object,
         entry_id: object,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.remove_shortcut(group_name, entry_id)
+            )
         cleaned = self._clean_name(group_name)
         if (
             cleaned is None
@@ -1551,6 +2147,10 @@ class GroupConfigurationService:
         group_name: object,
         entry_id: object,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.set_main_entry(group_name, entry_id)
+            )
         cleaned = self._clean_name(group_name)
         if (
             cleaned is None
@@ -1594,7 +2194,12 @@ class GroupConfigurationService:
                 if entry_index == index
                 else "同步窗口"
             )
-        if self._has_cycle(self._combined_sync_edges()):
+        if self._has_cycle(
+            self._combined_sync_edges(
+                explicit=self._sync_edges,
+                groups=self._groups,
+            )
+        ):
             for entry, role in zip(entries, original_roles):
                 entry["role"] = role
             raise SyncCycleError(SyncCycleError.player_message)
@@ -1602,6 +2207,10 @@ class GroupConfigurationService:
         return True
 
     def clear_group(self, group_name: object) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.clear_group(group_name)
+            )
         cleaned = self._clean_name(group_name)
         if cleaned is None:
             return False
@@ -1668,6 +2277,13 @@ class GroupConfigurationService:
         controller_entry_id: object,
         member_entry_id: object,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.add_sync_relation(
+                    controller_entry_id,
+                    member_entry_id,
+                )
+            )
         if (
             not isinstance(controller_entry_id, str)
             or not isinstance(member_entry_id, str)
@@ -1675,7 +2291,7 @@ class GroupConfigurationService:
             raise ValueError("sync identities must be strings.")
         controller = controller_entry_id.strip()
         member = member_entry_id.strip()
-        known = self._known_entry_ids()
+        known = self._known_entry_ids(self._groups)
         if (
             not controller
             or not member
@@ -1692,7 +2308,10 @@ class GroupConfigurationService:
             return False
         targets.append(member)
         if self._has_cycle(
-            self._combined_sync_edges(explicit=proposed)
+            self._combined_sync_edges(
+                explicit=proposed,
+                groups=self._groups,
+            )
         ):
             raise SyncCycleError(SyncCycleError.player_message)
         self._sync_edges = proposed
@@ -1704,6 +2323,13 @@ class GroupConfigurationService:
         controller_entry_id: object,
         member_entry_id: object,
     ) -> bool:
+        if not isinstance(self, _GroupConfigurationCandidate):
+            return self._mutate(
+                lambda candidate: candidate.remove_sync_relation(
+                    controller_entry_id,
+                    member_entry_id,
+                )
+            )
         if (
             not isinstance(controller_entry_id, str)
             or not isinstance(member_entry_id, str)
@@ -1726,14 +2352,24 @@ class GroupConfigurationService:
         self,
         group_name: object,
     ) -> tuple[GroupSyncMemberChoice, ...]:
-        group = self.group(group_name)
+        if isinstance(self, _GroupConfigurationCandidate):
+            return self._available_sync_members_unlocked(group_name)
+        return self._coordinator.snapshot(
+            lambda: self._available_sync_members_unlocked(group_name)
+        )
+
+    def _available_sync_members_unlocked(
+        self,
+        group_name: object,
+    ) -> tuple[GroupSyncMemberChoice, ...]:
+        group = self._group_unlocked(group_name)
         if group is None or group.main_entry is None:
             return ()
         controller = group.main_entry.entry_id
         existing = set(self._sync_edges.get(controller, ()))
         choices: list[GroupSyncMemberChoice] = []
         seen: set[str] = set()
-        for candidate_group in self.groups():
+        for candidate_group in self._groups_unlocked():
             for entry in candidate_group.entries:
                 if (
                     entry.entry_id == controller
@@ -1754,13 +2390,23 @@ class GroupConfigurationService:
         self,
         group_name: object,
     ) -> tuple[GroupSyncMemberChoice, ...]:
-        group = self.group(group_name)
+        if isinstance(self, _GroupConfigurationCandidate):
+            return self._explicit_sync_members_unlocked(group_name)
+        return self._coordinator.snapshot(
+            lambda: self._explicit_sync_members_unlocked(group_name)
+        )
+
+    def _explicit_sync_members_unlocked(
+        self,
+        group_name: object,
+    ) -> tuple[GroupSyncMemberChoice, ...]:
+        group = self._group_unlocked(group_name)
         if group is None or group.main_entry is None:
             return ()
         controller = group.main_entry.entry_id
         member_ids = tuple(self._sync_edges.get(controller, ()))
         labels: dict[str, str] = {}
-        for candidate_group in self.groups():
+        for candidate_group in self._groups_unlocked():
             for entry in candidate_group.entries:
                 labels.setdefault(
                     entry.entry_id,
@@ -1776,14 +2422,27 @@ class GroupConfigurationService:
         self,
         controller_entry_id: object,
     ) -> tuple[str, ...]:
+        if isinstance(self, _GroupConfigurationCandidate):
+            return self._expanded_sync_members_unlocked(controller_entry_id)
+        return self._coordinator.snapshot(
+            lambda: self._expanded_sync_members_unlocked(controller_entry_id)
+        )
+
+    def _expanded_sync_members_unlocked(
+        self,
+        controller_entry_id: object,
+    ) -> tuple[str, ...]:
         if not isinstance(controller_entry_id, str):
             return ()
         controller = controller_entry_id.strip()
-        if controller not in self._known_entry_ids():
+        if controller not in self._known_entry_ids(self._groups):
             return ()
         result: list[str] = []
         seen = {controller}
-        edges = self._combined_sync_edges()
+        edges = self._combined_sync_edges(
+            explicit=self._sync_edges,
+            groups=self._groups,
+        )
         stack = list(reversed(edges.get(controller, ())))
         while stack:
             member = stack.pop()
@@ -1795,3 +2454,21 @@ class GroupConfigurationService:
                 reversed(edges.get(member, ()))
             )
         return tuple(result)
+
+
+class _GroupConfigurationCandidate(GroupConfigurationService):
+    """Explicit isolated mutation target; it never owns or writes live state."""
+
+    def __init__(
+        self,
+        owner: GroupConfigurationService,
+        state: _GroupState,
+    ) -> None:
+        self.path = owner.path
+        self._legacy_config_path = owner._legacy_config_path
+        self._coordinator = owner._coordinator
+        self._state = self._state_copy(state)
+        self._save_requested = False
+
+    def _save(self) -> None:
+        self._save_requested = True

@@ -2,6 +2,13 @@ import json
 
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
+
+
+def _store(path) -> WindowRegistryStore:
+    return WindowRegistryStore(path, IdentityDataTransactionCoordinator())
 
 
 def test_missing_primary_recovers_from_valid_backup(tmp_path):
@@ -14,7 +21,7 @@ def test_missing_primary_recovers_from_valid_backup(tmp_path):
         encoding="utf-8",
     )
 
-    store = WindowRegistryStore(path)
+    store = _store(path)
     restored = store.load()
 
     assert [record.character_id for record in restored.all()] == ["160"]
@@ -34,7 +41,7 @@ def test_repeated_backup_recovery_is_idempotent(tmp_path):
         encoding="utf-8",
     )
 
-    store = WindowRegistryStore(path)
+    store = _store(path)
     first = store.load().to_dict()
     second = store.load().to_dict()
     third = store.load().to_dict()
@@ -51,7 +58,7 @@ def test_corrupt_primary_and_corrupt_backup_rebuilds_empty_safely(tmp_path):
     path.write_text('{"characters": [', encoding="utf-8")
     backup_path.write_text("not-json", encoding="utf-8")
 
-    store = WindowRegistryStore(path)
+    store = _store(path)
     restored = store.load()
 
     assert restored.all() == ()
@@ -63,7 +70,7 @@ def test_corrupt_primary_and_corrupt_backup_rebuilds_empty_safely(tmp_path):
 
 def test_recovery_from_corrupt_primary_remains_stable_on_next_load(tmp_path):
     path = tmp_path / "window_registry.json"
-    store = WindowRegistryStore(path)
+    store = _store(path)
     registry = WindowRegistry()
     registry.register_character("100", "100古")
     store.save(registry)

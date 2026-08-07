@@ -26,6 +26,7 @@ from main import (
     UI_THEME_CLASSIC_GOLD_MIGRATION_KEY,
     UI_THEME_KEY,
     _connected_sync_fingerprints,
+    _rebuild_group_input_identity,
     _sync_scope_has_all_safe_windows,
     build_services,
     apply_auto_battle_after_game_launch,
@@ -850,6 +851,38 @@ def test_group_configuration_change_does_not_stop_or_rebind_reconnect_snapshot()
     assert "SMART_RECONNECT_ENABLED_KEY" not in function_source
 
 
+def test_failed_committed_group_input_rebuild_leaves_zero_input() -> None:
+    allowed = ["old-input"]
+    choice = object()
+
+    def fail_after_partial_rebuild(_choice) -> None:
+        allowed[:] = ["partial-new-input"]
+        raise RuntimeError("input rebuild interrupted")
+
+    def clear_input() -> None:
+        allowed.clear()
+
+    assert _rebuild_group_input_identity(
+        choice,
+        fail_after_partial_rebuild,
+        clear_input,
+    ) is False
+    assert allowed == []
+
+
+def test_empty_committed_group_clears_input_without_trying_to_apply() -> None:
+    allowed = ["old-input"]
+    apply_calls = []
+
+    assert _rebuild_group_input_identity(
+        None,
+        lambda choice: apply_calls.append(choice),
+        allowed.clear,
+    ) is True
+    assert apply_calls == []
+    assert allowed == []
+
+
 def test_group_change_stops_all_automation_before_publishing_new_group():
     source = Path("main.py").read_text(encoding="utf-8")
     change_group = source[
@@ -865,12 +898,9 @@ def test_group_change_stops_all_automation_before_publishing_new_group():
     stop_index = change_group.index(
         "stop_group_automation_for_configuration_change()"
     )
-    apply_index = change_group.index("apply_group_identity(choice)")
-    workspace_index = change_group.index(
-        "workspace_service.set_current_group("
-    )
-    config_index = change_group.index(
-        "config.set(CURRENT_GROUP_NAME_KEY"
+    apply_index = change_group.index("_rebuild_group_input_identity(")
+    publication_index = change_group.index(
+        "current_group_publication_service.execute("
     )
     reopen_index = change_group.rindex(
         "reopen_group_operation_gate()"
@@ -880,10 +910,12 @@ def test_group_change_stops_all_automation_before_publishing_new_group():
         close_index
         < stop_index
         < apply_index
-        < config_index
-        < workspace_index
+        < publication_index
         < reopen_index
     )
+    assert "publication_plan_for_choice(" in change_group
+    assert "config.set(CURRENT_GROUP_NAME_KEY" not in change_group
+    assert "workspace_service.set_current_group(" not in change_group
 
 
 def test_group_change_allows_selection_but_clears_identity_when_unresolved():
@@ -895,16 +927,14 @@ def test_group_change_allows_selection_but_clears_identity_when_unresolved():
         )
     ]
 
-    apply_index = change_group.index("apply_group_identity(choice)")
-    clear_index = change_group.index("clear_group_identity()")
-    config_index = change_group.index("config.set(CURRENT_GROUP_NAME_KEY")
-    workspace_index = change_group.index(
-        "workspace_service.set_current_group("
+    apply_index = change_group.index("_rebuild_group_input_identity(")
+    clear_index = change_group.index("clear_group_identity,", apply_index)
+    publication_index = change_group.index(
+        "current_group_publication_service.execute("
     )
 
-    assert "identity_ready = apply_group_identity(choice) is not None" in change_group
-    assert "if not identity_ready:" in change_group
-    assert apply_index < clear_index < config_index < workspace_index
+    assert "identity_ready = _rebuild_group_input_identity(" in change_group
+    assert apply_index < clear_index < publication_index
     assert "同步與智慧重連已保持停用" in change_group
 
 
@@ -918,7 +948,9 @@ def test_failed_group_change_clears_unbound_identity_before_reopening_gate():
     ]
     rollback_start = change_group.index(
         "        except Exception:",
-        change_group.index("selected_workspace_group = "),
+        change_group.index(
+            "except CurrentGroupPublicationNotificationError as error:"
+        ),
     )
     rollback_end = change_group.index(
         "        reopen_group_operation_gate()",
@@ -931,11 +963,13 @@ def test_failed_group_change_clears_unbound_identity_before_reopening_gate():
 
     restore_index = rollback.index("restore_group_identity(old_choice)")
     clear_index = rollback.index("clear_group_identity()")
-    publish_index = rollback.index("restore_published_group(")
     reopen_index = rollback.index("reopen_group_operation_gate()")
 
-    assert restore_index < clear_index < publish_index < reopen_index
-    assert "if rollback_ready and publication_restored:" in rollback
+    assert restore_index < clear_index < reopen_index
+    assert "if rollback_ready:" in rollback
+    assert "restore_published_group(" not in change_group
+    assert "config.set(CURRENT_GROUP_NAME_KEY" not in change_group
+    assert "workspace_service.set_current_group(" not in change_group
 
 
 def test_role_identity_refresh_only_rebinds_current_group_and_reopens_gate():
