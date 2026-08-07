@@ -134,7 +134,6 @@ def test_revalidate_is_available_without_being_called_during_normal_resolution(t
     assert resolver.revalidate(expected) is False
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows file identity contract")
 def test_windows_file_identity_uses_volume_serial_and_file_index(tmp_path):
     shortcut = tmp_path / "role.lnk"
     shortcut.write_bytes(b"identity-only")
