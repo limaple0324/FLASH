@@ -1,6 +1,7 @@
 from config.config_manager import ConfigManager
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+from core.smart_reconnect_authorization import ReconnectLaunchMode
 from domain.character_store import CharacterStore
 from main import CURRENT_GROUP_NAME_KEY, build_services
 from services.app_context import AppContext
@@ -16,6 +17,15 @@ from services.group_configuration_service import GroupConfigurationService
 from services.group_selection_service import GroupSelectionService
 from services.identity_data_transaction_coordinator import (
     IdentityDataTransactionCoordinator,
+)
+from services.smart_reconnect_authorization_coordinator import (
+    SmartReconnectAuthorizationCoordinator,
+)
+from services.smart_reconnect_preparation_service import (
+    SmartReconnectPreparationService,
+)
+from services.smart_reconnect_target_identity_service import (
+    SmartReconnectTargetIdentityService,
 )
 from workspace.service import WorkspaceService
 
@@ -68,6 +78,14 @@ def test_build_services_injects_one_shared_identity_coordinator(tmp_path) -> Non
         AppContext.get(CurrentGroupPublicationService)._coordinator
         is coordinator
     )
+    authorization = AppContext.get(SmartReconnectAuthorizationCoordinator)
+    preparation = AppContext.get(SmartReconnectPreparationService)
+    target_identity = AppContext.get(SmartReconnectTargetIdentityService)
+    assert authorization is not None
+    assert preparation.authorization_coordinator is authorization
+    assert preparation.identity_coordinator is coordinator
+    assert preparation.product_launch_mode is ReconnectLaunchMode.IDENTITY_BOUND
+    assert target_identity.coordinator is coordinator
 
 
 def test_group_selection_and_ungrouped_join_use_explicit_view_results() -> None:

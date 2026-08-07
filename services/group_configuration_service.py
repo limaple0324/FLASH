@@ -206,7 +206,7 @@ class GroupConfigurationService:
     @property
     def migration_backup_path(self) -> Path | None:
         if not isinstance(self, _GroupConfigurationCandidate):
-            return self._coordinator.snapshot(
+            return self._coordinator.read_consistent(
                 lambda: self._state.migration_backup_path
             )
         return self._state.migration_backup_path
@@ -220,7 +220,7 @@ class GroupConfigurationService:
     @property
     def corrupt_backup_path(self) -> Path | None:
         if not isinstance(self, _GroupConfigurationCandidate):
-            return self._coordinator.snapshot(
+            return self._coordinator.read_consistent(
                 lambda: self._state.corrupt_backup_path
             )
         return self._state.corrupt_backup_path
@@ -234,7 +234,7 @@ class GroupConfigurationService:
     @property
     def recovered_from_backup(self) -> bool:
         if not isinstance(self, _GroupConfigurationCandidate):
-            return self._coordinator.snapshot(
+            return self._coordinator.read_consistent(
                 lambda: self._state.recovered_from_backup
             )
         return self._state.recovered_from_backup
@@ -1200,7 +1200,7 @@ class GroupConfigurationService:
     def groups(self) -> tuple[GroupConfiguration, ...]:
         if isinstance(self, _GroupConfigurationCandidate):
             return self._groups_unlocked()
-        return self._coordinator.snapshot(self._groups_unlocked)
+        return self._coordinator.read_consistent(self._groups_unlocked)
 
     def _groups_unlocked(self) -> tuple[GroupConfiguration, ...]:
         result: list[GroupConfiguration] = []
@@ -1273,7 +1273,7 @@ class GroupConfigurationService:
     def group(self, name: object) -> GroupConfiguration | None:
         if isinstance(self, _GroupConfigurationCandidate):
             return self._group_unlocked(name)
-        return self._coordinator.snapshot(lambda: self._group_unlocked(name))
+        return self._coordinator.read_consistent(lambda: self._group_unlocked(name))
 
     def group_in_transaction(
         self,
@@ -1832,7 +1832,7 @@ class GroupConfigurationService:
         payload = (
             self._payload()
             if isinstance(self, _GroupConfigurationCandidate)
-            else self._coordinator.snapshot(self._payload)
+            else self._coordinator.read_consistent(self._payload)
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(path.suffix + ".tmp")
@@ -2354,7 +2354,7 @@ class GroupConfigurationService:
     ) -> tuple[GroupSyncMemberChoice, ...]:
         if isinstance(self, _GroupConfigurationCandidate):
             return self._available_sync_members_unlocked(group_name)
-        return self._coordinator.snapshot(
+        return self._coordinator.read_consistent(
             lambda: self._available_sync_members_unlocked(group_name)
         )
 
@@ -2392,7 +2392,7 @@ class GroupConfigurationService:
     ) -> tuple[GroupSyncMemberChoice, ...]:
         if isinstance(self, _GroupConfigurationCandidate):
             return self._explicit_sync_members_unlocked(group_name)
-        return self._coordinator.snapshot(
+        return self._coordinator.read_consistent(
             lambda: self._explicit_sync_members_unlocked(group_name)
         )
 
@@ -2424,7 +2424,7 @@ class GroupConfigurationService:
     ) -> tuple[str, ...]:
         if isinstance(self, _GroupConfigurationCandidate):
             return self._expanded_sync_members_unlocked(controller_entry_id)
-        return self._coordinator.snapshot(
+        return self._coordinator.read_consistent(
             lambda: self._expanded_sync_members_unlocked(controller_entry_id)
         )
 

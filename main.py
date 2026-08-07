@@ -36,6 +36,7 @@ from adapters.windows_launch_fingerprint import (
     PowerShellShortcutFingerprintResolver,
     normalize_launch_fingerprint,
 )
+from adapters.windows_shortcut_seal import WindowsShortcutSealResolver
 from adapters.windows_smart_reconnect import (
     ReconnectRuntimeStateStore,
     RegisteredReconnectRole,
@@ -72,6 +73,10 @@ from config.path_manager import PathManager
 from core.bootstrap import Bootstrap
 from core.sp1_boundaries import ExternalAdapter, SmartReconnectBoundary
 from core.reconnect_policy import ReconnectScreenState
+from core.smart_reconnect_authorization import (
+    ReconnectLaunchMode,
+    ReconnectRevocationReason,
+)
 from core.target_window_observation import TargetWindowObservation
 from core.window_registry import WindowRegistry
 from core.version import MILESTONE, PRODUCT_NAME
@@ -259,6 +264,12 @@ from services.smart_reconnect_capture_settings_service import (
     SMART_RECONNECT_CAPTURE_MODES_KEY,
     SmartReconnectCaptureSettings,
     SmartReconnectCaptureSettingsService,
+)
+from services.smart_reconnect_authorization_coordinator import (
+    SmartReconnectAuthorizationCoordinator,
+)
+from services.smart_reconnect_preparation_service import (
+    SmartReconnectPreparationService,
 )
 from services.smart_reconnect_target_identity_service import (
     SmartReconnectTargetIdentityService,
@@ -1123,9 +1134,21 @@ def build_services(
     """Create, load, and register the cumulative SP1+SP2 services."""
     AppContext.clear()
     identity_data_transaction_coordinator = IdentityDataTransactionCoordinator()
+    smart_reconnect_authorization_coordinator = (
+        SmartReconnectAuthorizationCoordinator()
+    )
+    identity_data_transaction_coordinator.register_before_write_listener(
+        lambda _generation: smart_reconnect_authorization_coordinator.revoke(
+            ReconnectRevocationReason.IDENTITY_WRITE
+        )
+    )
     AppContext.register(
         IdentityDataTransactionCoordinator,
         identity_data_transaction_coordinator,
+    )
+    AppContext.register(
+        SmartReconnectAuthorizationCoordinator,
+        smart_reconnect_authorization_coordinator,
     )
     paths = PathManager(root=root)
     logger = LoggerService(paths.log_file("flash.log"))
@@ -1247,6 +1270,9 @@ def build_services(
         else paths.root / ".legacy-group-import-disabled"
     )
     shortcut_fingerprint_resolver = PowerShellShortcutFingerprintResolver()
+    shortcut_seal_resolver = WindowsShortcutSealResolver(
+        shortcut_fingerprint_resolver
+    )
     group_configuration_service = GroupConfigurationService(
         paths.data_dir() / GROUP_CONFIGURATION_FILENAME,
         identity_data_transaction_coordinator,
@@ -1261,15 +1287,6 @@ def build_services(
         group_configuration_service.path,
         shortcut_fingerprint_resolver,
         legacy_layout_config_path=legacy_group_config_path,
-    )
-    smart_reconnect_target_identity_service = (
-        SmartReconnectTargetIdentityService(
-            group_configuration_service.groups,
-            shortcut_fingerprint_resolver,
-            character_store.load,
-            registry.all,
-            paths.data_dir() / RECONNECT_TARGET_IDENTITY_FILENAME,
-        )
     )
     sync_scope_service = SyncScopeService(
         group_configuration_service,
@@ -1331,6 +1348,16 @@ def build_services(
         identity_data_transaction_coordinator,
         confirmed_group_orders=CONFIRMED_GROUP_ORDERS,
     )
+    smart_reconnect_target_identity_service = (
+        SmartReconnectTargetIdentityService(
+            identity_data_transaction_coordinator,
+            group_configuration_service,
+            character_view_service,
+            registry,
+            shortcut_fingerprint_resolver,
+            paths.data_dir() / RECONNECT_TARGET_IDENTITY_FILENAME,
+        )
+    )
     workspace_service = WorkspaceService(
         identity_data_transaction_coordinator,
         WorkspaceState(
@@ -1390,6 +1417,20 @@ def build_services(
         characters = current_group_publication_service.execute(
             prepare_initial_group
         ).result
+    smart_reconnect_preparation_service = SmartReconnectPreparationService(
+        target_identity_service=smart_reconnect_target_identity_service,
+        target_window_contract_service=target_window_contract_service,
+        shortcut_seal_resolver=shortcut_seal_resolver,
+        authorization_coordinator=smart_reconnect_authorization_coordinator,
+        identity_coordinator=identity_data_transaction_coordinator,
+        configuration=group_configuration_service,
+        character_view=character_view_service,
+        registry=registry,
+        workspace=workspace_service,
+        config=config,
+        current_group_name_key=CURRENT_GROUP_NAME_KEY,
+        product_launch_mode=ReconnectLaunchMode.IDENTITY_BOUND,
+    )
     character_detail_view_service = CharacterDetailViewService(
         character_view_service,
         character_game_data_view_service,
@@ -1554,6 +1595,10 @@ def build_services(
     AppContext.register(
         SmartReconnectTargetIdentityService,
         smart_reconnect_target_identity_service,
+    )
+    AppContext.register(
+        SmartReconnectPreparationService,
+        smart_reconnect_preparation_service,
     )
     AppContext.register(SyncScopeService, sync_scope_service)
     AppContext.register(

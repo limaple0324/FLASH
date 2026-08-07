@@ -55,6 +55,7 @@ from core.reconnect_policy import (
     ReconnectScreenState,
 )
 from core.sp1_boundaries import OperationResult, ReconnectState, SmartReconnectBoundary
+from core.window_instance import WindowInstanceToken
 from domain.character import CharacterImportance, character_importance_rank
 from services.group_launch_service import GroupLaunchPlan, GroupLaunchTarget
 from services.game_operation_gate import GameOperationGate
@@ -130,58 +131,6 @@ _ISOLATABLE_TARGET_WINDOW_FAILURE_CODES = frozenset(
 class ScreenRecognizer(Protocol):
     def recognize_capture(self, sample) -> ScreenRecognition:
         """Recognize a capture without changing or persisting it."""
-
-
-@dataclass(frozen=True, slots=True)
-class WindowInstanceToken:
-    handle: int
-    process_id: int
-    thread_id: int
-    window_class: str
-    rect: tuple[int, int, int, int]
-    minimized: bool
-    process_lifecycle_token: int
-
-    @classmethod
-    def from_window(
-        cls,
-        window: WindowInfo,
-    ) -> "WindowInstanceToken | None":
-        if (
-            not isinstance(window.handle, int)
-            or isinstance(window.handle, bool)
-            or window.handle <= 0
-            or not isinstance(window.process_id, int)
-            or isinstance(window.process_id, bool)
-            or window.process_id <= 0
-            or not isinstance(window.thread_id, int)
-            or isinstance(window.thread_id, bool)
-            or window.thread_id <= 0
-            or not isinstance(window.window_class, str)
-            or not window.window_class.strip()
-            or not isinstance(window.process_lifecycle_token, int)
-            or isinstance(window.process_lifecycle_token, bool)
-            or window.process_lifecycle_token <= 0
-            or not isinstance(window.rect, tuple)
-            or len(window.rect) != 4
-            or any(
-                not isinstance(value, int) or isinstance(value, bool)
-                for value in window.rect
-            )
-            or window.rect[2] <= window.rect[0]
-            or window.rect[3] <= window.rect[1]
-            or type(window.minimized) is not bool
-        ):
-            return None
-        return cls(
-            window.handle,
-            window.process_id,
-            window.thread_id,
-            window.window_class,
-            window.rect,
-            window.minimized,
-            window.process_lifecycle_token,
-        )
 
 
 @dataclass(frozen=True, slots=True)

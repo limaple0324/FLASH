@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Callable, Generic, TypeVar
 
 
 _RESULT = TypeVar("_RESULT")
@@ -59,6 +59,10 @@ class IdentityTransactionStageError(IdentityTransactionError):
 
 class IdentityTransactionValidationError(IdentityTransactionError):
     """Raised when a candidate or whole-transaction validator rejects the plan."""
+
+
+class IdentityTransactionInvalidationError(IdentityTransactionError):
+    """Raised when authorization invalidation rejects an identity write."""
 
 
 class IdentityTransactionRollbackError(IdentityTransactionError):
@@ -113,6 +117,12 @@ class _MemoryStage:
 class _CandidateFile:
     stage: _FileStage
     temporary_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityDataSnapshot(Generic[_RESULT]):
+    generation: int
+    value: _RESULT
 
 
 class IdentityDataTransaction:
@@ -279,6 +289,8 @@ class IdentityDataTransactionCoordinator:
         self._closed = False
         self._rollback_failure: IdentityTransactionRollbackError | None = None
         self._current_transaction: IdentityDataTransaction | None = None
+        self._generation = 0
+        self._before_write_listeners: list[Callable[[int], object]] = []
 
     def execute(
         self,
@@ -288,6 +300,7 @@ class IdentityDataTransactionCoordinator:
             raise TypeError("prepare must be callable")
         self._begin_operation(write=True)
         try:
+            self._notify_before_write()
             transaction = IdentityDataTransaction(self)
             with self._condition:
                 self._current_transaction = transaction
@@ -297,7 +310,10 @@ class IdentityDataTransactionCoordinator:
                 # A transaction object is never reusable, including when prepare
                 # escapes it and then raises before commit begins.
                 transaction._finish_preparing()
-            self._commit(transaction)
+            committed = self._commit(transaction)
+            if committed:
+                with self._condition:
+                    self._generation += 1
             return result
         except IdentityTransactionRollbackError as failure:
             with self._condition:
@@ -339,6 +355,14 @@ class IdentityDataTransactionCoordinator:
                     "caller does not own the active identity transaction"
                 )
 
+    def require_consistent_snapshot_owner(self) -> None:
+        """Require the current thread to own either a read or write snapshot."""
+        with self._condition:
+            if not self._active or self._owner_thread_id != threading.get_ident():
+                raise IdentityTransactionStageError(
+                    "caller does not own the active identity snapshot"
+                )
+
     def read_consistent(self, reader: Callable[[], _RESULT]) -> _RESULT:
         """Read or update auxiliary memory without crossing an identity write."""
         if not callable(reader):
@@ -355,6 +379,63 @@ class IdentityDataTransactionCoordinator:
             return reader()
         finally:
             self._end_operation()
+
+    def capture_snapshot(
+        self,
+        reader: Callable[[], _RESULT],
+    ) -> IdentityDataSnapshot[_RESULT]:
+        """Return a value paired with the generation held during its read."""
+        if not callable(reader):
+            raise TypeError("reader must be callable")
+        if self._is_current_owner():
+            with self._condition:
+                generation = self._generation
+            return IdentityDataSnapshot(generation, reader())
+        self._begin_operation(write=False)
+        try:
+            with self._condition:
+                generation = self._generation
+            return IdentityDataSnapshot(generation, reader())
+        finally:
+            self._end_operation()
+
+    def snapshot_with_generation(
+        self,
+        reader: Callable[[int], _RESULT],
+    ) -> _RESULT:
+        """Keep the identity snapshot locked through the caller's publication."""
+        if not callable(reader):
+            raise TypeError("reader must be callable")
+        if self._is_current_owner():
+            with self._condition:
+                generation = self._generation
+            return reader(generation)
+        self._begin_operation(write=False)
+        try:
+            with self._condition:
+                generation = self._generation
+            return reader(generation)
+        finally:
+            self._end_operation()
+
+    def register_before_write_listener(
+        self,
+        listener: Callable[[int], object],
+    ) -> None:
+        if not callable(listener):
+            raise TypeError("listener must be callable")
+        with self._condition:
+            if self._closing or self._closed:
+                raise IdentityTransactionClosedError(
+                    "identity transactions are closed"
+                )
+            if listener not in self._before_write_listeners:
+                self._before_write_listeners.append(listener)
+
+    @property
+    def generation(self) -> int:
+        with self._condition:
+            return self._generation
 
     def close_and_wait(self, timeout: float = 5.0) -> bool:
         if timeout < 0:
@@ -427,7 +508,23 @@ class IdentityDataTransactionCoordinator:
         with self._condition:
             return self._active and self._owner_thread_id == threading.get_ident()
 
-    def _commit(self, transaction: IdentityDataTransaction) -> None:
+    def _notify_before_write(self) -> None:
+        with self._condition:
+            generation = self._generation
+            listeners = tuple(self._before_write_listeners)
+        for listener in listeners:
+            try:
+                result = listener(generation)
+            except BaseException as error:
+                raise IdentityTransactionInvalidationError(
+                    "identity write invalidation listener failed"
+                ) from error
+            if result is False:
+                raise IdentityTransactionInvalidationError(
+                    "identity write invalidation listener rejected the write"
+                )
+
+    def _commit(self, transaction: IdentityDataTransaction) -> bool:
         operations = transaction._ordered_file_operations()
         memories = transaction._ordered_memories()
 
@@ -496,6 +593,7 @@ class IdentityDataTransactionCoordinator:
             raise
         finally:
             self._cleanup_candidates(candidates)
+        return bool(operations or memories)
 
     def _rollback(
         self,
@@ -561,10 +659,12 @@ class IdentityDataTransactionCoordinator:
 __all__ = [
     "IdentityDataTransaction",
     "IdentityDataTransactionCoordinator",
+    "IdentityDataSnapshot",
     "IdentityDataResource",
     "IdentityTransactionBlockedError",
     "IdentityTransactionClosedError",
     "IdentityTransactionError",
+    "IdentityTransactionInvalidationError",
     "IdentityTransactionReentryError",
     "IdentityTransactionRollbackError",
     "IdentityTransactionStageError",

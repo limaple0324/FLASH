@@ -57,6 +57,10 @@ class CharacterViewService:
                 )
             self._characters[character.character_id] = character
 
+    @property
+    def coordinator(self) -> IdentityDataTransactionCoordinator:
+        return self._coordinator
+
     def replace_characters(
         self,
         characters: Iterable[Character],
@@ -96,6 +100,12 @@ class CharacterViewService:
         self._coordinator.require_transaction(transaction)
         return tuple(self._characters.values())
 
+    def character_profiles(self) -> tuple[Character, ...]:
+        """Return stable character identities inside the shared read boundary."""
+        return self._coordinator.read_consistent(
+            lambda: tuple(self._characters.values())
+        )
+
     def _install_characters(self, replacement: dict[str, Character]) -> None:
         self._characters = dict(replacement)
 
@@ -112,7 +122,7 @@ class CharacterViewService:
         group_name: str | None = None,
     ) -> tuple[tuple[str, PlayerCharacterView], ...]:
         """提供內部服務安全配對；角色識別不得傳給顯示層。"""
-        return self._coordinator.snapshot(
+        return self._coordinator.read_consistent(
             lambda: self._all_with_identities_unlocked(group_name)
         )
 
@@ -182,7 +192,7 @@ class CharacterViewService:
         self,
         group_name: str | None = None,
     ) -> tuple[PlayerCharacterView, ...]:
-        return self._coordinator.snapshot(
+        return self._coordinator.read_consistent(
             lambda: self._all_unlocked(group_name)
         )
 
