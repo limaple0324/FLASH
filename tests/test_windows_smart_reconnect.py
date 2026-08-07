@@ -4823,7 +4823,9 @@ def test_stop_revokes_snapshot_and_initial_login_authorization():
     assert fixture.mouse.clicks == []
 
 
-def test_snapshot_battle_with_sealed_group_target_restarts_that_target(tmp_path):
+def test_snapshot_battle_without_unique_ungrouped_shortcut_never_restarts(
+    tmp_path,
+):
     window = make_window(1, fingerprint="a" * 64)
     restarter = FakeBattleRestarter()
     fixture = make_controller(
@@ -4835,6 +4837,131 @@ def test_snapshot_battle_with_sealed_group_target_restarts_that_target(tmp_path)
         group_launch_plan=make_group_plan(tmp_path, [window]),
     )
     activate_current_window_snapshot(fixture)
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert "battle_restart_identity_unresolved" in result.details[
+        "failure_codes"
+    ]
+    assert result.details["restarted_windows"] == 0
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
+def test_repeated_stop_preserves_ungrouped_restart_mode_after_reprepare(
+    tmp_path,
+):
+    window = make_window(1, fingerprint="a" * 64)
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        battle_markers=(2,),
+        battle_restarter=restarter,
+        group_launch_plan=make_group_plan(tmp_path, [window]),
+    )
+
+    fixture.controller.set_execution_enabled(False)
+    fixture.controller.set_execution_enabled(False)
+    prepared = fixture.controller.prepare_execution_snapshot()
+    assert prepared.success is True
+    assert fixture.controller.set_execution_enabled(True) is True
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert "battle_restart_identity_unresolved" in result.details[
+        "failure_codes"
+    ]
+    assert result.details["restarted_windows"] == 0
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
+def test_failed_reprepare_preserves_ungrouped_restart_mode_for_retry(
+    tmp_path,
+):
+    window = make_window(1, fingerprint="a" * 64)
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        battle_markers=(2,),
+        battle_restarter=restarter,
+        group_launch_plan=make_group_plan(tmp_path, [window]),
+    )
+    assert fixture.preparation is not None
+    target_provider = fixture.preparation._target_provider
+
+    fixture.controller.set_execution_enabled(False)
+    fixture.preparation._target_provider = lambda _targets: ()
+    failed = fixture.controller.prepare_execution_snapshot()
+    fixture.preparation._target_provider = target_provider
+    prepared = fixture.controller.prepare_execution_snapshot()
+    assert failed.success is False
+    assert prepared.success is True
+    assert fixture.controller.set_execution_enabled(True) is True
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert "battle_restart_identity_unresolved" in result.details[
+        "failure_codes"
+    ]
+    assert result.details["restarted_windows"] == 0
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
+@pytest.mark.parametrize("reset_plan", (False, True))
+def test_group_plan_reset_cannot_upgrade_current_ungrouped_restart_batch(
+    tmp_path,
+    reset_plan,
+):
+    window = make_window(1, fingerprint="a" * 64)
+    plan = make_group_plan(tmp_path, [window])
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        battle_markers=(2,),
+        battle_restarter=restarter,
+        group_launch_plan=plan,
+    )
+    prepared = activate_current_window_snapshot(fixture)
+    assert prepared.success is True
+
+    if reset_plan:
+        fixture.controller.set_group_launch_plan(None)
+    fixture.controller.set_group_launch_plan(plan)
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert "battle_restart_identity_unresolved" in result.details[
+        "failure_codes"
+    ]
+    assert result.details["restarted_windows"] == 0
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
+def test_identity_bound_group_batch_with_sealed_target_restarts_that_target(
+    tmp_path,
+):
+    window = make_window(1, fingerprint="a" * 64)
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        battle_markers=(2,),
+        battle_restarter=restarter,
+        group_launch_plan=make_group_plan(tmp_path, [window]),
+    )
 
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
@@ -8590,6 +8717,9 @@ def test_battle_restart_replacement_restarts_disconnect_wait(tmp_path):
     )
     backend = FakeWindowBackend([original])
     restarter = FakeBattleRestarter()
+    plan = make_group_plan(tmp_path, [original])
+    shortcut = plan.targets[0].shortcut_path
+    shortcut.write_bytes(b"shortcut")
     fixture = make_controller(
         [2],
         windows=[original],
@@ -8597,7 +8727,12 @@ def test_battle_restart_replacement_restarts_disconnect_wait(tmp_path):
         window_backend=backend,
         battle_markers={2},
         battle_restarter=restarter,
-        group_launch_plan=make_group_plan(tmp_path, [original]),
+        group_launch_plan=plan,
+        ungrouped_shortcut_provider=lambda fingerprint: (
+            shortcut
+            if fingerprint == original.launch_fingerprint
+            else None
+        ),
         clock=lambda: now[0],
     )
 
@@ -9591,7 +9726,7 @@ def test_stable_target_second_stage_rejects_duplicate_full_alias():
     assert fixture.mouse.clicks == [(1, target_candidate.click_point)]
 
 
-def test_mutable_target_change_does_not_replace_the_immutable_batch():
+def test_stable_target_change_at_delivery_check_cancels_input():
     selected = CharacterSelectionCandidate(
         160,
         None,
@@ -9630,8 +9765,8 @@ def test_mutable_target_change_does_not_replace_the_immutable_batch():
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert result.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(1, CHARACTER_ENTER_CLICK_POINT)]
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
 
 
 def test_stable_target_saved_line_never_replaces_visible_different_line():
@@ -9801,7 +9936,7 @@ def test_stable_target_evidence_uses_target_without_role_name_in_signature():
     )
 
 
-def test_immutable_planned_slot_is_not_replaced_by_unknown_competitor(tmp_path):
+def test_planned_level_is_blocked_by_unknown_three_digit_competitor(tmp_path):
     target = CharacterSelectionCandidate(
         120,
         None,
@@ -9842,8 +9977,8 @@ def test_immutable_planned_slot_is_not_replaced_by_unknown_competitor(tmp_path):
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert result.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(1, target.click_point)]
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
 
 
 # 第十輪後的直接測試只保留最新明確規格：最近線路、唯一已註冊主號、
@@ -10220,7 +10355,7 @@ def test_public_reconnect_uses_real_three_slot_primary_then_fresh_selected_frame
 
 
 @pytest.mark.parametrize("conflict", ("multiple_primary", "recent_role"))
-def test_primary_identity_inputs_follow_only_the_immutable_batch(conflict):
+def test_primary_identity_conflict_is_zero_input_and_retriable(conflict):
     providers = {
         "multiple_primary": lambda: (
             RegisteredReconnectRole(
@@ -10248,21 +10383,21 @@ def test_primary_identity_inputs_follow_only_the_immutable_batch(conflict):
     fixture.controller.reconnect()
     first = fixture.controller.reconnect()
 
+    assert first.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+    assert fingerprint not in fixture.controller._character_selection_targets
+
+    fixture.controller._registered_role_provider = _registered_roles
+    fixture.controller._recent_login_role_ids[fingerprint] = "120福"
+    fixture.controller.reconnect()
+    recovered = fixture.controller.reconnect()
+
     if conflict == "multiple_primary":
-        assert first.details["clicked_windows"] == 0
-        assert fixture.mouse.clicks == []
-        assert fingerprint not in fixture.controller._character_selection_targets
-
-        fixture.controller._registered_role_provider = _registered_roles
-        fixture.controller._recent_login_role_ids[fingerprint] = "120福"
-        fixture.controller.reconnect()
-        recovered = fixture.controller.reconnect()
-
         assert recovered.details["clicked_windows"] == 0
         assert fixture.mouse.clicks == []
         assert fixture.authorization.current_authorization() is None
     else:
-        assert first.details["clicked_windows"] == 1
+        assert recovered.details["clicked_windows"] == 1
         assert fixture.mouse.clicks == [(1, (0.651, 0.706))]
 
 

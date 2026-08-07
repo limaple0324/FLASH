@@ -2392,6 +2392,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self.set_allowed_fingerprints(allowed_fingerprints)
         self._battle_restarter = battle_restarter
         self._group_launch_plan: GroupLaunchPlan | None = None
+        self._group_launch_plan_explicit = False
+        self._explicit_plan_reprepare_pending = False
+        self._battle_restart_group_batch: (
+            ReconnectAuthorizationBatch | None
+        ) = None
         self._activation_snapshot_instances: (
             dict[str, WindowInstanceToken] | None
         ) = None
@@ -4681,6 +4686,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._activation_snapshot_direct_identity_collisions = frozenset()
         self._allowed_fingerprints = None
         self._group_launch_plan = None
+        self._explicit_plan_reprepare_pending = bool(
+            self._explicit_plan_reprepare_pending
+            or self._group_launch_plan_explicit
+        )
+        self._group_launch_plan_explicit = False
+        self._battle_restart_group_batch = None
         self._runtime_scope_token = None
         with self._source_authority_lock:
             self._source_state_generation += 1
@@ -4708,10 +4719,24 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if len(contexts) != len(batch.targets):
             raise ValueError("authorization contexts are incomplete")
         plan = self._authorization_plan(batch)
+        # The legacy snapshot transition deliberately discarded an explicitly
+        # supplied group plan.  Preserve that observable boundary: the new
+        # batch may monitor the same identities, but a later battle restart
+        # still needs the unique ungrouped shortcut proof.  A batch prepared
+        # directly from the product group source keeps its sealed group mode.
+        replaced_explicit_plan = bool(
+            self._group_launch_plan_explicit
+            or self._explicit_plan_reprepare_pending
+        )
         self._clear_execution_authority_locked()
         self._authorization_batch = batch
         self._authorization_contexts = contexts
         self._group_launch_plan = plan
+        self._group_launch_plan_explicit = False
+        self._explicit_plan_reprepare_pending = False
+        self._battle_restart_group_batch = (
+            None if replaced_explicit_plan else batch
+        )
         self._allowed_fingerprints = plan.fingerprints
         self._runtime_scope_token = self._group_scope_token(plan)
         self._activation_snapshot_instances = {
@@ -4889,6 +4914,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             previous_token = self._runtime_scope_token
             if plan is None:
                 self._group_launch_plan = None
+                self._group_launch_plan_explicit = False
+                self._explicit_plan_reprepare_pending = False
                 self.set_allowed_fingerprints(None)
                 self._runtime_scope_token = None
                 if (
@@ -4902,6 +4929,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 raise ValueError("plan must be a ready GroupLaunchPlan.")
             scope_token = self._group_scope_token(plan)
             self._group_launch_plan = plan
+            self._group_launch_plan_explicit = True
+            self._explicit_plan_reprepare_pending = False
             self.set_allowed_fingerprints(plan.fingerprints)
             self._runtime_scope_token = scope_token
             if previous_token != scope_token:
@@ -5055,7 +5084,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._activation_snapshot_source_fingerprints = None
             self._activation_snapshot_direct_identity_collisions = frozenset()
             self._allowed_fingerprints = None
+            self._explicit_plan_reprepare_pending = bool(
+                self._explicit_plan_reprepare_pending
+                or self._group_launch_plan_explicit
+            )
             self._group_launch_plan = None
+            self._group_launch_plan_explicit = False
+            self._battle_restart_group_batch = None
             self._runtime_scope_token = None
             with self._source_authority_lock:
                 self._source_state_generation += 1
@@ -6145,8 +6180,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 )
             except (TypeError, ValueError):
                 return None
+        return self._provided_target_identity_for_fingerprint(fingerprint)
+
+    def _provided_target_identity_for_fingerprint(
+        self,
+        fingerprint: str,
+    ) -> SmartReconnectTargetIdentity | None:
         provider = self._target_identity_provider
-        if self._group_launch_plan is not None or provider is None:
+        if provider is None:
             return None
         source_fingerprint = (
             self._activation_snapshot_source_fingerprints or {}
@@ -6186,10 +6227,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         item: ScreenRecognition,
     ) -> bool:
         if self._authorization_batch is not None:
-            return self._current_target_identity_for_action(
-                fingerprint,
-                item,
-            ) is not None
+            target = self._target_identity_for_fingerprint(fingerprint)
+            if target is None:
+                return False
+            if (
+                item.character_target_key is not None
+                and item.character_target_key
+                != self._target_identity_action_key(target)
+            ):
+                return False
+            if self._target_identity_provider is None:
+                return True
+            current = self._provided_target_identity_for_fingerprint(
+                fingerprint
+            )
+            return bool(
+                current is not None
+                and self._target_identity_action_key(current)
+                == self._target_identity_action_key(target)
+            )
         if self._group_launch_plan is not None:
             return True
         if self._target_identity_provider is None:
@@ -6416,6 +6472,27 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _restart_target_matches_authorization(
+        target: GroupLaunchTarget | None,
+        authorization_target: ReconnectAuthorizationTarget | None,
+    ) -> bool:
+        if (
+            target is None
+            or authorization_target is None
+            or authorization_target.shortcut_seal is None
+            or target.fingerprint != authorization_target.fingerprint
+        ):
+            return False
+        target_path = os.path.normcase(
+            os.path.abspath(os.fspath(target.shortcut_path))
+        )
+        sealed_identity = authorization_target.shortcut_seal.file_identity
+        sealed_path = os.path.normcase(
+            os.path.abspath(os.fspath(sealed_identity.normalized_path))
+        )
+        return target_path == sealed_path
 
     def _clear_reconnect_session(self, fingerprint: str) -> None:
         """Revoke every permission granted by a completed reconnect flow."""
@@ -6775,6 +6852,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     ) -> ScreenRecognition | None:
         if target is None:
             return None
+        expected_recent_role = self._recent_login_role_ids.get(fingerprint)
+        if (
+            expected_recent_role is not None
+            and not target.matches_observed_identity(expected_recent_role)
+        ):
+            return None
         candidates = tuple(item.character_candidates)
         pending = self._character_selection_targets.get(fingerprint)
         action_key = self._target_identity_action_key(target)
@@ -6856,6 +6939,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if (
                 complete_identity is not None
                 and complete_identity not in target.role_aliases
+            ):
+                return None
+            if complete_identity is None and any(
+                other.slot_index != saved_slot
+                and other.level is None
+                and self._complete_target_candidate_identity(
+                    other.identity
+                )
+                is None
+                for other in candidates
             ):
                 return None
         elif len(exact_alias_matches) == 1:
@@ -9461,16 +9554,36 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     == restart_event
                 ):
                     continue
-                plan = self._group_launch_plan
-                target = (
-                    plan.target_for_fingerprint(fingerprint)
-                    if plan is not None
-                    else self._ungrouped_restart_target(fingerprint)
+                batch = self._authorization_batch
+                uses_group_authorization = bool(
+                    batch is not None
+                    and self._battle_restart_group_batch == batch
+                )
+                plan = (
+                    self._group_launch_plan
+                    if uses_group_authorization
+                    else None
+                )
+                if uses_group_authorization:
+                    target = (
+                        plan.target_for_fingerprint(fingerprint)
+                        if plan is not None
+                        else None
+                    )
+                else:
+                    target = self._ungrouped_restart_target(fingerprint)
+                authorization_target = (
+                    batch.target_for(fingerprint)
+                    if batch is not None
+                    else None
                 )
                 snapshot = self._activation_snapshot_instances
                 if (
                     self._battle_restarter is None
-                    or target is None
+                    or not self._restart_target_matches_authorization(
+                        target,
+                        authorization_target,
+                    )
                     or (
                         plan is None
                         and (
@@ -9533,9 +9646,28 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         or authorization_target is None
                         or authorization_target.instance != instance
                         or authorization_target.shortcut_seal is None
-                        or self._group_launch_plan is not plan
-                        or plan is None
-                        or plan.target_for_fingerprint(fingerprint) != target
+                        or not self._restart_target_matches_authorization(
+                            target,
+                            authorization_target,
+                        )
+                        or (
+                            uses_group_authorization
+                            and (
+                                self._battle_restart_group_batch != batch
+                                or self._group_launch_plan is not plan
+                                or plan is None
+                                or plan.target_for_fingerprint(fingerprint)
+                                != target
+                            )
+                        )
+                        or (
+                            not uses_group_authorization
+                            and (
+                                self._battle_restart_group_batch == batch
+                                or self._ungrouped_restart_target(fingerprint)
+                                != target
+                            )
+                        )
                     ):
                         return None
                     bound_pending = _BoundPendingReopen(
@@ -9837,6 +9969,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         or not self._source_authority_is_current(
                             confirmation.source_state_generation,
                         )
+                    ):
+                        return "changed", False
+                    if not self._target_identity_action_is_current(
+                        fingerprint,
+                        item,
                     ):
                         return "changed", False
                     if (
