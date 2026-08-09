@@ -69,7 +69,7 @@ def test_windows_powershell_download_does_not_require_the_ie_engine():
     assert "Invoke-WebRequest `" in updater
     assert "-OutFile $TargetPath `" in updater
     assert "Invoke-RestMethod `" in updater
-    assert updater.count("-UseBasicParsing") == 2
+    assert updater.count("-UseBasicParsing") == 3
     assert "-TimeoutSec $ConnectionTimeoutSeconds" in updater
     assert "-TimeoutSec $DownloadTimeoutSeconds" in updater
     assert "Invoke-WithNetworkRetry" in updater
@@ -92,7 +92,10 @@ def test_only_main_push_can_publish_over_the_live_release():
     workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
 
     publish_step = workflow.split("- name: Publish latest desktop updater files", 1)[1]
-    publish_step = publish_step.split("- name: Upload Windows release bundle", 1)[0]
+    publish_step = publish_step.split(
+        "- name: Publish SP1-only desktop updater files",
+        1,
+    )[0]
     condition = next(
         line.strip()
         for line in publish_step.splitlines()
@@ -102,11 +105,94 @@ def test_only_main_push_can_publish_over_the_live_release():
     assert condition == (
         "if: github.event_name == 'push' && github.ref == 'refs/heads/main'"
     )
+    assert "windows-release-$env:GITHUB_SHA" in publish_step
+    assert "FLASH-Windows-release.zip" in publish_step
+    assert "git push origin release/latest --force" not in publish_step
+    assert "force = $false" in publish_step
+    assert "release-index.json" in publish_step
+
+
+def test_main_release_uses_draft_asset_verification_before_public_index():
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    publish_step = workflow.split("- name: Publish latest desktop updater files", 1)[1]
+    publish_step = publish_step.split(
+        "- name: Publish SP1-only desktop updater files",
+        1,
+    )[0]
+
+    assert "draft = $true" in publish_step
+    assert "make_latest = 'false'" in publish_step
+    assert "Invoke-RestMethod -Method 'Post' -Uri \"${uploadUrl}?name=$assetName\"" in publish_step
+    assert "& gh release upload $releaseTag $uploadAssetPath --repo $repo" in publish_step
+    assert "$assetHeaders['Accept'] = 'application/octet-stream'" in publish_step
     assert (
-        'Copy-Item "$env:GITHUB_WORKSPACE\\release\\sync_plus_icon.ico" '
-        '".\\sync_plus_icon.ico"'
+        "Remove-Item -LiteralPath $remoteAssetPath -Force "
+        "-ErrorAction SilentlyContinue"
     ) in publish_step
-    assert "git add -A" in publish_step
+    assert (
+        "& gh release download $releaseTag --repo $repo --pattern $assetName "
+        "--dir $remoteDownloadRoot --clobber"
+    ) in publish_step
+    assert "$remoteAssets.Count -ne 1" in publish_step
+    assert "[string]$remoteAsset.digest" in publish_step
+    assert "Expand-Archive -LiteralPath $remoteAssetPath" in publish_step
+    assert "verify_windows_release.ps1') -NoLaunch" in publish_step
+    assert "-TestFailAfterReplacement 1" in publish_step
+    assert "make_latest = 'true'" in publish_step
+    assert publish_step.index("-TestFailAfterReplacement 1") < publish_step.index(
+        "draft = $false"
+    )
+    assert publish_step.index("draft = $false") < publish_step.index(
+        "$oldReleaseLatest = Get-ReleaseLatestRef"
+    )
+
+
+def test_main_release_index_is_an_immutable_single_file_compare_and_swap():
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    publish_step = workflow.split("- name: Publish latest desktop updater files", 1)[1]
+    publish_step = publish_step.split(
+        "- name: Publish SP1-only desktop updater files",
+        1,
+    )[0]
+
+    for field in (
+        "schema = 1",
+        "source_commit = $env:GITHUB_SHA",
+        "run_id = [Int64]$env:GITHUB_RUN_ID",
+        "release_tag = $releaseTag",
+        "asset_name = $assetName",
+        "asset_size = $assetSize",
+        "asset_sha256 = $assetHash",
+        "published_utc = $publishedUtc",
+    ):
+        assert field in publish_step
+    assert publish_step.count("Get-ReleaseLatestRef") >= 4
+    assert "parents = @($oldReleaseLatest)" in publish_step
+    assert "base_tree" not in publish_step
+    assert "force = $false" in publish_step
+    assert (
+        'Invoke-GitHubJson -Method \'Get\' '
+        '-Uri "$apiRoot/git/commits/${updatedReleaseLatest}"'
+    ) in publish_step
+    assert "[string]$updatedCommit.sha -ne [string]$indexCommit.sha" in publish_step
+    assert (
+        "[string]$updatedCommit.tree.sha -ne [string]$indexTree.sha"
+    ) in publish_step
+    assert "$updatedTreeSha = [string]$updatedCommit.tree.sha" in publish_step
+    assert (
+        'Invoke-GitHubJson -Method \'Get\' '
+        '-Uri "$apiRoot/git/trees/${updatedTreeSha}?recursive=1"'
+    ) in publish_step
+    assert "updatedEntries.Count -ne 1" in publish_step
+    assert "$updatedEntries[0].path -ne 'release-index.json'" in publish_step
+    assert publish_step.index("$updatedReleaseLatest = Get-ReleaseLatestRef") < (
+        publish_step.index("$updatedCommit = Invoke-GitHubJson")
+    )
+    assert publish_step.index("$updatedCommit = Invoke-GitHubJson") < (
+        publish_step.index("$updatedTree = Invoke-GitHubJson")
+    )
+    index_section = publish_step.split("$oldReleaseLatest = Get-ReleaseLatestRef", 1)[1]
+    assert "FLASH.exe" not in index_section
 
 
 def test_windows_workflow_keeps_manual_artifact_build():

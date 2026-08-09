@@ -1,7 +1,9 @@
 import hashlib
+import json
 import shutil
 import subprocess
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,18 @@ POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")
 SOURCE_COMMIT = "a" * 40
 RELEASE_COMMIT = "b" * 40
 MANIFEST_PATH = "輔系統/SHA256SUMS.txt"
+RELEASE_ASSET_NAME = "FLASH-Windows-release.zip"
+RELEASE_TAG_PREFIX = "windows-release-"
+RELEASE_INDEX_FIELDS = (
+    "schema",
+    "source_commit",
+    "run_id",
+    "release_tag",
+    "asset_name",
+    "asset_size",
+    "asset_sha256",
+    "published_utc",
+)
 PAYLOAD_PATHS = (
     "FLASH.exe",
     "LATEST.txt",
@@ -233,6 +247,105 @@ def _run_updater(
 ) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         _updater_command(install_root, release_root, *extra_arguments),
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+
+def _write_release_index(
+    index_path: Path,
+    asset_path: Path,
+    *,
+    changes: dict[str, object] | None = None,
+) -> dict[str, object]:
+    document: dict[str, object] = {
+        "schema": 1,
+        "source_commit": SOURCE_COMMIT,
+        "run_id": 123456789,
+        "release_tag": f"{RELEASE_TAG_PREFIX}{SOURCE_COMMIT}",
+        "asset_name": RELEASE_ASSET_NAME,
+        "asset_size": asset_path.stat().st_size,
+        "asset_sha256": hashlib.sha256(asset_path.read_bytes()).hexdigest(),
+        "published_utc": "2026-08-09T00:00:00Z",
+    }
+    if changes:
+        document.update(changes)
+    index_path.write_text(
+        json.dumps(document, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return document
+
+
+def _create_release_archive(
+    root: Path,
+    *,
+    archive_names: tuple[str, ...] | None = None,
+    index_changes: dict[str, object] | None = None,
+) -> tuple[Path, Path, Path]:
+    release_root = _create_release(root)
+    asset_path = root / RELEASE_ASSET_NAME
+    names = archive_names or (*PAYLOAD_PATHS, MANIFEST_PATH)
+    with zipfile.ZipFile(
+        asset_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        for index, archive_name in enumerate(names):
+            source_name = (*PAYLOAD_PATHS, MANIFEST_PATH)[
+                min(index, len(PAYLOAD_PATHS))
+            ]
+            entry = zipfile.ZipInfo(archive_name)
+            # Windows zipfile 會把檔名中的反斜線自動轉為斜線；測試必須保留
+            # 原始 ZIP 檔名，才能驗證更新器在解壓前的拒絕邊界。
+            entry.filename = archive_name
+            archive.writestr(
+                entry,
+                _path(release_root, source_name).read_bytes(),
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+    index_path = root / "release-index.json"
+    _write_release_index(index_path, asset_path, changes=index_changes)
+    return release_root, index_path, asset_path
+
+
+def _release_asset_updater_command(
+    install_root: Path,
+    index_path: Path,
+    asset_path: Path,
+    *extra_arguments: str,
+) -> list[str]:
+    return [
+        str(POWERSHELL),
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(UPDATER_SOURCE),
+        "-InstallDirectory",
+        str(install_root),
+        "-TestReleaseIndexPath",
+        str(index_path),
+        "-TestReleaseAssetPath",
+        str(asset_path),
+        *extra_arguments,
+    ]
+
+
+def _run_release_asset_updater(
+    install_root: Path,
+    index_path: Path,
+    asset_path: Path,
+    *extra_arguments: str,
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        _release_asset_updater_command(
+            install_root,
+            index_path,
+            asset_path,
+            *extra_arguments,
+        ),
         capture_output=True,
         check=False,
         timeout=30,
@@ -476,7 +589,8 @@ def test_success_uses_one_fixed_release_commit_and_verifies_installed_files(
 
     updater = UPDATER_SOURCE.read_text(encoding="utf-8-sig")
     assert "commits/$ReleaseBranch" in updater
-    assert "raw.githubusercontent.com/$Repo/$ReleaseCommit/$urlPath" in updater
+    assert "raw.githubusercontent.com/$Repo/$ReleaseCommit/$ReleaseIndexRelativePath" in updater
+    assert "https://github.com/$Repo/releases/download/" in updater
     assert "?t=" not in updater
 
 
@@ -569,3 +683,225 @@ def test_transient_network_failures_retry_then_complete_transaction(
     assert "第 2 次嘗試" in log
     assert "第 3 次嘗試" in log
     assert "更新成功" in log
+
+
+def test_release_index_and_single_archive_complete_the_existing_transaction(
+    tmp_path: Path,
+):
+    release_root, index_path, asset_path = _create_release_archive(tmp_path)
+    install_root = _create_existing_install(tmp_path)
+
+    result = _run_release_asset_updater(
+        install_root,
+        index_path,
+        asset_path,
+    )
+
+    assert result.returncode == 0, _output(result)
+    for relative_path in (*PAYLOAD_PATHS, MANIFEST_PATH):
+        assert _path(install_root, relative_path).read_bytes() == _path(
+            release_root,
+            relative_path,
+        ).read_bytes()
+    log = _log(install_root)
+    assert f"固定發布版本：{SOURCE_COMMIT}" in log
+    assert "正式發布附件已通過大小與 SHA-256 核對" in log
+    assert "更新成功；全部檔案已套用並通過再次驗證" in log
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing",
+        "extra",
+        "schema_type",
+        "run_type",
+        "size_type",
+        "tag",
+        "source",
+        "run",
+        "time",
+        "asset_name",
+        "asset_size",
+        "asset_sha256",
+    ),
+)
+def test_invalid_release_index_never_changes_the_install(
+    tmp_path: Path,
+    case: str,
+):
+    _, index_path, asset_path = _create_release_archive(tmp_path)
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    if case == "missing":
+        index.pop("schema")
+    elif case == "extra":
+        index["unexpected"] = "no"
+    elif case == "schema_type":
+        index["schema"] = "1"
+    elif case == "run_type":
+        index["run_id"] = "123456789"
+    elif case == "size_type":
+        index["asset_size"] = str(index["asset_size"])
+    elif case == "tag":
+        index["release_tag"] = f"{RELEASE_TAG_PREFIX}{'b' * 40}"
+    elif case == "source":
+        index["source_commit"] = "b" * 40
+        index["release_tag"] = f"{RELEASE_TAG_PREFIX}{index['source_commit']}"
+    elif case == "run":
+        index["run_id"] = 987654321
+    elif case == "time":
+        index["published_utc"] = "2026-08-09T00:00:00+00:00"
+    elif case == "asset_name":
+        index["asset_name"] = "other.zip"
+    elif case == "asset_size":
+        index["asset_size"] += 1
+    elif case == "asset_sha256":
+        index["asset_sha256"] = "0" * 64
+    else:
+        raise AssertionError(case)
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    install_root = _create_existing_install(tmp_path)
+    before = _installed_payload_snapshot(install_root)
+    result = _run_release_asset_updater(
+        install_root,
+        index_path,
+        asset_path,
+    )
+
+    assert result.returncode != 0, _output(result)
+    assert _installed_payload_snapshot(install_root) == before
+    assert "更新成功" not in _log(install_root)
+
+
+@pytest.mark.parametrize(
+    "archive_names",
+    (
+        (
+            "../FLASH.exe",
+            *PAYLOAD_PATHS[1:],
+            MANIFEST_PATH,
+        ),
+        (
+            "FLASH.exe",
+            "LATEST.txt",
+            "安裝輔.cmd",
+            "更新輔.cmd",
+            "輔系統\\BUILD_INFO.txt",
+            *PAYLOAD_PATHS[5:],
+            MANIFEST_PATH,
+        ),
+        (
+            "FLASH.exe",
+            "FLASH.exe",
+            *PAYLOAD_PATHS[2:],
+            MANIFEST_PATH,
+        ),
+        (
+            "extra.txt",
+            *PAYLOAD_PATHS[1:],
+            MANIFEST_PATH,
+        ),
+        (
+            "release/FLASH.exe",
+            *PAYLOAD_PATHS[1:],
+            MANIFEST_PATH,
+        ),
+    ),
+    ids=("traversal", "backslash", "duplicate", "extra", "wrapper_root"),
+)
+def test_unsafe_release_archive_never_changes_the_install(
+    tmp_path: Path,
+    archive_names: tuple[str, ...],
+):
+    _, index_path, asset_path = _create_release_archive(
+        tmp_path,
+        archive_names=archive_names,
+    )
+    install_root = _create_existing_install(tmp_path)
+    before = _installed_payload_snapshot(install_root)
+
+    result = _run_release_asset_updater(
+        install_root,
+        index_path,
+        asset_path,
+    )
+
+    assert result.returncode != 0, _output(result)
+    assert _installed_payload_snapshot(install_root) == before
+    assert "更新成功" not in _log(install_root)
+
+
+def test_release_archive_failure_after_replacement_restores_every_file(
+    tmp_path: Path,
+):
+    _, index_path, asset_path = _create_release_archive(tmp_path)
+    install_root = _create_existing_install(tmp_path)
+    before = _installed_payload_snapshot(install_root)
+
+    result = _run_release_asset_updater(
+        install_root,
+        index_path,
+        asset_path,
+        "-TestFailAfterReplacement",
+        "3",
+    )
+
+    assert result.returncode != 0, _output(result)
+    assert _installed_payload_snapshot(install_root) == before
+    log = _log(install_root)
+    assert "開始回復原本安裝內容" in log
+    assert "回復完成；正式安裝內容已還原" in log
+
+
+def test_sp1_install_migrates_to_release_index_latest_transactionally(
+    tmp_path: Path,
+):
+    release_root, index_path, asset_path = _create_release_archive(tmp_path)
+    install_root = _create_existing_install(
+        tmp_path,
+        build_kind="sp1_release",
+        source_branch="sp1/completion-2026-07-25",
+        publish_target="release/sp1",
+    )
+    _path(install_root, "輔系統/BUILD_INFO.txt").write_text(
+        "\n".join(
+            (
+                "source_branch=sp1/completion-2026-07-25",
+                "build_kind=sp1_release",
+                "publish_target=release/sp1",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_release_asset_updater(
+        install_root,
+        index_path,
+        asset_path,
+    )
+
+    assert result.returncode == 0, _output(result)
+    assert "SP1 獨立版" in _log(install_root)
+    assert "release_branch=release/latest" in _path(
+        install_root,
+        "輔系統/UPDATE_CHANNEL.txt",
+    ).read_text(encoding="utf-8")
+    assert (install_root / "FLASH.exe").read_bytes() == (
+        release_root / "FLASH.exe"
+    ).read_bytes()
+
+
+def test_release_asset_test_injection_does_not_add_a_public_url_interface():
+    updater = UPDATER_SOURCE.read_text(encoding="utf-8-sig")
+
+    assert "TestReleaseIndexPath" in updater
+    assert "TestReleaseAssetPath" in updater
+    assert "TestReleaseIndexUrl" not in updater
+    assert "TestReleaseAssetUrl" not in updater
+    assert "raw.githubusercontent.com/$Repo/$ReleaseCommit/$ReleaseIndexRelativePath" in updater
+    assert "https://github.com/$Repo/releases/download/" in updater

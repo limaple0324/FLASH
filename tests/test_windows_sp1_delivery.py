@@ -160,8 +160,14 @@ def test_main_release_builds_latest_then_a_complete_payload_manifest():
         "- name: Publish latest desktop updater files",
         1,
     )[1]
-    assert 'release\\LATEST.txt" ".\\LATEST.txt"' in publish_step
-    assert "Set-Content \".\\LATEST.txt\"" not in publish_step
+    publish_step = publish_step.split(
+        "- name: Publish SP1-only desktop updater files",
+        1,
+    )[0]
+    assert "FLASH-Windows-release.zip" in publish_step
+    assert "release-index.json" in publish_step
+    assert "git push origin release/latest --force" not in publish_step
+    assert "force = $false" in publish_step
 
 
 def test_workflow_verifies_and_uploads_snapshot_before_any_publication():
@@ -177,6 +183,77 @@ def test_workflow_verifies_and_uploads_snapshot_before_any_publication():
     assert workflow.index("- name: Upload Windows release bundle") < workflow.index(
         "- name: Publish latest desktop updater files"
     )
+
+
+def test_main_release_zip_contains_only_the_updater_verified_payload():
+    workflow = _workflow()
+    zip_step = _step(
+        workflow,
+        "Create and verify Windows ZIP",
+        "Verify live install update rollback and desktop entries",
+    )
+
+    main_condition = "if ($env:FLASH_BUILD_KIND -eq 'main_release') {"
+    assert main_condition in zip_step
+    main_block, fallback_block = zip_step.split(main_condition, 1)[1].split(
+        "\n          else {",
+        1,
+    )
+    assert "CreateFromDirectory" not in main_block
+    assert "$zipEntryPaths = @(" in main_block
+    for relative_path in (
+        "FLASH.exe",
+        "LATEST.txt",
+        "安裝輔.cmd",
+        "更新輔.cmd",
+        "輔系統/BUILD_INFO.txt",
+        "sync_plus_icon.ico",
+        "輔系統/verify_windows_release.ps1",
+        "輔系統/安裝輔.ps1",
+        "輔系統/輔更新核心.ps1",
+        "輔系統/UPDATE_CHANNEL.txt",
+        "輔系統/檢查輔同步狀態.cmd",
+        "輔系統/檢查輔同步狀態.ps1",
+        "輔系統/SHA256SUMS.txt",
+    ):
+        assert f"'{relative_path}'" in main_block
+    assert ".gitattributes" not in main_block
+    assert "[IO.Compression.ZipFile]::CreateFromDirectory(" in fallback_block
+    assert "$releaseRoot," in fallback_block
+    assert "$zipPath," in fallback_block
+    assert "[IO.Compression.CompressionLevel]::Optimal," in fallback_block
+    assert "$false" in fallback_block
+
+
+def test_main_release_uses_one_immutable_release_asset_before_latest_index():
+    workflow = _workflow()
+    publish_step = workflow.split(
+        "- name: Publish latest desktop updater files",
+        1,
+    )[1].split(
+        "- name: Publish SP1-only desktop updater files",
+        1,
+    )[0]
+
+    assert '$releaseTag = "windows-release-$env:GITHUB_SHA"' in publish_step
+    assert "正式發布標籤已存在，為避免覆寫而停止" in publish_step
+    assert "draft = $true" in publish_step
+    assert "make_latest = 'false'" in publish_step
+    assert "$remoteAssets.Count -ne 1" in publish_step
+    assert "$remoteAsset.name -ne $assetName" in publish_step
+    assert "$remoteAssetPath" in publish_step
+    assert "--dir $remoteDownloadRoot --clobber" in publish_step
+    assert "Expand-Archive -LiteralPath $remoteAssetPath" in publish_step
+    assert "-TestReleaseIndexPath $testIndexPath" in publish_step
+    assert "-TestReleaseAssetPath $remoteAssetPath" in publish_step
+    assert "make_latest = 'true'" in publish_step
+    assert "$apiRoot/git/commits/${updatedReleaseLatest}" in publish_step
+    assert "$apiRoot/git/trees/${updatedTreeSha}?recursive=1" in publish_step
+    assert publish_step.index("$publicRelease = Invoke-GitHubJson") < publish_step.index(
+        "$oldReleaseLatest = Get-ReleaseLatestRef"
+    )
+    assert publish_step.count("Get-ReleaseLatestRef") >= 4
+    assert "updatedEntries.Count -ne 1" in publish_step
 
 
 def test_first_transactional_updater_migration_requires_a_full_installer():

@@ -6,6 +6,8 @@ param(
     [string]$InstallDirectory = "",
     [string]$ReleaseSourceDirectory = "",
     [string]$ResolvedReleaseCommit = "",
+    [string]$TestReleaseIndexPath = "",
+    [string]$TestReleaseAssetPath = "",
     [ValidateRange(0, 1000)]
     [int]$TestFailAfterReplacement = 0,
     [ValidateRange(0, 60000)]
@@ -32,6 +34,23 @@ $Repo = "limaple0324/FLASH"
 $ReleaseBranch = ""
 $ManifestRelativePath = "輔系統/SHA256SUMS.txt"
 $ChannelRelativePath = "輔系統/UPDATE_CHANNEL.txt"
+$ReleaseIndexRelativePath = "release-index.json"
+$ReleaseAssetName = "FLASH-Windows-release.zip"
+$ReleaseTagPrefix = "windows-release-"
+$ExpectedReleaseIndexFields = @(
+    "schema",
+    "source_commit",
+    "run_id",
+    "release_tag",
+    "asset_name",
+    "asset_size",
+    "asset_sha256",
+    "published_utc"
+)
+$MaxReleaseAssetBytes = [Int64]2GB
+$MaxArchiveExpandedBytes = [Int64]512MB
+$MaxArchiveEntryBytes = [Int64]512MB
+$MaxArchiveCompressionRatio = 200
 $PayloadPaths = @(
     "FLASH.exe",
     "LATEST.txt",
@@ -68,6 +87,15 @@ $TransactionRoot = Join-Path $TransactionBase $TransactionId
 $StageRoot = Join-Path $TransactionRoot "stage"
 $BackupRoot = Join-Path $TransactionRoot "backup"
 $UsingLocalSource = -not [string]::IsNullOrWhiteSpace($ReleaseSourceDirectory)
+$hasTestReleaseIndex = -not [string]::IsNullOrWhiteSpace($TestReleaseIndexPath)
+$hasTestReleaseAsset = -not [string]::IsNullOrWhiteSpace($TestReleaseAssetPath)
+if ($hasTestReleaseIndex -ne $hasTestReleaseAsset) {
+    throw "測試正式發布來源必須同時指定索引與附件。"
+}
+$UsingReleaseAssetTestSource = $hasTestReleaseIndex -and $hasTestReleaseAsset
+if ($UsingLocalSource -and $UsingReleaseAssetTestSource) {
+    throw "本機逐檔來源與測試正式發布來源不可同時使用。"
+}
 $LockStream = $null
 $AppliedRecords = New-Object System.Collections.ArrayList
 $TemporaryTargetPaths = New-Object System.Collections.ArrayList
@@ -472,14 +500,6 @@ function Assert-ReleaseIdentity(
     return $buildInfo
 }
 
-function Convert-ToUrlPath([string]$RelativePath) {
-    $encodedSegments = @()
-    foreach ($segment in ($RelativePath -split "/")) {
-        $encodedSegments += [Uri]::EscapeDataString($segment)
-    }
-    return ($encodedSegments -join "/")
-}
-
 function Resolve-ReleaseCommit {
     if (-not [string]::IsNullOrWhiteSpace($TestNetworkFailureKind)) {
         $testMessages = @{
@@ -540,25 +560,163 @@ function Resolve-ReleaseCommit {
     return $commit.ToLowerInvariant()
 }
 
-function Copy-OrDownloadPayload(
-    [string]$RelativePath,
-    [string]$TargetPath,
-    [string]$ReleaseCommit
+function Convert-ReleaseIndexInteger(
+    [object]$Value,
+    [string]$FieldName
+) {
+    if (
+        $null -eq $Value -or
+        (
+            $Value -isnot [Byte] -and
+            $Value -isnot [SByte] -and
+            $Value -isnot [Int16] -and
+            $Value -isnot [UInt16] -and
+            $Value -isnot [Int32] -and
+            $Value -isnot [UInt32] -and
+            $Value -isnot [Int64]
+        )
+    ) {
+        throw "release-index.json 的 $FieldName 必須是整數。"
+    }
+    return [Int64]$Value
+}
+
+function Read-ReleaseIndex([string]$Path) {
+    Require-File $Path
+    try {
+        $document = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 |
+            ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "release-index.json 格式不正確。"
+    }
+    if ($null -eq $document -or $document -isnot [PSCustomObject]) {
+        throw "release-index.json 必須是單一物件。"
+    }
+
+    $values = @{}
+    $properties = @($document.PSObject.Properties)
+    if ($properties.Count -ne $ExpectedReleaseIndexFields.Count) {
+        throw "release-index.json 欄位數量不正確。"
+    }
+    foreach ($property in $properties) {
+        $name = [string]$property.Name
+        if ($ExpectedReleaseIndexFields -notcontains $name) {
+            throw "release-index.json 含有未允許欄位：$name"
+        }
+        if ($values.ContainsKey($name)) {
+            throw "release-index.json 含有重複欄位：$name"
+        }
+        $values[$name] = $property.Value
+    }
+    foreach ($name in $ExpectedReleaseIndexFields) {
+        if (-not $values.ContainsKey($name)) {
+            throw "release-index.json 缺少欄位：$name"
+        }
+    }
+
+    $schema = Convert-ReleaseIndexInteger -Value $values["schema"] -FieldName "schema"
+    if ($schema -ne 1) {
+        throw "release-index.json 的 schema 必須是數字 1。"
+    }
+    $runId = Convert-ReleaseIndexInteger -Value $values["run_id"] -FieldName "run_id"
+    if ($runId -le 0) {
+        throw "release-index.json 的 run_id 必須是正整數。"
+    }
+    $assetSize = Convert-ReleaseIndexInteger -Value $values["asset_size"] -FieldName "asset_size"
+    if (
+        $assetSize -le 0 -or
+        $assetSize -gt $MaxReleaseAssetBytes
+    ) {
+        throw "release-index.json 的 asset_size 不在安全範圍內。"
+    }
+    foreach ($name in @("source_commit", "release_tag", "asset_name", "asset_sha256", "published_utc")) {
+        if ($values[$name] -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$values[$name])) {
+            throw "release-index.json 的 $name 必須是非空白字串。"
+        }
+    }
+
+    $sourceCommit = [string]$values["source_commit"]
+    if ($sourceCommit -notmatch "^[0-9a-f]{40}$") {
+        throw "release-index.json 的 source_commit 格式不正確。"
+    }
+    $releaseTag = [string]$values["release_tag"]
+    if ($releaseTag -ne ($ReleaseTagPrefix + $sourceCommit)) {
+        throw "release-index.json 的 release_tag 與來源 commit 不一致。"
+    }
+    if ([string]$values["asset_name"] -ne $ReleaseAssetName) {
+        throw "release-index.json 的 asset_name 不受支援。"
+    }
+    $assetHash = [string]$values["asset_sha256"]
+    if ($assetHash -notmatch "^[0-9a-f]{64}$") {
+        throw "release-index.json 的 asset_sha256 格式不正確。"
+    }
+    $publishedUtc = [string]$values["published_utc"]
+    if ($publishedUtc -notmatch "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$") {
+        throw "release-index.json 的 published_utc 格式不正確。"
+    }
+    $parsedUtc = [DateTime]::MinValue
+    if (
+        -not [DateTime]::TryParseExact(
+            $publishedUtc,
+            "yyyy-MM-ddTHH:mm:ssZ",
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal,
+            [ref]$parsedUtc
+        ) -or
+        $parsedUtc.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") -ne $publishedUtc
+    ) {
+        throw "release-index.json 的 published_utc 不是有效 UTC 時間。"
+    }
+
+    return @{
+        schema = $schema
+        source_commit = $sourceCommit
+        run_id = $runId
+        release_tag = $releaseTag
+        asset_name = [string]$values["asset_name"]
+        asset_size = $assetSize
+        asset_sha256 = $assetHash
+        published_utc = $publishedUtc
+    }
+}
+
+function Copy-OrDownloadReleaseIndex(
+    [string]$ReleaseCommit,
+    [string]$TargetPath
 ) {
     $targetParent = Split-Path -Parent $TargetPath
     New-Item -ItemType Directory -Force -Path $targetParent | Out-Null
-    Write-Step "取得：$RelativePath"
+    if ($UsingReleaseAssetTestSource) {
+        Require-File $TestReleaseIndexPath
+        Copy-Item -LiteralPath $TestReleaseIndexPath -Destination $TargetPath -Force
+        return
+    }
 
-    if ($UsingLocalSource) {
-        $sourceRoot = [IO.Path]::GetFullPath($ReleaseSourceDirectory)
-        $sourcePath = Get-PayloadPath -Root $sourceRoot -RelativePath $RelativePath
-        Require-File $sourcePath
-        Copy-Item -LiteralPath $sourcePath -Destination $TargetPath -Force
+    $url = "https://raw.githubusercontent.com/$Repo/$ReleaseCommit/$ReleaseIndexRelativePath"
+    Invoke-WithNetworkRetry "下載正式發布索引" {
+        Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $TargetPath `
+            -TimeoutSec $DownloadTimeoutSeconds `
+            -UseBasicParsing
+    } | Out-Null
+    Require-File $TargetPath
+}
+
+function Copy-OrDownloadReleaseAsset(
+    [hashtable]$ReleaseIndex,
+    [string]$TargetPath
+) {
+    $targetParent = Split-Path -Parent $TargetPath
+    New-Item -ItemType Directory -Force -Path $targetParent | Out-Null
+    if ($UsingReleaseAssetTestSource) {
+        Require-File $TestReleaseAssetPath
+        Copy-Item -LiteralPath $TestReleaseAssetPath -Destination $TargetPath -Force
     }
     else {
-        $urlPath = Convert-ToUrlPath -RelativePath $RelativePath
-        $url = "https://raw.githubusercontent.com/$Repo/$ReleaseCommit/$urlPath"
-        Invoke-WithNetworkRetry "下載 $RelativePath" {
+        $url = "https://github.com/$Repo/releases/download/$($ReleaseIndex["release_tag"])/$($ReleaseIndex["asset_name"])"
+        Invoke-WithNetworkRetry "下載正式發布附件" {
             Invoke-WebRequest `
                 -Uri $url `
                 -OutFile $TargetPath `
@@ -566,6 +724,244 @@ function Copy-OrDownloadPayload(
                 -UseBasicParsing
         } | Out-Null
     }
+    Require-File $TargetPath
+
+    $actualSize = [Int64](Get-Item -LiteralPath $TargetPath).Length
+    if ($actualSize -ne [Int64]$ReleaseIndex["asset_size"]) {
+        throw "正式發布附件大小與索引不一致。"
+    }
+    $actualHash = Get-Sha256Hex -Path $TargetPath
+    if ($actualHash -ne $ReleaseIndex["asset_sha256"]) {
+        throw "正式發布附件 SHA-256 與索引不一致。"
+    }
+}
+
+function Assert-ArchiveCentralDirectoryNames([string]$ArchivePath) {
+    Require-File $ArchivePath
+    $stream = [IO.File]::Open(
+        $ArchivePath,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
+    $reader = New-Object IO.BinaryReader($stream, [Text.Encoding]::UTF8, $true)
+    try {
+        if ($stream.Length -lt 22) {
+            throw "正式發布附件不是有效 ZIP 檔。"
+        }
+        $tailLength = [int][Math]::Min([Int64]65557, $stream.Length)
+        $tailStart = $stream.Length - $tailLength
+        $stream.Position = $tailStart
+        $tail = $reader.ReadBytes($tailLength)
+        $eocdOffset = -1
+        for ($index = $tail.Length - 22; $index -ge 0; $index--) {
+            if (
+                $tail[$index] -eq 0x50 -and
+                $tail[$index + 1] -eq 0x4B -and
+                $tail[$index + 2] -eq 0x05 -and
+                $tail[$index + 3] -eq 0x06
+            ) {
+                $commentLength = [int]$tail[$index + 20] + (
+                    [int]$tail[$index + 21] * 256
+                )
+                if ($index + 22 + $commentLength -eq $tail.Length) {
+                    $eocdOffset = $index
+                    break
+                }
+            }
+        }
+        if ($eocdOffset -lt 0) {
+            throw "正式發布附件缺少 ZIP 中央目錄。"
+        }
+
+        $stream.Position = $tailStart + $eocdOffset
+        if ($reader.ReadUInt32() -ne 0x06054B50) {
+            throw "正式發布附件 ZIP 中央目錄格式不正確。"
+        }
+        $diskNumber = $reader.ReadUInt16()
+        $centralDirectoryDisk = $reader.ReadUInt16()
+        $entriesOnDisk = $reader.ReadUInt16()
+        $entryCount = $reader.ReadUInt16()
+        $centralDirectorySize = $reader.ReadUInt32()
+        $centralDirectoryOffset = $reader.ReadUInt32()
+        $null = $reader.ReadUInt16()
+        if (
+            $diskNumber -ne 0 -or
+            $centralDirectoryDisk -ne 0 -or
+            $entriesOnDisk -ne $entryCount -or
+            $entryCount -eq [UInt16]::MaxValue -or
+            $centralDirectorySize -eq [UInt32]::MaxValue -or
+            $centralDirectoryOffset -eq [UInt32]::MaxValue
+        ) {
+            throw "正式發布附件不支援多磁碟或 ZIP64 格式。"
+        }
+        $centralDirectoryEnd = [Int64]$centralDirectoryOffset + [Int64]$centralDirectorySize
+        if ($centralDirectoryEnd -gt $stream.Length) {
+            throw "正式發布附件的 ZIP 中央目錄超出檔案範圍。"
+        }
+
+        $stream.Position = [Int64]$centralDirectoryOffset
+        for ($entryIndex = 0; $entryIndex -lt $entryCount; $entryIndex++) {
+            if ($reader.ReadUInt32() -ne 0x02014B50) {
+                throw "正式發布附件的 ZIP 檔案項目格式不正確。"
+            }
+            $null = $reader.ReadUInt16()
+            $null = $reader.ReadUInt16()
+            $null = $reader.ReadUInt16()
+            $null = $reader.ReadUInt16()
+            $null = $reader.ReadUInt16()
+            $null = $reader.ReadUInt16()
+            $null = $reader.ReadUInt32()
+            $null = $reader.ReadUInt32()
+            $null = $reader.ReadUInt32()
+            $nameLength = $reader.ReadUInt16()
+            $extraLength = $reader.ReadUInt16()
+            $commentLength = $reader.ReadUInt16()
+            $null = $reader.ReadUInt16()
+            $null = $reader.ReadUInt16()
+            $null = $reader.ReadUInt32()
+            $null = $reader.ReadUInt32()
+            $nameBytes = $reader.ReadBytes($nameLength)
+            if ($nameBytes.Length -ne $nameLength) {
+                throw "正式發布附件的 ZIP 檔名不完整。"
+            }
+            if ($nameBytes -contains [byte]0x5C) {
+                throw "正式發布附件含有反斜線檔名。"
+            }
+            $nextPosition = $stream.Position + [Int64]$extraLength + [Int64]$commentLength
+            if ($nextPosition -gt $centralDirectoryEnd) {
+                throw "正式發布附件的 ZIP 額外資料超出範圍。"
+            }
+            $stream.Position = $nextPosition
+        }
+    }
+    finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Expand-VerifiedReleaseArchive(
+    [string]$ArchivePath,
+    [string]$DestinationRoot
+) {
+    Require-File $ArchivePath
+    Assert-ArchiveCentralDirectoryNames -ArchivePath $ArchivePath
+    $fullDestination = [IO.Path]::GetFullPath($DestinationRoot).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    New-Item -ItemType Directory -Force -Path $fullDestination | Out-Null
+    if (Get-ChildItem -LiteralPath $fullDestination -Force | Select-Object -First 1) {
+        throw "安全解壓目錄必須是空白。"
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    try {
+        $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    }
+    catch {
+        throw "正式發布附件不是有效 ZIP 檔。"
+    }
+    try {
+        $entries = @($archive.Entries)
+        if ($entries.Count -ne $DownloadPaths.Count) {
+            throw "正式發布附件的檔案數量不正確。"
+        }
+        $seen = @{}
+        [Int64]$expandedLength = 0
+        foreach ($entry in $entries) {
+            $name = [string]$entry.FullName
+            if (
+                [string]::IsNullOrWhiteSpace($name) -or
+                $name.EndsWith("/") -or
+                $name -match "\\" -or
+                $name.StartsWith("/") -or
+                $name -match "^[A-Za-z]:" -or
+                $name -match "(^|/)(\.|\.\.)(/|$)"
+            ) {
+                throw "正式發布附件含有不安全路徑：$name"
+            }
+            if ($name -notmatch "/" -and $name -notin $DownloadPaths) {
+                throw "正式發布附件含有包裝根目錄或未允許檔案：$name"
+            }
+            if ($DownloadPaths -notcontains $name) {
+                throw "正式發布附件含有未允許檔案：$name"
+            }
+            if ($seen.ContainsKey($name)) {
+                throw "正式發布附件含有重複檔案：$name"
+            }
+            $seen[$name] = $true
+            if (
+                $entry.Length -lt 0 -or
+                $entry.Length -gt $MaxArchiveEntryBytes -or
+                $entry.Length -gt ($MaxArchiveExpandedBytes - $expandedLength)
+            ) {
+                throw "正式發布附件的解壓大小不安全：$name"
+            }
+            if (
+                $entry.Length -gt 0 -and
+                (
+                    $entry.CompressedLength -le 0 -or
+                    ([double]$entry.Length / [double]$entry.CompressedLength) -gt $MaxArchiveCompressionRatio
+                )
+            ) {
+                throw "正式發布附件疑似壓縮炸彈：$name"
+            }
+            $expandedLength += [Int64]$entry.Length
+        }
+        foreach ($relativePath in $DownloadPaths) {
+            if (-not $seen.ContainsKey($relativePath)) {
+                throw "正式發布附件缺少必要檔案：$relativePath"
+            }
+        }
+
+        foreach ($entry in $entries) {
+            $targetPath = Get-PayloadPath -Root $fullDestination -RelativePath $entry.FullName
+            $fullTarget = [IO.Path]::GetFullPath($targetPath)
+            if (
+                -not $fullTarget.StartsWith(
+                    $fullDestination + [IO.Path]::DirectorySeparatorChar,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            ) {
+                throw "正式發布附件解壓目的地不安全：$($entry.FullName)"
+            }
+            $targetParent = Split-Path -Parent $fullTarget
+            New-Item -ItemType Directory -Force -Path $targetParent | Out-Null
+            $input = $entry.Open()
+            $output = [IO.File]::Open(
+                $fullTarget,
+                [IO.FileMode]::CreateNew,
+                [IO.FileAccess]::Write,
+                [IO.FileShare]::None
+            )
+            try {
+                $input.CopyTo($output)
+            }
+            finally {
+                $output.Dispose()
+                $input.Dispose()
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
+
+function Copy-LocalPayload(
+    [string]$RelativePath,
+    [string]$TargetPath
+) {
+    $targetParent = Split-Path -Parent $TargetPath
+    New-Item -ItemType Directory -Force -Path $targetParent | Out-Null
+    Write-Step "取得：$RelativePath"
+
+    $sourceRoot = [IO.Path]::GetFullPath($ReleaseSourceDirectory)
+    $sourcePath = Get-PayloadPath -Root $sourceRoot -RelativePath $RelativePath
+    Require-File $sourcePath
+    Copy-Item -LiteralPath $sourcePath -Destination $TargetPath -Force
     Require-File $TargetPath
 }
 
@@ -695,15 +1091,41 @@ try {
 
     New-Item -ItemType Directory -Force -Path $StageRoot, $BackupRoot | Out-Null
     Write-Step "開始更新輔；正式安裝尚未修改。"
-    $releaseCommit = Resolve-ReleaseCommit
-    Write-Step "固定發布版本：$releaseCommit"
+    $releaseIndex = $null
+    if ($UsingLocalSource) {
+        $releaseCommit = Resolve-ReleaseCommit
+        Write-Step "固定發布版本：$releaseCommit"
+        foreach ($relativePath in $DownloadPaths) {
+            $targetPath = Get-PayloadPath -Root $StageRoot -RelativePath $relativePath
+            Copy-LocalPayload `
+                -RelativePath $relativePath `
+                -TargetPath $targetPath
+        }
+    }
+    else {
+        $indexPath = Join-Path $TransactionRoot $ReleaseIndexRelativePath
+        if ($UsingReleaseAssetTestSource) {
+            Write-Step "讀取測試正式發布索引。"
+        }
+        else {
+            $releaseIndexCommit = Resolve-ReleaseCommit
+            Write-Step "固定發布索引版本：$releaseIndexCommit"
+        }
+        Copy-OrDownloadReleaseIndex `
+            -ReleaseCommit $releaseIndexCommit `
+            -TargetPath $indexPath
+        $releaseIndex = Read-ReleaseIndex -Path $indexPath
+        $releaseCommit = [string]$releaseIndex["source_commit"]
+        Write-Step "固定發布版本：$releaseCommit"
 
-    foreach ($relativePath in $DownloadPaths) {
-        $targetPath = Get-PayloadPath -Root $StageRoot -RelativePath $relativePath
-        Copy-OrDownloadPayload `
-            -RelativePath $relativePath `
-            -TargetPath $targetPath `
-            -ReleaseCommit $releaseCommit
+        $archivePath = Join-Path $TransactionRoot $ReleaseAssetName
+        Copy-OrDownloadReleaseAsset `
+            -ReleaseIndex $releaseIndex `
+            -TargetPath $archivePath
+        Write-Step "正式發布附件已通過大小與 SHA-256 核對。"
+        Expand-VerifiedReleaseArchive `
+            -ArchivePath $archivePath `
+            -DestinationRoot $StageRoot
     }
 
     Write-Step "逐檔核對完整 SHA-256 manifest。"
@@ -712,6 +1134,14 @@ try {
         -Root $StageRoot `
         -Manifest $manifest `
         -ExpectedChannel $updateChannel
+    if ($null -ne $releaseIndex) {
+        if ($buildInfo["commit"] -ne $releaseIndex["source_commit"]) {
+            throw "BUILD_INFO.txt 與 release-index.json 的來源 commit 不一致。"
+        }
+        if ([string]$buildInfo["run_id"] -ne [string]$releaseIndex["run_id"]) {
+            throw "BUILD_INFO.txt 與 release-index.json 的 run_id 不一致。"
+        }
+    }
     Invoke-StagedVerifier -Root $StageRoot -Description "安裝前驗證"
 
     $migratingChannel = (

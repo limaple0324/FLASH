@@ -523,12 +523,52 @@ jobs:
           $releaseRoot = [IO.Path]::GetFullPath('release')
           Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          [IO.Compression.ZipFile]::CreateFromDirectory(
-            $releaseRoot,
-            $zipPath,
-            [IO.Compression.CompressionLevel]::Optimal,
-            $false
-          )
+          if ($env:FLASH_BUILD_KIND -eq 'main_release') {
+            $zipEntryPaths = @(
+              'FLASH.exe'
+              'LATEST.txt'
+              '安裝輔.cmd'
+              '更新輔.cmd'
+              '輔系統/BUILD_INFO.txt'
+              'sync_plus_icon.ico'
+              '輔系統/verify_windows_release.ps1'
+              '輔系統/安裝輔.ps1'
+              '輔系統/輔更新核心.ps1'
+              '輔系統/UPDATE_CHANNEL.txt'
+              '輔系統/檢查輔同步狀態.cmd'
+              '輔系統/檢查輔同步狀態.ps1'
+              '輔系統/SHA256SUMS.txt'
+            )
+            $archive = [IO.Compression.ZipFile]::Open(
+              $zipPath,
+              [IO.Compression.ZipArchiveMode]::Create
+            )
+            try {
+              foreach ($relativePath in $zipEntryPaths) {
+                $sourcePath = Join-Path $releaseRoot $relativePath
+                if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                  throw "Release ZIP payload is missing: $relativePath"
+                }
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                  $archive,
+                  $sourcePath,
+                  $relativePath,
+                  [IO.Compression.CompressionLevel]::Optimal
+                ) | Out-Null
+              }
+            }
+            finally {
+              $archive.Dispose()
+            }
+          }
+          else {
+            [IO.Compression.ZipFile]::CreateFromDirectory(
+              $releaseRoot,
+              $zipPath,
+              [IO.Compression.CompressionLevel]::Optimal,
+              $false
+            )
+          }
           if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
             throw 'Windows ZIP was not created.'
           }
@@ -668,45 +708,266 @@ jobs:
       - name: Publish latest desktop updater files
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          $publishRoot = Join-Path $env:RUNNER_TEMP 'flash-latest-release'
-          Remove-Item -Recurse -Force $publishRoot -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $publishRoot | Out-Null
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:GITHUB_REPOSITORY
+          $apiRoot = "https://api.github.com/repos/$repo"
+          $assetName = 'FLASH-Windows-release.zip'
+          $releaseTag = "windows-release-$env:GITHUB_SHA"
+          $headers = @{
+            'Accept' = 'application/vnd.github+json'
+            'Authorization' = "Bearer $env:GITHUB_TOKEN"
+            'User-Agent' = 'FLASH-Windows-Release'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
 
-          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" $publishRoot
-          Set-Location $publishRoot
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          function Invoke-GitHubJson {
+            param([string]$Method, [string]$Uri, $Body = $null)
+            if ($null -eq $Body) {
+              return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers
+            }
+            $json = $Body | ConvertTo-Json -Depth 8 -Compress
+            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -ContentType 'application/json' -Body $json
+          }
 
-          $branchExists = $true
-          git fetch origin release/latest
+          function Test-TransportFailure {
+            param([System.Exception]$Exception)
+            if ($Exception -is [System.Net.WebException]) {
+              return $null -eq $Exception.Response
+            }
+            return $Exception.Message -match '(?i)connection|transport|tls|timeout'
+          }
+
+          function Get-ReleaseLatestRef {
+            $response = Invoke-GitHubJson -Method 'Get' -Uri "$apiRoot/git/ref/heads/release/latest"
+            $sha = [string]$response.object.sha
+            if ($sha -notmatch '^[0-9a-fA-F]{40}$') {
+              throw 'release/latest 沒有有效的目前提交。'
+            }
+            return $sha.ToLowerInvariant()
+          }
+
+          $zipPath = Resolve-Path (Join-Path 'dist' "$env:FLASH_ARTIFACT_NAME.zip")
+          $releaseWork = Join-Path $env:RUNNER_TEMP 'flash-release-asset'
+          Remove-Item -LiteralPath $releaseWork -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $releaseWork | Out-Null
+          $uploadAssetPath = Join-Path $releaseWork $assetName
+          Copy-Item -LiteralPath $zipPath -Destination $uploadAssetPath
+          $assetSize = [Int64](Get-Item -LiteralPath $uploadAssetPath).Length
+          $assetHash = (Get-FileHash -LiteralPath $uploadAssetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          $tagExists = $false
+          try {
+            $null = Invoke-GitHubJson -Method 'Get' -Uri "$apiRoot/git/ref/tags/$releaseTag"
+            $tagExists = $true
+          }
+          catch {
+            $statusCode = $null
+            if ($_.Exception.Response) {
+              try {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+              }
+              catch {
+                $statusCode = $null
+              }
+            }
+            if ($statusCode -ne 404) {
+              throw
+            }
+          }
+          if ($tagExists) {
+            throw "正式發布標籤已存在，為避免覆寫而停止：$releaseTag"
+          }
+
+          $null = Invoke-GitHubJson -Method 'Post' -Uri "$apiRoot/git/refs" -Body @{
+            ref = "refs/tags/$releaseTag"
+            sha = $env:GITHUB_SHA
+          }
+          $draftRelease = Invoke-GitHubJson -Method 'Post' -Uri "$apiRoot/releases" -Body @{
+            tag_name = $releaseTag
+            target_commitish = $env:GITHUB_SHA
+            name = "Windows release $env:GITHUB_SHA"
+            draft = $true
+            prerelease = $false
+            make_latest = 'false'
+          }
+          $releaseId = [Int64]$draftRelease.id
+          $uploadUrl = ([string]$draftRelease.upload_url).Split('{')[0]
+          if ($releaseId -le 0 -or [string]::IsNullOrWhiteSpace($uploadUrl)) {
+            throw 'GitHub 沒有建立可上傳附件的草稿發布。'
+          }
+
+          try {
+            $null = Invoke-RestMethod -Method 'Post' -Uri "${uploadUrl}?name=$assetName" -Headers $headers -ContentType 'application/zip' -InFile $uploadAssetPath
+          }
+          catch {
+            if (-not (Test-TransportFailure $_.Exception)) {
+              throw
+            }
+            $env:GH_TOKEN = $env:GITHUB_TOKEN
+            & gh release upload $releaseTag $uploadAssetPath --repo $repo
+            if ($LASTEXITCODE -ne 0) {
+              throw '正式發布附件上傳的 REST 與 gh 備援皆失敗。'
+            }
+          }
+
+          $draftReadback = Invoke-GitHubJson -Method 'Get' -Uri "$apiRoot/releases/$releaseId"
+          if (-not $draftReadback.draft -or $draftReadback.tag_name -ne $releaseTag) {
+            throw '草稿發布回讀結果不一致。'
+          }
+          $remoteAssets = @($draftReadback.assets)
+          if ($remoteAssets.Count -ne 1) {
+            throw '草稿發布必須且只能有一個正式附件。'
+          }
+          $remoteAsset = $remoteAssets[0]
+          if ($remoteAsset.name -ne $assetName -or [Int64]$remoteAsset.size -ne $assetSize -or [string]$remoteAsset.digest -ne ("sha256:" + $assetHash)) {
+            throw 'GitHub 草稿附件的名稱、大小或 SHA-256 回讀不一致。'
+          }
+
+          $remoteDownloadRoot = Join-Path $releaseWork 'remote-download'
+          New-Item -ItemType Directory -Force -Path $remoteDownloadRoot | Out-Null
+          $remoteAssetPath = Join-Path $remoteDownloadRoot $assetName
+          $assetHeaders = $headers.Clone()
+          $assetHeaders['Accept'] = 'application/octet-stream'
+          try {
+            Invoke-WebRequest -Uri ([string]$remoteAsset.url) -Headers $assetHeaders -OutFile $remoteAssetPath -UseBasicParsing
+          }
+          catch {
+            if (-not (Test-TransportFailure $_.Exception)) {
+              throw
+            }
+            Remove-Item -LiteralPath $remoteAssetPath -Force -ErrorAction SilentlyContinue
+            $env:GH_TOKEN = $env:GITHUB_TOKEN
+            & gh release download $releaseTag --repo $repo --pattern $assetName --dir $remoteDownloadRoot --clobber
+            if ($LASTEXITCODE -ne 0) {
+              throw '正式發布附件回下載的 REST 與 gh 備援皆失敗。'
+            }
+          }
+          if (
+            -not (Test-Path -LiteralPath $remoteAssetPath -PathType Leaf) -or
+            [Int64](Get-Item -LiteralPath $remoteAssetPath).Length -ne $assetSize -or
+            (Get-FileHash -LiteralPath $remoteAssetPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $assetHash
+          ) {
+            throw '遠端正式發布附件的大小或 SHA-256 驗證失敗。'
+          }
+
+          $remoteExtractRoot = Join-Path $releaseWork 'remote-extract'
+          Expand-Archive -LiteralPath $remoteAssetPath -DestinationPath $remoteExtractRoot
+          & (Join-Path $remoteExtractRoot '輔系統/verify_windows_release.ps1') -NoLaunch
+          if (-not $?) {
+            throw '遠端正式發布附件解壓後驗證失敗。'
+          }
+
+          $testIndexPath = Join-Path $remoteDownloadRoot 'release-index.json'
+          $testIndex = @{
+            schema = 1
+            source_commit = $env:GITHUB_SHA
+            run_id = [Int64]$env:GITHUB_RUN_ID
+            release_tag = $releaseTag
+            asset_name = $assetName
+            asset_size = $assetSize
+            asset_sha256 = $assetHash
+            published_utc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+          }
+          $testIndex | ConvertTo-Json -Compress | Set-Content -LiteralPath $testIndexPath -Encoding utf8
+
+          $installRoot = Join-Path $releaseWork 'live-install'
+          $desktopRoot = Join-Path $releaseWork 'live-desktop'
+          New-Item -ItemType Directory -Force -Path $desktopRoot | Out-Null
+          & (Join-Path $remoteExtractRoot '輔系統/安裝輔.ps1') -SourceDirectory $remoteExtractRoot -InstallDirectory $installRoot -DesktopDirectory $desktopRoot
+          if (-not $?) {
+            throw '遠端正式發布附件安裝驗證失敗。'
+          }
+
+          $beforeHash = (Get-FileHash -LiteralPath (Join-Path $installRoot 'FLASH.exe') -Algorithm SHA256).Hash
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $remoteExtractRoot '輔系統/輔更新核心.ps1') -InstallDirectory $installRoot -TestReleaseIndexPath $testIndexPath -TestReleaseAssetPath $remoteAssetPath -TestFailAfterReplacement 1
+          if ($LASTEXITCODE -eq 0) {
+            throw '遠端正式附件回復驗證沒有觸發指定失敗。'
+          }
+          $afterRollbackHash = (Get-FileHash -LiteralPath (Join-Path $installRoot 'FLASH.exe') -Algorithm SHA256).Hash
+          if ($afterRollbackHash -ne $beforeHash) {
+            throw '遠端正式附件更新的回復沒有還原執行檔。'
+          }
+
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $remoteExtractRoot '輔系統/輔更新核心.ps1') -InstallDirectory $installRoot -TestReleaseIndexPath $testIndexPath -TestReleaseAssetPath $remoteAssetPath
           if ($LASTEXITCODE -ne 0) {
-            $branchExists = $false
+            throw '遠端正式附件無法完成正常交易式更新。'
           }
 
-          if ($branchExists) {
-            git checkout release/latest
+          $publicRelease = Invoke-GitHubJson -Method 'Patch' -Uri "$apiRoot/releases/$releaseId" -Body @{
+            draft = $false
+            make_latest = 'true'
           }
-          else {
-            git checkout --orphan release/latest
+          if ($publicRelease.draft -or $publicRelease.tag_name -ne $releaseTag) {
+            throw '正式發布公開回讀結果不一致。'
           }
+          $publishedUtc = [DateTime]::Parse([string]$publicRelease.published_at).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
-          Get-ChildItem -Force |
-            Where-Object { $_.Name -ne '.git' } |
-            Remove-Item -Recurse -Force
-
-          Copy-Item "$env:GITHUB_WORKSPACE\release\FLASH.exe" ".\FLASH.exe"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\sync_plus_icon.ico" ".\sync_plus_icon.ico"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\.gitattributes" ".\.gitattributes"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\LATEST.txt" ".\LATEST.txt"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\安裝輔.cmd" ".\安裝輔.cmd"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\更新輔.cmd" ".\更新輔.cmd"
-          Copy-Item "$env:GITHUB_WORKSPACE\release\輔系統" ".\輔系統" -Recurse -Force
-
-          # 同時登記刪除舊版發布分支殘留的原始碼與過期檔案。
-          git add -A
-          git commit -m "Update latest Windows FLASH build"
-          git push origin release/latest --force
+          $oldReleaseLatest = Get-ReleaseLatestRef
+          $releaseIndex = @{
+            schema = 1
+            source_commit = $env:GITHUB_SHA
+            run_id = [Int64]$env:GITHUB_RUN_ID
+            release_tag = $releaseTag
+            asset_name = $assetName
+            asset_size = $assetSize
+            asset_sha256 = $assetHash
+            published_utc = $publishedUtc
+          }
+          $releaseIndexJson = $releaseIndex | ConvertTo-Json -Compress
+          $indexBlob = Invoke-GitHubJson -Method 'Post' -Uri "$apiRoot/git/blobs" -Body @{
+            content = $releaseIndexJson
+            encoding = 'utf-8'
+          }
+          $indexTree = Invoke-GitHubJson -Method 'Post' -Uri "$apiRoot/git/trees" -Body @{
+            tree = @(
+              @{
+                path = 'release-index.json'
+                mode = '100644'
+                type = 'blob'
+                sha = [string]$indexBlob.sha
+              }
+            )
+          }
+          if ((Get-ReleaseLatestRef) -ne $oldReleaseLatest) {
+            throw 'release/latest 在建立索引提交前已改變，為避免覆寫而停止。'
+          }
+          $indexCommit = Invoke-GitHubJson -Method 'Post' -Uri "$apiRoot/git/commits" -Body @{
+            message = "Update latest Windows release index for $env:GITHUB_SHA"
+            tree = [string]$indexTree.sha
+            parents = @($oldReleaseLatest)
+          }
+          if ((Get-ReleaseLatestRef) -ne $oldReleaseLatest) {
+            throw 'release/latest 在提交索引後已改變，為避免覆寫而停止。'
+          }
+          $null = Invoke-GitHubJson -Method 'Patch' -Uri "$apiRoot/git/refs/heads/release/latest" -Body @{
+            sha = [string]$indexCommit.sha
+            force = $false
+          }
+          $updatedReleaseLatest = Get-ReleaseLatestRef
+          if ($updatedReleaseLatest -ne [string]$indexCommit.sha) {
+            throw 'release/latest 沒有指向新索引提交。'
+          }
+          $updatedCommit = Invoke-GitHubJson -Method 'Get' -Uri "$apiRoot/git/commits/${updatedReleaseLatest}"
+          if (
+            [string]$updatedCommit.sha -ne [string]$indexCommit.sha -or
+            [string]$updatedCommit.tree.sha -ne [string]$indexTree.sha
+          ) {
+            throw 'release/latest 的提交或根樹回讀不一致。'
+          }
+          $updatedTreeSha = [string]$updatedCommit.tree.sha
+          $updatedTree = Invoke-GitHubJson -Method 'Get' -Uri "$apiRoot/git/trees/${updatedTreeSha}?recursive=1"
+          $updatedEntries = @($updatedTree.tree)
+          if (
+            $updatedEntries.Count -ne 1 -or
+            $updatedEntries[0].path -ne 'release-index.json' -or
+            $updatedEntries[0].type -ne 'blob' -or
+            $updatedEntries[0].sha -ne [string]$indexBlob.sha
+          ) {
+            throw 'release/latest 必須只保存唯一的 release-index.json。'
+          }
 
       - name: Publish SP1-only desktop updater files
         if: github.ref == 'refs/heads/sp1/completion-2026-07-25' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_sp1))
