@@ -536,7 +536,7 @@ def test_missing_retry_refuses_incomplete_live_window_instance(
     assert opener.targets == []
 
 
-def test_missing_retry_refuses_live_duplicate_identity(tmp_path):
+def test_missing_retry_ignores_duplicate_identity_of_unrelated_target(tmp_path):
     duplicate = "b" * 64
     opener = _Opener()
     restarter = WindowsBattleWindowRestarter(
@@ -560,9 +560,9 @@ def test_missing_retry_refuses_live_duplicate_identity(tmp_path):
 
     result = restarter.reopen_missing(_target(tmp_path), [])
 
-    assert result.success is False
-    assert result.failure_code == "battle_window_identity_duplicate"
-    assert opener.targets == []
+    assert result.success is True
+    assert result.failure_code is None
+    assert len(opener.targets) == 1
 
 
 def test_missing_retry_refuses_when_live_enumeration_fails(tmp_path):
@@ -671,7 +671,7 @@ def test_direct_restart_refuses_cross_role_live_instance_collision(
     assert opener.targets == []
 
 
-def test_direct_reopen_refuses_cross_role_handle_collision(tmp_path):
+def test_direct_reopen_ignores_cross_role_handle_collision(tmp_path):
     first = _window(handle=21, process_id=201, fingerprint="b" * 64)
     second = _window(
         handle=first.handle,
@@ -687,9 +687,9 @@ def test_direct_reopen_refuses_cross_role_handle_collision(tmp_path):
 
     result = restarter.reopen_missing(_target(tmp_path), [])
 
-    assert result.success is False
-    assert result.failure_code == "battle_window_identity_duplicate"
-    assert opener.targets == []
+    assert result.success is True
+    assert result.failure_code is None
+    assert len(opener.targets) == 1
 
 
 @pytest.mark.parametrize(
@@ -700,7 +700,7 @@ def test_direct_reopen_refuses_cross_role_handle_collision(tmp_path):
         ("process_lifecycle_token", False),
     ),
 )
-def test_direct_restart_refuses_incomplete_live_candidate(
+def test_direct_restart_ignores_incomplete_unrelated_live_candidate(
     tmp_path,
     field,
     value,
@@ -722,10 +722,10 @@ def test_direct_restart_refuses_incomplete_live_candidate(
 
     result = restarter.restart(target_window, _target(tmp_path))
 
-    assert result.success is False
-    assert result.failure_code == "battle_window_existing_state_unknown"
-    assert closer.closed == []
-    assert opener.targets == []
+    assert result.success is True
+    assert result.failure_code is None
+    assert closer.closed == [target_window.handle]
+    assert len(opener.targets) == 1
 
 
 class _ShortcutResolver:

@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from adapters.windows_launch_fingerprint import (
     ShortcutFingerprintResolver,
     normalize_launch_fingerprint,
 )
 from core.smart_reconnect_authorization import (
-    identity_aliases_conflict,
+    ReconnectAuthorizationTarget,
     normalize_identity_alias,
     observed_alias_matches,
 )
@@ -45,6 +45,7 @@ class SmartReconnectTargetIdentity:
     character_id: str
     role_aliases: tuple[str, ...]
     importance: CharacterImportance
+    shortcut_path: Path | None = None
     original_slot_index: int | None = None
     original_line_number: int | None = None
 
@@ -68,6 +69,13 @@ class SmartReconnectTargetIdentity:
             raise ValueError("role_aliases must contain a valid identity")
         if not isinstance(self.importance, CharacterImportance):
             raise TypeError("importance must be CharacterImportance")
+        shortcut_path = (
+            Path(self.shortcut_path).resolve(strict=False)
+            if self.shortcut_path is not None
+            else None
+        )
+        if shortcut_path is not None and shortcut_path.suffix.casefold() != ".lnk":
+            raise ValueError("shortcut_path must identify a Windows shortcut")
         if self.original_slot_index is not None and (
             isinstance(self.original_slot_index, bool)
             or not isinstance(self.original_slot_index, int)
@@ -83,6 +91,7 @@ class SmartReconnectTargetIdentity:
         object.__setattr__(self, "fingerprint", fingerprint)
         object.__setattr__(self, "character_id", character_id)
         object.__setattr__(self, "role_aliases", aliases)
+        object.__setattr__(self, "shortcut_path", shortcut_path)
 
     def matches_observed_identity(self, value: object) -> bool:
         return observed_alias_matches(self.role_aliases, value)
@@ -112,6 +121,11 @@ class SmartReconnectTargetIdentityService:
         registry: WindowRegistry,
         shortcut_fingerprint_resolver: ShortcutFingerprintResolver,
         state_path: Path,
+        *,
+        ungrouped_shortcut_provider: Callable[[str], Path | None] | None = None,
+        ungrouped_shortcut_catalog_provider: (
+            Callable[[], Iterable[Path]] | None
+        ) = None,
     ) -> None:
         if not isinstance(coordinator, IdentityDataTransactionCoordinator):
             raise TypeError("coordinator must be IdentityDataTransactionCoordinator")
@@ -130,11 +144,25 @@ class SmartReconnectTargetIdentityService:
             raise TypeError("registry must be WindowRegistry")
         if not callable(getattr(shortcut_fingerprint_resolver, "resolve", None)):
             raise TypeError("shortcut_fingerprint_resolver must provide resolve")
+        if ungrouped_shortcut_provider is not None and not callable(
+            ungrouped_shortcut_provider
+        ):
+            raise TypeError("ungrouped_shortcut_provider must be callable or None")
+        if ungrouped_shortcut_catalog_provider is not None and not callable(
+            ungrouped_shortcut_catalog_provider
+        ):
+            raise TypeError(
+                "ungrouped_shortcut_catalog_provider must be callable or None"
+            )
         self._coordinator = coordinator
         self._configuration = configuration
         self._character_view = character_view
         self._registry = registry
         self._resolver = shortcut_fingerprint_resolver
+        self._ungrouped_shortcut_provider = ungrouped_shortcut_provider
+        self._ungrouped_shortcut_catalog_provider = (
+            ungrouped_shortcut_catalog_provider
+        )
         self._state_path = Path(state_path)
         self._saved = self._coordinator.read_consistent(self._load_state_unlocked)
 
@@ -170,13 +198,475 @@ class SmartReconnectTargetIdentityService:
             return None
         try:
             targets = self._coordinator.read_consistent(
-                lambda: self._build_targets_unlocked(group_name=None)
+                lambda: self._build_requested_targets_unlocked((normalized,))
             )
         except SmartReconnectTargetIdentityError:
             return None
         return next(
             (target for target in targets if target.fingerprint == normalized),
             None,
+        )
+
+    def targets_for_fingerprints_in_snapshot(
+        self,
+        fingerprints: Iterable[object],
+    ) -> tuple[SmartReconnectTargetIdentity, ...]:
+        """Resolve each actual fingerprint independently in one source snapshot."""
+
+        self._coordinator.require_consistent_snapshot_owner()
+        normalized = tuple(
+            dict.fromkeys(
+                value
+                for value in (
+                    normalize_launch_fingerprint(item) for item in fingerprints
+                )
+                if value is not None
+            )
+        )
+        return self._build_requested_targets_unlocked(normalized)
+
+    def observed_identity_alias_catalog(self) -> tuple[tuple[str, str], ...]:
+        """Return reliable screen aliases without making them target gates."""
+
+        try:
+            return self._coordinator.read_consistent(
+                self._observed_identity_alias_catalog_unlocked
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return ()
+
+    def _observed_identity_alias_catalog_unlocked(
+        self,
+    ) -> tuple[tuple[str, str], ...]:
+        self._coordinator.require_consistent_snapshot_owner()
+        aliases: list[tuple[str, str]] = []
+        for character in self._character_view.character_profiles():
+            if isinstance(character, Character):
+                normalized = normalize_identity_alias(character.display_name)
+                if normalized is not None:
+                    aliases.append((normalized, character.character_id))
+        for record in self._registry.all():
+            if not isinstance(record, CharacterWindowRecord):
+                continue
+            for value in (record.display_name, *record.aliases):
+                normalized = normalize_identity_alias(value)
+                if normalized is not None:
+                    aliases.append((normalized, record.character_id))
+        for group in self._configuration.groups():
+            for entry in group.entries:
+                normalized = normalize_identity_alias(entry.role_id)
+                if normalized is not None:
+                    aliases.append((normalized, entry.entry_id))
+        return tuple(dict.fromkeys(aliases))
+
+    def retained_target_is_current_in_snapshot(
+        self,
+        target: ReconnectAuthorizationTarget,
+    ) -> bool:
+        """Rebuild the absent target's unique source binding in this generation."""
+
+        self._coordinator.require_consistent_snapshot_owner()
+        if (
+            not isinstance(target, ReconnectAuthorizationTarget)
+            or target.character_id is None
+            or target.shortcut_seal is None
+        ):
+            return False
+        path = Path(
+            target.shortcut_seal.file_identity.normalized_path
+        ).resolve(strict=False)
+        groups = tuple(self._configuration.groups())
+        membership_paths = tuple(
+            entry.shortcut_path.resolve(strict=False)
+            for group in groups
+            for entry in group.entries
+        )
+        catalog_provider = self._ungrouped_shortcut_catalog_provider
+        catalog_paths: tuple[Path, ...] = ()
+        if catalog_provider is not None:
+            try:
+                catalog_paths = tuple(
+                    dict.fromkeys(
+                        Path(item).resolve(strict=False)
+                        for item in catalog_provider()
+                    )
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return False
+        paths = tuple(dict.fromkeys((*membership_paths, *catalog_paths, path)))
+        fingerprints_by_path: dict[Path, str] = {}
+        try:
+            resolved = self._resolver.resolve(paths)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            resolved = {}
+        if isinstance(resolved, Mapping):
+            requested_paths = frozenset(paths)
+            for raw_path, raw_fingerprint in resolved.items():
+                try:
+                    candidate = Path(raw_path).resolve(strict=False)
+                except (OSError, TypeError, ValueError):
+                    continue
+                fingerprint = normalize_launch_fingerprint(raw_fingerprint)
+                if candidate in requested_paths and fingerprint is not None:
+                    fingerprints_by_path[candidate] = fingerprint
+        matching_paths = frozenset(
+            candidate
+            for candidate in paths
+            if fingerprints_by_path.get(candidate) == target.fingerprint
+        )
+        if matching_paths != frozenset((path,)):
+            return False
+
+        characters_by_id = self._items_by_character_id(
+            self._character_view.character_profiles()
+        )
+        records_by_id = self._items_by_character_id(self._registry.all())
+        memberships = tuple(
+            (group, entry)
+            for group in groups
+            for entry in group.entries
+            if entry.shortcut_path.resolve(strict=False) == path
+        )
+        if memberships:
+            current_targets = tuple(
+                current
+                for group, entry in memberships
+                if (
+                    current := self._target_from_membership(
+                        target.fingerprint,
+                        group,
+                        entry,
+                        characters_by_id,
+                        records_by_id,
+                    )
+                )
+                is not None
+            )
+            unique_targets = tuple(dict.fromkeys(current_targets))
+            if len(unique_targets) != 1:
+                return False
+            current = unique_targets[0]
+        else:
+            if catalog_provider is None or path not in catalog_paths:
+                return False
+            shortcut_identity = normalize_identity_alias(path.stem)
+            matches: list[tuple[str, Character, CharacterWindowRecord]] = []
+            for character_id, characters in characters_by_id.items():
+                records = records_by_id.get(character_id, ())
+                if len(characters) != 1 or len(records) != 1:
+                    continue
+                character = characters[0]
+                record = records[0]
+                if (
+                    not isinstance(character, Character)
+                    or not isinstance(record, CharacterWindowRecord)
+                    or character.display_name != record.display_name
+                    or shortcut_identity is None
+                    or shortcut_identity not in self._aliases(
+                        character,
+                        record,
+                        None,
+                    )
+                ):
+                    continue
+                matches.append((character_id, character, record))
+            if len(matches) != 1 or matches[0][0] != target.character_id:
+                return False
+            character_id, character, record = matches[0]
+            saved = self._saved.get(target.fingerprint)
+            if (
+                saved is not None
+                and saved.character_id != character_id
+            ):
+                return False
+            current = SmartReconnectTargetIdentity(
+                fingerprint=target.fingerprint,
+                character_id=character_id,
+                role_aliases=self._aliases(character, record, None),
+                importance=character.importance,
+                shortcut_path=path,
+                original_slot_index=(
+                    saved.slot_index if saved is not None else None
+                ),
+                original_line_number=(
+                    saved.line_number if saved is not None else None
+                ),
+            )
+        return (
+            current.fingerprint == target.fingerprint
+            and current.character_id == target.character_id
+            and current.role_aliases == target.role_aliases
+            and current.importance is target.importance
+            and current.original_slot_index == target.original_slot_index
+            and current.original_line_number == target.original_line_number
+            and current.shortcut_path.resolve(strict=False) == path
+        )
+
+    def _build_requested_targets_unlocked(
+        self,
+        fingerprints: tuple[str, ...],
+    ) -> tuple[SmartReconnectTargetIdentity, ...]:
+        self._coordinator.require_consistent_snapshot_owner()
+        requested = frozenset(fingerprints)
+        if not requested:
+            return ()
+        groups = self._configuration.groups()
+        characters = self._character_view.character_profiles()
+        records = self._registry.all()
+        characters_by_id = self._items_by_character_id(characters)
+        records_by_id = self._items_by_character_id(records)
+
+        memberships_by_path: dict[
+            Path,
+            list[tuple[GroupConfiguration, GroupConfigurationEntry]],
+        ] = {}
+        for group in groups:
+            for entry in group.entries:
+                path = entry.shortcut_path.resolve(strict=False)
+                memberships_by_path.setdefault(path, []).append((group, entry))
+
+        catalog_paths: tuple[Path, ...] = ()
+        catalog_provider = self._ungrouped_shortcut_catalog_provider
+        if catalog_provider is not None:
+            try:
+                catalog_paths = tuple(
+                    dict.fromkeys(
+                        Path(item).resolve(strict=False)
+                        for item in catalog_provider()
+                    )
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return ()
+        all_source_paths = tuple(
+            dict.fromkeys((*memberships_by_path, *catalog_paths))
+        )
+
+        fingerprints_by_path: dict[Path, str] = {}
+        try:
+            raw = self._resolver.resolve(all_source_paths)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raw = {}
+        if isinstance(raw, Mapping):
+            requested_paths = frozenset(all_source_paths)
+            for raw_path, raw_fingerprint in raw.items():
+                try:
+                    path = Path(raw_path).resolve(strict=False)
+                except (OSError, TypeError, ValueError):
+                    continue
+                resolved = normalize_launch_fingerprint(raw_fingerprint)
+                if path in requested_paths and resolved is not None:
+                    fingerprints_by_path[path] = resolved
+        paths_by_fingerprint: dict[str, list[Path]] = {}
+        for path, fingerprint in fingerprints_by_path.items():
+            paths_by_fingerprint.setdefault(fingerprint, []).append(path)
+
+        bindings: dict[
+            str,
+            dict[
+                tuple[str, Path],
+                list[tuple[GroupConfiguration, GroupConfigurationEntry]],
+            ],
+        ] = {fingerprint: {} for fingerprint in fingerprints}
+        for path, memberships in memberships_by_path.items():
+            fingerprint = fingerprints_by_path.get(path)
+            if fingerprint not in requested:
+                continue
+            for group, entry in memberships:
+                bindings[fingerprint].setdefault(
+                    (entry.entry_id, path),
+                    [],
+                ).append((group, entry))
+
+        candidates: dict[str, SmartReconnectTargetIdentity] = {}
+        for fingerprint in fingerprints:
+            source_path_count = len(
+                paths_by_fingerprint.get(fingerprint, ())
+            )
+            if (
+                source_path_count > 1
+                or (
+                    catalog_provider is not None
+                    and source_path_count != 1
+                )
+            ):
+                continue
+            fingerprint_bindings = bindings[fingerprint]
+            if len(fingerprint_bindings) > 1:
+                continue
+            if fingerprint_bindings:
+                (_binding, memberships), = fingerprint_bindings.items()
+                resolved_targets: list[SmartReconnectTargetIdentity] = []
+                for group, entry in memberships:
+                    try:
+                        target = self._target_from_membership(
+                            fingerprint,
+                            group,
+                            entry,
+                            characters_by_id,
+                            records_by_id,
+                        )
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        continue
+                    if target is not None:
+                        resolved_targets.append(target)
+                resolved_memberships = tuple(resolved_targets)
+                unique = tuple(dict.fromkeys(resolved_memberships))
+                if len(unique) == 1:
+                    candidates[fingerprint] = unique[0]
+                continue
+            target = self._ungrouped_target(
+                fingerprint,
+                characters_by_id,
+                records_by_id,
+            )
+            if target is not None:
+                candidates[fingerprint] = target
+
+        character_counts: dict[str, int] = {}
+        for target in candidates.values():
+            character_counts[target.character_id] = (
+                character_counts.get(target.character_id, 0) + 1
+            )
+        return tuple(
+            target
+            for fingerprint in fingerprints
+            if (target := candidates.get(fingerprint)) is not None
+            and character_counts[target.character_id] == 1
+        )
+
+    @staticmethod
+    def _items_by_character_id(values: Iterable[object]) -> dict[str, tuple[object, ...]]:
+        result: dict[str, list[object]] = {}
+        for value in values:
+            character_id = getattr(value, "character_id", None)
+            if isinstance(character_id, str) and character_id.strip():
+                result.setdefault(character_id.strip(), []).append(value)
+        return {key: tuple(items) for key, items in result.items()}
+
+    def _target_from_membership(
+        self,
+        fingerprint: str,
+        group: GroupConfiguration,
+        entry: GroupConfigurationEntry,
+        characters_by_id: Mapping[str, tuple[object, ...]],
+        records_by_id: Mapping[str, tuple[object, ...]],
+    ) -> SmartReconnectTargetIdentity | None:
+        characters = characters_by_id.get(entry.entry_id, ())
+        records = records_by_id.get(entry.entry_id, ())
+        if len(characters) != 1 or len(records) != 1:
+            return None
+        character = characters[0]
+        record = records[0]
+        if (
+            not isinstance(character, Character)
+            or not isinstance(record, CharacterWindowRecord)
+            or character.display_name != record.display_name
+        ):
+            return None
+        aliases = self._aliases(character, record, entry.role_id)
+        if not aliases:
+            return None
+        saved = self._saved.get(fingerprint)
+        return SmartReconnectTargetIdentity(
+            fingerprint=fingerprint,
+            character_id=entry.entry_id,
+            role_aliases=aliases,
+            importance=character.importance,
+            shortcut_path=entry.shortcut_path,
+            original_slot_index=(
+                saved.slot_index
+                if saved is not None and saved.character_id == entry.entry_id
+                else None
+            ),
+            original_line_number=(
+                saved.line_number
+                if saved is not None and saved.character_id == entry.entry_id
+                else None
+            ),
+        )
+
+    def _ungrouped_target(
+        self,
+        fingerprint: str,
+        characters_by_id: Mapping[str, tuple[object, ...]],
+        records_by_id: Mapping[str, tuple[object, ...]],
+    ) -> SmartReconnectTargetIdentity | None:
+        provider = self._ungrouped_shortcut_provider
+        if provider is None:
+            return None
+        try:
+            candidate_path = provider(fingerprint)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if not isinstance(candidate_path, Path):
+            return None
+        path = candidate_path.resolve(strict=False)
+        if path.suffix.casefold() != ".lnk":
+            return None
+        try:
+            resolved = self._resolver.resolve((path,))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if (
+            not isinstance(resolved, Mapping)
+            or set(resolved) != {path}
+            or normalize_launch_fingerprint(resolved.get(path)) != fingerprint
+        ):
+            return None
+        saved = self._saved.get(fingerprint)
+        shortcut_identity = normalize_identity_alias(path.stem)
+        matches: list[SmartReconnectTargetIdentity] = []
+        for character_id, characters in characters_by_id.items():
+            if saved is not None and character_id != saved.character_id:
+                continue
+            records = records_by_id.get(character_id, ())
+            if len(characters) != 1 or len(records) != 1:
+                continue
+            character = characters[0]
+            record = records[0]
+            if (
+                not isinstance(character, Character)
+                or not isinstance(record, CharacterWindowRecord)
+                or character.display_name != record.display_name
+            ):
+                continue
+            aliases = self._aliases(character, record, None)
+            if shortcut_identity is None or shortcut_identity not in aliases:
+                continue
+            matches.append(
+                SmartReconnectTargetIdentity(
+                    fingerprint=fingerprint,
+                    character_id=character_id,
+                    role_aliases=aliases,
+                    importance=character.importance,
+                    shortcut_path=path,
+                    original_slot_index=(
+                        saved.slot_index if saved is not None else None
+                    ),
+                    original_line_number=(
+                        saved.line_number if saved is not None else None
+                    ),
+                )
+            )
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _aliases(
+        character: Character,
+        record: CharacterWindowRecord,
+        role_id: object,
+    ) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                normalized
+                for normalized in (
+                    normalize_identity_alias(character.display_name),
+                    normalize_identity_alias(record.display_name),
+                    normalize_identity_alias(role_id),
+                    *(normalize_identity_alias(value) for value in record.aliases),
+                )
+                if normalized is not None
+            )
         )
 
     def _build_targets_unlocked(
@@ -279,6 +769,7 @@ class SmartReconnectTargetIdentityService:
                     character_id=entry.entry_id,
                     role_aliases=aliases,
                     importance=character.importance,
+                    shortcut_path=path,
                     original_slot_index=slot_index,
                     original_line_number=line_number,
                 )
@@ -351,16 +842,6 @@ class SmartReconnectTargetIdentityService:
                 raise SmartReconnectTargetIdentityError(
                     f"target batch contains duplicate {label} identity"
                 )
-        for index, left in enumerate(targets):
-            for right in targets[index + 1 :]:
-                if any(
-                    identity_aliases_conflict(left_alias, right_alias)
-                    for left_alias in left.role_aliases
-                    for right_alias in right.role_aliases
-                ):
-                    raise SmartReconnectTargetIdentityError(
-                        "target batch contains ambiguous role aliases"
-                    )
 
     def remember_verified_slot(
         self,
@@ -415,7 +896,7 @@ class SmartReconnectTargetIdentityService:
             return False
 
         def prepare(transaction: IdentityDataTransaction) -> bool:
-            targets = self._build_targets_unlocked(group_name=None)
+            targets = self._build_requested_targets_unlocked((normalized,))
             target = next(
                 (item for item in targets if item.fingerprint == normalized),
                 None,

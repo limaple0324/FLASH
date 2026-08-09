@@ -5,6 +5,7 @@ import pytest
 
 from core.smart_reconnect_authorization import (
     ReconnectAuthorizationBatch,
+    ReconnectActionContext,
     ReconnectAuthorizationTarget,
     ReconnectLaunchMode,
     ReconnectRevocationReason,
@@ -94,20 +95,20 @@ def test_window_instance_token_is_complete_immutable_and_adapter_compatible():
         replace(token, process_lifecycle_token=0)
 
 
-def test_identity_bound_batch_is_non_empty_and_immutable(tmp_path):
+def test_identity_bound_batch_can_be_empty_and_is_immutable(tmp_path):
     batch = make_batch(tmp_path)
 
     assert batch.targets[0].character_id == "character-1"
     with pytest.raises(FrozenInstanceError):
         batch.epoch = 2
-    with pytest.raises(ValueError, match="non-empty"):
-        ReconnectAuthorizationBatch(
-            epoch=1,
-            batch_id="empty",
-            source=ReconnectSourceIdentity(0, 0, "g", "group", ("c",)),
-            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND,
-            targets=(),
-        )
+    empty = ReconnectAuthorizationBatch(
+        epoch=1,
+        batch_id="empty",
+        source=ReconnectSourceIdentity(0, 0, "g", "group", ()),
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND,
+        targets=(),
+    )
+    assert empty.targets == ()
 
 
 def test_source_rejects_duplicate_character_identity():
@@ -131,8 +132,6 @@ def test_source_rejects_duplicate_character_identity():
         ("character_id", None),
         ("role_aliases", ()),
         ("importance", None),
-        ("original_slot_index", None),
-        ("original_line_number", None),
         ("shortcut_seal", None),
     ),
 )
@@ -217,15 +216,30 @@ def test_every_launch_mode_rejects_every_duplicate_identity(
     "launch_mode",
     (ReconnectLaunchMode.IDENTITY_BOUND, ReconnectLaunchMode.COMPATIBILITY),
 )
-def test_every_launch_mode_rejects_cross_batch_alias_ambiguity(
+def test_full_shared_prefix_names_coexist_but_ambiguous_observation_is_blocked(
     tmp_path,
     launch_mode,
 ):
-    first = make_target(tmp_path, 1)
-    second = replace(make_target(tmp_path, 2), role_aliases=("角色1另一人",))
+    first = replace(make_target(tmp_path, 1), role_aliases=("100古",))
+    second = replace(make_target(tmp_path, 2), role_aliases=("100靈",))
+    batch = make_batch(tmp_path, first, second, launch_mode=launch_mode)
 
-    with pytest.raises(ValueError, match="ambiguous"):
-        make_batch(tmp_path, first, second, launch_mode=launch_mode)
+    assert batch.unique_target_for_observed_identity("100古") == first
+    assert batch.unique_target_for_observed_identity("100靈") == second
+    assert batch.unique_target_for_observed_identity("100") is None
+    assert batch.unique_target_for_observed_identity("100…") is None
+
+
+def test_slot_and_line_are_optional_monitoring_evidence(tmp_path):
+    target = replace(
+        make_target(tmp_path),
+        original_slot_index=None,
+        original_line_number=None,
+    )
+
+    batch = make_batch(tmp_path, target)
+
+    assert batch.targets == (target,)
 
 
 @pytest.mark.parametrize(
@@ -372,6 +386,10 @@ def test_rebinding_has_zero_authorization_and_full_publish_gets_new_epoch(tmp_pa
     )
     assert second.epoch == first.epoch + 1
     assert second.batch_id != first.batch_id
+    assert ReconnectActionContext.from_batch_target(
+        second,
+        second.targets[0],
+    ) == ReconnectActionContext.from_batch_target(first, first.targets[0])
 
 
 def test_run_authorized_holds_lock_until_callback_returns(tmp_path):
@@ -387,18 +405,22 @@ def test_run_authorized_holds_lock_until_callback_returns(tmp_path):
     revoked = threading.Event()
 
     def callback(current):
-        assert current is target
+        assert current == batch.targets[0]
         callback_entered.set()
         assert release_callback.wait(2)
         return "done"
 
     result = []
+    context = ReconnectActionContext.from_batch_target(
+        batch,
+        batch.targets[0],
+    )
     worker = threading.Thread(
         target=lambda: result.append(
             coordinator.run_authorized(
-                epoch=batch.epoch,
-                batch_id=batch.batch_id,
-                source_generation=batch.source.source_generation,
+                    epoch=context.authorization_epoch,
+                    batch_id=context.batch_id,
+                    source_generation=context.source_generation,
                 fingerprint=target.fingerprint,
                 character_id=target.character_id,
                 instance=target.instance,
@@ -434,10 +456,14 @@ def test_run_authorized_rejects_stale_epoch_instance_and_stopped_state(tmp_path)
         ReconnectLaunchMode.IDENTITY_BOUND,
         (target,),
     )
+    context = ReconnectActionContext.from_batch_target(
+        batch,
+        batch.targets[0],
+    )
     request = dict(
-        epoch=batch.epoch,
-        batch_id=batch.batch_id,
-        source_generation=batch.source.source_generation,
+        epoch=context.authorization_epoch,
+        batch_id=context.batch_id,
+        source_generation=context.source_generation,
         fingerprint=target.fingerprint,
         character_id=target.character_id,
         instance=target.instance,
@@ -445,7 +471,9 @@ def test_run_authorized_rejects_stale_epoch_instance_and_stopped_state(tmp_path)
     )
 
     with pytest.raises(ReconnectAuthorizationMismatchError):
-        coordinator.run_authorized(**{**request, "epoch": batch.epoch + 1})
+        coordinator.run_authorized(
+            **{**request, "epoch": context.authorization_epoch + 1}
+        )
     with pytest.raises(ReconnectAuthorizationMismatchError):
         coordinator.run_authorized(**{**request, "instance": make_instance(9)})
 
@@ -459,3 +487,153 @@ def test_run_authorized_rejects_stale_epoch_instance_and_stopped_state(tmp_path)
             ReconnectLaunchMode.IDENTITY_BOUND,
             (target,),
         )
+
+
+def test_rebind_preserves_unchanged_grants_and_changes_only_changed_target(
+    tmp_path,
+):
+    coordinator = SmartReconnectAuthorizationCoordinator()
+    first = make_target(tmp_path, 1)
+    second = make_target(tmp_path, 2)
+    initial = coordinator.publish(
+        make_source(first, second),
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (first, second),
+    )
+    initial_contexts = {
+        target.fingerprint: ReconnectActionContext.from_batch_target(
+            initial,
+            target,
+        )
+        for target in initial.targets
+    }
+    changed_second = replace(second, instance=make_instance(9))
+    coordinator.begin_reprepare()
+    rebound = coordinator.publish(
+        make_source(first, changed_second),
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (first, changed_second),
+    )
+
+    unchanged = rebound.target_for(first.fingerprint)
+    changed = rebound.target_for(second.fingerprint)
+    assert unchanged == initial.target_for(first.fingerprint)
+    assert ReconnectActionContext.from_batch_target(
+        rebound,
+        unchanged,
+    ) == initial_contexts[first.fingerprint]
+    changed_context = ReconnectActionContext.from_batch_target(
+        rebound,
+        changed,
+    )
+    assert changed_context != initial_contexts[second.fingerprint]
+    assert (
+        changed_context.source_generation
+        > initial_contexts[second.fingerprint].source_generation
+    )
+    assert rebound.source.source_generation == initial.source.source_generation
+
+    with pytest.raises(ReconnectAuthorizationMismatchError):
+        coordinator.run_authorized(
+            epoch=initial_contexts[second.fingerprint].authorization_epoch,
+            batch_id=initial_contexts[second.fingerprint].batch_id,
+            source_generation=(
+                initial_contexts[second.fingerprint].source_generation
+            ),
+            fingerprint=second.fingerprint,
+            character_id=second.character_id,
+            instance=second.instance,
+            callback=lambda current: current,
+        )
+
+
+def test_explicit_reenable_advances_target_generation_and_rejects_old_grant(
+    tmp_path,
+):
+    coordinator = SmartReconnectAuthorizationCoordinator()
+    target = make_target(tmp_path)
+    first = coordinator.publish(
+        make_source(target),
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (target,),
+    )
+    old_context = ReconnectActionContext.from_batch_target(
+        first,
+        first.targets[0],
+    )
+
+    coordinator.revoke(ReconnectRevocationReason.EXPLICIT)
+    second = coordinator.publish(
+        make_source(target),
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (target,),
+    )
+    new_context = ReconnectActionContext.from_batch_target(
+        second,
+        second.targets[0],
+    )
+
+    assert new_context.authorization_epoch > old_context.authorization_epoch
+    assert new_context.batch_id != old_context.batch_id
+    assert new_context.source_generation > old_context.source_generation
+    with pytest.raises(ReconnectAuthorizationMismatchError):
+        coordinator.run_authorized(
+            epoch=old_context.authorization_epoch,
+            batch_id=old_context.batch_id,
+            source_generation=old_context.source_generation,
+            fingerprint=old_context.fingerprint,
+            character_id=old_context.character_id,
+            instance=old_context.instance,
+            callback=lambda current: current,
+        )
+
+
+def test_continuous_session_never_adopts_changed_shortcut_seal(tmp_path):
+    coordinator = SmartReconnectAuthorizationCoordinator()
+    target = make_target(tmp_path)
+    coordinator.publish(
+        make_source(target),
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (target,),
+    )
+    changed = replace(
+        target,
+        shortcut_seal=replace(
+            target.shortcut_seal,
+            content_sha256="f" * 64,
+        ),
+    )
+
+    coordinator.begin_reprepare()
+    isolated = coordinator.publish(
+        make_source(changed),
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (changed,),
+    )
+
+    assert isolated.targets == ()
+    assert isolated.isolated_fingerprints == frozenset({target.fingerprint})
+
+    coordinator.revoke(ReconnectRevocationReason.EXPLICIT)
+    accepted = coordinator.publish(
+        make_source(changed),
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (changed,),
+    )
+    assert accepted.target_for(target.fingerprint) is not None
+
+
+def test_global_alias_owner_catalog_blocks_shared_complete_alias(tmp_path):
+    target = replace(
+        make_target(tmp_path),
+        role_aliases=("SharedCompleteAlias",),
+    )
+    batch = make_batch(tmp_path, target)
+
+    assert batch.unique_target_for_observed_identity(
+        "SharedCompleteAlias",
+        (
+            ("SharedCompleteAlias", target.character_id),
+            ("SharedCompleteAlias", "closed-character-owner"),
+        ),
+    ) is None

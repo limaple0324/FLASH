@@ -9,18 +9,16 @@ import pytest
 from config.config_manager import ConfigManager
 from core.smart_reconnect_authorization import (
     ReconnectLaunchMode,
-    ReconnectRevocationReason,
     ShortcutFileIdentity,
     ShortcutSeal,
 )
 from core.target_window_contract import (
-    TargetWindowContract,
-    TargetWindowPhase,
-    TargetWindowSnapshot,
+    ActualWindowContract,
+    ActualWindowSnapshot,
 )
+from core.window_instance import WindowInstanceToken
 from core.window_registry import CharacterWindowRecord, WindowRegistry
 from domain.character import Character, CharacterImportance
-from domain.group import CharacterGroup
 from services.character_view_service import CharacterViewService
 from services.group_configuration_service import (
     GroupConfiguration,
@@ -32,21 +30,16 @@ from services.identity_data_transaction_coordinator import (
     IdentityDataTransactionCoordinator,
 )
 from services.smart_reconnect_authorization_coordinator import (
+    ReconnectAuthorizationMismatchError,
     ReconnectAuthorizationState,
     SmartReconnectAuthorizationCoordinator,
 )
 from services.smart_reconnect_preparation_service import (
-    SmartReconnectPreparationError,
     SmartReconnectPreparationService,
 )
 from services.smart_reconnect_target_identity_service import (
     SmartReconnectTargetIdentityService,
 )
-from workspace.models import WorkspaceState
-from workspace.service import WorkspaceService
-
-
-CURRENT_GROUP = "current_group_name"
 
 
 class StaticGroupService:
@@ -95,7 +88,8 @@ class StaticSealResolver:
 
     def revalidate(self, expected):
         self.revalidate_calls += 1
-        return False
+        path = Path(expected.file_identity.normalized_path).resolve(strict=False)
+        return self.seals.get(path) == expected
 
 
 class StaticTargetWindowService:
@@ -104,8 +98,7 @@ class StaticTargetWindowService:
         self.entered = None
         self.release = None
 
-    def snapshot(self, group_name, *, expanded_sync_scope):
-        assert expanded_sync_scope is False
+    def actual_snapshot(self):
         if self.entered is not None:
             self.entered.set()
         if self.release is not None:
@@ -116,26 +109,37 @@ class StaticTargetWindowService:
 def build_fixture(tmp_path, *, include_saved_state=True):
     identity = IdentityDataTransactionCoordinator()
     authorization = SmartReconnectAuthorizationCoordinator()
-    characters = (
-        Character("character-1", "青龍主號", 120, CharacterImportance.PRIMARY),
-        Character("character-2", "白虎副號", 110, CharacterImportance.SECONDARY),
+    names = ("100古", "100靈", "安全角")
+    characters = tuple(
+        Character(
+            f"character-{index}",
+            name,
+            121 - index,
+            (
+                CharacterImportance.PRIMARY
+                if index == 1
+                else CharacterImportance.SECONDARY
+            ),
+        )
+        for index, name in enumerate(names, start=1)
     )
     records = tuple(
         CharacterWindowRecord(
             character.character_id,
             character.display_name,
-            aliases=(f"{character.display_name}舊稱",),
-            group="第一組",
+            aliases=(f"{character.display_name}別名",),
+            group="僅供顯示的舊組別",
             role=character.importance.value,
         )
         for character in characters
     )
     registry = StaticRegistry(records)
     character_view = CharacterViewService(registry, characters, identity)
-    fingerprints = ("a" * 64, "b" * 64)
+    fingerprints = ("a" * 64, "b" * 64, "c" * 64)
     entries = []
     seals = {}
     windows = []
+    fingerprint_paths = {}
     for index, (character, fingerprint) in enumerate(
         zip(characters, fingerprints),
         start=1,
@@ -146,39 +150,35 @@ def build_fixture(tmp_path, *, include_saved_state=True):
             entry_id=character.character_id,
             display_name=character.display_name,
             shortcut_path=shortcut,
-            role="主視窗" if index == 1 else "同步視窗",
+            role="主要" if index == 1 else "次要",
             order=index,
             placement=SavedWindowPlacement(0, 0, 800, 600),
-            role_id=f"{character.display_name}別名",
+            role_id=f"{character.display_name}登記",
         )
         entries.append(entry)
-        seals[shortcut.resolve()] = ShortcutSeal(
-            ShortcutFileIdentity(str(shortcut.resolve()), 50, index),
+        resolved_path = shortcut.resolve(strict=False)
+        fingerprint_paths[resolved_path] = fingerprint
+        seals[resolved_path] = ShortcutSeal(
+            ShortcutFileIdentity(str(resolved_path), 50, index),
             f"{index}" * 64,
             fingerprint,
         )
         windows.append(
-            TargetWindowContract(
-                schema_version=TargetWindowContract.SCHEMA_VERSION,
-                group_name="第一組",
-                window_code=f"W{index}",
-                display_name=character.display_name,
-                binding_role=entry.role,
-                role_id=entry.role_id,
-                character_id=character.character_id,
-                process_id=100 + index,
+            ActualWindowContract(
                 fingerprint=fingerprint,
-                phase=TargetWindowPhase.BACKGROUND,
-                safe=True,
-                handle=10 + index,
-                rect=(0, 0, 800, 600),
+                instance=WindowInstanceToken(
+                    handle=10 + index,
+                    process_id=100 + index,
+                    thread_id=200 + index,
+                    window_class="FlashWindow",
+                    rect=(0, 0, 800, 600),
+                    minimized=False,
+                    process_lifecycle_token=300 + index,
+                ),
                 visible=True,
-                thread_id=200 + index,
-                window_class="FlashWindow",
-                process_lifecycle_token=300 + index,
             )
         )
-    group = GroupConfiguration("group-1", "第一組", tuple(entries))
+    group = GroupConfiguration("group-1", "顯示組別", tuple(entries))
     group_service = StaticGroupService(identity, group)
     state_path = tmp_path / "smart_reconnect_target_identity.json"
     if include_saved_state:
@@ -202,75 +202,48 @@ def build_fixture(tmp_path, *, include_saved_state=True):
             ),
             encoding="utf-8",
         )
+    fingerprint_resolver = StaticFingerprintResolver(fingerprint_paths)
     target_identity = SmartReconnectTargetIdentityService(
         identity,
         group_service,
         character_view,
         registry,
-        StaticFingerprintResolver(
-            {
-                entry.shortcut_path.resolve(): fingerprint
-                for entry, fingerprint in zip(entries, fingerprints)
-            }
-        ),
+        fingerprint_resolver,
         state_path,
     )
     target_windows = StaticTargetWindowService(
-        TargetWindowSnapshot(
-            TargetWindowSnapshot.SCHEMA_VERSION,
-            group.name,
+        ActualWindowSnapshot(
+            ActualWindowSnapshot.SCHEMA_VERSION,
             tuple(windows),
         )
     )
     seal_resolver = StaticSealResolver(seals)
-    workspace = WorkspaceService(
-        identity,
-        WorkspaceState(
-            current_group=CharacterGroup(
-                group.group_id,
-                group.name,
-                characters,
-            )
-        ),
-    )
     config = ConfigManager(tmp_path / "config" / "settings.json")
-    config.set(CURRENT_GROUP, group.name)
     preparation = SmartReconnectPreparationService(
         target_identity_service=target_identity,
         target_window_contract_service=target_windows,
         shortcut_seal_resolver=seal_resolver,
         authorization_coordinator=authorization,
         identity_coordinator=identity,
-        configuration=group_service,
-        character_view=character_view,
-        registry=registry,
-        workspace=workspace,
         config=config,
-        current_group_name_key=CURRENT_GROUP,
         product_launch_mode=ReconnectLaunchMode.IDENTITY_BOUND,
     )
     return SimpleNamespace(
         identity=identity,
         authorization=authorization,
         characters=characters,
-        records=records,
-        registry=registry,
-        character_view=character_view,
         group=group,
         group_service=group_service,
-        target_identity=target_identity,
         target_windows=target_windows,
         seals=seal_resolver,
-        workspace=workspace,
-        config=config,
+        fingerprint_resolver=fingerprint_resolver,
+        fingerprints=fingerprints,
         preparation=preparation,
         state_path=state_path,
     )
 
 
-def test_prepare_publishes_one_complete_identity_bound_batch_from_old_v1_state(
-    tmp_path,
-):
+def test_prepare_publishes_complete_identity_bound_actual_window_batch(tmp_path):
     fixture = build_fixture(tmp_path)
 
     batch = fixture.preparation.prepare(
@@ -278,48 +251,224 @@ def test_prepare_publishes_one_complete_identity_bound_batch_from_old_v1_state(
     )
 
     assert batch.source.identity_generation == fixture.identity.generation
-    assert batch.source.character_ids == ("character-1", "character-2")
-    assert tuple(target.original_slot_index for target in batch.targets) == (0, 1)
-    assert tuple(target.original_line_number for target in batch.targets) == (1, 2)
+    assert batch.source.character_ids == (
+        "character-1",
+        "character-2",
+        "character-3",
+    )
+    assert tuple(target.original_slot_index for target in batch.targets) == (0, 1, 2)
+    assert tuple(target.original_line_number for target in batch.targets) == (1, 2, 3)
     assert fixture.authorization.current_authorization() is batch
     assert fixture.seals.revalidate_calls == 0
-    assert json.loads(fixture.state_path.read_text(encoding="utf-8"))["version"] == 1
 
 
-def test_missing_one_role_leaves_zero_authorization(tmp_path):
+def test_closed_window_rebinds_only_actual_remaining_windows(tmp_path):
     fixture = build_fixture(tmp_path)
-    fixture.preparation.prepare(launch_mode=ReconnectLaunchMode.IDENTITY_BOUND)
+    first = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
     fixture.target_windows.snapshot_value = replace(
         fixture.target_windows.snapshot_value,
-        targets=fixture.target_windows.snapshot_value.targets[:1],
+        targets=fixture.target_windows.snapshot_value.targets[:2],
     )
 
-    with pytest.raises(SmartReconnectPreparationError):
-        fixture.preparation.prepare(
-            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
-        )
+    rebound = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
 
-    assert fixture.authorization.current_authorization() is None
-    assert fixture.authorization.state is ReconnectAuthorizationState.EMPTY
+    assert tuple(target.character_id for target in rebound.targets) == (
+        "character-1",
+        "character-2",
+    )
+    assert tuple(
+        target.authorization_id for target in rebound.targets
+    ) == tuple(target.authorization_id for target in first.targets[:2])
+    assert fixture.authorization.state is ReconnectAuthorizationState.ACTIVE
+
+
+def test_real_preparation_replaces_only_changed_window_grant_generation(
+    tmp_path,
+):
+    fixture = build_fixture(tmp_path)
+    first = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+    old_target = first.targets[0]
+    old_sibling = first.targets[1]
+    original_window = fixture.target_windows.snapshot_value.targets[0]
+    replacement_instance = replace(
+        original_window.instance,
+        process_lifecycle_token=(
+            original_window.instance.process_lifecycle_token + 1000
+        ),
+    )
+    fixture.target_windows.snapshot_value = replace(
+        fixture.target_windows.snapshot_value,
+        targets=(
+            replace(original_window, instance=replacement_instance),
+            *fixture.target_windows.snapshot_value.targets[1:],
+        ),
+    )
+
+    rebound = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+
+    replacement_target = rebound.target_for(old_target.fingerprint)
+    current_sibling = rebound.target_for(old_sibling.fingerprint)
+    assert rebound.source.source_generation == first.source.source_generation == 0
+    assert replacement_target is not None
+    assert replacement_target.instance == replacement_instance
+    assert replacement_target.authorization_id != old_target.authorization_id
+    assert replacement_target.authorization_epoch > old_target.authorization_epoch
+    assert replacement_target.source_generation > old_target.source_generation
+    assert current_sibling == old_sibling
+    assert fixture.authorization.validate(
+        epoch=replacement_target.authorization_epoch,
+        batch_id=replacement_target.authorization_id,
+        source_generation=replacement_target.source_generation,
+        fingerprint=replacement_target.fingerprint,
+        character_id=replacement_target.character_id,
+        instance=replacement_target.instance,
+        callback=lambda current: current,
+    ) == replacement_target
+    with pytest.raises(ReconnectAuthorizationMismatchError):
+        fixture.authorization.validate(
+            epoch=old_target.authorization_epoch,
+            batch_id=old_target.authorization_id,
+            source_generation=old_target.source_generation,
+            fingerprint=old_target.fingerprint,
+            character_id=old_target.character_id,
+            instance=old_target.instance,
+            callback=lambda current: current,
+        )
+    with pytest.raises(ReconnectAuthorizationMismatchError):
+        fixture.authorization.validate(
+            epoch=replacement_target.authorization_epoch,
+            batch_id=replacement_target.authorization_id,
+            source_generation=replacement_target.source_generation,
+            fingerprint=replacement_target.fingerprint,
+            character_id=replacement_target.character_id,
+            instance=old_target.instance,
+            callback=lambda current: current,
+        )
 
 
 @pytest.mark.parametrize(
     "launch_mode",
     (ReconnectLaunchMode.IDENTITY_BOUND, ReconnectLaunchMode.COMPATIBILITY),
 )
-def test_every_launch_mode_rejects_missing_slot_or_line_without_fallback(
+def test_monitoring_authorization_allows_unknown_slot_and_line(
     tmp_path,
     launch_mode,
 ):
     fixture = build_fixture(tmp_path, include_saved_state=False)
 
-    with pytest.raises(SmartReconnectPreparationError):
-        fixture.preparation.prepare(launch_mode=launch_mode)
+    batch = fixture.preparation.prepare(launch_mode=launch_mode)
 
-    assert fixture.authorization.current_authorization() is None
+    assert len(batch.targets) == 3
+    assert all(target.original_slot_index is None for target in batch.targets)
+    assert all(target.original_line_number is None for target in batch.targets)
+    assert fixture.authorization.current_authorization() is batch
 
 
-def test_launch_mode_must_be_explicit_and_complete_compatibility_can_start(tmp_path):
+def test_one_missing_seal_isolates_only_that_window(tmp_path):
+    fixture = build_fixture(tmp_path)
+    missing_path = fixture.group.entries[1].shortcut_path.resolve(strict=False)
+    fixture.seals.seals.pop(missing_path)
+
+    batch = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+
+    assert tuple(target.fingerprint for target in batch.targets) == (
+        fixture.fingerprints[0],
+        fixture.fingerprints[2],
+    )
+    assert batch.isolated_fingerprints == frozenset((fixture.fingerprints[1],))
+    assert batch.isolated_window_count == 1
+
+
+def test_duplicate_shortcut_file_identity_isolates_conflicts_only(tmp_path):
+    fixture = build_fixture(tmp_path)
+    first_path = fixture.group.entries[0].shortcut_path.resolve(strict=False)
+    second_path = fixture.group.entries[1].shortcut_path.resolve(strict=False)
+    first_seal = fixture.seals.seals[first_path]
+    second_seal = fixture.seals.seals[second_path]
+    fixture.seals.seals[second_path] = replace(
+        second_seal,
+        file_identity=ShortcutFileIdentity(
+            str(second_path),
+            first_seal.file_identity.volume_serial_number,
+            first_seal.file_identity.file_index,
+        ),
+    )
+
+    batch = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+
+    assert tuple(target.fingerprint for target in batch.targets) == (
+        fixture.fingerprints[2],
+    )
+    assert batch.isolated_fingerprints == frozenset(fixture.fingerprints[:2])
+
+
+def test_empty_actual_snapshot_remains_active_for_future_windows(tmp_path):
+    fixture = build_fixture(tmp_path)
+    fixture.target_windows.snapshot_value = ActualWindowSnapshot(
+        ActualWindowSnapshot.SCHEMA_VERSION
+    )
+
+    batch = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+
+    assert batch.targets == ()
+    assert fixture.authorization.current_authorization() is batch
+    assert fixture.authorization.state is ReconnectAuthorizationState.ACTIVE
+
+
+def test_retained_absent_target_requires_unique_current_source_binding(tmp_path):
+    fixture = build_fixture(tmp_path)
+    first = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+    fixture.target_windows.snapshot_value = replace(
+        fixture.target_windows.snapshot_value,
+        targets=fixture.target_windows.snapshot_value.targets[1:],
+    )
+    conflict_path = tmp_path / "conflicting-role.lnk"
+    conflict_path.write_bytes(b"conflict")
+    conflict_entry = replace(
+        fixture.group.entries[1],
+        shortcut_path=conflict_path,
+        order=99,
+        role_id="衝突角色",
+    )
+    fixture.group_service.group_value = replace(
+        fixture.group,
+        entries=(*fixture.group.entries, conflict_entry),
+    )
+    fixture.fingerprint_resolver.fingerprints[
+        conflict_path.resolve(strict=False)
+    ] = fixture.fingerprints[0]
+
+    rebound = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND,
+        retained_targets=(first.targets[0],),
+    )
+
+    assert tuple(target.fingerprint for target in rebound.targets) == (
+        fixture.fingerprints[1],
+        fixture.fingerprints[2],
+    )
+    assert tuple(
+        target.authorization_id for target in rebound.targets
+    ) == tuple(target.authorization_id for target in first.targets[1:])
+
+
+def test_launch_mode_must_be_explicit_and_compatibility_can_be_requested(tmp_path):
     fixture = build_fixture(tmp_path)
 
     with pytest.raises(TypeError, match="explicitly"):
@@ -331,13 +480,8 @@ def test_launch_mode_must_be_explicit_and_complete_compatibility_can_start(tmp_p
     assert compatibility.launch_mode is ReconnectLaunchMode.COMPATIBILITY
 
 
-def test_identity_write_waits_for_snapshot_publish_then_revokes_new_batch(tmp_path):
+def test_identity_write_waits_for_snapshot_and_unchanged_grants_rebind(tmp_path):
     fixture = build_fixture(tmp_path)
-    fixture.identity.register_before_write_listener(
-        lambda _generation: fixture.authorization.revoke(
-            ReconnectRevocationReason.IDENTITY_WRITE
-        )
-    )
     entered = threading.Event()
     release = threading.Event()
     write_done = threading.Event()
@@ -370,7 +514,6 @@ def test_identity_write_waits_for_snapshot_publish_then_revokes_new_batch(tmp_pa
     writer = threading.Thread(target=write_identity)
     writer.start()
 
-    assert fixture.authorization.current_authorization() is None
     assert fixture.authorization.state is ReconnectAuthorizationState.REBINDING
     assert write_done.wait(0.05) is False
     release.set()
@@ -380,8 +523,17 @@ def test_identity_write_waits_for_snapshot_publish_then_revokes_new_batch(tmp_pa
     assert len(prepared) == 1
     assert state == {"value": "after"}
     assert fixture.identity.generation == 1
-    assert fixture.authorization.current_authorization() is None
-    assert (
-        fixture.authorization.last_revocation_reason
-        is ReconnectRevocationReason.IDENTITY_WRITE
+    first = prepared[0]
+    assert fixture.authorization.current_authorization() is first
+
+    rebound = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+    assert rebound.source.identity_generation == 1
+    assert tuple(
+        (target.authorization_epoch, target.authorization_id)
+        for target in rebound.targets
+    ) == tuple(
+        (target.authorization_epoch, target.authorization_id)
+        for target in first.targets
     )

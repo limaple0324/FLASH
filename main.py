@@ -75,7 +75,6 @@ from core.sp1_boundaries import ExternalAdapter, SmartReconnectBoundary
 from core.reconnect_policy import ReconnectScreenState
 from core.smart_reconnect_authorization import (
     ReconnectLaunchMode,
-    ReconnectRevocationReason,
 )
 from core.target_window_observation import TargetWindowObservation
 from core.window_registry import WindowRegistry
@@ -1137,11 +1136,6 @@ def build_services(
     smart_reconnect_authorization_coordinator = (
         SmartReconnectAuthorizationCoordinator()
     )
-    identity_data_transaction_coordinator.register_before_write_listener(
-        lambda _generation: smart_reconnect_authorization_coordinator.revoke(
-            ReconnectRevocationReason.IDENTITY_WRITE
-        )
-    )
     AppContext.register(
         IdentityDataTransactionCoordinator,
         identity_data_transaction_coordinator,
@@ -1348,6 +1342,7 @@ def build_services(
         identity_data_transaction_coordinator,
         confirmed_group_orders=CONFIRMED_GROUP_ORDERS,
     )
+    ungrouped_window_service: UngroupedWindowService | None = None
     smart_reconnect_target_identity_service = (
         SmartReconnectTargetIdentityService(
             identity_data_transaction_coordinator,
@@ -1356,6 +1351,16 @@ def build_services(
             registry,
             shortcut_fingerprint_resolver,
             paths.data_dir() / RECONNECT_TARGET_IDENTITY_FILENAME,
+            ungrouped_shortcut_provider=lambda fingerprint: (
+                ungrouped_window_service.shortcut_for(fingerprint)
+                if ungrouped_window_service is not None
+                else None
+            ),
+            ungrouped_shortcut_catalog_provider=lambda: (
+                ungrouped_window_service._candidate_shortcuts()
+                if ungrouped_window_service is not None
+                else ()
+            ),
         )
     )
     workspace_service = WorkspaceService(
@@ -1423,12 +1428,7 @@ def build_services(
         shortcut_seal_resolver=shortcut_seal_resolver,
         authorization_coordinator=smart_reconnect_authorization_coordinator,
         identity_coordinator=identity_data_transaction_coordinator,
-        configuration=group_configuration_service,
-        character_view=character_view_service,
-        registry=registry,
-        workspace=workspace_service,
         config=config,
-        current_group_name_key=CURRENT_GROUP_NAME_KEY,
         product_launch_mode=ReconnectLaunchMode.IDENTITY_BOUND,
     )
     character_detail_view_service = CharacterDetailViewService(
@@ -1789,12 +1789,22 @@ def build_services(
         ),
         preparation_service=smart_reconnect_preparation_service,
         shortcut_seal_resolver=shortcut_seal_resolver,
+        identity_generation_runner=(
+            identity_data_transaction_coordinator.snapshot_with_generation
+        ),
+        identity_alias_catalog_provider=(
+            smart_reconnect_target_identity_service
+            .observed_identity_alias_catalog
+        ),
         auto_battle_enabled=(
             normalize_smart_reconnect_auto_battle_enabled(
                 config.get(SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY)
             )
         ),
         failure_status_service=reconnect_failure_status_service,
+        target_windows_provider=(
+            target_window_contract_service.actual_reconnect_targets
+        ),
         failure_record_callback=lambda role_name, detail: (
             operation_record_store.append(
                 "智慧重連",

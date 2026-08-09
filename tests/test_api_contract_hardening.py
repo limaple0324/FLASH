@@ -1,6 +1,7 @@
 import hashlib
 import json
 from dataclasses import replace
+from pathlib import Path
 
 from adapters.windows_input_sync import (
     WindowInputPolicy,
@@ -38,6 +39,10 @@ from services.lifecycle_contract import (
     join_service,
     start_service,
     stop_service,
+)
+from services.smart_reconnect_authorization_coordinator import (
+    ReconnectAuthorizationState,
+    SmartReconnectAuthorizationCoordinator,
 )
 from services.sync_scope_service import SyncScopeService
 from services.target_window_contract_service import (
@@ -902,3 +907,210 @@ def test_oldest_reconnect_contract_migrates_to_safe_current_state(tmp_path):
     assert json.loads(
         state_path.read_text(encoding="utf-8")
     )["version"] == ReconnectRuntimeStateStore.VERSION
+
+
+def _many_group_configuration(tmp_path, group_sizes):
+    groups = []
+    for group_index, size in enumerate(group_sizes, start=1):
+        entries = []
+        for item_index in range(1, size + 1):
+            shortcut = (
+                tmp_path
+                / f"group-{group_index}-role-{item_index}.lnk"
+            )
+            shortcut.write_bytes(
+                f"shortcut-{group_index}-{item_index}".encode()
+            )
+            entries.append(
+                {
+                    "path": str(shortcut),
+                    "role": "主要" if item_index == 1 else "次要",
+                    "role_id": f"角色-{group_index}-{item_index}",
+                }
+            )
+        groups.append(
+            {
+                "name": f"組別-{group_index}",
+                "launch_entries": entries,
+            }
+        )
+    legacy = tmp_path / "many-groups-legacy.json"
+    legacy.write_text(
+        json.dumps({"groups": groups}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    configuration = GroupConfigurationService(
+        tmp_path / "many-groups.json",
+        legacy_config_path=legacy,
+    )
+    return configuration, SyncScopeService(configuration, _Resolver())
+
+
+def _actual_window(index, fingerprint, **changes):
+    values = {
+        "handle": 100 + index,
+        "title": f"Adobe Flash Player {index}",
+        "visible": True,
+        "minimized": False,
+        "rect": (index * 10, 0, index * 10 + 900, 600),
+        "process_id": 1000 + index,
+        "window_class": "Flash",
+        "launch_fingerprint": fingerprint,
+        "thread_id": 2000 + index,
+        "process_lifecycle_token": 3000 + index,
+    }
+    values.update(changes)
+    return WindowInfo(**values)
+
+
+def test_actual_window_source_ignores_nine_closed_members_of_group_fourteen(
+    tmp_path,
+):
+    configuration, scope_service = _many_group_configuration(tmp_path, (14,))
+    group = configuration.groups()[0]
+    scope = scope_service.scope(group.name)
+    windows = tuple(
+        _actual_window(index, fingerprint)
+        for index, fingerprint in enumerate(scope.fingerprints[:5], start=1)
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        _WindowBackend(windows, complete_instances=False),
+    )
+
+    snapshot = service.actual_snapshot()
+    reconnect_targets = service.actual_reconnect_targets()
+
+    assert len(group.entries) == 14
+    assert tuple(target.fingerprint for target in snapshot.targets) == (
+        scope.fingerprints[:5]
+    )
+    assert tuple(window.launch_fingerprint for window in reconnect_targets.windows) == (
+        scope.fingerprints[:5]
+    )
+    assert snapshot.failure_codes == ()
+    assert reconnect_targets.actual_window_snapshot is True
+
+
+def test_actual_window_source_monitors_twelve_windows_across_three_groups(
+    tmp_path,
+):
+    configuration, scope_service = _many_group_configuration(
+        tmp_path,
+        (4, 4, 4),
+    )
+    fingerprints = tuple(
+        fingerprint
+        for group in configuration.groups()
+        for fingerprint in scope_service.scope(group.name).fingerprints
+    )
+    windows = tuple(
+        _actual_window(index, fingerprint)
+        for index, fingerprint in enumerate(fingerprints, start=1)
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        _WindowBackend(windows, complete_instances=False),
+    )
+
+    snapshot = service.actual_snapshot()
+
+    assert len(configuration.groups()) == 3
+    assert len(snapshot.targets) == 12
+    assert frozenset(target.fingerprint for target in snapshot.targets) == (
+        frozenset(fingerprints)
+    )
+    assert snapshot.blocked_fingerprints == frozenset()
+
+
+def test_actual_window_source_locally_isolates_anonymous_incomplete_and_duplicate(
+    tmp_path,
+):
+    configuration, scope_service = _many_group_configuration(tmp_path, (6,))
+    fingerprints = scope_service.scope(configuration.groups()[0].name).fingerprints
+    safe_first = _actual_window(1, fingerprints[0])
+    collision_complete = _actual_window(2, fingerprints[1])
+    collision_incomplete = _actual_window(
+        3,
+        fingerprints[2],
+        handle=collision_complete.handle,
+        thread_id=None,
+    )
+    duplicate_first = _actual_window(4, fingerprints[3])
+    duplicate_second = _actual_window(5, fingerprints[3])
+    anonymous = _actual_window(6, None)
+    safe_second = _actual_window(7, fingerprints[4])
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        _WindowBackend(
+            (
+                safe_first,
+                collision_complete,
+                collision_incomplete,
+                duplicate_first,
+                duplicate_second,
+                anonymous,
+                safe_second,
+            ),
+            complete_instances=False,
+        ),
+    )
+
+    snapshot = service.actual_snapshot()
+    reconnect_targets = service.actual_reconnect_targets()
+
+    assert tuple(target.fingerprint for target in snapshot.targets) == (
+        fingerprints[0],
+        fingerprints[4],
+    )
+    assert snapshot.blocked_fingerprints == frozenset(
+        (fingerprints[1], fingerprints[2], fingerprints[3])
+    )
+    assert snapshot.anonymous_isolated_window_count == 1
+    assert snapshot.isolated_window_count == 5
+    assert tuple(window.handle for window in reconnect_targets.windows) == (
+        safe_first.handle,
+        safe_second.handle,
+    )
+    assert reconnect_targets.failure_codes == ()
+
+
+def test_main_wires_one_shared_actual_window_authority_and_final_stop(
+    monkeypatch,
+):
+    import main
+
+    source = (Path(__file__).parents[1] / "main.py").read_text(
+        encoding="utf-8"
+    )
+    assert source.count("SmartReconnectAuthorizationCoordinator()") == 1
+    assert "register_before_write_listener" not in source
+    assert "target_window_contract_service.actual_reconnect_targets" in source
+    assert "identity_data_transaction_coordinator.snapshot_with_generation" in source
+    assert "observed_identity_alias_catalog" in source
+
+    coordinator = SmartReconnectAuthorizationCoordinator()
+
+    class Monitor:
+        def stop(self):
+            return True
+
+    def registered(service_type):
+        if service_type is main.SmartReconnectMonitor:
+            return Monitor()
+        if service_type is main.SmartReconnectAuthorizationCoordinator:
+            return coordinator
+        return None
+
+    monkeypatch.setattr(main.AppContext, "get", registered)
+
+    main.shutdown_smart_reconnect_monitor()
+
+    assert coordinator.current_authorization() is None
+    assert coordinator.state is ReconnectAuthorizationState.STOPPED

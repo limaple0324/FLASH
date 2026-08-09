@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from enum import Enum
 from typing import Callable, TypeVar
 from uuid import uuid4
@@ -13,6 +14,7 @@ from core.smart_reconnect_authorization import (
     ReconnectLaunchMode,
     ReconnectRevocationReason,
     ReconnectSourceIdentity,
+    ShortcutSeal,
 )
 from core.window_instance import WindowInstanceToken
 
@@ -51,6 +53,9 @@ class SmartReconnectAuthorizationCoordinator:
         self._state = ReconnectAuthorizationState.EMPTY
         self._epoch = 0
         self._current: ReconnectAuthorizationBatch | None = None
+        self._rebinding_base: ReconnectAuthorizationBatch | None = None
+        self._shortcut_seal_baselines: dict[str, ShortcutSeal] = {}
+        self._target_source_generations: dict[str, int] = {}
         self._last_revocation_reason: ReconnectRevocationReason | None = None
 
     @property
@@ -77,6 +82,8 @@ class SmartReconnectAuthorizationCoordinator:
     def begin_reprepare(self) -> None:
         with self._lock:
             self._require_not_stopped()
+            if self._state is ReconnectAuthorizationState.ACTIVE:
+                self._rebinding_base = self._current
             self._current = None
             self._state = ReconnectAuthorizationState.REBINDING
             self._last_revocation_reason = ReconnectRevocationReason.REPREPARE
@@ -86,22 +93,87 @@ class SmartReconnectAuthorizationCoordinator:
         source: ReconnectSourceIdentity,
         launch_mode: ReconnectLaunchMode,
         targets: tuple[ReconnectAuthorizationTarget, ...],
+        isolated_fingerprints: frozenset[str] = frozenset(),
+        isolated_window_count: int | None = None,
+        anonymous_isolated_window_count: int = 0,
     ) -> ReconnectAuthorizationBatch:
-        """Replace authorization atomically; invalid input leaves zero authorization."""
+        """Publish one immutable collection while preserving unchanged grants."""
         with self._lock:
             self._require_not_stopped()
+            base = (
+                self._rebinding_base
+                if self._state is ReconnectAuthorizationState.REBINDING
+                else self._current
+            )
             self._current = None
             self._state = ReconnectAuthorizationState.REBINDING
             self._last_revocation_reason = ReconnectRevocationReason.REPREPARE
             try:
+                collection_epoch = self._epoch + 1
+                requested_targets = tuple(targets)
+                requested_character_ids = tuple(
+                    target.character_id
+                    for target in requested_targets
+                    if target.character_id is not None
+                )
+                if requested_character_ids != source.character_ids:
+                    raise ValueError(
+                        "authorization targets do not match source identities"
+                    )
+                assigned: list[ReconnectAuthorizationTarget] = []
+                seal_changed: set[str] = set()
+                for target in requested_targets:
+                    baseline = self._shortcut_seal_baselines.get(
+                        target.fingerprint
+                    )
+                    if (
+                        baseline is not None
+                        and baseline != target.shortcut_seal
+                    ):
+                        seal_changed.add(target.fingerprint)
+                        continue
+                    assigned.append(
+                        self._assign_target_grant(
+                            target,
+                            base,
+                            source,
+                            collection_epoch,
+                        )
+                    )
+                assigned_targets = tuple(assigned)
+                isolated = frozenset(
+                    (*isolated_fingerprints, *seal_changed)
+                )
+                base_isolated_count = (
+                    len(isolated_fingerprints)
+                    if isolated_window_count is None
+                    else isolated_window_count
+                )
+                effective_source = replace(
+                    source,
+                    character_ids=tuple(
+                        target.character_id
+                        for target in assigned_targets
+                        if target.character_id is not None
+                    ),
+                )
                 batch = ReconnectAuthorizationBatch(
-                    epoch=self._epoch + 1,
+                    epoch=collection_epoch,
                     batch_id=uuid4().hex,
-                    source=source,
+                    source=effective_source,
                     launch_mode=launch_mode,
-                    targets=tuple(targets),
+                    targets=assigned_targets,
+                    isolated_fingerprints=isolated,
+                    isolated_window_count=(
+                        base_isolated_count
+                        + len(seal_changed - set(isolated_fingerprints))
+                    ),
+                    anonymous_isolated_window_count=(
+                        anonymous_isolated_window_count
+                    ),
                 )
             except BaseException:
+                self._rebinding_base = None
                 self._state = ReconnectAuthorizationState.EMPTY
                 self._last_revocation_reason = (
                     ReconnectRevocationReason.PREPARATION_FAILED
@@ -109,9 +181,69 @@ class SmartReconnectAuthorizationCoordinator:
                 raise
             self._epoch = batch.epoch
             self._current = batch
+            for target in batch.targets:
+                if target.source_generation is not None:
+                    self._target_source_generations[target.fingerprint] = max(
+                        target.source_generation,
+                        self._target_source_generations.get(
+                            target.fingerprint,
+                            target.source_generation,
+                        ),
+                    )
+                if target.shortcut_seal is not None:
+                    self._shortcut_seal_baselines.setdefault(
+                        target.fingerprint,
+                        target.shortcut_seal,
+                    )
+            self._rebinding_base = None
             self._state = ReconnectAuthorizationState.ACTIVE
             self._last_revocation_reason = None
             return batch
+
+    def _assign_target_grant(
+        self,
+        target: ReconnectAuthorizationTarget,
+        base: ReconnectAuthorizationBatch | None,
+        source: ReconnectSourceIdentity,
+        collection_epoch: int,
+    ) -> ReconnectAuthorizationTarget:
+        previous = base.target_for(target.fingerprint) if base is not None else None
+        if (
+            previous is not None
+            and base is not None
+            and previous.has_same_authorization_evidence(target)
+            and previous.authorization_epoch is not None
+            and previous.authorization_id is not None
+            and previous.source_generation is not None
+        ):
+            return replace(
+                target,
+                authorization_epoch=previous.authorization_epoch,
+                authorization_id=previous.authorization_id,
+                source_generation=previous.source_generation,
+            )
+        latest_generation = self._target_source_generations.get(
+            target.fingerprint
+        )
+        if previous is not None and previous.source_generation is not None:
+            latest_generation = max(
+                previous.source_generation,
+                (
+                    latest_generation
+                    if latest_generation is not None
+                    else previous.source_generation
+                ),
+            )
+        return replace(
+            target,
+            authorization_epoch=collection_epoch,
+            authorization_id=uuid4().hex,
+            source_generation=(
+                source.source_generation
+                if latest_generation is None
+                else max(source.source_generation, latest_generation + 1)
+            ),
+        )
 
     def revoke(self, reason: ReconnectRevocationReason) -> None:
         if not isinstance(reason, ReconnectRevocationReason):
@@ -120,8 +252,59 @@ class SmartReconnectAuthorizationCoordinator:
             if self._state is ReconnectAuthorizationState.STOPPED:
                 return
             self._current = None
+            self._rebinding_base = None
+            if reason is ReconnectRevocationReason.EXPLICIT:
+                self._shortcut_seal_baselines.clear()
             self._state = ReconnectAuthorizationState.EMPTY
             self._last_revocation_reason = reason
+
+    def revoke_target(
+        self,
+        fingerprint: object,
+        reason: ReconnectRevocationReason = ReconnectRevocationReason.SOURCE_CHANGED,
+    ) -> bool:
+        """Revoke exactly one target without invalidating unchanged siblings."""
+
+        if not isinstance(reason, ReconnectRevocationReason):
+            raise TypeError("reason must be ReconnectRevocationReason")
+        with self._lock:
+            if self._state is ReconnectAuthorizationState.STOPPED:
+                return False
+            batch = self._current
+            if batch is None or self._state is not ReconnectAuthorizationState.ACTIVE:
+                return False
+            target = batch.target_for(fingerprint)
+            if target is None:
+                return False
+            remaining = tuple(item for item in batch.targets if item is not target)
+            self._epoch += 1
+            self._last_revocation_reason = reason
+            source = replace(
+                batch.source,
+                character_ids=tuple(
+                    item.character_id
+                    for item in remaining
+                    if item.character_id is not None
+                ),
+            )
+            self._current = ReconnectAuthorizationBatch(
+                epoch=self._epoch,
+                batch_id=uuid4().hex,
+                source=source,
+                launch_mode=batch.launch_mode,
+                targets=remaining,
+                isolated_fingerprints=frozenset(
+                    (*batch.isolated_fingerprints, target.fingerprint)
+                ),
+                isolated_window_count=(
+                    (batch.isolated_window_count or 0) + 1
+                ),
+                anonymous_isolated_window_count=(
+                    batch.anonymous_isolated_window_count
+                ),
+            )
+            self._state = ReconnectAuthorizationState.ACTIVE
+            return True
 
     def fail_preparation(self) -> None:
         self.revoke(ReconnectRevocationReason.PREPARATION_FAILED)
@@ -129,6 +312,8 @@ class SmartReconnectAuthorizationCoordinator:
     def stop(self) -> None:
         with self._lock:
             self._current = None
+            self._rebinding_base = None
+            self._shortcut_seal_baselines.clear()
             self._state = ReconnectAuthorizationState.STOPPED
             self._last_revocation_reason = ReconnectRevocationReason.STOPPED
 
@@ -177,16 +362,10 @@ class SmartReconnectAuthorizationCoordinator:
                     "reconnect authorization is not active"
                 )
             if (
-                epoch != batch.epoch
-                or batch_id != batch.batch_id
-                or source_generation != batch.source.source_generation
-            ):
-                raise ReconnectAuthorizationMismatchError(
-                    "authorization epoch or source generation changed"
-                )
-            target = batch.target_for(fingerprint)
-            if (
-                target is None
+                (target := batch.target_for(fingerprint)) is None
+                or target.authorization_epoch != epoch
+                or target.authorization_id != batch_id
+                or target.source_generation != source_generation
                 or target.character_id != character_id
                 or target.instance != instance
             ):

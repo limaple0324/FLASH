@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from enum import Enum
+from typing import Iterable
 
 from core.window_instance import WindowInstanceToken
 from domain.character import CharacterImportance
@@ -144,7 +145,7 @@ class ReconnectSourceIdentity:
         character_ids = tuple(
             _required_text(value, "character_id") for value in self.character_ids
         )
-        if not character_ids or len(character_ids) != len(set(character_ids)):
+        if len(character_ids) != len(set(character_ids)):
             raise ValueError(
                 "source character identities contain an empty or duplicate value"
             )
@@ -167,6 +168,9 @@ class ReconnectAuthorizationTarget:
     original_slot_index: int | None = None
     original_line_number: int | None = None
     shortcut_seal: ShortcutSeal | None = None
+    authorization_epoch: int | None = None
+    authorization_id: str | None = None
+    source_generation: int | None = None
 
     def __post_init__(self) -> None:
         fingerprint = _normalized_sha256(self.fingerprint)
@@ -209,12 +213,63 @@ class ReconnectAuthorizationTarget:
                 raise TypeError("shortcut_seal must be ShortcutSeal or None")
             if self.shortcut_seal.launch_fingerprint != fingerprint:
                 raise ValueError("shortcut seal and target fingerprint disagree")
+        grant_values = (
+            self.authorization_epoch,
+            self.authorization_id,
+            self.source_generation,
+        )
+        if any(value is not None for value in grant_values):
+            if (
+                isinstance(self.authorization_epoch, bool)
+                or not isinstance(self.authorization_epoch, int)
+                or self.authorization_epoch <= 0
+                or not isinstance(self.authorization_id, str)
+                or not self.authorization_id.strip()
+                or isinstance(self.source_generation, bool)
+                or not isinstance(self.source_generation, int)
+                or self.source_generation < 0
+            ):
+                raise ValueError("target authorization grant is incomplete")
         object.__setattr__(self, "fingerprint", fingerprint)
         object.__setattr__(self, "character_id", character_id)
         object.__setattr__(self, "role_aliases", aliases)
+        if self.authorization_id is not None:
+            object.__setattr__(
+                self,
+                "authorization_id",
+                self.authorization_id.strip(),
+            )
 
     def matches_observed_identity(self, value: object) -> bool:
         return observed_alias_matches(self.role_aliases, value)
+
+    def has_same_authorization_evidence(
+        self,
+        other: object,
+    ) -> bool:
+        """Compare immutable safety evidence without comparing its grant."""
+
+        if not isinstance(other, ReconnectAuthorizationTarget):
+            return False
+        return (
+            self.fingerprint,
+            self.instance,
+            self.character_id,
+            self.role_aliases,
+            self.importance,
+            self.original_slot_index,
+            self.original_line_number,
+            self.shortcut_seal,
+        ) == (
+            other.fingerprint,
+            other.instance,
+            other.character_id,
+            other.role_aliases,
+            other.importance,
+            other.original_slot_index,
+            other.original_line_number,
+            other.shortcut_seal,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +279,9 @@ class ReconnectAuthorizationBatch:
     source: ReconnectSourceIdentity
     launch_mode: ReconnectLaunchMode
     targets: tuple[ReconnectAuthorizationTarget, ...]
+    isolated_fingerprints: frozenset[str] = frozenset()
+    isolated_window_count: int | None = None
+    anonymous_isolated_window_count: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -238,15 +296,45 @@ class ReconnectAuthorizationBatch:
         if not isinstance(self.launch_mode, ReconnectLaunchMode):
             raise TypeError("launch_mode must be ReconnectLaunchMode")
         targets = tuple(self.targets)
-        if not targets or any(
+        if any(
             not isinstance(target, ReconnectAuthorizationTarget)
             for target in targets
         ):
-            raise ValueError("authorization targets must be a non-empty complete batch")
+            raise ValueError("authorization targets must be a complete collection")
         self._validate_unique_targets(targets)
         self._validate_complete_targets(targets)
+        isolated = frozenset(
+            normalized
+            for normalized in (
+                _normalized_sha256(value)
+                for value in self.isolated_fingerprints
+            )
+            if normalized is not None
+        )
+        if (
+            len(isolated) != len(self.isolated_fingerprints)
+            or isolated.intersection(target.fingerprint for target in targets)
+        ):
+            raise ValueError("isolated fingerprints are invalid or authorized")
+        isolated_count = (
+            len(isolated)
+            if self.isolated_window_count is None
+            else self.isolated_window_count
+        )
+        if (
+            isinstance(isolated_count, bool)
+            or not isinstance(isolated_count, int)
+            or isolated_count < len(isolated)
+            or isinstance(self.anonymous_isolated_window_count, bool)
+            or not isinstance(self.anonymous_isolated_window_count, int)
+            or self.anonymous_isolated_window_count < 0
+            or self.anonymous_isolated_window_count > isolated_count
+        ):
+            raise ValueError("authorization isolation counts are invalid")
         object.__setattr__(self, "batch_id", batch_id)
         object.__setattr__(self, "targets", targets)
+        object.__setattr__(self, "isolated_fingerprints", isolated)
+        object.__setattr__(self, "isolated_window_count", isolated_count)
 
     def target_for(self, fingerprint: object) -> ReconnectAuthorizationTarget | None:
         normalized = _normalized_sha256(fingerprint)
@@ -256,6 +344,68 @@ class ReconnectAuthorizationBatch:
             (target for target in self.targets if target.fingerprint == normalized),
             None,
         )
+
+    def unique_target_for_observed_identity(
+        self,
+        value: object,
+        known_aliases: Iterable[object] = (),
+    ) -> ReconnectAuthorizationTarget | None:
+        """Return one target only when the current collection proves it unique."""
+
+        observed = normalize_identity_alias(value)
+        if observed is None:
+            return None
+        comparison = observed.rstrip(".…")
+        if len(comparison) < 3:
+            return None
+        owners_by_alias: dict[str, set[str]] = {}
+        target_owner: dict[str, str] = {}
+        for target in self.targets:
+            owner = target.character_id or target.fingerprint
+            target_owner[target.fingerprint] = owner
+            for alias in target.role_aliases:
+                owners_by_alias.setdefault(alias, set()).add(owner)
+        for item in known_aliases:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[1], str)
+                and item[1].strip()
+            ):
+                normalized = normalize_identity_alias(item[0])
+                owner = item[1].strip()
+            else:
+                normalized = normalize_identity_alias(item)
+                current_owners = (
+                    owners_by_alias.get(normalized, set())
+                    if normalized is not None
+                    else set()
+                )
+                owner = (
+                    next(iter(current_owners))
+                    if len(current_owners) == 1
+                    else f"catalog:{normalized}"
+                )
+            if normalized is not None:
+                owners_by_alias.setdefault(normalized, set()).add(owner)
+        candidate_owners = {
+            owner
+            for alias, owners in owners_by_alias.items()
+            if alias.startswith(comparison)
+            for owner in owners
+        }
+        if len(candidate_owners) != 1:
+            return None
+        expected_owner = next(iter(candidate_owners))
+        matches = tuple(
+            target
+            for target in self.targets
+            if (
+                target_owner[target.fingerprint] == expected_owner
+                and target.matches_observed_identity(value)
+            )
+        )
+        return matches[0] if len(matches) == 1 else None
 
     @staticmethod
     def _validate_unique_targets(
@@ -299,8 +449,6 @@ class ReconnectAuthorizationBatch:
                 target.character_id is None
                 or not target.role_aliases
                 or target.importance is None
-                or target.original_slot_index is None
-                or target.original_line_number is None
                 or target.shortcut_seal is None
             ):
                 raise ValueError("authorization target is incomplete")
@@ -309,14 +457,6 @@ class ReconnectAuthorizationBatch:
         )
         if target_character_ids != self.source.character_ids:
             raise ValueError("authorization targets do not match source identities")
-        for index, left in enumerate(targets):
-            for right in targets[index + 1 :]:
-                if any(
-                    identity_aliases_conflict(left_alias, right_alias)
-                    for left_alias in left.role_aliases
-                    for right_alias in right.role_aliases
-                ):
-                    raise ValueError("cross-target identity aliases are ambiguous")
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,9 +507,21 @@ class ReconnectActionContext:
         if batch.target_for(target.fingerprint) != target or target.character_id is None:
             raise ValueError("target does not belong to the authorization batch")
         return cls(
-            authorization_epoch=batch.epoch,
-            batch_id=batch.batch_id,
-            source_generation=batch.source.source_generation,
+            authorization_epoch=(
+                target.authorization_epoch
+                if target.authorization_epoch is not None
+                else batch.epoch
+            ),
+            batch_id=(
+                target.authorization_id
+                if target.authorization_id is not None
+                else batch.batch_id
+            ),
+            source_generation=(
+                target.source_generation
+                if target.source_generation is not None
+                else batch.source.source_generation
+            ),
             fingerprint=target.fingerprint,
             character_id=target.character_id,
             instance=target.instance,

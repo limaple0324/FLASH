@@ -308,7 +308,10 @@ class WindowsBattleWindowRestarter:
                 False,
                 "battle_window_enumeration_failed",
             )
-        failure_code = self._candidate_collection_failure(candidates)
+        failure_code = self._target_instance_failure(
+            candidates,
+            expected_identity,
+        )
         if failure_code is not None:
             return BattleRestartResult(False, failure_code)
         exact = tuple(
@@ -336,7 +339,10 @@ class WindowsBattleWindowRestarter:
                 False,
                 "battle_window_enumeration_failed",
             )
-        failure_code = self._candidate_collection_failure(final_candidates)
+        failure_code = self._target_instance_failure(
+            final_candidates,
+            expected_identity,
+        )
         if failure_code is not None:
             return BattleRestartResult(False, failure_code)
         final_exact = tuple(
@@ -482,29 +488,41 @@ class WindowsBattleWindowRestarter:
         )
 
     @classmethod
-    def _candidate_collection_failure(
+    def _target_instance_failure(
         cls,
         candidates: tuple[WindowInfo, ...],
+        expected_identity: WindowInstanceIdentity,
     ) -> str | None:
-        identities = tuple(
-            cls._window_instance_identity(candidate)
-            for candidate in candidates
-        )
-        if any(identity is None for identity in identities):
+        exact = 0
+        expected_handle = expected_identity[0]
+        expected_process_id = expected_identity[1]
+        expected_fingerprint = expected_identity[-1]
+        conflicting = 0
+        conflicting_unknown = False
+        for candidate in candidates:
+            identity = cls._window_instance_identity(candidate)
+            if identity == expected_identity:
+                exact += 1
+                continue
+            fingerprint = normalize_launch_fingerprint(
+                candidate.launch_fingerprint
+            )
+            if (
+                candidate.handle == expected_handle
+                or candidate.process_id == expected_process_id
+                or fingerprint == expected_fingerprint
+            ):
+                conflicting += 1
+                conflicting_unknown = bool(
+                    conflicting_unknown or identity is None
+                )
+        if exact == 1 and not conflicting:
+            return None
+        if conflicting_unknown:
             return "battle_window_existing_state_unknown"
-        complete = tuple(
-            identity for identity in identities if identity is not None
-        )
-        handles = tuple(identity[0] for identity in complete)
-        process_ids = tuple(identity[1] for identity in complete)
-        fingerprints = tuple(identity[-1] for identity in complete)
-        if (
-            len(handles) != len(set(handles))
-            or len(process_ids) != len(set(process_ids))
-            or len(fingerprints) != len(set(fingerprints))
-        ):
-            return "battle_window_identity_duplicate"
-        return None
+        if exact == 0 and conflicting <= 1:
+            return "battle_window_identity_changed"
+        return "battle_window_identity_duplicate"
 
     def _current_window_instance_identity(
         self,
@@ -513,8 +531,6 @@ class WindowsBattleWindowRestarter:
         try:
             candidates = self._live_candidate_windows()
         except Exception:
-            return None
-        if self._candidate_collection_failure(candidates) is not None:
             return None
         exact = tuple(
             candidate
@@ -530,18 +546,19 @@ class WindowsBattleWindowRestarter:
         target: GroupLaunchTarget,
         candidates: tuple[WindowInfo, ...],
     ) -> str | None:
-        collection_failure = (
-            WindowsBattleWindowRestarter._candidate_collection_failure(
-                candidates
+        for window in candidates:
+            fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
             )
-        )
-        if collection_failure is not None:
-            return collection_failure
-        fingerprints = tuple(
-            WindowsBattleWindowRestarter._window_instance_identity(window)[-1]
-            for window in candidates
-        )
-        if target.fingerprint in fingerprints:
+            # An anonymous game window may be the just-closed target racing
+            # back into view.  Its identity cannot prove stable absence, so
+            # refuse only this reopen instead of risking a duplicate client.
+            if fingerprint is None:
+                return "battle_window_existing_state_unknown"
+            if fingerprint != target.fingerprint:
+                continue
+            if WindowsBattleWindowRestarter._window_instance_identity(window) is None:
+                return "battle_window_existing_state_unknown"
             return "battle_window_already_exists"
         return None
 

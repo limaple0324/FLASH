@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping
 
+from core.smart_reconnect_authorization import _normalized_sha256
+from core.window_instance import WindowInstanceToken
+
 
 class TargetWindowPhase(str, Enum):
     FOREGROUND = "foreground"
@@ -99,3 +102,75 @@ class TargetWindowSnapshot:
             "targets": [target.to_public_dict() for target in self.targets],
             "failure_codes": list(self.failure_codes),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ActualWindowContract:
+    """One currently existing game window with complete immutable identity."""
+
+    fingerprint: str
+    instance: WindowInstanceToken
+    visible: bool
+
+    def __post_init__(self) -> None:
+        fingerprint = _normalized_sha256(self.fingerprint)
+        if fingerprint is None:
+            raise ValueError("actual window fingerprint must be complete SHA-256")
+        if not isinstance(self.instance, WindowInstanceToken):
+            raise TypeError("actual window instance must be WindowInstanceToken")
+        if type(self.visible) is not bool:
+            raise TypeError("actual window visibility must be bool")
+        object.__setattr__(self, "fingerprint", fingerprint)
+
+
+@dataclass(frozen=True, slots=True)
+class ActualWindowSnapshot:
+    """Group-independent snapshot used only by per-window smart reconnect."""
+
+    schema_version: int
+    targets: tuple[ActualWindowContract, ...] = ()
+    blocked_fingerprints: frozenset[str] = frozenset()
+    isolated_window_count: int = 0
+    anonymous_isolated_window_count: int = 0
+    failure_codes: tuple[str, ...] = ()
+
+    SCHEMA_VERSION = 1
+
+    def __post_init__(self) -> None:
+        if self.schema_version != self.SCHEMA_VERSION:
+            raise ValueError("unsupported actual-window contract version")
+        targets = tuple(self.targets)
+        if any(not isinstance(target, ActualWindowContract) for target in targets):
+            raise TypeError("actual-window targets are invalid")
+        fingerprints = tuple(target.fingerprint for target in targets)
+        if len(fingerprints) != len(set(fingerprints)):
+            raise ValueError("actual-window targets contain duplicate fingerprints")
+        blocked = frozenset(
+            normalized
+            for normalized in (
+                _normalized_sha256(value)
+                for value in self.blocked_fingerprints
+            )
+            if normalized is not None
+        )
+        if (
+            len(blocked) != len(self.blocked_fingerprints)
+            or blocked.intersection(fingerprints)
+        ):
+            raise ValueError("blocked actual-window fingerprints are invalid")
+        for value, field in (
+            (self.isolated_window_count, "isolated_window_count"),
+            (
+                self.anonymous_isolated_window_count,
+                "anonymous_isolated_window_count",
+            ),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field} must be a non-negative integer")
+        if (
+            self.anonymous_isolated_window_count > self.isolated_window_count
+            or self.isolated_window_count < len(blocked)
+        ):
+            raise ValueError("actual-window isolation counts disagree")
+        object.__setattr__(self, "targets", targets)
+        object.__setattr__(self, "blocked_fingerprints", blocked)

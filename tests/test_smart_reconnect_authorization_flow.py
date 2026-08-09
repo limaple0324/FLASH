@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 
+import pytest
+
 from adapters.windows_battle_restart import (
     BattleRestartResult,
     WindowsShortcutOpenBackend,
@@ -9,6 +11,10 @@ from core.smart_reconnect_authorization import (
     ReconnectRevocationReason,
     ShortcutFileIdentity,
     ShortcutSeal,
+)
+from core.target_window_contract import WindowInstanceToken
+from services.smart_reconnect_authorization_coordinator import (
+    ReconnectAuthorizationMismatchError,
 )
 from services.group_launch_service import GroupLaunchTarget
 from services.target_window_contract_service import ResolvedTargetWindows
@@ -145,12 +151,21 @@ def test_bound_pending_reopen_provider_disappears_without_compatibility_fallback
 
 def test_full_window_instance_change_produces_zero_input():
     original = make_window(1)
+    sibling = make_window(2)
     fixture = make_controller(
-        [3],
-        windows=[original],
-        expected_windows=1,
+        [3, 1],
+        windows=[original, sibling],
+        expected_windows=2,
     )
     _arm_login_action(fixture, original)
+    old_batch = fixture.authorization.current_authorization()
+    assert old_batch is not None
+    old_grant = old_batch.target_for(original.launch_fingerprint)
+    sibling_grant = old_batch.target_for(sibling.launch_fingerprint)
+    assert old_grant is not None
+    assert sibling_grant is not None
+    old_instance = WindowInstanceToken.from_window(original)
+    assert old_instance is not None
 
     fixture.controller.reconnect()
     replacement = make_window(
@@ -160,12 +175,45 @@ def test_full_window_instance_change_produces_zero_input():
         thread_id=original.thread_id,
         process_lifecycle_token=original.process_lifecycle_token + 1,
     )
-    fixture.controller._window_backend.windows = [replacement]
+    replacement_instance = WindowInstanceToken.from_window(replacement)
+    assert replacement_instance is not None
+    fixture.controller._window_backend.windows = [replacement, sibling]
     result = fixture.controller.reconnect()
 
     assert result.details["clicked_windows"] == 0
     assert fixture.mouse.clicks == []
-    assert fixture.authorization.current_authorization() is None
+    current = fixture.authorization.current_authorization()
+    assert current is not None
+    replacement_grant = current.target_for(replacement.launch_fingerprint)
+    current_sibling_grant = current.target_for(sibling.launch_fingerprint)
+    assert replacement_grant is not None
+    assert current_sibling_grant is not None
+    assert replacement_grant.instance == replacement_instance
+    assert replacement_grant.instance != old_instance
+    assert replacement_grant.authorization_id != old_grant.authorization_id
+    assert replacement_grant.authorization_epoch != old_grant.authorization_epoch
+    assert replacement_grant.source_generation > old_grant.source_generation
+    assert current_sibling_grant == sibling_grant
+    with pytest.raises(ReconnectAuthorizationMismatchError):
+        fixture.authorization.validate(
+            epoch=old_grant.authorization_epoch,
+            batch_id=old_grant.authorization_id,
+            source_generation=old_grant.source_generation,
+            fingerprint=old_grant.fingerprint,
+            character_id=old_grant.character_id,
+            instance=old_instance,
+            callback=lambda target: target,
+        )
+    with pytest.raises(ReconnectAuthorizationMismatchError):
+        fixture.authorization.validate(
+            epoch=replacement_grant.authorization_epoch,
+            batch_id=replacement_grant.authorization_id,
+            source_generation=replacement_grant.source_generation,
+            fingerprint=replacement_grant.fingerprint,
+            character_id=replacement_grant.character_id,
+            instance=old_instance,
+            callback=lambda target: target,
+        )
 
 
 def test_shortcut_file_signature_change_blocks_real_reopen(

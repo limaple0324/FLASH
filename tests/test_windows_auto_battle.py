@@ -153,11 +153,31 @@ class _Windows:
     def top_window_at(self, _x, _y): return self.window.handle
 
 
+class _PublishedShortcutSealResolver:
+    def __init__(self):
+        self._published = {}
+
+    def publish(self, targets):
+        self._published = {
+            target.fingerprint: target.shortcut_seal
+            for target in targets
+            if target.shortcut_seal is not None
+        }
+
+    def revalidate(self, expected_seal):
+        return bool(
+            isinstance(expected_seal, ShortcutSeal)
+            and self._published.get(expected_seal.launch_fingerprint)
+            == expected_seal
+        )
+
+
 class _AuthorizationPreparation:
     def __init__(self, coordinator, window_backend):
         self.authorization_coordinator = coordinator
         self._window_backend = window_backend
         self._generation = 1
+        self.shortcut_seal_resolver = _PublishedShortcutSealResolver()
 
     def prepare(self, *, launch_mode):
         assert launch_mode is ReconnectLaunchMode.IDENTITY_BOUND
@@ -199,11 +219,13 @@ class _AuthorizationPreparation:
             character_ids=tuple(target.character_id for target in targets),
         )
         self._generation += 1
-        return self.authorization_coordinator.publish(
+        batch = self.authorization_coordinator.publish(
             source,
             launch_mode,
             tuple(targets),
         )
+        self.shortcut_seal_resolver.publish(batch.targets)
+        return batch
 
 
 def _authorization_services(window_backend):
@@ -318,6 +340,7 @@ def _controller(
     monotonic_clock=None,
     general_state=ReconnectScreenState.CONNECTED,
     battle_context=False,
+    shortcut_seal_resolver="published",
 ):
     width = frames[0].width if frames else 900
     height = frames[0].height if frames else 600
@@ -327,6 +350,8 @@ def _controller(
     clock = monotonic_clock or (lambda: 0.0)
     backend = _Windows(window)
     authorization, preparation = _authorization_services(backend)
+    if shortcut_seal_resolver == "published":
+        shortcut_seal_resolver = preparation.shortcut_seal_resolver
     controller = WindowsSmartReconnectController(
         expected_windows=1, title_keywords=("Adobe Flash Player",),
         window_backend=backend, capture_provider=capture,
@@ -341,11 +366,74 @@ def _controller(
         auto_battle_enabled=True, auto_battle_recognizer=AutoBattleRecognizer(ROOT),
         authorization_coordinator=authorization,
         preparation_service=preparation,
+        shortcut_seal_resolver=shortcut_seal_resolver,
     )
     prepared = controller.prepare_execution_snapshot()
     assert prepared.success is True
     controller.set_execution_enabled(True)
     return controller, window, mouse
+
+
+@pytest.mark.parametrize(
+    "seal_failure",
+    ("missing", "rejected", "error", "mismatch"),
+)
+def test_auto_battle_requires_the_exact_published_shortcut_seal(
+    seal_failure,
+) -> None:
+    class FailingResolver:
+        def revalidate(self, _expected_seal):
+            if seal_failure == "error":
+                raise OSError("shortcut seal unavailable")
+            return False
+
+    disabled = _red_x_full_sample()
+    resolver = (
+        None
+        if seal_failure == "missing"
+        else (
+            "published"
+            if seal_failure == "mismatch"
+            else FailingResolver()
+        )
+    )
+    controller, window, mouse = _controller(
+        [disabled, _enabled_battle_sample()],
+        shortcut_seal_resolver=resolver,
+    )
+    if seal_failure == "mismatch":
+        batch = controller._authorization_batch
+        assert batch is not None
+        target = batch.target_for(window.launch_fingerprint)
+        assert target is not None
+        expected_seal = target.shortcut_seal
+        assert expected_seal is not None
+        controller._shortcut_seals._published[target.fingerprint] = (
+            ShortcutSeal(
+                ShortcutFileIdentity(
+                    expected_seal.file_identity.normalized_path,
+                    expected_seal.file_identity.volume_serial_number,
+                    expected_seal.file_identity.file_index + 1,
+                ),
+                "f" * 64,
+                target.fingerprint,
+            )
+        )
+        assert controller._shortcut_seals.revalidate(expected_seal) is False
+
+    delivered = controller._run_auto_battle_for_connected(
+        window,
+        window.launch_fingerprint,
+        WindowInstanceToken.from_window(window),
+        disabled,
+        "visible",
+        0,
+        controller._source_state_generation,
+    )
+
+    assert delivered is False
+    assert mouse.clicks == []
+    assert not controller._auto_battle_evidence
 
 
 def test_connected_auto_battle_clicks_once_then_requires_third_panel() -> None:
@@ -456,6 +544,7 @@ def test_three_role_auto_battle_only_delivers_to_confirmed_role() -> None:
         auto_battle_recognizer=AutoBattleRecognizer(ROOT),
         authorization_coordinator=authorization,
         preparation_service=preparation,
+        shortcut_seal_resolver=preparation.shortcut_seal_resolver,
     )
     prepared = controller.prepare_execution_snapshot()
     assert prepared.success is True
@@ -722,6 +811,7 @@ def test_four_window_diagnostics_are_anonymous_hash_only_records() -> None:
         auto_battle_enabled=False,
         authorization_coordinator=authorization,
         preparation_service=preparation,
+        shortcut_seal_resolver=preparation.shortcut_seal_resolver,
     )
     assert controller.prepare_execution_snapshot().success is True
     controller.set_execution_enabled(True)
@@ -776,6 +866,7 @@ def test_eight_minimized_windows_use_only_active_fresh_capture_path() -> None:
         auto_battle_enabled=False,
         authorization_coordinator=authorization,
         preparation_service=preparation,
+        shortcut_seal_resolver=preparation.shortcut_seal_resolver,
     )
     assert controller.prepare_execution_snapshot().success is True
     controller.set_execution_enabled(True)
@@ -822,6 +913,7 @@ def test_minimized_restore_failure_exposes_only_anonymous_stage() -> None:
         auto_battle_enabled=False,
         authorization_coordinator=authorization,
         preparation_service=preparation,
+        shortcut_seal_resolver=preparation.shortcut_seal_resolver,
     )
     assert controller.prepare_execution_snapshot().success is True
     controller.set_execution_enabled(True)

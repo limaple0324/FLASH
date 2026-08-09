@@ -258,18 +258,110 @@ def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
     reconnect = AppContext.get(main_module.WindowsSmartReconnectController)
     keyboard = AppContext.get(main_module.WindowsInputSyncController)
     pointer = AppContext.get(main_module.WindowsPointerSyncController)
-    strict_targets = ("strict-target",)
+    current_group_window = main_module.WindowInfo(
+        101,
+        "Adobe Flash Player current group",
+        True,
+        False,
+        (0, 0, 900, 600),
+        201,
+        "ShockwaveFlash",
+        "1" * 64,
+        301,
+        401,
+    )
+    other_group_window = main_module.WindowInfo(
+        102,
+        "Adobe Flash Player other group",
+        True,
+        False,
+        (10, 10, 910, 610),
+        202,
+        "ShockwaveFlash",
+        "2" * 64,
+        302,
+        402,
+    )
+    safe_ungrouped_window = main_module.WindowInfo(
+        103,
+        "Adobe Flash Player safe ungrouped",
+        True,
+        False,
+        (20, 20, 920, 620),
+        203,
+        "ShockwaveFlash",
+        "3" * 64,
+        303,
+        403,
+    )
+    actual_windows = (
+        current_group_window,
+        other_group_window,
+        safe_ungrouped_window,
+    )
+    monkeypatch.setattr(
+        contract._window_backend,
+        "list_windows",
+        lambda: actual_windows,
+    )
+    actual_provider = reconnect._target_windows_provider
+    assert actual_provider is not None
+    assert actual_provider.__self__ is contract
+    assert (
+        actual_provider.__func__
+        is TargetWindowContractService.actual_reconnect_targets
+    )
+
+    actual_targets = actual_provider()
+
+    assert actual_targets.actual_window_snapshot is True
+    assert actual_targets == contract.actual_reconnect_targets()
+    assert tuple(
+        (window.handle, window.launch_fingerprint)
+        for window in actual_targets.windows
+    ) == tuple(
+        (window.handle, window.launch_fingerprint)
+        for window in actual_windows
+    )
+    assert actual_targets.failure_codes == ()
+    assert actual_targets.blocked_fingerprints == frozenset()
+
+    grouped_calls = []
     monkeypatch.setattr(
         contract,
         "reconnect_targets",
-        lambda _group_name: ResolvedTargetWindows(strict_targets),
+        lambda group_name: (
+            grouped_calls.append(group_name)
+            or ResolvedTargetWindows((current_group_window,))
+        ),
+    )
+    observed_candidates = []
+
+    def observe_grouped_targets(requested, *, candidate_windows=None):
+        candidates = tuple(candidate_windows or ())
+        observed_candidates.append(candidates)
+        return {
+            fingerprint: main_module.ReconnectScreenState.CONNECTED
+            for fingerprint in requested
+        }
+
+    monkeypatch.setattr(
+        reconnect,
+        "observe_screen_states",
+        observe_grouped_targets,
     )
 
-    assert reconnect._target_windows_provider is None
     assert reconnect._require_expected_window_count is False
-    # 未驗證的測試替身不得進入同步目標集合。
-    assert keyboard._target_windows_provider() == ()
-    assert pointer._target_windows_provider() == ()
+    assert keyboard._target_windows_provider() == (current_group_window,)
+    assert pointer._target_windows_provider() == (current_group_window,)
+    assert len(grouped_calls) == 2
+    assert grouped_calls[0] == grouped_calls[1]
+    assert observed_candidates == [
+        (current_group_window,),
+        (current_group_window,),
+    ]
+    assert other_group_window not in observed_candidates[0]
+    assert safe_ungrouped_window not in observed_candidates[0]
 
 
 def test_run_shuts_down_adapter_after_startup_failure(monkeypatch, tmp_path):

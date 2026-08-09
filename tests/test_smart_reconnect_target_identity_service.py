@@ -7,6 +7,12 @@ import pytest
 
 from core.window_registry import CharacterWindowRecord, WindowRegistry
 from domain.character import Character, CharacterImportance
+from core.smart_reconnect_authorization import (
+    ReconnectAuthorizationTarget,
+    ShortcutFileIdentity,
+    ShortcutSeal,
+)
+from core.window_instance import WindowInstanceToken
 from services.character_view_service import CharacterViewService
 from services.group_configuration_service import (
     GroupConfiguration,
@@ -33,10 +39,9 @@ class StaticShortcutResolver:
     def resolve(self, paths):
         self.calls += 1
         return {
-            Path(path).resolve(strict=False): self.values.get(
-                Path(path).resolve(strict=False)
-            )
+            resolved: self.values[resolved]
             for path in paths
+            if (resolved := Path(path).resolve(strict=False)) in self.values
         }
 
 
@@ -105,7 +110,15 @@ def make_record(
     )
 
 
-def make_service(tmp_path, groups, resolver, characters=None, records=None):
+def make_service(
+    tmp_path,
+    groups,
+    resolver,
+    characters=None,
+    records=None,
+    ungrouped_shortcut_provider=None,
+    ungrouped_shortcut_catalog_provider=None,
+):
     coordinator = IdentityDataTransactionCoordinator()
     registry = StaticRegistry(records or (make_record(),))
     character_view = CharacterViewService(
@@ -120,6 +133,10 @@ def make_service(tmp_path, groups, resolver, characters=None, records=None):
         registry,
         resolver,
         tmp_path / "smart_reconnect_targets.json",
+        ungrouped_shortcut_provider=ungrouped_shortcut_provider,
+        ungrouped_shortcut_catalog_provider=(
+            ungrouped_shortcut_catalog_provider
+        ),
     )
 
 
@@ -366,7 +383,7 @@ def test_incomplete_resolver_result_is_retried_instead_of_cached(tmp_path):
     assert resolver.calls == 2
 
 
-def test_same_complete_alias_blocks_every_fingerprint_for_both_characters(
+def test_same_complete_alias_keeps_targets_but_remains_in_ambiguity_catalog(
     tmp_path,
 ):
     first = tmp_path / "one.lnk"
@@ -401,11 +418,15 @@ def test_same_complete_alias_blocks_every_fingerprint_for_both_characters(
         ),
     )
 
-    assert service.target_for(FINGERPRINT) is None
-    assert service.target_for(OTHER_FINGERPRINT) is None
+    assert service.target_for(FINGERPRINT) is not None
+    assert service.target_for(OTHER_FINGERPRINT) is not None
+    assert (
+        "完整共用別名",
+        "character-1",
+    ) in service.observed_identity_alias_catalog()
 
 
-def test_shared_three_character_alias_prefix_blocks_both_characters(tmp_path):
+def test_shared_three_character_alias_prefix_keeps_both_full_targets(tmp_path):
     first = tmp_path / "one.lnk"
     second = tmp_path / "two.lnk"
     resolver = StaticShortcutResolver(
@@ -438,11 +459,13 @@ def test_shared_three_character_alias_prefix_blocks_both_characters(tmp_path):
         ),
     )
 
-    assert service.target_for(FINGERPRINT) is None
-    assert service.target_for(OTHER_FINGERPRINT) is None
+    assert service.target_for(FINGERPRINT) is not None
+    assert service.target_for(OTHER_FINGERPRINT) is not None
 
 
-def test_same_character_across_fingerprints_rejects_the_whole_batch(tmp_path):
+def test_same_character_conflict_isolated_only_when_both_windows_are_requested(
+    tmp_path,
+):
     first = tmp_path / "one.lnk"
     second = tmp_path / "two.lnk"
     resolver = StaticShortcutResolver(
@@ -462,8 +485,70 @@ def test_same_character_across_fingerprints_rejects_the_whole_batch(tmp_path):
         resolver,
     )
 
+    assert service.target_for(FINGERPRINT) is not None
+    assert service.target_for(OTHER_FINGERPRINT) is not None
+    resolved = service.coordinator.snapshot(
+        lambda: service.targets_for_fingerprints_in_snapshot(
+            (FINGERPRINT, OTHER_FINGERPRINT)
+        )
+    )
+    assert resolved == ()
+
+
+def test_group_label_never_decides_actual_window_eligibility(tmp_path):
+    shortcut = tmp_path / "role.lnk"
+    resolver = StaticShortcutResolver({shortcut.resolve(): FINGERPRINT})
+    service = make_service(
+        tmp_path,
+        (make_group("one", (make_entry(shortcut),)),),
+        resolver,
+        records=(replace(make_record(), group="另一組"),),
+    )
+
+    assert service.target_for(FINGERPRINT) is not None
+
+
+def test_first_ungrouped_window_uses_only_unique_exact_shortcut_name(tmp_path):
+    shortcut = tmp_path / "登記主號.lnk"
+    resolver = StaticShortcutResolver({shortcut.resolve(): FINGERPRINT})
+    service = make_service(
+        tmp_path,
+        (),
+        resolver,
+        ungrouped_shortcut_provider=lambda fingerprint: (
+            shortcut if fingerprint == FINGERPRINT else None
+        ),
+    )
+
+    target = service.target_for(FINGERPRINT)
+
+    assert target is not None
+    assert target.character_id == CHARACTER_ID
+    assert target.shortcut_path == shortcut.resolve()
+    assert target.original_slot_index is None
+    assert target.original_line_number is None
+
+
+def test_ungrouped_shortcut_name_never_guesses_between_exact_aliases(tmp_path):
+    shortcut = tmp_path / "完整共用別名.lnk"
+    resolver = StaticShortcutResolver({shortcut.resolve(): FINGERPRINT})
+    service = make_service(
+        tmp_path,
+        (),
+        resolver,
+        characters=(make_character(), make_character("character-2", "次要角色")),
+        records=(
+            make_record(aliases=("完整共用別名",)),
+            make_record(
+                "character-2",
+                "次要角色",
+                aliases=("完整共用別名",),
+            ),
+        ),
+        ungrouped_shortcut_provider=lambda _fingerprint: shortcut,
+    )
+
     assert service.target_for(FINGERPRINT) is None
-    assert service.target_for(OTHER_FINGERPRINT) is None
 
 
 def test_distinct_aliases_keep_both_character_targets_available(tmp_path):
@@ -642,3 +727,160 @@ def test_target_state_has_no_direct_persist_or_replace_path():
     assert "os.replace" not in source
     assert "transaction.stage_file(" in source
     assert "transaction.stage_memory(" in source
+
+
+def test_group_and_desktop_paths_with_same_fingerprint_isolate_only_target(
+    tmp_path,
+):
+    conflicted = tmp_path / "group-role.lnk"
+    desktop_duplicate = tmp_path / "desktop-role.lnk"
+    sibling = tmp_path / "sibling-role.lnk"
+    resolver = StaticShortcutResolver(
+        {
+            conflicted.resolve(): FINGERPRINT,
+            desktop_duplicate.resolve(): FINGERPRINT,
+            sibling.resolve(): OTHER_FINGERPRINT,
+        }
+    )
+    service = make_service(
+        tmp_path,
+        (
+            make_group(
+                "all",
+                (
+                    make_entry(conflicted),
+                    make_entry(
+                        sibling,
+                        entry_id="character-2",
+                        role_id="SiblingRole",
+                    ),
+                ),
+            ),
+        ),
+        resolver,
+        characters=(
+            make_character(),
+            make_character("character-2", "SiblingRole"),
+        ),
+        records=(
+            make_record(),
+            make_record(
+                "character-2",
+                "SiblingRole",
+                aliases=("SiblingRole",),
+            ),
+        ),
+        ungrouped_shortcut_catalog_provider=lambda: (
+            desktop_duplicate,
+        ),
+    )
+
+    assert service.target_for(FINGERPRINT) is None
+    assert service.target_for(OTHER_FINGERPRINT) is not None
+
+
+def test_fourteen_group_entries_with_one_unopened_bad_shortcut_keep_five_targets(
+    tmp_path,
+):
+    paths = tuple(tmp_path / f"role-{index}.lnk" for index in range(14))
+    fingerprints = tuple(f"{index + 1:064x}" for index in range(14))
+    resolver_values = {
+        path.resolve(): fingerprint
+        for path, fingerprint in zip(paths, fingerprints)
+    }
+    resolver_values.pop(paths[9].resolve())
+    entries = tuple(
+        make_entry(
+            path,
+            entry_id=f"character-{index}",
+            role_id=f"Role{index}",
+        )
+        for index, path in enumerate(paths)
+    )
+    characters = tuple(
+        make_character(f"character-{index}", f"Role{index}")
+        for index in range(14)
+    )
+    records = tuple(
+        make_record(
+            f"character-{index}",
+            f"Role{index}",
+            aliases=(f"Role{index}",),
+        )
+        for index in range(14)
+    )
+    service = make_service(
+        tmp_path,
+        (make_group("fourteen", entries),),
+        StaticShortcutResolver(resolver_values),
+        characters=characters,
+        records=records,
+    )
+
+    targets = service.coordinator.snapshot(
+        lambda: service.targets_for_fingerprints_in_snapshot(
+            fingerprints[:5]
+        )
+    )
+
+    assert len(targets) == 5
+    assert {target.fingerprint for target in targets} == set(
+        fingerprints[:5]
+    )
+
+
+def test_absent_ungrouped_target_ignores_ordinary_desktop_shortcut(
+    tmp_path,
+):
+    shortcut = tmp_path / "主要角色.lnk"
+    ordinary = tmp_path / "ordinary-tool.lnk"
+    resolver = StaticShortcutResolver(
+        {shortcut.resolve(): FINGERPRINT}
+    )
+    service = make_service(
+        tmp_path,
+        (),
+        resolver,
+        characters=(make_character(display_name="主要角色"),),
+        records=(
+            make_record(
+                display_name="主要角色",
+                aliases=("主要角色",),
+            ),
+        ),
+        ungrouped_shortcut_provider=lambda _fingerprint: shortcut,
+        ungrouped_shortcut_catalog_provider=lambda: (
+            shortcut,
+            ordinary,
+        ),
+    )
+    identity = service.target_for(FINGERPRINT)
+    assert identity is not None
+    authorization_target = ReconnectAuthorizationTarget(
+        fingerprint=FINGERPRINT,
+        instance=WindowInstanceToken(
+            1,
+            2,
+            3,
+            "ShockwaveFlash",
+            (0, 0, 100, 100),
+            False,
+            4,
+        ),
+        character_id=identity.character_id,
+        role_aliases=identity.role_aliases,
+        importance=identity.importance,
+        original_slot_index=identity.original_slot_index,
+        original_line_number=identity.original_line_number,
+        shortcut_seal=ShortcutSeal(
+            ShortcutFileIdentity(shortcut, 1, 2),
+            "c" * 64,
+            FINGERPRINT,
+        ),
+    )
+
+    assert service.coordinator.snapshot(
+        lambda: service.retained_target_is_current_in_snapshot(
+            authorization_target
+        )
+    ) is True

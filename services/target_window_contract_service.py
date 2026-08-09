@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
 from adapters.windows_window import WindowBackend, WindowInfo
 from core.target_window_contract import (
+    ActualWindowContract,
+    ActualWindowSnapshot,
     TargetWindowContract,
     TargetWindowPhase,
     TargetWindowSnapshot,
 )
+from core.window_instance import WindowInstanceToken
 from core.window_registry import WindowRegistry
 from services.group_configuration_service import (
     GroupConfigurationEntry,
@@ -26,6 +30,9 @@ class ResolvedTargetWindows:
     windows: tuple[WindowInfo, ...]
     failure_codes: tuple[str, ...] = ()
     blocked_fingerprints: frozenset[str] = frozenset()
+    isolated_window_count: int = 0
+    anonymous_isolated_window_count: int = 0
+    actual_window_snapshot: bool = False
 
 
 class TargetWindowContractService:
@@ -266,6 +273,118 @@ class TargetWindowContractService:
             self._safe_windows(snapshot),
             tuple(dict.fromkeys(failures)),
             blocked_fingerprints,
+        )
+
+    def actual_snapshot(self) -> ActualWindowSnapshot:
+        """Enumerate every existing game window without consulting a group."""
+
+        try:
+            candidates = tuple(
+                window
+                for window in self._window_backend.list_windows()
+                if all(
+                    keyword in window.title.casefold()
+                    for keyword in self._title_keywords
+                )
+            )
+        except Exception:
+            return ActualWindowSnapshot(
+                ActualWindowSnapshot.SCHEMA_VERSION,
+                failure_codes=("window_enumeration_failed",),
+            )
+
+        parsed: list[tuple[WindowInfo, str, WindowInstanceToken]] = []
+        blocked: set[str] = set()
+        anonymous_isolated = 0
+        isolated_count = 0
+        for window in candidates:
+            fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+            if fingerprint is None:
+                anonymous_isolated += 1
+                isolated_count += 1
+                continue
+            instance = WindowInstanceToken.from_window(window)
+            if instance is None:
+                blocked.add(fingerprint)
+                isolated_count += 1
+                continue
+            parsed.append((window, fingerprint, instance))
+
+        handle_counts = Counter(
+            window.handle
+            for window in candidates
+            if isinstance(window.handle, int)
+            and not isinstance(window.handle, bool)
+            and window.handle > 0
+        )
+        process_counts = Counter(
+            window.process_id
+            for window in candidates
+            if isinstance(window.process_id, int)
+            and not isinstance(window.process_id, bool)
+            and window.process_id > 0
+        )
+        fingerprint_counts = Counter(
+            fingerprint for _, fingerprint, _ in parsed
+        )
+        targets: list[ActualWindowContract] = []
+        for window, fingerprint, instance in parsed:
+            if (
+                fingerprint in blocked
+                or handle_counts[instance.handle] != 1
+                or process_counts[instance.process_id] != 1
+                or fingerprint_counts[fingerprint] != 1
+            ):
+                blocked.add(fingerprint)
+                isolated_count += 1
+                continue
+            targets.append(
+                ActualWindowContract(
+                    fingerprint=fingerprint,
+                    instance=instance,
+                    visible=bool(window.visible),
+                )
+            )
+        return ActualWindowSnapshot(
+            ActualWindowSnapshot.SCHEMA_VERSION,
+            targets=tuple(targets),
+            blocked_fingerprints=frozenset(blocked),
+            isolated_window_count=isolated_count,
+            anonymous_isolated_window_count=anonymous_isolated,
+        )
+
+    def actual_reconnect_targets(self) -> ResolvedTargetWindows:
+        """Return only safe actual windows plus per-window isolation evidence."""
+
+        snapshot = self.actual_snapshot()
+        windows = tuple(
+            WindowInfo(
+                handle=target.instance.handle,
+                title="",
+                visible=target.visible,
+                minimized=target.instance.minimized,
+                rect=target.instance.rect,
+                process_id=target.instance.process_id,
+                launch_fingerprint=target.fingerprint,
+                thread_id=target.instance.thread_id,
+                window_class=target.instance.window_class,
+                process_lifecycle_token=(
+                    target.instance.process_lifecycle_token
+                ),
+            )
+            for target in snapshot.targets
+        )
+        return ResolvedTargetWindows(
+            windows=windows,
+            failure_codes=snapshot.failure_codes,
+            blocked_fingerprints=snapshot.blocked_fingerprints,
+            isolated_window_count=snapshot.isolated_window_count,
+            anonymous_isolated_window_count=(
+                snapshot.anonymous_isolated_window_count
+            ),
+            actual_window_snapshot=True,
         )
 
     @staticmethod
