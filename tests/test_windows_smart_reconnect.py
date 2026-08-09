@@ -1520,6 +1520,7 @@ class FakeAuthorizationPreparation:
 
     def prepare(self, *, launch_mode, retained_targets=()):
         assert launch_mode is ReconnectLaunchMode.IDENTITY_BOUND
+        preparation_token = self.authorization_coordinator.begin_reprepare()
         source = replace(
             self._source,
             identity_generation=self._generation,
@@ -1541,7 +1542,8 @@ class FakeAuthorizationPreparation:
                 if target.fingerprint not in current_fingerprints
             ),
         )
-        return self.authorization_coordinator.publish(
+        return self.authorization_coordinator.publish_if_current(
+            preparation_token,
             source,
             launch_mode,
             targets,
@@ -1585,6 +1587,7 @@ class DynamicActualPreparation:
 
     def prepare(self, *, launch_mode, retained_targets=()):
         assert launch_mode is ReconnectLaunchMode.IDENTITY_BOUND
+        preparation_token = self.authorization_coordinator.begin_reprepare()
         resolved = self._target_windows_provider()
         if (
             not isinstance(resolved, ResolvedTargetWindows)
@@ -1634,7 +1637,8 @@ class DynamicActualPreparation:
                 if target.character_id is not None
             ),
         )
-        return self.authorization_coordinator.publish(
+        return self.authorization_coordinator.publish_if_current(
+            preparation_token,
             source,
             launch_mode,
             tuple(targets),

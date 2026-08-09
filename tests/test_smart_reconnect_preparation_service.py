@@ -1,5 +1,8 @@
 import json
+import multiprocessing
+import os
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +12,7 @@ import pytest
 from config.config_manager import ConfigManager
 from core.smart_reconnect_authorization import (
     ReconnectLaunchMode,
+    ReconnectRevocationReason,
     ShortcutFileIdentity,
     ShortcutSeal,
 )
@@ -32,14 +36,17 @@ from services.identity_data_transaction_coordinator import (
 from services.smart_reconnect_authorization_coordinator import (
     ReconnectAuthorizationMismatchError,
     ReconnectAuthorizationState,
+    ReconnectAuthorizationUnavailableError,
     SmartReconnectAuthorizationCoordinator,
 )
 from services.smart_reconnect_preparation_service import (
+    SmartReconnectPreparationError,
     SmartReconnectPreparationService,
 )
 from services.smart_reconnect_target_identity_service import (
     SmartReconnectTargetIdentityService,
 )
+from adapters.windows_window import Win32WindowBackend
 
 
 class StaticGroupService:
@@ -52,6 +59,15 @@ class StaticGroupService:
 
     def group(self, name):
         return self.group_value if name == self.group_value.name else None
+
+
+class CoordinatorBackedGroupService:
+    def __init__(self, coordinator, groups=()):
+        self.coordinator = coordinator
+        self._groups = tuple(groups)
+
+    def groups(self):
+        return self.coordinator.read_consistent(lambda: self._groups)
 
 
 class StaticRegistry(WindowRegistry):
@@ -234,13 +250,236 @@ def build_fixture(tmp_path, *, include_saved_state=True):
         characters=characters,
         group=group,
         group_service=group_service,
+        target_identity=target_identity,
         target_windows=target_windows,
         seals=seal_resolver,
         fingerprint_resolver=fingerprint_resolver,
         fingerprints=fingerprints,
         preparation=preparation,
+        config=config,
         state_path=state_path,
     )
+
+
+def _run_tk_preparation_lock_regression(work_dir, result_queue):
+    root = None
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        title = f"smart-reconnect-lock-{os.getpid()}"
+        root.title(title)
+        root.geometry("320x180+20+20")
+        root.update_idletasks()
+        root.update()
+
+        work_path = Path(work_dir)
+        shortcut = work_path / "tk-role.lnk"
+        shortcut.write_bytes(b"tk-shortcut")
+        resolved_shortcut = shortcut.resolve(strict=False)
+        fingerprint = "d" * 64
+        identity = IdentityDataTransactionCoordinator()
+        authorization = SmartReconnectAuthorizationCoordinator()
+        group_service = CoordinatorBackedGroupService(identity)
+        character = Character(
+            "tk-character",
+            "tk-role",
+            100,
+            CharacterImportance.PRIMARY,
+        )
+        record = CharacterWindowRecord(
+            character.character_id,
+            character.display_name,
+            aliases=("tk-role",),
+            role=character.importance.value,
+        )
+        registry = StaticRegistry((record,))
+        character_view = CharacterViewService(registry, (character,), identity)
+        backend = Win32WindowBackend()
+        provider_entered = threading.Event()
+        ui_read_started = threading.Event()
+        ui_read_done = threading.Event()
+        own_window_seen = threading.Event()
+        catalog_calls = {"value": 0}
+
+        def catalog():
+            catalog_calls["value"] += 1
+            if catalog_calls["value"] == 2:
+                provider_entered.set()
+                ui_read_started.wait()
+            windows = backend.list_windows()
+            if any(
+                window.process_id == os.getpid() and window.title == title
+                for window in windows
+            ):
+                own_window_seen.set()
+            return (shortcut,)
+
+        target_identity = SmartReconnectTargetIdentityService(
+            identity,
+            group_service,
+            character_view,
+            registry,
+            StaticFingerprintResolver({resolved_shortcut: fingerprint}),
+            work_path / "tk-target-state.json",
+            ungrouped_shortcut_provider=lambda _fingerprint: shortcut,
+            ungrouped_shortcut_catalog_provider=catalog,
+        )
+        target_windows = StaticTargetWindowService(
+            ActualWindowSnapshot(
+                ActualWindowSnapshot.SCHEMA_VERSION,
+                (
+                    ActualWindowContract(
+                        fingerprint=fingerprint,
+                        instance=WindowInstanceToken(
+                            handle=41,
+                            process_id=os.getpid(),
+                            thread_id=threading.get_native_id(),
+                            window_class="TkTopLevel",
+                            rect=(20, 20, 340, 200),
+                            minimized=False,
+                            process_lifecycle_token=1,
+                        ),
+                        visible=True,
+                    ),
+                ),
+            )
+        )
+        seal = ShortcutSeal(
+            ShortcutFileIdentity(
+                str(resolved_shortcut),
+                1,
+                1,
+            ),
+            "1" * 64,
+            fingerprint,
+        )
+        preparation = SmartReconnectPreparationService(
+            target_identity_service=target_identity,
+            target_window_contract_service=target_windows,
+            shortcut_seal_resolver=StaticSealResolver(
+                {resolved_shortcut: seal}
+            ),
+            authorization_coordinator=authorization,
+            identity_coordinator=identity,
+            config=ConfigManager(work_path / "tk-config" / "settings.json"),
+            product_launch_mode=ReconnectLaunchMode.IDENTITY_BOUND,
+        )
+        initial = preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
+        old_grant = initial.targets[0]
+        prepared = []
+        failures = []
+        old_grant_rejected = {"value": False}
+        heartbeats = {"value": 0}
+
+        def prepare_in_background():
+            try:
+                prepared.append(
+                    preparation.prepare(
+                        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+                    )
+                )
+            except Exception as error:
+                failures.append(repr(error))
+
+        worker = threading.Thread(target=prepare_in_background, daemon=True)
+        button = tk.Button(root, text="enable", command=worker.start)
+        button.pack()
+
+        def heartbeat():
+            heartbeats["value"] += 1
+            root.after(10, heartbeat)
+
+        def read_identity_when_external_started():
+            if not provider_entered.is_set():
+                root.after(5, read_identity_when_external_started)
+                return
+            old_grant_rejected["value"] = (
+                authorization.current_authorization() is None
+            )
+            try:
+                authorization.run_authorized(
+                    epoch=old_grant.authorization_epoch,
+                    batch_id=old_grant.authorization_id,
+                    source_generation=old_grant.source_generation,
+                    fingerprint=old_grant.fingerprint,
+                    character_id=old_grant.character_id,
+                    instance=old_grant.instance,
+                    callback=lambda current: current,
+                )
+            except ReconnectAuthorizationUnavailableError:
+                old_grant_rejected["value"] = (
+                    old_grant_rejected["value"] and True
+                )
+            else:
+                old_grant_rejected["value"] = False
+            ui_read_started.set()
+            group_service.groups()
+            ui_read_done.set()
+
+        root.after(0, heartbeat)
+        root.after(0, read_identity_when_external_started)
+        button.invoke()
+        deadline = time.monotonic() + 3.0
+        heartbeat_until = time.monotonic() + 1.0
+        while time.monotonic() < deadline and (
+            worker.is_alive() or time.monotonic() < heartbeat_until
+        ):
+            root.update()
+            time.sleep(0.002)
+        worker.join(0.2)
+        result_queue.put(
+            {
+                "worker_alive": worker.is_alive(),
+                "prepared": len(prepared),
+                "failures": failures,
+                "ui_read_done": ui_read_done.is_set(),
+                "heartbeats": heartbeats["value"],
+                "own_window_seen": own_window_seen.is_set(),
+                "old_grant_rejected": old_grant_rejected["value"],
+                "catalog_calls": catalog_calls["value"],
+            }
+        )
+    except BaseException as error:
+        result_queue.put({"error": repr(error)})
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows Tk window")
+def test_tk_ui_identity_read_keeps_heartbeating_during_ungrouped_preparation(
+    tmp_path,
+):
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_run_tk_preparation_lock_regression,
+        args=(str(tmp_path), result_queue),
+    )
+    process.start()
+    process.join(10)
+    if process.is_alive():
+        process.terminate()
+        process.join(2)
+        pytest.fail("Tk UI and ungrouped preparation deadlocked")
+
+    assert process.exitcode == 0
+    result = result_queue.get(timeout=1)
+    assert "error" not in result
+    assert result["worker_alive"] is False
+    assert result["prepared"] == 1
+    assert result["failures"] == []
+    assert result["ui_read_done"] is True
+    assert result["heartbeats"] >= 20
+    assert result["own_window_seen"] is True
+    assert result["old_grant_rejected"] is True
+    assert result["catalog_calls"] == 2
 
 
 def test_prepare_publishes_complete_identity_bound_actual_window_batch(tmp_path):
@@ -480,60 +719,177 @@ def test_launch_mode_must_be_explicit_and_compatibility_can_be_requested(tmp_pat
     assert compatibility.launch_mode is ReconnectLaunchMode.COMPATIBILITY
 
 
-def test_identity_write_waits_for_snapshot_and_unchanged_grants_rebind(tmp_path):
+@pytest.mark.parametrize("changed_source", ("identity", "config"))
+def test_source_write_does_not_wait_for_external_preparation_and_fails_stale(
+    tmp_path,
+    monkeypatch,
+    changed_source,
+):
     fixture = build_fixture(tmp_path)
+    initial = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+    old_grant = initial.targets[0]
     entered = threading.Event()
     release = threading.Event()
     write_done = threading.Event()
     fixture.target_windows.entered = entered
     fixture.target_windows.release = release
     prepared = []
-    prepare_thread = threading.Thread(
-        target=lambda: prepared.append(
-            fixture.preparation.prepare(
-                launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    failures = []
+    publish_calls = []
+    original_publish = fixture.authorization.publish
+
+    def counted_publish(*args, **kwargs):
+        publish_calls.append((args, kwargs))
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(fixture.authorization, "publish", counted_publish)
+
+    def prepare_in_background():
+        try:
+            prepared.append(
+                fixture.preparation.prepare(
+                    launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+                )
             )
-        )
-    )
+        except Exception as error:
+            failures.append(error)
+
+    prepare_thread = threading.Thread(target=prepare_in_background)
     prepare_thread.start()
     assert entered.wait(2)
+    assert fixture.authorization.current_authorization() is None
+    with pytest.raises(ReconnectAuthorizationUnavailableError):
+        fixture.authorization.run_authorized(
+            epoch=old_grant.authorization_epoch,
+            batch_id=old_grant.authorization_id,
+            source_generation=old_grant.source_generation,
+            fingerprint=old_grant.fingerprint,
+            character_id=old_grant.character_id,
+            instance=old_grant.instance,
+            callback=lambda current: current,
+        )
     state = {"value": "before"}
 
-    def write_identity():
-        def prepare(transaction):
-            transaction.stage_memory(
-                IdentityDataResource.CHARACTER_DATA,
-                lambda: dict(state),
-                lambda: state.update(value="after"),
-                lambda original: state.update(original),
-            )
+    def write_source():
+        if changed_source == "identity":
+            def prepare(transaction):
+                transaction.stage_memory(
+                    IdentityDataResource.CHARACTER_DATA,
+                    lambda: dict(state),
+                    lambda: state.update(value="after"),
+                    lambda original: state.update(original),
+                )
 
-        fixture.identity.execute(prepare)
+            fixture.identity.execute(prepare)
+        else:
+            fixture.config.set("changed_during_preparation", True)
         write_done.set()
 
-    writer = threading.Thread(target=write_identity)
+    writer = threading.Thread(target=write_source)
     writer.start()
 
     assert fixture.authorization.state is ReconnectAuthorizationState.REBINDING
-    assert write_done.wait(0.05) is False
+    assert write_done.wait(0.5) is True
     release.set()
     prepare_thread.join(2)
     writer.join(2)
 
-    assert len(prepared) == 1
-    assert state == {"value": "after"}
-    assert fixture.identity.generation == 1
-    first = prepared[0]
-    assert fixture.authorization.current_authorization() is first
+    assert prepare_thread.is_alive() is False
+    assert writer.is_alive() is False
+    assert prepared == []
+    assert len(failures) == 1
+    assert isinstance(failures[0], SmartReconnectPreparationError)
+    assert "changed during preparation" in str(failures[0])
+    assert publish_calls == []
+    assert fixture.authorization.current_authorization() is None
+    assert fixture.authorization.state is ReconnectAuthorizationState.EMPTY
+    assert state == (
+        {"value": "after"}
+        if changed_source == "identity"
+        else {"value": "before"}
+    )
+    assert fixture.identity.generation == (1 if changed_source == "identity" else 0)
+    assert fixture.config.revision == (1 if changed_source == "config" else 0)
 
-    rebound = fixture.preparation.prepare(
+
+@pytest.mark.parametrize(
+    ("blocked_stage", "invalidation", "expected_reason"),
+    (
+        (
+            "source_capture",
+            "revoke",
+            ReconnectRevocationReason.EXPLICIT,
+        ),
+        (
+            "external_window_read",
+            "revoke_target",
+            ReconnectRevocationReason.SOURCE_CHANGED,
+        ),
+    ),
+)
+def test_revocation_invalidates_inflight_preparation_ticket(
+    tmp_path,
+    monkeypatch,
+    blocked_stage,
+    invalidation,
+    expected_reason,
+):
+    fixture = build_fixture(tmp_path)
+    initial = fixture.preparation.prepare(
         launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
     )
-    assert rebound.source.identity_generation == 1
-    assert tuple(
-        (target.authorization_epoch, target.authorization_id)
-        for target in rebound.targets
-    ) == tuple(
-        (target.authorization_epoch, target.authorization_id)
-        for target in first.targets
-    )
+    entered = threading.Event()
+    release = threading.Event()
+    failures = []
+
+    if blocked_stage == "source_capture":
+        original_capture = (
+            fixture.target_identity.capture_source_snapshot_in_current
+        )
+
+        def blocked_capture():
+            entered.set()
+            assert release.wait(2)
+            return original_capture()
+
+        monkeypatch.setattr(
+            fixture.target_identity,
+            "capture_source_snapshot_in_current",
+            blocked_capture,
+        )
+    else:
+        fixture.target_windows.entered = entered
+        fixture.target_windows.release = release
+
+    def prepare_in_background():
+        try:
+            fixture.preparation.prepare(
+                launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+            )
+        except Exception as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=prepare_in_background)
+    worker.start()
+    assert entered.wait(2)
+    assert fixture.authorization.state is ReconnectAuthorizationState.REBINDING
+    assert fixture.authorization.current_authorization() is None
+
+    if invalidation == "revoke":
+        fixture.authorization.revoke(ReconnectRevocationReason.EXPLICIT)
+    else:
+        assert fixture.authorization.revoke_target(
+            initial.targets[0].fingerprint,
+            ReconnectRevocationReason.SOURCE_CHANGED,
+        ) is False
+    release.set()
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert len(failures) == 1
+    assert isinstance(failures[0], SmartReconnectPreparationError)
+    assert fixture.authorization.current_authorization() is None
+    assert fixture.authorization.state is ReconnectAuthorizationState.EMPTY
+    assert fixture.authorization.last_revocation_reason is expected_reason

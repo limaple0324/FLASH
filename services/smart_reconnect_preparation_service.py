@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 from collections import Counter
 from pathlib import Path
+from threading import Lock
 from typing import Mapping
 
 from adapters.windows_shortcut_seal import ShortcutSealResolver
-from config.config_manager import ConfigManager, ConfigStateSnapshot
+from config.config_manager import ConfigManager
 from core.smart_reconnect_authorization import (
     ReconnectAuthorizationBatch,
     ReconnectAuthorizationTarget,
@@ -21,10 +22,12 @@ from services.identity_data_transaction_coordinator import (
     IdentityDataTransactionCoordinator,
 )
 from services.smart_reconnect_authorization_coordinator import (
+    ReconnectPreparationToken,
     SmartReconnectAuthorizationCoordinator,
 )
 from services.smart_reconnect_target_identity_service import (
     SmartReconnectTargetIdentity,
+    SmartReconnectTargetIdentitySourceSnapshot,
     SmartReconnectTargetIdentityService,
 )
 from services.target_window_contract_service import TargetWindowContractService
@@ -39,7 +42,7 @@ class SmartReconnectPreparationError(RuntimeError):
 
 
 class SmartReconnectPreparationService:
-    """Hold Config -> identity -> authorization in the one allowed order."""
+    """Snapshot briefly, verify externally, then publish under the lock order."""
 
     def __init__(
         self,
@@ -79,6 +82,7 @@ class SmartReconnectPreparationService:
         self._identity = identity_coordinator
         self._config = config
         self._product_launch_mode = product_launch_mode
+        self._prepare_lock = Lock()
 
     @property
     def authorization_coordinator(self) -> SmartReconnectAuthorizationCoordinator:
@@ -98,30 +102,27 @@ class SmartReconnectPreparationService:
         launch_mode: ReconnectLaunchMode,
         retained_targets: tuple[ReconnectAuthorizationTarget, ...] = (),
     ) -> ReconnectAuthorizationBatch:
-        """Publish only while Config and identity generations are still held."""
+        """Publish only if short pre/post snapshots prove the same source."""
         if not isinstance(launch_mode, ReconnectLaunchMode):
             raise TypeError("launch_mode must be explicitly supplied")
-        with self._config.resource_guard():
-            config_snapshot = self._config.snapshot_state_locked()
-            return self._identity.snapshot_with_generation(
-                lambda generation: self._prepare_locked(
-                    generation,
-                    config_snapshot,
-                    launch_mode,
-                    tuple(retained_targets),
-                )
+        with self._prepare_lock:
+            return self._prepare_serialized(
+                launch_mode,
+                tuple(retained_targets),
             )
 
-    def _prepare_locked(
+    def _prepare_serialized(
         self,
-        identity_generation: int,
-        config_snapshot: ConfigStateSnapshot,
         launch_mode: ReconnectLaunchMode,
         retained_targets: tuple[ReconnectAuthorizationTarget, ...],
     ) -> ReconnectAuthorizationBatch:
-        self._identity.require_consistent_snapshot_owner()
-        self._authorization.begin_reprepare()
+        preparation_token = self._authorization.begin_reprepare()
         try:
+            (
+                identity_generation,
+                config_revision,
+                identity_source,
+            ) = self._capture_source()
             window_snapshot = self._target_windows.actual_snapshot()
             if window_snapshot.failure_codes:
                 raise SmartReconnectPreparationError(
@@ -131,8 +132,10 @@ class SmartReconnectPreparationService:
                 target.fingerprint for target in window_snapshot.targets
             )
             identities = (
-                self._target_identity.targets_for_fingerprints_in_snapshot(
-                    fingerprints
+                self._target_identity
+                .targets_for_fingerprints_from_source_snapshot(
+                    fingerprints,
+                    identity_source,
                 )
             )
             seals = self._resolve_seals(identities)
@@ -145,11 +148,12 @@ class SmartReconnectPreparationService:
                 targets,
                 retained_targets,
                 window_snapshot,
+                identity_source,
             )
             targets = self._without_conflicting_targets(targets)
             source = ReconnectSourceIdentity(
                 identity_generation=identity_generation,
-                config_revision=config_snapshot.revision,
+                config_revision=config_revision,
                 group_id=_ACTUAL_WINDOW_SCOPE_ID,
                 group_name=_ACTUAL_WINDOW_SCOPE_NAME,
                 character_ids=tuple(
@@ -166,21 +170,87 @@ class SmartReconnectPreparationService:
                 frozenset(fingerprints)
                 - frozenset(target.fingerprint for target in targets)
             )
-            return self._authorization.publish(
-                source,
-                launch_mode,
-                targets,
-                isolated,
-                window_snapshot.isolated_window_count + len(newly_isolated),
-                window_snapshot.anonymous_isolated_window_count,
+            return self._publish_if_source_current(
+                preparation_token=preparation_token,
+                expected_identity_generation=identity_generation,
+                expected_config_revision=config_revision,
+                source=source,
+                launch_mode=launch_mode,
+                targets=targets,
+                isolated=isolated,
+                isolated_window_count=(
+                    window_snapshot.isolated_window_count
+                    + len(newly_isolated)
+                ),
+                anonymous_isolated_window_count=(
+                    window_snapshot.anonymous_isolated_window_count
+                ),
             )
         except Exception as error:
-            self._authorization.fail_preparation()
+            self._authorization.fail_preparation(preparation_token)
             if isinstance(error, SmartReconnectPreparationError):
                 raise
             raise SmartReconnectPreparationError(
                 "smart reconnect authorization preparation failed"
             ) from error
+
+    def _capture_source(
+        self,
+    ) -> tuple[
+        int,
+        int,
+        SmartReconnectTargetIdentitySourceSnapshot,
+    ]:
+        with self._config.resource_guard():
+            config_revision = self._config.snapshot_state_locked().revision
+
+            identity_snapshot = self._identity.capture_snapshot(
+                self._target_identity.capture_source_snapshot_in_current
+            )
+        return (
+            identity_snapshot.generation,
+            config_revision,
+            identity_snapshot.value,
+        )
+
+    def _publish_if_source_current(
+        self,
+        *,
+        preparation_token: ReconnectPreparationToken,
+        expected_identity_generation: int,
+        expected_config_revision: int,
+        source: ReconnectSourceIdentity,
+        launch_mode: ReconnectLaunchMode,
+        targets: tuple[ReconnectAuthorizationTarget, ...],
+        isolated: frozenset[str],
+        isolated_window_count: int,
+        anonymous_isolated_window_count: int,
+    ) -> ReconnectAuthorizationBatch:
+        with self._config.resource_guard():
+            current_config_revision = (
+                self._config.snapshot_state_locked().revision
+            )
+
+            def publish(current_identity_generation: int):
+                if (
+                    current_config_revision != expected_config_revision
+                    or current_identity_generation
+                    != expected_identity_generation
+                ):
+                    raise SmartReconnectPreparationError(
+                        "identity or configuration changed during preparation"
+                    )
+                return self._authorization.publish_if_current(
+                    preparation_token,
+                    source,
+                    launch_mode,
+                    targets,
+                    isolated,
+                    isolated_window_count,
+                    anonymous_isolated_window_count,
+                )
+
+            return self._identity.snapshot_with_generation(publish)
 
     def _resolve_seals(
         self,
@@ -251,6 +321,7 @@ class SmartReconnectPreparationService:
         current: tuple[ReconnectAuthorizationTarget, ...],
         retained: tuple[ReconnectAuthorizationTarget, ...],
         window_snapshot: ActualWindowSnapshot,
+        identity_source: SmartReconnectTargetIdentitySourceSnapshot,
     ) -> tuple[ReconnectAuthorizationTarget, ...]:
         actual = frozenset(target.fingerprint for target in window_snapshot.targets)
         blocked = window_snapshot.blocked_fingerprints
@@ -261,8 +332,10 @@ class SmartReconnectPreparationService:
                 not isinstance(target, ReconnectAuthorizationTarget)
                 or target.fingerprint in seen
                 or target.fingerprint in blocked
-                or not self._target_identity.retained_target_is_current_in_snapshot(
-                    target
+                or not self._target_identity
+                .retained_target_is_current_from_source_snapshot(
+                    target,
+                    identity_source,
                 )
             ):
                 continue

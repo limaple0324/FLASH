@@ -45,6 +45,37 @@ class StaticShortcutResolver:
         }
 
 
+class CoordinatorReadProbe:
+    def __init__(self):
+        self.coordinator = None
+        self.calls = 0
+
+    def assert_available(self):
+        assert self.coordinator is not None
+        completed = threading.Event()
+        reader = threading.Thread(
+            target=lambda: (
+                self.coordinator.read_consistent(lambda: None),
+                completed.set(),
+            )
+        )
+        reader.start()
+        assert completed.wait(0.5), "external evidence ran under identity lock"
+        reader.join(1)
+        assert reader.is_alive() is False
+        self.calls += 1
+
+
+class ProbedShortcutResolver(StaticShortcutResolver):
+    def __init__(self, values, probe):
+        super().__init__(values)
+        self.probe = probe
+
+    def resolve(self, paths):
+        self.probe.assert_available()
+        return super().resolve(paths)
+
+
 class StaticGroupConfigurationService:
     def __init__(self, coordinator, groups):
         self.coordinator = coordinator
@@ -138,6 +169,63 @@ def make_service(
             ungrouped_shortcut_catalog_provider
         ),
     )
+
+
+def test_public_target_reads_and_remember_resolve_outside_identity_lock(
+    tmp_path,
+):
+    shortcut = tmp_path / "role.lnk"
+    probe = CoordinatorReadProbe()
+    resolver = ProbedShortcutResolver(
+        {shortcut.resolve(): FINGERPRINT},
+        probe,
+    )
+    service = make_service(
+        tmp_path,
+        (make_group("one", (make_entry(shortcut),)),),
+        resolver,
+    )
+    probe.coordinator = service.coordinator
+
+    assert service.target_for(FINGERPRINT) is not None
+    assert len(service.targets_for_group("one")) == 1
+    assert service.remember_verified_slot(
+        FINGERPRINT,
+        CHARACTER_ID,
+        0,
+    ) is True
+    assert probe.calls >= 3
+
+
+def test_ungrouped_catalog_provider_and_resolver_run_outside_identity_lock(
+    tmp_path,
+):
+    shortcut = tmp_path / "登記主號.lnk"
+    probe = CoordinatorReadProbe()
+    resolver = ProbedShortcutResolver(
+        {shortcut.resolve(): FINGERPRINT},
+        probe,
+    )
+
+    def catalog():
+        probe.assert_available()
+        return (shortcut,)
+
+    def shortcut_for(_fingerprint):
+        probe.assert_available()
+        return shortcut
+
+    service = make_service(
+        tmp_path,
+        (),
+        resolver,
+        ungrouped_shortcut_provider=shortcut_for,
+        ungrouped_shortcut_catalog_provider=catalog,
+    )
+    probe.coordinator = service.coordinator
+
+    assert service.target_for(FINGERPRINT) is not None
+    assert probe.calls >= 4
 
 
 def test_duplicate_group_membership_collapses_to_one_stable_target(tmp_path):
@@ -487,10 +575,8 @@ def test_same_character_conflict_isolated_only_when_both_windows_are_requested(
 
     assert service.target_for(FINGERPRINT) is not None
     assert service.target_for(OTHER_FINGERPRINT) is not None
-    resolved = service.coordinator.snapshot(
-        lambda: service.targets_for_fingerprints_in_snapshot(
-            (FINGERPRINT, OTHER_FINGERPRINT)
-        )
+    resolved = service.targets_for_fingerprints(
+        (FINGERPRINT, OTHER_FINGERPRINT)
     )
     assert resolved == ()
 
@@ -817,11 +903,7 @@ def test_fourteen_group_entries_with_one_unopened_bad_shortcut_keep_five_targets
         records=records,
     )
 
-    targets = service.coordinator.snapshot(
-        lambda: service.targets_for_fingerprints_in_snapshot(
-            fingerprints[:5]
-        )
-    )
+    targets = service.targets_for_fingerprints(fingerprints[:5])
 
     assert len(targets) == 5
     assert {target.fingerprint for target in targets} == set(
@@ -879,8 +961,4 @@ def test_absent_ungrouped_target_ignores_ordinary_desktop_shortcut(
         ),
     )
 
-    assert service.coordinator.snapshot(
-        lambda: service.retained_target_is_current_in_snapshot(
-            authorization_target
-        )
-    ) is True
+    assert service.retained_target_is_current(authorization_target) is True

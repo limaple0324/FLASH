@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Callable, Iterable, Mapping
 
 from adapters.windows_launch_fingerprint import (
@@ -104,6 +105,19 @@ class _SavedTargetState:
     line_number: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class SmartReconnectTargetIdentitySourceSnapshot:
+    """Immutable identity-only input captured while the coordinator is held."""
+
+    groups: tuple[GroupConfiguration, ...]
+    characters: tuple[Character, ...]
+    records: tuple[CharacterWindowRecord, ...]
+    saved_targets: tuple[tuple[str, _SavedTargetState], ...]
+
+    def saved_by_fingerprint(self) -> dict[str, _SavedTargetState]:
+        return dict(self.saved_targets)
+
+
 class SmartReconnectTargetIdentityError(RuntimeError):
     """The complete identity source cannot form one unambiguous batch."""
 
@@ -165,6 +179,7 @@ class SmartReconnectTargetIdentityService:
         )
         self._state_path = Path(state_path)
         self._saved = self._coordinator.read_consistent(self._load_state_unlocked)
+        self._remember_lock = Lock()
 
     @property
     def coordinator(self) -> IdentityDataTransactionCoordinator:
@@ -178,42 +193,90 @@ class SmartReconnectTargetIdentityService:
         self,
         group_name: object,
     ) -> tuple[SmartReconnectTargetIdentity, ...]:
+        source = self._capture_source()
         try:
-            return self._coordinator.read_consistent(
-                lambda: self._build_targets_unlocked(group_name=group_name)
+            targets = self.targets_for_group_from_source_snapshot(
+                group_name,
+                source.value,
             )
         except SmartReconnectTargetIdentityError:
             return ()
-
-    def targets_for_group_in_snapshot(
-        self,
-        group_name: object,
-    ) -> tuple[SmartReconnectTargetIdentity, ...]:
-        self._coordinator.require_consistent_snapshot_owner()
-        return self._build_targets_unlocked(group_name=group_name)
+        return targets if self._source_is_current(source.generation) else ()
 
     def target_for(self, fingerprint: object) -> SmartReconnectTargetIdentity | None:
         normalized = normalize_launch_fingerprint(fingerprint)
         if normalized is None:
             return None
+        source = self._capture_source()
         try:
-            targets = self._coordinator.read_consistent(
-                lambda: self._build_requested_targets_unlocked((normalized,))
+            targets = self.targets_for_fingerprints_from_source_snapshot(
+                (normalized,),
+                source.value,
             )
         except SmartReconnectTargetIdentityError:
+            return None
+        if not self._source_is_current(source.generation):
             return None
         return next(
             (target for target in targets if target.fingerprint == normalized),
             None,
         )
 
-    def targets_for_fingerprints_in_snapshot(
+    def targets_for_fingerprints(
         self,
         fingerprints: Iterable[object],
     ) -> tuple[SmartReconnectTargetIdentity, ...]:
-        """Resolve each actual fingerprint independently in one source snapshot."""
+        """Resolve externally, then reject a result from a changed generation."""
+
+        source = self._capture_source()
+        targets = self.targets_for_fingerprints_from_source_snapshot(
+            fingerprints,
+            source.value,
+        )
+        return targets if self._source_is_current(source.generation) else ()
+
+    def _capture_source(self):
+        return self._coordinator.capture_snapshot(
+            self.capture_source_snapshot_in_current
+        )
+
+    def _source_is_current(self, expected_generation: int) -> bool:
+        return (
+            self._coordinator.capture_snapshot(lambda: None).generation
+            == expected_generation
+        )
+
+    def targets_for_group_from_source_snapshot(
+        self,
+        group_name: object,
+        source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> tuple[SmartReconnectTargetIdentity, ...]:
+        if not isinstance(source, SmartReconnectTargetIdentitySourceSnapshot):
+            raise TypeError("source must be a target identity source snapshot")
+        return self._build_targets_from_source(group_name, source)
+
+    def capture_source_snapshot_in_current(
+        self,
+    ) -> SmartReconnectTargetIdentitySourceSnapshot:
+        """Copy only in-memory identity data while owning a short snapshot."""
 
         self._coordinator.require_consistent_snapshot_owner()
+        return SmartReconnectTargetIdentitySourceSnapshot(
+            groups=tuple(self._configuration.groups()),
+            characters=tuple(self._character_view.character_profiles()),
+            records=tuple(self._registry.all()),
+            saved_targets=tuple(sorted(self._saved.items())),
+        )
+
+    def targets_for_fingerprints_from_source_snapshot(
+        self,
+        fingerprints: Iterable[object],
+        source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> tuple[SmartReconnectTargetIdentity, ...]:
+        """Resolve external shortcut evidence after releasing identity locks."""
+
+        if not isinstance(source, SmartReconnectTargetIdentitySourceSnapshot):
+            raise TypeError("source must be a target identity source snapshot")
         normalized = tuple(
             dict.fromkeys(
                 value
@@ -223,7 +286,7 @@ class SmartReconnectTargetIdentityService:
                 if value is not None
             )
         )
-        return self._build_requested_targets_unlocked(normalized)
+        return self._build_requested_targets_from_source(normalized, source)
 
     def observed_identity_alias_catalog(self) -> tuple[tuple[str, str], ...]:
         """Return reliable screen aliases without making them target gates."""
@@ -259,13 +322,26 @@ class SmartReconnectTargetIdentityService:
                     aliases.append((normalized, entry.entry_id))
         return tuple(dict.fromkeys(aliases))
 
-    def retained_target_is_current_in_snapshot(
+    def retained_target_is_current(
         self,
         target: ReconnectAuthorizationTarget,
     ) -> bool:
-        """Rebuild the absent target's unique source binding in this generation."""
+        source = self._capture_source()
+        is_current = self.retained_target_is_current_from_source_snapshot(
+            target,
+            source.value,
+        )
+        return is_current and self._source_is_current(source.generation)
 
-        self._coordinator.require_consistent_snapshot_owner()
+    def retained_target_is_current_from_source_snapshot(
+        self,
+        target: ReconnectAuthorizationTarget,
+        source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> bool:
+        """Recheck one absent target using copied identity and external evidence."""
+
+        if not isinstance(source, SmartReconnectTargetIdentitySourceSnapshot):
+            return False
         if (
             not isinstance(target, ReconnectAuthorizationTarget)
             or target.character_id is None
@@ -275,7 +351,8 @@ class SmartReconnectTargetIdentityService:
         path = Path(
             target.shortcut_seal.file_identity.normalized_path
         ).resolve(strict=False)
-        groups = tuple(self._configuration.groups())
+        groups = source.groups
+        saved_targets = source.saved_by_fingerprint()
         membership_paths = tuple(
             entry.shortcut_path.resolve(strict=False)
             for group in groups
@@ -318,9 +395,9 @@ class SmartReconnectTargetIdentityService:
             return False
 
         characters_by_id = self._items_by_character_id(
-            self._character_view.character_profiles()
+            source.characters
         )
-        records_by_id = self._items_by_character_id(self._registry.all())
+        records_by_id = self._items_by_character_id(source.records)
         memberships = tuple(
             (group, entry)
             for group in groups
@@ -338,6 +415,7 @@ class SmartReconnectTargetIdentityService:
                         entry,
                         characters_by_id,
                         records_by_id,
+                        saved_targets,
                     )
                 )
                 is not None
@@ -373,7 +451,7 @@ class SmartReconnectTargetIdentityService:
             if len(matches) != 1 or matches[0][0] != target.character_id:
                 return False
             character_id, character, record = matches[0]
-            saved = self._saved.get(target.fingerprint)
+            saved = saved_targets.get(target.fingerprint)
             if (
                 saved is not None
                 and saved.character_id != character_id
@@ -402,17 +480,18 @@ class SmartReconnectTargetIdentityService:
             and current.shortcut_path.resolve(strict=False) == path
         )
 
-    def _build_requested_targets_unlocked(
+    def _build_requested_targets_from_source(
         self,
         fingerprints: tuple[str, ...],
+        source: SmartReconnectTargetIdentitySourceSnapshot,
     ) -> tuple[SmartReconnectTargetIdentity, ...]:
-        self._coordinator.require_consistent_snapshot_owner()
         requested = frozenset(fingerprints)
         if not requested:
             return ()
-        groups = self._configuration.groups()
-        characters = self._character_view.character_profiles()
-        records = self._registry.all()
+        groups = source.groups
+        characters = source.characters
+        records = source.records
+        saved_targets = source.saved_by_fingerprint()
         characters_by_id = self._items_by_character_id(characters)
         records_by_id = self._items_by_character_id(records)
 
@@ -504,6 +583,7 @@ class SmartReconnectTargetIdentityService:
                             entry,
                             characters_by_id,
                             records_by_id,
+                            saved_targets,
                         )
                     except (OSError, RuntimeError, TypeError, ValueError):
                         continue
@@ -518,6 +598,7 @@ class SmartReconnectTargetIdentityService:
                 fingerprint,
                 characters_by_id,
                 records_by_id,
+                saved_targets,
             )
             if target is not None:
                 candidates[fingerprint] = target
@@ -550,6 +631,7 @@ class SmartReconnectTargetIdentityService:
         entry: GroupConfigurationEntry,
         characters_by_id: Mapping[str, tuple[object, ...]],
         records_by_id: Mapping[str, tuple[object, ...]],
+        saved_targets: Mapping[str, _SavedTargetState],
     ) -> SmartReconnectTargetIdentity | None:
         characters = characters_by_id.get(entry.entry_id, ())
         records = records_by_id.get(entry.entry_id, ())
@@ -566,7 +648,7 @@ class SmartReconnectTargetIdentityService:
         aliases = self._aliases(character, record, entry.role_id)
         if not aliases:
             return None
-        saved = self._saved.get(fingerprint)
+        saved = saved_targets.get(fingerprint)
         return SmartReconnectTargetIdentity(
             fingerprint=fingerprint,
             character_id=entry.entry_id,
@@ -590,6 +672,7 @@ class SmartReconnectTargetIdentityService:
         fingerprint: str,
         characters_by_id: Mapping[str, tuple[object, ...]],
         records_by_id: Mapping[str, tuple[object, ...]],
+        saved_targets: Mapping[str, _SavedTargetState],
     ) -> SmartReconnectTargetIdentity | None:
         provider = self._ungrouped_shortcut_provider
         if provider is None:
@@ -613,7 +696,7 @@ class SmartReconnectTargetIdentityService:
             or normalize_launch_fingerprint(resolved.get(path)) != fingerprint
         ):
             return None
-        saved = self._saved.get(fingerprint)
+        saved = saved_targets.get(fingerprint)
         shortcut_identity = normalize_identity_alias(path.stem)
         matches: list[SmartReconnectTargetIdentity] = []
         for character_id, characters in characters_by_id.items():
@@ -669,13 +752,16 @@ class SmartReconnectTargetIdentityService:
             )
         )
 
-    def _build_targets_unlocked(
+    def _build_targets_from_source(
         self,
-        *,
         group_name: object | None,
+        source: SmartReconnectTargetIdentitySourceSnapshot,
     ) -> tuple[SmartReconnectTargetIdentity, ...]:
-        self._coordinator.require_consistent_snapshot_owner()
-        groups = self._selected_groups(group_name)
+        groups = self._selected_groups_from_source(
+            group_name,
+            source.groups,
+        )
+        saved_targets = source.saved_by_fingerprint()
         entries = tuple(
             (group, entry)
             for group in groups
@@ -708,8 +794,8 @@ class SmartReconnectTargetIdentityService:
                 "shortcut fingerprint batch is incomplete"
             )
 
-        characters = self._character_view.character_profiles()
-        records = self._registry.all()
+        characters = source.characters
+        records = source.records
         characters_by_id = self._unique_characters(characters)
         records_by_id = self._unique_records(records)
         targets: list[SmartReconnectTargetIdentity] = []
@@ -757,7 +843,7 @@ class SmartReconnectTargetIdentityService:
             if membership in exact_memberships and group_name is None:
                 continue
             exact_memberships.add(membership)
-            saved = self._saved.get(fingerprint)
+            saved = saved_targets.get(fingerprint)
             slot_index = None
             line_number = None
             if saved is not None and saved.character_id == entry.entry_id:
@@ -777,11 +863,11 @@ class SmartReconnectTargetIdentityService:
         self._validate_complete_batch(tuple(targets))
         return tuple(targets)
 
-    def _selected_groups(
-        self,
+    @staticmethod
+    def _selected_groups_from_source(
         group_name: object | None,
+        groups: tuple[GroupConfiguration, ...],
     ) -> tuple[GroupConfiguration, ...]:
-        groups = self._configuration.groups()
         if group_name is None:
             selected = groups
         elif isinstance(group_name, str) and group_name.strip():
@@ -887,6 +973,22 @@ class SmartReconnectTargetIdentityService:
         slot_index: int | None = None,
         line_number: int | None = None,
     ) -> bool:
+        with self._remember_lock:
+            return self._remember_serialized(
+                fingerprint,
+                character_id,
+                slot_index=slot_index,
+                line_number=line_number,
+            )
+
+    def _remember_serialized(
+        self,
+        fingerprint: object,
+        character_id: object,
+        *,
+        slot_index: int | None = None,
+        line_number: int | None = None,
+    ) -> bool:
         normalized = normalize_launch_fingerprint(fingerprint)
         if (
             normalized is None
@@ -895,13 +997,33 @@ class SmartReconnectTargetIdentityService:
         ):
             return False
 
-        def prepare(transaction: IdentityDataTransaction) -> bool:
-            targets = self._build_requested_targets_unlocked((normalized,))
-            target = next(
-                (item for item in targets if item.fingerprint == normalized),
-                None,
+        try:
+            source = self._capture_source()
+            targets = self.targets_for_fingerprints_from_source_snapshot(
+                (normalized,),
+                source.value,
             )
-            if target is None or target.character_id != character_id.strip():
+        except (
+            IdentityTransactionError,
+            OSError,
+            SmartReconnectTargetIdentityError,
+            TypeError,
+            ValueError,
+        ):
+            return False
+        target = next(
+            (item for item in targets if item.fingerprint == normalized),
+            None,
+        )
+        if target is None or target.character_id != character_id.strip():
+            return False
+
+        def prepare(transaction: IdentityDataTransaction) -> bool:
+            if (
+                self._coordinator.generation != source.generation
+                or tuple(sorted(self._saved.items()))
+                != source.value.saved_targets
+            ):
                 return False
             current = self._saved.get(
                 target.fingerprint,
@@ -1050,6 +1172,7 @@ class SmartReconnectTargetIdentityService:
 __all__ = [
     "SmartReconnectTargetIdentity",
     "SmartReconnectTargetIdentityError",
+    "SmartReconnectTargetIdentitySourceSnapshot",
     "SmartReconnectTargetIdentityService",
     "normalize_reconnect_role_alias",
 ]

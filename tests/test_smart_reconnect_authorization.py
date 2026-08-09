@@ -20,6 +20,7 @@ from services.smart_reconnect_authorization_coordinator import (
     ReconnectAuthorizationMismatchError,
     ReconnectAuthorizationState,
     ReconnectAuthorizationUnavailableError,
+    ReconnectPreparationToken,
     SmartReconnectAuthorizationCoordinator,
 )
 
@@ -375,7 +376,7 @@ def test_rebinding_has_zero_authorization_and_full_publish_gets_new_epoch(tmp_pa
         (target,),
     )
 
-    coordinator.begin_reprepare()
+    preparation_token = coordinator.begin_reprepare()
 
     assert coordinator.state is ReconnectAuthorizationState.REBINDING
     assert coordinator.current_authorization() is None
@@ -383,6 +384,7 @@ def test_rebinding_has_zero_authorization_and_full_publish_gets_new_epoch(tmp_pa
         make_source(target),
         ReconnectLaunchMode.IDENTITY_BOUND,
         (target,),
+        preparation_token=preparation_token,
     )
     assert second.epoch == first.epoch + 1
     assert second.batch_id != first.batch_id
@@ -390,6 +392,102 @@ def test_rebinding_has_zero_authorization_and_full_publish_gets_new_epoch(tmp_pa
         second,
         second.targets[0],
     ) == ReconnectActionContext.from_batch_target(first, first.targets[0])
+
+
+def test_explicit_revoke_invalidates_preparation_token_and_blocks_late_publish(
+    tmp_path,
+):
+    coordinator = SmartReconnectAuthorizationCoordinator()
+    target = make_target(tmp_path)
+    first = coordinator.publish(
+        make_source(target),
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (target,),
+    )
+    preparation_token = coordinator.begin_reprepare()
+
+    coordinator.revoke(ReconnectRevocationReason.EXPLICIT)
+
+    with pytest.raises(
+        ReconnectAuthorizationMismatchError,
+        match="token",
+    ):
+        coordinator.publish_if_current(
+            preparation_token,
+            make_source(target),
+            ReconnectLaunchMode.IDENTITY_BOUND,
+            (target,),
+        )
+    assert coordinator.current_authorization() is None
+    assert coordinator.state is ReconnectAuthorizationState.EMPTY
+    assert coordinator.epoch == first.epoch
+    assert (
+        coordinator.last_revocation_reason
+        is ReconnectRevocationReason.EXPLICIT
+    )
+
+
+def test_new_preparation_token_rejects_old_and_missing_without_losing_new(
+    tmp_path,
+):
+    coordinator = SmartReconnectAuthorizationCoordinator()
+    target = make_target(tmp_path)
+    old_token = coordinator.begin_reprepare()
+    current_token = coordinator.begin_reprepare()
+
+    with pytest.raises(ReconnectAuthorizationMismatchError, match="token"):
+        coordinator.publish_if_current(
+            old_token,
+            make_source(target),
+            ReconnectLaunchMode.IDENTITY_BOUND,
+            (target,),
+        )
+    with pytest.raises(ReconnectAuthorizationMismatchError, match="token"):
+        coordinator.publish(
+            make_source(target),
+            ReconnectLaunchMode.IDENTITY_BOUND,
+            (target,),
+        )
+
+    published = coordinator.publish_if_current(
+        current_token,
+        make_source(target),
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (target,),
+    )
+    assert coordinator.current_authorization() is published
+
+
+def test_preparation_token_rejects_equal_serial_from_other_or_caller(
+    tmp_path,
+):
+    coordinator = SmartReconnectAuthorizationCoordinator()
+    other_coordinator = SmartReconnectAuthorizationCoordinator()
+    target = make_target(tmp_path)
+    current_token = coordinator.begin_reprepare()
+    foreign_token = other_coordinator.begin_reprepare()
+    forged_token = ReconnectPreparationToken(current_token.serial)
+    assert foreign_token.serial == current_token.serial
+    assert forged_token.serial == current_token.serial
+
+    for untrusted_token in (foreign_token, forged_token):
+        with pytest.raises(ReconnectAuthorizationMismatchError, match="token"):
+            coordinator.publish_if_current(
+                untrusted_token,
+                make_source(target),
+                ReconnectLaunchMode.IDENTITY_BOUND,
+                (target,),
+            )
+        assert coordinator.state is ReconnectAuthorizationState.REBINDING
+        assert coordinator.current_authorization() is None
+
+    published = coordinator.publish_if_current(
+        current_token,
+        make_source(target),
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (target,),
+    )
+    assert coordinator.current_authorization() is published
 
 
 def test_run_authorized_holds_lock_until_callback_returns(tmp_path):
@@ -508,11 +606,12 @@ def test_rebind_preserves_unchanged_grants_and_changes_only_changed_target(
         for target in initial.targets
     }
     changed_second = replace(second, instance=make_instance(9))
-    coordinator.begin_reprepare()
+    preparation_token = coordinator.begin_reprepare()
     rebound = coordinator.publish(
         make_source(first, changed_second),
         ReconnectLaunchMode.IDENTITY_BOUND,
         (first, changed_second),
+        preparation_token=preparation_token,
     )
 
     unchanged = rebound.target_for(first.fingerprint)
@@ -604,11 +703,12 @@ def test_continuous_session_never_adopts_changed_shortcut_seal(tmp_path):
         ),
     )
 
-    coordinator.begin_reprepare()
+    preparation_token = coordinator.begin_reprepare()
     isolated = coordinator.publish(
         make_source(changed),
         ReconnectLaunchMode.IDENTITY_BOUND,
         (changed,),
+        preparation_token=preparation_token,
     )
 
     assert isolated.targets == ()

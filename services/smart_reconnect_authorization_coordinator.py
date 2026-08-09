@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, TypeVar
 from uuid import uuid4
@@ -41,6 +41,11 @@ class ReconnectAuthorizationMismatchError(ReconnectAuthorizationError):
     """Raised when a caller presents stale or different source evidence."""
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class ReconnectPreparationToken:
+    serial: int
+
+
 class SmartReconnectAuthorizationCoordinator:
     """One startup-owned lock around a complete authorization epoch.
 
@@ -57,6 +62,8 @@ class SmartReconnectAuthorizationCoordinator:
         self._shortcut_seal_baselines: dict[str, ShortcutSeal] = {}
         self._target_source_generations: dict[str, int] = {}
         self._last_revocation_reason: ReconnectRevocationReason | None = None
+        self._preparation_serial = 0
+        self._active_preparation_token: ReconnectPreparationToken | None = None
 
     @property
     def state(self) -> ReconnectAuthorizationState:
@@ -79,14 +86,18 @@ class SmartReconnectAuthorizationCoordinator:
                 return None
             return self._current
 
-    def begin_reprepare(self) -> None:
+    def begin_reprepare(self) -> ReconnectPreparationToken:
         with self._lock:
             self._require_not_stopped()
+            self._preparation_serial += 1
+            token = ReconnectPreparationToken(self._preparation_serial)
+            self._active_preparation_token = token
             if self._state is ReconnectAuthorizationState.ACTIVE:
                 self._rebinding_base = self._current
             self._current = None
             self._state = ReconnectAuthorizationState.REBINDING
             self._last_revocation_reason = ReconnectRevocationReason.REPREPARE
+            return token
 
     def publish(
         self,
@@ -96,10 +107,26 @@ class SmartReconnectAuthorizationCoordinator:
         isolated_fingerprints: frozenset[str] = frozenset(),
         isolated_window_count: int | None = None,
         anonymous_isolated_window_count: int = 0,
+        *,
+        preparation_token: ReconnectPreparationToken | None = None,
     ) -> ReconnectAuthorizationBatch:
         """Publish one immutable collection while preserving unchanged grants."""
         with self._lock:
             self._require_not_stopped()
+            if self._state is ReconnectAuthorizationState.REBINDING and (
+                preparation_token is None
+                or preparation_token is not self._active_preparation_token
+            ):
+                raise ReconnectAuthorizationMismatchError(
+                    "reconnect preparation token is missing or stale"
+                )
+            if (
+                preparation_token is not None
+                and preparation_token is not self._active_preparation_token
+            ):
+                raise ReconnectAuthorizationMismatchError(
+                    "reconnect preparation token is stale"
+                )
             base = (
                 self._rebinding_base
                 if self._state is ReconnectAuthorizationState.REBINDING
@@ -173,6 +200,8 @@ class SmartReconnectAuthorizationCoordinator:
                     ),
                 )
             except BaseException:
+                if preparation_token is self._active_preparation_token:
+                    self._active_preparation_token = None
                 self._rebinding_base = None
                 self._state = ReconnectAuthorizationState.EMPTY
                 self._last_revocation_reason = (
@@ -196,9 +225,31 @@ class SmartReconnectAuthorizationCoordinator:
                         target.shortcut_seal,
                     )
             self._rebinding_base = None
+            if preparation_token is self._active_preparation_token:
+                self._active_preparation_token = None
             self._state = ReconnectAuthorizationState.ACTIVE
             self._last_revocation_reason = None
             return batch
+
+    def publish_if_current(
+        self,
+        preparation_token: ReconnectPreparationToken,
+        source: ReconnectSourceIdentity,
+        launch_mode: ReconnectLaunchMode,
+        targets: tuple[ReconnectAuthorizationTarget, ...],
+        isolated_fingerprints: frozenset[str] = frozenset(),
+        isolated_window_count: int | None = None,
+        anonymous_isolated_window_count: int = 0,
+    ) -> ReconnectAuthorizationBatch:
+        return self.publish(
+            source,
+            launch_mode,
+            targets,
+            isolated_fingerprints,
+            isolated_window_count,
+            anonymous_isolated_window_count,
+            preparation_token=preparation_token,
+        )
 
     def _assign_target_grant(
         self,
@@ -251,6 +302,7 @@ class SmartReconnectAuthorizationCoordinator:
         with self._lock:
             if self._state is ReconnectAuthorizationState.STOPPED:
                 return
+            self._active_preparation_token = None
             self._current = None
             self._rebinding_base = None
             if reason is ReconnectRevocationReason.EXPLICIT:
@@ -270,6 +322,14 @@ class SmartReconnectAuthorizationCoordinator:
         with self._lock:
             if self._state is ReconnectAuthorizationState.STOPPED:
                 return False
+            if self._state is ReconnectAuthorizationState.REBINDING:
+                self._active_preparation_token = None
+                self._current = None
+                self._rebinding_base = None
+                self._state = ReconnectAuthorizationState.EMPTY
+                self._last_revocation_reason = reason
+                return False
+            self._active_preparation_token = None
             batch = self._current
             if batch is None or self._state is not ReconnectAuthorizationState.ACTIVE:
                 return False
@@ -306,11 +366,31 @@ class SmartReconnectAuthorizationCoordinator:
             self._state = ReconnectAuthorizationState.ACTIVE
             return True
 
-    def fail_preparation(self) -> None:
-        self.revoke(ReconnectRevocationReason.PREPARATION_FAILED)
+    def fail_preparation(
+        self,
+        preparation_token: ReconnectPreparationToken | None = None,
+    ) -> bool:
+        if preparation_token is None:
+            self.revoke(ReconnectRevocationReason.PREPARATION_FAILED)
+            return True
+        with self._lock:
+            if (
+                self._state is not ReconnectAuthorizationState.REBINDING
+                or preparation_token is not self._active_preparation_token
+            ):
+                return False
+            self._active_preparation_token = None
+            self._current = None
+            self._rebinding_base = None
+            self._state = ReconnectAuthorizationState.EMPTY
+            self._last_revocation_reason = (
+                ReconnectRevocationReason.PREPARATION_FAILED
+            )
+            return True
 
     def stop(self) -> None:
         with self._lock:
+            self._active_preparation_token = None
             self._current = None
             self._rebinding_base = None
             self._shortcut_seal_baselines.clear()
@@ -386,5 +466,6 @@ __all__ = [
     "ReconnectAuthorizationMismatchError",
     "ReconnectAuthorizationState",
     "ReconnectAuthorizationUnavailableError",
+    "ReconnectPreparationToken",
     "SmartReconnectAuthorizationCoordinator",
 ]
