@@ -247,11 +247,13 @@ def test_native_tray_menu_contains_all_confirmed_actions():
         encoding="utf-8"
     )
 
+    assert "self.WM_LBUTTONUP, self.WM_LBUTTONDBLCLK" in source
+    assert "self._events.put(SystemTrayEvent.RESTORE)" in source
     for label in (
         "顯示主程式",
         "隱藏主視窗",
         "恢復主視窗",
         "停止全部",
-        "完全關閉程式",
+        "結束程式",
     ):
         assert label in source

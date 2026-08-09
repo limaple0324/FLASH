@@ -238,7 +238,7 @@ class WindowsSystemTrayBackend:
                 user32.AppendMenuW(menu, self.MF_STRING, 3, "恢復主視窗")
                 user32.AppendMenuW(menu, self.MF_SEPARATOR, 0, None)
                 user32.AppendMenuW(menu, self.MF_STRING, 4, "停止全部")
-                user32.AppendMenuW(menu, self.MF_STRING, 5, "完全關閉程式")
+                user32.AppendMenuW(menu, self.MF_STRING, 5, "結束程式")
                 user32.SetForegroundWindow(wintypes.HWND(hwnd))
                 command = user32.TrackPopupMenu(
                     menu,
