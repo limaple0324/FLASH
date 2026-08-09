@@ -710,6 +710,7 @@ jobs:
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          FLASH_ARTIFACT_NAME: ${{ needs.test-and-build.outputs.artifact_name }}
         run: |
           $ErrorActionPreference = 'Stop'
           $repo = $env:GITHUB_REPOSITORY
@@ -749,7 +750,14 @@ jobs:
             return $sha.ToLowerInvariant()
           }
 
-          $zipPath = Resolve-Path (Join-Path 'dist' "$env:FLASH_ARTIFACT_NAME.zip")
+          $artifactName = [string]$env:FLASH_ARTIFACT_NAME
+          if ([string]::IsNullOrWhiteSpace($artifactName)) {
+            throw '前一個工作階段沒有提供正式成品名稱。'
+          }
+          if ($artifactName -notmatch '^[A-Za-z0-9][A-Za-z0-9+._-]{0,127}$') {
+            throw '正式成品名稱格式不安全。'
+          }
+          $zipPath = Resolve-Path (Join-Path 'dist' "$artifactName.zip")
           $releaseWork = Join-Path $env:RUNNER_TEMP 'flash-release-asset'
           Remove-Item -LiteralPath $releaseWork -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $releaseWork | Out-Null

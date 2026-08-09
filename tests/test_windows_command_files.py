@@ -112,6 +112,44 @@ def test_only_main_push_can_publish_over_the_live_release():
     assert "release-index.json" in publish_step
 
 
+def test_main_publish_maps_and_validates_cross_job_artifact_name():
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    publish_step = workflow.split("- name: Publish latest desktop updater files", 1)[1]
+    publish_step = publish_step.split(
+        "- name: Publish SP1-only desktop updater files",
+        1,
+    )[0]
+
+    output_mapping = (
+        "FLASH_ARTIFACT_NAME: "
+        "${{ needs.test-and-build.outputs.artifact_name }}"
+    )
+    read_name = "$artifactName = [string]$env:FLASH_ARTIFACT_NAME"
+    reject_empty = "[string]::IsNullOrWhiteSpace($artifactName)"
+    reject_unsafe = (
+        "$artifactName -notmatch "
+        "'^[A-Za-z0-9][A-Za-z0-9+._-]{0,127}$'"
+    )
+    resolve_zip = (
+        "$zipPath = Resolve-Path "
+        "(Join-Path 'dist' \"$artifactName.zip\")"
+    )
+
+    assert output_mapping in publish_step
+    assert read_name in publish_step
+    assert reject_empty in publish_step
+    assert reject_unsafe in publish_step
+    assert resolve_zip in publish_step
+    assert (
+        "Resolve-Path (Join-Path 'dist' \"$env:FLASH_ARTIFACT_NAME.zip\")"
+        not in publish_step
+    )
+    assert publish_step.index(output_mapping) < publish_step.index(read_name)
+    assert publish_step.index(read_name) < publish_step.index(reject_empty)
+    assert publish_step.index(reject_empty) < publish_step.index(reject_unsafe)
+    assert publish_step.index(reject_unsafe) < publish_step.index(resolve_zip)
+
+
 def test_main_release_uses_draft_asset_verification_before_public_index():
     workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
     publish_step = workflow.split("- name: Publish latest desktop updater files", 1)[1]
