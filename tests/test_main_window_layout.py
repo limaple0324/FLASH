@@ -10,10 +10,16 @@ def test_main_window_uses_home_view():
     assert "on_keyboard_sync_change=change_keyboard_sync" in source
     assert "group_choices=group_choices" in source
     assert "on_group_change=change_group" in source
+    assert "group_entries_provider=group_entries" in source
+    assert "workspace_state=workspace_state" in source
+    assert "workspace_state_provider=(" in source
+    assert "workspace_service.snapshot" in source
     assert "build_windows_card_overlay_selection_coordinator" in source
     assert "CardExpiryMonitor" in source
     assert "on_card_display_seconds_update=update_card_display_seconds" in source
-    assert "CharacterDetailWindow" in source
+    assert "CharacterDetailWindow" not in source
+    assert "home_view.show_character_detail(" in source
+    assert "entry_id=entry_id" in source
     assert "CharacterNoteService" in source
     assert "auto_click_service.configure_direct_left_sync(" in source
     assert "pointer_sync_controller.send_click(" in source
@@ -22,6 +28,9 @@ def test_main_window_uses_home_view():
     assert "tray_controller.stop(" in source
     assert "on_stop_all=stop_all_automation_from_tray" in source
     assert "on_exit=close_window" in source
+    assert "def hide_window_to_tray()" in source
+    assert 'window.protocol("WM_DELETE_WINDOW", hide_window_to_tray)' in source
+    assert 'window.protocol("WM_DELETE_WINDOW", close_window)' not in source
     assert "stop_complete_background_services" in source
     assert "沒有假裝已退出" in source
     assert "include_source=True" in source
@@ -37,6 +46,13 @@ def test_main_window_uses_home_view():
     assert "on_save_sync_target_settings=save_sync_target_settings" in source
     assert "on_calibrate_role_id=calibrate_role_id" in source
     assert "on_read_role_id=read_role_id" in source
+    assert "game_time_offset_ms=(" in source
+    assert "clamp_time_offset_ms(config.get(GAME_TIME_OFFSET_MS_KEY, 0))" in source
+    assert "game_time_auto_update=(" in source
+    assert "bool(config.get(GAME_TIME_AUTO_UPDATE_KEY, True))" in source
+    assert "game_time_snapshot_provider=(" in source
+    assert "game_time_timed_click_service.snapshot" in source
+    assert "on_game_time_settings_change=change_game_time_settings" in source
     assert "FeatureCardLayoutService(config)" in source
     assert "feature_card_layout_service.preference" in source
     assert "feature_card_layout_service.order_for" in source
@@ -162,6 +178,86 @@ def test_role_id_read_uses_the_entry_safe_window_not_groupwide_failure():
     assert "target_window_contract_service.snapshot(" in function_source
     assert "and item.safe" in function_source
     assert "if snapshot.failure_codes:" not in function_source
+
+
+def test_role_id_calibration_uses_only_the_visible_game_text():
+    source = Path("main.py").read_text(encoding="utf-8")
+    function_source = source[
+        source.index("    def calibrate_role_id("):
+        source.index("    def read_role_id(")
+    ]
+
+    assert "entry.display_name" not in function_source
+    assert "role_id_template_service.calibrate(" in function_source
+    assert "entry_id=entry_id" in function_source
+
+
+def test_role_id_is_automatically_read_only_for_connected_missing_roles():
+    source = Path("main.py").read_text(encoding="utf-8")
+    function_source = source[
+        source.index("    def auto_read_missing_role_id("):
+        source.index("    player_habit_reminder_service = (")
+    ]
+
+    assert "if not entry.role_id.strip()" in function_source
+    assert "window_info is None or window_info.minimized" in function_source
+    assert "screen_state is not ReconnectScreenState.CONNECTED" in function_source
+    assert "role_id_template_service.read_if_missing(" in function_source
+    assert "existing_role_id=entry.role_id" in function_source
+    assert "commit_role_id(" in function_source
+    assert "only_if_missing=True" in function_source
+    assert "group_configuration_service.set_role_id(" not in function_source
+    assert "entry.display_name" not in function_source
+    assert "window.after(" in function_source
+    assert "window.after_cancel(role_id_auto_read_id)" in source
+
+
+def test_cancelled_bulk_shortcut_selection_has_no_side_effects():
+    source = Path("main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    create_main_window = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "create_main_window"
+    )
+    add_group_shortcuts = next(
+        node
+        for node in ast.walk(create_main_window)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "add_group_shortcuts"
+    )
+    body = ast.get_source_segment(source, add_group_shortcuts)
+    assert body is not None
+
+    cancel_guard = next(
+        node
+        for node in add_group_shortcuts.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and isinstance(node.test.operand, ast.Name)
+        and node.test.operand.id == "selected"
+    )
+    assert len(cancel_guard.body) == 1
+    assert isinstance(cancel_guard.body[0], ast.Return)
+    assert isinstance(cancel_guard.body[0].value, ast.Constant)
+    assert cancel_guard.body[0].value.value is False
+
+    cancel_end = cancel_guard.end_lineno
+    assert cancel_end is not None
+    assert cancel_end < body.count("\n") + add_group_shortcuts.lineno
+    assert body.index("if not selected:") < body.index(
+        "stop_group_automation_for_configuration_change()"
+    ) < body.index("def mutation(candidate):")
+    assert body.index("def mutation(candidate):") < body.index(
+        "candidate.add_shortcuts("
+    )
+    assert body.count("candidate.add_shortcuts(") == 1
+    assert "group_configuration_service.add_shortcuts(" not in body
+    assert "finish_group_management(mutation)" in body
+    assert "tuple(Path(path) for path in selected)" in body
+    assert "set_role_id(" not in body
 
 
 def test_startup_error_uses_product_name():

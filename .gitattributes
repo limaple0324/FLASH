@@ -1,2 +1,4 @@
 *.cmd -text whitespace=cr-at-eol
 *.bat -text whitespace=cr-at-eol
+assets/ui_fonts/** -text -whitespace
+tests/fixtures/smart_reconnect/live_failures/*.jsonl -text

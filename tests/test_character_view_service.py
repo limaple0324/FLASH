@@ -3,6 +3,9 @@ import pytest
 from core.window_registry import WindowHealth, WindowRegistry
 from domain.character import Character, CharacterImportance
 from services.character_view_service import CharacterViewService, PlayerCharacterView
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
 
 
 def _character(
@@ -12,6 +15,21 @@ def _character(
     importance: CharacterImportance,
 ) -> Character:
     return Character(character_id, display_name, level, importance)
+
+
+def _view(
+    registry: WindowRegistry,
+    characters,
+    *,
+    coordinator: IdentityDataTransactionCoordinator | None = None,
+    **options,
+) -> CharacterViewService:
+    return CharacterViewService(
+        registry,
+        characters,
+        coordinator or IdentityDataTransactionCoordinator(),
+        **options,
+    )
 
 
 def test_view_joins_role_data_by_stable_identity_not_display_name() -> None:
@@ -30,7 +48,7 @@ def test_view_joins_role_data_by_stable_identity_not_display_name() -> None:
         CharacterImportance.PRIMARY,
     )
 
-    assert CharacterViewService(registry, (profile,)).all() == (
+    assert _view(registry, (profile,)).all() == (
         PlayerCharacterView(
             display_name="目前顯示名稱",
             group="14支",
@@ -46,7 +64,7 @@ def test_view_keeps_unmatched_registered_character_visible() -> None:
     registry = WindowRegistry()
     registry.register_character("registered-only", "待補資料", group="14支")
 
-    assert CharacterViewService(registry, ()).all() == (
+    assert _view(registry, ()).all() == (
         PlayerCharacterView(
             display_name="待補資料",
             group="14支",
@@ -69,7 +87,7 @@ def test_view_never_contains_window_or_identity_internals() -> None:
         rect=(0, 0, 800, 600),
         health=WindowHealth.READY,
     )
-    view = CharacterViewService(
+    view = _view(
         registry,
         (
             _character(
@@ -97,7 +115,7 @@ def test_view_rejects_duplicate_stable_character_profiles() -> None:
     )
 
     with pytest.raises(ValueError, match="Duplicate stable character ID"):
-        CharacterViewService(registry, profiles)
+        _view(registry, profiles)
 
 
 def test_view_uses_project_wide_role_priority_instead_of_registry_order() -> None:
@@ -130,7 +148,7 @@ def test_view_uses_project_wide_role_priority_instead_of_registry_order() -> Non
 
     assert [
         item.display_name
-        for item in CharacterViewService(registry, profiles).all()
+        for item in _view(registry, profiles).all()
     ] == ["主號高等", "主號低等", "分號", "備用"]
 
 
@@ -147,7 +165,7 @@ def test_view_uses_confirmed_group_order_inside_the_same_role() -> None:
 
     assert [
         item.display_name
-        for item in CharacterViewService(
+        for item in _view(
             registry,
             profiles,
             confirmed_group_orders={
@@ -164,5 +182,73 @@ def test_view_can_limit_results_to_current_group() -> None:
 
     assert [
         item.display_name
-        for item in CharacterViewService(registry, ()).all("乙組")
+        for item in _view(registry, ()).all("乙組")
     ] == ["乙"]
+
+
+def test_each_public_view_read_uses_exactly_one_coordinator_snapshot(
+    monkeypatch,
+) -> None:
+    registry = WindowRegistry()
+    registry.register_character("a", "甲", group="甲組")
+    coordinator = IdentityDataTransactionCoordinator()
+    service = _view(registry, (), coordinator=coordinator)
+    original_snapshot = coordinator.snapshot
+    calls = 0
+
+    def count_snapshot(reader):
+        nonlocal calls
+        calls += 1
+        return original_snapshot(reader)
+
+    monkeypatch.setattr(coordinator, "snapshot", count_snapshot)
+
+    assert service.all("甲組")[0].display_name == "甲"
+    assert calls == 1
+    assert service.all_with_identities("甲組")[0][0] == "a"
+    assert calls == 2
+
+
+def test_stage_replace_exposes_profiles_inside_same_transaction() -> None:
+    registry = WindowRegistry()
+    coordinator = IdentityDataTransactionCoordinator()
+    original = _character("a", "甲", 100, CharacterImportance.SECONDARY)
+    replacement = _character("b", "乙", 120, CharacterImportance.PRIMARY)
+    service = _view(registry, (original,), coordinator=coordinator)
+
+    observed = coordinator.execute(
+        lambda transaction: (
+            service.stage_replace(transaction, (replacement,)),
+            service.profiles_in_transaction(transaction),
+        )[1]
+    )
+
+    assert observed == (original,)
+    committed = coordinator.execute(service.profiles_in_transaction)
+    assert committed == (replacement,)
+
+
+def test_character_view_memory_failure_rolls_back_original_profiles(
+    monkeypatch,
+) -> None:
+    registry = WindowRegistry()
+    coordinator = IdentityDataTransactionCoordinator()
+    original = _character("a", "甲", 100, CharacterImportance.SECONDARY)
+    replacement = _character("b", "乙", 120, CharacterImportance.PRIMARY)
+    service = _view(registry, (original,), coordinator=coordinator)
+    install = service._install_characters
+    calls = 0
+
+    def fail_first(candidate):
+        nonlocal calls
+        calls += 1
+        install(candidate)
+        if calls == 1:
+            raise OSError("view publish interrupted")
+
+    monkeypatch.setattr(service, "_install_characters", fail_first)
+
+    with pytest.raises(OSError, match="view publish interrupted"):
+        service.replace_characters((replacement,))
+
+    assert service._characters == {"a": original}

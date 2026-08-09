@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import RLock
 
-from cards.lifecycle import CardLifecycle, _require_aware
+from cards.lifecycle import (
+    CardLifecycle,
+    CardPresentationOrder,
+    _require_aware,
+)
 from cards.models import GroupCard
 from cards.settings import CardDisplaySettings
 
@@ -154,7 +158,7 @@ class CardService:
             for _index, entry in sorted(
                 indexed,
                 key=lambda item: (
-                    int(item[1].card.priority_tier),
+                    item[1].presentation_order.sort_key(),
                     item[1].shown_at,
                     item[0],
                 ),
@@ -167,6 +171,7 @@ class CardService:
         shown_at: datetime | None = None,
         *,
         lifetime: timedelta | None = None,
+        presentation_order: CardPresentationOrder | None = None,
     ) -> GroupCard:
         if not isinstance(card, GroupCard):
             raise TypeError("card must be GroupCard.")
@@ -174,19 +179,25 @@ class CardService:
         with self._lock:
             for index, current in enumerate(self._entries):
                 if current.card.card_id == card.card_id:
+                    order = presentation_order or current.presentation_order
                     self._entries[index] = CardLifecycle(
                         card,
                         current.shown_at,
                         lifetime or current.lifetime,
+                        order,
                     )
                     break
             else:
                 shown_at = shown_at or datetime.now(timezone.utc)
+                order = presentation_order or CardPresentationOrder.general(
+                    card.card_id
+                )
                 self._entries.append(
                     CardLifecycle(
                         card,
                         shown_at,
                         lifetime or self.settings.lifetime,
+                        order,
                     )
                 )
         self._notify_changed()

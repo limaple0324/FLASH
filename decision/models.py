@@ -16,15 +16,16 @@ class DecisionOutput(str, Enum):
 
 class DecisionCategory(IntEnum):
     SAFETY_AND_DISCONNECTION = 1
-    TIME_LIMIT = 2
-    LOSS_RISK = 3
+    LOSS_RISK = 2
+    TIME_LIMIT = 3
     CURRENT_FOCUS = 4
     INTERRUPTED_RECOVERY = 5
     CURRENT_GROUP_PROGRESS = 6
     IMPORTANT_TODAY = 7
     DEFERRABLE = 8
     SUGGESTION = 9
-    QUIET = 10
+    GENERAL_INFORMATION = 10
+    QUIET = 11
 
 
 @dataclass(frozen=True, slots=True)

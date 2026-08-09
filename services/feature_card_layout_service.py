@@ -118,7 +118,7 @@ class FeatureCardLayoutService:
         collapsed = (
             raw.get("collapsed")
             if isinstance(raw, Mapping)
-            else False
+            else True
         )
         return FeatureCardPreference(
             card_id=clean_id,
@@ -129,7 +129,7 @@ class FeatureCardLayoutService:
                 and len(title.strip()) <= MAX_CARD_TITLE_LENGTH
                 else clean_default
             ),
-            collapsed=collapsed if isinstance(collapsed, bool) else False,
+            collapsed=collapsed if isinstance(collapsed, bool) else True,
         )
 
     def set_collapsed(
@@ -177,7 +177,7 @@ class FeatureCardLayoutService:
             collapsed=(
                 card_payload.get("collapsed")
                 if isinstance(card_payload.get("collapsed"), bool)
-                else False
+                else True
             ),
         )
 

@@ -4,10 +4,16 @@ from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from main import build_services, registry_status, save_registry
 from services.app_context import AppContext
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
 
 
 def test_build_services_loads_and_registers_registry(tmp_path):
-    store = WindowRegistryStore(tmp_path / "data" / "window_registry.json")
+    store = WindowRegistryStore(
+        tmp_path / "data" / "window_registry.json",
+        IdentityDataTransactionCoordinator(),
+    )
     registry = WindowRegistry()
     registry.register_character("160-old", "160古")
     store.save(registry)

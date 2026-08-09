@@ -57,16 +57,10 @@ class CardDisplaySettingsService:
         ):
             return self._resolution
 
-        previous_data = dict(self._config.data)
-        try:
-            self._config.set(
-                CARD_LIFETIME_SECONDS_CONFIG_KEY,
-                settings.lifetime_seconds,
-            )
-        except Exception:
-            self._config.data.clear()
-            self._config.data.update(previous_data)
-            raise
+        self._config.set(
+            CARD_LIFETIME_SECONDS_CONFIG_KEY,
+            settings.lifetime_seconds,
+        )
 
         resolution = CardDisplaySettingsResolution(
             settings=settings,

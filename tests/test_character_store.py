@@ -4,6 +4,13 @@ import pytest
 
 from domain.character import Character, CharacterImportance
 from domain.character_store import CharacterStore
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
+
+
+def _store(path) -> CharacterStore:
+    return CharacterStore(path, IdentityDataTransactionCoordinator())
 
 
 def _character(
@@ -17,7 +24,7 @@ def _character(
 
 def test_missing_store_returns_empty_without_creating_defaults(tmp_path) -> None:
     path = tmp_path / "characters.json"
-    store = CharacterStore(path)
+    store = _store(path)
 
     assert store.load() == ()
     assert path.exists() is False
@@ -27,7 +34,7 @@ def test_missing_store_returns_empty_without_creating_defaults(tmp_path) -> None
 
 def test_store_round_trips_player_character_profiles_atomically(tmp_path) -> None:
     path = tmp_path / "characters.json"
-    store = CharacterStore(path)
+    store = _store(path)
     characters = (
         _character("char-100", "嘻の百級", 100, CharacterImportance.SECONDARY),
         _character("char-160", "次元主號", 160, CharacterImportance.PRIMARY),
@@ -59,7 +66,7 @@ def test_store_round_trips_player_character_profiles_atomically(tmp_path) -> Non
 
 def test_store_rejects_duplicate_character_identity_before_writing(tmp_path) -> None:
     path = tmp_path / "characters.json"
-    store = CharacterStore(path)
+    store = _store(path)
     characters = (
         _character("same", "角色甲", 100, CharacterImportance.PRIMARY),
         _character("same", "角色乙", 120, CharacterImportance.RESERVE),
@@ -74,7 +81,7 @@ def test_store_rejects_duplicate_character_identity_before_writing(tmp_path) -> 
 def test_corrupt_store_is_preserved_and_does_not_create_guessed_data(tmp_path) -> None:
     path = tmp_path / "characters.json"
     path.write_text("{broken", encoding="utf-8")
-    store = CharacterStore(path)
+    store = _store(path)
 
     assert store.load() == ()
     assert store.recovered_from_corruption is True
@@ -85,7 +92,7 @@ def test_corrupt_store_is_preserved_and_does_not_create_guessed_data(tmp_path) -
 
 def test_corrupt_current_store_recovers_last_valid_backup(tmp_path) -> None:
     path = tmp_path / "characters.json"
-    store = CharacterStore(path)
+    store = _store(path)
     first = (_character("char-a", "角色甲", 100, CharacterImportance.PRIMARY),)
     second = (
         _character("char-b", "角色乙", 120, CharacterImportance.SECONDARY),
@@ -94,7 +101,7 @@ def test_corrupt_current_store_recovers_last_valid_backup(tmp_path) -> None:
     store.save(second)
     path.write_text("{broken", encoding="utf-8")
 
-    recovered = CharacterStore(path)
+    recovered = _store(path)
 
     assert recovered.load() == first
     assert recovered.recovered_from_corruption is True
@@ -120,7 +127,7 @@ def test_unknown_importance_is_preserved_as_corrupt_input(tmp_path) -> None:
         ),
         encoding="utf-8",
     )
-    store = CharacterStore(path)
+    store = _store(path)
 
     assert store.load() == ()
     assert store.recovered_from_corruption is True

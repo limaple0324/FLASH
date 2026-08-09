@@ -2,8 +2,22 @@ from pathlib import Path
 
 from adapters.windows_window import WindowInfo
 from core.reconnect_policy import ReconnectScreenState
-from services.group_configuration_service import GroupConfigurationService
+from services.group_configuration_service import (
+    GroupConfigurationService as _GroupConfigurationService,
+)
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
 from services.ungrouped_window_service import UngroupedWindowService
+
+
+class GroupConfigurationService(_GroupConfigurationService):
+    def __init__(self, path, *, legacy_config_path=None):
+        super().__init__(
+            path,
+            IdentityDataTransactionCoordinator(),
+            legacy_config_path=legacy_config_path,
+        )
 
 
 def _shortcut(directory: Path, name: str) -> Path:
@@ -128,3 +142,31 @@ def test_hides_duplicate_shortcut_identity_and_keeps_unknown_state(tmp_path):
         ("未知狀態.lnk", "unknown"),
     ]
     assert service.shortcut_for(duplicate_fingerprint) is None
+
+
+def test_shortcut_lookup_is_unique_and_does_not_reenter_screen_observation(
+    tmp_path,
+):
+    desktop = tmp_path / "Desktop"
+    shortcut = _shortcut(desktop, "唯一未分組")
+    fingerprint = "e" * 64
+    screen_calls = []
+    configuration = GroupConfigurationService(tmp_path / "groups.json")
+    backend = FakeWindowBackend((_window(1, fingerprint),))
+    service = UngroupedWindowService(
+        configuration,
+        FakeShortcutFingerprintResolver({shortcut: fingerprint}),
+        backend,
+        screen_states_provider=lambda *_args: screen_calls.append(True),
+        shortcut_roots=(desktop,),
+    )
+
+    assert service.shortcut_for(fingerprint) == shortcut
+    assert screen_calls == []
+
+    backend.windows = (
+        _window(1, fingerprint),
+        _window(2, fingerprint),
+    )
+    assert service.shortcut_for(fingerprint) is None
+    assert screen_calls == []

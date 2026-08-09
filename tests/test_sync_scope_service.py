@@ -1,8 +1,22 @@
 import hashlib
 import json
 
-from services.group_configuration_service import GroupConfigurationService
+from services.group_configuration_service import (
+    GroupConfigurationService as _GroupConfigurationService,
+)
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
 from services.sync_scope_service import SyncScopeService
+
+
+class GroupConfigurationService(_GroupConfigurationService):
+    def __init__(self, path, *, legacy_config_path=None):
+        super().__init__(
+            path,
+            IdentityDataTransactionCoordinator(),
+            legacy_config_path=legacy_config_path,
+        )
 
 
 class Resolver:

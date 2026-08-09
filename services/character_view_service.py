@@ -7,6 +7,11 @@ from typing import Iterable, Mapping
 
 from core.window_registry import WindowRegistry
 from domain.character import Character, character_priority_key
+from services.identity_data_transaction_coordinator import (
+    IdentityDataResource,
+    IdentityDataTransaction,
+    IdentityDataTransactionCoordinator,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,40 +33,103 @@ class CharacterViewService:
         self,
         registry: WindowRegistry,
         characters: Iterable[Character],
+        coordinator: IdentityDataTransactionCoordinator,
         *,
         confirmed_group_orders: Mapping[str, tuple[str, ...]] | None = None,
     ) -> None:
+        if not isinstance(registry, WindowRegistry):
+            raise TypeError("registry must be WindowRegistry.")
+        if not isinstance(coordinator, IdentityDataTransactionCoordinator):
+            raise TypeError("coordinator must be IdentityDataTransactionCoordinator.")
         self._registry = registry
+        self._coordinator = coordinator
         self._confirmed_group_orders = {
             group_name: tuple(order)
             for group_name, order in (confirmed_group_orders or {}).items()
         }
         self._characters: dict[str, Character] = {}
         for character in characters:
+            if not isinstance(character, Character):
+                raise TypeError("characters must contain only Character values.")
             if character.character_id in self._characters:
                 raise ValueError(
                     f"Duplicate stable character ID: {character.character_id}"
                 )
             self._characters[character.character_id] = character
 
+    @property
+    def coordinator(self) -> IdentityDataTransactionCoordinator:
+        return self._coordinator
+
     def replace_characters(
         self,
         characters: Iterable[Character],
     ) -> None:
+        self._coordinator.execute(
+            lambda transaction: self.stage_replace(transaction, characters)
+        )
+
+    def stage_replace(
+        self,
+        transaction: IdentityDataTransaction,
+        characters: Iterable[Character],
+    ) -> None:
+        self._coordinator.require_transaction(transaction)
         replacement: dict[str, Character] = {}
         for character in characters:
+            if not isinstance(character, Character):
+                raise TypeError("characters must contain only Character values.")
             if character.character_id in replacement:
                 raise ValueError(
                     f"Duplicate stable character ID: {character.character_id}"
                 )
             replacement[character.character_id] = character
-        self._characters = replacement
+        if replacement == self._characters:
+            return
+        transaction.stage_memory(
+            IdentityDataResource.CHARACTER_VIEW_CACHE,
+            lambda: dict(self._characters),
+            lambda: self._install_characters(replacement),
+            self._restore_characters,
+        )
+
+    def profiles_in_transaction(
+        self,
+        transaction: IdentityDataTransaction,
+    ) -> tuple[Character, ...]:
+        self._coordinator.require_transaction(transaction)
+        return tuple(self._characters.values())
+
+    def character_profiles(self) -> tuple[Character, ...]:
+        """Return stable character identities inside the shared read boundary."""
+        return self._coordinator.read_consistent(
+            lambda: tuple(self._characters.values())
+        )
+
+    def _install_characters(self, replacement: dict[str, Character]) -> None:
+        self._characters = dict(replacement)
+
+    def _restore_characters(self, snapshot: object) -> None:
+        if not isinstance(snapshot, dict) or any(
+            not isinstance(key, str) or not isinstance(value, Character)
+            for key, value in snapshot.items()
+        ):
+            raise TypeError("invalid character-view snapshot")
+        self._characters = dict(snapshot)
 
     def all_with_identities(
         self,
         group_name: str | None = None,
     ) -> tuple[tuple[str, PlayerCharacterView], ...]:
         """提供內部服務安全配對；角色識別不得傳給顯示層。"""
+        return self._coordinator.read_consistent(
+            lambda: self._all_with_identities_unlocked(group_name)
+        )
+
+    def _all_with_identities_unlocked(
+        self,
+        group_name: str | None,
+    ) -> tuple[tuple[str, PlayerCharacterView], ...]:
         snapshots: list[tuple[str, PlayerCharacterView]] = []
         records = tuple(
             record
@@ -124,8 +192,16 @@ class CharacterViewService:
         self,
         group_name: str | None = None,
     ) -> tuple[PlayerCharacterView, ...]:
+        return self._coordinator.read_consistent(
+            lambda: self._all_unlocked(group_name)
+        )
+
+    def _all_unlocked(
+        self,
+        group_name: str | None,
+    ) -> tuple[PlayerCharacterView, ...]:
         return tuple(
             snapshot
             for _character_id, snapshot
-            in self.all_with_identities(group_name)
+            in self._all_with_identities_unlocked(group_name)
         )

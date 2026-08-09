@@ -350,10 +350,14 @@ class WindowsInputSyncController:
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
         operation_gate: GameOperationGate | None = None,
+        require_expected_window_count: bool = True,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
         self._expected_windows = expected_windows
+        self._require_expected_window_count = bool(
+            require_expected_window_count
+        )
         self._keywords = tuple(
             keyword.strip().casefold()
             for keyword in title_keywords
@@ -532,6 +536,7 @@ class WindowsInputSyncController:
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
         operation_gate: GameOperationGate | None = None,
+        require_expected_window_count: bool = True,
     ) -> "WindowsInputSyncController":
         return cls(
             expected_windows=expected_windows,
@@ -550,6 +555,7 @@ class WindowsInputSyncController:
             screen_state_provider=screen_state_provider,
             target_windows_provider=target_windows_provider,
             operation_gate=operation_gate,
+            require_expected_window_count=require_expected_window_count,
         )
 
     def _record_role_operation(
@@ -676,6 +682,12 @@ class WindowsInputSyncController:
                     return
             except Exception:
                 return
+        if (
+            self._screen_state_provider is not None
+            and self._screen_state_provider(fingerprint)
+            is not ReconnectScreenState.CONNECTED
+        ):
+            return
         reconnecting = {
             normalized
             for value in self._reconnecting_provider()
@@ -687,6 +699,7 @@ class WindowsInputSyncController:
         if (
             fingerprint in reconnecting
             and self._deferred_service is not None
+            and self._screen_state_provider is None
         ):
             self._deferred_service.enqueue(
                 fingerprint,
@@ -1099,8 +1112,17 @@ class WindowsInputSyncController:
             partial_reconnect_candidate
             and not unresolved_title_identity
         )
+        safe_partial_group = (
+            not self._require_expected_window_count
+            and process_identity_valid
+            and fingerprint_identity_valid
+            and self._allowed_fingerprint_set is not None
+            and visible_fingerprint_set
+            <= self._allowed_fingerprint_set
+        )
         if (
-            len(windows) != self._expected_windows
+            self._require_expected_window_count
+            and len(windows) != self._expected_windows
             and not safe_partial_reconnect
         ):
             failures.append("window_count_mismatch")
@@ -1109,6 +1131,7 @@ class WindowsInputSyncController:
             and visible_fingerprint_set
             != self._allowed_fingerprint_set
             and not safe_partial_reconnect
+            and not safe_partial_group
         ):
             failures.append("group_identity_set_mismatch")
 
@@ -1144,6 +1167,25 @@ class WindowsInputSyncController:
                 if window.handle != captured_source
             )
 
+        if self._screen_state_provider is not None:
+            if (
+                source_fingerprint is None
+                or self._screen_state_provider(source_fingerprint)
+                is not ReconnectScreenState.CONNECTED
+            ):
+                failures.append("source_not_in_game")
+            eligible = tuple(
+                window
+                for window in eligible
+                if (
+                    (fingerprint := normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    )) is not None
+                    and self._screen_state_provider(fingerprint)
+                    is ReconnectScreenState.CONNECTED
+                )
+            )
+
         group_reconnecting = (
             bool(reconnecting & self._allowed_fingerprint_set)
             if self._allowed_fingerprint_set is not None
@@ -1157,6 +1199,7 @@ class WindowsInputSyncController:
             and normalized_policy is not None
             and self._deferred_service is not None
             and self._allowed_fingerprints is not None
+            and self._screen_state_provider is None
         ):
             visible_background = {
                 normalize_launch_fingerprint(
@@ -1297,6 +1340,7 @@ class WindowsInputSyncController:
             if (
                 fingerprint in reconnecting
                 and self._deferred_service is not None
+                and self._screen_state_provider is None
             ):
                 self._deferred_service.enqueue(
                     fingerprint,

@@ -24,8 +24,13 @@ from services.data_contract_migration_service import (
     DataContractMigrationService,
 )
 from services.event_bus import EventBus
-from services.group_configuration_service import GroupConfigurationService
+from services.group_configuration_service import (
+    GroupConfigurationService as _GroupConfigurationService,
+)
 from services.game_operation_gate import GameOperationGate
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
 from services.group_selection_service import GroupSelectionService
 from services.keyboard_sync_monitor import Win32KeyboardStateBackend
 from services.lifecycle_contract import (
@@ -38,6 +43,15 @@ from services.sync_scope_service import SyncScopeService
 from services.target_window_contract_service import (
     TargetWindowContractService,
 )
+
+
+class GroupConfigurationService(_GroupConfigurationService):
+    def __init__(self, path, *, legacy_config_path=None):
+        super().__init__(
+            path,
+            IdentityDataTransactionCoordinator(),
+            legacy_config_path=legacy_config_path,
+        )
 
 
 class _Resolver:
@@ -824,7 +838,9 @@ def test_lifecycle_contract_keeps_cancel_and_join_failures_explicit():
 def test_data_contract_migration_is_sequential_and_rejects_future(tmp_path):
     config = ConfigManager(tmp_path / "settings.json")
     service = DataContractMigrationService(config)
-    assert service.state.component_versions["reconnect"] == 6
+    assert service.state.component_versions["reconnect"] == (
+        ReconnectRuntimeStateStore.VERSION
+    )
     migrated = service.migrate_component(
         "reconnect",
         {"version": 1, "value": "kept"},
@@ -834,10 +850,14 @@ def test_data_contract_migration_is_sequential_and_rejects_future(tmp_path):
             3: lambda payload: {**payload, "version": 4},
             4: lambda payload: {**payload, "version": 5},
             5: lambda payload: {**payload, "version": 6},
+            6: lambda payload: {**payload, "version": 7},
         },
         version_key="version",
     )
-    assert migrated == {"version": 6, "value": "kept"}
+    assert migrated == {
+        "version": ReconnectRuntimeStateStore.VERSION,
+        "value": "kept",
+    }
     try:
         service.verify_supported_versions(
             {
@@ -881,4 +901,4 @@ def test_oldest_reconnect_contract_migrates_to_safe_current_state(tmp_path):
     assert state.active_fingerprints == set()
     assert json.loads(
         state_path.read_text(encoding="utf-8")
-    )["version"] == 6
+    )["version"] == ReconnectRuntimeStateStore.VERSION

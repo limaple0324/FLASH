@@ -1,17 +1,95 @@
+from dataclasses import replace
 from pathlib import Path
 
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
 from domain.character import Character, CharacterImportance
 from domain.character_store import CharacterStore
-from main import CHARACTER_FILENAME, build_services
+from adapters.windows_window import WindowInfo
+from core.reconnect_policy import ReconnectScreenState
+from main import (
+    CHARACTER_FILENAME,
+    build_services,
+    registered_game_data_target,
+)
 from services.app_context import AppContext
 from services.character_detail_view_service import (
     CharacterDetailViewService,
     PlayerCharacterDetail,
 )
 from services.character_game_data_view_service import CharacterGameDataView
+from services.character_game_data_update_service import CharacterGameDataUpdateService
+from services.character_game_data_capture_service import (
+    CharacterGameDataCaptureService,
+)
 from services.character_view_service import CharacterViewService, PlayerCharacterView
+from services.group_selection_service import PlayerGroupChoice, PlayerGroupMember
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
+
+
+_FINGERPRINT = "a" * 64
+
+
+def _game_data_selection() -> tuple[PlayerGroupChoice, PlayerGroupMember, WindowInfo]:
+    member = PlayerGroupMember("entry-a", "角色甲", "主號", "角色甲乙", "char-a")
+    return (
+        PlayerGroupChoice("group-a", "目前組別", 1, (member,)),
+        member,
+        WindowInfo(
+            123,
+            "",
+            True,
+            False,
+            (1, 2, 500, 600),
+            process_id=456,
+            window_class="ShockwaveFlash",
+            launch_fingerprint=_FINGERPRINT,
+            thread_id=789,
+            process_lifecycle_token=987654321,
+        ),
+    )
+
+
+def test_registered_game_data_target_requires_one_complete_connected_member() -> None:
+    selection, member, window = _game_data_selection()
+
+    target = registered_game_data_target(
+        "目前組別", selection, member, window, ReconnectScreenState.CONNECTED
+    )
+
+    assert target is not None
+    assert target.character_id == "char-a"
+    assert target.window_handle == 123
+    assert target.thread_id == 789
+    assert target.process_lifecycle_token == 987654321
+    assert registered_game_data_target(
+        "目前組別", selection, member, window, ReconnectScreenState.UNKNOWN
+    ) is None
+    duplicate = PlayerGroupChoice(
+        "group-a", "目前組別", 2, (member, member)
+    )
+    assert registered_game_data_target(
+        "目前組別", duplicate, member, window, ReconnectScreenState.CONNECTED
+    ) is None
+    assert registered_game_data_target(
+        "目前組別", selection, member, None, ReconnectScreenState.CONNECTED
+    ) is None
+    for incomplete in (
+        replace(window, visible=False),
+        replace(window, minimized=True),
+        replace(window, thread_id=None),
+        replace(window, window_class=None),
+        replace(window, process_lifecycle_token=None),
+    ):
+        assert registered_game_data_target(
+            "目前組別",
+            selection,
+            member,
+            incomplete,
+            ReconnectScreenState.CONNECTED,
+        ) is None
 
 
 def test_build_services_loads_character_profiles_into_read_only_view(tmp_path) -> None:
@@ -23,8 +101,15 @@ def test_build_services_loads_character_profiles_into_read_only_view(tmp_path) -
         role="古",
         note="守紀優先",
     )
-    WindowRegistryStore(tmp_path / "data" / "window_registry.json").save(registry)
-    CharacterStore(tmp_path / "data" / CHARACTER_FILENAME).save(
+    coordinator = IdentityDataTransactionCoordinator()
+    WindowRegistryStore(
+        tmp_path / "data" / "window_registry.json",
+        coordinator,
+    ).save(registry)
+    CharacterStore(
+        tmp_path / "data" / CHARACTER_FILENAME,
+        coordinator,
+    ).save(
         (
             Character(
                 "same-character",
@@ -78,9 +163,21 @@ def test_build_services_isolates_corrupt_character_profiles(tmp_path) -> None:
 def test_build_services_registers_confirmed_game_data_sections(tmp_path) -> None:
     registry = WindowRegistry()
     registry.register_character("char-a", "角色甲", group="14支")
-    WindowRegistryStore(tmp_path / "data" / "window_registry.json").save(registry)
+    WindowRegistryStore(
+        tmp_path / "data" / "window_registry.json",
+        IdentityDataTransactionCoordinator(),
+    ).save(registry)
 
     build_services(root=tmp_path)
+
+    assert isinstance(
+        AppContext.get(CharacterGameDataUpdateService),
+        CharacterGameDataUpdateService,
+    )
+    assert isinstance(
+        AppContext.get(CharacterGameDataCaptureService),
+        CharacterGameDataCaptureService,
+    )
 
     details = AppContext.get(CharacterDetailViewService)
     assert details.all() == (
@@ -114,3 +211,20 @@ def test_main_window_backfills_current_group_character_data_on_start() -> None:
     )
 
     assert build_index < refresh_index < subscribe_index
+
+
+def test_character_rows_keep_one_right_side_toggle_and_inline_detail() -> None:
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+    page_source = source[
+        source.index("    def _build_characters_page("):
+        source.index("    def set_game_data_read_status(")
+    ]
+
+    assert '"收起" if selected else "查看"' in page_source
+    assert ").pack(side=RIGHT)" in page_source
+    assert "if selected:" in page_source
+    assert "self._build_selected_character_detail(card)" in page_source
+    assert "self._build_selected_character_detail(card)" not in page_source[
+        :page_source.index("for line, detail, select in rows:")
+    ]
+    assert "def hide_character_detail(" in source

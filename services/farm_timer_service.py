@@ -17,12 +17,18 @@ from cards.priority import CardPriorityReason
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.group import CharacterGroup
 from services.card_coordinator import CardCoordinator
+from services.group_role_status_service import (
+    ROLE_STATUS_CLOSED,
+    ROLE_STATUS_OPEN,
+)
 
 
 FARM_PLANTING_CONFIRMED_EVENT = "farm_planting_confirmed"
 FARM_COMPLETED_EVENT = "farm_completed"
 FARM_MATURE_AFTER = timedelta(minutes=40)
-FARM_OVERDUE_AFTER = timedelta(minutes=45)
+FARM_ELEVATED_AFTER = timedelta(minutes=50)
+FARM_HIGHEST_RISK_AFTER = timedelta(minutes=55)
+FARM_DISAPPEARS_AFTER = timedelta(minutes=60)
 COPY_CODE_ACTION_ID = "複製代碼"
 
 
@@ -99,6 +105,8 @@ class FarmTimer:
     planted_at: datetime
     copy_code: str
     emitted_stage: str = "等待中"
+    paused_at: datetime | None = None
+    paused_seconds: int = 0
 
     @property
     def character_name(self) -> str:
@@ -112,6 +120,19 @@ class FarmTimer:
     def card_id(self) -> str:
         return f"farm:{_digest(self.timer_id)}"
 
+    def elapsed_at(self, now: datetime) -> timedelta:
+        current = _aware(now, "now")
+        paused_seconds = self.paused_seconds
+        if self.paused_at is not None:
+            paused_seconds += max(
+                0,
+                int((current - self.paused_at).total_seconds()),
+            )
+        return max(
+            current - self.planted_at - timedelta(seconds=paused_seconds),
+            timedelta(0),
+        )
+
     def to_dict(self) -> dict[str, object]:
         return {
             "timer_id": self.timer_id,
@@ -120,13 +141,19 @@ class FarmTimer:
             "planted_at": self.planted_at.isoformat(),
             "copy_code": self.copy_code,
             "emitted_stage": self.emitted_stage,
+            "paused_at": (
+                self.paused_at.isoformat()
+                if self.paused_at is not None
+                else None
+            ),
+            "paused_seconds": self.paused_seconds,
         }
 
 
 class FarmTimerService:
     """A timer starts only after a typed, confirmed planting event."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -217,8 +244,33 @@ class FarmTimerService:
             payload.get("emitted_stage", "等待中"),
             "emitted_stage",
         )
-        if stage not in {"等待中", "已成熟", "已逾時"}:
+        if stage not in {
+            "等待中",
+            "已成熟",
+            "優先收成",
+            "最高風險",
+            "作物已消失",
+            "已逾時",
+        }:
             raise ValueError("emitted_stage is invalid.")
+        raw_paused_at = payload.get("paused_at")
+        paused_at = (
+            _aware(
+                datetime.fromisoformat(
+                    _required_text(raw_paused_at, "paused_at")
+                ),
+                "paused_at",
+            )
+            if raw_paused_at is not None
+            else None
+        )
+        paused_seconds = payload.get("paused_seconds", 0)
+        if (
+            isinstance(paused_seconds, bool)
+            or not isinstance(paused_seconds, int)
+            or paused_seconds < 0
+        ):
+            raise ValueError("paused_seconds is invalid.")
         return FarmTimer(
             timer_id=_required_text(payload.get("timer_id"), "timer_id"),
             group=group,
@@ -226,6 +278,8 @@ class FarmTimerService:
             planted_at=_aware(planted_at, "planted_at"),
             copy_code=_required_text(payload.get("copy_code"), "copy_code"),
             emitted_stage=stage,
+            paused_at=paused_at,
+            paused_seconds=paused_seconds,
         )
 
     def _load(self) -> tuple[FarmTimer, ...]:
@@ -235,7 +289,7 @@ class FarmTimerService:
             payload = json.loads(self._state_path.read_text(encoding="utf-8"))
             if (
                 not isinstance(payload, Mapping)
-                or payload.get("schema_version") != self.SCHEMA_VERSION
+                or payload.get("schema_version") not in {1, self.SCHEMA_VERSION}
                 or not isinstance(payload.get("timers"), list)
             ):
                 return ()
@@ -252,18 +306,22 @@ class FarmTimerService:
         ):
             return ()
 
-    def _save(self) -> None:
+    def _save(
+        self,
+        timers: Mapping[str, FarmTimer] | None = None,
+    ) -> None:
         if self._state_path is None:
             return
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._state_path.with_name(
             f".{self._state_path.name}.{uuid.uuid4().hex}.tmp"
         )
+        timers = self._timers if timers is None else dict(timers)
         payload = {
             "schema_version": self.SCHEMA_VERSION,
             "timers": [
-                self._timers[key].to_dict()
-                for key in sorted(self._timers)
+                timers[key].to_dict()
+                for key in sorted(timers)
             ],
         }
         try:
@@ -294,8 +352,10 @@ class FarmTimerService:
             copy_code=event.copy_code,
         )
         with self._lock:
-            self._timers[timer.timer_id] = timer
-            self._save()
+            timers = dict(self._timers)
+            timers[timer.timer_id] = timer
+            self._save(timers)
+            self._timers = timers
         self._coordinator.cards.remove(timer.card_id)
         self._record(timer.character_name, "已開始獨立計時")
         return timer
@@ -304,10 +364,13 @@ class FarmTimerService:
         if not isinstance(event, FarmCompleted):
             raise TypeError("event must be FarmCompleted.")
         with self._lock:
-            timer = self._timers.pop(event.timer_id, None)
+            timer = self._timers.get(event.timer_id)
             if timer is None:
                 return False
-            self._save()
+            timers = dict(self._timers)
+            timers.pop(event.timer_id)
+            self._save(timers)
+            self._timers = timers
         self._coordinator.cards.complete(timer.card_id)
         self._record(timer.character_name, "已完成並移除提醒")
         return True
@@ -315,14 +378,26 @@ class FarmTimerService:
     def poll(self, now: datetime) -> tuple[GroupCard, ...]:
         now = _aware(now, "now")
         emitted: list[GroupCard] = []
+        plans: list[
+            tuple[FarmTimer, GroupCard, timedelta | None]
+        ] = []
         with self._lock:
+            timers = dict(self._timers)
             timer_ids = tuple(sorted(self._timers))
             for timer_id in timer_ids:
                 timer = self._timers[timer_id]
-                elapsed = now - timer.planted_at
-                if elapsed >= FARM_OVERDUE_AFTER:
-                    stage = "已逾時"
+                elapsed = timer.elapsed_at(now)
+                if timer.paused_at is not None:
+                    continue
+                if elapsed >= FARM_DISAPPEARS_AFTER:
+                    stage = "作物已消失"
                     reason = CardPriorityReason.LOSS_RISK
+                elif elapsed >= FARM_HIGHEST_RISK_AFTER:
+                    stage = "最高風險"
+                    reason = CardPriorityReason.LOSS_RISK
+                elif elapsed >= FARM_ELEVATED_AFTER:
+                    stage = "優先收成"
+                    reason = CardPriorityReason.TIME_LIMIT
                 elif elapsed >= FARM_MATURE_AFTER:
                     stage = "已成熟"
                     reason = CardPriorityReason.TIME_LIMIT
@@ -331,15 +406,76 @@ class FarmTimerService:
                 if timer.emitted_stage == stage:
                     continue
                 card = self._card(timer, stage, reason)
-                self._coordinator.show(card, shown_at=now)
-                self._timers[timer_id] = replace(
+                remaining_time = (
+                    FARM_HIGHEST_RISK_AFTER - elapsed
+                    if reason is CardPriorityReason.TIME_LIMIT
+                    else None
+                )
+                updated = replace(
                     timer,
                     emitted_stage=stage,
                 )
-                self._save()
-                self._record(timer.character_name, stage)
-                emitted.append(card)
+                timers[timer_id] = updated
+                plans.append((updated, card, remaining_time))
+            if plans:
+                self._save(timers)
+                self._timers = timers
+
+        for timer, card, remaining_time in plans:
+            presented = self._coordinator.submit(
+                self._coordinator.candidate_for_card(
+                    card,
+                    remaining_time=remaining_time,
+                ),
+                card,
+                shown_at=now,
+            )
+            self._record(timer.character_name, timer.emitted_stage)
+            if presented is not None:
+                emitted.append(presented)
         return tuple(emitted)
+
+    def handle_role_status(
+        self,
+        character_id: str,
+        status: str,
+        occurred_at: datetime,
+    ) -> bool:
+        """只讓可靠的遊戲關閉暫停該角色農場計時。"""
+        character_id = _required_text(character_id, "character_id")
+        occurred_at = _aware(occurred_at, "occurred_at")
+        if status not in {ROLE_STATUS_CLOSED, ROLE_STATUS_OPEN}:
+            return False
+        removed_cards: list[str] = []
+        with self._lock:
+            timers = dict(self._timers)
+            changed = False
+            for timer_id, timer in tuple(timers.items()):
+                if timer.character_id != character_id:
+                    continue
+                if status == ROLE_STATUS_CLOSED and timer.paused_at is None:
+                    timers[timer_id] = replace(timer, paused_at=occurred_at)
+                    removed_cards.append(timer.card_id)
+                    changed = True
+                elif status == ROLE_STATUS_OPEN and timer.paused_at is not None:
+                    paused_seconds = timer.paused_seconds + max(
+                        0,
+                        int((occurred_at - timer.paused_at).total_seconds()),
+                    )
+                    timers[timer_id] = replace(
+                        timer,
+                        paused_at=None,
+                        paused_seconds=paused_seconds,
+                        emitted_stage="等待中",
+                    )
+                    changed = True
+            if not changed:
+                return False
+            self._save(timers)
+            self._timers = timers
+        for card_id in removed_cards:
+            self._coordinator.cards.remove(card_id)
+        return True
 
     @staticmethod
     def _card(

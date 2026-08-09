@@ -37,26 +37,85 @@ class CharacterGameDataViewService:
                 life_soul="尚未安全讀取",
                 artifact="尚未安全讀取",
             )
-        obsidian = (
-            (
-                f"已開啟至第 {record.obsidian.opened_page} 頁｜"
-                f"尚餘 {record.obsidian.unlit_nodes} 個未點亮節點｜"
-                f"最後更新 {record.obsidian.updated_at}"
-            )
-            if record.obsidian is not None
-            else "尚未安全讀取"
-        )
-        life_soul = (
-            (
-                f"已讀取 {len(record.life_souls)}／"
-                f"{record.cultivated_pet_count} 隻培養寵物"
-            )
-            if record.cultivated_pet_count
-            else "尚未設定已培養寵物數量"
-        )
         return CharacterGameDataView(
-            pet_talent="尚未安全讀取",
-            obsidian=obsidian,
-            life_soul=life_soul,
-            artifact="尚未安全讀取",
+            pet_talent=self._pet_talent_summary(record),
+            obsidian=self._obsidian_summary(record),
+            life_soul=self._life_soul_summary(record),
+            artifact=self._artifact_summary(record),
         )
+
+    @staticmethod
+    def _pet_talent_summary(record) -> str:
+        snapshot = record.pet_talent
+        if snapshot is None:
+            return "尚未安全讀取"
+        pages = tuple(sorted(snapshot.pages, key=lambda item: item.page_number))
+        status = f"已讀取 {len(pages)}／4 頁"
+        if snapshot.complete:
+            status += "｜四頁已完整讀取"
+        lines = [status]
+        for page in pages:
+            lines.append(
+                f"第 {page.page_number} 頁｜{page.observed_text}｜"
+                f"最後更新 {page.updated_at}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _obsidian_summary(record) -> str:
+        snapshot = record.obsidian
+        if snapshot is None:
+            return "尚未安全讀取"
+        lines = [
+            f"已讀取 {snapshot.read_page_count}／10 頁",
+            f"最高已讀到第 {snapshot.highest_read_page} 頁",
+            f"已讀頁尚餘 {snapshot.total_unlit_nodes} 個未點亮節點",
+        ]
+        for page in snapshot.pages:
+            parts = [f"第 {page.opened_page} 頁"]
+            if page.stage is not None:
+                parts.append(page.stage)
+            if page.opened_nodes is not None:
+                parts.append(f"已亮 {page.opened_nodes} 格")
+            parts.append(f"未亮 {page.unlit_nodes} 格")
+            parts.append(f"最後更新 {page.updated_at}")
+            lines.append("｜".join(parts))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _life_soul_summary(record) -> str:
+        if not record.cultivated_pet_count:
+            return "尚未設定已培養寵物數量"
+        summary = (
+            f"已讀取 {record.read_pet_count}／"
+            f"{record.cultivated_pet_count} 隻培養寵物"
+        )
+        if not record.life_souls:
+            return summary
+        pet_lines: list[str] = []
+        for pet in record.life_souls:
+            souls = "；".join(
+                f"{soul.name}｜等級 {soul.level}｜{soul.effect}"
+                for soul in pet.souls
+            )
+            pet_lines.append(
+                f"{pet.pet_name}｜第 {pet.page_number} 頁｜"
+                f"{souls or '尚未讀到命魂'}｜"
+                f"最後更新 {pet.updated_at}"
+            )
+        return "\n".join((summary, *pet_lines))
+
+    @staticmethod
+    def _artifact_summary(record) -> str:
+        snapshot = record.artifact
+        if snapshot is None:
+            return "尚未安全讀取"
+        title = snapshot.page_name
+        if snapshot.level is not None:
+            title += f"｜等級 {snapshot.level}"
+        lines = [title]
+        lines.extend(snapshot.summary_lines)
+        if snapshot.rune_text:
+            lines.append("符文文字：" + "；".join(snapshot.rune_text))
+        lines.append(f"最後更新 {snapshot.updated_at}")
+        return "\n".join(lines)

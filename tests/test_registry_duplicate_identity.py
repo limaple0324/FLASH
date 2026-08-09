@@ -4,6 +4,9 @@ import pytest
 
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
 
 
 def duplicate_payload():
@@ -25,7 +28,7 @@ def test_store_treats_duplicate_character_ids_as_corruption(tmp_path):
     path = tmp_path / "window_registry.json"
     path.write_text(json.dumps(duplicate_payload(), ensure_ascii=False), encoding="utf-8")
 
-    store = WindowRegistryStore(path)
+    store = WindowRegistryStore(path, IdentityDataTransactionCoordinator())
     registry = store.load()
 
     assert registry.all() == ()

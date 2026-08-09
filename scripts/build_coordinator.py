@@ -218,7 +218,11 @@ class BuildCoordinator:
         cached = self._valid_cache(entry, digest)
         if cached is not None:
             return cached
-        temporary = self.cache_dir / f".{digest}.{uuid.uuid4().hex}.tmp"
+        # Keep the staging component short enough for the classic Windows
+        # path limit.  The final cache directory already carries the complete
+        # source digest; the temporary directory only needs process-unique
+        # publication identity.
+        temporary = self.cache_dir / f".tmp-{uuid.uuid4().hex}"
         temporary.mkdir(parents=True)
         try:
             target = temporary / "FLASH.exe"

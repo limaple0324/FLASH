@@ -1,7 +1,9 @@
 from datetime import datetime
 
 from cards.history_store import CardHistoryStore
+from cards.priority import CardPriorityReason
 from cards.service import CardService
+from decision.models import DecisionCategory
 from domain.activity_schedule import build_confirmed_activity_catalog
 from domain.group import CharacterGroup
 from domain.progress import TAIPEI_TIMEZONE
@@ -68,15 +70,21 @@ def test_hall_of_demons_card_appears_exactly_five_minutes_early(tmp_path):
 
 
 def test_midnight_activities_are_reminded_at_previous_day_2355(tmp_path):
-    service, _cards = _service(tmp_path)
+    service, cards = _service(tmp_path)
 
     due = service.poll(
         datetime(2026, 7, 27, 23, 55, 0, tzinfo=TAIPEI_TIMEZONE)
     )
 
-    assert {card.activity.name for card in due} == {"迷陣", "魔兵降臨"}
+    assert {card.activity.name for card in due} == {"迷陣"}
     assert all(card.current_progress == card.activity.name for card in due)
     assert all(card.name_only for card in due)
+    assert all(
+        card.priority_reason is CardPriorityReason.TIME_LIMIT for card in due
+    )
+    assert tuple(
+        entry.presentation_order.category for entry in cards.entries
+    ) == (DecisionCategory.TIME_LIMIT,)
 
 
 def test_manual_close_does_not_allow_same_occurrence_to_reappear(tmp_path):

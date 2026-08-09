@@ -8,6 +8,7 @@ from adapters.windows_input_sync import (
     normalize_input_policy,
 )
 from adapters.windows_window import WindowInfo
+from core.reconnect_policy import ReconnectScreenState
 from domain.sync_target_settings import SyncTargetSettings
 from services.deferred_sync_operation_service import (
     DeferredSyncOperationService,
@@ -248,6 +249,75 @@ def test_selected_group_identity_excludes_other_open_flash_windows():
     assert result.passed is True
     assert result.discovered_windows == 2
     assert messages.sent == [(1, 0x42), (3, 0x42)]
+
+
+def test_partial_group_sends_only_to_members_already_in_game():
+    backend = make_windows(count=2, foreground=1)
+    messages = FakeMessageBackend()
+    allowed = tuple(f"{index:064x}" for index in range(1, 4))
+    states = {
+        allowed[0]: ReconnectScreenState.CONNECTED,
+        allowed[1]: ReconnectScreenState.CONNECTED,
+        allowed[2]: ReconnectScreenState.LOGIN_START,
+    }
+    deferred = DeferredSyncOperationService()
+    sync = WindowsInputSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        allowed_fingerprints=allowed,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (allowed[2],),
+        screen_state_provider=states.get,
+        require_expected_window_count=False,
+    )
+    sync.set_controller_fingerprint(allowed[0])
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+        exclude_foreground=True,
+        source_handle=1,
+    )
+
+    assert result.passed is True
+    assert result.discovered_windows == 2
+    assert result.eligible_windows == 1
+    assert messages.sent == [(2, 0x42)]
+    assert deferred.pending() == 0
+
+
+def test_login_screen_source_cannot_start_partial_group_sync():
+    backend = make_windows(count=2, foreground=1)
+    messages = FakeMessageBackend()
+    allowed = tuple(f"{index:064x}" for index in range(1, 4))
+    states = {
+        allowed[0]: ReconnectScreenState.LOGIN_START,
+        allowed[1]: ReconnectScreenState.CONNECTED,
+    }
+    sync = WindowsInputSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        allowed_fingerprints=allowed,
+        screen_state_provider=states.get,
+        require_expected_window_count=False,
+    )
+    sync.set_controller_fingerprint(allowed[0])
+
+    result = sync.send_approved_key(
+        "B",
+        policy="all",
+        execute=True,
+        exclude_foreground=True,
+        source_handle=1,
+    )
+
+    assert result.failure_codes == ("source_not_in_game",)
+    assert messages.sent == []
 
 
 def test_selected_group_dispatch_uses_configured_fingerprint_order():

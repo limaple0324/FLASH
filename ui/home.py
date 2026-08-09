@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,10 +10,12 @@ from queue import Empty, Queue
 from threading import Event, Thread
 from tkinter import (
     BOTH,
+    BOTTOM,
     DISABLED,
     LEFT,
     NORMAL,
     RIGHT,
+    TOP,
     X,
     Y,
     Button,
@@ -27,9 +30,8 @@ from tkinter import (
     HORIZONTAL,
     IntVar,
     StringVar,
-    Toplevel,
 )
-from tkinter import colorchooser, messagebox
+from tkinter import colorchooser, font as tkfont, messagebox
 from tkinter.ttk import Progressbar
 
 from PIL import Image, ImageStat, ImageTk
@@ -63,6 +65,20 @@ from services.background_image_service import (
     DEFAULT_BACKGROUND_OPACITY,
 )
 from services.feature_card_layout_service import FeatureCardPreference
+from services.ui_font_service import (
+    CONTENT_FONT_SIZES,
+    CONTENT_HEADING_SIZES,
+    DEFAULT_CONTENT_FONT_SIZE,
+    DEFAULT_SIDEBAR_FONT_SIZE,
+    DEFAULT_UI_FONT_ID,
+    SIDEBAR_FONT_SIZES,
+    UI_FONT_FALLBACK_FAMILY,
+    UI_FONT_OPTIONS,
+    UIFontChoice,
+    normalize_content_font_size,
+    normalize_sidebar_font_size,
+    normalize_ui_font_id,
+)
 from services.card_preview_selection_service import (
     CardPreviewChoice,
     CardPreviewSelectionState,
@@ -88,6 +104,8 @@ from services.game_time_timed_click_service import (
 )
 from services.smart_reconnect_monitor import (
     DEFAULT_SMART_RECONNECT_INTERVAL_MS,
+    SMART_RECONNECT_MODE_BALANCED,
+    SMART_RECONNECT_MODE_HIGH_PERFORMANCE,
 )
 from services.smart_reconnect_capture_settings_service import (
     MINIMIZED_CAPTURE_MODE,
@@ -98,11 +116,26 @@ from services.smart_reconnect_capture_settings_service import (
 from workspace.models import WorkspaceState
 
 
+try:
+    import psutil  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
+
+
 INPUT_POLICY_LABELS = {
     "foreground_only": "僅允許前台",
     "foreground_background": "允許前台與背景",
     "all": "全部允許（含最小化）",
 }
+
+SMART_RECONNECT_CPU_WARNING_PERCENTAGE = 80
+SMART_RECONNECT_CPU_WARNING_COLOR = "#D64545"
+SMART_RECONNECT_CPU_POLL_DELAY_MS = 2_000
+SMART_RECONNECT_MODE_LABELS = {
+    SMART_RECONNECT_MODE_BALANCED: "省電模式",
+    SMART_RECONNECT_MODE_HIGH_PERFORMANCE: "高效能模式",
+}
+SMART_RECONNECT_MODE_VALUES = tuple(SMART_RECONNECT_MODE_LABELS.keys())
 
 BACKGROUND_PAGE_LABELS = {
     "home": "首頁",
@@ -378,6 +411,10 @@ def _contrast_ratio(first: str, second: str) -> float:
     return (light + 0.05) / (dark + 0.05)
 
 
+def _status_text_color(background: str) -> str:
+    return "#000000" if _contrast_ratio(background, "#000000") >= _contrast_ratio(background, "#FFFFFF") else "#FFFFFF"
+
+
 def _apply_theme_palette(name: object) -> str:
     key = (
         name
@@ -462,6 +499,22 @@ class GroupManagementViewResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SyncToggleViewResult:
+    success: bool
+    enabled: bool
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class SmartReconnectToggleViewResult:
+    """回傳智慧重連啟停的實際結果，供卡片顯示失敗原因。"""
+
+    success: bool
+    enabled: bool
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
 class FeatureCardSettingsSaveResult:
     succeeded: bool
     message: str
@@ -479,6 +532,9 @@ class _FeatureCardWidgets:
     order_frame: Frame
     toggle_button: Button
     settings_button: Button
+    control_row: Frame | None = None
+    control_title_label: Label | None = None
+    content_manager: str = ""
     title_label: Label | None = None
     title_original_pady: object | None = None
     collapsed: bool = False
@@ -488,6 +544,7 @@ class _FeatureCardWidgets:
     background_generation: int = 0
     background_photo: object | None = None
     background_after_id: str | None = None
+    persistent_children: set[object] = field(default_factory=set)
     hidden_layouts: list[
         tuple[object, str, dict[str, object]]
     ] = field(default_factory=list)
@@ -584,6 +641,28 @@ def _workspace_state_text(state: WorkspaceState) -> str:
     return f"目前組別：{group}\n目前活動：{activity}\n下一步：{next_step}"
 
 
+def _activity_schedule_visible_items(
+    state: PlayerActivitySchedule | None,
+    expanded: bool = False,
+) -> tuple[tuple[PlayerScheduledActivity, ...], int]:
+    if state is None or not state.activities:
+        return (), 0
+    items = tuple(state.activities)
+    if expanded:
+        return items, 0
+    current_index = next(
+        (index for index, item in enumerate(items) if item.status_text in {"\u9032\u884c\u4e2d", "\u6d3b\u52d5\u6642\u6bb5\u4e2d"}),
+        None,
+    )
+    upcoming = tuple(item for item in items if item.status_text == "\u5c1a\u672a\u958b\u59cb")
+    visible = (
+        items[current_index : current_index + 2]
+        if current_index is not None
+        else upcoming[:2] if upcoming else items[-1:]
+    )
+    return visible, max(0, len(items) - len(visible))
+
+
 def _activity_schedule_text(state: PlayerActivitySchedule | None) -> str:
     if state is None or not state.activities:
         return "今天沒有已登記的固定活動"
@@ -599,6 +678,27 @@ def _activity_schedule_text(state: PlayerActivitySchedule | None) -> str:
             description = " ".join(activity.description.split())
             lines.append(f"　敘述：{description}")
     return "\n".join(lines)
+
+
+def _activity_schedule_compact_text(
+    state: PlayerActivitySchedule | None,
+    expanded: bool = False,
+) -> str:
+    if state is None or not state.activities:
+        return _activity_schedule_text(state)
+    visible, _hidden = _activity_schedule_visible_items(state, expanded)
+    current = next((item for item in state.activities if item.status_text in {"\u9032\u884c\u4e2d", "\u6d3b\u52d5\u6642\u6bb5\u4e2d"}), None)
+    rendered = []
+    for index, item in enumerate(visible):
+        prefix = (
+            "目前：" if item is current else
+            "下一項：" if (current is not None or index == 0) and item.status_text == "\u5c1a\u672a\u958b\u59cb" else
+            "之後：" if item.status_text == "\u5c1a\u672a\u958b\u59cb" else "其他："
+        )
+        rendered.append(f"{prefix}{item.name}｜{item.time_text}｜適用：{item.eligibility_text or '未設定'}｜狀態：{item.status_text}｜下一步：{item.next_step}")
+        if item.description:
+            rendered.append(f"說明：{item.description}")
+    return "\n".join(rendered)
 
 
 def _safe_character_lines(
@@ -636,6 +736,20 @@ def _selected_sync_key_summary(keys: Iterable[str]) -> str:
     return "未勾選" if not ordered else "、".join(ordered)
 
 
+def smart_reconnect_cpu_usage_percent() -> float | None:
+    if psutil is None:
+        return None
+    try:
+        value = psutil.cpu_percent(interval=0.0)
+    except Exception:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    if value < 0 or value > 100:
+        return None
+    return float(value)
+
+
 class HomeView:
     """Usable SP3 shell that keeps confirmed capabilities in separate pages."""
 
@@ -648,7 +762,9 @@ class HomeView:
         input_policy: str = "all",
         on_input_policy_change=None,
         keyboard_sync_enabled: bool = False,
-        on_keyboard_sync_change: Callable[[bool], object] | None = None,
+        on_keyboard_sync_change: (
+            Callable[[bool], SyncToggleViewResult | bool] | None
+        ) = None,
         selected_sync_keys: Iterable[str] = ("ESC",),
         on_selected_sync_keys_change: (
             Callable[[tuple[str, ...]], object] | None
@@ -716,7 +832,7 @@ class HomeView:
             Callable[[], tuple[UngroupedWindow, ...]] | None
         ) = None,
         on_add_ungrouped_window_to_group: (
-            Callable[[str, str], object] | None
+            Callable[[str, str], GroupManagementViewResult] | None
         ) = None,
         on_remove_group_shortcut: (
             Callable[[str, str], object] | None
@@ -740,7 +856,7 @@ class HomeView:
             Callable[[str, str], object] | None
         ) = None,
         on_calibrate_role_id: (
-            Callable[[str, str, str], object] | None
+            Callable[[str, str], object] | None
         ) = None,
         on_read_role_id: (
             Callable[[str, str], object] | None
@@ -818,10 +934,23 @@ class HomeView:
         characters: Iterable[PlayerCharacterView] = (),
         character_choices: Iterable[PlayerCharacterDetailChoice] = (),
         smart_reconnect_enabled: bool = False,
+        smart_reconnect_auto_battle_enabled: bool = True,
+        smart_reconnect_runtime_status: str | None = None,
+        smart_reconnect_status_colors: Mapping[str, str] | None = None,
+        on_smart_reconnect_status_colors_change: (
+            Callable[[Mapping[str, str]], object] | None
+        ) = None,
         on_smart_reconnect_change: Callable[[bool], object] | None = None,
+        on_smart_reconnect_auto_battle_change: (
+            Callable[[bool], object] | None
+        ) = None,
         smart_reconnect_interval_ms: int = DEFAULT_SMART_RECONNECT_INTERVAL_MS,
         on_smart_reconnect_interval_change: (
             Callable[[int], object] | None
+        ) = None,
+        smart_reconnect_mode: str = SMART_RECONNECT_MODE_BALANCED,
+        on_smart_reconnect_mode_change: (
+            Callable[[str], object] | None
         ) = None,
         smart_reconnect_capture_modes: Mapping[str, bool] | None = None,
         on_smart_reconnect_capture_modes_change: (
@@ -882,6 +1011,20 @@ class HomeView:
         ) = None,
         theme_name: str = "classic_gold",
         on_theme_change: Callable[[str], object] | None = None,
+        show_hints: bool = False,
+        on_show_hints_change: Callable[[bool], object] | None = None,
+        ui_font_choices: Iterable[UIFontChoice] = (),
+        ui_font_id: str = DEFAULT_UI_FONT_ID,
+        sidebar_font_size: int = DEFAULT_SIDEBAR_FONT_SIZE,
+        content_font_size: int = DEFAULT_CONTENT_FONT_SIZE,
+        ui_font_failure_message: str = "",
+        on_ui_font_change: Callable[[str], object] | None = None,
+        on_sidebar_font_size_change: (
+            Callable[[int], object] | None
+        ) = None,
+        on_content_font_size_change: (
+            Callable[[int], object] | None
+        ) = None,
         feature_card_preference_provider: (
             Callable[[str, str], FeatureCardPreference] | None
         ) = None,
@@ -1041,6 +1184,7 @@ class HomeView:
             on_add_ungrouped_window_to_group
         )
         self._ungrouped_windows_frame = None
+        self._ungrouped_status_label: Label | None = None
         self._ungrouped_window_group_variables: dict[str, StringVar] = {}
         self.on_remove_group_shortcut = on_remove_group_shortcut
         self.on_set_group_main = on_set_group_main
@@ -1143,8 +1287,48 @@ class HomeView:
             raise TypeError(
                 "character_choices must contain PlayerCharacterDetailChoice values."
             )
+        self._selected_character_detail: PlayerCharacterDetail | None = None
+        self._on_save_selected_character_note: (
+            Callable[[str], PlayerCharacterDetail] | None
+        ) = None
+        self._on_clear_selected_character_note: (
+            Callable[[], PlayerCharacterDetail] | None
+        ) = None
+        self._on_selected_character_detail_error: (
+            Callable[[Exception], object] | None
+        ) = None
         self.smart_reconnect_enabled = bool(smart_reconnect_enabled)
+        self.smart_reconnect_auto_battle_enabled = (
+            smart_reconnect_auto_battle_enabled
+            if isinstance(smart_reconnect_auto_battle_enabled, bool)
+            else True
+        )
+        self.smart_reconnect_runtime_status = smart_reconnect_runtime_status
+        self._smart_reconnect_failure_message = ""
+        self._last_smart_reconnect_runtime_status = (
+            smart_reconnect_runtime_status
+            if smart_reconnect_runtime_status in {"已開啟", "重連中", "重連失敗"}
+            else None
+        )
+        self._smart_reconnect_runtime_presentation: (
+            tuple[str | None, str, str, str] | None
+        ) = None
+        default_status_colors = {"已開啟": SUCCESS, "重連中": WARNING, "重連失敗": "#D64545"}
+        supplied_colors = smart_reconnect_status_colors or {}
+        self.smart_reconnect_status_colors = {
+            name: (
+                supplied_colors.get(name, color).upper()
+                if isinstance(supplied_colors.get(name, color), str)
+                and re.fullmatch(r"#[0-9A-Fa-f]{6}", supplied_colors.get(name, color))
+                else color
+            )
+            for name, color in default_status_colors.items()
+        }
+        self.on_smart_reconnect_status_colors_change = on_smart_reconnect_status_colors_change
         self.on_smart_reconnect_change = on_smart_reconnect_change
+        self.on_smart_reconnect_auto_battle_change = (
+            on_smart_reconnect_auto_battle_change
+        )
         self.smart_reconnect_interval_ms = (
             smart_reconnect_interval_ms
             if isinstance(smart_reconnect_interval_ms, int)
@@ -1154,6 +1338,14 @@ class HomeView:
         )
         self.on_smart_reconnect_interval_change = (
             on_smart_reconnect_interval_change
+        )
+        self.smart_reconnect_mode = (
+            smart_reconnect_mode
+            if smart_reconnect_mode in SMART_RECONNECT_MODE_VALUES
+            else SMART_RECONNECT_MODE_BALANCED
+        )
+        self.on_smart_reconnect_mode_change = (
+            on_smart_reconnect_mode_change
         )
         self.smart_reconnect_capture_modes = (
             SmartReconnectCaptureSettings.from_value(
@@ -1201,6 +1393,46 @@ class HomeView:
             else "classic_gold"
         )
         self.on_theme_change = on_theme_change
+        self.show_hints = bool(show_hints)
+        self.on_show_hints_change = on_show_hints_change
+        provided_font_choices = tuple(ui_font_choices)
+        if tuple(
+            (choice.font_id, choice.display_name)
+            for choice in provided_font_choices
+            if isinstance(choice, UIFontChoice)
+        ) != UI_FONT_OPTIONS:
+            provided_font_choices = tuple(
+                UIFontChoice(
+                    font_id,
+                    display_name,
+                    UI_FONT_FALLBACK_FAMILY,
+                    UI_FONT_FALLBACK_FAMILY,
+                )
+                for font_id, display_name in UI_FONT_OPTIONS
+            )
+        self.ui_font_choices = provided_font_choices
+        self._ui_font_choices_by_id = {
+            choice.font_id: choice for choice in self.ui_font_choices
+        }
+        self._ui_font_ids_by_display_name = {
+            choice.display_name: choice.font_id
+            for choice in self.ui_font_choices
+        }
+        self.ui_font_id = normalize_ui_font_id(ui_font_id)
+        self.sidebar_font_size = normalize_sidebar_font_size(
+            sidebar_font_size
+        )
+        self.content_font_size = normalize_content_font_size(
+            content_font_size
+        )
+        self.ui_font_failure_message = (
+            ui_font_failure_message.strip()
+            if isinstance(ui_font_failure_message, str)
+            else ""
+        )
+        self.on_ui_font_change = on_ui_font_change
+        self.on_sidebar_font_size_change = on_sidebar_font_size_change
+        self.on_content_font_size_change = on_content_font_size_change
         self.feature_card_preference_provider = (
             feature_card_preference_provider
         )
@@ -1257,7 +1489,7 @@ class HomeView:
         self._feature_card_selector: OptionMenu | None = None
         self._feature_card_choice_ids: dict[str, str] = {}
         self._feature_card_selected_id: str | None = None
-        self._feature_card_settings_dialog: Toplevel | None = None
+        self._feature_card_settings_dialog: Frame | None = None
         self._feature_card_title_entry: Entry | None = None
         self._feature_card_status_label: Label | None = None
         self._pending_card_title_reset_id: str | None = None
@@ -1272,10 +1504,14 @@ class HomeView:
         self._card_background_prepare_poll_id: str | None = None
         self._card_background_prepare_message = ""
         self._feature_card_save_error = ""
+        self._hint_labels: list[Label] = []
+        self._hint_pack_info: dict[Label, dict[str, object]] = {}
+        self._show_hints_variable: IntVar | None = None
         self._card_background_choose_button: Button | None = None
         self._card_background_cancel_button: Button | None = None
         self._card_background_progress_bar: Progressbar | None = None
         self._navigation_buttons: dict[str, Button] = {}
+        self._navigation_frame: Frame | None = None
         self._workspace_label: Label | None = None
         self._activity_schedule_label: Label | None = None
         self._activity_description_variable: StringVar | None = None
@@ -1283,6 +1519,8 @@ class HomeView:
         self._activity_description_status_label: Label | None = None
         self._activity_description_choice_ids: dict[str, str] = {}
         self._card_label: Label | None = None
+        self._game_data_status_label: Label | None = None
+        self._game_data_status_text = "尚未安全讀取"
         self._card_actions_frame: Frame | None = None
         self._target_label: Label | None = None
         self._group_value_label: Label | None = None
@@ -1291,8 +1529,13 @@ class HomeView:
         self._habit_observation_days_entry: Entry | None = None
         self._habit_preferences_frame: Frame | None = None
         self._habit_status_label: Label | None = None
+        self._habit_management_frame: Frame | None = None
+        self._habit_management_button: Button | None = None
+        self._habit_management_status_label: Label | None = None
         self._keyboard_sync_label: Label | None = None
         self._keyboard_sync_button: Button | None = None
+        self._keyboard_sync_status_message = ""
+        self._keyboard_sync_status_color = MUTED
         self._sync_key_variables: dict[str, IntVar] = {}
         self._sync_key_count_label: Label | None = None
         self._sync_key_summary_label: Label | None = None
@@ -1303,6 +1546,17 @@ class HomeView:
         self._smart_reconnect_label: Label | None = None
         self._smart_reconnect_button: Button | None = None
         self._smart_reconnect_interval_entry: Entry | None = None
+        self._smart_reconnect_mode_variable: StringVar | None = None
+        self._smart_reconnect_mode_label_to_value: dict[str, str] = {}
+        self._smart_reconnect_mode_value_to_label: dict[str, str] = (
+            {
+                value: label
+                for value, label in SMART_RECONNECT_MODE_LABELS.items()
+            }
+        )
+        self._smart_reconnect_mode_value: str = self.smart_reconnect_mode
+        self._smart_reconnect_cpu_label: Label | None = None
+        self._smart_reconnect_cpu_after_id: str | None = None
         self._smart_reconnect_capture_mode_variables: dict[str, IntVar] = {}
         self._smart_reconnect_capture_mode_status_label: Label | None = None
         self._reconnect_failure_card: Frame | None = None
@@ -1320,6 +1574,9 @@ class HomeView:
         self._auto_click_toggle_button: Button | None = None
         self._group_entries_frame: Frame | None = None
         self._group_setting_message_label: Label | None = None
+        self._group_selection_status_label: Label | None = None
+        self._group_selection_buttons: dict[str, Button] = {}
+        self._role_id_messages: dict[str, str] = {}
         self._group_master_lock_button: Button | None = None
         self._group_add_button: Button | None = None
         self._group_clear_button: Button | None = None
@@ -1335,6 +1592,7 @@ class HomeView:
         self._group_reorder_original: tuple[str, ...] = ()
         self._group_reorder_working: list[str] = []
         self._group_drag_entry_id: str | None = None
+        self._group_drag_preview: Label | None = None
         self._group_launch_running = False
         self._group_launch_status_label: Label | None = None
         self._group_launch_hotkey_variable: StringVar | None = None
@@ -1345,6 +1603,8 @@ class HomeView:
         self._window_size_after_id: str | None = None
         self._game_time_offset_entry: Entry | None = None
         self._game_time_auto_variable: IntVar | None = None
+        self._game_time_sidebar_card: Frame | None = None
+        self._game_time_title_label: Label | None = None
         self._game_time_value_label: Label | None = None
         self._game_time_after_id: str | None = None
         self._timed_click_target_entry: Entry | None = None
@@ -1369,6 +1629,16 @@ class HomeView:
         self._page_canvas: Canvas | None = None
         self._page_canvas_window: int | None = None
         self._theme_variable: StringVar | None = None
+        self._ui_font_variable: StringVar | None = None
+        self._sidebar_font_size_variable: StringVar | None = None
+        self._content_font_size_variable: StringVar | None = None
+        self._ui_font_menu: OptionMenu | None = None
+        self._sidebar_font_size_menu: OptionMenu | None = None
+        self._content_font_size_menu: OptionMenu | None = None
+        self._font_status_label: Label | None = None
+        self._sidebar: Frame | None = None
+        self._content_root: Frame | None = None
+        self._page_heading_labels: list[Label] = []
         self._background_status_label: Label | None = None
         self._background_sidebar_label: Label | None = None
         self._background_sidebar_photo = None
@@ -1447,6 +1717,180 @@ class HomeView:
             ),
         }
 
+    def _selected_ui_font_family(self) -> str:
+        choice = self._ui_font_choices_by_id.get(self.ui_font_id)
+        if choice is None or not choice.ui_family.strip():
+            return UI_FONT_FALLBACK_FAMILY
+        return choice.ui_family.strip()
+
+    def _ui_font_display_name(self, font_id: str | None = None) -> str:
+        choice = self._ui_font_choices_by_id.get(
+            font_id or self.ui_font_id
+        )
+        if choice is None:
+            return self._ui_font_choices_by_id[
+                DEFAULT_UI_FONT_ID
+            ].display_name
+        return choice.display_name
+
+    def _configure_widget_font(
+        self,
+        widget,
+        size: int,
+    ) -> None:
+        try:
+            current = tkfont.Font(
+                root=self.parent,
+                font=widget.cget("font"),
+            )
+        except Exception:
+            return
+        actual = current.actual()
+        styles: list[str] = []
+        if actual.get("weight") == "bold":
+            styles.append("bold")
+        if actual.get("slant") == "italic":
+            styles.append("italic")
+        if bool(actual.get("underline")):
+            styles.append("underline")
+        if bool(actual.get("overstrike")):
+            styles.append("overstrike")
+        font_specification = (
+            self._selected_ui_font_family(),
+            int(size),
+            *styles,
+        )
+        try:
+            widget.configure(font=font_specification)
+        except Exception:
+            return
+        if isinstance(widget, OptionMenu):
+            try:
+                widget["menu"].configure(font=font_specification)
+            except Exception:
+                pass
+
+    def _apply_font_tree(
+        self,
+        root,
+        size: int,
+    ) -> None:
+        self._configure_widget_font(root, size)
+        try:
+            children = tuple(root.winfo_children())
+        except Exception:
+            return
+        for child in children:
+            self._apply_font_tree(child, size)
+
+    def _apply_ui_typography(self) -> None:
+        if self._content_root is not None:
+            self._apply_font_tree(
+                self._content_root,
+                self.content_font_size,
+            )
+        runtime_label = getattr(
+            self,
+            "_smart_reconnect_runtime_label",
+            None,
+        )
+        if runtime_label is not None:
+            self._configure_widget_font(
+                runtime_label,
+                self.content_font_size,
+            )
+        if self._sidebar is not None:
+            self._apply_font_tree(
+                self._sidebar,
+                self.sidebar_font_size,
+            )
+        heading_size = CONTENT_HEADING_SIZES[self.content_font_size]
+        for label in tuple(self._page_heading_labels):
+            self._configure_widget_font(
+                label,
+                heading_size,
+            )
+        try:
+            self.parent.update_idletasks()
+        except Exception:
+            return
+        self._sync_page_scroll_region()
+
+    def _change_ui_font_selection(self, display_name: str) -> None:
+        previous = self.ui_font_id
+        requested = self._ui_font_ids_by_display_name.get(display_name)
+        if requested is None or requested == previous:
+            return
+        try:
+            accepted = (
+                self.on_ui_font_change(requested)
+                if self.on_ui_font_change is not None
+                else True
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            accepted = False
+        if accepted is False:
+            if self._ui_font_variable is not None:
+                self._ui_font_variable.set(
+                    self._ui_font_display_name(previous)
+                )
+            return
+        self.ui_font_id = requested
+        self._apply_ui_typography()
+
+    def _change_sidebar_font_size_selection(self, value: str) -> None:
+        previous = self.sidebar_font_size
+        try:
+            requested = int(value)
+        except (TypeError, ValueError):
+            requested = -1
+        if requested not in SIDEBAR_FONT_SIZES or requested == previous:
+            if self._sidebar_font_size_variable is not None:
+                self._sidebar_font_size_variable.set(str(previous))
+            return
+        try:
+            accepted = (
+                self.on_sidebar_font_size_change(requested)
+                if self.on_sidebar_font_size_change is not None
+                else True
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            accepted = False
+        if accepted is False:
+            if self._sidebar_font_size_variable is not None:
+                self._sidebar_font_size_variable.set(str(previous))
+            return
+        self.sidebar_font_size = requested
+        self._apply_ui_typography()
+
+    def _change_content_font_size_selection(self, value: str) -> None:
+        previous = self.content_font_size
+        try:
+            requested = int(value)
+        except (TypeError, ValueError):
+            requested = -1
+        if requested not in CONTENT_FONT_SIZES or requested == previous:
+            if self._content_font_size_variable is not None:
+                self._content_font_size_variable.set(str(previous))
+            return
+        try:
+            accepted = (
+                self.on_content_font_size_change(requested)
+                if self.on_content_font_size_change is not None
+                else True
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            accepted = False
+        if accepted is False:
+            if self._content_font_size_variable is not None:
+                self._content_font_size_variable.set(str(previous))
+            return
+        self.content_font_size = requested
+        self._apply_ui_typography()
+
     @staticmethod
     def _button(parent, text: str, command=None, *, primary: bool = False):
         legacy_gold = (
@@ -1481,8 +1925,8 @@ class HomeView:
         self,
         parent,
         *,
-        padx: int = 18,
-        pady: int = 16,
+        padx: int = 14,
+        pady: int = 10,
         card_id: str | None = None,
         title: str | None = None,
         order_frame: Frame | None = None,
@@ -1516,42 +1960,30 @@ class HomeView:
         )
         background_label.place(x=0, y=0, relwidth=1, relheight=1)
         background_label.lower()
+        control_row = Frame(frame, bg=SURFACE)
+        control_title_label = Label(
+            control_row,
+            text=clean_title,
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        )
+        control_title_label.pack(side=LEFT, fill=X, expand=True)
         toggle_button = self._button(
-            frame,
+            control_row,
             "收合",
             lambda selected=clean_id: self._toggle_feature_card(selected),
         )
-        toggle_offset, settings_offset = _feature_card_control_offsets(
-            toggle_button.winfo_reqwidth()
-        )
-        toggle_button.place(
-            relx=1.0,
-            x=toggle_offset,
-            y=6,
-            anchor="ne",
-        )
+        toggle_button.pack(side=RIGHT, padx=(8, 0))
         settings_button = self._button(
-            frame,
+            control_row,
             "設定",
             lambda selected=clean_id: self._open_feature_card_settings(
                 selected
             ),
         )
-        settings_button.place(
-            relx=1.0,
-            x=settings_offset,
-            y=6,
-            anchor="ne",
-        )
-        frame.configure(
-            pady=_feature_card_content_pady(
-                pady,
-                max(
-                    int(settings_button.winfo_reqheight()),
-                    int(toggle_button.winfo_reqheight()),
-                ),
-            )
-        )
+        settings_button.pack(side=RIGHT)
         widgets = _FeatureCardWidgets(
             card_id=clean_id,
             page=page,
@@ -1560,6 +1992,8 @@ class HomeView:
             order_frame=order_frame or frame,
             toggle_button=toggle_button,
             settings_button=settings_button,
+            control_row=control_row,
+            control_title_label=control_title_label,
             collapsed=False,
             background_label=background_label,
         )
@@ -1583,7 +2017,7 @@ class HomeView:
             return FeatureCardPreference(
                 card_id=card_id,
                 title=default_title,
-                collapsed=False,
+                collapsed=True,
             )
         try:
             preference = self.feature_card_preference_provider(
@@ -1595,15 +2029,43 @@ class HomeView:
             return FeatureCardPreference(
                 card_id=card_id,
                 title=default_title,
-                collapsed=False,
+                collapsed=True,
             )
         if not isinstance(preference, FeatureCardPreference):
             return FeatureCardPreference(
                 card_id=card_id,
                 title=default_title,
-                collapsed=False,
+                collapsed=True,
             )
         return preference
+
+    def _feature_card_header_button(
+        self,
+        card_id: str,
+        text: str,
+        command: Callable[[], object],
+    ) -> Button:
+        widgets = self._feature_cards[card_id]
+        button = self._button(widgets.control_row, text, command)
+        button.pack(side=RIGHT, padx=(8, 0))
+        return button
+
+    def _keep_feature_card_status(
+        self,
+        card_id: str,
+        widget: object,
+    ) -> None:
+        widgets = self._feature_cards.get(card_id)
+        if widgets is None:
+            return
+        direct_child = widget
+        while (
+            direct_child is not None
+            and getattr(direct_child, "master", None) is not widgets.frame
+        ):
+            direct_child = getattr(direct_child, "master", None)
+        if direct_child is not None:
+            widgets.persistent_children.add(direct_child)
 
     def _finalize_feature_cards(self, page: str) -> None:
         card_ids = tuple(self._feature_cards_by_page.get(page, ()))
@@ -1613,61 +2075,122 @@ class HomeView:
                 card_id,
                 widgets.default_title,
             )
-            def label_tree(parent) -> tuple[Label, ...]:
+            direct_children = tuple(widgets.frame.winfo_children())
+            grid_children = tuple(
+                child for child in direct_children
+                if child not in (widgets.background_label, widgets.control_row)
+                and str(child.winfo_manager()) == "grid"
+            )
+            pack_children = tuple(
+                child for child in direct_children
+                if child not in (widgets.background_label, widgets.control_row)
+                and str(child.winfo_manager()) == "pack"
+            )
+            widgets.content_manager = "grid" if grid_children else "pack"
+            def matching_titles(parent) -> tuple[Label, ...]:
                 found: list[Label] = []
                 for child in parent.winfo_children():
-                    if isinstance(child, Label):
+                    if child is widgets.control_row:
+                        continue
+                    if isinstance(child, Label) and str(child.cget("text")) == widgets.default_title:
                         found.append(child)
-                    found.extend(label_tree(child))
+                    found.extend(matching_titles(child))
                 return tuple(found)
-
-            labels = tuple(
-                label
-                for label in label_tree(widgets.frame)
-                if label is not widgets.background_label
-            )
-            title_label = next(
-                (
-                    label
-                    for label in labels
-                    if str(label.cget("text")) == widgets.default_title
-                ),
-                None,
-            )
-            if title_label is None:
-                title_label = next(iter(labels), None)
-            widgets.title_label = title_label
-            if title_label is not None:
-                widgets.title_original_pady = title_label.cget("pady")
-                title_label.configure(
-                    text=preference.title,
-                    cursor="fleur",
+            for child in matching_titles(widgets.frame):
+                if str(child.winfo_manager()) == "grid":
+                    child.grid_remove()
+                elif str(child.winfo_manager()) == "pack":
+                    child.pack_forget()
+            if widgets.content_manager == "grid":
+                columns = 1
+                for child in grid_children:
+                    info = child.grid_info()
+                    child.grid_configure(row=int(info.get("row", 0)) + 1)
+                    columns = max(columns, int(info.get("column", 0)) + int(info.get("columnspan", 1)))
+                widgets.control_row.grid(row=0, column=0, columnspan=columns, sticky="ew", pady=(0, 8))
+                widgets.frame.grid_columnconfigure(0, weight=1)
+            else:
+                before = next(
+                    (child for child in pack_children if str(child.winfo_manager()) == "pack"),
+                    None,
                 )
-                title_label.bind(
-                    "<ButtonPress-1>",
-                    lambda _event, selected=card_id: (
-                        self._start_feature_card_drag(selected)
-                    ),
-                    add="+",
-                )
-                title_label.bind(
-                    "<ButtonRelease-1>",
-                    lambda event, selected=card_id: (
-                        self._finish_feature_card_drag(selected, event)
-                    ),
-                    add="+",
-                )
+                if before is not None:
+                    widgets.control_row.pack(fill=X, pady=(0, 8), before=before)
+                else:
+                    widgets.control_row.pack(fill=X, pady=(0, 8))
+            widgets.control_title_label.configure(text=preference.title, cursor="fleur")
+            widgets.title_label = widgets.control_title_label
+            widgets.title_original_pady = widgets.control_title_label.cget("pady")
+            widgets.control_title_label.bind("<ButtonPress-1>", lambda _event, selected=card_id: self._start_feature_card_drag(selected), add="+")
+            widgets.control_title_label.bind("<ButtonRelease-1>", lambda event, selected=card_id: self._finish_feature_card_drag(selected, event), add="+")
             self._load_feature_card_background(card_id)
-            self._set_feature_card_collapsed(
-                widgets,
-                preference.collapsed,
-                persist=False,
-            )
-            # Full-width contents are created after these placed controls.
-            # Raise the controls so later labels cannot cover their text.
-            widgets.settings_button.lift()
-            widgets.toggle_button.lift()
+            self._set_feature_card_collapsed(widgets, preference.collapsed, persist=False)
         self._apply_saved_feature_card_order(page)
+
+    def _hint_label(self, parent, text: str, **kwargs) -> Label:
+        label = Label(parent, text=text, **kwargs)
+        self._hint_labels.append(label)
+        return label
+
+    def _apply_hints_visibility(self) -> None:
+        for label in tuple(self._hint_labels):
+            try:
+                if not label.winfo_exists():
+                    continue
+                manager = str(label.winfo_manager())
+            except Exception:
+                continue
+            if self.show_hints:
+                if manager:
+                    continue
+                pack_info = self._hint_pack_info.pop(label, None)
+                if not pack_info:
+                    continue
+                clean_info = {
+                    key: value
+                    for key, value in pack_info.items()
+                    if key != "in"
+                }
+                siblings = label.master.winfo_children()
+                try:
+                    index = siblings.index(label)
+                except ValueError:
+                    index = -1
+                before = next(
+                    (
+                        sibling
+                        for sibling in siblings[index + 1 :]
+                        if str(sibling.winfo_manager()) == "pack"
+                    ),
+                    None,
+                )
+                if before is not None:
+                    label.pack(before=before, **clean_info)
+                else:
+                    label.pack(**clean_info)
+                continue
+            if manager == "pack":
+                self._hint_pack_info[label] = dict(label.pack_info())
+                label.pack_forget()
+
+    def _toggle_show_hints(self) -> None:
+        variable = self._show_hints_variable
+        if variable is None:
+            return
+        requested = bool(variable.get())
+        try:
+            if self.on_show_hints_change is not None:
+                accepted = self.on_show_hints_change(requested)
+                if accepted is False:
+                    variable.set(int(self.show_hints))
+                    return
+        except Exception as error:
+            self._report_refresh_error(error)
+            variable.set(int(self.show_hints))
+            return
+        self.show_hints = requested
+        self._apply_hints_visibility()
+        self._sync_page_scroll_region()
 
     def _set_feature_card_collapsed(
         self,
@@ -1680,8 +2203,10 @@ class HomeView:
             widgets.hidden_layouts.clear()
             keep = {
                 widgets.background_label,
+                widgets.control_row,
                 widgets.toggle_button,
                 widgets.settings_button,
+                *widgets.persistent_children,
             }
             title_container = widgets.title_label
             while (
@@ -1756,6 +2281,7 @@ class HomeView:
         widgets.toggle_button.configure(
             text="展開" if widgets.collapsed else "收合"
         )
+        self._apply_hints_visibility()
         if persist and self.on_feature_card_collapsed_change is not None:
             try:
                 self.on_feature_card_collapsed_change(
@@ -2053,12 +2579,7 @@ class HomeView:
     def build(self):
         active_page = self._active_page
         if self._feature_card_settings_dialog is not None:
-            try:
-                self._feature_card_settings_dialog.grab_release()
-                self._feature_card_settings_dialog.destroy()
-            except Exception:
-                pass
-            self._feature_card_settings_dialog = None
+            self._close_feature_card_settings()
         self._cancel_background_resize()
         self._clear_background_display_images(restore_widgets=False)
         self._cancel_window_size_poll()
@@ -2091,6 +2612,10 @@ class HomeView:
         self._pages.clear()
         self._feature_cards.clear()
         self._feature_cards_by_page.clear()
+        self._hint_labels.clear()
+        self._hint_pack_info.clear()
+        self._page_heading_labels.clear()
+        self._font_status_label = None
         self._building_page_name = None
         self._navigation_buttons.clear()
         self._background_page_labels.clear()
@@ -2104,12 +2629,25 @@ class HomeView:
         root = Frame(self.parent, bg=BACKGROUND)
         root.pack(fill=BOTH, expand=True)
         self._root = root
+        self._smart_reconnect_runtime_presentation = None
+        self._smart_reconnect_runtime_label = Label(
+            root,
+            text="",
+            font=("Microsoft JhengHei UI", 11, "bold"),
+            bg=SURFACE,
+            anchor="w",
+            padx=16,
+            pady=7,
+        )
+        self._smart_reconnect_runtime_label.pack(fill=X)
 
         body = Frame(root, bg=BACKGROUND)
+        self._body = body
         body.pack(fill=BOTH, expand=True)
-        sidebar = Frame(body, bg=SIDEBAR, width=176, padx=12, pady=16)
+        sidebar = Frame(body, bg=SIDEBAR, width=212, padx=10, pady=12)
         sidebar.pack(side=LEFT, fill=Y)
         sidebar.pack_propagate(False)
+        self._sidebar = sidebar
         self._background_sidebar_label = Label(
             sidebar,
             bg=SIDEBAR,
@@ -2124,7 +2662,7 @@ class HomeView:
             relheight=1,
         )
         self._background_sidebar_label.lower()
-        content_shell = Frame(body, bg=BACKGROUND, padx=22, pady=20)
+        content_shell = Frame(body, bg=BACKGROUND, padx=16, pady=14)
         content_shell.pack(side=LEFT, fill=BOTH, expand=True)
         scrollbar = Scrollbar(content_shell, orient="vertical")
         scrollbar.pack(side=RIGHT, fill=Y)
@@ -2144,6 +2682,7 @@ class HomeView:
             state="hidden",
         )
         content = Frame(canvas, bg=BACKGROUND)
+        self._content_root = content
         canvas_window = canvas.create_window(
             (0, 0),
             window=content,
@@ -2171,9 +2710,12 @@ class HomeView:
             ("records", "紀錄"),
             ("settings", "設定"),
         )
+        navigation_frame = Frame(sidebar, bg=SIDEBAR)
+        self._navigation_frame = navigation_frame
+        navigation_frame.pack(side=TOP, fill=X)
         for key, label in page_specs:
             button = Button(
-                sidebar,
+                navigation_frame,
                 text=label,
                 command=lambda selected=key: self.show_page(selected),
                 anchor="w",
@@ -2185,11 +2727,12 @@ class HomeView:
                 relief="flat",
                 bd=0,
                 padx=14,
-                pady=10,
+                pady=8,
                 cursor="hand2",
             )
             button.pack(fill=X, pady=2)
             self._navigation_buttons[key] = button
+        self._build_game_time_sidebar(sidebar)
 
         builders = (
             ("home", self._build_home_page),
@@ -2218,6 +2761,8 @@ class HomeView:
             background_label.place(x=0, y=0, relwidth=1, relheight=1)
             background_label.lower()
             self._background_page_labels[page_name] = background_label
+        self._apply_ui_typography()
+        self._apply_hints_visibility()
         self.show_page(
             active_page if active_page in self._pages else "home"
         )
@@ -3308,26 +3853,27 @@ class HomeView:
         self._group_value_label.pack(fill=X, pady=(3, 0))
 
     def _page_heading(self, parent, title: str, subtitle: str) -> None:
-        Label(
+        heading = Label(
             parent,
             text=title,
             font=("Microsoft JhengHei UI", 20, "bold"),
             bg=BACKGROUND,
             fg=TEXT,
             anchor="w",
-        ).pack(fill=X)
-        Label(
+        )
+        heading.pack(fill=X)
+        self._page_heading_labels.append(heading)
+        self._hint_label(
             parent,
             text=subtitle,
             font=("Microsoft JhengHei UI", 10),
             bg=BACKGROUND,
             fg=MUTED,
             anchor="w",
-        ).pack(fill=X, pady=(2, 16))
+        ).pack(fill=X, pady=(2, 10))
 
     def _build_home_page(self, parent) -> Frame:
         page = Frame(parent, bg=BACKGROUND)
-        self._page_heading(page, "今天要做什麼", "只顯示現在需要注意的內容")
 
         card_stack = Frame(page, bg=BACKGROUND)
         card_stack.pack(fill=X)
@@ -3341,64 +3887,24 @@ class HomeView:
         workspace_card = self._card(
             workspace_section,
             card_id="home.workspace",
-            title="目前工作區",
+            title="目前總覽",
             order_frame=workspace_section,
         )
         workspace_card.pack(fill=X)
-        Label(
-            workspace_card,
-            text="目前工作區",
-            font=("Microsoft JhengHei UI", 10),
-            bg=SURFACE,
-            fg=MUTED,
-            anchor="w",
-        ).pack(fill=X)
         self._workspace_label = Label(
             workspace_card,
-            text=_workspace_state_text(self.workspace_state),
+            text=self._home_overview_text(),
             justify=LEFT,
             font=("Microsoft JhengHei UI", 11),
             bg=SURFACE,
             fg=TEXT,
             anchor="w",
+            wraplength=740,
         )
         self._workspace_label.pack(fill=X, pady=(8, 0))
+        self._target_label = self._workspace_label
 
-        target_section = card_section(8)
-        target_card = self._card(
-            target_section,
-            card_id="home.group",
-            title="目前組別",
-            order_frame=target_section,
-        )
-        target_card.pack(fill=X)
-        Label(
-            target_card,
-            text="目前組別",
-            font=("Microsoft JhengHei UI", 10),
-            bg=SURFACE,
-            fg=MUTED,
-            anchor="w",
-        ).pack(fill=X)
-        self._target_label = Label(
-            target_card,
-            text=self._current_group_summary_text(),
-            font=("Microsoft JhengHei UI", 11),
-            bg=SURFACE,
-            fg=TEXT,
-            anchor="w",
-        )
-        self._target_label.pack(fill=X, pady=(8, 0))
-
-        role_section = card_section(20)
-        Label(
-            role_section,
-            text="目前組別角色",
-            font=("Microsoft JhengHei UI", 13, "bold"),
-            bg=BACKGROUND,
-            fg=TEXT,
-            anchor="w",
-        ).pack(fill=X, pady=(0, 8))
+        role_section = card_section(6)
         role_card = self._card(
             role_section,
             padx=10,
@@ -3408,14 +3914,6 @@ class HomeView:
             order_frame=role_section,
         )
         role_card.pack(fill=X)
-        Label(
-            role_card,
-            text="角色狀態",
-            font=("Microsoft JhengHei UI", 13, "bold"),
-            bg=SURFACE,
-            fg=TEXT,
-            anchor="w",
-        ).pack(fill=X, pady=(0, 8))
         self._home_role_rows_frame = Frame(role_card, bg=SURFACE)
         self._home_role_rows_frame.pack(fill=X)
         self.refresh_group_role_statuses()
@@ -3435,16 +3933,7 @@ class HomeView:
         )
         self._reconnect_failure_label.pack(fill=X)
 
-        schedule_section = card_section(20)
-        self._home_activity_heading = Label(
-            schedule_section,
-            text="今日已登記活動",
-            font=("Microsoft JhengHei UI", 13, "bold"),
-            bg=BACKGROUND,
-            fg=TEXT,
-            anchor="w",
-        )
-        self._home_activity_heading.pack(fill=X, pady=(0, 8))
+        schedule_section = card_section(6)
         schedule_card = self._card(
             schedule_section,
             pady=12,
@@ -3453,36 +3942,28 @@ class HomeView:
             order_frame=schedule_section,
         )
         schedule_card.pack(fill=X)
-        Label(
-            schedule_card,
-            text="今日活動",
-            font=("Microsoft JhengHei UI", 13, "bold"),
-            bg=SURFACE,
-            fg=TEXT,
-            anchor="w",
-        ).pack(fill=X, pady=(0, 8))
         self._activity_schedule_label = Label(
             schedule_card,
-            text=_activity_schedule_text(self.activity_schedule),
+            text=_activity_schedule_compact_text(self.activity_schedule),
             justify=LEFT,
-            font=("Microsoft JhengHei UI", 10),
+            font=("Microsoft JhengHei UI", 11),
             bg=SURFACE,
             fg=TEXT,
             anchor="w",
             wraplength=740,
         )
         self._activity_schedule_label.pack(fill=X)
-        self._build_activity_description_editor(schedule_card)
+        self._activity_schedule_expanded = False
+        self._activity_schedule_toggle_button = self._feature_card_header_button(
+            "home.schedule",
+            "",
+            self._toggle_activity_schedule_details,
+        )
+        self._refresh_activity_schedule_toggle()
+        self._activity_schedule_details_frame = Frame(schedule_card, bg=SURFACE)
+        self._build_activity_description_editor(self._activity_schedule_details_frame)
 
-        reminder_section = card_section(20)
-        Label(
-            reminder_section,
-            text="需要注意",
-            font=("Microsoft JhengHei UI", 13, "bold"),
-            bg=BACKGROUND,
-            fg=TEXT,
-            anchor="w",
-        ).pack(fill=X, pady=(0, 8))
+        reminder_section = card_section(6)
         reminder = self._card(
             reminder_section,
             card_id="home.reminders",
@@ -3490,14 +3971,6 @@ class HomeView:
             order_frame=reminder_section,
         )
         reminder.pack(fill=X)
-        Label(
-            reminder,
-            text="目前提醒",
-            font=("Microsoft JhengHei UI", 13, "bold"),
-            bg=SURFACE,
-            fg=TEXT,
-            anchor="w",
-        ).pack(fill=X, pady=(0, 8))
         self._card_label = Label(
             reminder,
             text=_card_text(self.status, self.card_view_state),
@@ -3517,7 +3990,7 @@ class HomeView:
             primary=True,
         ).pack(side=RIGHT)
 
-        Label(
+        self._hint_label(
             page,
             text="沒有可信新資訊時保持安靜，不猜測活動或完成進度。",
             font=("Microsoft JhengHei UI", 10),
@@ -3527,25 +4000,39 @@ class HomeView:
         ).pack(fill=X, pady=(12, 0))
         return page
 
-    def _current_group_summary_text(self) -> str:
-        group_name = self.current_group_name
-        if not group_name:
-            return "尚未選擇組別"
+    def _home_overview_text(self) -> str:
+        state = self.workspace_state
+        group_name = (
+            state.current_group.name
+            if state.current_group is not None
+            else self.current_group_name
+        )
         entries: tuple[GroupConfigurationEntry, ...] = ()
-        if self.group_entries_provider is not None:
+        if group_name and self.group_entries_provider is not None:
             try:
                 entries = self.group_entries_provider(group_name)
             except Exception:
                 entries = ()
-        if not entries:
-            return f"{group_name}｜尚未加入角色"
-        return (
-            f"{group_name}｜主控：{entries[0].display_name}｜"
-            f"{len(entries)} 個視窗"
+        activity = (
+            state.current_activity.name
+            if state.current_activity is not None
+            else "等待可信遊戲進度"
+        )
+        return "\n".join(
+            (
+                f"目前組別：{group_name or '尚未選擇'}",
+                f"主控：{entries[0].display_name if entries else '尚未設定'}",
+                f"視窗數：{len(entries)}",
+                f"目前活動：{activity}",
+                f"下一步：{state.next_step or '尚未提供'}",
+            )
         )
 
+    def _current_group_summary_text(self) -> str:
+        return self._home_overview_text()
+
     def refresh_current_group_summary(self) -> str:
-        text = self._current_group_summary_text()
+        text = self._home_overview_text()
         if self._target_label is not None:
             self._target_label.configure(text=text, fg=TEXT)
         return text
@@ -3587,7 +4074,7 @@ class HomeView:
             card_id="records.daily_files",
             title="每日文字記錄檔",
         )
-        files_card.pack(fill=X, pady=(14, 0))
+        files_card.pack(fill=X, pady=(10, 0))
         Label(
             files_card,
             text="每日文字記錄檔",
@@ -3607,7 +4094,7 @@ class HomeView:
             card_id="records.search",
             title="依日期與角色搜尋",
         )
-        search_card.pack(fill=X, pady=(14, 0))
+        search_card.pack(fill=X, pady=(10, 0))
         Label(
             search_card,
             text="依日期與角色搜尋",
@@ -3651,7 +4138,7 @@ class HomeView:
             self._search_operation_records,
             primary=True,
         ).pack(side=RIGHT, padx=(6, 0))
-        Label(
+        self._hint_label(
             search_card,
             text="日期格式：YYYY-MM-DD；角色可輸入完整或部分名稱",
             font=("Microsoft JhengHei UI", 9),
@@ -3942,6 +4429,7 @@ class HomeView:
             title="目前組別",
         )
         selector.pack(fill=X)
+        self._group_management_details_frame = Frame(page, bg=BACKGROUND)
         Label(
             selector,
             text="目前組別",
@@ -3988,8 +4476,18 @@ class HomeView:
         self._group_launch_button.pack(side=LEFT)
         if not names or self.on_launch_group is None:
             self._group_launch_button.configure(state=DISABLED)
-        self._group_restore_button = self._button(
+        self._group_management_frame = Frame(selector, bg=SURFACE)
+        self._group_management_expanded = False
+        self._group_management_button = self._button(
             launch_row,
+            "管理組別",
+            self._toggle_group_management,
+        )
+        self._group_management_button.pack(side=LEFT, padx=(8, 0))
+        position_row = Frame(self._group_management_frame, bg=SURFACE)
+        position_row.pack(fill=X, pady=(10, 0))
+        self._group_restore_button = self._button(
+            position_row,
             "恢復上次位置",
             self._restore_current_group,
         )
@@ -3997,7 +4495,7 @@ class HomeView:
         if not names or self.on_restore_group is None:
             self._group_restore_button.configure(state=DISABLED)
         self._group_record_button = self._button(
-            launch_row,
+            position_row,
             "記錄目前位置",
             self._record_current_group_positions,
         )
@@ -4032,7 +4530,11 @@ class HomeView:
             expand=True,
             padx=(12, 0),
         )
-        hotkey_row = Frame(selector, bg=SURFACE)
+        self._keep_feature_card_status(
+            "groups.current",
+            self._group_launch_status_label,
+        )
+        hotkey_row = Frame(self._group_management_frame, bg=SURFACE)
         hotkey_row.pack(fill=X, pady=(10, 0))
         Label(
             hotkey_row,
@@ -4074,7 +4576,7 @@ class HomeView:
             or self.on_group_launch_hotkey_change is None
         ):
             group_hotkey_menu.configure(state=DISABLED)
-        group_name_row = Frame(selector, bg=SURFACE)
+        group_name_row = Frame(self._group_management_frame, bg=SURFACE)
         group_name_row.pack(fill=X, pady=(12, 0))
         self._group_name_entry = Entry(
             group_name_row,
@@ -4104,7 +4606,7 @@ class HomeView:
             "改名",
             self._rename_current_group,
         ).pack(side=LEFT, padx=(8, 0))
-        group_order_row = Frame(selector, bg=SURFACE)
+        group_order_row = Frame(self._group_management_frame, bg=SURFACE)
         group_order_row.pack(fill=X, pady=(8, 0))
         self._button(
             group_order_row,
@@ -4121,8 +4623,10 @@ class HomeView:
             "刪除組",
             self._delete_current_group,
         ).pack(side=LEFT, padx=(8, 0))
+        group_file_row = Frame(self._group_management_frame, bg=SURFACE)
+        group_file_row.pack(fill=X, pady=(8, 0))
         self._group_stop_all_button = self._button(
-            group_order_row,
+            group_file_row,
             "停止全部受管遊戲",
             self._stop_all_managed_games,
         )
@@ -4130,17 +4634,17 @@ class HomeView:
         if self.on_stop_all_managed_games is None:
             self._group_stop_all_button.configure(state=DISABLED)
         self._button(
-            group_order_row,
+            group_file_row,
             "匯出組別設定",
             self._export_group_configuration,
         ).pack(side=LEFT, padx=(16, 0))
         self._button(
-            group_order_row,
+            group_file_row,
             "匯入組別設定",
             self._import_group_configuration,
         ).pack(side=LEFT, padx=(8, 0))
-        Label(
-            selector,
+        self._hint_label(
+            self._group_management_frame,
             text="匯入時同名組別會直接更新；舊版設定保持不變。",
             font=("Microsoft JhengHei UI", 9),
             bg=SURFACE,
@@ -4149,13 +4653,13 @@ class HomeView:
         ).pack(fill=X, pady=(8, 0))
 
         entry_card = self._card(
-            page,
+            self._group_management_details_frame,
             padx=12,
             pady=12,
             card_id="groups.roles",
             title="組別角色",
         )
-        entry_card.pack(fill=X, pady=(14, 0))
+        entry_card.pack(fill=X, pady=(10, 0))
         entry_header = Frame(entry_card, bg=SURFACE)
         entry_header.pack(fill=X)
         Label(
@@ -4166,8 +4670,10 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(side=LEFT, fill=X, expand=True)
+        entry_primary_actions = Frame(entry_card, bg=SURFACE)
+        entry_primary_actions.pack(fill=X, pady=(8, 0))
         self._group_add_button = self._button(
-            entry_header,
+            entry_primary_actions,
             "加入角色到組別",
             self._add_shortcuts_to_current_group,
             primary=True,
@@ -4178,39 +4684,41 @@ class HomeView:
         self._group_reorder_cancel_button = None
         if self._group_reorder_mode:
             self._group_reorder_finish_button = self._button(
-                entry_header,
+                entry_primary_actions,
                 "完成排序",
                 self._finish_group_entry_reorder,
                 primary=True,
             )
             self._group_reorder_finish_button.pack(side=RIGHT, padx=(0, 8))
             self._group_reorder_cancel_button = self._button(
-                entry_header,
+                entry_primary_actions,
                 "取消",
                 self._cancel_group_entry_reorder,
             )
             self._group_reorder_cancel_button.pack(side=RIGHT, padx=(0, 8))
         else:
             self._group_reorder_button = self._button(
-                entry_header,
+                entry_primary_actions,
                 "調整順序",
                 self._start_group_entry_reorder,
             )
             self._group_reorder_button.pack(side=RIGHT, padx=(0, 8))
+        entry_safety_actions = Frame(entry_card, bg=SURFACE)
+        entry_safety_actions.pack(fill=X, pady=(8, 0))
         self._group_clear_button = self._button(
-            entry_header,
+            entry_safety_actions,
             "清空角色",
             self._clear_current_group,
         )
         self._group_clear_button.pack(side=RIGHT, padx=(0, 8))
         self._group_master_lock_button = self._button(
-            entry_header,
+            entry_safety_actions,
             "主窗：已上鎖",
             self._toggle_group_master_locked,
         )
         self._group_master_lock_button.pack(side=RIGHT, padx=(0, 8))
         sync_base_button = self._button(
-            entry_header,
+            entry_safety_actions,
             "設定主基準點（3秒）",
             self._start_sync_base_point_capture,
         )
@@ -4227,6 +4735,11 @@ class HomeView:
             fg=WARNING,
             anchor="w",
         )
+        self._group_setting_message_label.pack(fill=X, pady=(8, 0))
+        self._keep_feature_card_status(
+            "groups.roles",
+            self._group_setting_message_label,
+        )
         self.refresh_group_entries()
 
         ungrouped_card = self._card(
@@ -4236,8 +4749,9 @@ class HomeView:
             card_id="groups.ungrouped_windows",
             title="未分組視窗",
         )
-        ungrouped_card.pack(fill=X, pady=(14, 0))
-        Label(
+        ungrouped_card.pack(fill=X, pady=(10, 0))
+        self._group_management_details_anchor = ungrouped_card
+        self._hint_label(
             ungrouped_card,
             text="只顯示已開啟且可唯一確認的遊戲捷徑。",
             font=("Microsoft JhengHei UI", 9),
@@ -4245,18 +4759,32 @@ class HomeView:
             fg=MUTED,
             anchor="w",
         ).pack(fill=X)
+        self._ungrouped_status_label = Label(
+            ungrouped_card,
+            text="",
+            font=("Microsoft JhengHei UI", 9, "bold"),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
+        )
+        self._ungrouped_status_label.pack(fill=X, pady=(6, 0))
+        self._keep_feature_card_status(
+            "groups.ungrouped_windows",
+            self._ungrouped_status_label,
+        )
         self._ungrouped_windows_frame = Frame(ungrouped_card, bg=SURFACE)
         self._ungrouped_windows_frame.pack(fill=X, pady=(10, 0))
         self.refresh_ungrouped_windows()
 
         sync_card = self._card(
-            page,
+            self._group_management_details_frame,
             padx=12,
             pady=12,
             card_id="groups.extended_sync",
             title="延伸同步範圍",
         )
-        sync_card.pack(fill=X, pady=(14, 0))
+        sync_card.pack(fill=X, pady=(10, 0))
         Label(
             sync_card,
             text="延伸同步範圍",
@@ -4265,7 +4793,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             sync_card,
             text="從目前組別主控遞迴加入其他角色或組別主控",
             font=("Microsoft JhengHei UI", 9),
@@ -4311,7 +4839,7 @@ class HomeView:
         self._group_sync_relations_frame.pack(fill=X, pady=(10, 0))
         self.refresh_group_sync_relations()
 
-        self._build_window_size_card(page)
+        self._build_window_size_card(self._group_management_details_frame)
 
         Label(
             page,
@@ -4339,6 +4867,7 @@ class HomeView:
         ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=8)
         list_card.grid_columnconfigure(0, weight=1)
         list_card.grid_columnconfigure(1, weight=1)
+        self._group_selection_buttons = {}
         if not self.group_choices:
             Label(
                 list_card,
@@ -4359,7 +4888,7 @@ class HomeView:
                 highlightthickness=1,
             )
             row.grid(
-                row=index // 2,
+                row=1 + index // 2,
                 column=index % 2,
                 sticky="ew",
                 padx=4,
@@ -4380,11 +4909,41 @@ class HomeView:
                 bg=SURFACE,
                 fg=MUTED,
             ).pack(side=LEFT, padx=8)
-            self._button(
+            button = self._button(
                 row,
-                "選擇",
+                (
+                    "目前使用"
+                    if choice.name == self.current_group_name
+                    else "選擇"
+                ),
                 lambda name=choice.name: self._select_group(name),
-            ).pack(side=RIGHT)
+            )
+            button.pack(side=RIGHT)
+            if choice.name == self.current_group_name:
+                button.configure(state=DISABLED)
+            self._group_selection_buttons[choice.name] = button
+        status_row = 2 + (len(self.group_choices) - 1) // 2
+        self._group_selection_status_label = Label(
+            list_card,
+            text="",
+            font=("Microsoft JhengHei UI", 9, "bold"),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
+        )
+        self._group_selection_status_label.grid(
+            row=max(2, status_row),
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            padx=10,
+            pady=(6, 4),
+        )
+        self._keep_feature_card_status(
+            "groups.list",
+            self._group_selection_status_label,
+        )
         return page
 
     def _build_window_size_card(self, page) -> None:
@@ -4393,7 +4952,7 @@ class HomeView:
             card_id="groups.window_size",
             title="還原／調整遊戲視窗尺寸",
         )
-        card.pack(fill=X, pady=(14, 0))
+        card.pack(fill=X, pady=(10, 0))
         Label(
             card,
             text="還原／調整遊戲視窗尺寸",
@@ -4402,7 +4961,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             card,
             text="沿用舊版操作；尺寸是遊戲內容區，不會移動或切換視窗",
             font=("Microsoft JhengHei UI", 9),
@@ -4512,6 +5071,11 @@ class HomeView:
             title="同步輸入",
         )
         input_card.pack(fill=X)
+        self._sync_key_toggle_button = self._feature_card_header_button(
+            "sync.input",
+            "",
+            self._toggle_sync_key_settings,
+        )
         Label(
             input_card,
             text="同步輸入",
@@ -4573,13 +5137,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(side=LEFT)
-        self._sync_key_toggle_button = self._button(
-            shortcut_heading,
-            "",
-            self._toggle_sync_key_settings,
-        )
-        self._sync_key_toggle_button.pack(side=RIGHT)
-        self._sync_key_count_label = Label(
+        self._sync_key_count_label = self._hint_label(
             shortcut_summary,
             text="",
             font=("Microsoft JhengHei UI", 9),
@@ -4588,7 +5146,7 @@ class HomeView:
             anchor="w",
         )
         self._sync_key_count_label.pack(fill=X, pady=(4, 0))
-        self._sync_key_summary_label = Label(
+        self._sync_key_summary_label = self._hint_label(
             shortcut_summary,
             text="",
             font=("Microsoft JhengHei UI", 9),
@@ -4633,13 +5191,20 @@ class HomeView:
         )
         self._keyboard_sync_button.pack(side=LEFT)
         self._keyboard_sync_label = Label(
-            actions,
+            input_card,
             text="",
             font=("Microsoft JhengHei UI", 9),
             bg=SURFACE,
             fg=MUTED,
+            anchor="w",
+            justify=LEFT,
+            wraplength=720,
         )
-        self._keyboard_sync_label.pack(side=LEFT, padx=12)
+        self._keyboard_sync_label.pack(fill=X, pady=(8, 0))
+        self._keep_feature_card_status(
+            "sync.input",
+            self._keyboard_sync_label,
+        )
         self._build_feature_hotkey_selector(
             input_card,
             "sync",
@@ -4653,7 +5218,7 @@ class HomeView:
             card_id="sync.reconnect",
             title="斷線重新連線",
         )
-        reconnect_card.pack(fill=X, pady=(14, 0))
+        reconnect_card.pack(fill=X, pady=(10, 0))
         Label(
             reconnect_card,
             text="斷線重新連線",
@@ -4671,6 +5236,39 @@ class HomeView:
             anchor="w",
         )
         self._smart_reconnect_label.pack(fill=X, pady=(10, 0))
+        self._keep_feature_card_status(
+            "sync.reconnect",
+            self._smart_reconnect_label,
+        )
+        auto_battle_row = Frame(reconnect_card, bg=SURFACE)
+        auto_battle_row.pack(fill=X, pady=(6, 0))
+        self._smart_reconnect_auto_battle_variable = IntVar(
+            master=self.parent,
+            value=1 if self.smart_reconnect_auto_battle_enabled else 0,
+        )
+        self._smart_reconnect_auto_battle_checkbutton = Checkbutton(
+            auto_battle_row,
+            text="自動戰鬥",
+            variable=self._smart_reconnect_auto_battle_variable,
+            command=self._toggle_smart_reconnect_auto_battle,
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            activebackground=SURFACE,
+            selectcolor=SURFACE,
+            anchor="e",
+        )
+        self._smart_reconnect_auto_battle_checkbutton.pack(side=RIGHT)
+        color_row = Frame(reconnect_card, bg=SURFACE)
+        color_row.pack(fill=X, pady=(6, 0))
+        self._smart_reconnect_color_entries = {}
+        for name in ("已開啟", "重連中", "重連失敗"):
+            Label(color_row, text=name, font=("Microsoft JhengHei UI", 9), bg=SURFACE, fg=TEXT).pack(side=LEFT, padx=(0, 4))
+            entry = Entry(color_row, width=8, font=("Microsoft JhengHei UI", 9), bg="#F8FAFD", fg=TEXT, relief="flat")
+            entry.insert(0, self.smart_reconnect_status_colors[name])
+            entry.pack(side=LEFT, padx=(0, 8))
+            self._smart_reconnect_color_entries[name] = entry
+        self._button(color_row, "保存顏色", self._save_smart_reconnect_status_colors).pack(side=LEFT)
         self._smart_reconnect_button = self._button(
             reconnect_card,
             "",
@@ -4734,6 +5332,10 @@ class HomeView:
             fill=X,
             pady=(6, 0),
         )
+        self._keep_feature_card_status(
+            "sync.reconnect",
+            self._smart_reconnect_capture_mode_status_label,
+        )
         interval_row = Frame(reconnect_card, bg=SURFACE)
         interval_row.pack(fill=X, pady=(10, 0))
         Label(
@@ -4770,7 +5372,7 @@ class HomeView:
             "reconnect",
             "智慧重連啟閉快捷鍵",
         )
-        Label(
+        self._hint_label(
             reconnect_card,
             text="啟用後會自動判定與重試；不需逐次按重連按鈕。",
             font=("Microsoft JhengHei UI", 9),
@@ -4780,7 +5382,6 @@ class HomeView:
         ).pack(fill=X, pady=(8, 0))
         self._refresh_smart_reconnect_controls()
 
-        self._build_game_time_card(page)
         self._build_timed_click_card(page)
 
         auto_click_card = self._card(
@@ -4788,7 +5389,7 @@ class HomeView:
             card_id="sync.auto_click",
             title="連續點擊",
         )
-        auto_click_card.pack(fill=X, pady=(14, 0))
+        auto_click_card.pack(fill=X, pady=(10, 0))
         Label(
             auto_click_card,
             text="連續點擊",
@@ -4887,6 +5488,10 @@ class HomeView:
             fg=MUTED,
         )
         self._auto_click_status_label.pack(side=LEFT, padx=12)
+        self._keep_feature_card_status(
+            "sync.auto_click",
+            self._auto_click_status_label,
+        )
         self._build_feature_hotkey_selector(
             auto_click_card,
             "auto_click",
@@ -4895,48 +5500,75 @@ class HomeView:
         self._refresh_auto_click_controls()
         return page
 
-    def _build_game_time_card(self, page) -> None:
-        card = self._card(
-            page,
-            card_id="sync.game_time",
-            title="遊戲時間",
+    def _build_game_time_sidebar(self, sidebar) -> None:
+        card = Frame(
+            sidebar,
+            bg=SIDEBAR_GROUP,
+            padx=8,
+            pady=8,
+            highlightbackground=SIDEBAR_ACTIVE,
+            highlightthickness=1,
         )
-        card.pack(fill=X, pady=(14, 0))
-        Label(
+        card.pack(side=BOTTOM, fill=X, pady=(12, 0))
+        self._game_time_sidebar_card = card
+        self._game_time_title_label = Label(
             card,
             text="遊戲時間",
-            font=("Microsoft JhengHei UI", 13, "bold"),
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=SIDEBAR_GROUP,
+            fg="#FFFFFF",
+            anchor="w",
+        )
+        self._game_time_title_label.pack(fill=X)
+        self._game_time_value_label = Label(
+            card,
+            text="讀取中",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=SIDEBAR_GROUP,
+            fg="#FFFFFF",
+            anchor="w",
+        )
+        self._game_time_value_label.pack(fill=X, pady=(5, 0))
+
+    def _build_game_time_settings_card(self, page) -> None:
+        card = self._card(
+            page,
+            card_id="settings.game_time",
+            title="遊戲時間設定",
+        )
+        card.pack(fill=X, pady=(10, 0))
+        Label(
+            card,
+            text="來源：系統時間",
+            font=("Microsoft JhengHei UI", 10),
             bg=SURFACE,
-            fg=TEXT,
+            fg=MUTED,
             anchor="w",
         ).pack(fill=X)
         row = Frame(card, bg=SURFACE)
-        row.pack(fill=X, pady=(10, 0))
+        row.pack(fill=X, pady=(8, 0))
         Label(
             row,
-            text="時間來源：系統時間",
-            font=("Microsoft JhengHei UI", 9),
+            text="時間偏移（毫秒）",
+            font=("Microsoft JhengHei UI", 10),
             bg=SURFACE,
             fg=TEXT,
-        ).pack(side=LEFT, padx=(0, 12))
-        Label(
-            row,
-            text="偏移ms",
-            font=("Microsoft JhengHei UI", 9),
-            bg=SURFACE,
-            fg=MUTED,
         ).pack(side=LEFT)
         self._game_time_offset_entry = Entry(
             row,
-            width=8,
-            font=("Microsoft JhengHei UI", 10),
+            width=7,
+            font=("Microsoft JhengHei UI", 9),
             bg=BACKGROUND,
             fg=TEXT,
             relief="flat",
             bd=0,
         )
         self._game_time_offset_entry.insert(0, str(self.game_time_offset_ms))
-        self._game_time_offset_entry.pack(side=LEFT, padx=(6, 12), ipady=5)
+        self._game_time_offset_entry.pack(
+            side=RIGHT,
+            padx=(6, 0),
+            ipady=3,
+        )
         self._game_time_offset_entry.bind(
             "<FocusOut>",
             lambda _event: self._apply_game_time_settings(),
@@ -4950,36 +5582,17 @@ class HomeView:
             value=1 if self.game_time_auto_update else 0,
         )
         Checkbutton(
-            row,
+            card,
             text="自動更新",
             variable=self._game_time_auto_variable,
             command=self._apply_game_time_settings,
-            font=("Microsoft JhengHei UI", 9),
+            font=("Microsoft JhengHei UI", 10),
             bg=SURFACE,
             fg=TEXT,
             activebackground=SURFACE,
+            activeforeground=TEXT,
             selectcolor=BACKGROUND,
-        ).pack(side=LEFT, padx=(0, 12))
-        self._game_time_value_label = Label(
-            row,
-            text="遊戲時間：讀取中",
-            font=("Microsoft JhengHei UI", 10, "bold"),
-            bg=SURFACE,
-            fg=PRIMARY,
-            anchor="w",
-        )
-        self._game_time_value_label.pack(side=LEFT, fill=X, expand=True)
-        Label(
-            card,
-            text=(
-                f"偏移可設定 {MIN_TIME_OFFSET_MS}～{MAX_TIME_OFFSET_MS} 毫秒；"
-                "不讀取遊戲畫面或記憶體。"
-            ),
-            font=("Microsoft JhengHei UI", 9),
-            bg=SURFACE,
-            fg=MUTED,
-            anchor="w",
-        ).pack(fill=X, pady=(8, 0))
+        ).pack(anchor="w", pady=(5, 0))
 
     def _build_timed_click_card(self, page) -> None:
         card = self._card(
@@ -4987,7 +5600,7 @@ class HomeView:
             card_id="sync.timed_click",
             title="定時按下",
         )
-        card.pack(fill=X, pady=(14, 0))
+        card.pack(fill=X, pady=(10, 0))
         Label(
             card,
             text="定時按下",
@@ -5085,7 +5698,11 @@ class HomeView:
             anchor="w",
         )
         self._timed_click_status_label.pack(fill=X, pady=(8, 0))
-        Label(
+        self._keep_feature_card_status(
+            "sync.timed_click",
+            self._timed_click_status_label,
+        )
+        self._hint_label(
             card,
             text=(
                 "設定位置後才可啟用；只操作該唯一角色視窗，"
@@ -5199,10 +5816,54 @@ class HomeView:
         desired = not self.keyboard_sync_enabled
         if self.on_keyboard_sync_change is None:
             return
-        accepted = self.on_keyboard_sync_change(desired)
-        if accepted is False:
+        previous = self.keyboard_sync_enabled
+        if desired:
+            self._keyboard_sync_status_message = "正在檢查同步條件…"
+            self._keyboard_sync_status_color = WARNING
+            self._refresh_keyboard_sync_controls()
+            try:
+                self.parent.update_idletasks()
+            except Exception:
+                pass
+        try:
+            result = self.on_keyboard_sync_change(desired)
+        except Exception as error:
+            self.keyboard_sync_enabled = previous
+            self._keyboard_sync_status_message = "同步未能變更，請查看紀錄。"
+            self._keyboard_sync_status_color = WARNING
+            self._refresh_keyboard_sync_controls()
+            self._report_refresh_error(error)
             return
-        self.keyboard_sync_enabled = desired
+        if isinstance(result, SyncToggleViewResult):
+            if not result.success:
+                self.keyboard_sync_enabled = previous if not desired else False
+                self._keyboard_sync_status_message = (
+                    result.message or "同步條件未通過，沒有啟用。"
+                )
+                self._keyboard_sync_status_color = WARNING
+                self._refresh_keyboard_sync_controls()
+                return
+            self.keyboard_sync_enabled = bool(result.enabled)
+            self._keyboard_sync_status_message = result.message
+            self._keyboard_sync_status_color = SUCCESS
+        elif result is False:
+            self.keyboard_sync_enabled = previous if not desired else False
+            self._keyboard_sync_status_message = (
+                "同步未能停止。"
+                if not desired
+                else "同步條件未通過，沒有啟用。"
+            )
+            self._keyboard_sync_status_color = WARNING
+            self._refresh_keyboard_sync_controls()
+            return
+        else:
+            self.keyboard_sync_enabled = desired
+            self._keyboard_sync_status_message = (
+                "同步中｜同步左鍵、拖曳與已確認快捷鍵"
+                if desired
+                else "同步已停止。"
+            )
+            self._keyboard_sync_status_color = SUCCESS
         self._refresh_keyboard_sync_controls()
 
     def _refresh_keyboard_sync_controls(self) -> None:
@@ -5218,13 +5879,18 @@ class HomeView:
                 ),
             )
         if self._keyboard_sync_label is not None:
+            status_text = self._keyboard_sync_status_message or (
+                "同步中｜同步左鍵、拖曳與已確認快捷鍵"
+                if self.keyboard_sync_enabled
+                else "尚未啟用"
+            )
             self._keyboard_sync_label.configure(
-                text=(
-                    "● 已啟用｜同步左鍵、拖曳與已確認快捷鍵"
-                    if self.keyboard_sync_enabled
-                    else "● 尚未啟用"
+                text=f"● {status_text}",
+                fg=(
+                    self._keyboard_sync_status_color
+                    if self._keyboard_sync_status_message
+                    else SUCCESS if self.keyboard_sync_enabled else MUTED
                 ),
-                fg=SUCCESS if self.keyboard_sync_enabled else MUTED,
             )
         if self._sync_key_count_label is not None:
             self._sync_key_count_label.configure(
@@ -5243,6 +5909,8 @@ class HomeView:
 
     def set_keyboard_sync_enabled(self, enabled: bool) -> None:
         self.keyboard_sync_enabled = bool(enabled)
+        self._keyboard_sync_status_message = ""
+        self._keyboard_sync_status_color = MUTED
         self._refresh_keyboard_sync_controls()
 
     def toggle_keyboard_sync_from_hotkey(self) -> None:
@@ -5250,6 +5918,62 @@ class HomeView:
 
     def set_smart_reconnect_enabled(self, enabled: bool) -> None:
         self.smart_reconnect_enabled = bool(enabled)
+        if self.smart_reconnect_enabled:
+            self.smart_reconnect_runtime_status = "已開啟"
+            self._last_smart_reconnect_runtime_status = "已開啟"
+            self._smart_reconnect_failure_message = ""
+        elif not self.smart_reconnect_enabled:
+            self.smart_reconnect_runtime_status = None
+            self._smart_reconnect_failure_message = ""
+        self._refresh_smart_reconnect_controls()
+
+    def set_smart_reconnect_enable_failure(self, message: object) -> None:
+        """Show a real enable failure without pretending monitoring started."""
+        self.smart_reconnect_enabled = False
+        self.smart_reconnect_runtime_status = "重連失敗"
+        self._last_smart_reconnect_runtime_status = "重連失敗"
+        self._smart_reconnect_failure_message = (
+            message.strip()
+            if isinstance(message, str) and message.strip()
+            else "智慧重連未能啟用，已維持安全停止。"
+        )
+        self._refresh_smart_reconnect_controls()
+
+    def set_smart_reconnect_runtime_status(self, value: object) -> None:
+        previous_status = self.smart_reconnect_runtime_status
+        if value in {"已開啟", "重連中", "重連失敗"}:
+            self.smart_reconnect_runtime_status = value
+            self._last_smart_reconnect_runtime_status = value
+        elif self.smart_reconnect_enabled:
+            self.smart_reconnect_runtime_status = self._last_smart_reconnect_runtime_status or "重連失敗"
+        elif getattr(self, "_smart_reconnect_failure_message", ""):
+            self.smart_reconnect_runtime_status = (
+                self._last_smart_reconnect_runtime_status
+                or "重連失敗"
+            )
+        else:
+            self.smart_reconnect_runtime_status = None
+        if self.smart_reconnect_runtime_status == previous_status:
+            return
+        self._refresh_smart_reconnect_controls()
+
+    def _save_smart_reconnect_status_colors(self) -> None:
+        requested = {
+            name: entry.get().strip()
+            for name, entry in self._smart_reconnect_color_entries.items()
+        }
+        callback = self.on_smart_reconnect_status_colors_change
+        if callback is None or callback(requested) is False:
+            for name, entry in self._smart_reconnect_color_entries.items():
+                entry.delete(0, "end")
+                entry.insert(0, self.smart_reconnect_status_colors[name])
+            if self._smart_reconnect_label is not None:
+                self._smart_reconnect_label.configure(
+                    text="● 顏色格式無效或保存失敗，已恢復原設定。",
+                    fg=WARNING,
+                )
+            return
+        self.smart_reconnect_status_colors = requested
         self._refresh_smart_reconnect_controls()
 
     def toggle_smart_reconnect_from_hotkey(self) -> None:
@@ -5340,10 +6064,46 @@ class HomeView:
         if self.on_smart_reconnect_change is None:
             return
         accepted = self.on_smart_reconnect_change(desired)
-        if accepted is False:
+        if isinstance(accepted, SmartReconnectToggleViewResult):
+            if not accepted.success:
+                if desired:
+                    self.set_smart_reconnect_enable_failure(accepted.message)
+                return
+            self.set_smart_reconnect_enabled(accepted.enabled)
             return
-        self.smart_reconnect_enabled = desired
-        self._refresh_smart_reconnect_controls()
+        if accepted is False:
+            if desired:
+                self.set_smart_reconnect_enable_failure(
+                    "智慧重連未能啟用，已維持安全停止。"
+                )
+            return
+        self.set_smart_reconnect_enabled(desired)
+
+    def _toggle_smart_reconnect_auto_battle(self) -> None:
+        variable = getattr(self, "_smart_reconnect_auto_battle_variable", None)
+        desired = bool(variable.get()) if variable is not None else False
+        callback = self.on_smart_reconnect_auto_battle_change
+        if callback is None or callback(desired) is False:
+            if variable is not None:
+                variable.set(1 if self.smart_reconnect_auto_battle_enabled else 0)
+            return
+        self.set_smart_reconnect_auto_battle_enabled(desired)
+
+    def set_smart_reconnect_auto_battle_enabled(
+        self,
+        enabled: bool,
+    ) -> None:
+        """Reflect one persisted child-switch value without toggling the master."""
+
+        normalized = enabled is not False
+        self.smart_reconnect_auto_battle_enabled = normalized
+        variable = getattr(
+            self,
+            "_smart_reconnect_auto_battle_variable",
+            None,
+        )
+        if variable is not None:
+            variable.set(1 if normalized else 0)
 
     def _refresh_smart_reconnect_controls(self) -> None:
         self._refresh_smart_reconnect_capture_mode_status()
@@ -5363,10 +6123,70 @@ class HomeView:
                 text=(
                     "● 自動監看中｜依目前狀態安全重試"
                     if self.smart_reconnect_enabled
+                    else f"● {getattr(self, '_smart_reconnect_failure_message', '')}"
+                    if getattr(self, "_smart_reconnect_failure_message", "")
                     else "● 安全停止｜不會點擊遊戲視窗"
                 ),
-                fg=SUCCESS if self.smart_reconnect_enabled else MUTED,
+                fg=(
+                    SUCCESS
+                    if self.smart_reconnect_enabled
+                    else "#D64545"
+                    if getattr(self, "_smart_reconnect_failure_message", "")
+                    else MUTED
+                ),
             )
+        runtime_label = getattr(self, "_smart_reconnect_runtime_label", None)
+        if runtime_label is not None:
+            failure_message = getattr(
+                self,
+                "_smart_reconnect_failure_message",
+                "",
+            )
+            status = (
+                self.smart_reconnect_runtime_status
+                if (
+                    self.smart_reconnect_enabled
+                    or getattr(self, "_smart_reconnect_failure_message", "")
+                ) else None
+            )
+            text = (
+                f"● 智慧重連：{status}｜{failure_message}"
+                if status and failure_message
+                else f"● 智慧重連：{status}"
+                if status
+                else ""
+            )
+            background = self.smart_reconnect_status_colors.get(
+                status,
+                SURFACE,
+            )
+            foreground = (
+                _status_text_color(background) if status else MUTED
+            )
+            presentation = (status, text, background, foreground)
+            previous_presentation = getattr(
+                self,
+                "_smart_reconnect_runtime_presentation",
+                None,
+            )
+            if presentation != previous_presentation:
+                runtime_label.configure(
+                    text=text,
+                    bg=background,
+                    fg=foreground,
+                )
+                try:
+                    is_managed = bool(runtime_label.winfo_manager())
+                except Exception:
+                    is_managed = bool(
+                        previous_presentation
+                        and previous_presentation[0] is not None
+                    )
+                if status and not is_managed:
+                    runtime_label.pack(before=self._body, fill=X)
+                elif not status and is_managed:
+                    runtime_label.pack_forget()
+                self._smart_reconnect_runtime_presentation = presentation
 
     def _auto_click_settings(self) -> tuple[int, str, bool, int]:
         if (
@@ -5472,12 +6292,8 @@ class HomeView:
             self.game_time_offset_ms = snapshot.offset_ms
             self.game_time_auto_update = snapshot.auto_update
             self._game_time_value_label.configure(
-                text=(
-                    f"遊戲時間：{snapshot.current_time_text}"
-                    if snapshot.auto_update
-                    else "遊戲時間：自動更新已關閉"
-                ),
-                fg=PRIMARY if snapshot.auto_update else MUTED,
+                text=snapshot.current_time_text,
+                fg="#FFFFFF",
             )
         self._schedule_game_time_tick()
 
@@ -5674,17 +6490,49 @@ class HomeView:
             padx=18,
             pady=8,
         ).pack(fill=X)
-        rows: tuple[tuple[str, Callable[[], None] | None], ...]
+        self._game_data_status_label = Label(
+            card,
+            text=self._game_data_status_text,
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            padx=18,
+        )
+        self._game_data_status_label.pack(fill=X, pady=(0, 4))
+        self._keep_feature_card_status(
+            "characters.list",
+            self._game_data_status_label,
+        )
+        rows: tuple[
+            tuple[
+                str,
+                PlayerCharacterDetail | None,
+                Callable[[], None] | None,
+            ],
+            ...,
+        ]
         if self.character_choices:
             rows = tuple(
-                (_safe_character_detail_line(choice.detail), choice.select)
+                (
+                    _safe_character_detail_line(choice.detail),
+                    choice.detail,
+                    choice.select,
+                )
                 for choice in self.character_choices
             )
         else:
-            rows = tuple((line, None) for line in _safe_character_lines(self.characters))
+            rows = tuple(
+                (line, None, None)
+                for line in _safe_character_lines(self.characters)
+            )
         if not rows:
-            rows = (("目前沒有可顯示的角色資料。", None),)
-        for line, select in rows:
+            rows = (("目前沒有可顯示的角色資料。", None, None),)
+        for line, detail, select in rows:
+            selected = (
+                detail is not None
+                and detail == self._selected_character_detail
+            )
             row = Frame(card, bg=SURFACE, padx=18, pady=6)
             row.pack(fill=X)
             Label(
@@ -5696,8 +6544,253 @@ class HomeView:
                 anchor="w",
             ).pack(side=LEFT, fill=X, expand=True)
             if select is not None:
-                self._button(row, "查看", select).pack(side=RIGHT)
+                self._button(
+                    row,
+                    "收起" if selected else "查看",
+                    (
+                        self.hide_character_detail
+                        if selected
+                        else select
+                    ),
+                ).pack(side=RIGHT)
+            if selected:
+                self._build_selected_character_detail(card)
         return page
+
+    def set_game_data_read_status(self, text: str) -> None:
+        self._game_data_status_text = text.strip() if isinstance(text, str) and text.strip() else "尚未安全讀取"
+        if self._game_data_status_label is not None:
+            self._game_data_status_label.configure(text=self._game_data_status_text)
+
+    def _build_selected_character_detail(self, parent) -> None:
+        detail = self._selected_character_detail
+        if detail is None:
+            return
+        detail_card = Frame(
+            parent,
+            bg=SURFACE,
+            padx=18,
+            pady=12,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
+        detail_card.pack(fill=X, padx=0, pady=(12, 0))
+        Label(
+            detail_card,
+            text=f"{detail.display_name}｜詳細資料",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+
+        profile = Frame(detail_card, bg=SURFACE)
+        profile.pack(fill=X, pady=(8, 0))
+        for title, value in (
+            ("組別", detail.group),
+            ("等級", detail.level),
+            ("分類", detail.importance),
+            ("定位", detail.role),
+        ):
+            self._character_detail_row(profile, title, value)
+
+        game_data = detail.game_data
+        game_data_card = Frame(
+            detail_card,
+            bg=SURFACE,
+            padx=14,
+            pady=10,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
+        game_data_card.pack(fill=X, pady=(12, 0))
+        Label(
+            game_data_card,
+            text="遊戲資料",
+            font=("Microsoft JhengHei UI", 11, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        for title, value in (
+            ("寵物天賦", game_data.pet_talent if game_data is not None else None),
+            ("黑曜石", game_data.obsidian if game_data is not None else None),
+            ("命魂", game_data.life_soul if game_data is not None else None),
+            ("魂器", game_data.artifact if game_data is not None else None),
+        ):
+            self._character_detail_row(game_data_card, title, value, wraplength=520)
+
+        note_card = Frame(
+            detail_card,
+            bg=SURFACE,
+            padx=14,
+            pady=10,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
+        note_card.pack(fill=X, pady=(12, 0))
+        Label(
+            note_card,
+            text="備註",
+            font=("Microsoft JhengHei UI", 11, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        ).pack(fill=X)
+        note_entry = Entry(
+            note_card,
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+        )
+        if detail.note:
+            note_entry.insert(0, detail.note)
+        note_entry.pack(fill=X, pady=(8, 10), ipady=7)
+        actions = Frame(note_card, bg=SURFACE)
+        actions.pack(fill=X)
+        self._button(
+            actions,
+            "儲存備註",
+            lambda: self._save_selected_character_note(note_entry.get()),
+            primary=True,
+        ).pack(side=LEFT)
+        self._button(
+            actions,
+            "清除",
+            self._clear_selected_character_note,
+        ).pack(side=LEFT, padx=(8, 0))
+
+    def _character_detail_row(
+        self,
+        parent,
+        title: str,
+        value: object,
+        *,
+        wraplength: int | None = None,
+    ) -> None:
+        row = Frame(parent, bg=SURFACE)
+        row.pack(fill=X, pady=3)
+        Label(
+            row,
+            text=title,
+            width=8,
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        ).pack(side=LEFT)
+        value_options = {
+            "text": self._character_detail_value(value),
+            "font": ("Microsoft JhengHei UI", 10),
+            "bg": SURFACE,
+            "fg": TEXT,
+            "anchor": "w",
+            "justify": LEFT,
+        }
+        if wraplength is not None:
+            value_options["wraplength"] = wraplength
+        Label(row, **value_options).pack(side=LEFT, fill=X, expand=True)
+
+    @staticmethod
+    def _character_detail_value(value: object) -> str:
+        if value is None:
+            return "尚未設定"
+        if isinstance(value, str):
+            return value.strip() or "尚未設定"
+        return str(value)
+
+    def show_character_detail(
+        self,
+        detail: PlayerCharacterDetail,
+        *,
+        on_save_note: Callable[[str], PlayerCharacterDetail],
+        on_clear_note: Callable[[], PlayerCharacterDetail],
+        on_error: Callable[[Exception], object] | None = None,
+    ) -> None:
+        if not isinstance(detail, PlayerCharacterDetail):
+            raise TypeError("detail must be PlayerCharacterDetail.")
+        if not callable(on_save_note) or not callable(on_clear_note):
+            raise TypeError("note callbacks must be callable.")
+        self._selected_character_detail = detail
+        self._on_save_selected_character_note = on_save_note
+        self._on_clear_selected_character_note = on_clear_note
+        self._on_selected_character_detail_error = on_error
+        self._refresh_characters_page()
+        self.show_page("characters")
+
+    def hide_character_detail(self) -> None:
+        self._selected_character_detail = None
+        self._on_save_selected_character_note = None
+        self._on_clear_selected_character_note = None
+        self._on_selected_character_detail_error = None
+        self._refresh_characters_page()
+
+    def _save_selected_character_note(self, note: str) -> None:
+        cleaned_note = note.strip()
+        if not cleaned_note:
+            self._clear_selected_character_note()
+            return
+        callback = self._on_save_selected_character_note
+        if callback is not None:
+            self._apply_selected_character_note(lambda: callback(cleaned_note))
+
+    def _clear_selected_character_note(self) -> None:
+        callback = self._on_clear_selected_character_note
+        if callback is not None:
+            self._apply_selected_character_note(callback)
+
+    def _apply_selected_character_note(
+        self,
+        operation: Callable[[], PlayerCharacterDetail],
+    ) -> None:
+        previous_detail = self._selected_character_detail
+        try:
+            detail = operation()
+            if not isinstance(detail, PlayerCharacterDetail):
+                raise TypeError("note operation must return PlayerCharacterDetail.")
+        except Exception as error:
+            if self._on_selected_character_detail_error is None:
+                raise
+            self._on_selected_character_detail_error(error)
+            return
+        if previous_detail is not None:
+            self.character_choices = tuple(
+                PlayerCharacterDetailChoice(
+                    detail=(
+                        detail
+                        if choice.detail == previous_detail
+                        else choice.detail
+                    ),
+                    select=choice.select,
+                )
+                for choice in self.character_choices
+            )
+        self._selected_character_detail = detail
+        self._refresh_characters_page()
+
+    def _refresh_characters_page(self) -> None:
+        current = self._pages.get("characters")
+        if current is None:
+            return
+        parent = current.master
+        current.destroy()
+        page = self._build_characters_page(parent)
+        self._pages["characters"] = page
+        background_label = Label(
+            page,
+            bg=BACKGROUND,
+            bd=0,
+            highlightthickness=0,
+            anchor="nw",
+        )
+        background_label.place(x=0, y=0, relwidth=1, relheight=1)
+        background_label.lower()
+        self._background_page_labels["characters"] = background_label
+        self._apply_ui_typography()
+        if self._active_page == "characters":
+            self.show_page("characters")
 
     def set_character_data(
         self,
@@ -5723,25 +6816,133 @@ class HomeView:
             )
         self.characters = updated_characters
         self.character_choices = updated_choices
-        current = self._pages.get("characters")
-        if current is None:
-            return
-        parent = current.master
-        current.destroy()
-        page = self._build_characters_page(parent)
-        self._pages["characters"] = page
-        background_label = Label(
+        self._refresh_characters_page()
+
+    def _build_habit_settings_card(self, page) -> Frame:
+        habit_card = self._card(
             page,
-            bg=BACKGROUND,
-            bd=0,
-            highlightthickness=0,
-            anchor="nw",
+            card_id="settings.habits",
+            title="玩家可能想記錄的習慣",
         )
-        background_label.place(x=0, y=0, relwidth=1, relheight=1)
-        background_label.lower()
-        self._background_page_labels["characters"] = background_label
-        if self._active_page == "characters":
-            self.show_page("characters")
+        habit_card.pack(fill=X, pady=(0, 10))
+        try:
+            habit_settings = (
+                self.habit_settings_provider()
+                if self.habit_settings_provider is not None
+                else PlayerHabitSettingsView(7, 7, 7, ())
+            )
+        except Exception as error:
+            self._report_refresh_error(error)
+            habit_settings = PlayerHabitSettingsView(7, 7, 7, ())
+
+        summary_row = Frame(habit_card, bg=SURFACE)
+        summary_row.pack(fill=X)
+        self._habit_status_label = Label(
+            summary_row,
+            text="尚無已記錄習慣",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+        )
+        self._habit_status_label.pack(side=LEFT, fill=X, expand=True)
+        self._habit_management_button = self._button(
+            summary_row,
+            "管理習慣",
+            self._toggle_habit_management,
+        )
+        self._habit_management_button.pack(side=RIGHT)
+
+        self._habit_management_frame = Frame(habit_card, bg=SURFACE)
+        self._hint_label(
+            self._habit_management_frame,
+            text=(
+                "前七個有效日只觀察活動時間與角色操作順序，"
+                "第八天才提出建議；不會直接操作遊戲。"
+            ),
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify="left",
+        ).pack(fill=X, pady=(10, 8))
+        habit_row = Frame(self._habit_management_frame, bg=SURFACE)
+        habit_row.pack(fill=X)
+        Label(
+            habit_row,
+            text="觀察天數",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+        ).pack(side=LEFT)
+        self._habit_observation_days_entry = Entry(
+            habit_row,
+            width=8,
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+        )
+        self._habit_observation_days_entry.insert(
+            0,
+            str(habit_settings.observation_days),
+        )
+        self._habit_observation_days_entry.pack(
+            side=LEFT,
+            padx=(8, 0),
+            ipady=7,
+        )
+        Label(
+            habit_row,
+            text=(
+                f"天｜同一習慣至少 {habit_settings.minimum_occurrences} 次，"
+                f"分布至少 {habit_settings.minimum_distinct_days} 天"
+            ),
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            padx=8,
+        ).pack(side=LEFT)
+        self._button(
+            habit_row,
+            "儲存",
+            self._save_habit_observation_days,
+            primary=True,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._habit_management_status_label = Label(
+            self._habit_management_frame,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+        )
+        self._habit_management_status_label.pack(fill=X, pady=(12, 6))
+        self._habit_preferences_frame = Frame(
+            self._habit_management_frame,
+            bg=SURFACE,
+        )
+        self._habit_preferences_frame.pack(fill=X)
+        self._button(
+            self._habit_management_frame,
+            "全部清除玩家習慣",
+            self._clear_habit_preferences,
+        ).pack(anchor="w", pady=(10, 0))
+        self._render_habit_preferences(habit_settings)
+        return habit_card
+
+    def _toggle_habit_management(self) -> None:
+        frame = self._habit_management_frame
+        button = self._habit_management_button
+        if frame is None or button is None:
+            return
+        if frame.winfo_manager():
+            frame.pack_forget()
+            button.configure(text="管理習慣")
+            return
+        frame.pack(fill=X, pady=(10, 0))
+        button.configure(text="收起管理")
 
     def _build_settings_page(self, parent) -> Frame:
         page = Frame(parent, bg=BACKGROUND)
@@ -5750,6 +6951,7 @@ class HomeView:
             "設定",
             "只保留玩家需要調整與查看的內容",
         )
+        self._build_habit_settings_card(page)
         theme_card = self._card(
             page,
             card_id="settings.theme",
@@ -5764,7 +6966,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             theme_card,
             text="可隨時切換整個主畫面的配色與閱讀風格。",
             font=("Microsoft JhengHei UI", 10),
@@ -5803,12 +7005,158 @@ class HomeView:
             primary=True,
         ).pack(side=RIGHT, padx=(8, 0))
 
+        font_row = Frame(theme_card, bg=SURFACE)
+        font_row.pack(fill=X, pady=(10, 0))
+        Label(
+            font_row,
+            text="介面字型",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+            width=12,
+        ).pack(side=LEFT)
+        self._ui_font_variable = StringVar(
+            master=self.parent,
+            value=self._ui_font_display_name(),
+        )
+        font_menu = OptionMenu(
+            font_row,
+            self._ui_font_variable,
+            *(choice.display_name for choice in self.ui_font_choices),
+            command=self._change_ui_font_selection,
+        )
+        self._ui_font_menu = font_menu
+        font_menu.configure(
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            activebackground=BORDER,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        font_menu["menu"].configure(
+            font=("Microsoft JhengHei UI", 10)
+        )
+        font_menu.pack(side=LEFT, fill=X, expand=True)
+
+        sidebar_size_row = Frame(theme_card, bg=SURFACE)
+        sidebar_size_row.pack(fill=X, pady=(8, 0))
+        Label(
+            sidebar_size_row,
+            text="左側選單字級",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+            width=12,
+        ).pack(side=LEFT)
+        self._sidebar_font_size_variable = StringVar(
+            master=self.parent,
+            value=str(self.sidebar_font_size),
+        )
+        sidebar_size_menu = OptionMenu(
+            sidebar_size_row,
+            self._sidebar_font_size_variable,
+            *(str(size) for size in SIDEBAR_FONT_SIZES),
+            command=self._change_sidebar_font_size_selection,
+        )
+        self._sidebar_font_size_menu = sidebar_size_menu
+        sidebar_size_menu.configure(
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            activebackground=BORDER,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        sidebar_size_menu["menu"].configure(
+            font=("Microsoft JhengHei UI", 10)
+        )
+        sidebar_size_menu.pack(side=LEFT, fill=X, expand=True)
+
+        content_size_row = Frame(theme_card, bg=SURFACE)
+        content_size_row.pack(fill=X, pady=(8, 0))
+        Label(
+            content_size_row,
+            text="內容區字級",
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+            anchor="w",
+            width=12,
+        ).pack(side=LEFT)
+        self._content_font_size_variable = StringVar(
+            master=self.parent,
+            value=str(self.content_font_size),
+        )
+        content_size_menu = OptionMenu(
+            content_size_row,
+            self._content_font_size_variable,
+            *(str(size) for size in CONTENT_FONT_SIZES),
+            command=self._change_content_font_size_selection,
+        )
+        self._content_font_size_menu = content_size_menu
+        content_size_menu.configure(
+            font=("Microsoft JhengHei UI", 10),
+            bg=BACKGROUND,
+            fg=TEXT,
+            activebackground=BORDER,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        content_size_menu["menu"].configure(
+            font=("Microsoft JhengHei UI", 10)
+        )
+        content_size_menu.pack(side=LEFT, fill=X, expand=True)
+
+        if self.ui_font_failure_message:
+            self._font_status_label = Label(
+                theme_card,
+                text=self.ui_font_failure_message,
+                font=("Microsoft JhengHei UI", 10),
+                bg=SURFACE,
+                fg=WARNING,
+                anchor="w",
+                justify=LEFT,
+                wraplength=650,
+            )
+            self._font_status_label.pack(fill=X, pady=(8, 0))
+            self._keep_feature_card_status(
+                "settings.theme",
+                self._font_status_label,
+            )
+        hint_row = Frame(theme_card, bg=SURFACE)
+        hint_row.pack(fill=X, pady=(8, 0))
+        self._show_hints_variable = IntVar(
+            master=self.parent,
+            value=int(self.show_hints),
+        )
+        Checkbutton(
+            hint_row,
+            text="顯示提示說明",
+            variable=self._show_hints_variable,
+            command=self._toggle_show_hints,
+            font=("Microsoft JhengHei UI", 10),
+            bg=SURFACE,
+            fg=TEXT,
+            activebackground=SURFACE,
+            activeforeground=TEXT,
+            selectcolor=BACKGROUND,
+            anchor="w",
+        ).pack(side=LEFT)
+
+        self._build_game_time_settings_card(page)
+
         background_card = self._card(
             page,
             card_id="settings.background",
             title="背景圖片",
         )
-        background_card.pack(fill=X, pady=(14, 0))
+        background_card.pack(fill=X, pady=(10, 0))
         Label(
             background_card,
             text="背景圖片",
@@ -5817,7 +7165,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             background_card,
             text=(
                 "可選擇一般圖片或相機 RAW；程式只顯示轉換後的"
@@ -5896,7 +7244,7 @@ class HomeView:
         self._background_cancel_button.configure(state=DISABLED)
 
         scope_frame = Frame(background_card, bg=SURFACE)
-        scope_frame.pack(fill=X, pady=(14, 0))
+        scope_frame.pack(fill=X, pady=(10, 0))
         Label(
             scope_frame,
             text="套用頁面",
@@ -5975,7 +7323,7 @@ class HomeView:
         ).pack(side=LEFT, padx=(8, 0))
 
         display_frame = Frame(background_card, bg=SURFACE)
-        display_frame.pack(fill=X, pady=(14, 0))
+        display_frame.pack(fill=X, pady=(10, 0))
         Label(
             display_frame,
             text="填補色與區域透明度",
@@ -6056,7 +7404,7 @@ class HomeView:
             ).pack(side=LEFT, padx=(8, 0))
             self._background_opacity_scales[key] = scale
         save_row = Frame(background_card, bg=SURFACE)
-        save_row.pack(fill=X, pady=(14, 0))
+        save_row.pack(fill=X, pady=(10, 0))
         self._button(
             save_row,
             "儲存背景設定",
@@ -6089,7 +7437,7 @@ class HomeView:
             card_id="settings.reminder_lifetime",
             title="提醒顯示時間",
         )
-        card.pack(fill=X, pady=(14, 0))
+        card.pack(fill=X, pady=(10, 0))
         Label(
             card,
             text="提醒顯示時間",
@@ -6098,7 +7446,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             card,
             text="設定提醒卡在畫面上保留的秒數。",
             font=("Microsoft JhengHei UI", 10),
@@ -6144,7 +7492,7 @@ class HomeView:
             card_id="settings.reminder_style",
             title="提醒卡樣式",
         )
-        preview_card.pack(fill=X, pady=(14, 0))
+        preview_card.pack(fill=X, pady=(10, 0))
         Label(
             preview_card,
             text="提醒卡樣式",
@@ -6153,7 +7501,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             preview_card,
             text=(
                 "只會套用已確認的提醒卡樣式；選擇會保存，"
@@ -6232,109 +7580,12 @@ class HomeView:
         )
         self._card_preview_status_label.pack(fill=X, pady=(10, 0))
 
-        habit_card = self._card(
-            page,
-            card_id="settings.habits",
-            title="玩家習慣",
-        )
-        habit_card.pack(fill=X, pady=(14, 0))
-        Label(
-            habit_card,
-            text="玩家習慣",
-            font=("Microsoft JhengHei UI", 13, "bold"),
-            bg=SURFACE,
-            fg=TEXT,
-            anchor="w",
-        ).pack(fill=X)
-        Label(
-            habit_card,
-            text=(
-                "前七個有效日只觀察活動時間與角色操作順序，"
-                "第八天才提出建議；不會直接操作遊戲。"
-            ),
-            font=("Microsoft JhengHei UI", 10),
-            bg=SURFACE,
-            fg=MUTED,
-            anchor="w",
-            justify="left",
-        ).pack(fill=X, pady=(6, 12))
-        try:
-            habit_settings = (
-                self.habit_settings_provider()
-                if self.habit_settings_provider is not None
-                else PlayerHabitSettingsView(7, 7, 7, ())
-            )
-        except Exception as error:
-            self._report_refresh_error(error)
-            habit_settings = PlayerHabitSettingsView(7, 7, 7, ())
-        habit_row = Frame(habit_card, bg=SURFACE)
-        habit_row.pack(fill=X)
-        Label(
-            habit_row,
-            text="觀察天數",
-            font=("Microsoft JhengHei UI", 10),
-            bg=SURFACE,
-            fg=TEXT,
-        ).pack(side=LEFT)
-        self._habit_observation_days_entry = Entry(
-            habit_row,
-            width=8,
-            font=("Microsoft JhengHei UI", 10),
-            bg=BACKGROUND,
-            fg=TEXT,
-            relief="flat",
-            bd=0,
-        )
-        self._habit_observation_days_entry.insert(
-            0,
-            str(habit_settings.observation_days),
-        )
-        self._habit_observation_days_entry.pack(
-            side=LEFT,
-            padx=(8, 0),
-            ipady=7,
-        )
-        Label(
-            habit_row,
-            text=(
-                f"天｜同一習慣至少 {habit_settings.minimum_occurrences} 次，"
-                f"分布至少 {habit_settings.minimum_distinct_days} 天"
-            ),
-            font=("Microsoft JhengHei UI", 9),
-            bg=SURFACE,
-            fg=MUTED,
-            padx=8,
-        ).pack(side=LEFT)
-        self._button(
-            habit_row,
-            "儲存",
-            self._save_habit_observation_days,
-            primary=True,
-        ).pack(side=LEFT, padx=(8, 0))
-        self._habit_status_label = Label(
-            habit_card,
-            text="尚未有玩家確認的偏好。",
-            font=("Microsoft JhengHei UI", 9),
-            bg=SURFACE,
-            fg=MUTED,
-            anchor="w",
-        )
-        self._habit_status_label.pack(fill=X, pady=(12, 6))
-        self._habit_preferences_frame = Frame(habit_card, bg=SURFACE)
-        self._habit_preferences_frame.pack(fill=X)
-        self._render_habit_preferences(habit_settings)
-        self._button(
-            habit_card,
-            "全部清除玩家習慣",
-            self._clear_habit_preferences,
-        ).pack(anchor="w", pady=(10, 0))
-
         status_card = self._card(
             page,
             card_id="settings.status",
             title="系統狀態",
         )
-        status_card.pack(fill=X, pady=(14, 0))
+        status_card.pack(fill=X, pady=(10, 0))
         Label(
             status_card,
             text="系統狀態",
@@ -6343,7 +7594,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             status_card,
             text="查看目前視窗、安全檢查與資料保存狀態。",
             font=("Microsoft JhengHei UI", 10),
@@ -6444,15 +7695,23 @@ class HomeView:
         ).pack(side=LEFT, padx=(8, 0))
         if not choices or self.on_activity_description_change is None:
             self._activity_description_entry.configure(state=DISABLED)
-        self._activity_description_status_label = Label(
+        self._hint_label(
             parent,
             text="空白後儲存可清除自訂敘述；不會改變活動識別或進度。",
             font=("Microsoft JhengHei UI", 9),
             bg=SURFACE,
             fg=MUTED,
             anchor="w",
+        ).pack(fill=X, pady=(8, 0))
+        self._activity_description_status_label = Label(
+            parent,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
         )
-        self._activity_description_status_label.pack(fill=X, pady=(8, 0))
+        self._activity_description_status_label.pack(fill=X, pady=(4, 0))
         if choices:
             self._load_activity_description(choices[0].activity_id)
 
@@ -6530,7 +7789,7 @@ class HomeView:
             card_id="settings.card_layout",
             title="功能卡片版面",
         )
-        layout_card.pack(fill=X, pady=(14, 0))
+        layout_card.pack(fill=X, pady=(10, 0))
         Label(
             layout_card,
             text="功能卡片版面",
@@ -6539,7 +7798,7 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(fill=X)
-        Label(
+        self._hint_label(
             layout_card,
             text=(
                 "直接拖曳各卡片標題可重新排序；每張卡片可收合、"
@@ -6654,7 +7913,7 @@ class HomeView:
         )
         self._card_background_cancel_button.pack(side=LEFT, padx=(8, 0))
         self._card_background_cancel_button.configure(state=DISABLED)
-        self._feature_card_status_label = Label(
+        self._hint_label(
             layout_card,
             text="拖移、收合與自訂都不會改變卡片內原有功能。",
             font=("Microsoft JhengHei UI", 9),
@@ -6662,8 +7921,17 @@ class HomeView:
             fg=MUTED,
             anchor="w",
             justify=LEFT,
+        ).pack(fill=X, pady=(8, 0))
+        self._feature_card_status_label = Label(
+            layout_card,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
         )
-        self._feature_card_status_label.pack(fill=X, pady=(8, 0))
+        self._feature_card_status_label.pack(fill=X, pady=(4, 0))
         self._refresh_feature_card_settings()
 
     def _feature_card_choice_items(
@@ -6839,17 +8107,42 @@ class HomeView:
             return self._card_background_prepare_message, True, False
         return "此處只修改這張卡片。", False, False
 
+    def _close_feature_card_settings(self) -> None:
+        dialog = self._feature_card_settings_dialog
+        if dialog is None:
+            return
+        card_id = getattr(dialog, "_feature_card_settings_card_id", None)
+        widgets = self._feature_cards.get(card_id)
+        if getattr(dialog, "_feature_card_grid_inserted", False) and widgets is not None:
+            for child in tuple(widgets.frame.grid_slaves()):
+                if child is dialog or child is widgets.control_row:
+                    continue
+                info = child.grid_info()
+                child.grid_configure(row=max(1, int(info.get("row", 0)) - 1))
+        if self._pending_card_background_id == card_id:
+            if self._card_background_prepare_running:
+                self._cancel_feature_card_background_prepare()
+            if self._pending_card_background_path is not None:
+                if self.on_discard_background_image is not None:
+                    self.on_discard_background_image(self._pending_card_background_path)
+                self._pending_card_background_path = None
+                self._load_feature_card_background(card_id)
+            self._pending_card_background_id = None
+        if self._pending_card_background_clear_id == card_id:
+            self._pending_card_background_clear_id = None
+        self._feature_card_settings_dialog = None
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+
     def _open_feature_card_settings(self, card_id: str) -> None:
         existing_dialog = self._feature_card_settings_dialog
         if existing_dialog is not None:
-            try:
-                if existing_dialog.winfo_exists():
-                    existing_dialog.lift()
-                    existing_dialog.focus_force()
-                    return
-            except Exception:
-                pass
-            self._feature_card_settings_dialog = None
+            if getattr(existing_dialog, "_feature_card_settings_card_id", None) == card_id:
+                self._close_feature_card_settings()
+                return
+            self._close_feature_card_settings()
         widgets = self._feature_cards.get(card_id)
         if widgets is None:
             return
@@ -6861,13 +8154,32 @@ class HomeView:
             self._feature_card_variable.set(label)
         self._refresh_feature_card_settings()
 
-        dialog = Toplevel(self.parent)
-        dialog.title(f"輔｜{widgets.default_title}設定")
-        dialog.transient(self.parent)
-        dialog.resizable(False, False)
-        dialog.configure(bg=SURFACE, padx=16, pady=14)
+        dialog = Frame(widgets.frame, bg=SURFACE, padx=12, pady=10)
+        dialog._feature_card_settings_card_id = card_id
+
+        if widgets.content_manager == "grid":
+            grid_children = tuple(
+                child for child in widgets.frame.grid_slaves()
+                if child is not widgets.control_row
+            )
+            for child in grid_children:
+                info = child.grid_info()
+                child.grid_configure(row=int(info.get("row", 0)) + 1)
+            columns = max(1, max((int(child.grid_info().get("column", 0)) + int(child.grid_info().get("columnspan", 1)) for child in grid_children), default=1))
+            dialog.grid(row=1, column=0, columnspan=columns, sticky="ew", pady=(0, 8))
+            dialog._feature_card_grid_inserted = True
+        else:
+            pack_children = widgets.frame.pack_slaves()
+            before = next(
+                (
+                    child for child in pack_children
+                    if child is not widgets.control_row
+                    and str(child.winfo_manager()) == "pack"
+                ),
+                None,
+            )
+            dialog.pack(fill=X, pady=(8, 0), before=before)
         self._feature_card_settings_dialog = dialog
-        dialog.grab_set()
 
         preference = self._feature_card_preference(
             card_id,
@@ -6948,7 +8260,7 @@ class HomeView:
         background_row.pack(fill=X)
         status_label = Label(
             dialog,
-            text="此處只修改這張卡片。",
+            text="",
             font=("Microsoft JhengHei UI", 9),
             bg=SURFACE,
             fg=MUTED,
@@ -7004,19 +8316,23 @@ class HomeView:
             "恢復預設名稱",
             request_default_title,
         ).pack(side=LEFT, padx=(8, 0))
-        status_label.pack(fill=X, pady=(10, 0))
+        self._hint_label(
+            dialog,
+            text="此處只修改這張卡片。",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="w",
+            justify=LEFT,
+        ).pack(fill=X, pady=(10, 0))
+        status_label.pack(fill=X, pady=(4, 0))
+        self._apply_hints_visibility()
 
         actions = Frame(dialog, bg=SURFACE)
         actions.pack(fill=X, pady=(12, 0))
 
         def close_dialog() -> None:
-            try:
-                dialog.grab_release()
-            except Exception:
-                pass
-            if self._feature_card_settings_dialog is dialog:
-                self._feature_card_settings_dialog = None
-            dialog.destroy()
+            self._close_feature_card_settings()
 
         def cancel() -> None:
             if (
@@ -7231,7 +8547,6 @@ class HomeView:
             save,
             primary=True,
         ).pack(side=RIGHT, padx=(0, 8))
-        dialog.protocol("WM_DELETE_WINDOW", cancel)
         title_entry.focus_set()
 
     def _save_feature_card_settings(
@@ -8348,12 +9663,7 @@ class HomeView:
     def dispose(self) -> None:
         """Release background image resources before the Tk window closes."""
         if self._feature_card_settings_dialog is not None:
-            try:
-                self._feature_card_settings_dialog.grab_release()
-                self._feature_card_settings_dialog.destroy()
-            except Exception:
-                pass
-            self._feature_card_settings_dialog = None
+            self._close_feature_card_settings()
         self._cancel_game_time_tick()
         self._cancel_timed_click_capture()
         self._background_prepare_cancel.set()
@@ -8496,6 +9806,14 @@ class HomeView:
             child.destroy()
         if self._habit_status_label is not None:
             self._habit_status_label.configure(
+                text=(
+                    f"已記錄 {len(settings.preferences)} 項"
+                    if settings.preferences
+                    else "尚無已記錄習慣"
+                )
+            )
+        if self._habit_management_status_label is not None:
+            self._habit_management_status_label.configure(
                 text=(
                     f"可信觀察 {len(settings.observations)} 筆｜"
                     f"已保存偏好 {len(settings.preferences)} 筆。"
@@ -8739,9 +10057,53 @@ class HomeView:
             self.parent.after_idle(self._sync_page_scroll_region)
             self._schedule_background_widget_images()
 
+    def _toggle_group_management(self) -> None:
+        frame = getattr(self, "_group_management_frame", None)
+        button = getattr(self, "_group_management_button", None)
+        details = getattr(self, "_group_management_details_frame", None)
+        if frame is None or button is None:
+            return
+        expanded = not bool(getattr(self, "_group_management_expanded", False))
+        if expanded:
+            frame.pack(fill=X, pady=(8, 0))
+            if details is not None:
+                anchor = getattr(self, "_group_management_details_anchor", None)
+                if anchor is not None:
+                    details.pack(fill=X, pady=(10, 0), before=anchor)
+                else:
+                    details.pack(fill=X, pady=(10, 0))
+            button.configure(text="收起管理")
+        else:
+            frame.pack_forget()
+            if details is not None:
+                details.pack_forget()
+            button.configure(text="管理組別")
+        self._group_management_expanded = expanded
+        self._sync_page_scroll_region()
+
+    def _show_group_selection_message(
+        self,
+        message: str,
+        *,
+        success: bool = False,
+    ) -> None:
+        if self._group_selection_status_label is not None:
+            self._group_selection_status_label.configure(
+                text=message,
+                fg=SUCCESS if success else WARNING,
+            )
+
+    def _refresh_group_selection_controls(self) -> None:
+        for group_name, button in self._group_selection_buttons.items():
+            current = group_name == self.current_group_name
+            button.configure(
+                text="目前使用" if current else "選擇",
+                state=DISABLED if current else NORMAL,
+            )
+
     def _select_group(self, name: str) -> None:
         if getattr(self, "_group_reorder_mode", False):
-            self._show_group_setting_message(
+            self._show_group_selection_message(
                 "請先完成或取消目前的角色排序。"
             )
             if self._group_variable is not None:
@@ -8758,7 +10120,7 @@ class HomeView:
             if not result.success:
                 if self._group_variable is not None:
                     self._group_variable.set(previous_name or "")
-                self._show_group_setting_message(
+                self._show_group_selection_message(
                     result.message or "組別沒有切換。"
                 )
                 return
@@ -8767,7 +10129,7 @@ class HomeView:
         elif result is False:
             if self._group_variable is not None:
                 self._group_variable.set(previous_name or "")
-            self._show_group_setting_message("組別沒有切換。")
+            self._show_group_selection_message("組別沒有切換。")
             return
         else:
             selected_name = name
@@ -8776,7 +10138,7 @@ class HomeView:
         }:
             if self._group_variable is not None:
                 self._group_variable.set(previous_name or "")
-            self._show_group_setting_message("組別沒有切換。")
+            self._show_group_selection_message("組別沒有切換。")
             return
         self.current_group_name = selected_name
         if self._group_variable is not None:
@@ -8793,8 +10155,11 @@ class HomeView:
         self.refresh_group_sync_relations()
         self.refresh_group_role_statuses()
         self.refresh_operation_records()
-        if success_message:
-            self._show_group_setting_message(success_message)
+        self._refresh_group_selection_controls()
+        self._show_group_selection_message(
+            success_message or f"已切換至 {selected_name}。",
+            success=True,
+        )
 
     @staticmethod
     def _normalized_window_size_value(
@@ -8996,17 +10361,30 @@ class HomeView:
         if self.on_keyboard_sync_change is None:
             return
         try:
-            accepted = self.on_keyboard_sync_change(False)
+            result = self.on_keyboard_sync_change(False)
         except Exception as error:
             self.set_group_launch_state(False, "同步未能停止。")
             self._report_refresh_error(error)
             return
-        if accepted is False:
+        if isinstance(result, SyncToggleViewResult):
+            if not result.success:
+                self.set_group_launch_state(
+                    False,
+                    result.message or "同步未能停止。",
+                )
+                return
+            self.keyboard_sync_enabled = bool(result.enabled)
+            message = result.message or "同步已停止。"
+        elif result is False:
             self.set_group_launch_state(False, "同步未能停止。")
             return
-        self.keyboard_sync_enabled = False
+        else:
+            self.keyboard_sync_enabled = False
+            message = "同步已停止。"
+        self._keyboard_sync_status_message = message
+        self._keyboard_sync_status_color = SUCCESS
         self._refresh_keyboard_sync_controls()
-        self.set_group_launch_state(False, "同步已停止。")
+        self.set_group_launch_state(False, message)
 
     def _stop_all_managed_games(self) -> None:
         self._run_group_window_action(
@@ -9331,6 +10709,7 @@ class HomeView:
         )
 
     def _cancel_group_entry_reorder(self) -> None:
+        self._clear_group_entry_drag_preview()
         self._group_reorder_mode = False
         self._group_reorder_original = ()
         self._group_reorder_working = []
@@ -9347,7 +10726,9 @@ class HomeView:
             return
         proposed = tuple(self._group_reorder_working)
         if proposed == self._group_reorder_original:
-            self._cancel_group_entry_reorder()
+            self._show_group_setting_message(
+                "順序尚未調整；請拖曳到另一個角色位置。"
+            )
             return
         try:
             result = self.on_reorder_group_entries(
@@ -9368,18 +10749,63 @@ class HomeView:
         self._group_reorder_original = ()
         self._group_reorder_working = []
         self._group_drag_entry_id = None
+        self._clear_group_entry_drag_preview()
         self.build()
         self._show_group_setting_message("角色啟動順序已保存。")
 
-    def _start_group_entry_drag(self, entry_id: str) -> None:
-        if self._group_reorder_mode:
-            self._group_drag_entry_id = entry_id
+    def _start_group_entry_drag(
+        self,
+        event,
+        entry_id: str,
+        display_name: str,
+    ) -> None:
+        if not self._group_reorder_mode:
+            return
+        self._clear_group_entry_drag_preview()
+        self._group_drag_entry_id = entry_id
+        self._group_drag_preview = Label(
+            self.parent,
+            text=f"正在移動：{display_name}",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=SURFACE,
+            fg=TEXT,
+            relief="solid",
+            bd=1,
+            padx=10,
+            pady=4,
+        )
+        self._move_group_entry_drag(event)
+
+    def _move_group_entry_drag(self, event) -> None:
+        preview = self._group_drag_preview
+        if preview is None:
+            return
+        try:
+            preview.place_configure(
+                x=max(0, event.x_root - self.parent.winfo_rootx() + 14),
+                y=max(0, event.y_root - self.parent.winfo_rooty() + 14),
+            )
+            preview.lift()
+        except Exception:
+            self._clear_group_entry_drag_preview()
+
+    def _clear_group_entry_drag_preview(self) -> None:
+        preview = self._group_drag_preview
+        self._group_drag_preview = None
+        if preview is not None:
+            try:
+                preview.destroy()
+            except Exception:
+                pass
 
     def _bind_group_entry_drag_tree(
         self,
         widget,
         entry_id: str,
+        display_name: str,
     ) -> None:
+        if isinstance(widget, (Button, Checkbutton, Entry)):
+            return
         widget._group_entry_id = entry_id
         try:
             widget.configure(cursor="fleur")
@@ -9387,20 +10813,30 @@ class HomeView:
             pass
         widget.bind(
             "<ButtonPress-1>",
-            lambda _event, value=entry_id: self._start_group_entry_drag(
-                value
+            lambda event, value=entry_id, label=display_name: (
+                self._start_group_entry_drag(
+                    event,
+                    value,
+                    label,
+                )
             ),
         )
+        widget.bind("<B1-Motion>", self._move_group_entry_drag)
         widget.bind(
             "<ButtonRelease-1>",
             self._finish_group_entry_drag,
         )
         for child in widget.winfo_children():
-            self._bind_group_entry_drag_tree(child, entry_id)
+            self._bind_group_entry_drag_tree(
+                child,
+                entry_id,
+                display_name,
+            )
 
     def _finish_group_entry_drag(self, event) -> None:
         source_id = self._group_drag_entry_id
         self._group_drag_entry_id = None
+        self._clear_group_entry_drag_preview()
         if not self._group_reorder_mode or source_id is None:
             return
         try:
@@ -9642,14 +11078,13 @@ class HomeView:
                 bd=0,
             )
             role_id_entry.insert(0, entry.role_id)
+            role_id_entry.configure(state="readonly")
             role_id_entry.pack(side=LEFT, padx=(0, 6), ipady=4)
             self._button(
                 top_row,
                 "校正角色 ID",
-                lambda value=entry.entry_id,
-                field=role_id_entry: self._calibrate_group_role_id(
+                lambda value=entry.entry_id: self._calibrate_group_role_id(
                     value,
-                    field,
                 ),
             ).pack(side=LEFT)
             self._button(
@@ -9685,16 +11120,28 @@ class HomeView:
             remove_button.pack(side=RIGHT)
             if locked or self._group_reorder_mode:
                 remove_button.configure(state=DISABLED)
+            role_id_message = self._role_id_messages.get(entry.entry_id, "")
+            if role_id_message:
+                Label(
+                    row,
+                    text=role_id_message,
+                    font=("Microsoft JhengHei UI", 9),
+                    bg=BACKGROUND,
+                    fg=SUCCESS if role_id_message.startswith("已") else WARNING,
+                    anchor="w",
+                ).pack(fill=X, pady=(6, 0))
             if entry.role != "主窗口":
+                main_action_row = Frame(row, bg=BACKGROUND)
+                main_action_row.pack(fill=X, pady=(6, 0))
                 main_button = self._button(
-                    top_row,
+                    main_action_row,
                     "設為主窗口",
                     lambda value=entry.entry_id: self._set_group_main(
                         value
                     ),
                 )
-                main_button.pack(side=RIGHT, padx=(0, 6))
-                if locked or self._group_reorder_mode:
+                main_button.pack(side=RIGHT)
+                if locked:
                     main_button.configure(state=DISABLED)
             if self._group_reorder_mode:
                 Label(
@@ -9708,6 +11155,7 @@ class HomeView:
                 self._bind_group_entry_drag_tree(
                     row,
                     entry.entry_id,
+                    entry.display_name,
                 )
                 continue
             settings_row = Frame(row, bg=BACKGROUND)
@@ -9929,7 +11377,7 @@ class HomeView:
             }
             or self.on_add_ungrouped_window_to_group is None
         ):
-            self._show_group_setting_message("請先選擇可加入的組別。")
+            self._show_ungrouped_status("請先選擇可加入的組別。")
             return
         try:
             result = self.on_add_ungrouped_window_to_group(
@@ -9937,17 +11385,40 @@ class HomeView:
                 group_name,
             )
         except Exception as error:
+            self._show_ungrouped_status(
+                "加入組別失敗，未變更未分組視窗。"
+            )
             self._report_refresh_error(error)
             return
-        if result is False:
-            self._show_group_setting_message("未加入任何組別。")
+        if not isinstance(result, GroupManagementViewResult):
+            self._show_ungrouped_status(
+                "加入結果無法確認，未變更未分組視窗。"
+            )
             return
-        self._show_group_setting_message(
-            result if isinstance(result, str) else "已加入組別。"
+        if not result.success:
+            self._show_ungrouped_status(
+                result.message or "未加入任何組別。"
+            )
+            return
+        self._show_ungrouped_status(
+            result.message or f"已加入 {group_name}。",
+            success=True,
         )
         self.refresh_group_entries()
         self.refresh_group_sync_relations()
         self.refresh_ungrouped_windows()
+
+    def _show_ungrouped_status(
+        self,
+        message: str,
+        *,
+        success: bool = False,
+    ) -> None:
+        if self._ungrouped_status_label is not None:
+            self._ungrouped_status_label.configure(
+                text=message,
+                fg=SUCCESS if success else WARNING,
+            )
 
     def _toggle_group_role_details(
         self,
@@ -10084,7 +11555,6 @@ class HomeView:
     def _calibrate_group_role_id(
         self,
         entry_id: str,
-        field: Entry,
     ) -> None:
         if (
             self.current_group_name is None
@@ -10095,12 +11565,11 @@ class HomeView:
             result = self.on_calibrate_role_id(
                 self.current_group_name,
                 entry_id,
-                field.get(),
             )
         except Exception as error:
             self._report_refresh_error(error)
             return
-        self._show_group_setting_message(result)
+        self._show_role_id_message(entry_id, result)
         self.refresh_group_entries()
 
     def _read_group_role_id(self, entry_id: str) -> None:
@@ -10117,8 +11586,15 @@ class HomeView:
         except Exception as error:
             self._report_refresh_error(error)
             return
-        self._show_group_setting_message(result)
+        self._show_role_id_message(entry_id, result)
         self.refresh_group_entries()
+
+    def _show_role_id_message(self, entry_id: str, value: object) -> None:
+        message = value.strip() if isinstance(value, str) else ""
+        if message:
+            self._role_id_messages[entry_id] = message
+        else:
+            self._role_id_messages.pop(entry_id, None)
 
     def _set_group_main(self, entry_id: str) -> None:
         if (
@@ -10302,14 +11778,53 @@ class HomeView:
                 if self.workspace_state_provider is not None
                 else previous
             )
-            text = _workspace_state_text(state)
+            if not isinstance(state, WorkspaceState):
+                raise TypeError("workspace provider must return WorkspaceState.")
         except Exception as error:
             self._report_refresh_error(error)
-            return _workspace_state_text(previous)
+            return self._home_overview_text()
         self.workspace_state = state
+        text = self._home_overview_text()
         if self._workspace_label is not None:
             self._workspace_label.configure(text=text)
         return text
+
+    def _refresh_activity_schedule_toggle(self) -> None:
+        button = getattr(self, "_activity_schedule_toggle_button", None)
+        if button is None:
+            return
+        _visible, hidden = _activity_schedule_visible_items(
+            self.activity_schedule,
+            bool(getattr(self, "_activity_schedule_expanded", False)),
+        )
+        button.configure(
+            text=(
+                "收起其他活動與設定"
+                if self._activity_schedule_expanded
+                else f"查看全部（其餘 {hidden} 項）"
+                if hidden > 0
+                else "活動敘述設定"
+            )
+        )
+        if not button.winfo_manager():
+            button.pack(side=RIGHT, padx=(8, 0))
+
+    def _toggle_activity_schedule_details(self) -> None:
+        self._activity_schedule_expanded = not bool(self._activity_schedule_expanded)
+        if self._activity_schedule_label is not None:
+            self._activity_schedule_label.configure(
+                text=_activity_schedule_compact_text(
+                    self.activity_schedule,
+                    self._activity_schedule_expanded,
+                )
+            )
+        details = getattr(self, "_activity_schedule_details_frame", None)
+        if details is not None:
+            if self._activity_schedule_expanded:
+                details.pack(fill=X, pady=(8, 0))
+            else:
+                details.pack_forget()
+        self._refresh_activity_schedule_toggle()
 
     def refresh_activity_schedule(self) -> str:
         previous = self.activity_schedule
@@ -10323,13 +11838,17 @@ class HomeView:
                 raise TypeError(
                     "activity schedule provider must return PlayerActivitySchedule."
                 )
-            text = _activity_schedule_text(state)
+            text = _activity_schedule_compact_text(
+                state,
+                bool(getattr(self, "_activity_schedule_expanded", False)),
+            )
         except Exception as error:
             self._report_refresh_error(error)
             return _activity_schedule_text(previous)
         self.activity_schedule = state
         if self._activity_schedule_label is not None:
             self._activity_schedule_label.configure(text=text)
+        self._refresh_activity_schedule_toggle()
         return text
 
     def refresh_cards(self) -> str:

@@ -2,6 +2,13 @@ import json
 
 from core.window_registry import WindowHealth, WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
+
+
+def _store(path) -> WindowRegistryStore:
+    return WindowRegistryStore(path, IdentityDataTransactionCoordinator())
 
 
 def test_registry_round_trip_preserves_identity_but_not_stale_handle(tmp_path):
@@ -17,7 +24,7 @@ def test_registry_round_trip_preserves_identity_but_not_stale_handle(tmp_path):
         health=WindowHealth.READY,
     )
 
-    store = WindowRegistryStore(tmp_path / "window_registry.json")
+    store = _store(tmp_path / "window_registry.json")
     store.save(registry)
     restored = store.load().get("160")
 
@@ -34,7 +41,7 @@ def test_registry_round_trip_preserves_identity_but_not_stale_handle(tmp_path):
 
 def test_store_uses_current_schema_version_and_removes_temp_file(tmp_path):
     path = tmp_path / "window_registry.json"
-    store = WindowRegistryStore(path)
+    store = _store(path)
     registry = WindowRegistry()
     record = registry.register_character("100", "100古")
 
@@ -70,7 +77,7 @@ def test_v1_registry_migrates_and_is_saved_as_v2(tmp_path):
         encoding="utf-8",
     )
 
-    store = WindowRegistryStore(path)
+    store = _store(path)
     registry = store.load()
     migrated = registry.get("120")
 
@@ -88,7 +95,7 @@ def test_v1_registry_migrates_and_is_saved_as_v2(tmp_path):
 
 def test_save_keeps_previous_valid_file_as_backup(tmp_path):
     path = tmp_path / "window_registry.json"
-    store = WindowRegistryStore(path)
+    store = _store(path)
     registry = WindowRegistry()
     registry.register_character("first", "第一角")
     store.save(registry)
@@ -104,7 +111,7 @@ def test_save_keeps_previous_valid_file_as_backup(tmp_path):
 
 def test_corrupt_registry_recovers_from_last_valid_backup(tmp_path):
     path = tmp_path / "window_registry.json"
-    store = WindowRegistryStore(path)
+    store = _store(path)
     registry = WindowRegistry()
     registry.register_character("first", "第一角")
     store.save(registry)
@@ -124,7 +131,7 @@ def test_corrupt_registry_recovers_from_last_valid_backup(tmp_path):
 def test_corrupt_registry_without_backup_is_preserved_and_rebuilt_empty(tmp_path):
     path = tmp_path / "window_registry.json"
     path.write_text('{"characters": [', encoding="utf-8")
-    store = WindowRegistryStore(path)
+    store = _store(path)
 
     registry = store.load()
 
@@ -139,7 +146,7 @@ def test_corrupt_registry_without_backup_is_preserved_and_rebuilt_empty(tmp_path
 def test_unsupported_schema_is_recovered_conservatively(tmp_path):
     path = tmp_path / "window_registry.json"
     path.write_text('{"schema_version": 999, "characters": []}', encoding="utf-8")
-    store = WindowRegistryStore(path)
+    store = _store(path)
 
     registry = store.load()
 
@@ -170,7 +177,7 @@ def test_invalid_saved_handle_is_never_restored(tmp_path):
         encoding="utf-8",
     )
 
-    record = WindowRegistryStore(path).load().get("120")
+    record = _store(path).load().get("120")
 
     assert record.handle is None
     assert record.health is WindowHealth.UNKNOWN

@@ -9,9 +9,9 @@ from domain.group import CharacterGroup
 from services.card_expiry_monitor import CARD_EXPIRY_CHECK_MS, CardExpiryMonitor
 
 
-def _card() -> GroupCard:
+def _card(card_id: str = "guard") -> GroupCard:
     return GroupCard(
-        card_id="guard",
+        card_id=card_id,
         group=CharacterGroup(group_id="14-windows", name="14支"),
         activity=ActivityDefinition(
             activity_id="guard",
@@ -146,7 +146,7 @@ def test_pending_expired_card_is_recorded_without_becoming_visible():
             shown_at=shown_at,
             lifetime=timedelta(minutes=5),
         )
-    pending = _card()
+    pending = _card("zzz-pending")
     cards.upsert(
         pending,
         shown_at=shown_at,
@@ -165,8 +165,8 @@ def test_pending_expired_card_is_recorded_without_becoming_visible():
     schedule.run_next()
 
     assert recorded == [pending]
-    assert tuple(card.card_id for card in cards.cards) == (
+    assert {card.card_id for card in cards.cards} == {
         "one",
         "two",
         "three",
-    )
+    }

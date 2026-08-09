@@ -44,7 +44,7 @@ class CardViewItem:
             requires_player_action=card.requires_player_action,
             next_step=card.next_step,
             priority_reason=card.priority_reason.value,
-            priority_level=int(card.priority_tier),
+            priority_level=int(entry.presentation_order.category),
             shown_at=entry.shown_at,
             expires_at=entry.expires_at,
             name_only=card.name_only,

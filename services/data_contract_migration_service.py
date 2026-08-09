@@ -29,7 +29,7 @@ class DataContractMigrationService:
         "progress": 1,
         "habits": 1,
         "cards": 1,
-        "reconnect": 6,
+        "reconnect": 7,
         "legacy_settings": 2,
     }
 

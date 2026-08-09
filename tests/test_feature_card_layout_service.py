@@ -18,7 +18,7 @@ def test_default_order_and_preferences_do_not_write_configuration(tmp_path):
         "home.b",
     )
     assert service.preference("home.a", "預設標題").title == "預設標題"
-    assert service.preference("home.a", "預設標題").collapsed is False
+    assert service.preference("home.a", "預設標題").collapsed is True
     assert FEATURE_CARD_LAYOUT_CONFIG_KEY not in config.data
 
 
@@ -29,7 +29,7 @@ def test_reorder_collapse_and_title_survive_restart(tmp_path):
         ("home.b", "home.a"),
         ("home.a", "home.b"),
     )
-    service.set_collapsed("home.b", True)
+    service.set_collapsed("home.b", False)
     service.set_title("home.b", "我的卡片")
 
     restored = FeatureCardLayoutService(
@@ -42,7 +42,7 @@ def test_reorder_collapse_and_title_survive_restart(tmp_path):
     )
     preference = restored.preference("home.b", "預設標題")
     assert preference.title == "我的卡片"
-    assert preference.collapsed is True
+    assert preference.collapsed is False
 
 
 def test_new_cards_are_appended_without_losing_saved_order(tmp_path):
@@ -106,3 +106,25 @@ def test_reset_title_keeps_collapsed_state(tmp_path):
     preference = service.preference("home.a", "預設")
     assert preference.title == "預設"
     assert preference.collapsed is True
+
+
+def test_missing_or_invalid_collapsed_value_fails_closed_without_rewriting(tmp_path):
+    config, service = _service(tmp_path)
+    config.set(
+        FEATURE_CARD_LAYOUT_CONFIG_KEY,
+        {
+            "schema_version": 1,
+            "pages": {},
+            "cards": {
+                "home.missing": {},
+                "home.invalid": {"collapsed": 1},
+                "home.expanded": {"collapsed": False},
+            },
+        },
+    )
+    before = dict(config.data)
+
+    assert service.preference("home.missing", "缺值").collapsed is True
+    assert service.preference("home.invalid", "壞值").collapsed is True
+    assert service.preference("home.expanded", "已保存").collapsed is False
+    assert config.data == before

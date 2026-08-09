@@ -1,14 +1,28 @@
 import json
+from pathlib import Path
 
 import pytest
 
+import services.identity_data_transaction_coordinator as transaction_module
 from services.group_configuration_service import (
-    GroupConfigurationService,
+    GroupConfigurationService as _GroupConfigurationService,
     GroupHotkeyConflictError,
     GroupMasterLockedError,
     SyncCycleError,
 )
 from services.group_launch_service import SavedWindowPlacement
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
+)
+
+
+class GroupConfigurationService(_GroupConfigurationService):
+    def __init__(self, path, *, legacy_config_path=None):
+        super().__init__(
+            path,
+            IdentityDataTransactionCoordinator(),
+            legacy_config_path=legacy_config_path,
+        )
 
 
 def _shortcut(tmp_path, name):
@@ -904,17 +918,20 @@ def test_failed_schema_migration_keeps_original_and_recovery_copy(
         encoding="utf-8",
     )
     before = owned.read_bytes()
-    original_writer = GroupConfigurationService._write_json_atomic.__func__
+    original_replace = transaction_module.os.replace
 
-    def fail_owned_write(cls, path, payload):
-        if path == owned:
+    def fail_owned_write(source, destination):
+        if (
+            Path(destination).absolute() == owned.absolute()
+            and ".candidate-" in Path(source).name
+        ):
             raise OSError("simulated migration failure")
-        return original_writer(cls, path, payload)
+        return original_replace(source, destination)
 
     monkeypatch.setattr(
-        GroupConfigurationService,
-        "_write_json_atomic",
-        classmethod(fail_owned_write),
+        transaction_module.os,
+        "replace",
+        fail_owned_write,
     )
 
     with pytest.raises(OSError, match="simulated migration failure"):
@@ -924,6 +941,67 @@ def test_failed_schema_migration_keeps_original_and_recovery_copy(
     assert owned.read_bytes() == before
     assert len(backups) == 1
     assert backups[0].read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "managed_target",
+    [
+        "primary",
+        "backup",
+        "backup_namespace",
+        "migration",
+        "migration_namespace",
+        "corrupt",
+        "corrupt_namespace",
+        "legacy",
+    ],
+)
+def test_export_rejects_managed_group_paths_without_writing(
+    tmp_path,
+    managed_target,
+):
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(
+        json.dumps({"groups": []}),
+        encoding="utf-8",
+    )
+    owned = tmp_path / "groups.json"
+    service = GroupConfigurationService(
+        owned,
+        legacy_config_path=legacy,
+    )
+    assert service.create_group("alpha") is True
+    assert service.create_group("beta") is True
+    destinations = {
+        "primary": owned,
+        "backup": service.backup_path,
+        "backup_namespace": owned.with_name(owned.name + ".bak.audit.json"),
+        "migration": owned.with_name(owned.name + ".pre-migration"),
+        "migration_namespace": owned.with_name(
+            owned.name + ".pre-migration.audit.json"
+        ),
+        "corrupt": owned.with_name(owned.name + ".corrupt"),
+        "corrupt_namespace": owned.with_name(
+            owned.name + ".corrupt.audit.json"
+        ),
+        "legacy": legacy,
+    }
+    destination = destinations[managed_target]
+    if destination not in {owned, service.backup_path, legacy}:
+        destination.write_bytes(b"managed sentinel")
+    observed = {owned, service.backup_path, destination, legacy}
+    before = {
+        path: path.read_bytes() if path.exists() else None
+        for path in observed
+    }
+
+    with pytest.raises(ValueError):
+        service.export_configuration(destination)
+
+    assert {
+        path: path.read_bytes() if path.exists() else None
+        for path in observed
+    } == before
 
 
 def test_export_import_keeps_safe_root_unknown_fields(tmp_path):

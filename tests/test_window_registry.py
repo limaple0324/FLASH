@@ -225,3 +225,51 @@ def test_schema_v1_data_migrates_without_trusting_old_handle():
     assert record.confirmed is False
     assert record.process_id == 123
     assert registry.to_dict()["schema_version"] == 2
+
+
+def test_runtime_clone_and_replace_preserve_exact_live_observation():
+    registry = WindowRegistry()
+    registry.register_character(
+        "character-a",
+        "角色甲",
+        group="甲組",
+        role="主控",
+        note="原備註",
+    )
+    registry.confirm_window(
+        "character-a",
+        handle=654,
+        process_id=321,
+        window_class="GameWindow",
+        rect=(10, 20, 810, 620),
+        health=WindowHealth.WARNING,
+    )
+
+    candidate = registry.clone_runtime()
+    candidate.set_note("character-a", "新備註")
+
+    assert candidate.get("character-a").handle == 654
+    assert candidate.get("character-a").process_id == 321
+    assert candidate.get("character-a").window_class == "GameWindow"
+    assert candidate.get("character-a").rect == (10, 20, 810, 620)
+    assert candidate.get("character-a").health is WindowHealth.WARNING
+    assert candidate.get("character-a").confirmed is True
+    assert registry.get("character-a").note == "原備註"
+
+    registry.replace_runtime(candidate)
+
+    assert registry.get("character-a") == candidate.get("character-a")
+
+
+def test_runtime_replace_validates_every_record_before_single_publication():
+    live = WindowRegistry()
+    live.register_character("live", "現有角色")
+    before = live.all()
+    invalid = WindowRegistry()
+    record = invalid.register_character("candidate", "候選角色")
+    invalid._records["mismatched-key"] = record
+
+    with pytest.raises(ValueError, match="key"):
+        live.replace_runtime(invalid)
+
+    assert live.all() == before

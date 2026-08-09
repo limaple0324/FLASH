@@ -377,12 +377,9 @@ class BackgroundImageService:
         if candidate_metadata is not None:
             metadata[str(candidate)] = candidate_metadata
             values[BACKGROUND_METADATA_CONFIG_KEY] = metadata
-        previous_data = dict(self._config.data)
         try:
             self._config.update_values(values)
         except Exception:
-            self._config.data.clear()
-            self._config.data.update(previous_data)
             return self._failure("背景圖片無法保存，原本背景已保留。")
         self._prepared_metadata.pop(candidate, None)
         self._cleanup_unreferenced()
@@ -440,12 +437,9 @@ class BackgroundImageService:
         if candidate_metadata is not None:
             metadata[str(candidate)] = candidate_metadata
             values[BACKGROUND_METADATA_CONFIG_KEY] = metadata
-        previous_data = dict(self._config.data)
         try:
             self._config.update_values(values)
         except Exception:
-            self._config.data.clear()
-            self._config.data.update(previous_data)
             return self._failure("卡片背景無法保存，原本卡片背景已保留。")
         self._prepared_metadata.pop(candidate, None)
         self._cleanup_unreferenced()
@@ -495,7 +489,6 @@ class BackgroundImageService:
     def clear(self) -> BackgroundImageResult:
         """Clear the setting and remove only this service's managed copy."""
         managed_path = self.current_background()
-        previous_data = dict(self._config.data)
         try:
             self._config.update_values(
                 {
@@ -504,8 +497,6 @@ class BackgroundImageService:
                 }
             )
         except Exception:
-            self._config.data.clear()
-            self._config.data.update(previous_data)
             return self._failure("背景圖片無法清除，原本背景已保留。")
 
         self._cleanup_unreferenced()
@@ -547,7 +538,6 @@ class BackgroundImageService:
 
     def clear_all(self) -> BackgroundImageResult:
         """Remove global and page assignments while keeping source files untouched."""
-        previous_data = dict(self._config.data)
         try:
             self._config.update_values(
                 {
@@ -558,8 +548,6 @@ class BackgroundImageService:
                 }
             )
         except Exception:
-            self._config.data.clear()
-            self._config.data.update(previous_data)
             return self._failure("所有背景無法恢復預設，原本設定已保留。")
         self._cleanup_unreferenced()
         return BackgroundImageResult(
@@ -655,7 +643,6 @@ class BackgroundImageService:
         if not source.is_file():
             return self._failure("找不到背景設定備份，原本設定已保留。")
         staged_paths: dict[str, Path] = {}
-        previous_data = dict(self._config.data)
         try:
             with zipfile.ZipFile(source, "r") as archive:
                 payload = json.loads(
@@ -782,8 +769,6 @@ class BackgroundImageService:
                     }
                 )
         except Exception:
-            self._config.data.clear()
-            self._config.data.update(previous_data)
             for path in staged_paths.values():
                 path.unlink(missing_ok=True)
             return self._failure(
