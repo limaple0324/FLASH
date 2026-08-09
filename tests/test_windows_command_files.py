@@ -1,4 +1,10 @@
+import os
+import shutil
+import subprocess
+import textwrap
 from pathlib import Path
+
+import pytest
 
 
 WINDOWS_COMMAND_FILES = (
@@ -204,10 +210,14 @@ def test_main_release_index_is_an_immutable_single_file_compare_and_swap():
         "published_utc = $publishedUtc",
     ):
         assert field in publish_step
-    assert publish_step.count("Get-ReleaseLatestRef") >= 4
+    assert publish_step.count("Get-ReleaseLatestRef") == 4
+    assert publish_step.count(
+        "if ((Get-ReleaseLatestRef) -ne $oldReleaseLatest) {"
+    ) == 2
     assert "parents = @($oldReleaseLatest)" in publish_step
     assert "base_tree" not in publish_step
     assert "force = $false" in publish_step
+    assert "$updatedReleaseLatest = [string]$indexCommit.sha" in publish_step
     assert (
         'Invoke-GitHubJson -Method \'Get\' '
         '-Uri "$apiRoot/git/commits/${updatedReleaseLatest}"'
@@ -223,14 +233,326 @@ def test_main_release_index_is_an_immutable_single_file_compare_and_swap():
     ) in publish_step
     assert "updatedEntries.Count -ne 1" in publish_step
     assert "$updatedEntries[0].path -ne 'release-index.json'" in publish_step
-    assert publish_step.index("$updatedReleaseLatest = Get-ReleaseLatestRef") < (
-        publish_step.index("$updatedCommit = Invoke-GitHubJson")
-    )
+    assert "$updatedReleaseLatest = Get-ReleaseLatestRef" not in publish_step
+    assert publish_step.index(
+        "$updatedReleaseLatest = [string]$indexCommit.sha"
+    ) < publish_step.index("$updatedCommit = Invoke-GitHubJson")
     assert publish_step.index("$updatedCommit = Invoke-GitHubJson") < (
         publish_step.index("$updatedTree = Invoke-GitHubJson")
     )
     index_section = publish_step.split("$oldReleaseLatest = Get-ReleaseLatestRef", 1)[1]
     assert "FLASH.exe" not in index_section
+    assert "git fetch" not in index_section
+    assert "git push" not in index_section
+
+
+def test_main_release_latest_patch_and_rest_readback_are_strict_and_bounded():
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    publish_step = workflow.split("- name: Publish latest desktop updater files", 1)[1]
+    publish_step = publish_step.split(
+        "- name: Publish SP1-only desktop updater files",
+        1,
+    )[0]
+
+    assert (
+        "$updatedRefResponse = Invoke-GitHubJson -Method 'Patch' "
+        '-Uri "$apiRoot/git/refs/heads/release/latest" -Body @{'
+    ) in publish_step
+    assert "sha = $expectedReleaseLatest" in publish_step
+    assert "force = $false" in publish_step
+    assert (
+        "[string]$updatedRefResponse.ref -cne "
+        "'refs/heads/release/latest'"
+    ) in publish_step
+    assert "[string]$updatedRefResponse.object.type -cne 'commit'" in publish_step
+    assert (
+        "[string]$updatedRefResponse.object.sha -cne $expectedReleaseLatest"
+    ) in publish_step
+
+    assert "$releaseLatestRestAttempts = 3" in publish_step
+    assert (
+        "for ($readbackAttempt = 1; "
+        "$readbackAttempt -le $releaseLatestRestAttempts; "
+        "$readbackAttempt++) {"
+    ) in publish_step
+    assert "$readbackHeaders = $SharedHeaders.Clone()" in publish_step
+    assert "$readbackHeaders['Cache-Control'] = 'no-cache'" in publish_step
+    assert "[Guid]::NewGuid().ToString('N')" in publish_step
+    assert (
+        '"$ApiRoot/git/ref/heads/release/latest?readback=$readbackNonce"'
+    ) in publish_step
+    assert "function Confirm-ReleaseLatestRefUpdate" in publish_step
+    assert publish_step.count("Confirm-ReleaseLatestRefUpdate") == 2
+    assert (
+        "$null = Confirm-ReleaseLatestRefUpdate `\n"
+        "            -SharedHeaders $headers `\n"
+        "            -ApiRoot $apiRoot `\n"
+        "            -Repository $repo `\n"
+        "            -OldSha $oldReleaseLatest `\n"
+        "            -ExpectedSha $expectedReleaseLatest"
+    ) in publish_step
+
+    disposition_helper = publish_step.split(
+        "function Get-ReleaseLatestReadbackDisposition",
+        1,
+    )[1].split("function Confirm-AnonymousReleaseLatestReadback", 1)[0]
+    assert "$observed -eq $ExpectedSha.ToLowerInvariant()" in disposition_helper
+    assert "return 'confirmed'" in disposition_helper
+    assert "$observed -eq $OldSha.ToLowerInvariant()" in disposition_helper
+    assert "return 'retry'" in disposition_helper
+    assert disposition_helper.count("throw") == 2
+    assert "if (-not $releaseLatestRestConfirmed) {" in publish_step
+
+
+def test_main_release_latest_anonymous_fallback_is_read_only_and_exact():
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    publish_step = workflow.split("- name: Publish latest desktop updater files", 1)[1]
+    publish_step = publish_step.split(
+        "- name: Publish SP1-only desktop updater files",
+        1,
+    )[0]
+    index_section = publish_step.split("$oldReleaseLatest = Get-ReleaseLatestRef", 1)[1]
+
+    assert "$env:GIT_TERMINAL_PROMPT = '0'" in publish_step
+    command_and_exit = (
+        '& git ls-remote --refs --exit-code "https://github.com/$Repository.git" '
+        "refs/heads/release/latest\n"
+        "              )\n"
+        "              $anonymousReadbackExit = $LASTEXITCODE"
+    )
+    assert command_and_exit in publish_step
+    assert "-Lines $anonymousReadbackLines" in publish_step
+    assert "-ExitCode $anonymousReadbackExit" in publish_step
+    assert "-ExpectedSha $ExpectedSha" in publish_step
+    assert "Confirm-ReleaseLatestRefUpdate" in index_section
+    assert "git fetch" not in index_section
+    assert "git push" not in index_section
+
+    anonymous_helper = publish_step.split(
+        "function Confirm-AnonymousReleaseLatestReadback",
+        1,
+    )[1].split("$artifactName =", 1)[0]
+    assert "if ($ExitCode -ne 0)" in anonymous_helper
+    assert "if ($ExpectedSha -cnotmatch '^[0-9a-f]{40}$')" in anonymous_helper
+    assert "$readbackLines = @($Lines)" in anonymous_helper
+    assert "if ($readbackLines.Count -ne 1)" in anonymous_helper
+    assert (
+        "$readbackLine -cnotmatch "
+        "'^(?<sha>[0-9a-f]{40})\\s+refs/heads/release/latest$'"
+    ) in anonymous_helper
+    assert "$Matches.sha -cne $ExpectedSha" in anonymous_helper
+
+
+def test_release_latest_readback_helpers_execute_and_publish_script_parses(tmp_path):
+    powershell = shutil.which("pwsh") or shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable")
+
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    publish_step = workflow.split("- name: Publish latest desktop updater files", 1)[1]
+    publish_step = publish_step.split(
+        "- name: Publish SP1-only desktop updater files",
+        1,
+    )[0]
+    helper_start = publish_step.index(
+        "          function Get-ReleaseLatestReadbackDisposition"
+    )
+    helper_end = publish_step.index("          $artifactName =", helper_start)
+    helpers = textwrap.dedent(publish_step[helper_start:helper_end])
+
+    old_sha = "a" * 40
+    expected_sha = "b" * 40
+    third_sha = "c" * 40
+    probe = f"""
+$ErrorActionPreference = 'Stop'
+{helpers}
+$oldSha = '{old_sha}'
+$expectedSha = '{expected_sha}'
+$thirdSha = '{third_sha}'
+if ((Get-ReleaseLatestReadbackDisposition -ObservedSha $expectedSha -OldSha $oldSha -ExpectedSha $expectedSha) -ne 'confirmed') {{ throw 'expected SHA was not confirmed' }}
+if ((Get-ReleaseLatestReadbackDisposition -ObservedSha $oldSha -OldSha $oldSha -ExpectedSha $expectedSha) -ne 'retry') {{ throw 'old SHA was not retried' }}
+$thirdRejected = $false
+try {{ $null = Get-ReleaseLatestReadbackDisposition -ObservedSha $thirdSha -OldSha $oldSha -ExpectedSha $expectedSha }} catch {{ $thirdRejected = $true }}
+if (-not $thirdRejected) {{ throw 'third SHA was accepted' }}
+$correctLine = "$expectedSha`trefs/heads/release/latest"
+if (-not (Confirm-AnonymousReleaseLatestReadback -Lines @($correctLine) -ExitCode 0 -ExpectedSha $expectedSha)) {{ throw 'anonymous readback was rejected' }}
+$twoLinesRejected = $false
+try {{ $null = Confirm-AnonymousReleaseLatestReadback -Lines @($correctLine, $correctLine) -ExitCode 0 -ExpectedSha $expectedSha }} catch {{ $twoLinesRejected = $true }}
+if (-not $twoLinesRejected) {{ throw 'two anonymous lines were accepted' }}
+$wrongShaRejected = $false
+try {{ $null = Confirm-AnonymousReleaseLatestReadback -Lines @("$oldSha`trefs/heads/release/latest") -ExitCode 0 -ExpectedSha $expectedSha }} catch {{ $wrongShaRejected = $true }}
+if (-not $wrongShaRejected) {{ throw 'old anonymous SHA was accepted' }}
+$exitRejected = $false
+try {{ $null = Confirm-AnonymousReleaseLatestReadback -Lines @($correctLine) -ExitCode 2 -ExpectedSha $expectedSha }} catch {{ $exitRejected = $true }}
+if (-not $exitRejected) {{ throw 'failed anonymous command was accepted' }}
+
+function Assert-ProbeCondition {{
+  param([bool]$Condition, [string]$Message)
+  if (-not $Condition) {{ throw $Message }}
+}}
+
+$script:mockShas = @()
+$script:throwRest = $false
+$script:restCalls = 0
+$script:sleepCalls = 0
+$script:gitCalls = 0
+$script:requestUris = @()
+$script:cacheValues = @()
+$script:headerIdentities = @()
+$script:gitArguments = @()
+$script:gitLines = @()
+$script:gitExitCode = 0
+
+function Reset-ReadbackMocks {{
+  param([string[]]$Shas, [bool]$ThrowRest = $false)
+  $script:mockShas = @($Shas)
+  $script:throwRest = $ThrowRest
+  $script:restCalls = 0
+  $script:sleepCalls = 0
+  $script:gitCalls = 0
+  $script:requestUris = @()
+  $script:cacheValues = @()
+  $script:headerIdentities = @()
+  $script:gitArguments = @()
+  $script:gitLines = @("$expectedSha`trefs/heads/release/latest")
+  $script:gitExitCode = 0
+}}
+
+function Invoke-RestMethod {{
+  [CmdletBinding()]
+  param([string]$Method, [string]$Uri, [hashtable]$Headers)
+  $script:restCalls += 1
+  $script:requestUris += $Uri
+  $script:cacheValues += [string]$Headers['Cache-Control']
+  $script:headerIdentities += [Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($Headers)
+  if ($script:throwRest) {{ throw 'mock REST failure' }}
+  $sha = [string]$script:mockShas[$script:restCalls - 1]
+  return [pscustomobject]@{{ object = [pscustomobject]@{{ sha = $sha }} }}
+}}
+
+function Start-Sleep {{
+  [CmdletBinding()]
+  param([int]$Seconds)
+  $script:sleepCalls += 1
+}}
+
+function git {{
+  $script:gitCalls += 1
+  $script:gitArguments = @($args)
+  $global:LASTEXITCODE = $script:gitExitCode
+  foreach ($line in $script:gitLines) {{ Write-Output $line }}
+}}
+
+$env:GITHUB_RUN_ID = '12345'
+$env:GITHUB_RUN_ATTEMPT = '1'
+
+Reset-ReadbackMocks -Shas @($expectedSha)
+$sharedHeaders = @{{ Accept = 'application/json'; Authorization = 'secret' }}
+$sharedHeaderIdentity = [Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($sharedHeaders)
+$result = Confirm-ReleaseLatestRefUpdate -SharedHeaders $sharedHeaders -ApiRoot 'https://api.example.test' -Repository 'example/repo' -OldSha $oldSha -ExpectedSha $expectedSha
+Assert-ProbeCondition -Condition ($result -eq $true) -Message 'first-new did not succeed'
+Assert-ProbeCondition -Condition ($script:restCalls -eq 1) -Message 'first-new REST count was not one'
+Assert-ProbeCondition -Condition ($script:sleepCalls -eq 0) -Message 'first-new slept'
+Assert-ProbeCondition -Condition ($script:gitCalls -eq 0) -Message 'first-new used anonymous fallback'
+Assert-ProbeCondition -Condition ($script:cacheValues.Count -eq 1) -Message 'first-new cache header count was not one'
+Assert-ProbeCondition -Condition ($script:cacheValues[0] -ceq 'no-cache') -Message 'first-new REST read lacked no-cache'
+Assert-ProbeCondition -Condition ($script:requestUris.Count -eq 1) -Message 'first-new URI count was not one'
+$firstNewUriPattern = '^https://api\\.example\\.test/git/ref/heads/release/latest\\?readback=12345-1-1-[0-9a-f]{{32}}$'
+Assert-ProbeCondition -Condition ($script:requestUris[0] -cmatch $firstNewUriPattern) -Message 'first-new URI nonce was invalid'
+Assert-ProbeCondition -Condition ($script:headerIdentities.Count -eq 1) -Message 'first-new header count was not one'
+Assert-ProbeCondition -Condition ($script:headerIdentities[0] -ne $sharedHeaderIdentity) -Message 'first-new reused shared headers'
+Assert-ProbeCondition -Condition (-not $sharedHeaders.ContainsKey('Cache-Control')) -Message 'first-new polluted shared headers'
+
+Reset-ReadbackMocks -Shas @($oldSha, $oldSha, $expectedSha)
+$sharedHeaders = @{{ Accept = 'application/json'; Authorization = 'secret' }}
+$result = Confirm-ReleaseLatestRefUpdate -SharedHeaders $sharedHeaders -ApiRoot 'https://api.example.test' -Repository 'example/repo' -OldSha $oldSha -ExpectedSha $expectedSha
+Assert-ProbeCondition -Condition ($result -eq $true) -Message 'old-old-new did not succeed'
+Assert-ProbeCondition -Condition ($script:restCalls -eq 3) -Message 'old-old-new REST count was not three'
+Assert-ProbeCondition -Condition ($script:sleepCalls -eq 2) -Message 'old-old-new sleep count was not two'
+Assert-ProbeCondition -Condition ($script:gitCalls -eq 0) -Message 'old-old-new used anonymous fallback'
+$badCacheValues = @($script:cacheValues | Where-Object {{ $_ -cne 'no-cache' }})
+Assert-ProbeCondition -Condition ($badCacheValues.Count -eq 0) -Message 'a REST read lacked no-cache'
+$uniqueUris = @($script:requestUris | Select-Object -Unique)
+Assert-ProbeCondition -Condition ($uniqueUris.Count -eq 3) -Message 'REST readback URIs were not unique'
+$uniqueHeaders = @($script:headerIdentities | Select-Object -Unique)
+Assert-ProbeCondition -Condition ($uniqueHeaders.Count -eq 3) -Message 'REST readback headers were not cloned'
+Assert-ProbeCondition -Condition (-not $sharedHeaders.ContainsKey('Cache-Control')) -Message 'shared headers were polluted'
+
+Reset-ReadbackMocks -Shas @($oldSha, $oldSha, $oldSha)
+$sharedHeaders = @{{ Accept = 'application/json'; Authorization = 'secret' }}
+$result = Confirm-ReleaseLatestRefUpdate -SharedHeaders $sharedHeaders -ApiRoot 'https://api.example.test' -Repository 'example/repo' -OldSha $oldSha -ExpectedSha $expectedSha
+Assert-ProbeCondition -Condition ($result -eq $true) -Message 'old-old-old fallback did not succeed'
+Assert-ProbeCondition -Condition ($script:restCalls -eq 3) -Message 'old-old-old REST count was not three'
+Assert-ProbeCondition -Condition ($script:sleepCalls -eq 2) -Message 'old-old-old sleep count was not two'
+Assert-ProbeCondition -Condition ($script:gitCalls -eq 1) -Message 'old-old-old fallback count was not one'
+Assert-ProbeCondition -Condition ($env:GIT_TERMINAL_PROMPT -ceq '0') -Message 'anonymous fallback allowed prompts'
+$expectedGitArguments = 'ls-remote|--refs|--exit-code|https://github.com/example/repo.git|refs/heads/release/latest'
+Assert-ProbeCondition -Condition (($script:gitArguments -join '|') -ceq $expectedGitArguments) -Message 'anonymous fallback arguments changed'
+
+Reset-ReadbackMocks -Shas @($thirdSha)
+$thirdDispatchRejected = $false
+try {{ $null = Confirm-ReleaseLatestRefUpdate -SharedHeaders @{{ Accept = 'application/json' }} -ApiRoot 'https://api.example.test' -Repository 'example/repo' -OldSha $oldSha -ExpectedSha $expectedSha }} catch {{ $thirdDispatchRejected = $true }}
+Assert-ProbeCondition -Condition $thirdDispatchRejected -Message 'third SHA dispatch was accepted'
+Assert-ProbeCondition -Condition ($script:restCalls -eq 1) -Message 'third SHA did not stop after one REST read'
+Assert-ProbeCondition -Condition ($script:sleepCalls -eq 0) -Message 'third SHA slept before failing'
+Assert-ProbeCondition -Condition ($script:gitCalls -eq 0) -Message 'third SHA used anonymous fallback'
+
+Reset-ReadbackMocks -Shas @($expectedSha) -ThrowRest $true
+$restFailureRejected = $false
+try {{ $null = Confirm-ReleaseLatestRefUpdate -SharedHeaders @{{ Accept = 'application/json' }} -ApiRoot 'https://api.example.test' -Repository 'example/repo' -OldSha $oldSha -ExpectedSha $expectedSha }} catch {{ $restFailureRejected = $true }}
+Assert-ProbeCondition -Condition $restFailureRejected -Message 'REST exception was accepted'
+Assert-ProbeCondition -Condition ($script:restCalls -eq 1) -Message 'REST exception did not stop after one call'
+Assert-ProbeCondition -Condition ($script:sleepCalls -eq 0) -Message 'REST exception slept before failing'
+Assert-ProbeCondition -Condition ($script:gitCalls -eq 0) -Message 'REST exception used anonymous fallback'
+"""
+    probe_path = tmp_path / "release_latest_readback_probe.ps1"
+    probe_path.write_text(probe, encoding="utf-8-sig")
+    probe_result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(probe_path),
+        ],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert probe_result.returncode == 0, probe_result.stdout + probe_result.stderr
+
+    publish_body = textwrap.dedent(publish_step.split("        run: |\n", 1)[1])
+    publish_script_path = tmp_path / "publish_latest.ps1"
+    publish_script_path.write_text(publish_body, encoding="utf-8-sig")
+    environment = os.environ.copy()
+    environment["FLASH_PUBLISH_SCRIPT_PATH"] = str(publish_script_path)
+    parse_result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            (
+                "$tokens=$null;$parseErrors=$null;"
+                "[System.Management.Automation.Language.Parser]::ParseFile("
+                "$env:FLASH_PUBLISH_SCRIPT_PATH,[ref]$tokens,[ref]$parseErrors)"
+                "|Out-Null;"
+                "if(@($parseErrors).Count -ne 0){"
+                "$parseErrors|ForEach-Object{Write-Error $_.Message};exit 1}"
+            ),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert parse_result.returncode == 0, parse_result.stdout + parse_result.stderr
 
 
 def test_windows_workflow_keeps_manual_artifact_build():

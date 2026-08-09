@@ -750,6 +750,95 @@ jobs:
             return $sha.ToLowerInvariant()
           }
 
+          function Get-ReleaseLatestReadbackDisposition {
+            param(
+              [string]$ObservedSha,
+              [string]$OldSha,
+              [string]$ExpectedSha
+            )
+            foreach ($sha in @($ObservedSha, $OldSha, $ExpectedSha)) {
+              if ($sha -notmatch '^[0-9a-fA-F]{40}$') {
+                throw 'release/latest 回讀包含無效的提交識別。'
+              }
+            }
+            $observed = $ObservedSha.ToLowerInvariant()
+            if ($observed -eq $ExpectedSha.ToLowerInvariant()) {
+              return 'confirmed'
+            }
+            if ($observed -eq $OldSha.ToLowerInvariant()) {
+              return 'retry'
+            }
+            throw "release/latest 回讀到非預期的第三個提交：$observed"
+          }
+
+          function Confirm-AnonymousReleaseLatestReadback {
+            param(
+              [object[]]$Lines,
+              [int]$ExitCode,
+              [string]$ExpectedSha
+            )
+            if ($ExitCode -ne 0) {
+              throw "匿名 release/latest 回讀失敗，結束碼：$ExitCode"
+            }
+            if ($ExpectedSha -cnotmatch '^[0-9a-f]{40}$') {
+              throw '匿名 release/latest 回讀的預期提交識別無效。'
+            }
+            $readbackLines = @($Lines)
+            if ($readbackLines.Count -ne 1) {
+              throw "匿名 release/latest 回讀必須恰有一行，實際：$($readbackLines.Count)"
+            }
+            $readbackLine = [string]$readbackLines[0]
+            if ($readbackLine -cnotmatch '^(?<sha>[0-9a-f]{40})\s+refs/heads/release/latest$') {
+              throw '匿名 release/latest 回讀格式或參照不正確。'
+            }
+            if ([string]$Matches.sha -cne $ExpectedSha) {
+              throw '匿名 release/latest 回讀沒有指向新索引提交。'
+            }
+            return $true
+          }
+
+          function Confirm-ReleaseLatestRefUpdate {
+            param(
+              [hashtable]$SharedHeaders,
+              [string]$ApiRoot,
+              [string]$Repository,
+              [string]$OldSha,
+              [string]$ExpectedSha
+            )
+            $releaseLatestRestAttempts = 3
+            $releaseLatestRestConfirmed = $false
+            for ($readbackAttempt = 1; $readbackAttempt -le $releaseLatestRestAttempts; $readbackAttempt++) {
+              $readbackHeaders = $SharedHeaders.Clone()
+              $readbackHeaders['Cache-Control'] = 'no-cache'
+              $readbackNonce = '{0}-{1}-{2}-{3}' -f $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT, $readbackAttempt, [Guid]::NewGuid().ToString('N')
+              $readbackResponse = Invoke-RestMethod -Method 'Get' -Uri "$ApiRoot/git/ref/heads/release/latest?readback=$readbackNonce" -Headers $readbackHeaders
+              $readbackDisposition = Get-ReleaseLatestReadbackDisposition `
+                -ObservedSha ([string]$readbackResponse.object.sha) `
+                -OldSha $OldSha `
+                -ExpectedSha $ExpectedSha
+              if ($readbackDisposition -eq 'confirmed') {
+                $releaseLatestRestConfirmed = $true
+                break
+              }
+              if ($readbackAttempt -lt $releaseLatestRestAttempts) {
+                Start-Sleep -Seconds 2
+              }
+            }
+
+            if (-not $releaseLatestRestConfirmed) {
+              $env:GIT_TERMINAL_PROMPT = '0'
+              $anonymousReadbackLines = @(
+                & git ls-remote --refs --exit-code "https://github.com/$Repository.git" refs/heads/release/latest
+              )
+              $anonymousReadbackExit = $LASTEXITCODE
+              $null = Confirm-AnonymousReleaseLatestReadback `
+                -Lines $anonymousReadbackLines `
+                -ExitCode $anonymousReadbackExit `
+                -ExpectedSha $ExpectedSha
+            }
+            return $true
+          }
+
           $artifactName = [string]$env:FLASH_ARTIFACT_NAME
           if ([string]::IsNullOrWhiteSpace($artifactName)) {
             throw '前一個工作階段沒有提供正式成品名稱。'
@@ -950,14 +1039,27 @@ jobs:
           if ((Get-ReleaseLatestRef) -ne $oldReleaseLatest) {
             throw 'release/latest 在提交索引後已改變，為避免覆寫而停止。'
           }
-          $null = Invoke-GitHubJson -Method 'Patch' -Uri "$apiRoot/git/refs/heads/release/latest" -Body @{
-            sha = [string]$indexCommit.sha
+          $expectedReleaseLatest = [string]$indexCommit.sha
+          $updatedRefResponse = Invoke-GitHubJson -Method 'Patch' -Uri "$apiRoot/git/refs/heads/release/latest" -Body @{
+            sha = $expectedReleaseLatest
             force = $false
           }
-          $updatedReleaseLatest = Get-ReleaseLatestRef
-          if ($updatedReleaseLatest -ne [string]$indexCommit.sha) {
-            throw 'release/latest 沒有指向新索引提交。'
+          if (
+            [string]$updatedRefResponse.ref -cne 'refs/heads/release/latest' -or
+            [string]$updatedRefResponse.object.type -cne 'commit' -or
+            [string]$updatedRefResponse.object.sha -cne $expectedReleaseLatest
+          ) {
+            throw 'release/latest 更新回應與新索引提交不一致。'
           }
+
+          $null = Confirm-ReleaseLatestRefUpdate `
+            -SharedHeaders $headers `
+            -ApiRoot $apiRoot `
+            -Repository $repo `
+            -OldSha $oldReleaseLatest `
+            -ExpectedSha $expectedReleaseLatest
+
+          $updatedReleaseLatest = [string]$indexCommit.sha
           $updatedCommit = Invoke-GitHubJson -Method 'Get' -Uri "$apiRoot/git/commits/${updatedReleaseLatest}"
           if (
             [string]$updatedCommit.sha -ne [string]$indexCommit.sha -or
