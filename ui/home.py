@@ -1477,6 +1477,7 @@ class HomeView:
             on_background_display_settings_update
         )
         self.on_refresh_error = on_refresh_error
+        self._disposed = False
         self._root: Frame | None = None
         self._active_page = "home"
         self._mousewheel_binding_id: str | None = None
@@ -1545,6 +1546,11 @@ class HomeView:
         self._feature_hotkey_variables: dict[str, StringVar] = {}
         self._smart_reconnect_label: Label | None = None
         self._smart_reconnect_button: Button | None = None
+        self._smart_reconnect_enable_results: Queue[
+            tuple[bool, object, Callable[[bool], object]]
+        ] = Queue()
+        self._smart_reconnect_enable_running = False
+        self._smart_reconnect_enable_poll_id: str | None = None
         self._smart_reconnect_interval_entry: Entry | None = None
         self._smart_reconnect_mode_variable: StringVar | None = None
         self._smart_reconnect_mode_label_to_value: dict[str, str] = {}
@@ -6060,10 +6066,106 @@ class HomeView:
         entry.insert(0, str(interval_ms))
 
     def _toggle_smart_reconnect(self) -> None:
-        desired = not self.smart_reconnect_enabled
-        if self.on_smart_reconnect_change is None:
+        if getattr(self, "_smart_reconnect_enable_running", False):
             return
-        accepted = self.on_smart_reconnect_change(desired)
+        desired = not self.smart_reconnect_enabled
+        callback = self.on_smart_reconnect_change
+        if callback is None:
+            return
+        if desired:
+            self._start_smart_reconnect_enable(callback)
+            return
+        accepted = callback(False)
+        self._apply_smart_reconnect_toggle_result(False, accepted)
+
+    def _start_smart_reconnect_enable(
+        self,
+        callback: Callable[[bool], object],
+    ) -> None:
+        results: Queue[
+            tuple[bool, object, Callable[[bool], object]]
+        ] = Queue()
+        self._smart_reconnect_enable_results = results
+        self._smart_reconnect_enable_running = True
+        self._refresh_smart_reconnect_controls()
+        try:
+            self._smart_reconnect_enable_poll_id = self.parent.after(
+                50,
+                self._poll_smart_reconnect_enable,
+            )
+        except Exception:
+            self._smart_reconnect_enable_running = False
+            self.set_smart_reconnect_enable_failure(
+                "智慧重連未能啟用，已維持安全停止。"
+            )
+            return
+
+        def worker() -> None:
+            try:
+                accepted = callback(True)
+            except Exception as error:
+                results.put((False, error, callback))
+            else:
+                results.put((True, accepted, callback))
+
+        try:
+            thread = Thread(
+                target=worker,
+                daemon=True,
+                name="fu-smart-reconnect-enable",
+            )
+            thread.start()
+        except Exception:
+            if self._smart_reconnect_enable_poll_id is not None:
+                try:
+                    self.parent.after_cancel(
+                        self._smart_reconnect_enable_poll_id
+                    )
+                except Exception:
+                    pass
+                self._smart_reconnect_enable_poll_id = None
+            self._smart_reconnect_enable_running = False
+            self.set_smart_reconnect_enable_failure(
+                "智慧重連未能啟用，已維持安全停止。"
+            )
+            return
+
+    def _poll_smart_reconnect_enable(self) -> None:
+        self._smart_reconnect_enable_poll_id = None
+        if (
+            not getattr(self, "_smart_reconnect_enable_running", False)
+            or getattr(self, "_disposed", False)
+        ):
+            return
+        try:
+            succeeded, accepted, callback = (
+                self._smart_reconnect_enable_results.get_nowait()
+            )
+        except Empty:
+            self._smart_reconnect_enable_poll_id = self.parent.after(
+                50,
+                self._poll_smart_reconnect_enable,
+            )
+            return
+        self._smart_reconnect_enable_running = False
+        if getattr(self, "_disposed", False):
+            return
+        if not succeeded:
+            try:
+                callback(False)
+            except Exception:
+                pass
+            self.set_smart_reconnect_enable_failure(
+                "智慧重連未能啟用，已維持安全停止。"
+            )
+            return
+        self._apply_smart_reconnect_toggle_result(True, accepted)
+
+    def _apply_smart_reconnect_toggle_result(
+        self,
+        desired: bool,
+        accepted: object,
+    ) -> None:
         if isinstance(accepted, SmartReconnectToggleViewResult):
             if not accepted.success:
                 if desired:
@@ -6109,6 +6211,15 @@ class HomeView:
         self._refresh_smart_reconnect_capture_mode_status()
         if self._smart_reconnect_button is not None:
             self._smart_reconnect_button.configure(
+                state=(
+                    DISABLED
+                    if getattr(
+                        self,
+                        "_smart_reconnect_enable_running",
+                        False,
+                    )
+                    else NORMAL
+                ),
                 text=(
                     "停止智慧重連"
                     if self.smart_reconnect_enabled
@@ -9582,6 +9693,8 @@ class HomeView:
         )
 
     def prepare_close(self) -> bool:
+        if getattr(self, "_smart_reconnect_enable_running", False):
+            return False
         return self._confirm_background_departure()
 
     def _apply_saved_background_for_page(self, page: str) -> None:
@@ -9662,6 +9775,16 @@ class HomeView:
 
     def dispose(self) -> None:
         """Release background image resources before the Tk window closes."""
+        self._disposed = True
+        self._smart_reconnect_enable_running = False
+        if self._smart_reconnect_enable_poll_id is not None:
+            try:
+                self.parent.after_cancel(
+                    self._smart_reconnect_enable_poll_id
+                )
+            except Exception:
+                pass
+            self._smart_reconnect_enable_poll_id = None
         if self._feature_card_settings_dialog is not None:
             self._close_feature_card_settings()
         self._cancel_game_time_tick()

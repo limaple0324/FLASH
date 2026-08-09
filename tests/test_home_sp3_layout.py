@@ -2,8 +2,10 @@ import ast
 import inspect
 from datetime import datetime
 from pathlib import Path
+from threading import Event, get_ident
+from time import monotonic, sleep
 from types import SimpleNamespace
-from tkinter import DISABLED, Button, Checkbutton, Entry, Label, TclError, Tk
+from tkinter import DISABLED, NORMAL, Button, Checkbutton, Entry, Label, TclError, Tk
 
 import pytest
 
@@ -145,6 +147,49 @@ class _RuntimeLabelStub(_ConfigureStub):
 
     def winfo_manager(self) -> str:
         return self.manager
+
+
+class _AfterStub:
+    def __init__(self):
+        self.callbacks: dict[str, object] = {}
+        self.cancelled: list[str] = []
+
+    def after(self, _delay: int, callback) -> str:
+        after_id = f"after-{len(self.callbacks) + 1}"
+        self.callbacks[after_id] = callback
+        return after_id
+
+    def after_cancel(self, after_id: str) -> None:
+        self.cancelled.append(after_id)
+        self.callbacks.pop(after_id, None)
+
+
+def _prepare_smart_reconnect_enable_test(view: HomeView) -> None:
+    view.parent = _AfterStub()
+    view._disposed = False
+    view._smart_reconnect_enable_running = False
+    view._smart_reconnect_enable_poll_id = None
+
+
+def _finish_smart_reconnect_enable(view: HomeView) -> None:
+    deadline = monotonic() + 2.0
+    while (
+        view._smart_reconnect_enable_running
+        and view._smart_reconnect_enable_results.empty()
+        and monotonic() < deadline
+    ):
+        sleep(0.005)
+    if view._smart_reconnect_enable_running:
+        view._poll_smart_reconnect_enable()
+    assert view._smart_reconnect_enable_running is False
+
+
+def _pump_tk_until(root: Tk, condition, timeout: float = 2.0) -> None:
+    deadline = monotonic() + timeout
+    while not condition() and monotonic() < deadline:
+        root.update()
+        sleep(0.005)
+    assert condition()
 
 
 def test_home_uses_the_same_smart_reconnect_interval_default() -> None:
@@ -586,21 +631,42 @@ def test_successful_group_change_shows_warning_message() -> None:
     ]
 
 
-def test_smart_reconnect_stop_timeout_never_displays_safe_stop() -> None:
+def test_smart_reconnect_stop_timeout_never_displays_safe_stop(
+    monkeypatch,
+) -> None:
     view = object.__new__(HomeView)
+    view.parent = _AfterStub()
     view.smart_reconnect_enabled = True
-    view.on_smart_reconnect_change = lambda _enabled: False
+    ui_thread_id = get_ident()
+    callback_calls: list[tuple[bool, int]] = []
+
+    def callback(enabled: bool) -> bool:
+        callback_calls.append((enabled, get_ident()))
+        return False
+
+    thread_constructions: list[object] = []
+
+    def forbidden_thread(**kwargs):
+        thread_constructions.append(kwargs)
+        raise AssertionError("正常停用不得建立背景執行緒")
+
+    monkeypatch.setattr("ui.home.Thread", forbidden_thread)
+    view.on_smart_reconnect_change = callback
     refreshes: list[bool] = []
     view._refresh_smart_reconnect_controls = lambda: refreshes.append(True)
 
     view._toggle_smart_reconnect()
 
+    assert callback_calls == [(False, ui_thread_id)]
+    assert thread_constructions == []
+    assert view.parent.callbacks == {}
     assert view.smart_reconnect_enabled is True
     assert refreshes == []
 
 
 def test_smart_reconnect_enable_and_disable_update_the_header_immediately() -> None:
     view = object.__new__(HomeView)
+    _prepare_smart_reconnect_enable_test(view)
     view.smart_reconnect_enabled = False
     view.smart_reconnect_runtime_status = None
     view._last_smart_reconnect_runtime_status = None
@@ -611,6 +677,7 @@ def test_smart_reconnect_enable_and_disable_update_the_header_immediately() -> N
     )
 
     view._toggle_smart_reconnect()
+    _finish_smart_reconnect_enable(view)
     assert refreshed[-1] == (True, "已開啟")
 
     view._toggle_smart_reconnect()
@@ -701,6 +768,7 @@ def test_smart_reconnect_header_only_updates_changed_presentation() -> None:
 
 def test_smart_reconnect_enable_failure_is_shown_in_card_and_header() -> None:
     view = object.__new__(HomeView)
+    _prepare_smart_reconnect_enable_test(view)
     view.smart_reconnect_enabled = False
     view.smart_reconnect_runtime_status = None
     view._last_smart_reconnect_runtime_status = None
@@ -720,6 +788,7 @@ def test_smart_reconnect_enable_failure_is_shown_in_card_and_header() -> None:
     )
 
     view._toggle_smart_reconnect()
+    _finish_smart_reconnect_enable(view)
 
     assert refreshed[-1] == (
         False,
@@ -730,6 +799,7 @@ def test_smart_reconnect_enable_failure_is_shown_in_card_and_header() -> None:
 
 def test_smart_reconnect_success_clears_previous_enable_failure() -> None:
     view = object.__new__(HomeView)
+    _prepare_smart_reconnect_enable_test(view)
     view.smart_reconnect_enabled = False
     view.smart_reconnect_runtime_status = "重連失敗"
     view._last_smart_reconnect_runtime_status = "重連失敗"
@@ -742,10 +812,255 @@ def test_smart_reconnect_success_clears_previous_enable_failure() -> None:
     view._refresh_smart_reconnect_controls = lambda: None
 
     view._toggle_smart_reconnect()
+    _finish_smart_reconnect_enable(view)
 
     assert view.smart_reconnect_enabled is True
     assert view._smart_reconnect_failure_message == ""
     assert view.smart_reconnect_runtime_status == "已開啟"
+
+
+def test_smart_reconnect_enable_exception_rolls_back_on_ui_thread() -> None:
+    view = object.__new__(HomeView)
+    _prepare_smart_reconnect_enable_test(view)
+    view.smart_reconnect_enabled = False
+    view.smart_reconnect_runtime_status = None
+    view._last_smart_reconnect_runtime_status = None
+    view._smart_reconnect_failure_message = ""
+    ui_thread_id = get_ident()
+    callback_calls: list[tuple[bool, int]] = []
+    monitor_running = False
+
+    def callback(enabled: bool) -> bool:
+        nonlocal monitor_running
+        callback_calls.append((enabled, get_ident()))
+        monitor_running = enabled
+        if enabled:
+            raise RuntimeError("設定保存失敗")
+        raise RuntimeError("撤銷回報失敗")
+
+    view.on_smart_reconnect_change = callback
+    refresh_threads: list[int] = []
+    view._refresh_smart_reconnect_controls = lambda: refresh_threads.append(
+        get_ident()
+    )
+
+    view._toggle_smart_reconnect()
+    _finish_smart_reconnect_enable(view)
+
+    assert [enabled for enabled, _thread_id in callback_calls] == [True, False]
+    assert callback_calls[0][1] != ui_thread_id
+    assert callback_calls[1][1] == ui_thread_id
+    assert monitor_running is False
+    assert view.smart_reconnect_enabled is False
+    assert view.smart_reconnect_runtime_status == "重連失敗"
+    assert view._smart_reconnect_failure_message == (
+        "智慧重連未能啟用，已維持安全停止。"
+    )
+    assert set(refresh_threads) == {ui_thread_id}
+
+
+def test_smart_reconnect_poll_registration_failure_never_starts_worker() -> None:
+    class _FailingAfter:
+        def after(self, _delay: int, _callback) -> str:
+            raise RuntimeError("排程失敗")
+
+    view = object.__new__(HomeView)
+    view.parent = _FailingAfter()
+    view._disposed = False
+    view._smart_reconnect_enable_running = False
+    view._smart_reconnect_enable_poll_id = None
+    view.smart_reconnect_enabled = False
+    view.smart_reconnect_runtime_status = None
+    view._last_smart_reconnect_runtime_status = None
+    view._smart_reconnect_failure_message = ""
+    callback_calls: list[bool] = []
+    view.on_smart_reconnect_change = lambda enabled: callback_calls.append(
+        enabled
+    )
+    running_states: list[bool] = []
+    view._refresh_smart_reconnect_controls = lambda: running_states.append(
+        view._smart_reconnect_enable_running
+    )
+    view._confirm_background_departure = lambda: True
+
+    view._toggle_smart_reconnect()
+
+    assert callback_calls == []
+    assert running_states == [True, False]
+    assert view._smart_reconnect_enable_running is False
+    assert view.smart_reconnect_runtime_status == "重連失敗"
+    assert view.prepare_close() is True
+
+
+def test_smart_reconnect_thread_start_failure_cancels_poll_and_fails_safe(
+    monkeypatch,
+) -> None:
+    class _ThreadStartFailure:
+        def start(self) -> None:
+            raise RuntimeError("執行緒無法啟動")
+
+    view = object.__new__(HomeView)
+    _prepare_smart_reconnect_enable_test(view)
+    parent = view.parent
+    view.smart_reconnect_enabled = False
+    view.smart_reconnect_runtime_status = None
+    view._last_smart_reconnect_runtime_status = None
+    view._smart_reconnect_failure_message = ""
+    callback_calls: list[bool] = []
+    view.on_smart_reconnect_change = lambda enabled: callback_calls.append(
+        enabled
+    )
+    running_states: list[bool] = []
+    view._refresh_smart_reconnect_controls = lambda: running_states.append(
+        view._smart_reconnect_enable_running
+    )
+    view._confirm_background_departure = lambda: True
+    monkeypatch.setattr(
+        "ui.home.Thread",
+        lambda **_kwargs: _ThreadStartFailure(),
+    )
+
+    view._toggle_smart_reconnect()
+
+    assert callback_calls == []
+    assert parent.cancelled == ["after-1"]
+    assert parent.callbacks == {}
+    assert view._smart_reconnect_enable_poll_id is None
+    assert view._smart_reconnect_enable_running is False
+    assert running_states == [True, False]
+    assert view.smart_reconnect_runtime_status == "重連失敗"
+    assert view.prepare_close() is True
+
+
+def test_real_tk_smart_reconnect_enable_keeps_ui_responsive_and_blocks_reentry() -> None:
+    try:
+        root = Tk()
+    except TclError:
+        pytest.skip("目前環境沒有可用顯示")
+    root.withdraw()
+    ui_thread_id = get_ident()
+    callback_started = Event()
+    callback_release = Event()
+    callback_calls: list[tuple[bool, int]] = []
+    heartbeat_threads: list[int] = []
+    applied_threads: list[int] = []
+
+    def callback(enabled: bool) -> SmartReconnectToggleViewResult:
+        callback_calls.append((enabled, get_ident()))
+        callback_started.set()
+        callback_release.wait(3.0)
+        return SmartReconnectToggleViewResult(
+            True,
+            True,
+            "智慧重連已開啟，正在安全監看。",
+        )
+
+    view = HomeView(
+        root,
+        {"self_check_passed": True},
+        on_smart_reconnect_change=callback,
+    )
+    try:
+        view.build()
+        button = view._smart_reconnect_button
+        assert button is not None
+        original_apply = view.set_smart_reconnect_enabled
+
+        def record_apply(enabled: bool) -> None:
+            applied_threads.append(get_ident())
+            original_apply(enabled)
+
+        view.set_smart_reconnect_enabled = record_apply
+        root.after(10, lambda: heartbeat_threads.append(get_ident()))
+
+        button.invoke()
+
+        assert view._smart_reconnect_enable_running is True
+        assert button.cget("state") == DISABLED
+        assert view.prepare_close() is False
+        button.invoke()
+        view.toggle_smart_reconnect_from_hotkey()
+        _pump_tk_until(
+            root,
+            lambda: callback_started.is_set() and bool(heartbeat_threads),
+        )
+        assert len(callback_calls) == 1
+        assert callback_calls[0][0] is True
+        assert callback_calls[0][1] != ui_thread_id
+        assert heartbeat_threads == [ui_thread_id]
+
+        callback_release.set()
+        _pump_tk_until(
+            root,
+            lambda: not view._smart_reconnect_enable_running,
+        )
+
+        assert view.smart_reconnect_enabled is True
+        assert view.smart_reconnect_runtime_status == "已開啟"
+        assert applied_threads == [ui_thread_id]
+        assert button.cget("state") == NORMAL
+        assert view.prepare_close() is True
+    finally:
+        callback_release.set()
+        view.dispose()
+        root.destroy()
+
+
+def test_real_tk_dispose_cancels_enable_poll_and_drops_late_result() -> None:
+    try:
+        root = Tk()
+    except TclError:
+        pytest.skip("目前環境沒有可用顯示")
+    root.withdraw()
+    callback_started = Event()
+    callback_release = Event()
+    callback_calls: list[bool] = []
+    applied: list[bool] = []
+
+    def callback(enabled: bool) -> SmartReconnectToggleViewResult:
+        callback_calls.append(enabled)
+        callback_started.set()
+        callback_release.wait(3.0)
+        return SmartReconnectToggleViewResult(True, True, "已啟用")
+
+    view = HomeView(
+        root,
+        {"self_check_passed": True},
+        on_smart_reconnect_change=callback,
+    )
+    destroyed = False
+    try:
+        view.build()
+        view.set_smart_reconnect_enabled = lambda enabled: applied.append(
+            enabled
+        )
+        button = view._smart_reconnect_button
+        assert button is not None
+        button.invoke()
+        _pump_tk_until(root, callback_started.is_set)
+        assert view._smart_reconnect_enable_poll_id is not None
+
+        view.dispose()
+        assert view._smart_reconnect_enable_poll_id is None
+        root.destroy()
+        destroyed = True
+        callback_release.set()
+        deadline = monotonic() + 2.0
+        while (
+            view._smart_reconnect_enable_results.empty()
+            and monotonic() < deadline
+        ):
+            sleep(0.005)
+
+        assert callback_calls == [True]
+        assert not view._smart_reconnect_enable_results.empty()
+        assert applied == []
+        assert view.smart_reconnect_enabled is False
+    finally:
+        callback_release.set()
+        if not destroyed:
+            view.dispose()
+            root.destroy()
 
 
 def test_smart_reconnect_header_keeps_the_short_chinese_failure_reason() -> None:
