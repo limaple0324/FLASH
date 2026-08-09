@@ -5332,7 +5332,7 @@ def test_recent_line_target_change_requires_two_new_matching_frames():
     assert fixture.mouse.clicks == [(1, (0.5, 0.722))]
 
 
-def test_real_controller_uses_guarded_fresh_background_capture():
+def test_real_controller_never_reveals_or_restores_windows_for_capture():
     controller = WindowsSmartReconnectController.for_real_windows(
         reference_dir=Path("assets") / "reconnect_reference",
         expected_windows=1,
@@ -5340,19 +5340,13 @@ def test_real_controller_uses_guarded_fresh_background_capture():
 
     assert isinstance(controller._capture_provider, Win32PrintWindowProvider)
     assert type(controller._capture_provider) is Win32PrintWindowProvider
-    assert isinstance(
-        controller._obscured_capture_provider,
-        Win32TemporarilyRevealedCaptureProvider,
-    )
-    assert isinstance(
-        controller._active_refresh_capture_provider,
-        Win32RecoveringPrintWindowProvider,
-    )
+    assert controller._obscured_capture_provider is None
+    assert controller._active_refresh_capture_provider is None
     assert controller._primary_capture_is_trusted is True
     assert controller._primary_capture_is_fresh_without_visibility is False
 
 
-def test_real_obscured_provider_is_used_only_by_active_reconnect(
+def test_real_controller_never_uses_obscured_provider_for_active_reconnect(
     monkeypatch,
 ):
     window = make_window(1)
@@ -5398,28 +5392,18 @@ def test_real_obscured_provider_is_used_only_by_active_reconnect(
         auto_battle_enabled=False,
     )
     visible = FakeCaptureProvider({window.handle: None})
-    obscured = FakeCaptureProvider({window.handle: 1})
-    guarded_provider = controller._obscured_capture_provider
-    assert isinstance(
-        guarded_provider,
-        Win32TemporarilyRevealedCaptureProvider,
-    )
+    primary = FakeCaptureProvider({window.handle: None})
+    assert controller._obscured_capture_provider is None
+    assert controller._active_refresh_capture_provider is None
     monkeypatch.setattr(
         controller._visible_capture_provider,
         "capture",
         visible.capture,
     )
     monkeypatch.setattr(
-        guarded_provider,
-        "capture",
-        obscured.capture,
-    )
-    monkeypatch.setattr(
         controller._capture_provider,
         "capture",
-        lambda _handle: (_ for _ in ()).throw(
-            AssertionError("stale PrintWindow path is forbidden")
-        ),
+        primary.capture,
     )
     controller._recognizer = FakeRecognizer(
         {1: ReconnectScreenState.CONNECTED}
@@ -5431,26 +5415,16 @@ def test_real_obscured_provider_is_used_only_by_active_reconnect(
     assert observed == {
         window.launch_fingerprint: ReconnectScreenState.UNKNOWN
     }
-    assert obscured.calls == []
+    assert visible.calls == [window.handle]
+    assert primary.calls == []
 
     assert controller.prepare_execution_snapshot().success is True
     controller.set_execution_enabled(True)
     result = controller.reconnect()
 
-    assert result.code == "reconnect.connected"
-    assert obscured.calls == [window.handle]
-    assert result.details["capture_diagnostics"] == [
-        {
-            "window_index": 1,
-            "stage": "scan",
-            "capture_path": "obscured",
-            "width": 2,
-            "height": 2,
-            "sha256": result.details["capture_diagnostics"][0]["sha256"],
-            "recognition_score": 0.0,
-            "rejection_gate": None,
-        }
-    ]
+    assert result.details["clicked_windows"] == 0
+    assert visible.calls == [window.handle, window.handle]
+    assert primary.calls == [window.handle]
 
 
 def test_failed_minimized_refresh_never_falls_back_to_passive_pixels():

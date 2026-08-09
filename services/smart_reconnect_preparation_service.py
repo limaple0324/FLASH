@@ -6,7 +6,7 @@ import os
 from collections import Counter
 from pathlib import Path
 from threading import Lock
-from typing import Mapping
+from typing import Callable, Mapping
 
 from adapters.windows_shortcut_seal import ShortcutSealResolver
 from config.config_manager import ConfigManager
@@ -16,6 +16,7 @@ from core.smart_reconnect_authorization import (
     ReconnectLaunchMode,
     ReconnectSourceIdentity,
     ShortcutSeal,
+    normalize_identity_alias,
 )
 from core.target_window_contract import ActualWindowSnapshot
 from services.identity_data_transaction_coordinator import (
@@ -26,6 +27,9 @@ from services.smart_reconnect_authorization_coordinator import (
     SmartReconnectAuthorizationCoordinator,
 )
 from services.smart_reconnect_target_identity_service import (
+    SmartReconnectIdentityEvidence,
+    SmartReconnectIdentityEvidenceResult,
+    SmartReconnectPendingIdentityCandidate,
     SmartReconnectTargetIdentity,
     SmartReconnectTargetIdentitySourceSnapshot,
     SmartReconnectTargetIdentityService,
@@ -54,6 +58,7 @@ class SmartReconnectPreparationService:
         identity_coordinator: IdentityDataTransactionCoordinator,
         config: ConfigManager,
         product_launch_mode: ReconnectLaunchMode,
+        role_identity_reader: Callable[[int], object] | None = None,
     ) -> None:
         if not isinstance(identity_coordinator, IdentityDataTransactionCoordinator):
             raise TypeError("identity_coordinator must be IdentityDataTransactionCoordinator")
@@ -75,6 +80,8 @@ class SmartReconnectPreparationService:
             raise TypeError("config must be ConfigManager")
         if product_launch_mode is not ReconnectLaunchMode.IDENTITY_BOUND:
             raise ValueError("product launch mode must remain identity-bound")
+        if role_identity_reader is not None and not callable(role_identity_reader):
+            raise TypeError("role_identity_reader must be callable or None")
         self._target_identity = target_identity_service
         self._target_windows = target_window_contract_service
         self._shortcut_seals = shortcut_seal_resolver
@@ -82,6 +89,7 @@ class SmartReconnectPreparationService:
         self._identity = identity_coordinator
         self._config = config
         self._product_launch_mode = product_launch_mode
+        self._role_identity_reader = role_identity_reader
         self._prepare_lock = Lock()
 
     @property
@@ -131,24 +139,87 @@ class SmartReconnectPreparationService:
             fingerprints = tuple(
                 target.fingerprint for target in window_snapshot.targets
             )
-            identities = (
+            resolution = (
                 self._target_identity
-                .targets_for_fingerprints_from_source_snapshot(
+                .resolve_for_fingerprints_from_source_snapshot(
                     fingerprints,
                     identity_source,
                 )
+            )
+            evidence_candidates = tuple(
+                dict.fromkeys(
+                    (
+                        *resolution.pending_candidates,
+                        *resolution.verification_candidates,
+                    )
+                )
+            )
+            verified_fingerprints: frozenset[str] = frozenset()
+            observations = self._identity_evidence(
+                evidence_candidates,
+                window_snapshot,
+                identity_source,
+            )
+            if evidence_candidates:
+                evidence_result = self._persist_identity_evidence(
+                    evidence_candidates,
+                    observations,
+                    expected_identity_generation=identity_generation,
+                    expected_config_revision=config_revision,
+                    expected_source=identity_source,
+                )
+                verified_fingerprints = (
+                    evidence_result.confirmed_fingerprints
+                )
+                (
+                    identity_generation,
+                    refreshed_config_revision,
+                    identity_source,
+                ) = self._capture_source()
+                if refreshed_config_revision != config_revision:
+                    raise SmartReconnectPreparationError(
+                        "configuration changed during identity enrollment"
+                    )
+                window_snapshot = self._target_windows.actual_snapshot()
+                if window_snapshot.failure_codes:
+                    raise SmartReconnectPreparationError(
+                        "actual game windows cannot be enumerated safely"
+                    )
+                fingerprints = tuple(
+                    target.fingerprint for target in window_snapshot.targets
+                )
+                resolution = (
+                    self._target_identity
+                    .resolve_for_fingerprints_from_source_snapshot(
+                        fingerprints,
+                        identity_source,
+                    )
+                )
+            verification_fingerprints = frozenset(
+                candidate.fingerprint
+                for candidate in resolution.verification_candidates
+            )
+            identities = tuple(
+                identity
+                for identity in resolution.targets
+                if identity.fingerprint not in verification_fingerprints
+                or identity.fingerprint in verified_fingerprints
             )
             seals = self._resolve_seals(identities)
             targets = self._build_authorization_targets(
                 identities,
                 window_snapshot,
                 seals,
+                identity_source,
+                config_revision,
+                verified_fingerprints,
             )
             targets = self._retain_absent_pending_targets(
                 targets,
                 retained_targets,
                 window_snapshot,
                 identity_source,
+                config_revision,
             )
             targets = self._without_conflicting_targets(targets)
             source = ReconnectSourceIdentity(
@@ -174,6 +245,7 @@ class SmartReconnectPreparationService:
                 preparation_token=preparation_token,
                 expected_identity_generation=identity_generation,
                 expected_config_revision=config_revision,
+                expected_identity_source=identity_source,
                 source=source,
                 launch_mode=launch_mode,
                 targets=targets,
@@ -213,12 +285,148 @@ class SmartReconnectPreparationService:
             identity_snapshot.value,
         )
 
+    def _identity_evidence(
+        self,
+        candidates: tuple[SmartReconnectPendingIdentityCandidate, ...],
+        window_snapshot: ActualWindowSnapshot,
+        identity_source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> tuple[SmartReconnectIdentityEvidence, ...]:
+        reader = self._role_identity_reader
+        if reader is None or not candidates:
+            return ()
+        windows = {
+            target.fingerprint: target
+            for target in window_snapshot.targets
+        }
+        paths = tuple(
+            dict.fromkeys(candidate.shortcut_path for candidate in candidates)
+        )
+        try:
+            raw_seals = self._shortcut_seals.resolve(paths)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return ()
+        if not isinstance(raw_seals, Mapping):
+            return ()
+        evidence: list[SmartReconnectIdentityEvidence] = []
+        for candidate in candidates:
+            window = windows.get(candidate.fingerprint)
+            seal = raw_seals.get(candidate.shortcut_path)
+            if (
+                window is None
+                or not isinstance(seal, ShortcutSeal)
+                or seal.launch_fingerprint != candidate.fingerprint
+                or self._normalized_path(
+                    seal.file_identity.normalized_path
+                )
+                != self._normalized_path(candidate.shortcut_path)
+            ):
+                continue
+            try:
+                result = reader(window.instance.handle)
+            except Exception:
+                continue
+            role_id = getattr(result, "role_id", None)
+            alias = normalize_identity_alias(role_id)
+            if (
+                getattr(result, "success", None) is not True
+                or not isinstance(role_id, str)
+                or alias is None
+                or len(alias) < 3
+                or any(character.isspace() for character in role_id)
+                or "..." in role_id
+                or "…" in role_id
+            ):
+                continue
+            evidence.append(
+                SmartReconnectIdentityEvidence(
+                    candidate=candidate,
+                    instance=window.instance,
+                    shortcut_seal=seal,
+                    role_alias=alias,
+                )
+            )
+        final_snapshot = self._target_windows.actual_snapshot()
+        if final_snapshot.failure_codes:
+            raise SmartReconnectPreparationError(
+                "actual game windows changed during identity observation"
+            )
+        final_windows = {
+            target.fingerprint: target
+            for target in final_snapshot.targets
+        }
+        final_resolution = (
+            self._target_identity.resolve_for_fingerprints_from_source_snapshot(
+                tuple(item.candidate.fingerprint for item in evidence),
+                identity_source,
+            )
+        )
+        final_candidates = {
+            item.fingerprint: item
+            for item in (
+                *final_resolution.pending_candidates,
+                *final_resolution.verification_candidates,
+            )
+        }
+        accepted: list[SmartReconnectIdentityEvidence] = []
+        for item in evidence:
+            current_window = final_windows.get(item.candidate.fingerprint)
+            current_candidate = final_candidates.get(
+                item.candidate.fingerprint
+            )
+            if (
+                current_window is None
+                or current_window.instance != item.instance
+                or current_candidate != item.candidate
+            ):
+                continue
+            try:
+                seal_is_current = (
+                    self._shortcut_seals.revalidate(item.shortcut_seal)
+                    is True
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                seal_is_current = False
+            if seal_is_current:
+                accepted.append(item)
+        return tuple(accepted)
+
+    def _persist_identity_evidence(
+        self,
+        candidates: tuple[SmartReconnectPendingIdentityCandidate, ...],
+        observations: tuple[SmartReconnectIdentityEvidence, ...],
+        *,
+        expected_identity_generation: int,
+        expected_config_revision: int,
+        expected_source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> SmartReconnectIdentityEvidenceResult:
+        with self._config.resource_guard():
+            if (
+                self._config.snapshot_state_locked().revision
+                != expected_config_revision
+            ):
+                raise SmartReconnectPreparationError(
+                    "configuration changed during identity enrollment"
+                )
+            result = self._target_identity.record_identity_evidence(
+                candidates,
+                observations,
+                expected_generation=expected_identity_generation,
+                expected_config_revision=expected_config_revision,
+                expected_source=expected_source,
+            )
+            if not result.source_current:
+                raise SmartReconnectPreparationError(
+                    "identity source changed during identity enrollment"
+                )
+            return result
+
     def _publish_if_source_current(
         self,
         *,
         preparation_token: ReconnectPreparationToken,
         expected_identity_generation: int,
         expected_config_revision: int,
+        expected_identity_source: SmartReconnectTargetIdentitySourceSnapshot,
         source: ReconnectSourceIdentity,
         launch_mode: ReconnectLaunchMode,
         targets: tuple[ReconnectAuthorizationTarget, ...],
@@ -232,10 +440,17 @@ class SmartReconnectPreparationService:
             )
 
             def publish(current_identity_generation: int):
+                current_identity_source = (
+                    self._target_identity.capture_source_snapshot_in_current()
+                )
                 if (
                     current_config_revision != expected_config_revision
                     or current_identity_generation
                     != expected_identity_generation
+                    or current_identity_source.saved_targets
+                    != expected_identity_source.saved_targets
+                    or current_identity_source.state_writable
+                    != expected_identity_source.state_writable
                 ):
                     raise SmartReconnectPreparationError(
                         "identity or configuration changed during preparation"
@@ -285,21 +500,37 @@ class SmartReconnectPreparationService:
         identities: tuple[SmartReconnectTargetIdentity, ...],
         window_snapshot: ActualWindowSnapshot,
         seals: Mapping[str, ShortcutSeal],
+        identity_source: SmartReconnectTargetIdentitySourceSnapshot,
+        config_revision: int,
+        verified_fingerprints: frozenset[str],
     ) -> tuple[ReconnectAuthorizationTarget, ...]:
         if not isinstance(window_snapshot, ActualWindowSnapshot):
             raise SmartReconnectPreparationError("actual window snapshot is invalid")
         identity_by_fingerprint = {
             identity.fingerprint: identity for identity in identities
         }
+        saved_by_fingerprint = identity_source.saved_by_fingerprint()
         result: list[ReconnectAuthorizationTarget] = []
         for window in window_snapshot.targets:
             identity = identity_by_fingerprint.get(window.fingerprint)
             seal = seals.get(window.fingerprint)
+            saved = saved_by_fingerprint.get(window.fingerprint)
             if (
                 identity is None
                 or seal is None
             ):
                 continue
+            if saved is not None and saved.has_complete_evidence:
+                if (
+                    not saved.is_confirmed
+                    or window.fingerprint not in verified_fingerprints
+                    or saved.instance != window.instance
+                    or saved.shortcut_seal != seal
+                    or saved.shortcut_path != identity.shortcut_path
+                    or saved.config_revision != config_revision
+                    or saved.evidence_alias not in identity.role_aliases
+                ):
+                    continue
             try:
                 target = ReconnectAuthorizationTarget(
                     fingerprint=identity.fingerprint,
@@ -322,16 +553,29 @@ class SmartReconnectPreparationService:
         retained: tuple[ReconnectAuthorizationTarget, ...],
         window_snapshot: ActualWindowSnapshot,
         identity_source: SmartReconnectTargetIdentitySourceSnapshot,
+        config_revision: int,
     ) -> tuple[ReconnectAuthorizationTarget, ...]:
         actual = frozenset(target.fingerprint for target in window_snapshot.targets)
         blocked = window_snapshot.blocked_fingerprints
         result = list(current)
         seen = set(actual)
+        saved_by_fingerprint = identity_source.saved_by_fingerprint()
         for target in retained:
+            saved = saved_by_fingerprint.get(
+                getattr(target, "fingerprint", "")
+            )
             if (
                 not isinstance(target, ReconnectAuthorizationTarget)
                 or target.fingerprint in seen
                 or target.fingerprint in blocked
+                or (
+                    saved is not None
+                    and saved.has_complete_evidence
+                    and (
+                        not saved.is_confirmed
+                        or saved.config_revision != config_revision
+                    )
+                )
                 or not self._target_identity
                 .retained_target_is_current_from_source_snapshot(
                     target,

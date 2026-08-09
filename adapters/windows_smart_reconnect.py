@@ -2614,16 +2614,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             expected_windows=expected_windows,
             title_keywords=title_keywords,
             window_backend=window_backend,
-            # Passive observation never changes window state. Active reconnect
-            # scans use guarded reversible providers for fresh desktop pixels.
+            # Formal monitoring is observation-only.  Obscured or minimized
+            # windows stay UNKNOWN rather than being shown, restored, reordered,
+            # resized, or focused merely to obtain pixels.
             capture_provider=Win32PrintWindowProvider(),
             visible_capture_provider=Win32VisibleRegionCaptureProvider(),
-            obscured_capture_provider=(
-                Win32TemporarilyRevealedCaptureProvider()
-            ),
-            active_refresh_capture_provider=(
-                Win32RecoveringPrintWindowProvider()
-            ),
+            obscured_capture_provider=None,
+            active_refresh_capture_provider=None,
             primary_capture_is_trusted=True,
             primary_capture_is_fresh_without_visibility=False,
             recognizer=ReferenceScreenRecognizer(reference_dir),
@@ -6859,7 +6856,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             target.fingerprint,
             target.character_id,
             aliases_digest,
-            target.importance.value,
+            (
+                target.importance.value
+                if target.importance is not None
+                else None
+            ),
             target.original_slot_index,
             target.original_line_number,
         )

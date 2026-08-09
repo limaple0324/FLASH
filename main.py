@@ -1430,6 +1430,9 @@ def build_services(
         identity_coordinator=identity_data_transaction_coordinator,
         config=config,
         product_launch_mode=ReconnectLaunchMode.IDENTITY_BOUND,
+        role_identity_reader=lambda window_handle: (
+            role_id_template_service.read(window_handle)
+        ),
     )
     character_detail_view_service = CharacterDetailViewService(
         character_view_service,

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
 from typing import Callable, Iterable, Mapping
+from uuid import uuid4
 
 from adapters.windows_launch_fingerprint import (
     ShortcutFingerprintResolver,
@@ -14,9 +15,12 @@ from adapters.windows_launch_fingerprint import (
 )
 from core.smart_reconnect_authorization import (
     ReconnectAuthorizationTarget,
+    ShortcutFileIdentity,
+    ShortcutSeal,
     normalize_identity_alias,
     observed_alias_matches,
 )
+from core.window_instance import WindowInstanceToken
 from core.window_registry import CharacterWindowRecord, WindowRegistry
 from domain.character import Character, CharacterImportance
 from services.character_view_service import CharacterViewService
@@ -45,7 +49,7 @@ class SmartReconnectTargetIdentity:
     fingerprint: str
     character_id: str
     role_aliases: tuple[str, ...]
-    importance: CharacterImportance
+    importance: CharacterImportance | None
     shortcut_path: Path | None = None
     original_slot_index: int | None = None
     original_line_number: int | None = None
@@ -68,8 +72,11 @@ class SmartReconnectTargetIdentity:
         )
         if not aliases:
             raise ValueError("role_aliases must contain a valid identity")
-        if not isinstance(self.importance, CharacterImportance):
-            raise TypeError("importance must be CharacterImportance")
+        if self.importance is not None and not isinstance(
+            self.importance,
+            CharacterImportance,
+        ):
+            raise TypeError("importance must be CharacterImportance or None")
         shortcut_path = (
             Path(self.shortcut_path).resolve(strict=False)
             if self.shortcut_path is not None
@@ -103,6 +110,109 @@ class _SavedTargetState:
     character_id: str
     slot_index: int | None
     line_number: int | None
+    verified_aliases: tuple[str, ...] = ()
+    status: str = "confirmed"
+    shortcut_path: Path | None = None
+    instance: WindowInstanceToken | None = None
+    shortcut_seal: ShortcutSeal | None = None
+    evidence_alias: str | None = None
+    identity_generation: int | None = None
+    config_revision: int | None = None
+    evidence_revision: int = 0
+
+    @property
+    def is_pending(self) -> bool:
+        return self.status == "pending"
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.status == "confirmed"
+
+    @property
+    def has_complete_evidence(self) -> bool:
+        return (
+            self.shortcut_path is not None
+            and self.instance is not None
+            and self.shortcut_seal is not None
+            and self.evidence_alias is not None
+            and self.identity_generation is not None
+            and self.config_revision is not None
+            and self.evidence_revision > 0
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SmartReconnectPendingIdentityCandidate:
+    """One live fingerprint whose shortcut is unique but role is unknown."""
+
+    fingerprint: str
+    shortcut_path: Path
+
+    def __post_init__(self) -> None:
+        fingerprint = normalize_launch_fingerprint(self.fingerprint)
+        if fingerprint is None:
+            raise ValueError("fingerprint must be a complete SHA-256 digest")
+        shortcut_path = Path(self.shortcut_path).resolve(strict=False)
+        if shortcut_path.suffix.casefold() != ".lnk":
+            raise ValueError("shortcut_path must identify a Windows shortcut")
+        object.__setattr__(self, "fingerprint", fingerprint)
+        object.__setattr__(self, "shortcut_path", shortcut_path)
+
+
+@dataclass(frozen=True, slots=True)
+class SmartReconnectIdentityEvidence:
+    """One complete background observation for a unique live shortcut."""
+
+    candidate: SmartReconnectPendingIdentityCandidate
+    instance: WindowInstanceToken
+    shortcut_seal: ShortcutSeal
+    role_alias: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate, SmartReconnectPendingIdentityCandidate):
+            raise TypeError("candidate must be a pending identity candidate")
+        if not isinstance(self.instance, WindowInstanceToken):
+            raise TypeError("instance must be a complete window instance")
+        if not isinstance(self.shortcut_seal, ShortcutSeal):
+            raise TypeError("shortcut_seal must be complete")
+        alias = normalize_identity_alias(self.role_alias)
+        if (
+            alias is None
+            or len(alias) < 3
+            or any(character.isspace() for character in self.role_alias)
+            or "..." in self.role_alias
+            or "…" in self.role_alias
+        ):
+            raise ValueError("role_alias must be a complete stable identity")
+        expected_path = self.candidate.shortcut_path.resolve(strict=False)
+        actual_path = Path(
+            self.shortcut_seal.file_identity.normalized_path
+        ).resolve(strict=False)
+        if (
+            self.shortcut_seal.launch_fingerprint
+            != self.candidate.fingerprint
+            or actual_path != expected_path
+        ):
+            raise ValueError("identity evidence does not match its shortcut")
+        object.__setattr__(self, "role_alias", alias)
+
+
+@dataclass(frozen=True, slots=True)
+class SmartReconnectIdentityEvidenceResult:
+    """Result of one atomic pending-evidence update."""
+
+    source_current: bool
+    confirmed_fingerprints: frozenset[str] = frozenset()
+    state_changed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SmartReconnectTargetResolution:
+    targets: tuple[SmartReconnectTargetIdentity, ...]
+    pending_candidates: tuple[SmartReconnectPendingIdentityCandidate, ...]
+    verification_candidates: tuple[
+        SmartReconnectPendingIdentityCandidate, ...
+    ] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +223,8 @@ class SmartReconnectTargetIdentitySourceSnapshot:
     characters: tuple[Character, ...]
     records: tuple[CharacterWindowRecord, ...]
     saved_targets: tuple[tuple[str, _SavedTargetState], ...]
+    identity_generation: int = 0
+    state_writable: bool = True
 
     def saved_by_fingerprint(self) -> dict[str, _SavedTargetState]:
         return dict(self.saved_targets)
@@ -125,7 +237,7 @@ class SmartReconnectTargetIdentityError(RuntimeError):
 class SmartReconnectTargetIdentityService:
     """Resolve all target identities while one shared coordinator owns the source."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -178,7 +290,11 @@ class SmartReconnectTargetIdentityService:
             ungrouped_shortcut_catalog_provider
         )
         self._state_path = Path(state_path)
-        self._saved = self._coordinator.read_consistent(self._load_state_unlocked)
+        self._state_write_blocked = False
+        # Construction has not published this service to any caller yet.  Read
+        # the persisted file before joining the shared identity lock so disk I/O
+        # can never hold UI identity readers behind it.
+        self._saved = self._load_state_unlocked()
         self._remember_lock = Lock()
 
     @property
@@ -253,6 +369,8 @@ class SmartReconnectTargetIdentityService:
     ) -> tuple[SmartReconnectTargetIdentity, ...]:
         if not isinstance(source, SmartReconnectTargetIdentitySourceSnapshot):
             raise TypeError("source must be a target identity source snapshot")
+        if not source.state_writable:
+            return ()
         return self._build_targets_from_source(group_name, source)
 
     def capture_source_snapshot_in_current(
@@ -266,6 +384,8 @@ class SmartReconnectTargetIdentityService:
             characters=tuple(self._character_view.character_profiles()),
             records=tuple(self._registry.all()),
             saved_targets=tuple(sorted(self._saved.items())),
+            identity_generation=self._coordinator.generation,
+            state_writable=not self._state_write_blocked,
         )
 
     def targets_for_fingerprints_from_source_snapshot(
@@ -286,7 +406,32 @@ class SmartReconnectTargetIdentityService:
                 if value is not None
             )
         )
-        return self._build_requested_targets_from_source(normalized, source)
+        return self.resolve_for_fingerprints_from_source_snapshot(
+            normalized,
+            source,
+        ).targets
+
+    def resolve_for_fingerprints_from_source_snapshot(
+        self,
+        fingerprints: Iterable[object],
+        source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> SmartReconnectTargetResolution:
+        """Return authorized identities and safe-to-observe unknown windows."""
+
+        if not isinstance(source, SmartReconnectTargetIdentitySourceSnapshot):
+            raise TypeError("source must be a target identity source snapshot")
+        if not source.state_writable:
+            return SmartReconnectTargetResolution((), (), ())
+        normalized = tuple(
+            dict.fromkeys(
+                value
+                for value in (
+                    normalize_launch_fingerprint(item) for item in fingerprints
+                )
+                if value is not None
+            )
+        )
+        return self._resolve_requested_targets_from_source(normalized, source)
 
     def observed_identity_alias_catalog(self) -> tuple[tuple[str, str], ...]:
         """Return reliable screen aliases without making them target gates."""
@@ -320,6 +465,11 @@ class SmartReconnectTargetIdentityService:
                 normalized = normalize_identity_alias(entry.role_id)
                 if normalized is not None:
                     aliases.append((normalized, entry.entry_id))
+        for saved in self._saved.values():
+            if not saved.is_confirmed:
+                continue
+            for alias in saved.verified_aliases:
+                aliases.append((alias, saved.character_id))
         return tuple(dict.fromkeys(aliases))
 
     def retained_target_is_current(
@@ -342,6 +492,8 @@ class SmartReconnectTargetIdentityService:
 
         if not isinstance(source, SmartReconnectTargetIdentitySourceSnapshot):
             return False
+        if not source.state_writable:
+            return False
         if (
             not isinstance(target, ReconnectAuthorizationTarget)
             or target.character_id is None
@@ -353,6 +505,16 @@ class SmartReconnectTargetIdentityService:
         ).resolve(strict=False)
         groups = source.groups
         saved_targets = source.saved_by_fingerprint()
+        saved_for_target = saved_targets.get(target.fingerprint)
+        if saved_for_target is not None:
+            if saved_for_target.is_pending:
+                return False
+            if (
+                saved_for_target.has_complete_evidence
+                and saved_for_target.identity_generation
+                != source.identity_generation
+            ):
+                return False
         membership_paths = tuple(
             entry.shortcut_path.resolve(strict=False)
             for group in groups
@@ -448,28 +610,48 @@ class SmartReconnectTargetIdentityService:
                 ):
                     continue
                 matches.append((character_id, character, record))
-            if len(matches) != 1 or matches[0][0] != target.character_id:
-                return False
-            character_id, character, record = matches[0]
             saved = saved_targets.get(target.fingerprint)
-            if (
-                saved is not None
-                and saved.character_id != character_id
+            if len(matches) == 1 and matches[0][0] == target.character_id:
+                character_id, character, record = matches[0]
+                if (
+                    saved is not None
+                    and saved.character_id != character_id
+                ):
+                    return False
+                current = SmartReconnectTargetIdentity(
+                    fingerprint=target.fingerprint,
+                    character_id=character_id,
+                    role_aliases=self._aliases(character, record, None),
+                    importance=character.importance,
+                    shortcut_path=path,
+                    original_slot_index=(
+                        saved.slot_index if saved is not None else None
+                    ),
+                    original_line_number=(
+                        saved.line_number if saved is not None else None
+                    ),
+                )
+            elif (
+                matches
+                or saved is None
+                or saved.character_id != target.character_id
+                or not self._saved_verified_identity_is_safe(
+                    target.fingerprint,
+                    saved,
+                    source,
+                )
             ):
                 return False
-            current = SmartReconnectTargetIdentity(
-                fingerprint=target.fingerprint,
-                character_id=character_id,
-                role_aliases=self._aliases(character, record, None),
-                importance=character.importance,
-                shortcut_path=path,
-                original_slot_index=(
-                    saved.slot_index if saved is not None else None
-                ),
-                original_line_number=(
-                    saved.line_number if saved is not None else None
-                ),
-            )
+            else:
+                current = SmartReconnectTargetIdentity(
+                    fingerprint=target.fingerprint,
+                    character_id=saved.character_id,
+                    role_aliases=saved.verified_aliases,
+                    importance=None,
+                    shortcut_path=path,
+                    original_slot_index=saved.slot_index,
+                    original_line_number=saved.line_number,
+                )
         return (
             current.fingerprint == target.fingerprint
             and current.character_id == target.character_id
@@ -480,14 +662,14 @@ class SmartReconnectTargetIdentityService:
             and current.shortcut_path.resolve(strict=False) == path
         )
 
-    def _build_requested_targets_from_source(
+    def _resolve_requested_targets_from_source(
         self,
         fingerprints: tuple[str, ...],
         source: SmartReconnectTargetIdentitySourceSnapshot,
-    ) -> tuple[SmartReconnectTargetIdentity, ...]:
+    ) -> SmartReconnectTargetResolution:
         requested = frozenset(fingerprints)
         if not requested:
-            return ()
+            return SmartReconnectTargetResolution((), ())
         groups = source.groups
         characters = source.characters
         records = source.records
@@ -515,7 +697,7 @@ class SmartReconnectTargetIdentityService:
                     )
                 )
             except (OSError, RuntimeError, TypeError, ValueError):
-                return ()
+                return SmartReconnectTargetResolution((), ())
         all_source_paths = tuple(
             dict.fromkeys((*memberships_by_path, *catalog_paths))
         )
@@ -557,6 +739,14 @@ class SmartReconnectTargetIdentityService:
                 ).append((group, entry))
 
         candidates: dict[str, SmartReconnectTargetIdentity] = {}
+        pending_candidates: dict[
+            str,
+            SmartReconnectPendingIdentityCandidate,
+        ] = {}
+        verification_candidates: dict[
+            str,
+            SmartReconnectPendingIdentityCandidate,
+        ] = {}
         for fingerprint in fingerprints:
             source_path_count = len(
                 paths_by_fingerprint.get(fingerprint, ())
@@ -568,6 +758,22 @@ class SmartReconnectTargetIdentityService:
                     and source_path_count != 1
                 )
             ):
+                continue
+            saved = saved_targets.get(fingerprint)
+            unique_candidate = (
+                SmartReconnectPendingIdentityCandidate(
+                    fingerprint,
+                    paths_by_fingerprint[fingerprint][0],
+                )
+                if source_path_count == 1
+                else None
+            )
+            # A persisted pending identity is observation-only even if a later
+            # group entry happens to mention the same shortcut.  It must finish
+            # the independent evidence cycle before entering authorization.
+            if saved is not None and saved.is_pending:
+                if unique_candidate is not None:
+                    pending_candidates[fingerprint] = unique_candidate
                 continue
             fingerprint_bindings = bindings[fingerprint]
             if len(fingerprint_bindings) > 1:
@@ -593,27 +799,66 @@ class SmartReconnectTargetIdentityService:
                 unique = tuple(dict.fromkeys(resolved_memberships))
                 if len(unique) == 1:
                     candidates[fingerprint] = unique[0]
+                    if (
+                        unique_candidate is not None
+                        and saved is not None
+                        and saved.is_confirmed
+                        and saved.has_complete_evidence
+                    ):
+                        verification_candidates[fingerprint] = unique_candidate
                 continue
             target = self._ungrouped_target(
                 fingerprint,
                 characters_by_id,
                 records_by_id,
                 saved_targets,
+                source,
             )
             if target is not None:
                 candidates[fingerprint] = target
+                if (
+                    unique_candidate is not None
+                    and saved is not None
+                    and saved.is_confirmed
+                    and saved.has_complete_evidence
+                ):
+                    verification_candidates[fingerprint] = unique_candidate
+            elif unique_candidate is not None:
+                pending_candidates[fingerprint] = unique_candidate
 
         character_counts: dict[str, int] = {}
         for target in candidates.values():
             character_counts[target.character_id] = (
                 character_counts.get(target.character_id, 0) + 1
             )
-        return tuple(
-            target
-            for fingerprint in fingerprints
-            if (target := candidates.get(fingerprint)) is not None
-            and character_counts[target.character_id] == 1
+        return SmartReconnectTargetResolution(
+            tuple(
+                target
+                for fingerprint in fingerprints
+                if (target := candidates.get(fingerprint)) is not None
+                and character_counts[target.character_id] == 1
+            ),
+            tuple(
+                pending_candidates[fingerprint]
+                for fingerprint in fingerprints
+                if fingerprint in pending_candidates
+            ),
+            tuple(
+                verification_candidates[fingerprint]
+                for fingerprint in fingerprints
+                if fingerprint in verification_candidates
+            ),
         )
+
+    def _build_requested_targets_from_source(
+        self,
+        fingerprints: tuple[str, ...],
+        source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> tuple[SmartReconnectTargetIdentity, ...]:
+        return self._resolve_requested_targets_from_source(
+            fingerprints,
+            source,
+        ).targets
 
     @staticmethod
     def _items_by_character_id(values: Iterable[object]) -> dict[str, tuple[object, ...]]:
@@ -673,6 +918,7 @@ class SmartReconnectTargetIdentityService:
         characters_by_id: Mapping[str, tuple[object, ...]],
         records_by_id: Mapping[str, tuple[object, ...]],
         saved_targets: Mapping[str, _SavedTargetState],
+        source: SmartReconnectTargetIdentitySourceSnapshot,
     ) -> SmartReconnectTargetIdentity | None:
         provider = self._ungrouped_shortcut_provider
         if provider is None:
@@ -731,7 +977,28 @@ class SmartReconnectTargetIdentityService:
                     ),
                 )
             )
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) == 1:
+            return matches[0]
+        if (
+            matches
+            or saved is None
+            or not saved.verified_aliases
+            or not self._saved_verified_identity_is_safe(
+                fingerprint,
+                saved,
+                source,
+            )
+        ):
+            return None
+        return SmartReconnectTargetIdentity(
+            fingerprint=fingerprint,
+            character_id=saved.character_id,
+            role_aliases=saved.verified_aliases,
+            importance=None,
+            shortcut_path=path,
+            original_slot_index=saved.slot_index,
+            original_line_number=saved.line_number,
+        )
 
     @staticmethod
     def _aliases(
@@ -751,6 +1018,311 @@ class SmartReconnectTargetIdentityService:
                 if normalized is not None
             )
         )
+
+    @staticmethod
+    def _alias_owners_from_source(
+        source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> dict[str, set[str]]:
+        owners: dict[str, set[str]] = {}
+
+        def remember(value: object, owner: object) -> None:
+            alias = normalize_identity_alias(value)
+            if (
+                alias is not None
+                and isinstance(owner, str)
+                and owner.strip()
+            ):
+                owners.setdefault(alias, set()).add(owner.strip())
+
+        for character in source.characters:
+            if isinstance(character, Character):
+                remember(character.display_name, character.character_id)
+        for record in source.records:
+            if not isinstance(record, CharacterWindowRecord):
+                continue
+            remember(record.display_name, record.character_id)
+            for alias in record.aliases:
+                remember(alias, record.character_id)
+        for group in source.groups:
+            for entry in group.entries:
+                remember(entry.role_id, entry.entry_id)
+        for saved in source.saved_by_fingerprint().values():
+            if not saved.is_confirmed:
+                continue
+            for alias in saved.verified_aliases:
+                remember(alias, saved.character_id)
+        return owners
+
+    @classmethod
+    def _saved_verified_identity_is_safe(
+        cls,
+        fingerprint: str,
+        saved: _SavedTargetState,
+        source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> bool:
+        if not saved.is_confirmed or not saved.verified_aliases:
+            return False
+        if any(
+            getattr(value, "character_id", None) == saved.character_id
+            for value in (*source.characters, *source.records)
+        ):
+            return False
+        same_character_fingerprints = tuple(
+            current_fingerprint
+            for current_fingerprint, current in source.saved_targets
+            if (
+                current.character_id == saved.character_id
+                and current.is_confirmed
+                and current.verified_aliases
+            )
+        )
+        if same_character_fingerprints != (fingerprint,):
+            return False
+        owners = cls._alias_owners_from_source(source)
+        for alias in saved.verified_aliases:
+            for known_alias, known_owners in owners.items():
+                if (
+                    alias == known_alias
+                    and known_owners != {saved.character_id}
+                ):
+                    return False
+        return True
+
+    def record_identity_evidence(
+        self,
+        candidates: Iterable[SmartReconnectPendingIdentityCandidate],
+        observations: Iterable[SmartReconnectIdentityEvidence],
+        *,
+        expected_generation: int,
+        expected_config_revision: int,
+        expected_source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> SmartReconnectIdentityEvidenceResult:
+        """Persist one independent observation cycle without external I/O."""
+
+        if (
+            not isinstance(expected_source, SmartReconnectTargetIdentitySourceSnapshot)
+            or isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation < 0
+            or isinstance(expected_config_revision, bool)
+            or not isinstance(expected_config_revision, int)
+            or expected_config_revision < 0
+        ):
+            return SmartReconnectIdentityEvidenceResult(False)
+        normalized_candidates = tuple(
+            item
+            for item in candidates
+            if isinstance(item, SmartReconnectPendingIdentityCandidate)
+        )
+        fingerprint_counts: dict[str, int] = {}
+        path_counts: dict[Path, int] = {}
+        for item in normalized_candidates:
+            fingerprint_counts[item.fingerprint] = (
+                fingerprint_counts.get(item.fingerprint, 0) + 1
+            )
+            path_counts[item.shortcut_path] = (
+                path_counts.get(item.shortcut_path, 0) + 1
+            )
+        unique_candidates = {
+            item.fingerprint: item
+            for item in normalized_candidates
+            if fingerprint_counts[item.fingerprint] == 1
+            and path_counts[item.shortcut_path] == 1
+        }
+        observed_by_fingerprint: dict[str, SmartReconnectIdentityEvidence] = {}
+        duplicate_observations: set[str] = set()
+        for item in observations:
+            if (
+                not isinstance(item, SmartReconnectIdentityEvidence)
+                or unique_candidates.get(item.candidate.fingerprint)
+                != item.candidate
+            ):
+                continue
+            if item.candidate.fingerprint in observed_by_fingerprint:
+                duplicate_observations.add(item.candidate.fingerprint)
+                continue
+            observed_by_fingerprint[item.candidate.fingerprint] = item
+        for fingerprint in duplicate_observations:
+            observed_by_fingerprint.pop(fingerprint, None)
+
+        expected_saved = expected_source.saved_by_fingerprint()
+        alias_owners = self._alias_owners_from_source(expected_source)
+        observed_alias_counts: dict[str, int] = {}
+        for item in observed_by_fingerprint.values():
+            observed_alias_counts[item.role_alias] = (
+                observed_alias_counts.get(item.role_alias, 0) + 1
+            )
+        rejected_aliases: set[str] = set()
+        for fingerprint, item in observed_by_fingerprint.items():
+            current = expected_saved.get(fingerprint)
+            other_owners = alias_owners.get(item.role_alias, set()) - (
+                {current.character_id} if current is not None else set()
+            )
+            if observed_alias_counts[item.role_alias] != 1 or other_owners:
+                rejected_aliases.add(fingerprint)
+        for fingerprint in rejected_aliases:
+            observed_by_fingerprint.pop(fingerprint, None)
+
+        candidate_state = dict(expected_saved)
+        confirmed: set[str] = set()
+        changed = False
+        committed_generation = expected_generation + 1
+        for fingerprint, candidate in unique_candidates.items():
+            current = candidate_state.get(fingerprint)
+            original_revision = (
+                current.evidence_revision if current is not None else 0
+            )
+            path_changed = (
+                current is not None
+                and current.shortcut_path is not None
+                and current.shortcut_path != candidate.shortcut_path
+            )
+            if current is None:
+                current = _SavedTargetState(
+                    character_id=f"smart-reconnect-{uuid4().hex}",
+                    slot_index=None,
+                    line_number=None,
+                    status="pending",
+                    shortcut_path=candidate.shortcut_path,
+                )
+                candidate_state[fingerprint] = current
+                changed = True
+            elif path_changed:
+                current = replace(
+                    current,
+                    slot_index=None,
+                    line_number=None,
+                    verified_aliases=(),
+                    status="pending",
+                    shortcut_path=candidate.shortcut_path,
+                    instance=None,
+                    shortcut_seal=None,
+                    evidence_alias=None,
+                    identity_generation=None,
+                    config_revision=None,
+                    evidence_revision=original_revision + 1,
+                )
+                candidate_state[fingerprint] = current
+                changed = True
+
+            observation = observed_by_fingerprint.get(fingerprint)
+            if observation is None:
+                continue
+            same_evidence = (
+                current.has_complete_evidence
+                and current.shortcut_path == candidate.shortcut_path
+                and current.instance == observation.instance
+                and current.shortcut_seal == observation.shortcut_seal
+                and current.evidence_alias == observation.role_alias
+                and current.identity_generation == expected_generation
+                and current.config_revision == expected_config_revision
+            )
+            if current.is_confirmed and same_evidence:
+                confirmed.add(fingerprint)
+                continue
+            if (
+                current.is_pending
+                and same_evidence
+                and current.identity_generation == expected_generation
+            ):
+                updated = replace(
+                    current,
+                    verified_aliases=(observation.role_alias,),
+                    status="confirmed",
+                    identity_generation=committed_generation,
+                )
+                candidate_state[fingerprint] = updated
+                confirmed.add(fingerprint)
+                changed = True
+                continue
+            updated = replace(
+                current,
+                slot_index=None,
+                line_number=None,
+                verified_aliases=(),
+                status="pending",
+                shortcut_path=candidate.shortcut_path,
+                instance=observation.instance,
+                shortcut_seal=observation.shortcut_seal,
+                evidence_alias=observation.role_alias,
+                identity_generation=committed_generation,
+                config_revision=expected_config_revision,
+                evidence_revision=original_revision + 1,
+            )
+            if updated != candidate_state.get(fingerprint):
+                candidate_state[fingerprint] = updated
+                changed = True
+
+        if changed:
+            candidate_state = self._advance_complete_evidence_generation(
+                candidate_state,
+                expected_generation=expected_generation,
+                committed_generation=committed_generation,
+            )
+
+        def source_is_current() -> bool:
+            return (
+                self._coordinator.generation == expected_generation
+                and tuple(sorted(self._saved.items()))
+                == expected_source.saved_targets
+                and (not self._state_write_blocked)
+                == expected_source.state_writable
+            )
+
+        if not changed or self._state_write_blocked:
+            snapshot = self._coordinator.capture_snapshot(source_is_current)
+            return SmartReconnectIdentityEvidenceResult(
+                source_current=(
+                    snapshot.generation == expected_generation
+                    and snapshot.value
+                ),
+                confirmed_fingerprints=(
+                    frozenset(confirmed)
+                    if not self._state_write_blocked
+                    else frozenset()
+                ),
+                state_changed=False,
+            )
+
+        with self._remember_lock:
+            def prepare(
+                transaction: IdentityDataTransaction,
+            ) -> SmartReconnectIdentityEvidenceResult:
+                if not source_is_current():
+                    return SmartReconnectIdentityEvidenceResult(False)
+                content = self._serialize_state(candidate_state)
+                transaction.stage_file(
+                    IdentityDataResource.RECONNECT_IDENTITY,
+                    self._state_path,
+                    content,
+                    lambda serialized: self._validate_serialized_state(
+                        serialized,
+                        candidate_state,
+                    ),
+                )
+                transaction.stage_memory(
+                    IdentityDataResource.RECONNECT_IDENTITY,
+                    lambda: dict(self._saved),
+                    lambda: self._install_saved(candidate_state),
+                    self._restore_saved,
+                )
+                return SmartReconnectIdentityEvidenceResult(
+                    True,
+                    frozenset(confirmed),
+                    True,
+                )
+
+            try:
+                return self._coordinator.execute(prepare)
+            except IdentityTransactionRollbackError:
+                raise
+            except (
+                IdentityTransactionError,
+                OSError,
+                TypeError,
+                ValueError,
+            ):
+                return SmartReconnectIdentityEvidenceResult(False)
 
     def _build_targets_from_source(
         self,
@@ -844,6 +1416,8 @@ class SmartReconnectTargetIdentityService:
                 continue
             exact_memberships.add(membership)
             saved = saved_targets.get(fingerprint)
+            if saved is not None and saved.is_pending:
+                continue
             slot_index = None
             line_number = None
             if saved is not None and saved.character_id == entry.entry_id:
@@ -999,6 +1573,8 @@ class SmartReconnectTargetIdentityService:
 
         try:
             source = self._capture_source()
+            if not source.value.state_writable:
+                return False
             targets = self.targets_for_fingerprints_from_source_snapshot(
                 (normalized,),
                 source.value,
@@ -1029,15 +1605,27 @@ class SmartReconnectTargetIdentityService:
                 target.fingerprint,
                 _SavedTargetState(target.character_id, None, None),
             )
-            updated = _SavedTargetState(
-                target.character_id,
-                current.slot_index if slot_index is None else slot_index,
-                current.line_number if line_number is None else line_number,
+            if current.is_pending:
+                return False
+            updated = replace(
+                current,
+                character_id=target.character_id,
+                slot_index=(
+                    current.slot_index if slot_index is None else slot_index
+                ),
+                line_number=(
+                    current.line_number if line_number is None else line_number
+                ),
             )
             if updated == current:
                 return True
             candidate = dict(self._saved)
             candidate[target.fingerprint] = updated
+            candidate = self._advance_complete_evidence_generation(
+                candidate,
+                expected_generation=source.generation,
+                committed_generation=source.generation + 1,
+            )
             content = self._serialize_state(candidate)
             transaction.stage_file(
                 IdentityDataResource.RECONNECT_IDENTITY,
@@ -1072,18 +1660,32 @@ class SmartReconnectTargetIdentityService:
     def _load_state_unlocked(self) -> dict[str, _SavedTargetState]:
         try:
             content = self._state_path.read_bytes()
+        except FileNotFoundError:
+            return {}
         except OSError:
+            self._state_write_blocked = True
             return {}
         try:
             return self._parse_state(content)
-        except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ):
+            self._state_write_blocked = True
             return {}
 
     @classmethod
     def _parse_state(cls, content: bytes) -> dict[str, _SavedTargetState]:
         payload = json.loads(content.decode("utf-8"))
-        if not isinstance(payload, Mapping) or payload.get("version") != cls.SCHEMA_VERSION:
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("version") not in (1, cls.SCHEMA_VERSION)
+        ):
             raise ValueError("unsupported target identity state")
+        version = payload.get("version")
         raw_targets = payload.get("targets")
         if not isinstance(raw_targets, Mapping):
             raise ValueError("target identity state has no target mapping")
@@ -1095,9 +1697,155 @@ class SmartReconnectTargetIdentityService:
             character_id = raw_value.get("character_id")
             slot_index = raw_value.get("slot_index")
             line_number = raw_value.get("line_number")
+            raw_aliases = (
+                raw_value.get("verified_aliases", ())
+                if version == cls.SCHEMA_VERSION
+                else ()
+            )
+            if not isinstance(raw_aliases, (list, tuple)):
+                raise ValueError("target identity state entry is invalid")
+            verified_aliases = tuple(
+                dict.fromkeys(
+                    alias
+                    for alias in (
+                        normalize_identity_alias(value)
+                        for value in raw_aliases
+                    )
+                    if alias is not None
+                )
+            )
+            status = (
+                raw_value.get("status", "confirmed")
+                if version == cls.SCHEMA_VERSION
+                else "confirmed"
+            )
+            raw_path = (
+                raw_value.get("shortcut_path")
+                if version == cls.SCHEMA_VERSION
+                else None
+            )
+            shortcut_path = None
+            if raw_path is not None:
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    raise ValueError("target identity state entry is invalid")
+                shortcut_path = Path(raw_path).resolve(strict=False)
+                if shortcut_path.suffix.casefold() != ".lnk":
+                    raise ValueError("target identity state entry is invalid")
+            instance = cls._parse_saved_instance(
+                raw_value.get("instance")
+                if version == cls.SCHEMA_VERSION
+                else None
+            )
+            shortcut_seal = cls._parse_saved_seal(
+                raw_value.get("shortcut_seal")
+                if version == cls.SCHEMA_VERSION
+                else None
+            )
+            raw_evidence_alias = (
+                raw_value.get("evidence_alias")
+                if version == cls.SCHEMA_VERSION
+                else None
+            )
+            evidence_alias = normalize_identity_alias(raw_evidence_alias)
+            identity_generation = (
+                raw_value.get("identity_generation")
+                if version == cls.SCHEMA_VERSION
+                else None
+            )
+            config_revision = (
+                raw_value.get("config_revision")
+                if version == cls.SCHEMA_VERSION
+                else None
+            )
+            evidence_revision = (
+                raw_value.get("evidence_revision", 0)
+                if version == cls.SCHEMA_VERSION
+                else 0
+            )
+            evidence_fields = (
+                instance,
+                shortcut_seal,
+                evidence_alias,
+                identity_generation,
+                config_revision,
+            )
+            evidence_is_empty = all(value is None for value in evidence_fields)
+            evidence_is_complete = all(value is not None for value in evidence_fields)
+            v2_structure_is_valid = (
+                version != cls.SCHEMA_VERSION
+                or (
+                    status == "confirmed"
+                    and (
+                        (
+                            not verified_aliases
+                            and shortcut_path is None
+                            and evidence_is_empty
+                            and evidence_revision == 0
+                        )
+                        or (
+                            shortcut_path is not None
+                            and evidence_is_complete
+                            and evidence_revision > 0
+                            and verified_aliases == (evidence_alias,)
+                        )
+                    )
+                )
+                or (
+                    version == cls.SCHEMA_VERSION
+                    and status == "pending"
+                    and not verified_aliases
+                    and shortcut_path is not None
+                    and (evidence_is_empty or evidence_is_complete)
+                )
+            )
             if (
                 not isinstance(character_id, str)
                 or not character_id.strip()
+                or status not in {"pending", "confirmed"}
+                or len(verified_aliases) != len(raw_aliases)
+                or any(len(alias) < 3 for alias in verified_aliases)
+                or (
+                    raw_evidence_alias is not None
+                    and (
+                        not isinstance(raw_evidence_alias, str)
+                        or evidence_alias is None
+                        or len(evidence_alias) < 3
+                        or any(
+                            character.isspace()
+                            for character in raw_evidence_alias
+                        )
+                        or "..." in raw_evidence_alias
+                        or "…" in raw_evidence_alias
+                    )
+                )
+                or (not evidence_is_empty and not evidence_is_complete)
+                or (evidence_is_complete and shortcut_path is None)
+                or (
+                    identity_generation is not None
+                    and (
+                        isinstance(identity_generation, bool)
+                        or not isinstance(identity_generation, int)
+                        or identity_generation < 0
+                    )
+                )
+                or (
+                    config_revision is not None
+                    and (
+                        isinstance(config_revision, bool)
+                        or not isinstance(config_revision, int)
+                        or config_revision < 0
+                    )
+                )
+                or isinstance(evidence_revision, bool)
+                or not isinstance(evidence_revision, int)
+                or evidence_revision < 0
+                or (evidence_is_complete and evidence_revision == 0)
+                or (
+                    evidence_is_empty
+                    and shortcut_path is None
+                    and evidence_revision != 0
+                )
+                or not v2_structure_is_valid
                 or (
                     slot_index is not None
                     and (
@@ -1121,8 +1869,57 @@ class SmartReconnectTargetIdentityService:
                 character_id.strip(),
                 slot_index,
                 line_number,
+                verified_aliases,
+                status,
+                shortcut_path,
+                instance,
+                shortcut_seal,
+                evidence_alias,
+                identity_generation,
+                config_revision,
+                evidence_revision,
             )
         return result
+
+    @staticmethod
+    def _parse_saved_instance(raw: object) -> WindowInstanceToken | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise ValueError("target identity instance is invalid")
+        rect = raw.get("rect")
+        if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+            raise ValueError("target identity instance is invalid")
+        return WindowInstanceToken(
+            handle=raw.get("handle"),
+            process_id=raw.get("process_id"),
+            thread_id=raw.get("thread_id"),
+            window_class=raw.get("window_class"),
+            rect=tuple(rect),
+            minimized=raw.get("minimized"),
+            process_lifecycle_token=raw.get("process_lifecycle_token"),
+        )
+
+    @staticmethod
+    def _parse_saved_seal(raw: object) -> ShortcutSeal | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise ValueError("target identity shortcut seal is invalid")
+        raw_identity = raw.get("file_identity")
+        if not isinstance(raw_identity, Mapping):
+            raise ValueError("target identity shortcut seal is invalid")
+        return ShortcutSeal(
+            ShortcutFileIdentity(
+                normalized_path=raw_identity.get("normalized_path"),
+                volume_serial_number=raw_identity.get(
+                    "volume_serial_number"
+                ),
+                file_index=raw_identity.get("file_index"),
+            ),
+            content_sha256=raw.get("content_sha256"),
+            launch_fingerprint=raw.get("launch_fingerprint"),
+        )
 
     @classmethod
     def _serialize_state(
@@ -1136,6 +1933,53 @@ class SmartReconnectTargetIdentityService:
                     "character_id": value.character_id,
                     "slot_index": value.slot_index,
                     "line_number": value.line_number,
+                    "verified_aliases": list(value.verified_aliases),
+                    "status": value.status,
+                    "shortcut_path": (
+                        str(value.shortcut_path)
+                        if value.shortcut_path is not None
+                        else None
+                    ),
+                    "instance": (
+                        {
+                            "handle": value.instance.handle,
+                            "process_id": value.instance.process_id,
+                            "thread_id": value.instance.thread_id,
+                            "window_class": value.instance.window_class,
+                            "rect": list(value.instance.rect),
+                            "minimized": value.instance.minimized,
+                            "process_lifecycle_token": (
+                                value.instance.process_lifecycle_token
+                            ),
+                        }
+                        if value.instance is not None
+                        else None
+                    ),
+                    "shortcut_seal": (
+                        {
+                            "file_identity": {
+                                "normalized_path": (
+                                    value.shortcut_seal.file_identity.normalized_path
+                                ),
+                                "volume_serial_number": (
+                                    value.shortcut_seal.file_identity.volume_serial_number
+                                ),
+                                "file_index": (
+                                    value.shortcut_seal.file_identity.file_index
+                                ),
+                            },
+                            "content_sha256": value.shortcut_seal.content_sha256,
+                            "launch_fingerprint": (
+                                value.shortcut_seal.launch_fingerprint
+                            ),
+                        }
+                        if value.shortcut_seal is not None
+                        else None
+                    ),
+                    "evidence_alias": value.evidence_alias,
+                    "identity_generation": value.identity_generation,
+                    "config_revision": value.config_revision,
+                    "evidence_revision": value.evidence_revision,
                 }
                 for fingerprint, value in sorted(saved.items())
             },
@@ -1152,8 +1996,36 @@ class SmartReconnectTargetIdentityService:
     ) -> bool:
         try:
             return cls._parse_state(content) == dict(expected)
-        except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ):
             return False
+
+    @staticmethod
+    def _advance_complete_evidence_generation(
+        candidate: Mapping[str, _SavedTargetState],
+        *,
+        expected_generation: int,
+        committed_generation: int,
+    ) -> dict[str, _SavedTargetState]:
+        return {
+            fingerprint: (
+                replace(
+                    state,
+                    identity_generation=committed_generation,
+                )
+                if (
+                    state.has_complete_evidence
+                    and state.identity_generation == expected_generation
+                )
+                else state
+            )
+            for fingerprint, state in candidate.items()
+        }
 
     def _install_saved(self, candidate: Mapping[str, _SavedTargetState]) -> None:
         self._coordinator.require_active_transaction_owner()
@@ -1170,8 +2042,12 @@ class SmartReconnectTargetIdentityService:
 
 
 __all__ = [
+    "SmartReconnectIdentityEvidence",
+    "SmartReconnectIdentityEvidenceResult",
+    "SmartReconnectPendingIdentityCandidate",
     "SmartReconnectTargetIdentity",
     "SmartReconnectTargetIdentityError",
+    "SmartReconnectTargetResolution",
     "SmartReconnectTargetIdentitySourceSnapshot",
     "SmartReconnectTargetIdentityService",
     "normalize_reconnect_role_alias",

@@ -448,7 +448,10 @@ class ReconnectAuthorizationBatch:
             if (
                 target.character_id is None
                 or not target.role_aliases
-                or target.importance is None
+                or (
+                    target.importance is None
+                    and self.launch_mode is not ReconnectLaunchMode.IDENTITY_BOUND
+                )
                 or target.shortcut_seal is None
             ):
                 raise ValueError("authorization target is incomplete")

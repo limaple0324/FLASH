@@ -132,11 +132,10 @@ def test_source_rejects_duplicate_character_identity():
     (
         ("character_id", None),
         ("role_aliases", ()),
-        ("importance", None),
         ("shortcut_seal", None),
     ),
 )
-def test_every_launch_mode_rejects_every_missing_identity_field(
+def test_every_launch_mode_rejects_every_missing_dedicated_identity_field(
     tmp_path,
     launch_mode,
     field,
@@ -151,6 +150,29 @@ def test_every_launch_mode_rejects_every_missing_identity_field(
             "batch",
             source,
             launch_mode,
+            (target,),
+        )
+
+
+def test_only_identity_bound_target_may_omit_importance(tmp_path):
+    target = replace(make_target(tmp_path), importance=None)
+    source = ReconnectSourceIdentity(0, 0, "g", "group", ("character-1",))
+
+    identity_bound = ReconnectAuthorizationBatch(
+        1,
+        "identity-bound",
+        source,
+        ReconnectLaunchMode.IDENTITY_BOUND,
+        (target,),
+    )
+
+    assert identity_bound.targets == (target,)
+    with pytest.raises(ValueError, match="incomplete"):
+        ReconnectAuthorizationBatch(
+            1,
+            "compatibility",
+            source,
+            ReconnectLaunchMode.COMPATIBILITY,
             (target,),
         )
 

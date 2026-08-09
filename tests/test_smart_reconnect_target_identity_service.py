@@ -19,9 +19,11 @@ from services.group_configuration_service import (
     GroupConfigurationEntry,
 )
 from services.smart_reconnect_target_identity_service import (
+    SmartReconnectIdentityEvidence,
     SmartReconnectTargetIdentityService,
 )
 from services.identity_data_transaction_coordinator import (
+    IdentityDataResource,
     IdentityDataTransactionCoordinator,
 )
 
@@ -329,11 +331,13 @@ def test_verified_slot_and_line_persist_without_role_names(tmp_path):
     state_path = tmp_path / "smart_reconnect_targets.json"
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     serialized = state_path.read_text(encoding="utf-8")
-    assert payload["targets"][FINGERPRINT] == {
-        "character_id": CHARACTER_ID,
-        "slot_index": 2,
-        "line_number": 8,
-    }
+    saved = payload["targets"][FINGERPRINT]
+    assert saved["character_id"] == CHARACTER_ID
+    assert saved["slot_index"] == 2
+    assert saved["line_number"] == 8
+    assert saved["status"] == "confirmed"
+    assert saved["verified_aliases"] == []
+    assert saved["evidence_revision"] == 0
     assert "登記主號" not in serialized
     assert "主號別名" not in serialized
     assert "舊別名" not in serialized
@@ -395,11 +399,113 @@ def test_corrupt_state_fails_closed_without_renaming_user_file(tmp_path):
 
     target = service.target_for(FINGERPRINT)
 
-    assert target is not None
-    assert target.original_slot_index is None
-    assert target.original_line_number is None
+    assert target is None
+    source = service.coordinator.capture_snapshot(
+        service.capture_source_snapshot_in_current
+    )
+    resolution = service.resolve_for_fingerprints_from_source_snapshot(
+        (FINGERPRINT,),
+        source.value,
+    )
+    assert resolution.targets == ()
+    assert resolution.pending_candidates == ()
+    assert resolution.verification_candidates == ()
+    assert service.remember_verified_slot(FINGERPRINT, CHARACTER_ID, 1) is False
     assert state_path.read_text(encoding="utf-8") == "{broken"
     assert tuple(tmp_path.glob("*.corrupt*")) == ()
+
+
+@pytest.mark.parametrize(
+    "invalid_shape",
+    (
+        "alias_without_evidence",
+        "path_without_evidence",
+        "complete_evidence_without_alias",
+    ),
+)
+def test_v2_impossible_confirmed_evidence_is_corrupt(
+    tmp_path,
+    invalid_shape,
+):
+    fingerprint = "a" * 64
+    shortcut = tmp_path / "unregistered-0.lnk"
+    state_path = tmp_path / "smart_reconnect_targets.json"
+    target_state = {
+        "character_id": "smart-reconnect-fixed",
+        "slot_index": None,
+        "line_number": None,
+        "verified_aliases": (
+            ["100古"] if invalid_shape == "alias_without_evidence" else []
+        ),
+        "status": "confirmed",
+        "shortcut_path": str(shortcut.resolve()),
+        "instance": None,
+        "shortcut_seal": None,
+        "evidence_alias": None,
+        "identity_generation": None,
+        "config_revision": None,
+        "evidence_revision": 0,
+    }
+    if invalid_shape == "complete_evidence_without_alias":
+        target_state.update(
+            instance={
+                "handle": 100,
+                "process_id": 200,
+                "thread_id": 300,
+                "window_class": "ShockwaveFlash",
+                "rect": [0, 0, 800, 600],
+                "minimized": False,
+                "process_lifecycle_token": 400,
+            },
+            shortcut_seal={
+                "file_identity": {
+                    "normalized_path": str(shortcut.resolve()),
+                    "volume_serial_number": 50,
+                    "file_index": 60,
+                },
+                "content_sha256": "1" * 64,
+                "launch_fingerprint": fingerprint,
+            },
+            evidence_alias="100古",
+            identity_generation=1,
+            config_revision=1,
+            evidence_revision=1,
+        )
+    original = (
+        json.dumps(
+            {
+                "version": 2,
+                "targets": {fingerprint: target_state},
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    state_path.write_bytes(original)
+
+    service, fingerprints, _paths, _instances, _seals, _aliases = (
+        _pending_identity_fixture(tmp_path, ("100古",))
+    )
+    source = service.coordinator.capture_snapshot(
+        service.capture_source_snapshot_in_current
+    )
+    resolution = service.resolve_for_fingerprints_from_source_snapshot(
+        fingerprints,
+        source.value,
+    )
+
+    assert source.value.state_writable is False
+    assert resolution.targets == ()
+    assert service.target_for(fingerprint) is None
+    assert ("100古", "smart-reconnect-fixed") not in (
+        service.observed_identity_alias_catalog()
+    )
+    assert service.remember_verified_slot(
+        fingerprint,
+        "smart-reconnect-fixed",
+        1,
+    ) is False
+    assert state_path.read_bytes() == original
 
 
 def test_short_or_conflicting_observed_alias_is_never_accepted(tmp_path):
@@ -687,12 +793,11 @@ def test_state_file_and_memory_commit_together(tmp_path):
 
     payload = json.loads(service.state_path.read_text(encoding="utf-8"))
     target = service.target_for(FINGERPRINT)
-    assert payload["version"] == 1
-    assert payload["targets"][FINGERPRINT] == {
-        "character_id": CHARACTER_ID,
-        "slot_index": 2,
-        "line_number": 7,
-    }
+    assert payload["version"] == 2
+    assert payload["targets"][FINGERPRINT]["character_id"] == CHARACTER_ID
+    assert payload["targets"][FINGERPRINT]["slot_index"] == 2
+    assert payload["targets"][FINGERPRINT]["line_number"] == 7
+    assert payload["targets"][FINGERPRINT]["status"] == "confirmed"
     assert target.original_slot_index == 2
     assert target.original_line_number == 7
 
@@ -962,3 +1067,338 @@ def test_absent_ungrouped_target_ignores_ordinary_desktop_shortcut(
     )
 
     assert service.retained_target_is_current(authorization_target) is True
+
+
+def _pending_identity_fixture(tmp_path, aliases=("100古",)):
+    fingerprints = tuple(
+        chr(ord("a") + index) * 64 for index in range(len(aliases))
+    )
+    shortcuts = tuple(
+        tmp_path / f"unregistered-{index}.lnk"
+        for index in range(len(aliases))
+    )
+    paths_by_fingerprint = dict(zip(fingerprints, shortcuts))
+    service = make_service(
+        tmp_path,
+        (),
+        StaticShortcutResolver(
+            {
+                shortcut.resolve(): fingerprint
+                for shortcut, fingerprint in zip(shortcuts, fingerprints)
+            }
+        ),
+        ungrouped_shortcut_provider=paths_by_fingerprint.get,
+        ungrouped_shortcut_catalog_provider=lambda: shortcuts,
+    )
+    instances = tuple(
+        WindowInstanceToken(
+            100 + index,
+            200 + index,
+            300 + index,
+            "ShockwaveFlash",
+            (0, 0, 800, 600),
+            False,
+            400 + index,
+        )
+        for index in range(len(aliases))
+    )
+    seals = tuple(
+        ShortcutSeal(
+            ShortcutFileIdentity(shortcut, 50, 60 + index),
+            f"{index + 1}" * 64,
+            fingerprint,
+        )
+        for index, (shortcut, fingerprint) in enumerate(
+            zip(shortcuts, fingerprints)
+        )
+    )
+    return service, fingerprints, shortcuts, instances, seals, tuple(aliases)
+
+
+def _source_and_candidates(service, fingerprints):
+    source = service.coordinator.capture_snapshot(
+        service.capture_source_snapshot_in_current
+    )
+    resolution = service.resolve_for_fingerprints_from_source_snapshot(
+        fingerprints,
+        source.value,
+    )
+    candidates = tuple(
+        dict.fromkeys(
+            (
+                *resolution.pending_candidates,
+                *resolution.verification_candidates,
+            )
+        )
+    )
+    return source, resolution, candidates
+
+
+def _record_complete_cycle(
+    service,
+    fingerprints,
+    instances,
+    seals,
+    aliases,
+    *,
+    config_revision=7,
+):
+    source, resolution, candidates = _source_and_candidates(
+        service,
+        fingerprints,
+    )
+    evidence = tuple(
+        SmartReconnectIdentityEvidence(candidate, instance, seal, alias)
+        for candidate, instance, seal, alias in zip(
+            candidates,
+            instances,
+            seals,
+            aliases,
+        )
+    )
+    result = service.record_identity_evidence(
+        candidates,
+        evidence,
+        expected_generation=source.generation,
+        expected_config_revision=config_revision,
+        expected_source=source.value,
+    )
+    return source, resolution, candidates, result
+
+
+def test_pending_identity_requires_two_cycles_and_identical_third_is_noop(
+    tmp_path,
+):
+    fixture = _pending_identity_fixture(tmp_path)
+    service, fingerprints, _paths, instances, seals, aliases = fixture
+
+    first = _record_complete_cycle(
+        service,
+        fingerprints,
+        instances,
+        seals,
+        aliases,
+    )[-1]
+    first_generation = service.coordinator.generation
+    first_payload = json.loads(service.state_path.read_text(encoding="utf-8"))
+    first_saved = first_payload["targets"][fingerprints[0]]
+
+    assert first.source_current is True
+    assert first.confirmed_fingerprints == frozenset()
+    assert first_saved["status"] == "pending"
+    assert first_saved["verified_aliases"] == []
+    assert service.target_for(fingerprints[0]) is None
+    assert all(
+        owner != first_saved["character_id"]
+        for _alias, owner in service.observed_identity_alias_catalog()
+    )
+
+    second = _record_complete_cycle(
+        service,
+        fingerprints,
+        instances,
+        seals,
+        aliases,
+    )[-1]
+    second_generation = service.coordinator.generation
+    second_bytes = service.state_path.read_bytes()
+    second_saved = json.loads(second_bytes)["targets"][fingerprints[0]]
+
+    assert second.confirmed_fingerprints == frozenset(fingerprints)
+    assert second_saved["status"] == "confirmed"
+    assert second_saved["character_id"] == first_saved["character_id"]
+    assert second_saved["verified_aliases"] == [aliases[0]]
+    assert second_generation == first_generation + 1
+    assert service.target_for(fingerprints[0]) is not None
+
+    third = _record_complete_cycle(
+        service,
+        fingerprints,
+        instances,
+        seals,
+        aliases,
+    )[-1]
+
+    assert third.confirmed_fingerprints == frozenset(fingerprints)
+    assert third.state_changed is False
+    assert service.coordinator.generation == second_generation
+    assert service.state_path.read_bytes() == second_bytes
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    ("instance", "seal", "alias", "config", "generation"),
+)
+def test_confirmed_identity_change_resets_to_pending(tmp_path, changed_field):
+    fixture = _pending_identity_fixture(tmp_path)
+    service, fingerprints, _paths, instances, seals, aliases = fixture
+    _record_complete_cycle(service, fingerprints, instances, seals, aliases)
+    _record_complete_cycle(service, fingerprints, instances, seals, aliases)
+    before = json.loads(service.state_path.read_text(encoding="utf-8"))[
+        "targets"
+    ][fingerprints[0]]
+
+    changed_instances = instances
+    changed_seals = seals
+    changed_aliases = aliases
+    config_revision = 7
+    if changed_field == "instance":
+        changed_instances = (replace(instances[0], handle=999),)
+    elif changed_field == "seal":
+        changed_seals = (
+            replace(seals[0], content_sha256="f" * 64),
+        )
+    elif changed_field == "alias":
+        changed_aliases = ("100靈",)
+    elif changed_field == "config":
+        config_revision = 8
+    else:
+        def stage_unrelated_identity_write(transaction):
+            transaction.stage_memory(
+                IdentityDataResource.CURRENT_GROUP,
+                lambda: None,
+                lambda: None,
+                lambda _snapshot: None,
+            )
+            return True
+
+        service.coordinator.execute(stage_unrelated_identity_write)
+
+    result = _record_complete_cycle(
+        service,
+        fingerprints,
+        changed_instances,
+        changed_seals,
+        changed_aliases,
+        config_revision=config_revision,
+    )[-1]
+    after = json.loads(service.state_path.read_text(encoding="utf-8"))[
+        "targets"
+    ][fingerprints[0]]
+
+    assert result.confirmed_fingerprints == frozenset()
+    assert after["status"] == "pending"
+    assert after["character_id"] == before["character_id"]
+    assert after["verified_aliases"] == []
+    assert after["evidence_revision"] > before["evidence_revision"]
+    assert service.target_for(fingerprints[0]) is None
+
+
+def test_persisted_full_shared_prefix_identities_coexist(tmp_path):
+    fixture = _pending_identity_fixture(tmp_path, ("100古", "100靈"))
+    service, fingerprints, _paths, instances, seals, aliases = fixture
+    _record_complete_cycle(service, fingerprints, instances, seals, aliases)
+    promoted = _record_complete_cycle(
+        service,
+        fingerprints,
+        instances,
+        seals,
+        aliases,
+    )[-1]
+
+    assert promoted.confirmed_fingerprints == frozenset(fingerprints)
+    targets = service.targets_for_fingerprints(fingerprints)
+    assert {target.role_aliases for target in targets} == {
+        ("100古",),
+        ("100靈",),
+    }
+    catalog = service.observed_identity_alias_catalog()
+    assert {alias for alias, _owner in catalog if alias.startswith("100")} == {
+        "100古",
+        "100靈",
+    }
+
+
+def test_pending_identity_survives_service_restart_with_same_opaque_id(
+    tmp_path,
+):
+    fixture = _pending_identity_fixture(tmp_path)
+    service, fingerprints, paths, instances, seals, aliases = fixture
+    _record_complete_cycle(service, fingerprints, instances, seals, aliases)
+    before = json.loads(service.state_path.read_text(encoding="utf-8"))[
+        "targets"
+    ][fingerprints[0]]
+
+    reloaded = make_service(
+        tmp_path,
+        (),
+        StaticShortcutResolver({paths[0].resolve(): fingerprints[0]}),
+        ungrouped_shortcut_provider=lambda fingerprint: (
+            paths[0] if fingerprint == fingerprints[0] else None
+        ),
+        ungrouped_shortcut_catalog_provider=lambda: paths,
+    )
+    _source, resolution, candidates = _source_and_candidates(
+        reloaded,
+        fingerprints,
+    )
+    after = json.loads(reloaded.state_path.read_text(encoding="utf-8"))[
+        "targets"
+    ][fingerprints[0]]
+
+    assert before["status"] == after["status"] == "pending"
+    assert before["character_id"] == after["character_id"]
+    assert len(candidates) == 1
+    assert resolution.targets == ()
+    assert reloaded.target_for(fingerprints[0]) is None
+
+
+def test_remembered_slot_and_line_preserve_confirmed_verified_aliases(tmp_path):
+    fixture = _pending_identity_fixture(tmp_path)
+    service, fingerprints, _paths, instances, seals, aliases = fixture
+    _record_complete_cycle(service, fingerprints, instances, seals, aliases)
+    _record_complete_cycle(service, fingerprints, instances, seals, aliases)
+    target = service.target_for(fingerprints[0])
+    assert target is not None
+
+    assert service.remember_verified_slot(
+        fingerprints[0],
+        target.character_id,
+        2,
+    ) is True
+    assert service.remember_verified_line(
+        fingerprints[0],
+        target.character_id,
+        7,
+    ) is True
+    saved = json.loads(service.state_path.read_text(encoding="utf-8"))[
+        "targets"
+    ][fingerprints[0]]
+
+    assert saved["verified_aliases"] == [aliases[0]]
+    assert saved["slot_index"] == 2
+    assert saved["line_number"] == 7
+
+
+def test_version_one_state_loads_and_migrates_on_next_verified_write(tmp_path):
+    shortcut = tmp_path / "role.lnk"
+    state_path = tmp_path / "smart_reconnect_targets.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "targets": {
+                    FINGERPRINT: {
+                        "character_id": CHARACTER_ID,
+                        "slot_index": 1,
+                        "line_number": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = make_service(
+        tmp_path,
+        (make_group("one", (make_entry(shortcut),)),),
+        StaticShortcutResolver({shortcut.resolve(): FINGERPRINT}),
+    )
+
+    assert service.target_for(FINGERPRINT).original_slot_index == 1
+    assert service.remember_verified_line(FINGERPRINT, CHARACTER_ID, 6) is True
+    migrated = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert migrated["version"] == 2
+    assert migrated["targets"][FINGERPRINT]["status"] == "confirmed"
+    assert migrated["targets"][FINGERPRINT]["slot_index"] == 1
+    assert migrated["targets"][FINGERPRINT]["line_number"] == 6

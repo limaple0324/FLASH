@@ -17,6 +17,10 @@ from main import (
     format_window_status,
 )
 from services.app_context import AppContext
+from services.role_id_template_service import RoleIdTemplateService
+from services.smart_reconnect_preparation_service import (
+    SmartReconnectPreparationService,
+)
 
 
 class FakeAdapter:
@@ -80,6 +84,20 @@ def test_build_services_keeps_invalid_persisted_fingerprint_fail_closed(tmp_path
     result = adapter.health_check()
     assert result.success is False
     assert result.code == "window.identity_invalid"
+
+
+def test_build_services_wires_role_template_reader_into_reconnect_preparation(
+    tmp_path,
+):
+    build_services(root=tmp_path)
+    role_templates = AppContext.get(RoleIdTemplateService)
+    preparation = AppContext.get(SmartReconnectPreparationService)
+    calls: list[int] = []
+    expected = object()
+    role_templates.read = lambda handle: calls.append(handle) or expected
+
+    assert preparation._role_identity_reader(4321) is expected
+    assert calls == [4321]
 
 
 def test_unconfigured_window_detection_remains_unsafe():
