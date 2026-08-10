@@ -133,6 +133,7 @@ class ActualWindowSnapshot:
     isolated_window_count: int = 0
     anonymous_isolated_window_count: int = 0
     failure_codes: tuple[str, ...] = ()
+    observation_generation: int = 0
 
     SCHEMA_VERSION = 1
 
@@ -164,6 +165,7 @@ class ActualWindowSnapshot:
                 self.anonymous_isolated_window_count,
                 "anonymous_isolated_window_count",
             ),
+            (self.observation_generation, "observation_generation"),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{field} must be a non-negative integer")

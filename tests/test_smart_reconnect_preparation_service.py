@@ -47,6 +47,17 @@ from services.smart_reconnect_target_identity_service import (
     SmartReconnectTargetIdentityService,
 )
 from adapters.windows_window import Win32WindowBackend
+from adapters.game_screen_recognizer import ScreenRecognition
+from adapters.windows_smart_reconnect_observation_broker import (
+    SmartReconnectEnumerationResult,
+    SmartReconnectObservationRequest,
+    SmartReconnectObservationSnapshot,
+    SmartReconnectShortcutObservation,
+    SmartReconnectWindowObservation,
+    WindowsSmartReconnectObservationBroker,
+)
+from adapters.windows_window import WindowInfo
+from core.reconnect_policy import ReconnectScreenState
 
 
 class StaticGroupService:
@@ -120,6 +131,81 @@ class StaticTargetWindowService:
         if self.release is not None:
             assert self.release.wait(2)
         return self.snapshot_value
+
+
+class StaticObservationBroker:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+        self.refresh_calls = 0
+        self.entered = None
+        self.release = None
+        self.gate_entered = None
+        self.gate_release = None
+
+    def refresh(self, _paths=()):
+        self.refresh_calls += 1
+        if self.entered is not None:
+            self.entered.set()
+        if self.release is not None:
+            assert self.release.wait(2)
+        return self.snapshot
+
+    def latest_snapshot(self):
+        return self.snapshot
+
+    def current_snapshot(self):
+        return self.snapshot
+
+    def is_generation_current(self, generation):
+        return generation == self.snapshot.generation
+
+    def run_if_generation_current(self, generation, callback):
+        initially_current = self.is_generation_current(generation)
+        if self.gate_entered is not None:
+            self.gate_entered.set()
+        if self.gate_release is not None:
+            assert self.gate_release.wait(2)
+        if (
+            not initially_current
+            or not self.is_generation_current(generation)
+        ):
+            return False, None
+        return True, callback()
+
+
+class BrokerTargetWindowService:
+    def __init__(self, broker):
+        self.broker = broker
+
+    def actual_snapshot(self):
+        observed = self.broker.refresh()
+        return ActualWindowSnapshot(
+            ActualWindowSnapshot.SCHEMA_VERSION,
+            targets=tuple(
+                ActualWindowContract(
+                    item.window.launch_fingerprint,
+                    item.instance,
+                    item.window.visible,
+                )
+                for item in observed.windows
+                if item.instance is not None
+            ),
+            blocked_fingerprints=observed.blocked_fingerprints,
+            isolated_window_count=observed.isolated_window_count,
+            anonymous_isolated_window_count=(
+                observed.anonymous_isolated_window_count
+            ),
+            failure_codes=observed.failure_codes,
+            observation_generation=observed.generation,
+        )
+
+
+class ForbiddenSealResolver:
+    def resolve(self, _paths):
+        raise AssertionError("formal preparation used direct seal resolution")
+
+    def revalidate(self, _seal):
+        raise AssertionError("formal preparation used direct seal revalidation")
 
 
 def build_fixture(tmp_path, *, include_saved_state=True):
@@ -259,6 +345,71 @@ def build_fixture(tmp_path, *, include_saved_state=True):
         config=config,
         state_path=state_path,
     )
+
+
+def install_broker_preparation_path(fixture):
+    legacy = fixture.target_windows.snapshot_value
+    windows = tuple(
+        SmartReconnectWindowObservation(
+            window=WindowInfo(
+                handle=target.instance.handle,
+                title="Adobe Flash Player",
+                visible=target.visible,
+                minimized=target.instance.minimized,
+                rect=target.instance.rect,
+                process_id=target.instance.process_id,
+                window_class=target.instance.window_class,
+                launch_fingerprint=target.fingerprint,
+                thread_id=target.instance.thread_id,
+                process_lifecycle_token=(
+                    target.instance.process_lifecycle_token
+                ),
+            ),
+            instance=target.instance,
+            sample=None,
+            recognition=ScreenRecognition(
+                ReconnectScreenState.UNKNOWN,
+                None,
+                None,
+                None,
+            ),
+            fresh_capture=False,
+            capture_route="visible",
+            role_id=None,
+        )
+        for target in legacy.targets
+    )
+    shortcuts = tuple(
+        SmartReconnectShortcutObservation(
+            str(path),
+            seal.launch_fingerprint,
+            seal,
+        )
+        for path, seal in fixture.seals.seals.items()
+    )
+    broker = StaticObservationBroker(
+        SmartReconnectObservationSnapshot(
+            generation=17,
+            windows=windows,
+            shortcuts=shortcuts,
+        )
+    )
+    fixture.target_identity._observation_broker = broker
+    fixture.target_identity._resolver = type(
+        "ForbiddenFingerprintResolver",
+        (),
+        {
+            "resolve": lambda _self, _paths: (_ for _ in ()).throw(
+                AssertionError(
+                    "formal preparation used direct fingerprint resolution"
+                )
+            )
+        },
+    )()
+    fixture.preparation._observation_broker = broker
+    fixture.preparation._shortcut_seals = ForbiddenSealResolver()
+    fixture.preparation._target_windows = BrokerTargetWindowService(broker)
+    return broker
 
 
 def _run_tk_preparation_lock_regression(work_dir, result_queue):
@@ -499,6 +650,110 @@ def test_prepare_publishes_complete_identity_bound_actual_window_batch(tmp_path)
     assert tuple(target.original_line_number for target in batch.targets) == (1, 2, 3)
     assert fixture.authorization.current_authorization() is batch
     assert fixture.seals.revalidate_calls == 0
+
+
+def test_broker_preparation_uses_only_published_process_observation(tmp_path):
+    fixture = build_fixture(tmp_path)
+    broker = install_broker_preparation_path(fixture)
+
+    batch = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+
+    assert tuple(target.fingerprint for target in batch.targets) == (
+        fixture.fingerprints
+    )
+    assert broker.refresh_calls == 1
+    assert fixture.authorization.current_authorization() is batch
+
+
+def test_local_broker_shortcut_isolation_preserves_sibling_grant_objects(
+    tmp_path,
+):
+    fixture = build_fixture(tmp_path)
+    broker = install_broker_preparation_path(fixture)
+    first = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+    first_by_fingerprint = {
+        target.fingerprint: target for target in first.targets
+    }
+    changed = fixture.fingerprints[0]
+    broker.snapshot = SmartReconnectObservationSnapshot(
+        generation=broker.snapshot.generation + 1,
+        windows=tuple(
+            item
+            for item in broker.snapshot.windows
+            if item.window.launch_fingerprint != changed
+        ),
+        shortcuts=broker.snapshot.shortcuts,
+        blocked_fingerprints=frozenset((changed,)),
+        isolated_window_count=1,
+    )
+
+    rebound = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+
+    assert rebound.target_for(changed) is None
+    for fingerprint in fixture.fingerprints[1:]:
+        sibling = rebound.target_for(fingerprint)
+        previous = first_by_fingerprint[fingerprint]
+        assert sibling == previous
+        assert sibling.authorization_id == previous.authorization_id
+        assert sibling.authorization_epoch == previous.authorization_epoch
+        assert sibling.source_generation == previous.source_generation
+
+
+def test_broker_wait_holds_no_identity_or_config_lock_and_rejects_stale_result(
+    tmp_path,
+):
+    fixture = build_fixture(tmp_path)
+    broker = install_broker_preparation_path(fixture)
+    entered = threading.Event()
+    release = threading.Event()
+    broker.entered = entered
+    broker.release = release
+    prepared = []
+    failures = []
+
+    def prepare_in_background():
+        try:
+            prepared.append(
+                fixture.preparation.prepare(
+                    launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+                )
+            )
+        except Exception as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=prepare_in_background)
+    worker.start()
+    assert entered.wait(2)
+    assert fixture.authorization.current_authorization() is None
+
+    identity_read = threading.Event()
+    identity_reader = threading.Thread(
+        target=lambda: (
+            fixture.identity.read_consistent(lambda: identity_read.set())
+        )
+    )
+    identity_reader.start()
+    assert identity_read.wait(0.5)
+    fixture.config.set("changed_during_broker_observation", True)
+
+    release.set()
+    worker.join(2)
+    identity_reader.join(2)
+
+    assert worker.is_alive() is False
+    assert identity_reader.is_alive() is False
+    assert prepared == []
+    assert len(failures) == 1
+    assert isinstance(failures[0], SmartReconnectPreparationError)
+    assert "changed during preparation" in str(failures[0])
+    assert fixture.authorization.current_authorization() is None
+    assert fixture.authorization.state is ReconnectAuthorizationState.EMPTY
 
 
 def test_corrupt_identity_state_blocks_group_actual_window_authorization(
@@ -918,7 +1173,11 @@ def test_revocation_invalidates_inflight_preparation_ticket(
     assert fixture.authorization.last_revocation_reason is expected_reason
 
 
-def build_pending_preparation_fixture(tmp_path):
+def build_pending_preparation_fixture(
+    tmp_path,
+    *,
+    role_aliases=("100古",),
+):
     identity = IdentityDataTransactionCoordinator()
     authorization = SmartReconnectAuthorizationCoordinator()
     group_service = CoordinatorBackedGroupService(identity, ())
@@ -942,28 +1201,40 @@ def build_pending_preparation_fixture(tmp_path):
         ),
         identity,
     )
-    fingerprints = ["d" * 64]
-    paths = [tmp_path / "unknown-1.lnk"]
-    paths[0].write_bytes(b"unknown-1")
+    fingerprints = [f"{13 + index:x}" * 64 for index in range(len(role_aliases))]
+    paths = [
+        tmp_path / f"unknown-{index + 1}.lnk"
+        for index in range(len(role_aliases))
+    ]
+    for index, path in enumerate(paths, start=1):
+        path.write_bytes(f"unknown-{index}".encode("ascii"))
     instances = [
         WindowInstanceToken(
-            501,
-            601,
-            701,
+            501 + index,
+            601 + index,
+            701 + index,
             "FlashWindow",
             (0, 0, 800, 600),
             False,
-            801,
+            801 + index,
         )
+        for index in range(len(role_aliases))
     ]
-    aliases = {501: "100古"}
-    fingerprint_paths = {paths[0].resolve(): fingerprints[0]}
+    aliases = {
+        instance.handle: alias
+        for instance, alias in zip(instances, role_aliases)
+    }
+    fingerprint_paths = {
+        path.resolve(): fingerprint
+        for path, fingerprint in zip(paths, fingerprints)
+    }
     seals = {
-        paths[0].resolve(): ShortcutSeal(
-            ShortcutFileIdentity(paths[0], 90, 91),
-            "1" * 64,
-            fingerprints[0],
+        path.resolve(): ShortcutSeal(
+            ShortcutFileIdentity(path, 90, 91 + index),
+            f"{index + 1}" * 64,
+            fingerprint,
         )
+        for index, (path, fingerprint) in enumerate(zip(paths, fingerprints))
     }
     target_identity = SmartReconnectTargetIdentityService(
         identity,
@@ -982,12 +1253,13 @@ def build_pending_preparation_fixture(tmp_path):
     target_windows = StaticTargetWindowService(
         ActualWindowSnapshot(
             ActualWindowSnapshot.SCHEMA_VERSION,
-            (
+            tuple(
                 ActualWindowContract(
-                    fingerprints[0],
-                    instances[0],
+                    fingerprint,
+                    instance,
                     True,
-                ),
+                )
+                for fingerprint, instance in zip(fingerprints, instances)
             ),
         )
     )
@@ -1020,6 +1292,178 @@ def build_pending_preparation_fixture(tmp_path):
         instances=instances,
         aliases=aliases,
     )
+
+
+def install_pending_broker_path(fixture, *, generation=31):
+    instance = fixture.instances[0]
+    fingerprint = fixture.fingerprints[0]
+    shortcut = fixture.paths[0].resolve()
+    seal = fixture.seals.seals[shortcut]
+    broker = StaticObservationBroker(
+        SmartReconnectObservationSnapshot(
+            generation=generation,
+            windows=(
+                SmartReconnectWindowObservation(
+                    window=WindowInfo(
+                        handle=instance.handle,
+                        title="Adobe Flash Player",
+                        visible=True,
+                        minimized=instance.minimized,
+                        rect=instance.rect,
+                        process_id=instance.process_id,
+                        window_class=instance.window_class,
+                        launch_fingerprint=fingerprint,
+                        thread_id=instance.thread_id,
+                        process_lifecycle_token=(
+                            instance.process_lifecycle_token
+                        ),
+                    ),
+                    instance=instance,
+                    sample=None,
+                    recognition=ScreenRecognition(
+                        ReconnectScreenState.CONNECTED,
+                        1.0,
+                        None,
+                        "connected",
+                    ),
+                    fresh_capture=True,
+                    capture_route="visible",
+                    role_id=fixture.aliases[instance.handle],
+                ),
+            ),
+            shortcuts=(
+                SmartReconnectShortcutObservation(
+                    os.fspath(shortcut),
+                    fingerprint,
+                    seal,
+                ),
+            ),
+        )
+    )
+    fixture.target_identity._observation_broker = broker
+    fixture.preparation._observation_broker = broker
+    fixture.preparation._target_windows = BrokerTargetWindowService(broker)
+    fixture.preparation._shortcut_seals = ForbiddenSealResolver()
+    return broker
+
+
+def _formal_pending_observation_worker(
+    request: SmartReconnectObservationRequest,
+):
+    payload = json.loads(
+        (Path(request.reference_dir) / "formal-observation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    windows = tuple(
+        WindowInfo(
+            handle=item["handle"],
+            title="Adobe Flash Player",
+            visible=True,
+            minimized=False,
+            rect=(0, 0, 800, 600),
+            process_id=item["process_id"],
+            window_class="FlashWindow",
+            launch_fingerprint=item["fingerprint"],
+            thread_id=item["thread_id"],
+            process_lifecycle_token=item["process_lifecycle_token"],
+        )
+        for item in payload["windows"]
+    )
+    shortcuts = tuple(
+        SmartReconnectShortcutObservation(
+            item["path"],
+            item["fingerprint"],
+            ShortcutSeal(
+                ShortcutFileIdentity(
+                    item["path"],
+                    item["volume_serial_number"],
+                    item["file_index"],
+                ),
+                item["content_sha256"],
+                item["fingerprint"],
+            ),
+        )
+        for item in payload["shortcuts"]
+    )
+    if request.stage == "enumerate":
+        return SmartReconnectEnumerationResult(
+            windows=windows,
+            shortcuts=shortcuts,
+            foreground_handle=windows[0].handle if windows else None,
+        )
+    if request.stage == "window":
+        window = request.window
+        assert window is not None
+        role_id = next(
+            item["role_id"]
+            for item in payload["windows"]
+            if item["handle"] == window.handle
+        )
+        return SmartReconnectWindowObservation(
+            window=window,
+            instance=WindowInstanceToken.from_window(window),
+            sample=None,
+            recognition=ScreenRecognition(
+                ReconnectScreenState.CONNECTED,
+                1.0,
+                None,
+                "connected",
+            ),
+            fresh_capture=True,
+            capture_route="print_window",
+            role_id=role_id,
+        )
+    if request.stage == "seal":
+        return request.expected_seal
+    raise AssertionError(request.stage)
+
+
+def install_formal_pending_broker_path(fixture):
+    payload = {
+        "windows": [
+            {
+                "handle": instance.handle,
+                "process_id": instance.process_id,
+                "thread_id": instance.thread_id,
+                "process_lifecycle_token": (
+                    instance.process_lifecycle_token
+                ),
+                "fingerprint": fingerprint,
+                "role_id": fixture.aliases[instance.handle],
+            }
+            for fingerprint, instance in zip(
+                fixture.fingerprints,
+                fixture.instances,
+            )
+        ],
+        "shortcuts": [
+            {
+                "path": seal.file_identity.normalized_path,
+                "volume_serial_number": (
+                    seal.file_identity.volume_serial_number
+                ),
+                "file_index": seal.file_identity.file_index,
+                "content_sha256": seal.content_sha256,
+                "fingerprint": seal.launch_fingerprint,
+            }
+            for seal in fixture.seals.seals.values()
+        ],
+    }
+    (fixture.target_identity.state_path.parent / "formal-observation.json").write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    broker = WindowsSmartReconnectObservationBroker(
+        reference_dir=fixture.target_identity.state_path.parent,
+        _worker_operation=_formal_pending_observation_worker,
+    )
+    fixture.target_identity._observation_broker = broker
+    fixture.preparation._observation_broker = broker
+    fixture.preparation._target_windows = BrokerTargetWindowService(broker)
+    fixture.preparation._shortcut_seals = ForbiddenSealResolver()
+    fixture.preparation._role_identity_reader = None
+    return broker
 
 
 def test_pending_window_has_zero_grant_until_second_independent_observation(
@@ -1061,6 +1505,202 @@ def test_pending_window_has_zero_grant_until_second_independent_observation(
     assert third.targets[0].authorization_epoch == second.targets[0].authorization_epoch
     assert third.targets[0].source_generation == second.targets[0].source_generation
     assert fixture.identity.generation == second_generation
+
+
+def test_bare_level_100_remains_pending_and_never_receives_a_grant(tmp_path):
+    fixture = build_pending_preparation_fixture(tmp_path)
+    fixture.aliases[501] = "100"
+
+    first = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+    second = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+    saved = json.loads(
+        fixture.target_identity.state_path.read_text(encoding="utf-8")
+    )["targets"][fixture.fingerprints[0]]
+
+    assert first.targets == ()
+    assert second.targets == ()
+    assert saved["status"] == "pending"
+    assert saved["verified_aliases"] == []
+    assert saved["evidence_alias"] is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires spawn process broker")
+def test_formal_spawn_broker_keeps_100_pending_and_confirms_full_names(
+    tmp_path,
+):
+    bare_root = tmp_path / "bare"
+    bare_root.mkdir()
+    bare = build_pending_preparation_fixture(
+        bare_root,
+        role_aliases=("100",),
+    )
+    bare_broker = install_formal_pending_broker_path(bare)
+    try:
+        bare_first = bare.preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
+        bare_second = bare.preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
+        bare_state = json.loads(
+            bare.target_identity.state_path.read_text(encoding="utf-8")
+        )["targets"][bare.fingerprints[0]]
+
+        assert bare_first.targets == ()
+        assert bare_second.targets == ()
+        assert bare_state["status"] == "pending"
+        assert bare_state["verified_aliases"] == []
+        assert bare_broker.current_snapshot().generation >= 2
+    finally:
+        assert bare_broker.close() is True
+
+    full_root = tmp_path / "full"
+    full_root.mkdir()
+    full = build_pending_preparation_fixture(
+        full_root,
+        role_aliases=("100古", "100靈"),
+    )
+    full_broker = install_formal_pending_broker_path(full)
+    try:
+        full_first = full.preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
+        full_second = full.preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
+        full_state = json.loads(
+            full.target_identity.state_path.read_text(encoding="utf-8")
+        )["targets"]
+
+        assert full_first.targets == ()
+        assert len(full_second.targets) == 2
+        assert {
+            target.role_aliases for target in full_second.targets
+        } == {("100古",), ("100靈",)}
+        assert {
+            full_state[fingerprint]["status"]
+            for fingerprint in full.fingerprints
+        } == {"confirmed"}
+        assert full_broker.current_snapshot().generation >= 2
+    finally:
+        assert full_broker.close() is True
+
+
+def test_observation_generation_changes_before_persistence_write_nothing(
+    tmp_path,
+):
+    fixture = build_pending_preparation_fixture(tmp_path)
+    broker = install_pending_broker_path(fixture)
+    broker.gate_entered = threading.Event()
+    broker.gate_release = threading.Event()
+    failures = []
+
+    def prepare_and_capture_failure():
+        try:
+            fixture.preparation.prepare(
+                launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+            )
+        except Exception as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=prepare_and_capture_failure)
+    worker.start()
+    assert broker.gate_entered.wait(2)
+    broker.snapshot = replace(
+        broker.snapshot,
+        generation=broker.snapshot.generation + 1,
+    )
+    broker.gate_release.set()
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert len(failures) == 1
+    assert isinstance(failures[0], SmartReconnectPreparationError)
+    assert "observation changed before identity enrollment" in str(failures[0])
+    assert fixture.target_identity.state_path.exists() is False
+    assert fixture.authorization.current_authorization() is None
+    assert fixture.authorization.state is ReconnectAuthorizationState.EMPTY
+
+
+def test_observation_generation_changes_before_authorization_publish_nothing(
+    tmp_path,
+):
+    fixture = build_fixture(tmp_path)
+    broker = install_broker_preparation_path(fixture)
+    broker.gate_entered = threading.Event()
+    broker.gate_release = threading.Event()
+    failures = []
+
+    def prepare_and_capture_failure():
+        try:
+            fixture.preparation.prepare(
+                launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+            )
+        except Exception as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=prepare_and_capture_failure)
+    worker.start()
+    assert broker.gate_entered.wait(2)
+    broker.snapshot = replace(
+        broker.snapshot,
+        generation=broker.snapshot.generation + 1,
+    )
+    broker.gate_release.set()
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert len(failures) == 1
+    assert isinstance(failures[0], SmartReconnectPreparationError)
+    assert "observation changed during authorization publish" in str(
+        failures[0]
+    )
+    assert fixture.authorization.current_authorization() is None
+    assert fixture.authorization.state is ReconnectAuthorizationState.EMPTY
+
+
+def test_old_preparation_failure_cannot_revoke_new_preparation_ticket(
+    tmp_path,
+):
+    fixture = build_fixture(tmp_path)
+    broker = install_broker_preparation_path(fixture)
+    entered = threading.Event()
+    release = threading.Event()
+    broker.entered = entered
+    broker.release = release
+    failures = []
+
+    def prepare_once():
+        return (
+            fixture.preparation.prepare(
+                launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+            )
+        )
+
+    def run_and_capture():
+        try:
+            prepare_once()
+        except Exception as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=run_and_capture)
+    worker.start()
+    assert entered.wait(2)
+    newer = fixture.authorization.begin_reprepare()
+
+    release.set()
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert len(failures) == 1
+    assert isinstance(failures[0], SmartReconnectPreparationError)
+    assert fixture.authorization.state is ReconnectAuthorizationState.REBINDING
+    assert fixture.authorization.current_authorization() is None
+    assert fixture.authorization.fail_preparation(newer) is True
 
 
 def test_pending_window_write_keeps_confirmed_sibling_grant_object(tmp_path):

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
+from adapters.windows_smart_reconnect_observation_broker import (
+    WindowsSmartReconnectObservationBroker,
+)
 from adapters.windows_window import WindowBackend, WindowInfo
 from core.target_window_contract import (
     ActualWindowContract,
@@ -33,6 +38,7 @@ class ResolvedTargetWindows:
     isolated_window_count: int = 0
     anonymous_isolated_window_count: int = 0
     actual_window_snapshot: bool = False
+    observation_generation: int = 0
 
 
 class TargetWindowContractService:
@@ -46,11 +52,15 @@ class TargetWindowContractService:
         window_backend: WindowBackend,
         *,
         title_keywords: tuple[str, ...] = ("Adobe Flash Player",),
+        observation_broker: (
+            WindowsSmartReconnectObservationBroker | None
+        ) = None,
     ) -> None:
         self._configuration = configuration
         self._scope_service = scope_service
         self._registry = registry
         self._window_backend = window_backend
+        self._observation_broker = observation_broker
         self._title_keywords = tuple(
             keyword.strip().casefold()
             for keyword in title_keywords
@@ -113,28 +123,65 @@ class TargetWindowContractService:
                 entry_candidates.setdefault(entry.entry_id, []).append(
                     (configured_group.name, entry)
                 )
-        scope = self._scope(name)
-        if scope.ready:
-            fingerprint_by_id = dict(zip(scope.entry_ids, scope.fingerprints))
-            selected_ids = (
-                scope.entry_ids
-                if expanded_sync_scope
-                else tuple(entry.entry_id for entry in group.entries)
+        broker = self._observation_broker
+        observation = broker.current_snapshot() if broker is not None else None
+        if broker is not None and observation is None:
+            return TargetWindowSnapshot(
+                TargetWindowSnapshot.SCHEMA_VERSION,
+                name,
+                failure_codes=("observation_unavailable",),
             )
-            snapshot_failures: tuple[str, ...] = ()
+        if observation is not None:
+            (
+                selected_ids,
+                fingerprint_by_id,
+                snapshot_failures,
+            ) = self._scope_from_observation(
+                group,
+                configured_groups,
+                observation,
+                expanded_sync_scope=expanded_sync_scope,
+            )
         else:
-            fingerprint_by_id = {}
-            selected_ids = tuple(entry.entry_id for entry in group.entries)
-            snapshot_failures = scope.failure_codes
+            scope = self._scope(name)
+            if scope.ready:
+                fingerprint_by_id = dict(
+                    zip(scope.entry_ids, scope.fingerprints)
+                )
+                selected_ids = (
+                    scope.entry_ids
+                    if expanded_sync_scope
+                    else tuple(entry.entry_id for entry in group.entries)
+                )
+                snapshot_failures = ()
+            else:
+                fingerprint_by_id = {}
+                selected_ids = tuple(
+                    entry.entry_id for entry in group.entries
+                )
+                snapshot_failures = scope.failure_codes
 
-        try:
-            windows = tuple(self._window_backend.list_windows())
-            foreground_handle = self._window_backend.foreground_handle()
-        except Exception:
-            windows = ()
-            foreground_handle = None
+        if observation is not None:
+            windows = tuple(item.window for item in observation.windows)
+            foreground_handle = observation.foreground_handle
+        else:
+            try:
+                windows = tuple(self._window_backend.list_windows())
+                foreground_handle = self._window_backend.foreground_handle()
+            except Exception:
+                windows = ()
+                foreground_handle = None
+                snapshot_failures = tuple(
+                    dict.fromkeys(
+                        (*snapshot_failures, "window_enumeration_failed")
+                    )
+                )
+
+        if observation is not None and observation.failure_codes:
             snapshot_failures = tuple(
-                dict.fromkeys((*snapshot_failures, "window_enumeration_failed"))
+                dict.fromkeys(
+                    (*snapshot_failures, *observation.failure_codes)
+                )
             )
 
         candidate_windows = tuple(
@@ -226,11 +273,116 @@ class TargetWindowContractService:
             snapshot_failures = tuple(
                 dict.fromkeys((*snapshot_failures, "target_entry_unresolved"))
             )
+        if (
+            broker is not None
+            and broker.current_snapshot() is not observation
+        ):
+            return TargetWindowSnapshot(
+                TargetWindowSnapshot.SCHEMA_VERSION,
+                name,
+                failure_codes=("observation_superseded",),
+            )
         return TargetWindowSnapshot(
             TargetWindowSnapshot.SCHEMA_VERSION,
             name,
             targets,
             snapshot_failures,
+        )
+
+    @staticmethod
+    def _path_key(path: object) -> str:
+        return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+    def _scope_from_observation(
+        self,
+        group,
+        configured_groups,
+        observation,
+        *,
+        expanded_sync_scope: bool,
+    ) -> tuple[tuple[str, ...], dict[str, str], tuple[str, ...]]:
+        root_ids = tuple(entry.entry_id for entry in group.entries)
+        failures: list[str] = []
+        if observation.generation <= 0:
+            failures.append("observation_unavailable")
+        failures.extend(observation.failure_codes)
+
+        entry_by_id: dict[str, GroupConfigurationEntry] = {}
+        conflicting_ids: set[str] = set()
+        for configured_group in configured_groups:
+            for entry in configured_group.entries:
+                current = entry_by_id.get(entry.entry_id)
+                if (
+                    current is not None
+                    and self._path_key(current.shortcut_path)
+                    != self._path_key(entry.shortcut_path)
+                ):
+                    conflicting_ids.add(entry.entry_id)
+                else:
+                    entry_by_id[entry.entry_id] = entry
+
+        if expanded_sync_scope:
+            controller = group.main_entry
+            if controller is None:
+                failures.append("group_controller_unavailable")
+                selected_ids = root_ids
+            else:
+                try:
+                    members = tuple(
+                        self._configuration.expanded_sync_members(
+                            controller.entry_id
+                        )
+                    )
+                except Exception:
+                    members = ()
+                    failures.append("sync_identity_unresolved")
+                selected_ids = (controller.entry_id, *members)
+        else:
+            selected_ids = root_ids
+
+        if any(entry_id in conflicting_ids for entry_id in selected_ids):
+            failures.append("sync_identity_path_conflict")
+        if any(entry_id not in entry_by_id for entry_id in selected_ids):
+            failures.append("sync_identity_unresolved")
+
+        fingerprint_by_path: dict[str, str] = {}
+        duplicate_paths: set[str] = set()
+        for item in observation.shortcuts:
+            fingerprint = normalize_launch_fingerprint(item.fingerprint)
+            if fingerprint is None or item.seal is None or item.failure_codes:
+                continue
+            key = self._path_key(item.path)
+            previous = fingerprint_by_path.get(key)
+            if previous is not None and previous != fingerprint:
+                duplicate_paths.add(key)
+            else:
+                fingerprint_by_path[key] = fingerprint
+
+        resolved: list[str] = []
+        for entry_id in selected_ids:
+            entry = entry_by_id.get(entry_id)
+            if entry is None:
+                continue
+            key = self._path_key(entry.shortcut_path)
+            fingerprint = (
+                None
+                if key in duplicate_paths
+                else fingerprint_by_path.get(key)
+            )
+            if fingerprint is None:
+                failures.append("shortcut_identity_unresolved")
+            else:
+                resolved.append(fingerprint)
+        if len(resolved) != len(set(resolved)):
+            failures.append("shortcut_identity_duplicate")
+
+        unique_failures = tuple(dict.fromkeys(failures))
+        if unique_failures or len(resolved) != len(selected_ids):
+            return selected_ids, {}, unique_failures
+        return (
+            selected_ids,
+            dict(zip(selected_ids, resolved)),
+            (),
         )
 
     def windows(
@@ -277,6 +429,48 @@ class TargetWindowContractService:
 
     def actual_snapshot(self) -> ActualWindowSnapshot:
         """Enumerate every existing game window without consulting a group."""
+
+        broker = self._observation_broker
+        if broker is not None:
+            observation = broker.refresh(self._configured_shortcut_paths())
+            if (
+                observation.generation <= 0
+                or not broker.is_generation_current(observation.generation)
+            ):
+                return ActualWindowSnapshot(
+                    ActualWindowSnapshot.SCHEMA_VERSION,
+                    failure_codes=tuple(
+                        dict.fromkeys(
+                            (*observation.failure_codes, "observation_unavailable")
+                        )
+                    ),
+                )
+            targets = tuple(
+                ActualWindowContract(
+                    fingerprint=fingerprint,
+                    instance=item.instance,
+                    visible=bool(item.window.visible),
+                )
+                for item in observation.windows
+                if item.instance is not None
+                and (
+                    fingerprint := normalize_launch_fingerprint(
+                        item.window.launch_fingerprint
+                    )
+                ) is not None
+                and fingerprint not in observation.blocked_fingerprints
+            )
+            return ActualWindowSnapshot(
+                ActualWindowSnapshot.SCHEMA_VERSION,
+                targets=targets,
+                blocked_fingerprints=observation.blocked_fingerprints,
+                isolated_window_count=observation.isolated_window_count,
+                anonymous_isolated_window_count=(
+                    observation.anonymous_isolated_window_count
+                ),
+                failure_codes=observation.failure_codes,
+                observation_generation=observation.generation,
+            )
 
         try:
             candidates = tuple(
@@ -355,6 +549,21 @@ class TargetWindowContractService:
             anonymous_isolated_window_count=anonymous_isolated,
         )
 
+    def _configured_shortcut_paths(self) -> tuple[Path, ...]:
+        """Capture only immutable path values before broker I/O begins."""
+
+        try:
+            groups = tuple(self._configuration.groups())
+        except Exception:
+            return ()
+        return tuple(
+            dict.fromkeys(
+                Path(entry.shortcut_path)
+                for group in groups
+                for entry in group.entries
+            )
+        )
+
     def actual_reconnect_targets(self) -> ResolvedTargetWindows:
         """Return only safe actual windows plus per-window isolation evidence."""
 
@@ -385,6 +594,7 @@ class TargetWindowContractService:
                 snapshot.anonymous_isolated_window_count
             ),
             actual_window_snapshot=True,
+            observation_generation=snapshot.observation_generation,
         )
 
     @staticmethod

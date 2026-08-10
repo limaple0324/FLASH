@@ -5,6 +5,8 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import multiprocessing
+import os
 import re
 import sys
 import traceback
@@ -41,6 +43,9 @@ from adapters.windows_smart_reconnect import (
     ReconnectRuntimeStateStore,
     RegisteredReconnectRole,
     WindowsSmartReconnectController,
+)
+from adapters.windows_smart_reconnect_observation_broker import (
+    WindowsSmartReconnectObservationBroker,
 )
 from adapters.windows_pointer_sync import (
     Win32PointerMessageBackend,
@@ -1289,6 +1294,24 @@ def build_services(
     synchronized_window_backend = Win32WindowBackend(
         PowerShellLaunchFingerprintResolver()
     )
+    initial_smart_reconnect_capture_settings = (
+        smart_reconnect_capture_settings_service.snapshot()
+    )
+    smart_reconnect_observation_broker = (
+        WindowsSmartReconnectObservationBroker(
+            reference_dir=resource_path(RECONNECT_REFERENCE_DIR),
+            shortcut_roots=UngroupedWindowService.default_shortcut_roots(),
+            visible_capture_enabled=(
+                initial_smart_reconnect_capture_settings.visible
+            ),
+            obscured_capture_enabled=(
+                initial_smart_reconnect_capture_settings.obscured
+            ),
+            minimized_capture_enabled=(
+                initial_smart_reconnect_capture_settings.minimized
+            ),
+        )
+    )
     game_operation_gate = GameOperationGate()
     AppContext.register(GameOperationGate, game_operation_gate)
     target_window_contract_service = TargetWindowContractService(
@@ -1296,6 +1319,7 @@ def build_services(
         sync_scope_service,
         registry,
         synchronized_window_backend,
+        observation_broker=smart_reconnect_observation_broker,
     )
     sync_calibration_backend = Win32SyncCalibrationBackend()
     role_id_template_service = RoleIdTemplateService()
@@ -1361,6 +1385,7 @@ def build_services(
                 if ungrouped_window_service is not None
                 else ()
             ),
+            observation_broker=smart_reconnect_observation_broker,
         )
     )
     workspace_service = WorkspaceService(
@@ -1430,9 +1455,7 @@ def build_services(
         identity_coordinator=identity_data_transaction_coordinator,
         config=config,
         product_launch_mode=ReconnectLaunchMode.IDENTITY_BOUND,
-        role_identity_reader=lambda window_handle: (
-            role_id_template_service.read(window_handle)
-        ),
+        observation_broker=smart_reconnect_observation_broker,
     )
     character_detail_view_service = CharacterDetailViewService(
         character_view_service,
@@ -1602,6 +1625,10 @@ def build_services(
     AppContext.register(
         SmartReconnectPreparationService,
         smart_reconnect_preparation_service,
+    )
+    AppContext.register(
+        WindowsSmartReconnectObservationBroker,
+        smart_reconnect_observation_broker,
     )
     AppContext.register(SyncScopeService, sync_scope_service)
     AppContext.register(
@@ -1825,6 +1852,7 @@ def build_services(
         verified_line_recorder=(
             smart_reconnect_target_identity_service.remember_verified_line
         ),
+        observation_broker=smart_reconnect_observation_broker,
     )
 
     def registered_game_data_window(window_handle: int) -> RegisteredGameDataWindow | None:
@@ -2145,13 +2173,15 @@ def shutdown_external_adapter(logger: LoggerService | None = None) -> None:
 
 def shutdown_smart_reconnect_monitor(
     logger: LoggerService | None = None,
-) -> None:
+) -> bool:
     """Stop the daemon monitor before services and logs are released."""
+    stopped = True
     try:
         monitor = AppContext.get(SmartReconnectMonitor)
         if monitor is not None and not monitor.stop():
             raise RuntimeError("Smart reconnect monitor did not stop in time.")
     except Exception:
+        stopped = False
         if logger is not None:
             try:
                 logger.error(
@@ -2166,6 +2196,27 @@ def shutdown_smart_reconnect_monitor(
         )
         if coordinator is not None:
             coordinator.stop()
+    return stopped
+
+
+def shutdown_smart_reconnect_observation_broker(
+    logger: LoggerService | None = None,
+) -> bool:
+    """Kill every broker worker after monitor and authorization stop."""
+
+    broker = AppContext.get(WindowsSmartReconnectObservationBroker)
+    if broker is None:
+        return True
+    try:
+        closed = broker.close()
+    except Exception:
+        closed = False
+    if not closed and logger is not None:
+        try:
+            logger.error("Smart reconnect observation broker did not close.")
+        except Exception:
+            pass
+    return closed
 
 
 def shutdown_ui_font_service(
@@ -2591,6 +2642,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     smart_reconnect_monitor = AppContext.get(SmartReconnectMonitor)
     smart_reconnect_controller = AppContext.get(
         WindowsSmartReconnectController
+    )
+    smart_reconnect_observation_broker = AppContext.get(
+        WindowsSmartReconnectObservationBroker
     )
     smart_reconnect_capture_settings_service = AppContext.get(
         SmartReconnectCaptureSettingsService
@@ -5503,6 +5557,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 smart_reconnect_capture_settings_service.update(modes)
             )
             smart_reconnect_controller.set_capture_settings(settings)
+            smart_reconnect_observation_broker.set_capture_modes(
+                visible=settings.visible,
+                obscured=settings.obscured,
+                minimized=settings.minimized,
+            )
         except Exception as error:
             if logger is not None:
                 logger.error(
@@ -6085,29 +6144,32 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         stage = "resolve_candidates"
         candidate_index = -1
         try:
-            capture_service = AppContext.get(CharacterGameDataCaptureService)
             candidates = current_sync_target_windows()
-            if capture_service is not None and candidates:
+            if candidates:
                 candidate_index = game_data_read_cursor % len(candidates)
                 selected = candidates[candidate_index]
                 game_data_read_cursor += 1
-                home_view.set_game_data_read_status("安全讀取中")
-                stage = "capture"
-                result = capture_service.read(selected.handle)
-                if result.status.value in {"updated", "unchanged"}:
-                    if result.status.value == "updated":
-                        stage = "refresh"
-                        refresh_character_data(current_group_name())
-                    page = result.page.data if result.page is not None else None
-                    opened_page = getattr(page, "opened_page", None)
-                    home_view.set_game_data_read_status(
-                        f"已確認黑曜石第 {opened_page} 頁"
-                        if isinstance(opened_page, int) else "尚未安全讀取"
+                stage = "published_observation"
+                fingerprint = normalize_launch_fingerprint(
+                    selected.launch_fingerprint
+                )
+                published = (
+                    smart_reconnect_observation_broker.current_snapshot()
+                )
+                observed = (
+                    published.window_for(fingerprint)
+                    if (
+                        published is not None
+                        and
+                        fingerprint is not None
                     )
-                else:
-                    home_view.set_game_data_read_status("尚未安全讀取")
+                    else None
+                )
+                home_view.set_game_data_read_status(
+                    "背景監看中" if observed is not None else "等待背景監看"
+                )
             else:
-                home_view.set_game_data_read_status("尚未安全讀取")
+                home_view.set_game_data_read_status("等待背景監看")
         except Exception as error:
             home_view.set_game_data_read_status("尚未安全讀取")
             if logger is not None:
@@ -6301,51 +6363,95 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 role_id_auto_read_cursor % len(missing_entries)
             ]
             role_id_auto_read_cursor += 1
-            window_info = unique_window_for_group_entry(
-                group_name,
-                entry.entry_id,
+            published = smart_reconnect_observation_broker.current_snapshot()
+            if published is None:
+                return
+            entry_path = os.path.normcase(
+                os.path.abspath(os.fspath(entry.shortcut_path))
             )
-            if window_info is None or window_info.minimized:
+            shortcut_matches = tuple(
+                item
+                for item in published.shortcuts
+                if (
+                    os.path.normcase(os.path.abspath(item.path)) == entry_path
+                    and normalize_launch_fingerprint(item.fingerprint)
+                    is not None
+                    and item.seal is not None
+                    and not item.failure_codes
+                )
+            )
+            if len(shortcut_matches) != 1:
                 return
             fingerprint = normalize_launch_fingerprint(
-                window_info.launch_fingerprint
+                shortcut_matches[0].fingerprint
             )
-            if fingerprint is None:
+            observed = published.window_for(fingerprint)
+            if (
+                observed is None
+                or observed.window.minimized
+                or observed.recognition.state
+                is not ReconnectScreenState.CONNECTED
+                or not isinstance(observed.role_id, str)
+                or not observed.role_id.strip()
+            ):
                 return
-            screen_state = smart_reconnect_controller.observe_screen_states(
-                (fingerprint,),
-                candidate_windows=(window_info,),
-            ).get(fingerprint)
-            if screen_state is not ReconnectScreenState.CONNECTED:
-                return
-            result = role_id_template_service.read_if_missing(
-                window_info.handle,
-                existing_role_id=entry.role_id,
-            )
-            if result.success:
-                latest_group = group_configuration_service.group(group_name)
-                latest_entry = (
-                    next(
-                        (
-                            item
-                            for item in latest_group.entries
-                            if item.entry_id == entry.entry_id
-                        ),
-                        None,
+            def commit_current_role_id() -> bool:
+                coordinator = identity_data_transaction_coordinator
+                if coordinator is None:
+                    return False
+
+                def stage_if_still_missing(candidate) -> bool:
+                    target_group = candidate.group(group_name)
+                    target_entry = (
+                        next(
+                            (
+                                item
+                                for item in target_group.entries
+                                if item.entry_id == entry.entry_id
+                            ),
+                            None,
+                        )
+                        if target_group is not None
+                        else None
                     )
-                    if latest_group is not None
-                    else None
-                )
-                if latest_entry is not None and not latest_entry.role_id.strip():
-                    committed, saved = commit_role_id(
+                    if (
+                        target_entry is None
+                        or target_entry.role_id.strip()
+                    ):
+                        return False
+                    return candidate.set_role_id(
                         group_name,
                         entry.entry_id,
-                        result.role_id,
-                        only_if_missing=True,
+                        observed.role_id,
                     )
-                    if committed.success and saved:
-                        home_view.refresh_group_entries()
-                        home_view.refresh_group_role_statuses()
+
+                # This timer owns only the persisted role field.  Runtime
+                # input identity rebuilding can stop monitors, wait for
+                # operation gates, and resolve shortcuts; none of that may
+                # run on the Tk thread or while the broker generation gate is
+                # held.  The empty-role check and staged write share one
+                # identity transaction so a concurrent user value always
+                # wins.  The normal interactive commit_role_id path retains
+                # its broader group-management semantics.
+                return coordinator.execute(
+                    lambda transaction: (
+                        group_configuration_service.stage_candidate(
+                            transaction,
+                            stage_if_still_missing,
+                        )
+                    )
+                )
+
+            current, saved = (
+                smart_reconnect_observation_broker
+                .run_if_generation_current(
+                    published.generation,
+                    commit_current_role_id,
+                )
+            )
+            if current and saved:
+                home_view.refresh_group_entries()
+                home_view.refresh_group_role_statuses()
         except Exception:
             if logger is not None:
                 logger.warning("自動讀取遊戲內角色名稱失敗。")
@@ -6911,8 +7017,9 @@ def _run_application(
         return 1
     finally:
         try:
-            shutdown_smart_reconnect_monitor(logger)
+            monitor_stopped = shutdown_smart_reconnect_monitor(logger)
         except Exception:
+            monitor_stopped = False
             if logger is not None:
                 logger.error(
                     "Smart reconnect final shutdown failed:\n"
@@ -6920,34 +7027,51 @@ def _run_application(
                 )
         finally:
             try:
-                shutdown_sync_controllers(logger)
+                broker_stopped = shutdown_smart_reconnect_observation_broker(
+                    logger
+                )
+                monitor_stopped_after_broker = (
+                    shutdown_smart_reconnect_monitor(logger)
+                )
+                if (
+                    not broker_stopped
+                    or not monitor_stopped
+                    or not monitor_stopped_after_broker
+                ) and logger is not None:
+                    logger.error(
+                        "Smart reconnect shutdown left a live monitor or "
+                        "observation worker."
+                    )
             finally:
                 try:
-                    shutdown_event_subscriptions(logger)
+                    shutdown_sync_controllers(logger)
                 finally:
                     try:
-                        shutdown_external_adapter(logger)
+                        shutdown_event_subscriptions(logger)
                     finally:
                         try:
-                            save_registry(logger)
-                        except Exception:
-                            if logger is not None:
-                                logger.error(
-                                    "Registry final save failed:\n"
-                                    f"{traceback.format_exc()}"
-                                )
+                            shutdown_external_adapter(logger)
                         finally:
                             try:
-                                shutdown_identity_data_transactions(logger)
+                                save_registry(logger)
+                            except Exception:
+                                if logger is not None:
+                                    logger.error(
+                                        "Registry final save failed:\n"
+                                        f"{traceback.format_exc()}"
+                                    )
                             finally:
                                 try:
-                                    shutdown_ui_font_service(logger)
+                                    shutdown_identity_data_transactions(logger)
                                 finally:
-                                    close_operation_record_store(
-                                        operation_record_store,
-                                        logger,
-                                    )
-                                    close_logger(logger)
+                                    try:
+                                        shutdown_ui_font_service(logger)
+                                    finally:
+                                        close_operation_record_store(
+                                            operation_record_store,
+                                            logger,
+                                        )
+                                        close_logger(logger)
 
 
 def run(
@@ -7025,6 +7149,7 @@ def close_logger(logger: LoggerService | None) -> None:
 
 
 def main() -> None:
+    multiprocessing.freeze_support()
     raw_arguments = tuple(sys.argv[1:])
     arguments = set(raw_arguments)
     target_desktop_verify_only = TARGET_DESKTOP_VERIFY_ARGUMENT in arguments

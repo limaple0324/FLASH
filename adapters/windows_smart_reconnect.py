@@ -45,6 +45,10 @@ from adapters.windows_battle_restart import (
     WindowsShortcutOpenBackend,
 )
 from adapters.windows_shortcut_seal import ShortcutSealResolver
+from adapters.windows_smart_reconnect_observation_broker import (
+    SmartReconnectObservationSnapshot,
+    WindowsSmartReconnectObservationBroker,
+)
 from adapters.windows_launch_fingerprint import (
     PowerShellLaunchFingerprintResolver,
     normalize_launch_fingerprint,
@@ -64,6 +68,7 @@ from core.smart_reconnect_authorization import (
     ReconnectFrameWitness,
     ReconnectLaunchMode,
     ReconnectRevocationReason,
+    ShortcutSeal,
 )
 from core.window_instance import WindowInstanceToken
 from domain.character import CharacterImportance, character_importance_rank
@@ -150,6 +155,31 @@ _ISOLATABLE_TARGET_WINDOW_FAILURE_CODES = frozenset(
 class ScreenRecognizer(Protocol):
     def recognize_capture(self, sample) -> ScreenRecognition:
         """Recognize a capture without changing or persisting it."""
+
+
+class _ObservationBrokerWindowBackend:
+    """Read-only latest-window view for the battle restarter."""
+
+    def __init__(self, broker: WindowsSmartReconnectObservationBroker) -> None:
+        self._broker = broker
+
+    def list_windows(self) -> tuple[WindowInfo, ...]:
+        snapshot = self._broker.published_snapshot_without_wait()
+        if snapshot is None:
+            return ()
+        return tuple(
+            item.window for item in snapshot.windows
+        )
+
+
+class _ObservationBrokerShortcutSealResolver:
+    """Accept only a fresh process witness captured before the reopen."""
+
+    def __init__(self, broker: WindowsSmartReconnectObservationBroker) -> None:
+        self._broker = broker
+
+    def revalidate(self, expected: ShortcutSeal) -> bool:
+        return self._broker.seal_is_witnessed_without_wait(expected)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2265,6 +2295,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         evidence_recorder: SmartReconnectEvidenceRecorder | None = None,
         evidence_required: bool = False,
         evidence_initialization_failed: bool = False,
+        observation_broker: (
+            WindowsSmartReconnectObservationBroker | None
+        ) = None,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -2280,6 +2313,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if not self._keywords:
             raise ValueError("At least one title keyword is required")
         self._window_backend = window_backend
+        self._observation_broker = observation_broker
         self._capture_provider = capture_provider
         self._visible_capture_provider = visible_capture_provider
         self._obscured_capture_provider = obscured_capture_provider
@@ -2518,6 +2552,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             _TrustedConnectedEvidence,
         ] = {}
         self._source_state_generation = 0
+        self._broker_scan_generation: int | None = None
+        self._broker_scan_snapshot: (
+            SmartReconnectObservationSnapshot | None
+        ) = None
+        self._broker_scan_thread_id: int | None = None
         # A continuing source failure is one revocation edge.  Keep its
         # identity until a complete authority source observes that identity
         # again, so repeated scans of the same missing role do not keep
@@ -2591,6 +2630,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         require_expected_window_count: bool = True,
         auto_battle_enabled: bool = True,
         evidence_recorder: SmartReconnectEvidenceRecorder | None = None,
+        observation_broker: (
+            WindowsSmartReconnectObservationBroker | None
+        ) = None,
     ) -> "WindowsSmartReconnectController":
         window_backend = (
             window_backend
@@ -2629,10 +2671,20 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             state_path=state_path,
             require_expected_window_count=require_expected_window_count,
             battle_restarter=WindowsBattleWindowRestarter(
-                window_backend,
+                (
+                    _ObservationBrokerWindowBackend(observation_broker)
+                    if observation_broker is not None
+                    else window_backend
+                ),
                 Win32WindowCloseBackend(),
                 WindowsShortcutOpenBackend(
-                    shortcut_seal_resolver=shortcut_seal_resolver,
+                    shortcut_seal_resolver=(
+                        _ObservationBrokerShortcutSealResolver(
+                            observation_broker
+                        )
+                        if observation_broker is not None
+                        else shortcut_seal_resolver
+                    ),
                 ),
             ),
             failure_status_service=failure_status_service,
@@ -2657,6 +2709,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             evidence_recorder=evidence_recorder,
             evidence_required=True,
             evidence_initialization_failed=evidence_initialization_failed,
+            observation_broker=observation_broker,
         )
 
     @property
@@ -3869,6 +3922,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
         return result
 
+    def _current_broker_observation(
+        self,
+    ) -> SmartReconnectObservationSnapshot | None:
+        """Use the broker-gated scan snapshot without reversing lock order."""
+
+        broker = self._observation_broker
+        if broker is None:
+            return None
+        if self._broker_scan_thread_id == threading.get_ident():
+            return self._broker_scan_snapshot
+        return broker.current_snapshot()
+
     def _capture_and_recognize_unobserved(
         self,
         window: WindowInfo,
@@ -3882,6 +3947,33 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         bool,
         str | None,
     ]:
+        broker = self._observation_broker
+        if broker is not None:
+            instance = WindowInstanceToken.from_window(window)
+            snapshot = self._current_broker_observation()
+            observed = (
+                snapshot.window_for(fingerprint)
+                if snapshot is not None
+                else None
+            )
+            if (
+                instance is None
+                or observed is None
+                or observed.instance != instance
+                or WindowInstanceToken.from_window(observed.window) != instance
+            ):
+                return self._unknown_capture_result()
+            with self._capture_settings_lock:
+                settings = self._capture_settings
+            route = observed.capture_route
+            if not self._capture_route_enabled(settings, route):
+                return self._disabled_capture_result(route or "visible")
+            return (
+                observed.sample,
+                observed.recognition,
+                observed.fresh_capture,
+                route,
+            )
         # Every capture route must start from one complete, immutable window
         # instance. Do this before reading settings or probing/capturing so
         # an incomplete source candidate cannot refresh online evidence.
@@ -4397,6 +4489,32 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         }
         if not requested:
             return {}
+        broker = self._observation_broker
+        if broker is not None:
+            snapshot = broker.current_snapshot()
+            if snapshot is None:
+                return {
+                    fingerprint: ReconnectScreenState.UNKNOWN
+                    for fingerprint in requested
+                }
+            result: dict[str, ReconnectScreenState] = {}
+            for fingerprint in requested:
+                observed = snapshot.window_for(fingerprint)
+                if (
+                    fingerprint in snapshot.blocked_fingerprints
+                    or observed is None
+                    or observed.instance is None
+                ):
+                    result[fingerprint] = ReconnectScreenState.UNKNOWN
+                    continue
+                result[fingerprint] = (
+                    observed.recognition.state
+                    if observed.fresh_capture
+                    or observed.recognition.state
+                    is ReconnectScreenState.CHECK_DISABLED
+                    else ReconnectScreenState.UNKNOWN
+                )
+            return result
         # Passive UI/synchronization readers are not an execution authority.
         # While a reconnect transaction is active they must not capture,
         # wait, or advance the source generation used by its final input gate.
@@ -5119,6 +5237,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def _prepare_product_authorization_locked(
         self,
     ) -> ReconnectAuthorizationBatch | None:
+        if self._observation_broker is not None:
+            # Broker preparation may wait for bounded child processes.  Formal
+            # callers must use the unlocked two-phase entry below.
+            return None
         preparation = self._preparation
         coordinator = self._authorization
         if preparation is None or coordinator is None:
@@ -5148,9 +5270,68 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             TypeError,
             ValueError,
         ):
-            coordinator.fail_preparation()
             self._clear_execution_authority_locked()
             return None
+
+    def _prepare_product_authorization_observed(
+        self,
+    ) -> ReconnectAuthorizationBatch | None:
+        """Wait for broker I/O without owning any controller product lock."""
+
+        preparation = self._preparation
+        coordinator = self._authorization
+        if preparation is None or coordinator is None:
+            return None
+        with self._scan_lock:
+            retained_targets = tuple(
+                bound.target
+                for fingerprint, bound
+                in self._pending_reopen_authorizations.items()
+                if fingerprint in self._pending_reopen_fingerprints
+            )
+        try:
+            batch = preparation.prepare(
+                launch_mode=ReconnectLaunchMode.IDENTITY_BOUND,
+                retained_targets=retained_targets,
+            )
+        except (
+            OSError,
+            ReconnectAuthorizationError,
+            SmartReconnectPreparationError,
+            TypeError,
+            ValueError,
+        ):
+            with self._scan_lock:
+                if coordinator.current_authorization() is None:
+                    self._clear_execution_authority_locked()
+            return None
+        with self._scan_lock:
+            if coordinator.current_authorization() != batch:
+                return None
+            self._bind_authorization_batch_locked(batch)
+            return batch
+
+    def _refresh_reopen_seal_witnesses(self) -> None:
+        """Read every possible reopen seal before taking the scan lock."""
+
+        broker = self._observation_broker
+        witness = getattr(broker, "seal_witness", None)
+        if broker is None or not callable(witness):
+            return
+        with self._scan_lock:
+            batch = self._authorization_batch
+            seals = tuple(
+                target.shortcut_seal
+                for target in (batch.targets if batch is not None else ())
+                if target.shortcut_seal is not None
+            )
+        for seal in seals:
+            try:
+                witness(seal)
+            except Exception:
+                # The final opener resolver requires a live witness and will
+                # fail closed for this target when process observation fails.
+                continue
 
     def _action_context_for(
         self,
@@ -5273,28 +5454,32 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     "Reconnect execution must be stopped before preparation.",
                     "execution_gate_open",
                 )
-            batch = self._prepare_product_authorization_locked()
-            if batch is None:
-                return self._snapshot_failure(
-                    "reconnect.snapshot_identity_unsafe",
-                    "The complete reconnect authorization batch is unavailable.",
-                    "authorization_batch_unavailable",
-                )
-            return OperationResult(
-                True,
-                "reconnect.snapshot_ready",
-                "The complete reconnect authorization batch is ready.",
-                {
-                    "failure_codes": [],
-                    "window_count": len(batch.targets),
-                    "isolated_window_count": batch.isolated_window_count,
-                    "anonymous_isolated_window_count": (
-                        batch.anonymous_isolated_window_count
-                    ),
-                    "authorization_epoch": batch.epoch,
-                    "authorization_batch_id": batch.batch_id,
-                },
+        if self._observation_broker is not None:
+            batch = self._prepare_product_authorization_observed()
+        else:
+            with self._scan_lock:
+                batch = self._prepare_product_authorization_locked()
+        if batch is None:
+            return self._snapshot_failure(
+                "reconnect.snapshot_identity_unsafe",
+                "The complete reconnect authorization batch is unavailable.",
+                "authorization_batch_unavailable",
             )
+        return OperationResult(
+            True,
+            "reconnect.snapshot_ready",
+            "The complete reconnect authorization batch is ready.",
+            {
+                "failure_codes": [],
+                "window_count": len(batch.targets),
+                "isolated_window_count": batch.isolated_window_count,
+                "anonymous_isolated_window_count": (
+                    batch.anonymous_isolated_window_count
+                ),
+                "authorization_epoch": batch.epoch,
+                "authorization_batch_id": batch.batch_id,
+            },
+        )
     def _initial_login_authorization_is_current(
         self,
         fingerprint: str,
@@ -6210,6 +6395,52 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if coordinator is None or action_context is None:
             return False, None
         shortcut_identity_changed = False
+        current_batch = coordinator.current_authorization()
+        current_target = (
+            current_batch.target_for(action_context.fingerprint)
+            if current_batch is not None
+            else None
+        )
+        if current_target is None:
+            return False, None
+        broker = self._observation_broker
+        broker_generation: int | None = None
+        if broker is not None:
+            observation = self._current_broker_observation()
+            shortcut = (
+                observation.shortcut_for(current_target.fingerprint)
+                if observation is not None
+                else None
+            )
+            seal_is_current = bool(
+                current_target.shortcut_seal is not None
+                and self._broker_scan_generation is not None
+                and observation is not None
+                and observation.generation == self._broker_scan_generation
+                and shortcut is not None
+                and not shortcut.failure_codes
+                and shortcut.seal == current_target.shortcut_seal
+            )
+            broker_generation = (
+                observation.generation if observation is not None else None
+            )
+        else:
+            resolver = self._shortcut_seals
+            try:
+                seal_is_current = bool(
+                    current_target.shortcut_seal is not None
+                    and resolver is not None
+                    and resolver.revalidate(current_target.shortcut_seal)
+                    is True
+                )
+            except Exception:
+                seal_is_current = False
+        if not seal_is_current:
+            self._isolate_product_authorization_target(
+                action_context.fingerprint,
+                ReconnectRevocationReason.SOURCE_CHANGED,
+            )
+            return False, None
 
         # Hold the source authority generation across the backend call.  A
         # completed source revocation therefore linearizes before an older
@@ -6228,16 +6459,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 raise ReconnectAuthorizationError(
                     "authorization target changed before delivery"
                 )
-            resolver = self._shortcut_seals
-            try:
-                seal_is_current = bool(
-                    target.shortcut_seal is not None
-                    and resolver is not None
-                    and resolver.revalidate(target.shortcut_seal) is True
-                )
-            except Exception:
-                seal_is_current = False
-            if not seal_is_current:
+            if target.shortcut_seal != current_target.shortcut_seal:
                 shortcut_identity_changed = True
                 raise ReconnectAuthorizationError(
                     "shortcut seal changed before delivery"
@@ -6293,15 +6515,44 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 raise ReconnectAuthorizationError(
                     "identity generation changed before delivery"
                 )
-            return coordinator.run_authorized(
-                epoch=action_context.authorization_epoch,
-                batch_id=action_context.batch_id,
-                source_generation=action_context.source_generation,
-                fingerprint=action_context.fingerprint,
-                character_id=action_context.character_id,
-                instance=action_context.instance,
-                callback=authorized_backend_call,
+            def authorize() -> object:
+                return coordinator.run_authorized(
+                    epoch=action_context.authorization_epoch,
+                    batch_id=action_context.batch_id,
+                    source_generation=action_context.source_generation,
+                    fingerprint=action_context.fingerprint,
+                    character_id=action_context.character_id,
+                    instance=action_context.instance,
+                    callback=authorized_backend_call,
+                )
+
+            if broker is None:
+                return authorize()
+            if broker_generation is None:
+                raise ReconnectAuthorizationError(
+                    "observation generation changed before delivery"
+                )
+            if (
+                self._broker_scan_thread_id == threading.get_ident()
+                and self._broker_scan_snapshot is not None
+                and self._broker_scan_snapshot.generation
+                == broker_generation
+            ):
+                # _scan entered through the broker generation gate before it
+                # acquired the controller scan lock.  Re-entering the broker
+                # here would create scan -> broker and invert that order.
+                return authorize()
+            generation_is_current, result = (
+                broker.run_if_generation_current(
+                    broker_generation,
+                    authorize,
+                )
             )
+            if not generation_is_current:
+                raise ReconnectAuthorizationError(
+                    "observation generation changed before delivery"
+                )
+            return result
 
         try:
             runner = self._identity_generation_runner
@@ -6490,6 +6741,35 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         tuple[str, ...],
         frozenset[str],
     ]:
+        broker = self._observation_broker
+        if broker is not None:
+            snapshot = self._current_broker_observation()
+            self._candidate_source_is_actual = True
+            self._activation_snapshot_direct_identity_collisions = frozenset()
+            if snapshot is None:
+                self._actual_isolated_window_count = 0
+                self._anonymous_isolated_window_count = 0
+                return (), ("observation_unavailable",), frozenset()
+            self._actual_isolated_window_count = snapshot.isolated_window_count
+            self._anonymous_isolated_window_count = (
+                snapshot.anonymous_isolated_window_count
+            )
+            return (
+                tuple(
+                    item.window
+                    for item in snapshot.windows
+                    if item.instance is not None
+                    and (
+                        fingerprint := normalize_launch_fingerprint(
+                            item.window.launch_fingerprint
+                        )
+                    )
+                    is not None
+                    and fingerprint not in snapshot.blocked_fingerprints
+                ),
+                snapshot.failure_codes,
+                snapshot.blocked_fingerprints,
+            )
         if self._target_windows_provider is not None:
             try:
                 provided = self._target_windows_provider()
@@ -6882,7 +7162,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 != self._target_identity_action_key(target)
             ):
                 return False
-            if self._target_identity_provider is None:
+            if (
+                self._target_identity_provider is None
+                or self._observation_broker is not None
+            ):
                 return True
             current = self._provided_target_identity_for_fingerprint(
                 fingerprint
@@ -7105,25 +7388,41 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self,
         fingerprint: str,
     ) -> GroupLaunchTarget | None:
-        provider = self._ungrouped_shortcut_provider
-        if provider is None:
-            return None
         source_fingerprint = (
             self._activation_snapshot_source_fingerprints or {}
         ).get(fingerprint, fingerprint)
-        try:
-            candidate = provider(source_fingerprint)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            return None
-        if not isinstance(candidate, Path):
-            return None
-        shortcut = Path(candidate)
-        try:
-            available = shortcut.is_file()
-        except OSError:
-            available = False
-        if shortcut.suffix.casefold() != ".lnk" or not available:
-            return None
+        broker = self._observation_broker
+        if broker is not None:
+            snapshot = self._current_broker_observation()
+            observation = (
+                snapshot.shortcut_for(source_fingerprint)
+                if snapshot is not None
+                else None
+            )
+            if (
+                observation is None
+                or observation.seal is None
+                or observation.failure_codes
+            ):
+                return None
+            shortcut = Path(observation.path)
+        else:
+            provider = self._ungrouped_shortcut_provider
+            if provider is None:
+                return None
+            try:
+                candidate = provider(source_fingerprint)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return None
+            if not isinstance(candidate, Path):
+                return None
+            shortcut = Path(candidate)
+            try:
+                available = shortcut.is_file()
+            except OSError:
+                available = False
+            if shortcut.suffix.casefold() != ".lnk" or not available:
+                return None
         try:
             return GroupLaunchTarget(
                 order=1,
@@ -8297,6 +8596,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if snapshot_failures == ("snapshot_rebind_required",):
             if not self._execution_allowed():
                 return None
+            if self._observation_broker is not None:
+                # The changed instance is rejected for this scan.  The next
+                # scan performs a fresh process observation before taking this
+                # controller lock and can grant only that replacement.
+                return None
             rebound = self._prepare_product_authorization_locked()
             if rebound is None:
                 return None
@@ -9449,7 +9753,47 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         # Group identity may be rebound from the UI thread while recognition is
         # running. Keep reconnect state internally consistent without holding
         # the shared game-operation gate during this read-only work.
+        if (
+            execute
+            and self._observation_broker is not None
+            and self._execution_allowed()
+        ):
+            self._prepare_product_authorization_observed()
+            self._refresh_reopen_seal_witnesses()
+        broker = self._observation_broker
+        if broker is None:
+            return self._scan_with_broker_snapshot(execute, None)
+        broker_snapshot = broker.current_snapshot()
+        if broker_snapshot is None:
+            return self._scan_with_broker_snapshot(execute, None)
+        current, result = broker.run_if_generation_current(
+            broker_snapshot.generation,
+            lambda: self._scan_with_broker_snapshot(
+                execute,
+                broker_snapshot,
+            ),
+        )
+        if current and result is not None:
+            return result
+        # The publication changed after the lock-free preparation and before
+        # the broker gate.  Run one fail-closed memory-only scan without ever
+        # consulting the broker from inside the controller lock.
+        return self._scan_with_broker_snapshot(execute, None)
+
+    def _scan_with_broker_snapshot(
+        self,
+        execute: bool,
+        broker_snapshot: SmartReconnectObservationSnapshot | None,
+    ) -> ReconnectBatchResult:
+        broker_generation = (
+            broker_snapshot.generation
+            if broker_snapshot is not None
+            else None
+        )
         with self._scan_lock:
+            self._broker_scan_generation = broker_generation
+            self._broker_scan_snapshot = broker_snapshot
+            self._broker_scan_thread_id = threading.get_ident()
             if execute:
                 with self._source_authority_lock:
                     self._execution_scan_active.set()
@@ -9461,6 +9805,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     with self._source_authority_lock:
                         self._execution_scan_thread_id = None
                         self._execution_scan_active.clear()
+                self._broker_scan_thread_id = None
+                self._broker_scan_snapshot = None
+                self._broker_scan_generation = None
 
     def _scan_locked(self, *, execute: bool) -> ReconnectBatchResult:
         if execute:
@@ -9472,7 +9819,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 or coordinator.current_authorization() != batch
                 or not self._identity_generation_is_current(batch)
             ):
-                batch = self._prepare_product_authorization_locked()
+                batch = (
+                    None
+                    if self._observation_broker is not None
+                    else self._prepare_product_authorization_locked()
+                )
             if batch is None:
                 result = ReconnectBatchResult(
                     expected_windows=self._expected_windows,
@@ -9525,6 +9876,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if (
             execute
             and snapshot_failures == ("snapshot_rebind_required",)
+            and self._observation_broker is None
         ):
             rebound = self._prepare_product_authorization_locked()
             if rebound is None:

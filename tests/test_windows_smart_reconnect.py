@@ -1,5 +1,6 @@
 import ctypes
 import hashlib
+import inspect
 import json
 import threading
 import time
@@ -33,7 +34,14 @@ from adapters.windows_smart_reconnect import (
     WindowInstanceToken,
     WindowsSmartReconnectController,
 )
+from adapters.windows_smart_reconnect_observation_broker import (
+    SmartReconnectObservationSnapshot,
+    SmartReconnectShortcutObservation,
+    SmartReconnectWindowObservation,
+    WindowsSmartReconnectObservationBroker,
+)
 from adapters.windows_window import WindowInfo
+from config.config_manager import ConfigManager
 from core.reconnect_policy import ReconnectScreenState
 from core.smart_reconnect_authorization import (
     ReconnectAuthorizationTarget,
@@ -61,6 +69,9 @@ from services.smart_reconnect_evidence_store import (
 )
 from services.smart_reconnect_target_identity_service import (
     SmartReconnectTargetIdentity,
+)
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
 )
 from services.target_window_contract_service import ResolvedTargetWindows
 
@@ -108,6 +119,48 @@ class FakeWindowBackend:
 
     def top_window_at(self, _x, _y):
         return None
+
+
+class StaticControllerObservationBroker:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+        self.current = True
+        self.latest_calls = 0
+        self.refresh_calls = 0
+        self.seal_witness_calls = []
+        self.events = None
+
+    def latest_snapshot(self):
+        self.latest_calls += 1
+        return self.snapshot
+
+    def current_snapshot(self):
+        self.latest_calls += 1
+        return self.snapshot if self.current else None
+
+    def published_snapshot_without_wait(self):
+        return self.snapshot if self.current else None
+
+    def run_if_generation_current(self, generation, callback):
+        if not self.is_generation_current(generation):
+            return False, None
+        return True, callback()
+
+    def seal_is_witnessed_without_wait(self, expected):
+        return expected in self.seal_witness_calls
+
+    def refresh(self, _paths=()):
+        self.refresh_calls += 1
+        raise AssertionError("controller must not refresh process observation")
+
+    def is_generation_current(self, generation):
+        return self.current and generation == self.snapshot.generation
+
+    def seal_witness(self, expected):
+        self.seal_witness_calls.append(expected)
+        if self.events is not None:
+            self.events.append(("seal_witness", expected))
+        return object()
 
 
 class FullyVisibleWindowBackend(FakeWindowBackend):
@@ -1729,6 +1782,7 @@ def make_controller(
     shortcut_seal_resolver=None,
     identity_generation_runner=None,
     identity_alias_catalog_provider=None,
+    observation_broker=None,
 ):
     if clock is None:
         default_time = [-5.0]
@@ -1958,6 +2012,7 @@ def make_controller(
             shortcut_seal_resolver=shortcut_seal_resolver,
             identity_generation_runner=identity_generation_runner,
             identity_alias_catalog_provider=identity_alias_catalog_provider,
+            observation_broker=observation_broker,
             evidence_recorder=evidence_recorder,
             evidence_required=evidence_required,
             evidence_initialization_failed=(
@@ -2126,6 +2181,351 @@ def activate_current_window_snapshot(
     if prepared.success:
         fixture.controller.set_execution_enabled(True)
     return prepared
+
+
+def _controller_observation_snapshot(windows, *, generation=1):
+    return SmartReconnectObservationSnapshot(
+        generation=generation,
+        windows=tuple(
+            SmartReconnectWindowObservation(
+                window=window,
+                instance=WindowInstanceToken.from_window(window),
+                sample=CaptureSample(
+                    width=2,
+                    height=2,
+                    pixels=bytes([1, 0, 0, 255] * 4),
+                    api_succeeded=True,
+                ),
+                recognition=ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=1.0,
+                    click_point=None,
+                    reference_name="connected",
+                ),
+                fresh_capture=True,
+                capture_route="print_window",
+                role_id=None,
+            )
+            for window in windows
+        ),
+    )
+
+
+def test_broker_passive_observation_reads_latest_without_refresh_or_direct_io():
+    window = make_window(1)
+    broker = StaticControllerObservationBroker(
+        _controller_observation_snapshot((window,), generation=7)
+    )
+
+    class ForbiddenWindowBackend:
+        def list_windows(self):
+            raise AssertionError("passive observation enumerated windows")
+
+    class ForbiddenCapture:
+        def capture(self, _handle):
+            raise AssertionError("passive observation captured a window")
+
+    controller = WindowsSmartReconnectController(
+        expected_windows=1,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=ForbiddenWindowBackend(),
+        capture_provider=ForbiddenCapture(),
+        recognizer=FakeRecognizer({}, {}),
+        mouse_backend=FakeMouseBackend(),
+        require_expected_window_count=False,
+        observation_broker=broker,
+    )
+
+    observed = controller.observe_screen_states(
+        (window.launch_fingerprint,)
+    )
+
+    assert observed == {
+        window.launch_fingerprint: ReconnectScreenState.CONNECTED,
+    }
+    assert broker.latest_calls == 1
+    assert broker.refresh_calls == 0
+
+
+def test_broker_passive_observation_rejects_noncurrent_connected_snapshot():
+    window = make_window(1)
+    broker = StaticControllerObservationBroker(
+        _controller_observation_snapshot((window,), generation=8)
+    )
+    broker.current = False
+    controller = WindowsSmartReconnectController(
+        expected_windows=1,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=FakeWindowBackend((window,)),
+        capture_provider=FakeCaptureProvider({window.handle: 1}),
+        recognizer=FakeRecognizer({1: ReconnectScreenState.CONNECTED}, {}),
+        mouse_backend=FakeMouseBackend(),
+        require_expected_window_count=False,
+        observation_broker=broker,
+    )
+
+    observed = controller.observe_screen_states((window.launch_fingerprint,))
+
+    assert observed == {
+        window.launch_fingerprint: ReconnectScreenState.UNKNOWN,
+    }
+
+
+def test_broker_generation_change_interleaves_without_deadlock_or_stale_input(
+    tmp_path,
+    monkeypatch,
+):
+    window = make_window(1)
+    fingerprint = window.launch_fingerprint
+    seal = ShortcutSeal(
+        ShortcutFileIdentity(
+            str(Path.cwd() / ".pytest-shortcuts" / "1.lnk"),
+            1,
+            1,
+        ),
+        f"{1:064x}",
+        fingerprint,
+    )
+    broker = WindowsSmartReconnectObservationBroker(reference_dir=tmp_path)
+    serial = broker._next_request()
+    published = broker._publish(
+        serial,
+        replace(
+            _controller_observation_snapshot((window,), generation=0),
+            shortcuts=(
+                SmartReconnectShortcutObservation(
+                    seal.file_identity.normalized_path,
+                    fingerprint,
+                    seal,
+                ),
+            ),
+        ),
+    )
+    assert published is not None
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        observation_broker=broker,
+    )
+    context = fixture.controller._action_context_for(
+        fingerprint,
+        WindowInstanceToken.from_window(window),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    delivered = []
+    outcomes = []
+    original_current = broker.current_snapshot
+
+    def blocked_current_snapshot():
+        snapshot = original_current()
+        if threading.current_thread().name == "authorized-delivery":
+            entered.set()
+            assert release.wait(2)
+        return snapshot
+
+    monkeypatch.setattr(broker, "current_snapshot", blocked_current_snapshot)
+    fixture.controller._broker_scan_generation = published.generation
+    worker = threading.Thread(
+        name="authorized-delivery",
+        target=lambda: outcomes.append(
+            fixture.controller._run_authorized_backend_call(
+                lambda: delivered.append("input"),
+                action_context=context,
+                expected_capture_settings_revision=None,
+                capture_route="visible",
+                expected_source_state_generation=None,
+            )
+        ),
+    )
+    worker.start()
+    assert entered.wait(2)
+
+    broker.set_capture_modes(
+        visible=False,
+        obscured=True,
+        minimized=True,
+    )
+    release.set()
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert outcomes == [(False, None)]
+    assert delivered == []
+    assert broker.current_snapshot() is None
+    assert broker.close() is True
+
+
+def test_scan_waiting_for_broker_holds_no_scan_config_or_identity_lock(
+    tmp_path,
+    monkeypatch,
+):
+    window = make_window(1)
+    broker = WindowsSmartReconnectObservationBroker(reference_dir=tmp_path)
+    serial = broker._next_request()
+    assert broker._publish(
+        serial,
+        _controller_observation_snapshot((window,), generation=0),
+    ) is not None
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        observation_broker=broker,
+    )
+    config = ConfigManager(tmp_path / "config" / "settings.json")
+    identity = IdentityDataTransactionCoordinator()
+    entered = threading.Event()
+    results = []
+    original_current = broker.current_snapshot
+
+    def announced_current_snapshot():
+        entered.set()
+        return original_current()
+
+    monkeypatch.setattr(
+        broker,
+        "current_snapshot",
+        announced_current_snapshot,
+    )
+    with broker._state_lock:
+        worker = threading.Thread(
+            target=lambda: results.append(
+                fixture.controller.check_connection()
+            )
+        )
+        worker.start()
+        assert entered.wait(2)
+        assert fixture.controller._scan_lock.acquire(timeout=0.5) is True
+        fixture.controller._scan_lock.release()
+        with config.resource_guard():
+            assert config.snapshot_state_locked().revision >= 0
+        assert identity.read_consistent(lambda: "identity-free") == (
+            "identity-free"
+        )
+
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert len(results) == 1
+    assert broker.close() is True
+
+
+def test_broker_preparation_wait_does_not_hold_controller_scan_lock():
+    windows = (make_window(1), make_window(2))
+    broker = StaticControllerObservationBroker(
+        _controller_observation_snapshot(windows, generation=11)
+    )
+    fixture = make_controller(
+        [1, 1],
+        windows=windows,
+        expected_windows=2,
+        observation_broker=broker,
+    )
+    fixture.controller.set_execution_enabled(False)
+    original_prepare = fixture.preparation.prepare
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+
+    def blocked_prepare(**kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original_prepare(**kwargs)
+
+    fixture.preparation.prepare = blocked_prepare
+    worker = threading.Thread(
+        target=lambda: results.append(
+            fixture.controller.prepare_execution_snapshot()
+        )
+    )
+    worker.start()
+    assert entered.wait(2)
+
+    assert fixture.controller._scan_lock.acquire(timeout=0.5) is True
+    fixture.controller._scan_lock.release()
+    release.set()
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert len(results) == 1
+    assert results[0].success is True
+    assert broker.refresh_calls == 0
+
+
+def test_true_reopen_reads_broker_seal_witness_before_restarter(tmp_path):
+    window = make_window(1)
+    plan = make_group_plan(tmp_path, (window,), "witness")
+    target = plan.targets[0]
+    seal = ShortcutSeal(
+        ShortcutFileIdentity(target.shortcut_path, 1, 1),
+        f"{1:064x}",
+        window.launch_fingerprint,
+    )
+    observation = SmartReconnectObservationSnapshot(
+        generation=19,
+        windows=(
+            SmartReconnectWindowObservation(
+                window=window,
+                instance=WindowInstanceToken.from_window(window),
+                sample=CaptureSample(2, 2, bytes([2, 0, 0, 255] * 4), True),
+                recognition=ScreenRecognition(
+                    state=ReconnectScreenState.DISCONNECTED,
+                    score=1.0,
+                    click_point=(0.5, 0.5),
+                    reference_name="disconnected",
+                    battle_context=True,
+                ),
+                fresh_capture=True,
+                capture_route="print_window",
+                role_id=None,
+            ),
+        ),
+        shortcuts=(
+            SmartReconnectShortcutObservation(
+                str(target.shortcut_path),
+                window.launch_fingerprint,
+                seal,
+            ),
+        ),
+    )
+    broker = StaticControllerObservationBroker(observation)
+    events = []
+    broker.events = events
+
+    class WitnessRestarter(FakeClosedBattleRestarter):
+        def restart(self, current_window, current_target):
+            events.append(("restart", current_target.fingerprint))
+            return super().restart(current_window, current_target)
+
+    restarter = WitnessRestarter()
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        battle_restarter=restarter,
+        group_launch_plan=plan,
+        observation_broker=broker,
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert restarter.calls
+    restart_index = next(
+        index for index, event in enumerate(events) if event[0] == "restart"
+    )
+    assert any(
+        event[0] == "seal_witness" for event in events[:restart_index]
+    )
+    assert broker.seal_witness_calls[-1] == seal
+
+
+def test_controller_never_fails_preparation_without_its_token():
+    source = inspect.getsource(WindowsSmartReconnectController)
+
+    assert "fail_preparation()" not in source
 
 
 def test_passive_observation_uses_explicit_ungrouped_candidates():
