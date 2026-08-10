@@ -729,13 +729,13 @@ def test_live_install_validation_is_runner_temp_local_and_keeps_original_artifac
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows installer contracts")
 def test_live_install_validation_executes_formal_rollback_update_and_cleanup(tmp_path):
-    powershell = shutil.which("powershell.exe")
-    if powershell is None:
-        pytest.skip("Windows PowerShell is unavailable")
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("pwsh is unavailable")
 
     running_flash = subprocess.run(
         [
-            powershell,
+            pwsh,
             "-NoProfile",
             "-NonInteractive",
             "-Command",
@@ -820,6 +820,7 @@ def test_live_install_validation_executes_formal_rollback_update_and_cleanup(tmp
         "Upload Windows release bundle",
     )
     script_body = textwrap.dedent(installer_step.split("        run: |\n", 1)[1])
+    assert script_body.count("& powershell.exe") == 2
     script_path = workspace / "validation_install.ps1"
     script_path.write_text(script_body, encoding="utf-8-sig")
     runner_temp = tmp_path / "runner"
@@ -837,7 +838,7 @@ def test_live_install_validation_executes_formal_rollback_update_and_cleanup(tmp
     )
     result = subprocess.run(
         [
-            powershell,
+            pwsh,
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
