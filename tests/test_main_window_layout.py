@@ -194,22 +194,121 @@ def test_role_id_calibration_uses_only_the_visible_game_text():
 
 def test_role_id_is_automatically_read_only_for_connected_missing_roles():
     source = Path("main.py").read_text(encoding="utf-8")
-    function_source = source[
-        source.index("    def auto_read_missing_role_id("):
-        source.index("    player_habit_reminder_service = (")
-    ]
+    tree = ast.parse(source)
+    create_window = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "create_main_window"
+    )
+    automatic = next(
+        node
+        for node in create_window.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "auto_read_missing_role_id"
+    )
+    commit = next(
+        node
+        for node in ast.walk(automatic)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "commit_current_role_id"
+    )
+    stage = next(
+        node
+        for node in ast.walk(commit)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "stage_if_still_missing"
+    )
 
-    assert "if not entry.role_id.strip()" in function_source
-    assert "window_info is None or window_info.minimized" in function_source
-    assert "screen_state is not ReconnectScreenState.CONNECTED" in function_source
-    assert "role_id_template_service.read_if_missing(" in function_source
-    assert "existing_role_id=entry.role_id" in function_source
-    assert "commit_role_id(" in function_source
-    assert "only_if_missing=True" in function_source
-    assert "group_configuration_service.set_role_id(" not in function_source
-    assert "entry.display_name" not in function_source
-    assert "window.after(" in function_source
+    def call_path(call):
+        parts = []
+        node = call.func
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        return ".".join(reversed(parts))
+
+    automatic_calls = {
+        call_path(node)
+        for node in ast.walk(automatic)
+        if isinstance(node, ast.Call)
+    }
+    commit_calls = {
+        call_path(node)
+        for node in ast.walk(commit)
+        if isinstance(node, ast.Call)
+    }
+    stage_calls = {
+        call_path(node)
+        for node in ast.walk(stage)
+        if isinstance(node, ast.Call)
+    }
+    gate = next(
+        node
+        for node in ast.walk(automatic)
+        if isinstance(node, ast.Call)
+        and call_path(node)
+        == "smart_reconnect_observation_broker.run_if_generation_current"
+    )
+    stage_candidate = next(
+        node
+        for node in ast.walk(commit)
+        if isinstance(node, ast.Call)
+        and call_path(node)
+        == "group_configuration_service.stage_candidate"
+    )
+
+    assert (
+        "smart_reconnect_observation_broker.current_snapshot"
+        in automatic_calls
+    )
+    assert isinstance(gate.args[0], ast.Attribute)
+    assert isinstance(gate.args[0].value, ast.Name)
+    assert gate.args[0].value.id == "published"
+    assert gate.args[0].attr == "generation"
+    assert isinstance(gate.args[1], ast.Name)
+    assert gate.args[1].id == "commit_current_role_id"
+    assert "coordinator.execute" in commit_calls
+    assert "group_configuration_service.stage_candidate" in commit_calls
+    assert len(stage_candidate.args) == 2
+    assert isinstance(stage_candidate.args[0], ast.Name)
+    assert stage_candidate.args[0].id == "transaction"
+    assert isinstance(stage_candidate.args[1], ast.Name)
+    assert stage_candidate.args[1].id == "stage_if_still_missing"
+    assert "target_entry.role_id.strip" in stage_calls
+    assert "candidate.set_role_id" in stage_calls
+    assert any(
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "observed"
+        and node.attr == "role_id"
+        for node in ast.walk(stage)
+    )
+    assert "window.after" in automatic_calls
     assert "window.after_cancel(role_id_auto_read_id)" in source
+
+    forbidden = {
+        "commit_role_id",
+        "finish_group_management",
+        "_rebuild_group_input_identity",
+        "apply_group_identity",
+        "selected_group_plan",
+        "stop_group_automation_for_configuration_change",
+        "stop_service",
+        "game_operation_gate.close_and_wait",
+        "role_id_template_service.read",
+        "role_id_template_service.read_if_missing",
+    }
+    assert automatic_calls.isdisjoint(forbidden)
+    assert not any(path.endswith(".list_windows") for path in automatic_calls)
+    assert not any(path.endswith(".capture") for path in automatic_calls)
+    automatic_source = ast.get_source_segment(source, automatic)
+    assert automatic_source is not None
+    assert "PowerShell" not in automatic_source
+    assert "Win32" not in automatic_source
+    assert ".title" not in automatic_source
 
 
 def test_cancelled_bulk_shortcut_selection_has_no_side_effects():
