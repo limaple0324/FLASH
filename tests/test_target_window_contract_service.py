@@ -108,6 +108,10 @@ class StaticBroker:
         self.latest_calls += 1
         return self.snapshot if self.current else None
 
+    def stable_snapshot(self):
+        self.latest_calls += 1
+        return self.snapshot
+
     def is_generation_current(self, generation):
         return self.current and generation == self.snapshot.generation
 
@@ -220,19 +224,74 @@ def test_group_snapshot_reads_latest_broker_snapshot_without_direct_io(tmp_path)
         TargetWindowPhase.BACKGROUND,
     )
     assert all(target.safe for target in grouped.targets)
-    assert broker.latest_calls == 2
+    assert broker.latest_calls == 1
     assert broker.paths is None
 
 
-def test_group_snapshot_rejects_noncurrent_broker_publication(tmp_path):
+def test_group_snapshot_keeps_the_once_captured_stable_publication(tmp_path):
+    paths = (tmp_path / "one.lnk", tmp_path / "two.lnk")
+    safe = SmartReconnectObservationSnapshot(
+        generation=12,
+        windows=(
+            _observed(_window(FIRST, 1)),
+            _observed(_window(SECOND, 2)),
+        ),
+        shortcuts=(
+            _shortcut(paths[0], FIRST, 1),
+            _shortcut(paths[1], SECOND, 2),
+        ),
+    )
+    replacement = SmartReconnectObservationSnapshot(
+        generation=13,
+        failure_codes=("window_enumeration_failed",),
+    )
+
+    class InterleavingBroker(StaticBroker):
+        def stable_snapshot(self):
+            self.latest_calls += 1
+            captured = self.snapshot
+            self.snapshot = replacement
+            return captured
+
+    broker = InterleavingBroker(safe)
+    service = TargetWindowContractService(
+        StaticConfiguration(paths),
+        object(),
+        WindowRegistry(),
+        ForbiddenWindowBackend(),
+        observation_broker=broker,
+    )
+
+    grouped = service.snapshot("one", expanded_sync_scope=False)
+
+    assert grouped.failure_codes == ()
+    assert tuple(target.fingerprint for target in grouped.safe_targets) == (
+        FIRST,
+        SECOND,
+    )
+    assert broker.latest_calls == 1
+
+
+def test_group_snapshot_keeps_stable_sync_targets_during_action_refresh(tmp_path):
+    paths = (tmp_path / "one.lnk", tmp_path / "two.lnk")
     snapshot = SmartReconnectObservationSnapshot(
         generation=14,
-        windows=(_observed(_window(FIRST, 1)),),
+        windows=(
+            _observed(_window(FIRST, 1)),
+            _observed(_window(SECOND, 2)),
+        ),
+        shortcuts=(
+            _shortcut(paths[0], FIRST, 1),
+            _shortcut(paths[1], SECOND, 2),
+        ),
     )
     service, broker, _paths = _service(tmp_path, snapshot)
     broker.current = False
 
     grouped = service.snapshot("one", expanded_sync_scope=False)
 
-    assert grouped.targets == ()
-    assert grouped.failure_codes == ("observation_unavailable",)
+    assert grouped.failure_codes == ()
+    assert tuple(target.fingerprint for target in grouped.safe_targets) == (
+        FIRST,
+        SECOND,
+    )

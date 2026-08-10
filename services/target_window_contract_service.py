@@ -124,7 +124,18 @@ class TargetWindowContractService:
                     (configured_group.name, entry)
                 )
         broker = self._observation_broker
-        observation = broker.current_snapshot() if broker is not None else None
+        stable_reader = (
+            getattr(broker, "stable_snapshot", None)
+            if broker is not None
+            else None
+        )
+        observation = (
+            stable_reader()
+            if callable(stable_reader)
+            else broker.current_snapshot()
+            if broker is not None
+            else None
+        )
         if broker is not None and observation is None:
             return TargetWindowSnapshot(
                 TargetWindowSnapshot.SCHEMA_VERSION,
@@ -272,15 +283,6 @@ class TargetWindowContractService:
         if len(targets) != len(selected_ids):
             snapshot_failures = tuple(
                 dict.fromkeys((*snapshot_failures, "target_entry_unresolved"))
-            )
-        if (
-            broker is not None
-            and broker.current_snapshot() is not observation
-        ):
-            return TargetWindowSnapshot(
-                TargetWindowSnapshot.SCHEMA_VERSION,
-                name,
-                failure_codes=("observation_superseded",),
             )
         return TargetWindowSnapshot(
             TargetWindowSnapshot.SCHEMA_VERSION,
@@ -433,9 +435,20 @@ class TargetWindowContractService:
         broker = self._observation_broker
         if broker is not None:
             observation = broker.refresh(self._configured_shortcut_paths())
+            action_reader = getattr(broker, "action_snapshot", None)
+            action = action_reader() if callable(action_reader) else None
+            if action is not None:
+                action_observation, action_lease = action
+            else:
+                action_observation = (
+                    observation
+                    if broker.is_generation_current(observation.generation)
+                    else None
+                )
+                action_lease = None
             if (
                 observation.generation <= 0
-                or not broker.is_generation_current(observation.generation)
+                or action_observation is not observation
             ):
                 return ActualWindowSnapshot(
                     ActualWindowSnapshot.SCHEMA_VERSION,
@@ -470,6 +483,10 @@ class TargetWindowContractService:
                 ),
                 failure_codes=observation.failure_codes,
                 observation_generation=observation.generation,
+                observation_request_serial=observation.request_serial,
+                observation_static_generation=observation.static_generation,
+                changed_fingerprints=observation.changed_fingerprints,
+                action_lease=action_lease,
             )
 
         try:

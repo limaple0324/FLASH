@@ -6,6 +6,12 @@ import ctypes
 import hashlib
 import json
 import multiprocessing
+
+# Frozen spawn children must be diverted before tkinter or any heavyweight
+# product adapter is imported.  The guarded call is a no-op for normal imports.
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
 import os
 import re
 import sys
@@ -13,6 +19,7 @@ import traceback
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from threading import Lock
 from time import monotonic
@@ -1131,6 +1138,21 @@ def _rebuild_group_input_identity(
     return ready
 
 
+def _close_observation_broker_on_build_failure(builder):
+    @wraps(builder)
+    def guarded(*args, **kwargs):
+        try:
+            return builder(*args, **kwargs)
+        except BaseException:
+            broker = AppContext.get(WindowsSmartReconnectObservationBroker)
+            if isinstance(broker, WindowsSmartReconnectObservationBroker):
+                broker.close()
+            raise
+
+    return guarded
+
+
+@_close_observation_broker_on_build_failure
 def build_services(
     root: Path | None = None,
     card_preview_catalog: CardPreviewCatalog | None = None,
@@ -1312,6 +1334,16 @@ def build_services(
             ),
         )
     )
+    if not smart_reconnect_observation_broker.start():
+        raise RuntimeError("Smart reconnect observation workers did not start.")
+    try:
+        AppContext.register(
+            WindowsSmartReconnectObservationBroker,
+            smart_reconnect_observation_broker,
+        )
+    except BaseException:
+        smart_reconnect_observation_broker.close()
+        raise
     game_operation_gate = GameOperationGate()
     AppContext.register(GameOperationGate, game_operation_gate)
     target_window_contract_service = TargetWindowContractService(
@@ -1625,10 +1657,6 @@ def build_services(
     AppContext.register(
         SmartReconnectPreparationService,
         smart_reconnect_preparation_service,
-    )
-    AppContext.register(
-        WindowsSmartReconnectObservationBroker,
-        smart_reconnect_observation_broker,
     )
     AppContext.register(SyncScopeService, sync_scope_service)
     AppContext.register(
@@ -6154,7 +6182,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                     selected.launch_fingerprint
                 )
                 published = (
-                    smart_reconnect_observation_broker.current_snapshot()
+                    smart_reconnect_observation_broker.stable_snapshot()
                 )
                 observed = (
                     published.window_for(fingerprint)
@@ -6363,7 +6391,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 role_id_auto_read_cursor % len(missing_entries)
             ]
             role_id_auto_read_cursor += 1
-            published = smart_reconnect_observation_broker.current_snapshot()
+            published = smart_reconnect_observation_broker.stable_snapshot()
             if published is None:
                 return
             entry_path = os.path.normcase(
@@ -7149,7 +7177,6 @@ def close_logger(logger: LoggerService | None) -> None:
 
 
 def main() -> None:
-    multiprocessing.freeze_support()
     raw_arguments = tuple(sys.argv[1:])
     arguments = set(raw_arguments)
     target_desktop_verify_only = TARGET_DESKTOP_VERIFY_ARGUMENT in arguments

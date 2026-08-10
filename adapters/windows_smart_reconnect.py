@@ -70,6 +70,10 @@ from core.smart_reconnect_authorization import (
     ReconnectRevocationReason,
     ShortcutSeal,
 )
+from core.target_window_contract import (
+    ObservationActionLease,
+    ObservationFreshness,
+)
 from core.window_instance import WindowInstanceToken
 from domain.character import CharacterImportance, character_importance_rank
 from services.group_launch_service import GroupLaunchPlan, GroupLaunchTarget
@@ -179,7 +183,7 @@ class _ObservationBrokerShortcutSealResolver:
         self._broker = broker
 
     def revalidate(self, expected: ShortcutSeal) -> bool:
-        return self._broker.seal_is_witnessed_without_wait(expected)
+        return self._broker.seal_is_witnessed(expected)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2553,6 +2557,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         ] = {}
         self._source_state_generation = 0
         self._broker_scan_generation: int | None = None
+        self._broker_scan_action_lease: ObservationActionLease | None = None
         self._broker_scan_snapshot: (
             SmartReconnectObservationSnapshot | None
         ) = None
@@ -4491,7 +4496,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return {}
         broker = self._observation_broker
         if broker is not None:
-            snapshot = broker.current_snapshot()
+            stable_reader = getattr(broker, "stable_snapshot", None)
+            snapshot = (
+                stable_reader()
+                if callable(stable_reader)
+                else broker.current_snapshot()
+            )
             if snapshot is None:
                 return {
                     fingerprint: ReconnectScreenState.UNKNOWN
@@ -4509,7 +4519,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     continue
                 result[fingerprint] = (
                     observed.recognition.state
-                    if observed.fresh_capture
+                    if observed.freshness
+                    is ObservationFreshness.PROVEN_CURRENT
                     or observed.recognition.state
                     is ReconnectScreenState.CHECK_DISABLED
                     else ReconnectScreenState.UNKNOWN
@@ -5311,27 +5322,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._bind_authorization_batch_locked(batch)
             return batch
 
-    def _refresh_reopen_seal_witnesses(self) -> None:
-        """Read every possible reopen seal before taking the scan lock."""
+    def _revalidate_reopen_seal(self, expected: ShortcutSeal) -> bool:
+        """Read one seal only at the final, true-reopen leaf."""
 
         broker = self._observation_broker
-        witness = getattr(broker, "seal_witness", None)
-        if broker is None or not callable(witness):
-            return
-        with self._scan_lock:
-            batch = self._authorization_batch
-            seals = tuple(
-                target.shortcut_seal
-                for target in (batch.targets if batch is not None else ())
-                if target.shortcut_seal is not None
-            )
-        for seal in seals:
-            try:
-                witness(seal)
-            except Exception:
-                # The final opener resolver requires a live witness and will
-                # fail closed for this target when process observation fails.
-                continue
+        if broker is None:
+            # The legacy path revalidates through its shortcut resolver inside
+            # the authorized backend leaf; only broker-backed execution needs
+            # the additional observation witness.
+            return True
+        witness = getattr(broker, "revalidate_reopen_seal", None)
+        if not callable(witness):
+            return False
+        try:
+            return witness(expected) is not None
+        except Exception:
+            return False
 
     def _action_context_for(
         self,
@@ -5666,6 +5672,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         # waiting for the scan's read-only work to finish.
         self._execution_enabled.clear()
         self._record_evidence_monitoring_state(False)
+        if self._observation_broker is not None:
+            invalidate_observation_action = getattr(
+                self._observation_broker,
+                "invalidate_action",
+                None,
+            )
+            if callable(invalidate_observation_action):
+                invalidate_observation_action()
         if self._authorization is not None:
             self._authorization.revoke(ReconnectRevocationReason.EXPLICIT)
         with self._scan_lock:
@@ -6405,6 +6419,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return False, None
         broker = self._observation_broker
         broker_generation: int | None = None
+        broker_action_lease: ObservationActionLease | None = None
         if broker is not None:
             observation = self._current_broker_observation()
             shortcut = (
@@ -6424,6 +6439,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             broker_generation = (
                 observation.generation if observation is not None else None
             )
+            broker_action_lease = self._broker_scan_action_lease
+            if broker_action_lease is None:
+                action_reader = getattr(broker, "action_snapshot", None)
+                action = action_reader() if callable(action_reader) else None
+                if action is not None and action[0] is observation:
+                    broker_action_lease = action[1]
         else:
             resolver = self._shortcut_seals
             try:
@@ -6504,6 +6525,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             raise ReconnectAuthorizationError(
                                 "action evidence changed before delivery"
                             )
+                    # The broker's outer action gate keeps this exact,
+                    # unforgeable lease installed while the authorization,
+                    # source, and capture locks are acquired.  Time can still
+                    # pass while waiting for those locks, so recheck the same
+                    # immutable deadline at the final delivery leaf.
+                    if (
+                        broker_action_lease is not None
+                        and broker_action_lease.deadline_monotonic
+                        <= time.monotonic()
+                    ):
+                        raise ReconnectAuthorizationError(
+                            "observation action lease expired before delivery"
+                        )
                     return callback()
 
         def run_for_identity_generation(identity_generation: int) -> object:
@@ -6532,16 +6566,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 raise ReconnectAuthorizationError(
                     "observation generation changed before delivery"
                 )
-            if (
-                self._broker_scan_thread_id == threading.get_ident()
-                and self._broker_scan_snapshot is not None
-                and self._broker_scan_snapshot.generation
-                == broker_generation
-            ):
-                # _scan entered through the broker generation gate before it
-                # acquired the controller scan lock.  Re-entering the broker
-                # here would create scan -> broker and invert that order.
-                return authorize()
+            if broker_action_lease is not None:
+                generation_is_current, result = broker.run_if_action_current(
+                    broker_action_lease,
+                    authorize,
+                )
+                if not generation_is_current:
+                    raise ReconnectAuthorizationError(
+                        "observation action lease changed before delivery"
+                    )
+                return result
             generation_is_current, result = (
                 broker.run_if_generation_current(
                     broker_generation,
@@ -9604,6 +9638,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
             def retry_bound_open():
                 def authorize_open_leaf(callback):
+                    if not self._revalidate_reopen_seal(
+                        bound_pending.target.shortcut_seal
+                    ):
+                        return False, None
                     return self._run_authorized_backend_call(
                         callback,
                         action_context=bound_pending.action_context,
@@ -9759,31 +9797,29 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             and self._execution_allowed()
         ):
             self._prepare_product_authorization_observed()
-            self._refresh_reopen_seal_witnesses()
         broker = self._observation_broker
         if broker is None:
-            return self._scan_with_broker_snapshot(execute, None)
-        broker_snapshot = broker.current_snapshot()
+            return self._scan_with_broker_snapshot(execute, None, None)
+        action_reader = getattr(broker, "action_snapshot", None)
+        action = action_reader() if callable(action_reader) else None
+        if action is None:
+            broker_snapshot = broker.current_snapshot()
+            broker_lease = None
+        else:
+            broker_snapshot, broker_lease = action
         if broker_snapshot is None:
-            return self._scan_with_broker_snapshot(execute, None)
-        current, result = broker.run_if_generation_current(
-            broker_snapshot.generation,
-            lambda: self._scan_with_broker_snapshot(
-                execute,
-                broker_snapshot,
-            ),
+            return self._scan_with_broker_snapshot(execute, None, None)
+        return self._scan_with_broker_snapshot(
+            execute,
+            broker_snapshot,
+            broker_lease,
         )
-        if current and result is not None:
-            return result
-        # The publication changed after the lock-free preparation and before
-        # the broker gate.  Run one fail-closed memory-only scan without ever
-        # consulting the broker from inside the controller lock.
-        return self._scan_with_broker_snapshot(execute, None)
 
     def _scan_with_broker_snapshot(
         self,
         execute: bool,
         broker_snapshot: SmartReconnectObservationSnapshot | None,
+        broker_action_lease: ObservationActionLease | None,
     ) -> ReconnectBatchResult:
         broker_generation = (
             broker_snapshot.generation
@@ -9793,6 +9829,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         with self._scan_lock:
             self._broker_scan_generation = broker_generation
             self._broker_scan_snapshot = broker_snapshot
+            self._broker_scan_action_lease = broker_action_lease
             self._broker_scan_thread_id = threading.get_ident()
             if execute:
                 with self._source_authority_lock:
@@ -9808,6 +9845,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 self._broker_scan_thread_id = None
                 self._broker_scan_snapshot = None
                 self._broker_scan_generation = None
+                self._broker_scan_action_lease = None
 
     def _scan_locked(self, *, execute: bool) -> ReconnectBatchResult:
         if execute:
@@ -11001,7 +11039,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         bound_pending
                     )
 
-                    def authorize_restart_leaf(callback):
+                    def authorize_restart_leaf(
+                        callback,
+                        *,
+                        reopen: bool = False,
+                    ):
+                        if (
+                            reopen
+                            and not self._revalidate_reopen_seal(
+                                authorization_target.shortcut_seal
+                            )
+                        ):
+                            return False, None
                         return self._run_authorized_backend_call(
                             callback,
                             action_context=bound_pending.action_context,
@@ -11034,7 +11083,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             refreshed_window,
                             target,
                             close_authorizer=authorize_restart_leaf,
-                            open_authorizer=authorize_restart_leaf,
+                            open_authorizer=(
+                                lambda callback: authorize_restart_leaf(
+                                    callback,
+                                    reopen=True,
+                                )
+                            ),
                             expected_shortcut_seal=(
                                 authorization_target.shortcut_seal
                             ),
@@ -11044,7 +11098,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             lambda: self._battle_restarter.restart(
                                 refreshed_window,
                                 target,
-                            )
+                            ),
+                            reopen=True,
                         )
                         restart = (
                             raw_restart

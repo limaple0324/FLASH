@@ -18,6 +18,7 @@ from adapters.windows_launch_fingerprint import (
 )
 from adapters.windows_smart_reconnect import WindowsSmartReconnectController
 from adapters.windows_smart_reconnect_observation_broker import (
+    SmartReconnectObservationRequest,
     SmartReconnectObservationSnapshot,
     SmartReconnectShortcutObservation,
     SmartReconnectWindowObservation,
@@ -74,6 +75,21 @@ class FakeAdapter:
 
     def shutdown(self) -> None:
         return None
+
+
+def _startup_slot_worker(request: SmartReconnectObservationRequest):
+    if request.stage == "slow-slot":
+        time.sleep(2)
+    return request.stage
+
+
+@pytest.fixture(autouse=True)
+def close_process_observation_broker_after_test():
+    try:
+        yield
+    finally:
+        main_module.shutdown_smart_reconnect_monitor()
+        assert main_module.shutdown_smart_reconnect_observation_broker() is True
 
 
 def test_normalize_window_keywords_accepts_string_and_list():
@@ -143,28 +159,127 @@ def test_build_services_wires_process_observation_broker_into_reconnect_chain(
     assert target_windows._observation_broker is broker
     assert controller._observation_broker is broker
     assert broker._worker_operation is _execute_observation_request
-    assert "RoleIdTemplateService().read" in inspect.getsource(_observe_window)
+    assert len(broker._active) == 4
+    assert all(worker.process.is_alive() for worker in broker._active.values())
+    observation_source = inspect.getsource(_observe_window)
+    assert "role_id_region_sample(sample)" in observation_source
+    assert "WindowsRoleIdOcrReader().read(role_sample)" in observation_source
+    assert "RoleIdTemplateService().read" not in observation_source
 
 
-def test_main_calls_multiprocessing_freeze_support_before_run(monkeypatch):
-    events = []
-    monkeypatch.setattr(
-        main_module.multiprocessing,
-        "freeze_support",
-        lambda: events.append("freeze_support"),
-    )
+def test_build_services_registration_failure_closes_all_observation_slots(
+    tmp_path,
+    monkeypatch,
+):
+    product_type = WindowsSmartReconnectObservationBroker
+    created = []
+
+    class TrackedBroker(product_type):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    original_register = AppContext.register
+
+    def fail_broker_registration(key, value):
+        if key is TrackedBroker:
+            raise RuntimeError("registration failed")
+        return original_register(key, value)
+
     monkeypatch.setattr(
         main_module,
-        "run",
-        lambda **_kwargs: events.append("run") or 0,
+        "WindowsSmartReconnectObservationBroker",
+        TrackedBroker,
     )
-    monkeypatch.setattr(main_module.sys, "argv", ["main.py"])
+    monkeypatch.setattr(
+        AppContext,
+        "register",
+        staticmethod(fail_broker_registration),
+    )
 
-    with pytest.raises(SystemExit) as stopped:
-        main_module.main()
+    with pytest.raises(RuntimeError, match="registration failed"):
+        build_services(root=tmp_path)
 
-    assert stopped.value.code == 0
-    assert events == ["freeze_support", "run"]
+    assert len(created) == 1
+    assert created[0]._active == {}
+    assert created[0]._slots == {}
+    assert created[0].close() is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Tk only")
+def test_real_tk_heartbeat_continues_while_one_observation_slot_rebuilds(
+    tmp_path,
+):
+    broker = WindowsSmartReconnectObservationBroker(
+        reference_dir=tmp_path,
+        _worker_operation=_startup_slot_worker,
+    )
+    assert broker.start() is True
+    warmup = tuple(
+        SmartReconnectObservationRequest(
+            stage=f"warm-{index}",
+            reference_dir=str(tmp_path),
+            title_keywords=("adobe flash player",),
+        )
+        for index in range(4)
+    )
+    assert broker._request_many(warmup, 2.0) == tuple(
+        request.stage for request in warmup
+    )
+    initial_epochs = tuple(broker._slot_epochs)
+    root = tkinter.Tk()
+    root.withdraw()
+    heartbeats = []
+    completed = threading.Event()
+    results = []
+
+    def heartbeat():
+        heartbeats.append(time.monotonic())
+        if not completed.is_set():
+            root.after(5, heartbeat)
+
+    requests = tuple(
+        SmartReconnectObservationRequest(
+            stage=("slow-slot" if index == 0 else f"fast-{index}"),
+            reference_dir=str(tmp_path),
+            title_keywords=("adobe flash player",),
+        )
+        for index in range(4)
+    )
+
+    def run_long_batch():
+        results.extend(broker._request_many(requests, 0.4))
+        completed.set()
+
+    worker = threading.Thread(target=run_long_batch)
+    try:
+        root.after(1, heartbeat)
+        worker.start()
+        deadline = time.monotonic() + 3
+        while not completed.is_set() and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.005)
+        worker.join(1)
+
+        assert completed.is_set()
+        assert worker.is_alive() is False
+        assert len(heartbeats) >= 5
+        assert results[0] is None
+        assert results[1:] == ["fast-1", "fast-2", "fast-3"]
+        assert broker._slot_epochs[0] == initial_epochs[0] + 1
+        assert tuple(broker._slot_epochs[1:]) == initial_epochs[1:]
+        assert len(broker._active) == 4
+    finally:
+        root.destroy()
+        assert broker.close() is True
+
+
+def test_main_freeze_support_precedes_tkinter_and_product_imports():
+    source = Path(main_module.__file__).read_text(encoding="utf-8-sig")
+
+    freeze_index = source.index("multiprocessing.freeze_support()")
+    assert freeze_index < source.index("from tkinter import")
+    assert freeze_index < source.index("from adapters.background_capability import")
 
 
 def test_application_shutdown_stops_monitor_before_observation_broker():
@@ -380,7 +495,8 @@ def test_real_tk_build_services_timers_only_consume_published_broker_snapshot(
         }
         assert callbacks_completed == callbacks_scheduled
         assert heartbeat == ["alive"]
-        assert broker._active == {}
+        assert len(broker._active) == 4
+        assert all(worker.process.is_alive() for worker in broker._active.values())
         assert groups.group("timer-group").entries[0].role_id == "role-100"
         assert runtime_calls == {
             "plan": 0,
@@ -479,10 +595,10 @@ def test_real_tk_build_services_timers_only_consume_published_broker_snapshot(
         replacement_published = threading.Event()
         old_snapshot_released = threading.Event()
         invalidation_failures = []
-        original_current_snapshot = broker.current_snapshot
+        original_stable_snapshot = broker.stable_snapshot
 
-        def barrier_current_snapshot():
-            snapshot = original_current_snapshot()
+        def barrier_stable_snapshot():
+            snapshot = original_stable_snapshot()
             if (
                 not old_snapshot_returned.is_set()
                 and any(
@@ -497,8 +613,8 @@ def test_real_tk_build_services_timers_only_consume_published_broker_snapshot(
 
         monkeypatch.setattr(
             broker,
-            "current_snapshot",
-            barrier_current_snapshot,
+            "stable_snapshot",
+            barrier_stable_snapshot,
         )
 
         def publish_replacement():
@@ -592,8 +708,10 @@ def test_timer_source_contains_no_direct_capture_or_role_read():
 
     assert "capture_service.read(" not in obsidian
     assert "role_id_template_service.read_if_missing(" not in role
-    assert ".current_snapshot()" in obsidian
-    assert ".current_snapshot()" in role
+    assert ".stable_snapshot()" in obsidian
+    assert ".stable_snapshot()" in role
+    assert ".current_snapshot()" not in obsidian
+    assert ".current_snapshot()" not in role
     assert "unique_window_for_group_entry" not in role
     assert "group_launch_service.plan" not in role
 

@@ -1,14 +1,19 @@
 import json
 from dataclasses import replace
 from threading import Event
+from time import monotonic, sleep
 
-from adapters.windows_input_sync import WindowInputPolicy
+from adapters.windows_input_sync import (
+    WindowInputPolicy,
+    same_stable_window_instance,
+)
 from adapters.windows_pointer_sync import (
     Win32PointerMessageBackend,
     WindowsPointerSyncController,
 )
 from adapters.windows_window import WindowInfo
 from core.reconnect_policy import ReconnectScreenState
+from core.window_instance import WindowInstanceToken
 from domain.sync_target_settings import SyncTargetSettings
 from services.deferred_sync_operation_service import (
     DeferredSyncOperationService,
@@ -23,8 +28,10 @@ def _window(handle, *, minimized=False):
         minimized=minimized,
         rect=(0, 0, 900, 600),
         process_id=100 + handle,
+        thread_id=200 + handle,
         window_class="Flash",
         launch_fingerprint=f"{handle:064x}",
+        process_lifecycle_token=300 + handle,
     )
 
 
@@ -79,6 +86,22 @@ class AdjustedMessages(Messages):
         return True
 
 
+class MutableInstanceVerifier:
+    def __init__(self, windows):
+        self.current = {
+            window.handle: WindowInstanceToken.from_window(window)
+            for window in windows
+        }
+        self.checked = Event()
+
+    def is_current(self, instance):
+        self.checked.set()
+        return same_stable_window_instance(
+            self.current.get(instance.handle),
+            instance,
+        )
+
+
 class Win32Function:
     def __init__(self, callback):
         self._callback = callback
@@ -116,12 +139,13 @@ class Win32PointerApi:
         result_pointer._obj.value = 1
         return True
 
-def _controller(windows, messages):
+def _controller(windows, messages, *, verifier=None):
     controller = WindowsPointerSyncController(
         expected_windows=len(windows),
         title_keywords=("Adobe Flash Player",),
         window_backend=Windows(windows),
         message_backend=messages,
+        instance_verifier=verifier,
     )
     allowed = tuple(window.launch_fingerprint for window in windows)
     controller.set_allowed_fingerprints(allowed)
@@ -529,7 +553,7 @@ def test_identity_mismatch_sends_nothing():
     assert messages.sent == []
 
 
-def test_one_reconnecting_role_pauses_pointer_sync_for_entire_group():
+def test_one_reconnecting_role_defers_only_that_pointer_target():
     windows = [_window(1), _window(2), _window(3)]
     messages = Messages()
     deferred = DeferredSyncOperationService()
@@ -553,20 +577,22 @@ def test_one_reconnecting_role_pauses_pointer_sync_for_entire_group():
         policy=WindowInputPolicy.ALL,
     )
 
-    assert result.failure_codes == ("sync_group_deferred_reconnect",)
-    assert messages.sent == []
-    assert deferred.pending() == 2
+    assert result.failure_codes == ("sync_deferred_reconnect",)
+    assert messages.sent == [(2, 0.5, 0.5, "left_down")]
+    assert deferred.pending() == 1
+    assert deferred.pending(windows[2].launch_fingerprint) == 1
 
 
 def test_reconnecting_pointer_preserves_background_policy_eligibility(tmp_path):
     windows = [_window(1), _window(2, minimized=True), _window(3)]
     state_path = tmp_path / "deferred.json"
     deferred = DeferredSyncOperationService(state_path=state_path)
+    messages = Messages()
     controller = WindowsPointerSyncController(
         expected_windows=3,
         title_keywords=("Adobe Flash Player",),
         window_backend=Windows(windows),
-        message_backend=Messages(),
+        message_backend=messages,
         deferred_service=deferred,
         reconnecting_provider=lambda: (windows[2].launch_fingerprint,),
     )
@@ -583,7 +609,8 @@ def test_reconnecting_pointer_preserves_background_policy_eligibility(tmp_path):
     )
     saved = json.loads(state_path.read_text(encoding="utf-8"))
 
-    assert result.failure_codes == ("sync_group_deferred_reconnect",)
+    assert result.failure_codes == ("sync_deferred_reconnect",)
+    assert messages.sent == []
     assert deferred.pending() == 1
     assert saved["items"][0]["target_id"] == windows[2].launch_fingerprint
     assert saved["items"][0]["payload"]["policy"] == (
@@ -596,11 +623,12 @@ def test_closed_reconnecting_role_is_deferred_for_pointer_all_policy(tmp_path):
     allowed = (f"{1:064x}", f"{2:064x}", f"{3:064x}")
     state_path = tmp_path / "deferred.json"
     deferred = DeferredSyncOperationService(state_path=state_path)
+    messages = Messages()
     controller = WindowsPointerSyncController(
         expected_windows=3,
         title_keywords=("Adobe Flash Player",),
         window_backend=Windows(windows, foreground=1),
-        message_backend=Messages(),
+        message_backend=messages,
         deferred_service=deferred,
         reconnecting_provider=lambda: (allowed[-1],),
     )
@@ -615,11 +643,11 @@ def test_closed_reconnecting_role_is_deferred_for_pointer_all_policy(tmp_path):
     )
     saved = json.loads(state_path.read_text(encoding="utf-8"))
 
-    assert result.failure_codes == ("sync_group_deferred_reconnect",)
+    assert result.failure_codes == ("sync_deferred_reconnect",)
     assert result.eligible_windows == 2
+    assert messages.sent == [(2, 0.5, 0.5, "left_down")]
     assert {item["target_id"] for item in saved["items"]} == {
-        allowed[1],
-        allowed[2],
+        allowed[-1],
     }
 
 
@@ -627,11 +655,12 @@ def test_closed_reconnecting_pointer_foreground_only_defers_only_source():
     windows = [_window(1)]
     allowed = (f"{1:064x}", f"{2:064x}")
     deferred = DeferredSyncOperationService()
+    messages = Messages()
     controller = WindowsPointerSyncController(
         expected_windows=2,
         title_keywords=("Adobe Flash Player",),
         window_backend=Windows(windows, foreground=1),
-        message_backend=Messages(),
+        message_backend=messages,
         deferred_service=deferred,
         reconnecting_provider=lambda: (allowed[-1],),
     )
@@ -646,9 +675,10 @@ def test_closed_reconnecting_pointer_foreground_only_defers_only_source():
         include_source=True,
     )
 
-    assert result.failure_codes == ("sync_group_deferred_reconnect",)
-    assert deferred.pending() == 1
-    assert deferred.pending(allowed[0]) == 1
+    assert result.failure_codes == ()
+    assert messages.sent == [(1, 0.5, 0.5, "left_down")]
+    assert deferred.pending() == 0
+    assert deferred.pending(allowed[0]) == 0
     assert deferred.pending(allowed[1]) == 0
 
 
@@ -659,11 +689,12 @@ def test_closed_reconnecting_pointer_background_policy_excludes_known_minimized(
     allowed = (f"{1:064x}", f"{2:064x}", f"{3:064x}")
     state_path = tmp_path / "deferred.json"
     deferred = DeferredSyncOperationService(state_path=state_path)
+    messages = Messages()
     controller = WindowsPointerSyncController(
         expected_windows=3,
         title_keywords=("Adobe Flash Player",),
         window_backend=Windows(windows, foreground=1),
-        message_backend=Messages(),
+        message_backend=messages,
         deferred_service=deferred,
         reconnecting_provider=lambda: (allowed[-1],),
     )
@@ -676,21 +707,23 @@ def test_closed_reconnecting_pointer_background_policy_excludes_known_minimized(
         event="left_down",
         policy=WindowInputPolicy.FOREGROUND_BACKGROUND,
     )
+    assert result.failure_codes == ("sync_deferred_reconnect",)
     saved = json.loads(state_path.read_text(encoding="utf-8"))
-
-    assert result.failure_codes == ("sync_group_deferred_reconnect",)
-    assert [item["target_id"] for item in saved["items"]] == [allowed[-1]]
+    assert {item["target_id"] for item in saved["items"]} == {allowed[-1]}
+    assert messages.sent == []
+    assert deferred.pending() == 1
 
 
 def test_pointer_background_policy_defers_missing_when_source_is_only_visible():
     windows = [_window(1)]
     allowed = (f"{1:064x}", f"{2:064x}")
     deferred = DeferredSyncOperationService()
+    messages = Messages()
     controller = WindowsPointerSyncController(
         expected_windows=2,
         title_keywords=("Adobe Flash Player",),
         window_backend=Windows(windows, foreground=1),
-        message_backend=Messages(),
+        message_backend=messages,
         deferred_service=deferred,
         reconnecting_provider=lambda: (allowed[-1],),
     )
@@ -704,8 +737,10 @@ def test_pointer_background_policy_defers_missing_when_source_is_only_visible():
         policy=WindowInputPolicy.FOREGROUND_BACKGROUND,
     )
 
-    assert result.failure_codes == ("sync_group_deferred_reconnect",)
+    assert result.failure_codes == ("sync_deferred_reconnect",)
+    assert messages.sent == []
     assert deferred.pending() == 1
+    assert deferred.pending(allowed[-1]) == 1
 
 
 def test_closed_non_reconnecting_pointer_role_fails_closed():
@@ -761,7 +796,7 @@ def test_partial_pointer_reconnect_with_unknown_flash_identity_fails_closed():
     assert deferred.pending() == 0
 
 
-def test_release_uses_original_pressed_targets_after_source_leaves_group():
+def test_release_stops_when_captured_source_leaves_group():
     windows = [_window(1), _window(2), _window(3)]
     messages = Messages()
     controller = _controller(windows, messages)
@@ -782,10 +817,11 @@ def test_release_uses_original_pressed_targets_after_source_leaves_group():
         policy=WindowInputPolicy.ALL,
     )
 
-    assert result.passed is True
-    assert messages.sent[-2:] == [
-        (2, 0.2, 0.3, "left_up"),
-        (3, 0.2, 0.3, "left_up"),
+    assert result.passed is False
+    assert result.failure_codes == ("source_instance_changed",)
+    assert messages.sent == [
+        (2, 0.2, 0.3, "left_down"),
+        (3, 0.2, 0.3, "left_down"),
     ]
 
 
@@ -814,14 +850,16 @@ def test_reconnecting_group_persists_atomic_click_for_every_target(tmp_path):
     )
     saved = json.loads(state_path.read_text(encoding="utf-8"))
 
-    assert result.failure_codes == ("sync_group_deferred_reconnect",)
-    assert deferred.pending() == 3
-    assert messages.sent == []
-    assert [item["payload"]["event"] for item in saved["items"]] == [
-        "click",
-        "click",
-        "click",
+    assert result.failure_codes == ("sync_deferred_reconnect",)
+    assert deferred.pending() == 1
+    assert messages.sent == [
+        (1, 0.5, 0.5, "left_down"),
+        (1, 0.5, 0.5, "left_up"),
+        (2, 0.5, 0.5, "left_down"),
+        (2, 0.5, 0.5, "left_up"),
     ]
+    assert [item["payload"]["event"] for item in saved["items"]] == ["click"]
+    assert saved["items"][0]["target_id"] == windows[2].launch_fingerprint
 
 
 def test_reconnecting_group_ignores_click_from_non_game_window():
@@ -895,3 +933,257 @@ def test_unknown_flash_identity_must_block_physical_fallback():
 
     assert controller.source_is_eligible(1) is False
     assert controller.source_must_block_physical_fallback(1) is True
+
+
+def test_pointer_immediate_skips_reused_target_and_sends_safe_sibling():
+    windows = [_window(1), _window(2), _window(3)]
+    messages = Messages()
+    verifier = MutableInstanceVerifier(windows)
+    verifier.current[2] = WindowInstanceToken.from_window(
+        replace(windows[1], process_lifecycle_token=9002)
+    )
+    controller = _controller(windows, messages, verifier=verifier)
+
+    result = controller.send(
+        source_handle=1,
+        x_ratio=0.2,
+        y_ratio=0.3,
+        event="move",
+        policy=WindowInputPolicy.ALL,
+    )
+
+    assert messages.sent == [(3, 0.2, 0.3, "move")]
+    assert result.sent_windows == 1
+    assert "input_target_instance_changed" in result.failure_codes
+
+
+def test_pointer_source_replacement_stops_all_remaining_targets():
+    windows = [_window(1), _window(2), _window(3)]
+    messages = Messages()
+    verifier = MutableInstanceVerifier(windows)
+    verifier.current[1] = WindowInstanceToken.from_window(
+        replace(windows[0], process_lifecycle_token=9001)
+    )
+    controller = _controller(windows, messages, verifier=verifier)
+
+    result = controller.send(
+        source_handle=1,
+        x_ratio=0.2,
+        y_ratio=0.3,
+        event="move",
+        policy=WindowInputPolicy.ALL,
+    )
+
+    assert messages.sent == []
+    assert "source_instance_changed" in result.failure_codes
+
+
+def test_pointer_delayed_delivery_rejects_captured_target_replacement():
+    windows = [_window(1), _window(2)]
+    messages = Messages()
+    verifier = MutableInstanceVerifier(windows)
+    controller = _controller(windows, messages, verifier=verifier)
+    controller.set_target_settings(
+        {windows[1].launch_fingerprint: SyncTargetSettings(delay_ms=30)}
+    )
+    try:
+        result = controller.send(
+            source_handle=1,
+            x_ratio=0.2,
+            y_ratio=0.3,
+            event="move",
+            policy=WindowInputPolicy.ALL,
+        )
+        verifier.current[2] = WindowInstanceToken.from_window(
+            replace(windows[1], process_lifecycle_token=9002)
+        )
+
+        assert result.scheduled_windows == 1
+        assert verifier.checked.wait(0.5)
+        sleep(0.05)
+        assert messages.sent == []
+    finally:
+        controller._dispatch_scheduler.close()
+
+
+def test_pointer_reconnect_delivery_persists_source_and_binds_new_target(
+    tmp_path,
+):
+    windows = [_window(1), _window(2)]
+    backend = Windows(windows)
+    messages = Messages()
+    verifier = MutableInstanceVerifier(windows)
+    state_path = tmp_path / "pointer-instances.json"
+    deferred = DeferredSyncOperationService(state_path=state_path)
+    target = windows[1].launch_fingerprint
+    states = {
+        windows[0].launch_fingerprint: ReconnectScreenState.CONNECTED,
+        target: ReconnectScreenState.LOGIN_START,
+    }
+    controller = WindowsPointerSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (target,),
+        screen_state_provider=states.get,
+        instance_verifier=verifier,
+    )
+    controller.set_allowed_fingerprints(
+        window.launch_fingerprint for window in windows
+    )
+    result = controller.send(
+        source_handle=1,
+        x_ratio=0.2,
+        y_ratio=0.3,
+        event="left_down",
+        policy=WindowInputPolicy.ALL,
+    )
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    replacement = replace(
+        windows[1],
+        handle=20,
+        process_id=920,
+        thread_id=820,
+        process_lifecycle_token=720,
+    )
+    backend.windows[1] = replacement
+    verifier.current.pop(2)
+    verifier.current[20] = WindowInstanceToken.from_window(replacement)
+    states[target] = ReconnectScreenState.CONNECTED
+    deferred.process_ready(
+        reconnecting_targets=(),
+        failed_targets=(),
+        ready_targets=(target,),
+    )
+    deadline = monotonic() + 1.0
+    while deferred.pending() and monotonic() < deadline:
+        sleep(0.01)
+
+    assert result.failure_codes == ("sync_deferred_reconnect",)
+    assert saved["items"][0]["payload"]["target_fingerprint"] == target
+    assert saved["items"][0]["payload"]["reconnect_target"] is True
+    assert "target_instance" not in saved["items"][0]["payload"]
+    assert deferred.pending() == 0
+    assert messages.sent == [(20, 0.2, 0.3, "left_down")]
+    assert deferred.failures() == ()
+
+
+def test_pointer_reconnect_delivery_rejects_replaced_source(tmp_path):
+    windows = [_window(1), _window(2)]
+    backend = Windows(windows)
+    messages = Messages()
+    verifier = MutableInstanceVerifier(windows)
+    deferred = DeferredSyncOperationService(
+        state_path=tmp_path / "pointer-source.json"
+    )
+    target = windows[1].launch_fingerprint
+    states = {
+        windows[0].launch_fingerprint: ReconnectScreenState.CONNECTED,
+        target: ReconnectScreenState.LOGIN_START,
+    }
+    controller = WindowsPointerSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: (target,),
+        screen_state_provider=states.get,
+        instance_verifier=verifier,
+    )
+    controller.set_allowed_fingerprints(
+        window.launch_fingerprint for window in windows
+    )
+
+    controller.send(
+        source_handle=1,
+        x_ratio=0.2,
+        y_ratio=0.3,
+        event="left_down",
+        policy=WindowInputPolicy.ALL,
+    )
+    verifier.current[1] = WindowInstanceToken.from_window(
+        replace(windows[0], process_lifecycle_token=901)
+    )
+    states[target] = ReconnectScreenState.CONNECTED
+    deferred.process_ready(
+        reconnecting_targets=(),
+        failed_targets=(),
+        ready_targets=(target,),
+    )
+    deadline = monotonic() + 1.0
+    while deferred.pending() and monotonic() < deadline:
+        sleep(0.01)
+
+    assert deferred.pending() == 0
+    assert messages.sent == []
+    assert len(deferred.failures()) == 1
+
+
+def test_pointer_left_up_clears_reused_handle_without_sending_new_window():
+    windows = [_window(1), _window(2)]
+    messages = Messages()
+    verifier = MutableInstanceVerifier(windows)
+    controller = _controller(windows, messages, verifier=verifier)
+
+    down = controller.send(
+        source_handle=1,
+        x_ratio=0.2,
+        y_ratio=0.3,
+        event="left_down",
+        policy=WindowInputPolicy.ALL,
+    )
+    verifier.current[2] = WindowInstanceToken.from_window(
+        replace(windows[1], process_lifecycle_token=9002)
+    )
+    up = controller.send(
+        source_handle=1,
+        x_ratio=0.8,
+        y_ratio=0.9,
+        event="left_up",
+        policy=WindowInputPolicy.ALL,
+    )
+
+    assert down.sent_windows == 1
+    assert up.sent_windows == 0
+    assert messages.sent == [(2, 0.2, 0.3, "left_down")]
+    assert controller.has_pressed_targets() is False
+
+
+def test_pointer_pressed_state_survives_same_instance_move_and_minimize():
+    windows = [_window(1), _window(2)]
+    messages = Messages()
+    verifier = MutableInstanceVerifier(windows)
+    controller = _controller(windows, messages, verifier=verifier)
+
+    down = controller.send(
+        source_handle=1,
+        x_ratio=0.2,
+        y_ratio=0.3,
+        event="left_down",
+        policy=WindowInputPolicy.ALL,
+    )
+    moved = replace(
+        windows[1],
+        rect=(20, 30, 920, 630),
+        minimized=True,
+    )
+    windows[1] = moved
+    verifier.current[2] = WindowInstanceToken.from_window(moved)
+    up = controller.send(
+        source_handle=1,
+        x_ratio=0.8,
+        y_ratio=0.9,
+        event="left_up",
+        policy=WindowInputPolicy.ALL,
+    )
+
+    assert down.sent_windows == 1
+    assert up.sent_windows == 1
+    assert messages.sent == [
+        (2, 0.2, 0.3, "left_down"),
+        (2, 0.2, 0.3, "left_up"),
+    ]
+    assert controller.has_pressed_targets() is False

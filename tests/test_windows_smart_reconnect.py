@@ -70,6 +70,7 @@ from services.smart_reconnect_evidence_store import (
 from services.smart_reconnect_target_identity_service import (
     SmartReconnectTargetIdentity,
 )
+from core.target_window_contract import ObservationActionLease
 from services.identity_data_transaction_coordinator import (
     IdentityDataTransactionCoordinator,
 )
@@ -129,6 +130,11 @@ class StaticControllerObservationBroker:
         self.refresh_calls = 0
         self.seal_witness_calls = []
         self.events = None
+        self.lease = ObservationActionLease(
+            1,
+            snapshot.generation,
+            time.monotonic() + 120,
+        )
 
     def latest_snapshot(self):
         self.latest_calls += 1
@@ -138,6 +144,13 @@ class StaticControllerObservationBroker:
         self.latest_calls += 1
         return self.snapshot if self.current else None
 
+    def stable_snapshot(self):
+        self.latest_calls += 1
+        return self.snapshot
+
+    def action_snapshot(self):
+        return (self.snapshot, self.lease) if self.current else None
+
     def published_snapshot_without_wait(self):
         return self.snapshot if self.current else None
 
@@ -145,6 +158,22 @@ class StaticControllerObservationBroker:
         if not self.is_generation_current(generation):
             return False, None
         return True, callback()
+
+    def run_if_action_current(self, lease, callback):
+        if (
+            not self.current
+            or lease is not self.lease
+            or lease.deadline_monotonic <= time.monotonic()
+        ):
+            return False, None
+        return True, callback()
+
+    def seal_is_witnessed(self, expected):
+        return (
+            self.current
+            and self.lease.deadline_monotonic > time.monotonic()
+            and expected in self.seal_witness_calls
+        )
 
     def seal_is_witnessed_without_wait(self, expected):
         return expected in self.seal_witness_calls
@@ -161,6 +190,9 @@ class StaticControllerObservationBroker:
         if self.events is not None:
             self.events.append(("seal_witness", expected))
         return object()
+
+    def revalidate_reopen_seal(self, expected):
+        return self.seal_witness(expected)
 
 
 class FullyVisibleWindowBackend(FakeWindowBackend):
@@ -2203,7 +2235,7 @@ def _controller_observation_snapshot(windows, *, generation=1):
                     reference_name="connected",
                 ),
                 fresh_capture=True,
-                capture_route="print_window",
+                capture_route="visible",
                 role_id=None,
             )
             for window in windows
@@ -2247,7 +2279,7 @@ def test_broker_passive_observation_reads_latest_without_refresh_or_direct_io():
     assert broker.refresh_calls == 0
 
 
-def test_broker_passive_observation_rejects_noncurrent_connected_snapshot():
+def test_broker_passive_observation_keeps_stable_connected_snapshot_during_refresh():
     window = make_window(1)
     broker = StaticControllerObservationBroker(
         _controller_observation_snapshot((window,), generation=8)
@@ -2267,7 +2299,7 @@ def test_broker_passive_observation_rejects_noncurrent_connected_snapshot():
     observed = controller.observe_screen_states((window.launch_fingerprint,))
 
     assert observed == {
-        window.launch_fingerprint: ReconnectScreenState.UNKNOWN,
+        window.launch_fingerprint: ReconnectScreenState.CONNECTED,
     }
 
 
@@ -2378,16 +2410,16 @@ def test_scan_waiting_for_broker_holds_no_scan_config_or_identity_lock(
     identity = IdentityDataTransactionCoordinator()
     entered = threading.Event()
     results = []
-    original_current = broker.current_snapshot
+    original_action = broker.action_snapshot
 
-    def announced_current_snapshot():
+    def announced_action_snapshot():
         entered.set()
-        return original_current()
+        return original_action()
 
     monkeypatch.setattr(
         broker,
-        "current_snapshot",
-        announced_current_snapshot,
+        "action_snapshot",
+        announced_action_snapshot,
     )
     with broker._state_lock:
         worker = threading.Thread(
@@ -2409,6 +2441,37 @@ def test_scan_waiting_for_broker_holds_no_scan_config_or_identity_lock(
 
     assert worker.is_alive() is False
     assert len(results) == 1
+    assert broker.close() is True
+
+
+def test_execution_stop_invalidates_real_broker_action_but_keeps_stable_view(
+    tmp_path,
+):
+    window = make_window(1)
+    broker = WindowsSmartReconnectObservationBroker(reference_dir=tmp_path)
+    serial = broker._next_request()
+    published = broker._publish(
+        serial,
+        _controller_observation_snapshot((window,), generation=0),
+    )
+    assert published is not None
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        observation_broker=broker,
+    )
+    action = broker.action_snapshot()
+    assert action is not None
+
+    assert fixture.controller.set_execution_enabled(False) is True
+
+    assert broker.action_snapshot() is None
+    assert broker.run_if_action_current(action[1], lambda: "late") == (
+        False,
+        None,
+    )
+    assert broker.stable_snapshot() is published
     assert broker.close() is True
 
 
@@ -2520,6 +2583,160 @@ def test_true_reopen_reads_broker_seal_witness_before_restarter(tmp_path):
         event[0] == "seal_witness" for event in events[:restart_index]
     )
     assert broker.seal_witness_calls[-1] == seal
+
+
+def test_action_lease_is_rechecked_at_click_leaf_and_normal_scan_reads_no_seal(
+    tmp_path,
+):
+    window = make_window(1)
+    plan = make_group_plan(tmp_path, (window,), "leaf-expiry")
+    target = plan.targets[0]
+    seal = ShortcutSeal(
+        ShortcutFileIdentity(target.shortcut_path, 1, 1),
+        f"{1:064x}",
+        window.launch_fingerprint,
+    )
+    observation = SmartReconnectObservationSnapshot(
+        generation=20,
+        windows=(
+            SmartReconnectWindowObservation(
+                window=window,
+                instance=WindowInstanceToken.from_window(window),
+                sample=CaptureSample(2, 2, bytes([2, 0, 0, 255] * 4), True),
+                recognition=ScreenRecognition(
+                    state=ReconnectScreenState.DISCONNECTED,
+                    score=1.0,
+                    click_point=(0.5, 0.5),
+                    reference_name="disconnected",
+                    battle_context=False,
+                ),
+                fresh_capture=True,
+                capture_route="visible",
+                role_id=None,
+            ),
+        ),
+        shortcuts=(
+            SmartReconnectShortcutObservation(
+                str(target.shortcut_path),
+                window.launch_fingerprint,
+                seal,
+            ),
+        ),
+    )
+    broker = StaticControllerObservationBroker(observation)
+    leaf_checks = []
+
+    def expire_at_leaf(lease, _callback):
+        leaf_checks.append(lease)
+        return False, None
+
+    broker.run_if_action_current = expire_at_leaf
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        group_launch_plan=plan,
+        observation_broker=broker,
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert leaf_checks and all(lease is broker.lease for lease in leaf_checks)
+    assert fixture.mouse.clicks == []
+    assert broker.seal_witness_calls == []
+
+
+def test_action_lease_expiring_while_capture_lock_waits_blocks_final_click(
+    tmp_path,
+):
+    window = make_window(1)
+    plan = make_group_plan(tmp_path, (window,), "leaf-lock-expiry")
+    target = plan.targets[0]
+    seal = ShortcutSeal(
+        ShortcutFileIdentity(target.shortcut_path, 1, 1),
+        f"{1:064x}",
+        window.launch_fingerprint,
+    )
+    observation = SmartReconnectObservationSnapshot(
+        generation=21,
+        windows=(
+            SmartReconnectWindowObservation(
+                window=window,
+                instance=WindowInstanceToken.from_window(window),
+                sample=CaptureSample(2, 2, bytes([2, 0, 0, 255] * 4), True),
+                recognition=ScreenRecognition(
+                    state=ReconnectScreenState.DISCONNECTED,
+                    score=1.0,
+                    click_point=(0.5, 0.5),
+                    reference_name="disconnected",
+                    battle_context=False,
+                ),
+                fresh_capture=True,
+                capture_route="visible",
+                role_id=None,
+            ),
+        ),
+        shortcuts=(
+            SmartReconnectShortcutObservation(
+                str(target.shortcut_path),
+                window.launch_fingerprint,
+                seal,
+            ),
+        ),
+    )
+    broker = StaticControllerObservationBroker(observation)
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        group_launch_plan=plan,
+        observation_broker=broker,
+    )
+    fixture.controller.reconnect()
+    broker.lease = ObservationActionLease(
+        2,
+        observation.generation,
+        time.monotonic() + 0.2,
+    )
+    first_check = threading.Event()
+    continue_after_first_check = threading.Event()
+    leaf_checks = []
+
+    def wait_after_first_check(lease, callback):
+        if (
+            not broker.current
+            or lease is not broker.lease
+            or lease.deadline_monotonic <= time.monotonic()
+        ):
+            return False, None
+        leaf_checks.append(lease)
+        first_check.set()
+        if not continue_after_first_check.wait(1):
+            return False, None
+        return True, callback()
+
+    broker.run_if_action_current = wait_after_first_check
+    outcomes = []
+    worker = threading.Thread(
+        target=lambda: outcomes.append(fixture.controller.reconnect()),
+        daemon=True,
+    )
+    worker.start()
+    assert first_check.wait(1) is True
+    fixture.controller._capture_settings_lock.acquire()
+    try:
+        continue_after_first_check.set()
+        while time.monotonic() <= broker.lease.deadline_monotonic:
+            time.sleep(0.005)
+    finally:
+        fixture.controller._capture_settings_lock.release()
+    worker.join(1)
+
+    assert worker.is_alive() is False
+    assert outcomes
+    assert leaf_checks == [broker.lease]
+    assert fixture.mouse.clicks == []
 
 
 def test_controller_never_fails_preparation_without_its_token():

@@ -261,8 +261,12 @@ def test_role_id_is_automatically_read_only_for_connected_missing_roles():
     )
 
     assert (
-        "smart_reconnect_observation_broker.current_snapshot"
+        "smart_reconnect_observation_broker.stable_snapshot"
         in automatic_calls
+    )
+    assert (
+        "smart_reconnect_observation_broker.current_snapshot"
+        not in automatic_calls
     )
     assert isinstance(gate.args[0], ast.Attribute)
     assert isinstance(gate.args[0].value, ast.Name)

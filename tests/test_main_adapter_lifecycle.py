@@ -250,11 +250,20 @@ def test_background_image_runtime_verification_uses_real_service_without_ui(
 def test_run_shuts_down_adapter_after_normal_window_close(monkeypatch, tmp_path):
     adapter = RecordingAdapter()
     prepare_run(monkeypatch, tmp_path, adapter)
+    lock_releases = []
+    monkeypatch.setattr(
+        main_module,
+        "acquire_main_instance_lock",
+        lambda: SimpleNamespace(
+            release=lambda: lock_releases.append(True),
+        ),
+    )
     window = SimpleNamespace(mainloop=lambda: None)
     monkeypatch.setattr(main_module, "create_main_window", lambda status, paths: window)
 
     assert main_module.run(root=tmp_path) == 0
     assert adapter.shutdown_calls == 1
+    assert lock_releases == [True]
 
 
 def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
@@ -605,8 +614,12 @@ def test_obsidian_polling_reschedules_after_a_safe_cycle_failure_and_cancels_on_
     assert "window.after" in schedule_calls
     assert "current_sync_target_windows" in polling_calls
     assert (
-        "smart_reconnect_observation_broker.current_snapshot"
+        "smart_reconnect_observation_broker.stable_snapshot"
         in polling_calls
+    )
+    assert (
+        "smart_reconnect_observation_broker.current_snapshot"
+        not in polling_calls
     )
     assert "published.window_for" in polling_calls
     assert "schedule_registered_obsidian_poll" in polling_calls

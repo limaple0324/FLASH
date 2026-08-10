@@ -12,8 +12,13 @@ from time import perf_counter_ns
 from typing import Iterable, Mapping, Protocol
 
 from adapters.windows_input_sync import (
+    Win32WindowInstanceVerifier,
+    WindowInstanceVerifier,
     WindowInputPolicy,
     normalize_input_policy,
+    same_stable_window_instance,
+    window_instance_from_payload,
+    window_instance_to_payload,
 )
 from adapters.windows_launch_fingerprint import (
     PowerShellLaunchFingerprintResolver,
@@ -29,10 +34,18 @@ from core.reconnect_policy import ReconnectScreenState
 from collections.abc import Callable
 from domain.sync_target_settings import SyncTargetSettings
 from services.sync_dispatch_scheduler import SyncDispatchScheduler
+from core.window_instance import WindowInstanceToken
 
 
 POINTER_EVENTS = frozenset({"move", "left_down", "left_up"})
 POINTER_OPERATIONS = POINTER_EVENTS | {"click"}
+
+
+@dataclass(frozen=True, slots=True)
+class _PressedTarget:
+    instance: WindowInstanceToken
+    x_ratio: float
+    y_ratio: float
 
 
 class PointerMessageBackend(Protocol):
@@ -300,6 +313,7 @@ class WindowsPointerSyncController:
         ) = None,
         operation_gate: GameOperationGate | None = None,
         require_expected_window_count: bool = True,
+        instance_verifier: WindowInstanceVerifier | None = None,
     ) -> None:
         self._expected_windows = max(1, int(expected_windows))
         self._require_expected_window_count = bool(
@@ -323,7 +337,8 @@ class WindowsPointerSyncController:
         self._screen_state_provider = screen_state_provider
         self._target_windows_provider = target_windows_provider
         self._operation_gate = operation_gate
-        self._pressed_targets: dict[int, tuple[float, float]] = {}
+        self._instance_verifier = instance_verifier
+        self._pressed_targets: dict[int, _PressedTarget] = {}
         self._pressed_targets_lock = Lock()
         self._target_settings: dict[str, SyncTargetSettings] = {}
         self._dispatch_scheduler = SyncDispatchScheduler(
@@ -343,6 +358,16 @@ class WindowsPointerSyncController:
         event = payload.get("event")
         x_ratio = payload.get("x_ratio")
         y_ratio = payload.get("y_ratio")
+        target_fingerprint = normalize_launch_fingerprint(
+            payload.get("target_fingerprint")
+        )
+        reconnect_target = payload.get("reconnect_target") is True
+        source_instance = window_instance_from_payload(
+            payload.get("source_instance")
+        )
+        target_instance = window_instance_from_payload(
+            payload.get("target_instance")
+        )
         if (
             not isinstance(event, str)
             or event not in POINTER_OPERATIONS
@@ -350,6 +375,9 @@ class WindowsPointerSyncController:
             or isinstance(x_ratio, bool)
             or not isinstance(y_ratio, (int, float))
             or isinstance(y_ratio, bool)
+            or source_instance is None
+            or target_fingerprint != fingerprint
+            or (not reconnect_target and target_instance is None)
         ):
             return False
         lease = (
@@ -365,6 +393,9 @@ class WindowsPointerSyncController:
                 float(x_ratio),
                 float(y_ratio),
                 event,
+                source_instance,
+                target_instance,
+                reconnect_target=reconnect_target,
             )
         finally:
             if lease is not None:
@@ -408,7 +439,21 @@ class WindowsPointerSyncController:
             target_windows_provider=target_windows_provider,
             operation_gate=operation_gate,
             require_expected_window_count=require_expected_window_count,
+            instance_verifier=Win32WindowInstanceVerifier(),
         )
+
+    def _instance_is_current(
+        self,
+        instance: WindowInstanceToken | None,
+    ) -> bool:
+        if instance is None:
+            return False
+        if self._instance_verifier is None:
+            return True
+        try:
+            return bool(self._instance_verifier.is_current(instance))
+        except Exception:
+            return False
 
     def _record_role_operation(
         self,
@@ -433,6 +478,10 @@ class WindowsPointerSyncController:
         x_ratio: float,
         y_ratio: float,
         event: str,
+        source_instance: WindowInstanceToken,
+        target_instance: WindowInstanceToken | None,
+        *,
+        reconnect_target: bool,
     ) -> bool:
         if (
             self._screen_state_provider is None
@@ -443,14 +492,25 @@ class WindowsPointerSyncController:
         matches = tuple(
             window
             for window in self._all_title_matching_windows()
-            if normalize_launch_fingerprint(window.launch_fingerprint)
-            == fingerprint
+            if (
+                normalize_launch_fingerprint(window.launch_fingerprint)
+                == fingerprint
+                and (
+                    reconnect_target
+                    or same_stable_window_instance(
+                        WindowInstanceToken.from_window(window),
+                        target_instance,
+                    )
+                )
+            )
         )
         if len(matches) != 1:
             return False
         window = matches[0]
+        current_target_instance = WindowInstanceToken.from_window(window)
         if (
-            not self._message_backend.is_window(window.handle)
+            current_target_instance is None
+            or not self._message_backend.is_window(window.handle)
             or not self._message_backend.probe_responsive(
                 window.handle,
                 self._preflight_timeout_ms,
@@ -466,12 +526,19 @@ class WindowsPointerSyncController:
         if self._conflict_arbiter is not None and lease is None:
             return False
         try:
+            if (
+                not self._instance_is_current(source_instance)
+                or not self._instance_is_current(current_target_instance)
+            ):
+                return False
             delivered = self._deliver_pointer_now(
                 window,
                 fingerprint,
                 x_ratio,
                 y_ratio,
                 event,
+                source_instance,
+                current_target_instance,
             )
             if event != "move":
                 self._record_role_operation(
@@ -485,6 +552,40 @@ class WindowsPointerSyncController:
         finally:
             if lease is not None:
                 lease.release()
+
+    def _enqueue_reconnect_pointer(
+        self,
+        fingerprint: str,
+        x_ratio: float,
+        y_ratio: float,
+        event: str,
+        source_instance: WindowInstanceToken | None,
+        *,
+        policy: WindowInputPolicy | None = None,
+        delay_already_applied: bool = False,
+    ) -> bool:
+        if self._deferred_service is None or source_instance is None:
+            return False
+        payload: dict[str, object] = {
+            "x_ratio": x_ratio,
+            "y_ratio": y_ratio,
+            "event": event,
+            "target_fingerprint": fingerprint,
+            "reconnect_target": True,
+            "source_instance": window_instance_to_payload(source_instance),
+        }
+        if policy is not None:
+            payload["policy"] = policy.value
+            payload["source_eligible_at_capture"] = True
+        if delay_already_applied:
+            payload["delay_already_applied"] = True
+        self._deferred_service.enqueue(
+            fingerprint,
+            f"pointer:{event}:{x_ratio:.4f}:{y_ratio:.4f}",
+            kind="pointer",
+            payload=payload,
+        )
+        return True
 
     def set_expected_windows(self, value: int) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -702,7 +803,14 @@ class WindowsPointerSyncController:
         x_ratio: float,
         y_ratio: float,
         event: str,
+        source_instance: WindowInstanceToken,
+        target_instance: WindowInstanceToken,
     ) -> bool:
+        if (
+            not self._instance_is_current(source_instance)
+            or not self._instance_is_current(target_instance)
+        ):
+            return False
         if event == "click":
             down_delivered = self._send_pointer_with_settings(
                 window,
@@ -712,12 +820,19 @@ class WindowsPointerSyncController:
                 "left_down",
             )
             self._remember_pointer_delivery(
-                window.handle,
+                target_instance,
                 x_ratio,
                 y_ratio,
                 "left_down",
                 down_delivered,
             )
+            if (
+                not self._instance_is_current(source_instance)
+                or not self._instance_is_current(target_instance)
+            ):
+                if not self._instance_is_current(target_instance):
+                    self._discard_pressed_instance(target_instance)
+                return False
             try:
                 up_delivered = self._send_pointer_with_settings(
                     window,
@@ -729,14 +844,17 @@ class WindowsPointerSyncController:
             except OSError:
                 up_delivered = False
             self._remember_pointer_delivery(
-                window.handle,
+                target_instance,
                 x_ratio,
                 y_ratio,
                 "left_up",
                 up_delivered,
             )
             if down_delivered and not up_delivered:
-                self._release_pressed_handles((window.handle,))
+                self._release_pressed_handles(
+                    (window.handle,),
+                    source_instance=source_instance,
+                )
             return down_delivered and up_delivered
         delivered = self._send_pointer_with_settings(
             window,
@@ -746,7 +864,7 @@ class WindowsPointerSyncController:
             event,
         )
         self._remember_pointer_delivery(
-            window.handle,
+            target_instance,
             x_ratio,
             y_ratio,
             event,
@@ -773,6 +891,8 @@ class WindowsPointerSyncController:
         y_ratio: float,
         event: str,
         execution_guard: Callable[[], bool] | None,
+        source_instance: WindowInstanceToken,
+        target_instance: WindowInstanceToken,
     ) -> None:
         lease = (
             self._operation_gate.acquire(
@@ -791,6 +911,8 @@ class WindowsPointerSyncController:
                 y_ratio,
                 event,
                 execution_guard,
+                source_instance,
+                target_instance,
             )
         finally:
             if lease is not None:
@@ -803,6 +925,8 @@ class WindowsPointerSyncController:
         y_ratio: float,
         event: str,
         execution_guard: Callable[[], bool] | None,
+        source_instance: WindowInstanceToken,
+        target_instance: WindowInstanceToken,
     ) -> None:
         if execution_guard is not None:
             try:
@@ -810,12 +934,6 @@ class WindowsPointerSyncController:
                     return
             except Exception:
                 return
-        if (
-            self._screen_state_provider is not None
-            and self._screen_state_provider(fingerprint)
-            is not ReconnectScreenState.CONNECTED
-        ):
-            return
         reconnecting = {
             normalized
             for value in self._reconnecting_provider()
@@ -828,18 +946,16 @@ class WindowsPointerSyncController:
         if (
             fingerprint in reconnecting
             and self._deferred_service is not None
-            and self._screen_state_provider is None
         ):
-            self._deferred_service.enqueue(
+            if not self._instance_is_current(source_instance):
+                return
+            self._enqueue_reconnect_pointer(
                 fingerprint,
-                operation,
-                kind="pointer",
-                payload={
-                    "x_ratio": x_ratio,
-                    "y_ratio": y_ratio,
-                    "event": event,
-                    "delay_already_applied": True,
-                },
+                x_ratio,
+                y_ratio,
+                event,
+                source_instance,
+                delay_already_applied=True,
             )
             if event != "move":
                 self._record_role_operation(
@@ -848,9 +964,19 @@ class WindowsPointerSyncController:
                     "延遲到期時斷線，等待重連後補做",
                 )
             return
+        if (
+            self._screen_state_provider is not None
+            and self._screen_state_provider(fingerprint)
+            is not ReconnectScreenState.CONNECTED
+        ):
+            return
         window = self._unique_window_for_fingerprint(fingerprint)
         if (
             window is None
+            or not same_stable_window_instance(
+                WindowInstanceToken.from_window(window),
+                target_instance,
+            )
             or not self._message_backend.is_window(window.handle)
             or not self._message_backend.probe_responsive(
                 window.handle,
@@ -872,12 +998,19 @@ class WindowsPointerSyncController:
         if self._conflict_arbiter is not None and lease is None:
             return
         try:
+            if (
+                not self._instance_is_current(source_instance)
+                or not self._instance_is_current(target_instance)
+            ):
+                return
             delivered = self._deliver_pointer_now(
                 window,
                 fingerprint,
                 x_ratio,
                 y_ratio,
                 event,
+                source_instance,
+                target_instance,
             )
             if event != "move":
                 self._record_role_operation(
@@ -898,7 +1031,7 @@ class WindowsPointerSyncController:
 
     def _remember_pointer_delivery(
         self,
-        handle: int,
+        instance: WindowInstanceToken,
         x_ratio: float,
         y_ratio: float,
         event: str,
@@ -908,38 +1041,81 @@ class WindowsPointerSyncController:
             return
         with self._pressed_targets_lock:
             if event == "left_down":
-                self._pressed_targets[handle] = (x_ratio, y_ratio)
-            elif event == "move" and handle in self._pressed_targets:
-                self._pressed_targets[handle] = (x_ratio, y_ratio)
+                self._pressed_targets[instance.handle] = _PressedTarget(
+                    instance=instance,
+                    x_ratio=x_ratio,
+                    y_ratio=y_ratio,
+                )
+            elif (
+                event == "move"
+                and (
+                    current := self._pressed_targets.get(instance.handle)
+                ) is not None
+                and same_stable_window_instance(current.instance, instance)
+            ):
+                self._pressed_targets[instance.handle] = _PressedTarget(
+                    instance=instance,
+                    x_ratio=x_ratio,
+                    y_ratio=y_ratio,
+                )
             elif event == "left_up":
-                self._pressed_targets.pop(handle, None)
+                current = self._pressed_targets.get(instance.handle)
+                if current is not None and same_stable_window_instance(
+                    current.instance,
+                    instance,
+                ):
+                    self._pressed_targets.pop(instance.handle, None)
 
-    def _release_pressed_handles(self, handles: Iterable[int]) -> int:
+    def _discard_pressed_instance(
+        self,
+        instance: WindowInstanceToken,
+    ) -> None:
+        with self._pressed_targets_lock:
+            current = self._pressed_targets.get(instance.handle)
+            if current is not None and same_stable_window_instance(
+                current.instance,
+                instance,
+            ):
+                self._pressed_targets.pop(instance.handle, None)
+
+    def _release_pressed_handles(
+        self,
+        handles: Iterable[int],
+        *,
+        source_instance: WindowInstanceToken | None = None,
+    ) -> int:
         selected = frozenset(handles)
         with self._pressed_targets_lock:
             pending = tuple(
-                (handle, position)
-                for handle, position in self._pressed_targets.items()
+                (handle, pressed)
+                for handle, pressed in self._pressed_targets.items()
                 if handle in selected
             )
         released = 0
-        for handle, (x_ratio, y_ratio) in pending:
+        for handle, pressed in pending:
+            if (
+                source_instance is not None
+                and not self._instance_is_current(source_instance)
+            ):
+                break
+            if not self._instance_is_current(pressed.instance):
+                self._discard_pressed_instance(pressed.instance)
+                continue
             delivered = False
             try:
                 delivered = bool(
                     self._message_backend.is_window(handle)
                     and self._message_backend.send_pointer(
                         handle,
-                        x_ratio,
-                        y_ratio,
+                        pressed.x_ratio,
+                        pressed.y_ratio,
                         "left_up",
                     )
                 )
             except OSError:
                 delivered = False
             if delivered:
-                with self._pressed_targets_lock:
-                    self._pressed_targets.pop(handle, None)
+                self._discard_pressed_instance(pressed.instance)
                 released += 1
         return released
 
@@ -1220,6 +1396,19 @@ class WindowsPointerSyncController:
     ) -> PointerSyncResult:
         controller_started_ns = perf_counter_ns()
         windows = self._windows()
+        source_window = next(
+            (
+                window
+                for window in windows
+                if window.handle == source_handle
+            ),
+            None,
+        )
+        source_instance = (
+            WindowInstanceToken.from_window(source_window)
+            if source_window is not None
+            else None
+        )
         failures: list[str] = []
         normalized_policy = normalize_input_policy(policy)
         normalized_event = (
@@ -1257,7 +1446,19 @@ class WindowsPointerSyncController:
                         failures=("execution_stopped",),
                         controller_started_ns=controller_started_ns,
                     )
-            released = self._release_pressed_handles(pressed_handles)
+            if not self._instance_is_current(source_instance):
+                return self._result(
+                    discovered_windows=len(windows),
+                    eligible_windows=len(pressed_handles),
+                    sent_windows=0,
+                    event=normalized_event,
+                    failures=("source_instance_changed",),
+                    controller_started_ns=controller_started_ns,
+                )
+            released = self._release_pressed_handles(
+                pressed_handles,
+                source_instance=source_instance,
+            )
             return self._result(
                 discovered_windows=len(windows),
                 eligible_windows=len(pressed_handles),
@@ -1289,6 +1490,8 @@ class WindowsPointerSyncController:
             ),
             None,
         )
+        if execute and source_window is not None and source_instance is None:
+            failures.append("source_instance_incomplete")
         if (
             self._controller_fingerprint is not None
             and source_fingerprint != self._controller_fingerprint
@@ -1405,6 +1608,47 @@ class WindowsPointerSyncController:
                 if include_source or window.handle != source_handle
             )
 
+        visible_policy_fingerprints = tuple(
+            fingerprint
+            for window in eligible
+            if (
+                fingerprint := normalize_launch_fingerprint(
+                    window.launch_fingerprint
+                )
+            )
+            is not None
+        )
+        missing_policy_fingerprints = (
+            ()
+            if normalized_policy is WindowInputPolicy.FOREGROUND_ONLY
+            else missing_allowed
+        )
+        deferred_fingerprints = (
+            tuple(
+                dict.fromkeys(
+                    fingerprint
+                    for fingerprint in (
+                        *visible_policy_fingerprints,
+                        *missing_policy_fingerprints,
+                    )
+                    if (
+                        fingerprint in reconnecting
+                        and (include_source or fingerprint != source_fingerprint)
+                    )
+                )
+            )
+            if execute and self._deferred_service is not None
+            else ()
+        )
+        if deferred_fingerprints:
+            deferred_set = frozenset(deferred_fingerprints)
+            eligible = tuple(
+                window
+                for window in eligible
+                if normalize_launch_fingerprint(window.launch_fingerprint)
+                not in deferred_set
+            )
+
         if self._screen_state_provider is not None:
             if (
                 source_fingerprint is None
@@ -1433,11 +1677,7 @@ class WindowsPointerSyncController:
                 failures=failures,
                 controller_started_ns=controller_started_ns,
             )
-        group_reconnecting = (
-            bool(reconnecting & self._allowed_fingerprint_set)
-            if self._allowed_fingerprint_set is not None
-            else bool(reconnecting)
-        )
+        group_reconnecting = False
         if (
             execute
             and group_reconnecting
@@ -1490,7 +1730,26 @@ class WindowsPointerSyncController:
                     failures=("no_eligible_windows",),
                     controller_started_ns=controller_started_ns,
                 )
+            windows_by_fingerprint = {
+                fingerprint: window
+                for window in windows
+                if (
+                    fingerprint := normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    )
+                ) is not None
+            }
+            enqueued = 0
             for fingerprint in target_fingerprints:
+                target_window = windows_by_fingerprint.get(fingerprint)
+                target_instance = (
+                    WindowInstanceToken.from_window(target_window)
+                    if target_window is not None
+                    else None
+                )
+                if source_instance is None or target_instance is None:
+                    failures.append("deferred_instance_incomplete")
+                    continue
                 self._deferred_service.enqueue(
                     fingerprint,
                     operation,
@@ -1501,8 +1760,15 @@ class WindowsPointerSyncController:
                         "event": normalized_event,
                         "policy": normalized_policy.value,
                         "source_eligible_at_capture": True,
+                        "source_instance": window_instance_to_payload(
+                            source_instance
+                        ),
+                        "target_instance": window_instance_to_payload(
+                            target_instance
+                        ),
                     },
                 )
+                enqueued += 1
                 if normalized_event != "move":
                     self._record_role_operation(
                         fingerprint,
@@ -1511,13 +1777,38 @@ class WindowsPointerSyncController:
                     )
             return self._result(
                 discovered_windows=len(windows),
-                eligible_windows=len(target_fingerprints),
+                eligible_windows=enqueued,
                 sent_windows=0,
                 event=normalized_event,
-                failures=("sync_group_deferred_reconnect",),
+                failures=tuple(
+                    dict.fromkeys(
+                        (*failures, "sync_group_deferred_reconnect")
+                    )
+                ),
                 controller_started_ns=controller_started_ns,
             )
-        if not eligible:
+        deferred = 0
+        for fingerprint in deferred_fingerprints:
+            if self._enqueue_reconnect_pointer(
+                fingerprint,
+                x_ratio,
+                y_ratio,
+                normalized_event,
+                source_instance,
+                policy=normalized_policy,
+            ):
+                deferred += 1
+                if normalized_event != "move":
+                    self._record_role_operation(
+                        fingerprint,
+                        "?郊撌阡",
+                        "?函?蝑????鋆?",
+                    )
+            else:
+                failures.append("deferred_instance_incomplete")
+        if deferred:
+            failures.append("sync_deferred_reconnect")
+        if not eligible and deferred == 0:
             return self._result(
                 discovered_windows=len(windows),
                 eligible_windows=0,
@@ -1526,6 +1817,16 @@ class WindowsPointerSyncController:
                 failures=("no_eligible_windows",),
                 controller_started_ns=controller_started_ns,
             )
+        if not eligible:
+            return self._result(
+                discovered_windows=len(windows),
+                eligible_windows=deferred,
+                sent_windows=0,
+                event=normalized_event,
+                failures=failures,
+                controller_started_ns=controller_started_ns,
+            )
+        delivery_target_count = len(eligible) + deferred
         preflight_started_ns = perf_counter_ns()
         valid_windows = tuple(
             window
@@ -1538,18 +1839,9 @@ class WindowsPointerSyncController:
             perf_counter_ns() - preflight_started_ns,
         )
         if len(valid) != len(eligible):
-            return self._result(
-                discovered_windows=len(windows),
-                eligible_windows=len(eligible),
-                sent_windows=0,
-                event=normalized_event,
-                failures=("input_target_invalid_or_unresponsive",),
-                controller_started_ns=controller_started_ns,
-                preflight_elapsed_ns=preflight_elapsed_ns,
-            )
+            failures.append("input_target_invalid_or_unresponsive")
         sent = 0
         scheduled = 0
-        deferred = 0
         reconnecting = reconnecting
         dispatch_first_ns: int | None = None
         dispatch_last_ns: int | None = None
@@ -1560,6 +1852,10 @@ class WindowsPointerSyncController:
                 fingerprint = normalize_launch_fingerprint(
                     window.launch_fingerprint
                 )
+                target_instance = WindowInstanceToken.from_window(window)
+                if target_instance is None:
+                    failures.append("input_target_instance_incomplete")
+                    continue
                 operation = (
                     f"pointer:{normalized_event}:"
                     f"{x_ratio:.4f}:{y_ratio:.4f}"
@@ -1567,21 +1863,22 @@ class WindowsPointerSyncController:
                 if (
                     fingerprint in reconnecting
                     and self._deferred_service is not None
-                    and self._screen_state_provider is None
                 ):
-                    self._deferred_service.enqueue(
+                    if source_instance is None:
+                        failures.append("source_instance_incomplete")
+                        break
+                    enqueued = self._enqueue_reconnect_pointer(
                         fingerprint,
-                        operation,
-                        kind="pointer",
-                        payload={
-                            "x_ratio": x_ratio,
-                            "y_ratio": y_ratio,
-                            "event": normalized_event,
-                            "policy": normalized_policy.value,
-                            "source_eligible_at_capture": True,
-                        },
+                        x_ratio,
+                        y_ratio,
+                        normalized_event,
+                        source_instance,
+                        policy=normalized_policy,
                     )
-                    deferred += 1
+                    deferred += int(enqueued)
+                    if not enqueued:
+                        failures.append("deferred_instance_incomplete")
+                        continue
                     if normalized_event != "move":
                         self._record_role_operation(
                             fingerprint,
@@ -1598,12 +1895,16 @@ class WindowsPointerSyncController:
                         delayed_x=x_ratio,
                         delayed_y=y_ratio,
                         delayed_event=normalized_event,
-                        delayed_guard=execution_guard: self._run_scheduled_pointer(
+                        delayed_guard=execution_guard,
+                        delayed_source=source_instance,
+                        delayed_target=target_instance: self._run_scheduled_pointer(
                             role_fingerprint,
                             delayed_x,
                             delayed_y,
                             delayed_event,
                             delayed_guard,
+                            delayed_source,
+                            delayed_target,
                         ),
                     )
                     if scheduled_ok:
@@ -1640,6 +1941,15 @@ class WindowsPointerSyncController:
                                 failures.append("execution_stopped")
                                 execution_stopped = True
                                 break
+                        if source_instance is None or not self._instance_is_current(
+                            source_instance
+                        ):
+                            failures.append("source_instance_changed")
+                            execution_stopped = True
+                            break
+                        if not self._instance_is_current(target_instance):
+                            failures.append("input_target_instance_changed")
+                            continue
                         dispatch_started_ns = perf_counter_ns()
                         if dispatch_first_ns is None:
                             dispatch_first_ns = dispatch_started_ns
@@ -1650,6 +1960,8 @@ class WindowsPointerSyncController:
                             x_ratio,
                             y_ratio,
                             normalized_event,
+                            source_instance,
+                            target_instance,
                         )
                         if normalized_event == "left_down" and delivered:
                             batch_down_handles.add(window.handle)
@@ -1667,13 +1979,13 @@ class WindowsPointerSyncController:
                         "同步左鍵",
                         "成功" if delivered else "失敗",
                     )
-        if execute and sent + scheduled + deferred != len(eligible):
+        if execute and sent + scheduled + deferred != delivery_target_count:
             failures.append("input_delivery_failed")
         if execution_stopped:
             self.release_pressed_targets()
         elif (
             normalized_event in {"left_down", "click"}
-            and sent + scheduled + deferred != len(eligible)
+            and sent + scheduled + deferred != delivery_target_count
             and batch_down_handles
         ):
             self._release_pressed_handles(batch_down_handles)
@@ -1687,7 +1999,7 @@ class WindowsPointerSyncController:
         )
         return self._result(
             discovered_windows=len(windows),
-            eligible_windows=len(eligible),
+            eligible_windows=delivery_target_count,
             sent_windows=sent,
             event=normalized_event,
             failures=failures,

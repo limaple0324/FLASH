@@ -416,7 +416,14 @@ class SmartReconnectTargetIdentityService:
     ) -> SmartReconnectObservationSnapshot | None:
         del source
         broker = self._observation_broker
-        return broker.current_snapshot() if broker is not None else None
+        if broker is None:
+            return None
+        stable_reader = getattr(broker, "stable_snapshot", None)
+        return (
+            stable_reader()
+            if callable(stable_reader)
+            else broker.current_snapshot()
+        )
 
     def targets_for_group_from_source_snapshot(
         self,

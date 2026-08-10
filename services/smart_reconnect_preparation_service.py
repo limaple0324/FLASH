@@ -21,7 +21,11 @@ from core.smart_reconnect_authorization import (
     ReconnectSourceIdentity,
     ShortcutSeal,
 )
-from core.target_window_contract import ActualWindowSnapshot
+from core.target_window_contract import (
+    ActualWindowSnapshot,
+    ObservationActionLease,
+    ObservationFreshness,
+)
 from services.identity_data_transaction_coordinator import (
     IdentityDataTransactionCoordinator,
 )
@@ -99,6 +103,10 @@ class SmartReconnectPreparationService:
         self._role_identity_reader = role_identity_reader
         self._observation_broker = observation_broker
         self._prepare_lock = Lock()
+        self._last_static_generation: int | None = None
+        self._last_identity_generation: int | None = None
+        self._last_config_revision: int | None = None
+        self._last_requires_confirmation = True
 
     @property
     def authorization_coordinator(self) -> SmartReconnectAuthorizationCoordinator:
@@ -132,13 +140,24 @@ class SmartReconnectPreparationService:
         launch_mode: ReconnectLaunchMode,
         retained_targets: tuple[ReconnectAuthorizationTarget, ...],
     ) -> ReconnectAuthorizationBatch:
-        preparation_token = self._authorization.begin_reprepare()
+        preparation_token = (
+            self._authorization.begin_reprepare()
+            if self._observation_broker is None
+            else None
+        )
+        authorization_state = self._authorization.state
+        authorization_epoch = self._authorization.epoch
+        authorization_batch = self._authorization.current_authorization()
         try:
             (
                 identity_generation,
                 config_revision,
                 identity_source,
             ) = self._capture_source()
+            self._notify_observation_source(
+                identity_generation,
+                config_revision,
+            )
             window_snapshot = self._target_windows.actual_snapshot()
             observation_snapshot = self._matching_observation_snapshot(
                 window_snapshot
@@ -147,6 +166,22 @@ class SmartReconnectPreparationService:
                 raise SmartReconnectPreparationError(
                     "actual game windows cannot be enumerated safely"
                 )
+            current_batch = self._authorization.current_authorization()
+            if (
+                current_batch is not None
+                and window_snapshot.observation_static_generation > 0
+                and not window_snapshot.changed_fingerprints
+                and self._last_static_generation
+                == window_snapshot.observation_static_generation
+                and self._last_identity_generation == identity_generation
+                and self._last_config_revision == config_revision
+                and not self._last_requires_confirmation
+                and current_batch.launch_mode is launch_mode
+                and current_batch.source.identity_generation
+                == identity_generation
+                and current_batch.source.config_revision == config_revision
+            ):
+                return current_batch
             fingerprints = tuple(
                 target.fingerprint for target in window_snapshot.targets
             )
@@ -173,9 +208,36 @@ class SmartReconnectPreparationService:
                 identity_source,
                 observation_snapshot=observation_snapshot,
             )
-            if evidence_candidates:
+            if observation_snapshot is None:
+                observed_fingerprints = frozenset(
+                    candidate.fingerprint
+                    for candidate in evidence_candidates
+                )
+            else:
+                observed_fingerprints = frozenset(
+                    candidate.fingerprint
+                    for candidate in evidence_candidates
+                    if (
+                        (window := observation_snapshot.window_for(
+                            candidate.fingerprint
+                        ))
+                        is not None
+                        and window.capture_route == "visible"
+                        and window.fresh_capture is True
+                        and window.freshness
+                        is ObservationFreshness.PROVEN_CURRENT
+                        and window.sample is not None
+                        and window.sample.api_succeeded is True
+                    )
+                )
+            persist_candidates = tuple(
+                candidate
+                for candidate in evidence_candidates
+                if candidate.fingerprint in observed_fingerprints
+            )
+            if persist_candidates:
                 evidence_result = self._persist_identity_evidence(
-                    evidence_candidates,
+                    persist_candidates,
                     observations,
                     expected_identity_generation=identity_generation,
                     expected_config_revision=config_revision,
@@ -185,6 +247,7 @@ class SmartReconnectPreparationService:
                         if observation_snapshot is not None
                         else None
                     ),
+                    expected_action_lease=window_snapshot.action_lease,
                 )
                 verified_fingerprints = (
                     evidence_result.confirmed_fingerprints
@@ -194,6 +257,10 @@ class SmartReconnectPreparationService:
                     refreshed_config_revision,
                     identity_source,
                 ) = self._capture_source()
+                self._notify_observation_source(
+                    identity_generation,
+                    refreshed_config_revision,
+                )
                 if refreshed_config_revision != config_revision:
                     raise SmartReconnectPreparationError(
                         "configuration changed during identity enrollment"
@@ -267,8 +334,11 @@ class SmartReconnectPreparationService:
                 frozenset(fingerprints)
                 - frozenset(target.fingerprint for target in targets)
             )
-            return self._publish_if_source_current(
+            batch = self._publish_if_source_current(
                 preparation_token=preparation_token,
+                expected_authorization_state=authorization_state,
+                expected_authorization_epoch=authorization_epoch,
+                expected_authorization_batch=authorization_batch,
                 expected_identity_generation=identity_generation,
                 expected_config_revision=config_revision,
                 expected_identity_source=identity_source,
@@ -288,9 +358,23 @@ class SmartReconnectPreparationService:
                     if observation_snapshot is not None
                     else None
                 ),
+                expected_action_lease=window_snapshot.action_lease,
             )
+            self._last_static_generation = (
+                window_snapshot.observation_static_generation
+            )
+            self._last_identity_generation = identity_generation
+            self._last_config_revision = config_revision
+            self._last_requires_confirmation = bool(
+                frozenset(
+                    candidate.fingerprint for candidate in evidence_candidates
+                )
+                - verified_fingerprints
+            )
+            return batch
         except Exception as error:
-            self._authorization.fail_preparation(preparation_token)
+            if preparation_token is not None:
+                self._authorization.fail_preparation(preparation_token)
             if isinstance(error, SmartReconnectPreparationError):
                 raise
             raise SmartReconnectPreparationError(
@@ -316,6 +400,20 @@ class SmartReconnectPreparationService:
             identity_snapshot.value,
         )
 
+    def _notify_observation_source(
+        self,
+        identity_generation: int,
+        config_revision: int,
+    ) -> None:
+        broker = self._observation_broker
+        notifier = (
+            getattr(broker, "set_identity_source", None)
+            if broker is not None
+            else None
+        )
+        if callable(notifier):
+            notifier(identity_generation, config_revision)
+
     def _matching_observation_snapshot(
         self,
         window_snapshot: ActualWindowSnapshot,
@@ -323,7 +421,13 @@ class SmartReconnectPreparationService:
         broker = self._observation_broker
         if broker is None:
             return None
-        observation = broker.current_snapshot()
+        action_reader = getattr(broker, "action_snapshot", None)
+        action = action_reader() if callable(action_reader) else None
+        if action is not None:
+            observation, action_lease = action
+        else:
+            observation = broker.current_snapshot()
+            action_lease = None
         if (
             observation is None
             or
@@ -331,6 +435,10 @@ class SmartReconnectPreparationService:
             or observation.generation
             != window_snapshot.observation_generation
             or observation.failure_codes
+            or (
+                window_snapshot.action_lease is not None
+                and action_lease is not window_snapshot.action_lease
+            )
         ):
             raise SmartReconnectPreparationError(
                 "window and observation generations disagree"
@@ -462,6 +570,12 @@ class SmartReconnectPreparationService:
             if (
                 window is None
                 or window.instance is None
+                or window.capture_route != "visible"
+                or window.fresh_capture is not True
+                or window.freshness
+                is not ObservationFreshness.PROVEN_CURRENT
+                or window.sample is None
+                or window.sample.api_succeeded is not True
                 or shortcut is None
                 or shortcut.seal is None
                 or shortcut.failure_codes
@@ -497,6 +611,7 @@ class SmartReconnectPreparationService:
         expected_config_revision: int,
         expected_source: SmartReconnectTargetIdentitySourceSnapshot,
         expected_observation_generation: int | None,
+        expected_action_lease: ObservationActionLease | None,
     ) -> SmartReconnectIdentityEvidenceResult:
         def persist_current_evidence():
             with self._config.resource_guard():
@@ -527,8 +642,10 @@ class SmartReconnectPreparationService:
             raise SmartReconnectPreparationError(
                 "observation broker became unavailable"
             )
-        current, result = broker.run_if_generation_current(
+        current, result = self._run_if_observation_current(
+            broker,
             expected_observation_generation,
+            expected_action_lease,
             persist_current_evidence,
         )
         if not current or result is None:
@@ -540,7 +657,10 @@ class SmartReconnectPreparationService:
     def _publish_if_source_current(
         self,
         *,
-        preparation_token: ReconnectPreparationToken,
+        preparation_token: ReconnectPreparationToken | None,
+        expected_authorization_state: object,
+        expected_authorization_epoch: int,
+        expected_authorization_batch: ReconnectAuthorizationBatch | None,
         expected_identity_generation: int,
         expected_config_revision: int,
         expected_identity_source: SmartReconnectTargetIdentitySourceSnapshot,
@@ -551,6 +671,7 @@ class SmartReconnectPreparationService:
         isolated_window_count: int,
         anonymous_isolated_window_count: int,
         expected_observation_generation: int | None = None,
+        expected_action_lease: ObservationActionLease | None = None,
     ) -> ReconnectAuthorizationBatch:
         def publish_current_source():
             with self._config.resource_guard():
@@ -575,8 +696,24 @@ class SmartReconnectPreparationService:
                         raise SmartReconnectPreparationError(
                             "identity or configuration changed during preparation"
                         )
+                    current_token = preparation_token
+                    if current_token is None:
+                        if (
+                            self._authorization.state
+                            is not expected_authorization_state
+                            or self._authorization.epoch
+                            != expected_authorization_epoch
+                            or self._authorization.current_authorization()
+                            is not expected_authorization_batch
+                        ):
+                            raise SmartReconnectPreparationError(
+                                "authorization changed during preparation"
+                            )
+                        current_token = (
+                            self._authorization.begin_reprepare()
+                        )
                     return self._authorization.publish_if_current(
-                        preparation_token,
+                        current_token,
                         source,
                         launch_mode,
                         targets,
@@ -594,8 +731,10 @@ class SmartReconnectPreparationService:
             raise SmartReconnectPreparationError(
                 "observation broker became unavailable"
             )
-        current, batch = broker.run_if_generation_current(
+        current, batch = self._run_if_observation_current(
+            broker,
             expected_observation_generation,
+            expected_action_lease,
             publish_current_source,
         )
         if not current or batch is None:
@@ -603,6 +742,18 @@ class SmartReconnectPreparationService:
                 "observation changed during authorization publish"
             )
         return batch
+
+    @staticmethod
+    def _run_if_observation_current(
+        broker: WindowsSmartReconnectObservationBroker,
+        generation: int,
+        lease: ObservationActionLease | None,
+        callback,
+    ):
+        action_runner = getattr(broker, "run_if_action_current", None)
+        if isinstance(lease, ObservationActionLease) and callable(action_runner):
+            return action_runner(lease, callback)
+        return broker.run_if_generation_current(generation, callback)
 
     def _resolve_seals(
         self,

@@ -30,6 +30,7 @@ from services.deferred_sync_operation_service import (
 )
 from services.game_operation_gate import GameOperationGate
 from core.reconnect_policy import ReconnectScreenState
+from core.window_instance import WindowInstanceToken
 
 
 APPROVED_SYNC_KEYS = frozenset(GAME_SHORTCUT_BY_KEY)
@@ -104,6 +105,200 @@ class KeyMessageBackend(Protocol):
         virtual_keys: tuple[int, ...],
     ) -> bool:
         """Post a modifier chord while preserving down/up ordering."""
+
+
+class WindowInstanceVerifier(Protocol):
+    """Verify one previously captured window instance without enumeration."""
+
+    def is_current(self, instance: WindowInstanceToken) -> bool: ...
+
+
+def same_stable_window_instance(
+    left: WindowInstanceToken | None,
+    right: WindowInstanceToken | None,
+) -> bool:
+    """Compare only the fields that identify one durable Win32 instance."""
+    return bool(
+        isinstance(left, WindowInstanceToken)
+        and isinstance(right, WindowInstanceToken)
+        and left.handle == right.handle
+        and left.process_id == right.process_id
+        and left.thread_id == right.thread_id
+        and left.window_class == right.window_class
+        and left.process_lifecycle_token == right.process_lifecycle_token
+    )
+
+
+class Win32WindowInstanceVerifier:
+    """Fail-closed Win32 verifier for a complete immutable window token."""
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    @staticmethod
+    def _user32():
+        return ctypes.windll.user32 if os.name == "nt" else None
+
+    @staticmethod
+    def _kernel32():
+        return ctypes.windll.kernel32 if os.name == "nt" else None
+
+    @staticmethod
+    def _configure(user32, kernel32) -> None:
+        user32.IsWindow.argtypes = (wintypes.HWND,)
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = (
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetClassNameW.argtypes = (
+            wintypes.HWND,
+            wintypes.LPWSTR,
+            ctypes.c_int,
+        )
+        user32.GetClassNameW.restype = ctypes.c_int
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        )
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+    def is_current(self, instance: WindowInstanceToken) -> bool:
+        if not isinstance(instance, WindowInstanceToken):
+            return False
+        user32 = self._user32()
+        kernel32 = self._kernel32()
+        if user32 is None or kernel32 is None:
+            return False
+        process_handle = None
+        try:
+            self._configure(user32, kernel32)
+            hwnd = wintypes.HWND(instance.handle)
+            if not user32.IsWindow(hwnd):
+                return False
+            process_id = wintypes.DWORD()
+            thread_id = int(
+                user32.GetWindowThreadProcessId(
+                    hwnd,
+                    ctypes.byref(process_id),
+                )
+                or 0
+            )
+            if (
+                thread_id != instance.thread_id
+                or int(process_id.value) != instance.process_id
+            ):
+                return False
+            class_buffer = ctypes.create_unicode_buffer(256)
+            if not user32.GetClassNameW(hwnd, class_buffer, len(class_buffer)):
+                return False
+            if class_buffer.value != instance.window_class:
+                return False
+            process_handle = kernel32.OpenProcess(
+                self.PROCESS_QUERY_LIMITED_INFORMATION,
+                False,
+                instance.process_id,
+            )
+            if not process_handle:
+                return False
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                process_handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return False
+            lifecycle = (
+                int(created.dwHighDateTime) << 32
+            ) | int(created.dwLowDateTime)
+            if lifecycle != instance.process_lifecycle_token:
+                return False
+            if not user32.IsWindow(hwnd):
+                return False
+            final_process_id = wintypes.DWORD()
+            final_thread_id = int(
+                user32.GetWindowThreadProcessId(
+                    hwnd,
+                    ctypes.byref(final_process_id),
+                )
+                or 0
+            )
+            if (
+                final_thread_id != thread_id
+                or final_thread_id != instance.thread_id
+                or int(final_process_id.value) != int(process_id.value)
+                or int(final_process_id.value) != instance.process_id
+            ):
+                return False
+            final_class_buffer = ctypes.create_unicode_buffer(256)
+            if not user32.GetClassNameW(
+                hwnd,
+                final_class_buffer,
+                len(final_class_buffer),
+            ):
+                return False
+            return (
+                final_class_buffer.value == class_buffer.value
+                and final_class_buffer.value == instance.window_class
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
+        finally:
+            if process_handle:
+                try:
+                    kernel32.CloseHandle(process_handle)
+                except (AttributeError, OSError):
+                    pass
+
+
+def window_instance_to_payload(
+    instance: WindowInstanceToken,
+) -> dict[str, object]:
+    return {
+        "handle": instance.handle,
+        "process_id": instance.process_id,
+        "thread_id": instance.thread_id,
+        "window_class": instance.window_class,
+        "rect": list(instance.rect),
+        "minimized": instance.minimized,
+        "process_lifecycle_token": instance.process_lifecycle_token,
+    }
+
+
+def window_instance_from_payload(value: object) -> WindowInstanceToken | None:
+    if not isinstance(value, Mapping):
+        return None
+    rect = value.get("rect")
+    if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+        return None
+    try:
+        return WindowInstanceToken(
+            handle=value.get("handle"),
+            process_id=value.get("process_id"),
+            thread_id=value.get("thread_id"),
+            window_class=value.get("window_class"),
+            rect=tuple(rect),
+            minimized=value.get("minimized"),
+            process_lifecycle_token=value.get("process_lifecycle_token"),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 class Win32KeyMessageBackend:
@@ -351,6 +546,7 @@ class WindowsInputSyncController:
         ) = None,
         operation_gate: GameOperationGate | None = None,
         require_expected_window_count: bool = True,
+        instance_verifier: WindowInstanceVerifier | None = None,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -378,6 +574,7 @@ class WindowsInputSyncController:
         self._screen_state_provider = screen_state_provider
         self._target_windows_provider = target_windows_provider
         self._operation_gate = operation_gate
+        self._instance_verifier = instance_verifier
         self._target_settings: dict[str, SyncTargetSettings] = {}
         self._dispatch_scheduler = SyncDispatchScheduler(
             thread_name="flash-key-delay",
@@ -395,7 +592,22 @@ class WindowsInputSyncController:
         payload: Mapping[str, object],
     ) -> bool:
         key = normalize_approved_key(payload.get("key"))
-        if key is None:
+        target_fingerprint = normalize_launch_fingerprint(
+            payload.get("target_fingerprint")
+        )
+        reconnect_target = payload.get("reconnect_target") is True
+        source_instance = window_instance_from_payload(
+            payload.get("source_instance")
+        )
+        target_instance = window_instance_from_payload(
+            payload.get("target_instance")
+        )
+        if (
+            key is None
+            or source_instance is None
+            or target_fingerprint != fingerprint
+            or (not reconnect_target and target_instance is None)
+        ):
             return False
         lease = (
             self._operation_gate.acquire("keyboard-deferred")
@@ -409,6 +621,9 @@ class WindowsInputSyncController:
                 fingerprint,
                 key,
                 VIRTUAL_KEY_SEQUENCES[key],
+                source_instance,
+                target_instance,
+                reconnect_target=reconnect_target,
             )
         finally:
             if lease is not None:
@@ -556,7 +771,21 @@ class WindowsInputSyncController:
             target_windows_provider=target_windows_provider,
             operation_gate=operation_gate,
             require_expected_window_count=require_expected_window_count,
+            instance_verifier=Win32WindowInstanceVerifier(),
         )
+
+    def _instance_is_current(
+        self,
+        instance: WindowInstanceToken | None,
+    ) -> bool:
+        if instance is None:
+            return False
+        if self._instance_verifier is None:
+            return True
+        try:
+            return bool(self._instance_verifier.is_current(instance))
+        except Exception:
+            return False
 
     def _record_role_operation(
         self,
@@ -580,6 +809,10 @@ class WindowsInputSyncController:
         fingerprint: str,
         normalized_key: str,
         virtual_keys: tuple[int, ...],
+        source_instance: WindowInstanceToken,
+        target_instance: WindowInstanceToken | None,
+        *,
+        reconnect_target: bool,
     ) -> bool:
         if (
             self._screen_state_provider is None
@@ -590,13 +823,25 @@ class WindowsInputSyncController:
         matches = tuple(
             window
             for window in self._all_title_matching_windows()
-            if normalize_launch_fingerprint(window.launch_fingerprint)
-            == fingerprint
+            if (
+                normalize_launch_fingerprint(window.launch_fingerprint)
+                == fingerprint
+                and (
+                    reconnect_target
+                    or same_stable_window_instance(
+                        WindowInstanceToken.from_window(window),
+                        target_instance,
+                    )
+                )
+            )
         )
         if len(matches) != 1:
             return False
         window = matches[0]
+        current_target_instance = WindowInstanceToken.from_window(window)
         if (
+            current_target_instance is None
+            or
             not self._message_backend.is_window(window.handle)
             or not self._message_backend.probe_responsive(
                 window.handle,
@@ -615,6 +860,11 @@ class WindowsInputSyncController:
         if self._conflict_arbiter is not None and lease is None:
             return False
         try:
+            if (
+                not self._instance_is_current(source_instance)
+                or not self._instance_is_current(current_target_instance)
+            ):
+                return False
             if len(virtual_keys) == 1:
                 delivered = bool(
                     self._message_backend.send_virtual_key(
@@ -641,12 +891,44 @@ class WindowsInputSyncController:
             if lease is not None:
                 lease.release()
 
+    def _enqueue_reconnect_key(
+        self,
+        fingerprint: str,
+        normalized_key: str,
+        source_instance: WindowInstanceToken | None,
+        *,
+        policy: WindowInputPolicy | None = None,
+        delay_already_applied: bool = False,
+    ) -> bool:
+        if self._deferred_service is None or source_instance is None:
+            return False
+        payload: dict[str, object] = {
+            "key": normalized_key,
+            "target_fingerprint": fingerprint,
+            "reconnect_target": True,
+            "source_instance": window_instance_to_payload(source_instance),
+        }
+        if policy is not None:
+            payload["policy"] = policy.value
+            payload["source_eligible_at_capture"] = True
+        if delay_already_applied:
+            payload["delay_already_applied"] = True
+        self._deferred_service.enqueue(
+            fingerprint,
+            f"key:{normalized_key}",
+            kind="keyboard",
+            payload=payload,
+        )
+        return True
+
     def _run_scheduled_key(
         self,
         fingerprint: str,
         normalized_key: str,
         virtual_keys: tuple[int, ...],
         execution_guard: Callable[[], bool] | None,
+        source_instance: WindowInstanceToken,
+        target_instance: WindowInstanceToken,
     ) -> None:
         lease = (
             self._operation_gate.acquire(
@@ -664,6 +946,8 @@ class WindowsInputSyncController:
                 normalized_key,
                 virtual_keys,
                 execution_guard,
+                source_instance,
+                target_instance,
             )
         finally:
             if lease is not None:
@@ -675,6 +959,8 @@ class WindowsInputSyncController:
         normalized_key: str,
         virtual_keys: tuple[int, ...],
         execution_guard: Callable[[], bool] | None,
+        source_instance: WindowInstanceToken,
+        target_instance: WindowInstanceToken,
     ) -> None:
         if execution_guard is not None:
             try:
@@ -682,12 +968,6 @@ class WindowsInputSyncController:
                     return
             except Exception:
                 return
-        if (
-            self._screen_state_provider is not None
-            and self._screen_state_provider(fingerprint)
-            is not ReconnectScreenState.CONNECTED
-        ):
-            return
         reconnecting = {
             normalized
             for value in self._reconnecting_provider()
@@ -699,16 +979,14 @@ class WindowsInputSyncController:
         if (
             fingerprint in reconnecting
             and self._deferred_service is not None
-            and self._screen_state_provider is None
         ):
-            self._deferred_service.enqueue(
+            if not self._instance_is_current(source_instance):
+                return
+            self._enqueue_reconnect_key(
                 fingerprint,
-                f"key:{normalized_key}",
-                kind="keyboard",
-                payload={
-                    "key": normalized_key,
-                    "delay_already_applied": True,
-                },
+                normalized_key,
+                source_instance,
+                delay_already_applied=True,
             )
             self._record_role_operation(
                 fingerprint,
@@ -716,11 +994,23 @@ class WindowsInputSyncController:
                 "延遲到期時斷線，等待重連後補做",
             )
             return
+        if (
+            self._screen_state_provider is not None
+            and self._screen_state_provider(fingerprint)
+            is not ReconnectScreenState.CONNECTED
+        ):
+            return
         matches = tuple(
             window
             for window in self._all_title_matching_windows()
-            if normalize_launch_fingerprint(window.launch_fingerprint)
-            == fingerprint
+            if (
+                normalize_launch_fingerprint(window.launch_fingerprint)
+                == fingerprint
+                and same_stable_window_instance(
+                    WindowInstanceToken.from_window(window),
+                    target_instance,
+                )
+            )
         )
         if len(matches) != 1:
             self._record_role_operation(
@@ -754,6 +1044,11 @@ class WindowsInputSyncController:
         if self._conflict_arbiter is not None and lease is None:
             return
         try:
+            if (
+                not self._instance_is_current(source_instance)
+                or not self._instance_is_current(target_instance)
+            ):
+                return
             if len(virtual_keys) == 1:
                 delivered = bool(
                     self._message_backend.send_virtual_key(
@@ -1027,6 +1322,28 @@ class WindowsInputSyncController:
             ),
             None,
         )
+        source_window = next(
+            (
+                window
+                for window in windows
+                if window.handle == captured_source
+            ),
+            None,
+        )
+        source_instance = (
+            WindowInstanceToken.from_window(source_window)
+            if source_window is not None
+            else None
+        )
+        if execute and source_instance is None:
+            return self._base_result(
+                key=normalized_key,
+                policy=normalized_policy,
+                windows=windows,
+                execute=True,
+                failures=("source_instance_incomplete",),
+                controller_started_ns=controller_started_ns,
+            )
         if (
             execute
             and self._controller_fingerprint is not None
@@ -1167,6 +1484,50 @@ class WindowsInputSyncController:
                 if window.handle != captured_source
             )
 
+        visible_policy_fingerprints = tuple(
+            fingerprint
+            for window in eligible
+            if (
+                fingerprint := normalize_launch_fingerprint(
+                    window.launch_fingerprint
+                )
+            )
+            is not None
+        )
+        missing_policy_fingerprints = (
+            ()
+            if normalized_policy is WindowInputPolicy.FOREGROUND_ONLY
+            else missing_allowed
+        )
+        deferred_fingerprints = (
+            tuple(
+                dict.fromkeys(
+                    fingerprint
+                    for fingerprint in (
+                        *visible_policy_fingerprints,
+                        *missing_policy_fingerprints,
+                    )
+                    if (
+                        fingerprint in reconnecting
+                        and not (
+                            exclude_foreground
+                            and fingerprint == source_fingerprint
+                        )
+                    )
+                )
+            )
+            if execute and self._deferred_service is not None
+            else ()
+        )
+        if deferred_fingerprints:
+            deferred_set = frozenset(deferred_fingerprints)
+            eligible = tuple(
+                window
+                for window in eligible
+                if normalize_launch_fingerprint(window.launch_fingerprint)
+                not in deferred_set
+            )
+
         if self._screen_state_provider is not None:
             if (
                 source_fingerprint is None
@@ -1186,11 +1547,7 @@ class WindowsInputSyncController:
                 )
             )
 
-        group_reconnecting = (
-            bool(reconnecting & self._allowed_fingerprint_set)
-            if self._allowed_fingerprint_set is not None
-            else bool(reconnecting)
-        )
+        group_reconnecting = False
         if (
             not failures
             and execute
@@ -1246,7 +1603,26 @@ class WindowsInputSyncController:
                     failures=("no_eligible_windows",),
                     controller_started_ns=controller_started_ns,
                 )
+            windows_by_fingerprint = {
+                fingerprint: window
+                for window in windows
+                if (
+                    fingerprint := normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    )
+                ) is not None
+            }
+            enqueued = 0
             for fingerprint in targets:
+                target_window = windows_by_fingerprint.get(fingerprint)
+                target_instance = (
+                    WindowInstanceToken.from_window(target_window)
+                    if target_window is not None
+                    else None
+                )
+                if source_instance is None or target_instance is None:
+                    failures.append("deferred_instance_incomplete")
+                    continue
                 self._deferred_service.enqueue(
                     fingerprint,
                     f"key:{normalized_key}",
@@ -1255,8 +1631,15 @@ class WindowsInputSyncController:
                         "key": normalized_key,
                         "policy": normalized_policy.value,
                         "source_eligible_at_capture": True,
+                        "source_instance": window_instance_to_payload(
+                            source_instance
+                        ),
+                        "target_instance": window_instance_to_payload(
+                            target_instance
+                        ),
                     },
                 )
+                enqueued += 1
                 self._record_role_operation(
                     fingerprint,
                     f"快捷鍵 {normalized_key}",
@@ -1268,12 +1651,46 @@ class WindowsInputSyncController:
                 windows=windows,
                 eligible=eligible,
                 execute=True,
-                failures=("sync_group_deferred_reconnect",),
+                failures=tuple(
+                    dict.fromkeys(
+                        (*failures, "sync_group_deferred_reconnect")
+                    )
+                ),
                 controller_started_ns=controller_started_ns,
-                eligible_count=len(targets),
+                eligible_count=enqueued,
             )
 
-        if not eligible:
+        if failures:
+            return self._base_result(
+                key=normalized_key,
+                policy=normalized_policy,
+                windows=windows,
+                eligible=eligible,
+                execute=execute,
+                failures=failures,
+                controller_started_ns=controller_started_ns,
+            )
+
+        deferred = 0
+        for fingerprint in deferred_fingerprints:
+            if self._enqueue_reconnect_key(
+                fingerprint,
+                normalized_key,
+                source_instance,
+                policy=normalized_policy,
+            ):
+                deferred += 1
+                self._record_role_operation(
+                    fingerprint,
+                    f"敹急??{normalized_key}",
+                    "?函?蝑????鋆?",
+                )
+            else:
+                failures.append("deferred_instance_incomplete")
+        if deferred:
+            failures.append("sync_deferred_reconnect")
+
+        if not eligible and deferred == 0:
             return self._base_result(
                 key=normalized_key,
                 policy=normalized_policy,
@@ -1283,7 +1700,19 @@ class WindowsInputSyncController:
                 failures=("no_eligible_windows",),
                 controller_started_ns=controller_started_ns,
             )
+        if not eligible:
+            return self._base_result(
+                key=normalized_key,
+                policy=normalized_policy,
+                windows=windows,
+                eligible=eligible,
+                eligible_count=deferred,
+                execute=execute,
+                failures=failures,
+                controller_started_ns=controller_started_ns,
+            )
 
+        delivery_target_count = len(eligible) + deferred
         preflight_started_ns = perf_counter_ns()
         valid_targets = tuple(
             window
@@ -1301,19 +1730,6 @@ class WindowsInputSyncController:
         if len(responsive_targets) != len(eligible):
             failures.append("input_target_unresponsive")
 
-        if failures:
-            return self._base_result(
-                key=normalized_key,
-                policy=normalized_policy,
-                windows=windows,
-                eligible=eligible,
-                responsive=len(responsive_targets),
-                execute=execute,
-                failures=failures,
-                controller_started_ns=controller_started_ns,
-                preflight_elapsed_ns=preflight_elapsed_ns,
-            )
-
         if not execute:
             return self._base_result(
                 key=normalized_key,
@@ -1322,6 +1738,7 @@ class WindowsInputSyncController:
                 eligible=eligible,
                 responsive=len(responsive_targets),
                 execute=False,
+                failures=failures,
                 controller_started_ns=controller_started_ns,
                 preflight_elapsed_ns=preflight_elapsed_ns,
             )
@@ -1329,7 +1746,6 @@ class WindowsInputSyncController:
         virtual_keys = VIRTUAL_KEY_SEQUENCES[normalized_key]
         sent = 0
         scheduled = 0
-        deferred = 0
         reconnecting = reconnecting
         dispatch_first_ns: int | None = None
         dispatch_last_ns: int | None = None
@@ -1337,18 +1753,27 @@ class WindowsInputSyncController:
             fingerprint = normalize_launch_fingerprint(
                 window.launch_fingerprint
             )
+            target_instance = WindowInstanceToken.from_window(window)
+            if target_instance is None:
+                failures.append("input_target_instance_incomplete")
+                continue
             if (
                 fingerprint in reconnecting
                 and self._deferred_service is not None
-                and self._screen_state_provider is None
             ):
-                self._deferred_service.enqueue(
+                if source_instance is None:
+                    failures.append("source_instance_incomplete")
+                    break
+                enqueued = self._enqueue_reconnect_key(
                     fingerprint,
-                    f"key:{normalized_key}",
-                    kind="keyboard",
-                    payload={"key": normalized_key},
+                    normalized_key,
+                    source_instance,
+                    policy=normalized_policy,
                 )
-                deferred += 1
+                deferred += int(enqueued)
+                if not enqueued:
+                    failures.append("deferred_instance_incomplete")
+                    continue
                 self._record_role_operation(
                     fingerprint,
                     f"快捷鍵 {normalized_key}",
@@ -1363,11 +1788,15 @@ class WindowsInputSyncController:
                     lambda role_fingerprint=fingerprint,
                     delayed_key=normalized_key,
                     delayed_virtual_keys=virtual_keys,
-                    delayed_guard=execution_guard: self._run_scheduled_key(
+                    delayed_guard=execution_guard,
+                    delayed_source=source_instance,
+                    delayed_target=target_instance: self._run_scheduled_key(
                         role_fingerprint,
                         delayed_key,
                         delayed_virtual_keys,
                         delayed_guard,
+                        delayed_source,
+                        delayed_target,
                     ),
                 )
                 if scheduled_ok:
@@ -1402,6 +1831,14 @@ class WindowsInputSyncController:
                         if not execution_allowed:
                             failures.append("execution_stopped")
                             break
+                    if source_instance is None or not self._instance_is_current(
+                        source_instance
+                    ):
+                        failures.append("source_instance_changed")
+                        break
+                    if not self._instance_is_current(target_instance):
+                        failures.append("input_target_instance_changed")
+                        continue
                     dispatch_started_ns = perf_counter_ns()
                     if dispatch_first_ns is None:
                         dispatch_first_ns = dispatch_started_ns
@@ -1430,7 +1867,7 @@ class WindowsInputSyncController:
             finally:
                 if lease is not None:
                     lease.release()
-        if sent + scheduled + deferred != len(eligible):
+        if sent + scheduled + deferred != delivery_target_count:
             failures.append("input_delivery_failed")
         dispatch_spread_ns = (
             max(0, dispatch_last_ns - dispatch_first_ns)
@@ -1446,6 +1883,7 @@ class WindowsInputSyncController:
             policy=normalized_policy,
             windows=windows,
             eligible=eligible,
+            eligible_count=delivery_target_count,
             responsive=len(responsive_targets),
             sent=sent,
             execute=True,

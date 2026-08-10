@@ -34,13 +34,26 @@ from adapters.windows_shortcut_seal import Win32ShortcutFileIdentityProvider
 from adapters.windows_window import WindowInfo, Win32WindowBackend
 from core.reconnect_policy import ReconnectScreenState
 from core.smart_reconnect_authorization import ShortcutSeal
+from core.target_window_contract import (
+    ObservationActionLease,
+    ObservationFreshness,
+    ProcessObservationCacheKey,
+    RoleObservationCacheKey,
+    ShortcutObservationCacheKey,
+)
 from core.window_instance import WindowInstanceToken
-from services.role_id_template_service import RoleIdTemplateService
+from adapters.windows_role_id_ocr import WindowsRoleIdOcrReader
+from services.role_id_template_service import (
+    clean_role_id_text,
+    role_id_region_sample,
+)
 
 
 ENUMERATION_TIMEOUT_SECONDS = 3.0
 WINDOW_TIMEOUT_SECONDS = 3.0
 MAX_PARALLEL_WINDOWS = 4
+ACTION_LEASE_SECONDS = 30.0
+WORKER_STOP_SECONDS = 0.5
 
 _RESULT = TypeVar("_RESULT")
 
@@ -54,12 +67,23 @@ def _unknown_recognition() -> ScreenRecognition:
     )
 
 
+def _capture_sha256(sample: CaptureSample | None) -> str | None:
+    if sample is None or not sample.api_succeeded:
+        return None
+    digest = hashlib.sha256()
+    digest.update(sample.width.to_bytes(8, "little", signed=True))
+    digest.update(sample.height.to_bytes(8, "little", signed=True))
+    digest.update(sample.pixels)
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class SmartReconnectShortcutObservation:
     path: str
     fingerprint: str | None
     seal: ShortcutSeal | None
     failure_codes: tuple[str, ...] = ()
+    cache_key: ShortcutObservationCacheKey | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +96,37 @@ class SmartReconnectWindowObservation:
     capture_route: str | None
     role_id: str | None
     failure_codes: tuple[str, ...] = ()
+    freshness: ObservationFreshness | None = None
+    process_cache_key: ProcessObservationCacheKey | None = None
+    role_cache_key: RoleObservationCacheKey | None = None
+    role_region_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        freshness = self.freshness
+        if freshness is None:
+            freshness = (
+                ObservationFreshness.PROVEN_CURRENT
+                if self.fresh_capture
+                else ObservationFreshness.UNPROVEN
+            )
+            object.__setattr__(self, "freshness", freshness)
+        if not isinstance(freshness, ObservationFreshness):
+            raise TypeError("window observation freshness is invalid")
+        if self.fresh_capture is not (
+            freshness is ObservationFreshness.PROVEN_CURRENT
+        ):
+            raise ValueError("window freshness flags disagree")
+        if self.role_region_sha256 is not None:
+            role_region_sha256 = normalize_launch_fingerprint(
+                self.role_region_sha256
+            )
+            if role_region_sha256 is None:
+                raise ValueError("window role-region SHA-256 is invalid")
+            object.__setattr__(
+                self,
+                "role_region_sha256",
+                role_region_sha256,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +140,11 @@ class SmartReconnectEnumerationResult:
 @dataclass(frozen=True, slots=True)
 class SmartReconnectObservationSnapshot:
     generation: int
+    request_serial: int = 0
+    published_at_monotonic: float = 0.0
+    action_deadline_monotonic: float = 0.0
+    static_generation: int = 0
+    changed_fingerprints: frozenset[str] = frozenset()
     windows: tuple[SmartReconnectWindowObservation, ...] = ()
     shortcuts: tuple[SmartReconnectShortcutObservation, ...] = ()
     blocked_fingerprints: frozenset[str] = frozenset()
@@ -108,6 +168,31 @@ class SmartReconnectObservationSnapshot:
             > self.isolated_window_count
         ):
             raise ValueError("anonymous isolation count is invalid")
+        for value, field_name in (
+            (self.request_serial, "request serial"),
+            (self.static_generation, "static generation"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"observation {field_name} must be non-negative")
+        for value, field_name in (
+            (self.published_at_monotonic, "published time"),
+            (self.action_deadline_monotonic, "action deadline"),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value < 0
+            ):
+                raise ValueError(f"observation {field_name} must be non-negative")
+        object.__setattr__(
+            self,
+            "changed_fingerprints",
+            frozenset(
+                fingerprint
+                for value in self.changed_fingerprints
+                if (fingerprint := normalize_launch_fingerprint(value)) is not None
+            ),
+        )
 
     def window_for(
         self,
@@ -141,10 +226,18 @@ class SmartReconnectObservationRequest:
     shortcut_paths: tuple[str, ...] = ()
     shortcut_roots: tuple[str, ...] = ()
     window: WindowInfo | None = None
+    windows: tuple[WindowInfo, ...] = ()
+    cached_role_id: str | None = None
+    role_cache_hit: bool = False
+    role_cache_key: RoleObservationCacheKey | None = None
     visible_capture_enabled: bool = True
     obscured_capture_enabled: bool = True
     minimized_capture_enabled: bool = True
     expected_seal: ShortcutSeal | None = None
+    shortcut_static_observations: tuple[
+        SmartReconnectShortcutObservation,
+        ...,
+    ] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,8 +247,89 @@ class SmartReconnectSealWitness:
     expected_seal: ShortcutSeal
 
 
+@dataclass(frozen=True, slots=True)
+class SmartReconnectObservationJob:
+    request_serial: int
+    job_serial: int
+    worker_epoch: int
+    kind: str
+    deadline_monotonic: float
+    request: SmartReconnectObservationRequest
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkerReply:
+    request_serial: int
+    job_serial: int
+    worker_epoch: int
+    succeeded: bool
+    payload: object | None
+
+
 def _normalized_path(path: Path) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _shortcut_cache_key(path: Path) -> ShortcutObservationCacheKey | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    try:
+        identity = Win32ShortcutFileIdentityProvider().identity_for(path)
+        return ShortcutObservationCacheKey(
+            normalized_path=_normalized_path(path),
+            file_identity=identity,
+            modified_ns=stat.st_mtime_ns,
+            size=stat.st_size,
+            content_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _system_powershell_path() -> str:
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    return os.path.join(
+        system_root,
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+    )
+
+
+def _standard_powershell_environment(
+    source: dict[str, str] | None = None,
+) -> dict[str, str]:
+    environment = dict(source or os.environ)
+    system_root = environment.get("SystemRoot", r"C:\Windows")
+    program_files = environment.get("ProgramFiles", r"C:\Program Files")
+    environment["PSModulePath"] = os.pathsep.join(
+        (
+            os.path.join(
+                system_root,
+                "System32",
+                "WindowsPowerShell",
+                "v1.0",
+                "Modules",
+            ),
+            os.path.join(program_files, "WindowsPowerShell", "Modules"),
+        )
+    )
+    return environment
+
+
+def _run_system_powershell(command, *args, **kwargs):
+    command = list(command)
+    if command:
+        command[0] = _system_powershell_path()
+    kwargs["env"] = _standard_powershell_environment(kwargs.get("env"))
+    previous = _worker_dll_directory_reset()
+    try:
+        return subprocess.run(command, *args, **kwargs)
+    finally:
+        _worker_dll_directory_restore(previous)
 
 
 def _discover_shortcut_paths(
@@ -181,14 +355,122 @@ def _discover_shortcut_paths(
     return tuple(candidates[key] for key in sorted(candidates))
 
 
+class _BoundedPowerShellShortcutFingerprintResolver(
+    PowerShellShortcutFingerprintResolver
+):
+    """Resolve all shortcuts in one process with a deadline per item."""
+
+    _SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
+$resolved = @{}
+$abandoned = New-Object System.Collections.ArrayList
+try {
+    $encoded = [string]$env:FLASH_SHORTCUT_PATHS_B64
+    $paths = @()
+    if (-not [string]::IsNullOrWhiteSpace($encoded)) {
+        $paths = @(
+            [Text.Encoding]::UTF8.GetString(
+                [Convert]::FromBase64String($encoded)
+            ) | ConvertFrom-Json | ForEach-Object { [string]$_ }
+        )
+    }
+    $itemScript = @'
+param([int]$Index, [string]$Path)
+$ErrorActionPreference = 'Stop'
+if (
+    [string]::IsNullOrWhiteSpace($Path) -or
+    [IO.Path]::GetExtension($Path) -ine '.lnk' -or
+    -not (Test-Path -LiteralPath $Path -PathType Leaf)
+) { return }
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($Path)
+$arguments = [string]$shortcut.Arguments
+if ([string]::IsNullOrWhiteSpace($arguments)) { return }
+$sha256 = [Security.Cryptography.SHA256]::Create()
+try {
+    $digest = $sha256.ComputeHash(
+        [Text.Encoding]::UTF8.GetBytes($arguments)
+    )
+    [pscustomobject]@{
+        Key = [string]$Index
+        Value = [BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant()
+    }
+} finally {
+    $sha256.Dispose()
+}
+'@
+    $active = New-Object System.Collections.ArrayList
+    $next = 0
+    while ($next -lt $paths.Count -or $active.Count -gt 0) {
+        while ($next -lt $paths.Count -and $active.Count -lt 4) {
+            $runspace = [RunspaceFactory]::CreateRunspace()
+            $runspace.ApartmentState = [Threading.ApartmentState]::STA
+            $runspace.ThreadOptions = [Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
+            $runspace.Open()
+            $powerShell = [PowerShell]::Create()
+            $powerShell.Runspace = $runspace
+            [void]$powerShell.AddScript($itemScript).AddArgument($next).AddArgument($paths[$next])
+            $async = $powerShell.BeginInvoke()
+            [void]$active.Add([pscustomobject]@{
+                PowerShell = $powerShell
+                Runspace = $runspace
+                Async = $async
+                Deadline = [DateTime]::UtcNow.AddSeconds(3)
+            })
+            $next++
+        }
+        foreach ($task in @($active)) {
+            if ($task.Async.IsCompleted) {
+                try {
+                    foreach ($item in @($task.PowerShell.EndInvoke($task.Async))) {
+                        if ($null -ne $item -and $item.Key -and $item.Value) {
+                            $resolved[[string]$item.Key] = [string]$item.Value
+                        }
+                    }
+                } catch {
+                    # Per-item failure stays absent without exposing arguments.
+                } finally {
+                    $task.PowerShell.Dispose()
+                    $task.Runspace.Dispose()
+                    [void]$active.Remove($task)
+                }
+            } elseif ([DateTime]::UtcNow -ge $task.Deadline) {
+                try { [void]$task.PowerShell.BeginStop($null, $null) } catch {}
+                [void]$abandoned.Add($task)
+                [void]$active.Remove($task)
+            }
+        }
+        if ($next -lt $paths.Count -or $active.Count -gt 0) {
+            Start-Sleep -Milliseconds 10
+        }
+    }
+} catch {
+    $resolved = @{}
+}
+[Console]::Out.WriteLine(($resolved | ConvertTo-Json -Compress))
+[Console]::Out.Flush()
+if ($abandoned.Count -gt 0) { [Environment]::Exit(0) }
+"""
+
+
 def _shortcut_observations(
     paths: tuple[Path, ...],
 ) -> tuple[SmartReconnectShortcutObservation, ...]:
     if not paths:
         return ()
-    resolver = PowerShellShortcutFingerprintResolver()
+    resolver = _BoundedPowerShellShortcutFingerprintResolver(
+        runner=_run_system_powershell,
+        timeout_seconds=(
+            WINDOW_TIMEOUT_SECONDS
+            * (1 + math.ceil(len(paths) / MAX_PARALLEL_WINDOWS))
+        ),
+    )
     try:
         raw = resolver.resolve(paths)
+    except _WorkerEnvironmentError:
+        raise
     except Exception:
         raw = {}
     normalized_raw: dict[str, str] = {}
@@ -208,6 +490,7 @@ def _shortcut_observations(
                     fingerprint=None,
                     seal=None,
                     failure_codes=("shortcut_identity_unresolved",),
+                    cache_key=_shortcut_cache_key(path),
                 )
             )
             continue
@@ -226,6 +509,7 @@ def _shortcut_observations(
                     fingerprint=fingerprint,
                     seal=None,
                     failure_codes=("shortcut_seal_unresolved",),
+                    cache_key=_shortcut_cache_key(path),
                 )
             )
             continue
@@ -234,9 +518,68 @@ def _shortcut_observations(
                 path=normalized_path,
                 fingerprint=fingerprint,
                 seal=seal,
+                cache_key=_shortcut_cache_key(path),
             )
         )
     return tuple(observations)
+
+
+def _shortcut_observations_from_static(
+    static_observations: tuple[SmartReconnectShortcutObservation, ...],
+) -> tuple[SmartReconnectShortcutObservation, ...]:
+    """Resolve arguments only; reuse bounded per-path file evidence."""
+    if not static_observations:
+        return ()
+    paths = tuple(Path(item.path) for item in static_observations)
+    resolver = _BoundedPowerShellShortcutFingerprintResolver(
+        runner=_run_system_powershell,
+        timeout_seconds=(
+            WINDOW_TIMEOUT_SECONDS
+            * (1 + math.ceil(len(paths) / MAX_PARALLEL_WINDOWS))
+        ),
+    )
+    try:
+        raw = resolver.resolve(paths)
+    except _WorkerEnvironmentError:
+        raise
+    except Exception:
+        raw = {}
+    normalized_raw = {
+        _normalized_path(Path(path)): normalized
+        for path, fingerprint in raw.items()
+        if (normalized := normalize_launch_fingerprint(fingerprint)) is not None
+    }
+    results: list[SmartReconnectShortcutObservation] = []
+    for static in static_observations:
+        cache_key = static.cache_key
+        fingerprint = normalized_raw.get(static.path)
+        if cache_key is None:
+            results.append(replace(
+                static,
+                fingerprint=None,
+                seal=None,
+                failure_codes=("shortcut_static_unresolved",),
+            ))
+            continue
+        if fingerprint is None:
+            results.append(replace(
+                static,
+                fingerprint=None,
+                seal=None,
+                failure_codes=("shortcut_identity_unresolved",),
+            ))
+            continue
+        results.append(SmartReconnectShortcutObservation(
+            path=static.path,
+            fingerprint=fingerprint,
+            seal=ShortcutSeal(
+                file_identity=cache_key.file_identity,
+                content_sha256=cache_key.content_sha256,
+                launch_fingerprint=fingerprint,
+            ),
+            cache_key=cache_key,
+        ))
+    return tuple(results)
 
 
 class _ScopedPowerShellLaunchFingerprintResolver:
@@ -246,6 +589,8 @@ class _ScopedPowerShellLaunchFingerprintResolver:
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
+$resolved = @{}
+$abandoned = New-Object System.Collections.ArrayList
 try {
     $pids = @(
         ([string]$env:FLASH_WINDOW_PIDS).Split(',') |
@@ -265,70 +610,116 @@ try {
             ) | ConvertFrom-Json | ForEach-Object { [string]$_ }
         )
     }
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcuts = @()
-    foreach ($path in $paths) {
-        if (
-            [IO.Path]::GetExtension($path) -ine '.lnk' -or
-            -not (Test-Path -LiteralPath $path -PathType Leaf)
-        ) { continue }
-        try {
-            $item = $shell.CreateShortcut($path)
-            $arguments = ([string]$item.Arguments).Trim()
-            if (-not [string]::IsNullOrWhiteSpace($arguments)) {
-                $shortcuts += [pscustomobject]@{
-                    Arguments = $arguments
-                    TargetPath = [string]$item.TargetPath
-                }
+    $itemScript = @'
+param([int]$ProcessId, [string[]]$Paths)
+$ErrorActionPreference = 'Stop'
+$shell = New-Object -ComObject WScript.Shell
+$shortcuts = @()
+foreach ($path in $Paths) {
+    if (
+        [IO.Path]::GetExtension($path) -ine '.lnk' -or
+        -not (Test-Path -LiteralPath $path -PathType Leaf)
+    ) { continue }
+    try {
+        $item = $shell.CreateShortcut($path)
+        $arguments = ([string]$item.Arguments).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($arguments)) {
+            $shortcuts += [pscustomobject]@{
+                Arguments = $arguments
+                TargetPath = [string]$item.TargetPath
             }
-        } catch {}
-    }
-    $resolved = @{}
-    foreach ($processId in $pids) {
-        $process = Get-CimInstance Win32_Process -Filter (
-            "ProcessId = $processId"
-        ) -ErrorAction SilentlyContinue
-        if ($null -eq $process) { continue }
-        $commandLine = ([string]$process.CommandLine).TrimEnd()
-        $executablePath = [string]$process.ExecutablePath
-        $matches = @(
-            $shortcuts | Where-Object {
-                $arguments = [string]$_.Arguments
-                $prefixLength = $commandLine.Length - $arguments.Length
-                $commandLine.EndsWith(
-                    $arguments,
-                    [StringComparison]::Ordinal
-                ) -and
-                $prefixLength -gt 0 -and
-                [char]::IsWhiteSpace($commandLine[$prefixLength - 1]) -and
-                (
-                    [string]::IsNullOrWhiteSpace($_.TargetPath) -or
-                    [string]::IsNullOrWhiteSpace($executablePath) -or
-                    [string]::Equals(
-                        [IO.Path]::GetFullPath($_.TargetPath),
-                        [IO.Path]::GetFullPath($executablePath),
-                        [StringComparison]::OrdinalIgnoreCase
-                    )
-                )
-            } | Select-Object -ExpandProperty Arguments -Unique
+        }
+    } catch {}
+}
+$process = Get-CimInstance Win32_Process -Filter (
+    "ProcessId = $ProcessId"
+) -ErrorAction Stop
+if ($null -eq $process) { return }
+$commandLine = ([string]$process.CommandLine).TrimEnd()
+$executablePath = [string]$process.ExecutablePath
+$matches = @(
+    $shortcuts | Where-Object {
+        $arguments = [string]$_.Arguments
+        $prefixLength = $commandLine.Length - $arguments.Length
+        $commandLine.EndsWith($arguments, [StringComparison]::Ordinal) -and
+        $prefixLength -gt 0 -and
+        [char]::IsWhiteSpace($commandLine[$prefixLength - 1]) -and
+        (
+            [string]::IsNullOrWhiteSpace($_.TargetPath) -or
+            [string]::IsNullOrWhiteSpace($executablePath) -or
+            [string]::Equals(
+                [IO.Path]::GetFullPath($_.TargetPath),
+                [IO.Path]::GetFullPath($executablePath),
+                [StringComparison]::OrdinalIgnoreCase
+            )
         )
-        if ($matches.Count -ne 1) { continue }
-        $sha256 = [Security.Cryptography.SHA256]::Create()
-        try {
-            $digest = $sha256.ComputeHash(
-                [Text.Encoding]::UTF8.GetBytes([string]$matches[0])
-            )
-            $resolved[[string]$processId] = (
-                [BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant()
-            )
-        } finally {
-            $sha256.Dispose()
+    } | Select-Object -ExpandProperty Arguments -Unique
+)
+if ($matches.Count -ne 1) { return }
+$sha256 = [Security.Cryptography.SHA256]::Create()
+try {
+    $digest = $sha256.ComputeHash(
+        [Text.Encoding]::UTF8.GetBytes([string]$matches[0])
+    )
+    [pscustomobject]@{
+        Key = [string]$ProcessId
+        Value = [BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant()
+    }
+} finally {
+    $sha256.Dispose()
+}
+'@
+    $active = New-Object System.Collections.ArrayList
+    $next = 0
+    while ($next -lt $pids.Count -or $active.Count -gt 0) {
+        while ($next -lt $pids.Count -and $active.Count -lt 4) {
+            $runspace = [RunspaceFactory]::CreateRunspace()
+            $runspace.ApartmentState = [Threading.ApartmentState]::STA
+            $runspace.ThreadOptions = [Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
+            $runspace.Open()
+            $powerShell = [PowerShell]::Create()
+            $powerShell.Runspace = $runspace
+            [void]$powerShell.AddScript($itemScript).AddArgument($pids[$next]).AddArgument([string[]]$paths)
+            $async = $powerShell.BeginInvoke()
+            [void]$active.Add([pscustomobject]@{
+                PowerShell = $powerShell
+                Runspace = $runspace
+                Async = $async
+                Deadline = [DateTime]::UtcNow.AddSeconds(3)
+            })
+            $next++
+        }
+        foreach ($task in @($active)) {
+            if ($task.Async.IsCompleted) {
+                try {
+                    foreach ($item in @($task.PowerShell.EndInvoke($task.Async))) {
+                        if ($null -ne $item -and $item.Key -and $item.Value) {
+                            $resolved[[string]$item.Key] = [string]$item.Value
+                        }
+                    }
+                } catch {
+                    # Per-process failure remains absent and affects only it.
+                } finally {
+                    $task.PowerShell.Dispose()
+                    $task.Runspace.Dispose()
+                    [void]$active.Remove($task)
+                }
+            } elseif ([DateTime]::UtcNow -ge $task.Deadline) {
+                try { [void]$task.PowerShell.BeginStop($null, $null) } catch {}
+                [void]$abandoned.Add($task)
+                [void]$active.Remove($task)
+            }
+        }
+        if ($next -lt $pids.Count -or $active.Count -gt 0) {
+            Start-Sleep -Milliseconds 10
         }
     }
-    Write-Output ($resolved | ConvertTo-Json -Compress)
 } catch {
-    Write-Output '{}'
+    $resolved = @{}
 }
+[Console]::Out.WriteLine(($resolved | ConvertTo-Json -Compress))
+[Console]::Out.Flush()
+if ($abandoned.Count -gt 0) { [Environment]::Exit(0) }
 """
 
     def __init__(self, paths: tuple[Path, ...]) -> None:
@@ -346,7 +737,7 @@ try {
         )
         if os.name != "nt" or not normalized_ids or not self._paths:
             return {}
-        environment = os.environ.copy()
+        environment = _standard_powershell_environment()
         environment["FLASH_WINDOW_PIDS"] = ",".join(
             str(value) for value in normalized_ids
         )
@@ -357,9 +748,9 @@ try {
             ).encode("utf-8")
         ).decode("ascii")
         try:
-            completed = subprocess.run(
+            completed = _run_system_powershell(
                 (
-                    "powershell.exe",
+                    _system_powershell_path(),
                     "-NoLogo",
                     "-NoProfile",
                     "-NonInteractive",
@@ -372,7 +763,15 @@ try {
                 ),
                 capture_output=True,
                 text=False,
-                timeout=12.0,
+                timeout=(
+                    WINDOW_TIMEOUT_SECONDS
+                    * (
+                        1
+                        + math.ceil(
+                            len(normalized_ids) / MAX_PARALLEL_WINDOWS
+                        )
+                    )
+                ),
                 env=environment,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 check=False,
@@ -434,6 +833,7 @@ def _enumerate_observation_source(
                 fingerprint=None,
                 seal=None,
                 failure_codes=("shortcut_observation_pending",),
+                cache_key=None,
             )
             for path in paths
         ),
@@ -443,18 +843,49 @@ def _enumerate_observation_source(
 
 def _resolve_shortcut_observation(
     request: SmartReconnectObservationRequest,
+) -> tuple[SmartReconnectShortcutObservation, ...]:
+    paths = tuple(Path(value) for value in request.shortcut_paths)
+    if not paths:
+        return ()
+    static_by_path = {
+        item.path: item
+        for item in request.shortcut_static_observations
+        if item.cache_key is not None
+    }
+    normalized_paths = tuple(_normalized_path(path) for path in paths)
+    if any(path not in static_by_path for path in normalized_paths):
+        return tuple(
+            SmartReconnectShortcutObservation(
+                path=path,
+                fingerprint=None,
+                seal=None,
+                failure_codes=("shortcut_static_missing",),
+            )
+            for path in normalized_paths
+        )
+    return _shortcut_observations_from_static(
+        tuple(static_by_path[path] for path in normalized_paths)
+    )
+
+
+def _resolve_shortcut_static_observation(
+    request: SmartReconnectObservationRequest,
 ) -> SmartReconnectShortcutObservation:
     if len(request.shortcut_paths) != 1:
-        raise ValueError("shortcut observation requires one path")
+        raise ValueError("shortcut static observation requires one path")
     path = Path(request.shortcut_paths[0])
-    observations = _shortcut_observations((path,))
-    if len(observations) == 1:
-        return observations[0]
+    normalized_path = _normalized_path(path)
+    cache_key = _shortcut_cache_key(path)
     return SmartReconnectShortcutObservation(
-        path=_normalized_path(path),
+        path=normalized_path,
         fingerprint=None,
         seal=None,
-        failure_codes=("shortcut_observation_failed",),
+        failure_codes=(
+            ("shortcut_observation_pending",)
+            if cache_key is not None
+            else ("shortcut_static_unresolved",)
+        ),
+        cache_key=cache_key,
     )
 
 
@@ -481,6 +912,38 @@ def _resolve_window_identity(
     )
 
 
+def _resolve_window_identities(
+    request: SmartReconnectObservationRequest,
+) -> tuple[WindowInfo, ...]:
+    windows = tuple(request.windows)
+    if not windows and isinstance(request.window, WindowInfo):
+        windows = (request.window,)
+    if not windows:
+        return ()
+    process_ids = tuple(
+        window.process_id
+        for window in windows
+        if isinstance(window.process_id, int)
+        and not isinstance(window.process_id, bool)
+        and window.process_id > 0
+    )
+    paths = tuple(Path(value) for value in request.shortcut_paths)
+    resolved = _ScopedPowerShellLaunchFingerprintResolver(paths).resolve(
+        process_ids
+    )
+    return tuple(
+        replace(
+            window,
+            launch_fingerprint=(
+                resolved.get(window.process_id)
+                if isinstance(window.process_id, int)
+                else None
+            ),
+        )
+        for window in windows
+    )
+
+
 def _observe_window(
     request: SmartReconnectObservationRequest,
 ) -> SmartReconnectWindowObservation:
@@ -490,17 +953,6 @@ def _observe_window(
     instance = WindowInstanceToken.from_window(window)
     role_id: str | None = None
     role_failure: tuple[str, ...] = ()
-    if instance is not None:
-        try:
-            role_result = RoleIdTemplateService().read(window.handle)
-            role_id = role_result.role_id.strip() if role_result.success else None
-            if not role_id:
-                role_failure = ("role_identity_unresolved",)
-        except Exception:
-            role_failure = ("role_identity_unresolved",)
-    else:
-        role_failure = ("window_instance_incomplete",)
-
     route = "minimized" if window.minimized else None
     sample: CaptureSample | None = None
     recognition = _unknown_recognition()
@@ -521,10 +973,7 @@ def _observe_window(
             )
         elif background_sample is not None and background_sample.api_succeeded:
             sample = background_sample
-            recognition = ReferenceScreenRecognizer(
-                Path(request.reference_dir)
-            ).recognize_capture(sample)
-            fresh = True
+            capture_failure = ("desktop_pixels_unproven",)
         else:
             capture_failure = ("background_capture_unknown",)
     else:
@@ -552,18 +1001,95 @@ def _observe_window(
             )
         else:
             sample = (
-                background_sample
+                visible_sample
+                if route == "visible"
+                else background_sample
                 if background_sample is not None
                 and background_sample.api_succeeded
-                else visible_sample
+                else None
             )
-            if sample is not None and sample.api_succeeded:
+            if route == "visible" and sample is not None and sample.api_succeeded:
                 recognition = ReferenceScreenRecognizer(
                     Path(request.reference_dir)
                 ).recognize_capture(sample)
                 fresh = True
+            elif sample is not None and sample.api_succeeded:
+                capture_failure = ("desktop_pixels_unproven",)
             else:
                 capture_failure = ("background_capture_unknown",)
+    current_visible_sample = bool(
+        instance is not None
+        and route == "visible"
+        and fresh
+        and sample is not None
+        and sample.api_succeeded
+    )
+    role_sample: CaptureSample | None = None
+    role_region_sha256: str | None = None
+    if current_visible_sample:
+        try:
+            role_sample = role_id_region_sample(sample)
+            role_region_sha256 = _capture_sha256(role_sample)
+        except Exception:
+            role_sample = None
+            role_region_sha256 = None
+    cache_matches_current_region = bool(
+        current_visible_sample
+        and role_region_sha256 is not None
+        and request.role_cache_hit
+        and request.role_cache_key is not None
+        and request.role_cache_key.instance == instance
+        and request.role_cache_key.role_region_sha256
+        == role_region_sha256
+    )
+    if cache_matches_current_region:
+        role_id = clean_role_id_text(request.cached_role_id or "") or None
+        if role_id is None:
+            role_failure = ("role_identity_unresolved",)
+    elif current_visible_sample and role_region_sha256 is not None:
+        try:
+            role_id = clean_role_id_text(
+                WindowsRoleIdOcrReader().read(role_sample)
+                if role_sample is not None and role_sample.api_succeeded
+                else ""
+            ) or None
+            if not role_id:
+                role_failure = ("role_identity_unresolved",)
+        except Exception:
+            role_failure = ("role_identity_unresolved",)
+    elif current_visible_sample:
+        role_failure = ("role_identity_unresolved",)
+    elif instance is None:
+        role_failure = ("window_instance_incomplete",)
+    else:
+        role_failure = ("role_visible_evidence_unavailable",)
+    process_cache_key: ProcessObservationCacheKey | None = None
+    if (
+        isinstance(window.process_id, int)
+        and not isinstance(window.process_id, bool)
+        and window.process_id > 0
+        and isinstance(window.process_lifecycle_token, int)
+        and not isinstance(window.process_lifecycle_token, bool)
+        and window.process_lifecycle_token > 0
+    ):
+        process_cache_key = ProcessObservationCacheKey(
+            window.process_id,
+            window.process_lifecycle_token,
+        )
+    role_cache_key: RoleObservationCacheKey | None = None
+    if (
+        current_visible_sample
+        and role_region_sha256 is not None
+        and request.role_cache_key is not None
+        and request.role_cache_key.instance == instance
+    ):
+        try:
+            role_cache_key = replace(
+                request.role_cache_key,
+                role_region_sha256=role_region_sha256,
+            )
+        except (TypeError, ValueError):
+            role_cache_key = None
     return SmartReconnectWindowObservation(
         window=window,
         instance=instance,
@@ -573,6 +1099,14 @@ def _observe_window(
         capture_route=route,
         role_id=role_id,
         failure_codes=tuple(dict.fromkeys((*role_failure, *capture_failure))),
+        freshness=(
+            ObservationFreshness.PROVEN_CURRENT
+            if fresh
+            else ObservationFreshness.UNPROVEN
+        ),
+        process_cache_key=process_cache_key,
+        role_cache_key=role_cache_key,
+        role_region_sha256=role_region_sha256,
     )
 
 
@@ -597,8 +1131,10 @@ def _execute_observation_request(
         return _enumerate_observation_source(request)
     if request.stage == "shortcut":
         return _resolve_shortcut_observation(request)
+    if request.stage == "shortcut_static":
+        return _resolve_shortcut_static_observation(request)
     if request.stage == "identity":
-        return _resolve_window_identity(request)
+        return _resolve_window_identities(request)
     if request.stage == "window":
         return _observe_window(request)
     if request.stage == "seal":
@@ -606,23 +1142,103 @@ def _execute_observation_request(
     raise ValueError("unsupported observation stage")
 
 
+class _WorkerEnvironmentError(RuntimeError):
+    """The worker cannot safely create another child process."""
+
+
+def _worker_dll_directory_reset() -> str | None:
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetDllDirectoryW.argtypes = (
+            ctypes.c_uint32,
+            ctypes.c_wchar_p,
+        )
+        kernel32.GetDllDirectoryW.restype = ctypes.c_uint32
+        kernel32.SetDllDirectoryW.argtypes = (ctypes.c_wchar_p,)
+        kernel32.SetDllDirectoryW.restype = ctypes.c_int
+        size = kernel32.GetDllDirectoryW(0, None)
+        previous = None
+        if size:
+            buffer = ctypes.create_unicode_buffer(size + 1)
+            if kernel32.GetDllDirectoryW(len(buffer), buffer):
+                previous = buffer.value
+        if not kernel32.SetDllDirectoryW(None):
+            raise OSError(ctypes.get_last_error())
+        return previous
+    except Exception as error:
+        raise _WorkerEnvironmentError(
+            "failed to clear the worker DLL directory"
+        ) from error
+
+
+def _worker_dll_directory_restore(previous: str | None) -> None:
+    if os.name != "nt":
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.SetDllDirectoryW.argtypes = (ctypes.c_wchar_p,)
+        kernel32.SetDllDirectoryW.restype = ctypes.c_int
+        if not kernel32.SetDllDirectoryW(previous):
+            raise OSError(ctypes.get_last_error())
+    except Exception as error:
+        raise _WorkerEnvironmentError(
+            "failed to restore the worker DLL directory"
+        ) from error
+
+
 def _worker_bootstrap(
     gate,
-    sender: Connection,
-    request: SmartReconnectObservationRequest,
+    connection: Connection,
+    worker_epoch: int,
     operation: Callable[[SmartReconnectObservationRequest], object],
 ) -> None:
     try:
         if not gate.wait(5.0):
             return
-        sender.send((True, operation(request)))
-    except BaseException as error:
-        try:
-            sender.send((False, f"{type(error).__name__}: {error}"))
-        except BaseException:
-            pass
+        while True:
+            try:
+                job = connection.recv()
+            except (EOFError, OSError):
+                return
+            if job is None:
+                return
+            if (
+                not isinstance(job, SmartReconnectObservationJob)
+                or job.worker_epoch != worker_epoch
+            ):
+                continue
+            fatal_worker_environment = False
+            try:
+                payload = operation(job.request)
+                reply = _WorkerReply(
+                    job.request_serial,
+                    job.job_serial,
+                    worker_epoch,
+                    True,
+                    payload,
+                )
+            except BaseException as error:
+                fatal_worker_environment = isinstance(
+                    error,
+                    _WorkerEnvironmentError,
+                )
+                reply = _WorkerReply(
+                    job.request_serial,
+                    job.job_serial,
+                    worker_epoch,
+                    False,
+                    f"{type(error).__name__}: {error}",
+                )
+            try:
+                connection.send(reply)
+            except (BrokenPipeError, EOFError, OSError):
+                return
+            if fatal_worker_environment:
+                return
     finally:
-        sender.close()
+        connection.close()
 
 
 class _WindowsJob:
@@ -746,9 +1362,10 @@ class _WindowsJob:
 @dataclass(slots=True)
 class _ActiveWorker:
     process: multiprocessing.Process
-    receiver: Connection
+    connection: Connection
     job: _WindowsJob
-    deadline: float
+    slot_index: int
+    epoch: int
     finish_lock: Lock = field(default_factory=Lock)
 
 
@@ -786,14 +1403,26 @@ class WindowsSmartReconnectObservationBroker:
         self._worker_operation = _worker_operation or _execute_observation_request
         self._context = multiprocessing.get_context("spawn")
         self._refresh_lock = Lock()
+        self._request_lock = Lock()
+        self._pool_lock = RLock()
         self._state_lock = RLock()
+        self._action_gate = RLock()
         self._active_lock = RLock()
         self._active: dict[int, _ActiveWorker] = {}
+        self._slots: dict[int, _ActiveWorker] = {}
+        self._slot_epochs = [0] * MAX_PARALLEL_WINDOWS
+        self._job_serial = 0
+        self._started = False
         self._request_serial = 0
         self._published_request_serial = 0
         self._generation = 0
+        self._static_generation = 0
         self._closed = False
         self._latest = SmartReconnectObservationSnapshot(generation=0)
+        self._stable_snapshot: SmartReconnectObservationSnapshot | None = None
+        self._action_snapshot: SmartReconnectObservationSnapshot | None = None
+        self._action_lease: ObservationActionLease | None = None
+        self._refresh_inflight = False
         self._published_snapshot_without_wait: (
             SmartReconnectObservationSnapshot | None
         ) = None
@@ -802,13 +1431,37 @@ class WindowsSmartReconnectObservationBroker:
         self._published_witnesses_without_wait: tuple[
             SmartReconnectSealWitness, ...
         ] = ()
+        self._shortcut_cache: dict[
+            str,
+            SmartReconnectShortcutObservation,
+        ] = {}
+        self._process_cache: dict[
+            ProcessObservationCacheKey,
+            str,
+        ] = {}
+        self._role_cache: dict[
+            RoleObservationCacheKey,
+            str,
+        ] = {}
+        self._role_cache_by_instance: dict[
+            WindowInstanceToken,
+            tuple[RoleObservationCacheKey, str],
+        ] = {}
+        self._identity_source = (0, 0)
+        self._role_source_generation = 1
+        self._shortcut_catalog_paths: tuple[str, ...] = ()
+        self._shortcut_refresh_required = True
+        self._last_static_by_fingerprint: dict[
+            str,
+            tuple[WindowInstanceToken, ShortcutSeal | None, str | None],
+        ] = {}
 
     @staticmethod
     def batch_timeout_seconds(window_count: int) -> float:
         count = max(0, int(window_count))
         return (
             2.0 * ENUMERATION_TIMEOUT_SECONDS
-            + math.ceil(count / MAX_PARALLEL_WINDOWS)
+            + (4 + math.ceil(count / MAX_PARALLEL_WINDOWS))
             * WINDOW_TIMEOUT_SECONDS
         )
 
@@ -816,17 +1469,47 @@ class WindowsSmartReconnectObservationBroker:
         with self._state_lock:
             return self._latest
 
+    def stable_snapshot(self) -> SmartReconnectObservationSnapshot | None:
+        """Read the immutable stable pointer without waiting on broker work."""
+
+        return self._published_snapshot_without_wait
+
+    def refresh_inflight(self) -> bool:
+        with self._state_lock:
+            return self._refresh_inflight
+
     def current_snapshot(self) -> SmartReconnectObservationSnapshot | None:
-        """Return the latest publication only while its request is current."""
+        """Return only the action-capable, unexpired current publication."""
 
         with self._state_lock:
             return (
-                self._latest
+                self._action_snapshot
                 if self._generation_is_current_unlocked(
-                    self._latest.generation
+                    (
+                        self._action_snapshot.generation
+                        if self._action_snapshot is not None
+                        else 0
+                    )
                 )
                 else None
             )
+
+    def action_snapshot(
+        self,
+    ) -> tuple[
+        SmartReconnectObservationSnapshot,
+        ObservationActionLease,
+    ] | None:
+        with self._state_lock:
+            snapshot = self._action_snapshot
+            lease = self._action_lease
+            if (
+                snapshot is None
+                or lease is None
+                or not self._action_lease_is_current_unlocked(lease)
+            ):
+                return None
+            return snapshot, lease
 
     def published_snapshot_without_wait(
         self,
@@ -845,8 +1528,25 @@ class WindowsSmartReconnectObservationBroker:
             and isinstance(generation, int)
             and not isinstance(generation, bool)
             and generation > 0
-            and self._latest.generation == generation
+            and self._action_snapshot is not None
+            and self._action_snapshot.generation == generation
             and self._published_request_serial == self._request_serial
+            and self._action_lease is not None
+            and self._action_lease.deadline_monotonic > time.monotonic()
+        )
+
+    def _action_lease_is_current_unlocked(
+        self,
+        lease: ObservationActionLease,
+    ) -> bool:
+        return bool(
+            lease is self._action_lease
+            and self._action_snapshot is not None
+            and lease.request_serial == self._request_serial
+            and lease.observation_generation == self._action_snapshot.generation
+            and lease.deadline_monotonic > time.monotonic()
+            and self._published_request_serial == self._request_serial
+            and not self._closed
         )
 
     def run_if_generation_current(
@@ -858,18 +1558,67 @@ class WindowsSmartReconnectObservationBroker:
 
         if not callable(callback):
             raise TypeError("callback must be callable")
-        with self._state_lock:
-            if not self._generation_is_current_unlocked(generation):
-                return False, None
+        with self._action_gate:
+            with self._state_lock:
+                if not self._generation_is_current_unlocked(generation):
+                    return False, None
+            return True, callback()
+
+    def run_if_action_current(
+        self,
+        lease: ObservationActionLease,
+        callback: Callable[[], _RESULT],
+    ) -> tuple[bool, _RESULT | None]:
+        """Linearize a pure-memory action against one unforgeable lease."""
+
+        if not isinstance(lease, ObservationActionLease):
+            return False, None
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        with self._action_gate:
+            with self._state_lock:
+                if not self._action_lease_is_current_unlocked(lease):
+                    return False, None
             return True, callback()
 
     def set_visible_capture_enabled(self, enabled: bool) -> None:
-        with self._state_lock:
-            self.set_capture_modes(
-                visible=enabled,
-                obscured=self._obscured_capture_enabled,
-                minimized=self._minimized_capture_enabled,
-            )
+        self.set_capture_modes(
+            visible=enabled,
+            obscured=self._obscured_capture_enabled,
+            minimized=self._minimized_capture_enabled,
+        )
+
+    def set_identity_source(
+        self,
+        identity_generation: int,
+        config_revision: int,
+    ) -> None:
+        """Invalidate only role evidence when its immutable source changes."""
+
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in (identity_generation, config_revision)
+        ):
+            raise ValueError("identity source values must be non-negative")
+        source = (identity_generation, config_revision)
+        with self._action_gate:
+            with self._state_lock:
+                if self._closed or source == self._identity_source:
+                    return
+                if source[1] != self._identity_source[1]:
+                    self._shortcut_refresh_required = True
+                self._identity_source = source
+                self._role_source_generation += 1
+                self._role_cache.clear()
+                self._role_cache_by_instance.clear()
+                self._request_serial += 1
+                self._current_witnesses.clear()
+                self._published_witnesses_without_wait = ()
+                self._action_snapshot = None
+                self._action_lease = None
+                self._refresh_inflight = False
 
     def set_capture_modes(
         self,
@@ -878,33 +1627,83 @@ class WindowsSmartReconnectObservationBroker:
         obscured: bool,
         minimized: bool,
     ) -> None:
-        with self._state_lock:
-            values = (bool(visible), bool(obscured), bool(minimized))
-            if values == (
-                self._visible_capture_enabled,
-                self._obscured_capture_enabled,
-                self._minimized_capture_enabled,
-            ):
-                return
-            (
-                self._visible_capture_enabled,
-                self._obscured_capture_enabled,
-                self._minimized_capture_enabled,
-            ) = values
-            self._request_serial += 1
-            self._current_witnesses.clear()
-            self._published_snapshot_without_wait = None
-            self._published_witnesses_without_wait = ()
+        with self._action_gate:
+            with self._state_lock:
+                values = (bool(visible), bool(obscured), bool(minimized))
+                if values == (
+                    self._visible_capture_enabled,
+                    self._obscured_capture_enabled,
+                    self._minimized_capture_enabled,
+                ):
+                    return
+                (
+                    self._visible_capture_enabled,
+                    self._obscured_capture_enabled,
+                    self._minimized_capture_enabled,
+                ) = values
+                self._request_serial += 1
+                self._current_witnesses.clear()
+                self._published_witnesses_without_wait = ()
+                self._action_snapshot = None
+                self._action_lease = None
+                self._refresh_inflight = False
 
-    def _next_request(self) -> int | None:
-        with self._state_lock:
-            if self._closed:
-                return None
-            self._request_serial += 1
-            self._current_witnesses.clear()
-            self._published_snapshot_without_wait = None
-            self._published_witnesses_without_wait = ()
-            return self._request_serial
+    def _next_request(
+        self,
+        shortcut_paths: tuple[str, ...] | None = None,
+    ) -> tuple[
+        int,
+        SmartReconnectObservationSnapshot,
+        int,
+        dict[str, SmartReconnectShortcutObservation],
+        dict[ProcessObservationCacheKey, str],
+        dict[RoleObservationCacheKey, str],
+        dict[
+            WindowInstanceToken,
+            tuple[RoleObservationCacheKey, str],
+        ],
+        bool,
+    ] | int | None:
+        with self._action_gate:
+            with self._state_lock:
+                if self._closed:
+                    return None
+                self._request_serial += 1
+                self._current_witnesses.clear()
+                self._published_witnesses_without_wait = ()
+                self._action_snapshot = None
+                self._action_lease = None
+                self._refresh_inflight = True
+                context = (
+                    self._request_serial,
+                    self._stable_snapshot or self._latest,
+                    self._role_source_generation,
+                    dict(self._shortcut_cache),
+                    dict(self._process_cache),
+                    dict(self._role_cache),
+                    dict(self._role_cache_by_instance),
+                    bool(
+                        self._shortcut_refresh_required
+                        or shortcut_paths != self._shortcut_catalog_paths
+                        or not self._shortcut_cache
+                    ),
+                )
+                return self._request_serial if shortcut_paths is None else context
+
+    def invalidate_action(self) -> bool:
+        """Revoke every action lease and supersede an in-flight refresh."""
+
+        with self._action_gate:
+            with self._state_lock:
+                if self._closed:
+                    return False
+                self._request_serial += 1
+                self._current_witnesses.clear()
+                self._published_witnesses_without_wait = ()
+                self._action_snapshot = None
+                self._action_lease = None
+                self._refresh_inflight = False
+                return True
 
     def _request_is_current(self, serial: int) -> bool:
         with self._state_lock:
@@ -918,46 +1717,83 @@ class WindowsSmartReconnectObservationBroker:
         results = self._request_many((request,), timeout_seconds)
         return results[0] if results else None
 
-    def _start_worker(
-        self,
-        request: SmartReconnectObservationRequest,
-        timeout_seconds: float,
-    ) -> _ActiveWorker:
-        receiver, sender = self._context.Pipe(duplex=False)
+    def start(self) -> bool:
+        """Start exactly four persistent spawn workers once."""
+
+        with self._pool_lock:
+            with self._state_lock:
+                if self._closed:
+                    return False
+                if self._started:
+                    return len(self._slots) == MAX_PARALLEL_WINDOWS
+            started: list[_ActiveWorker] = []
+            try:
+                for slot_index in range(MAX_PARALLEL_WINDOWS):
+                    worker = self._start_worker(slot_index)
+                    started.append(worker)
+            except BaseException:
+                for worker in started:
+                    self._finish_worker(worker, kill=True)
+                with self._state_lock:
+                    self._started = False
+                return False
+            with self._state_lock:
+                closed = self._closed
+                if not closed:
+                    self._started = True
+            if closed:
+                for worker in tuple(started):
+                    self._finish_worker(worker, kill=True)
+                return False
+            return True
+
+    def _start_worker(self, slot_index: int) -> _ActiveWorker:
+        if (
+            isinstance(slot_index, bool)
+            or not isinstance(slot_index, int)
+            or slot_index < 0
+            or slot_index >= MAX_PARALLEL_WINDOWS
+        ):
+            raise ValueError("worker slot index is invalid")
+        parent, child = self._context.Pipe(duplex=True)
         gate = self._context.Event()
+        self._slot_epochs[slot_index] += 1
+        epoch = self._slot_epochs[slot_index]
         process = self._context.Process(
             target=_worker_bootstrap,
-            args=(gate, sender, request, self._worker_operation),
+            args=(gate, child, epoch, self._worker_operation),
             daemon=False,
         )
         started = False
-        sender_closed = False
+        child_closed = False
         job: _WindowsJob | None = None
         try:
-            # Registration and close are serialized while the child is still
-            # behind its gate.  Close can therefore never miss a started
-            # process or report success before that process is registered.
             with self._state_lock:
                 if self._closed:
                     raise RuntimeError("observation broker is closed")
-                process.start()
-                started = True
-                sender.close()
-                sender_closed = True
-                job = _WindowsJob(process.pid)
-                worker = _ActiveWorker(
-                    process=process,
-                    receiver=receiver,
-                    job=job,
-                    deadline=time.monotonic() + timeout_seconds,
-                )
+            process.start()
+            started = True
+            child.close()
+            child_closed = True
+            job = _WindowsJob(process.pid)
+            worker = _ActiveWorker(
+                process=process,
+                connection=parent,
+                job=job,
+                slot_index=slot_index,
+                epoch=epoch,
+            )
+            with self._state_lock:
+                if self._closed:
+                    raise RuntimeError("observation broker closed during start")
                 with self._active_lock:
                     self._active[id(worker)] = worker
-                gate.set()
-                return worker
+                    self._slots[slot_index] = worker
+            gate.set()
+            return worker
         except BaseException:
-            if not sender_closed:
-                sender.close()
+            if not child_closed:
+                child.close()
             if job is not None:
                 job.close()
             if started:
@@ -970,7 +1806,7 @@ class WindowsSmartReconnectObservationBroker:
                     if callable(kill_process):
                         kill_process()
                         process.join(0.5)
-            receiver.close()
+            parent.close()
             if not started or not process.is_alive():
                 try:
                     process.close()
@@ -983,21 +1819,27 @@ class WindowsSmartReconnectObservationBroker:
             with self._active_lock:
                 if self._active.get(id(worker)) is not worker:
                     return True
+            if not kill:
+                try:
+                    worker.connection.send(None)
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+                worker.process.join(WORKER_STOP_SECONDS)
             if kill:
                 worker.job.close()
-            worker.process.join(0.5)
+            worker.process.join(WORKER_STOP_SECONDS)
             if worker.process.is_alive():
                 worker.job.close()
                 worker.process.terminate()
-                worker.process.join(0.5)
+                worker.process.join(WORKER_STOP_SECONDS)
             if worker.process.is_alive():
                 kill_process = getattr(worker.process, "kill", None)
                 if callable(kill_process):
                     kill_process()
-                    worker.process.join(0.5)
+                    worker.process.join(WORKER_STOP_SECONDS)
             if worker.process.is_alive():
                 return False
-            worker.receiver.close()
+            worker.connection.close()
             worker.job.close()
             try:
                 worker.process.close()
@@ -1006,7 +1848,22 @@ class WindowsSmartReconnectObservationBroker:
             with self._active_lock:
                 if self._active.get(id(worker)) is worker:
                     self._active.pop(id(worker), None)
+                if self._slots.get(worker.slot_index) is worker:
+                    self._slots.pop(worker.slot_index, None)
             return True
+
+    def _restart_worker(self, worker: _ActiveWorker) -> _ActiveWorker | None:
+        with self._pool_lock:
+            slot_index = worker.slot_index
+            if not self._finish_worker(worker, kill=True):
+                return None
+            with self._state_lock:
+                if self._closed:
+                    return None
+            try:
+                return self._start_worker(slot_index)
+            except BaseException:
+                return None
 
     def _request_many(
         self,
@@ -1015,46 +1872,77 @@ class WindowsSmartReconnectObservationBroker:
     ) -> tuple[object | None, ...]:
         if not requests:
             return ()
-        workers: list[_ActiveWorker] = []
-        try:
-            for request in requests:
-                workers.append(self._start_worker(request, timeout_seconds))
-        except BaseException:
-            for worker in workers:
-                self._finish_worker(worker, kill=True)
-            return tuple(None for _request in requests)
-        results: list[object | None] = [None] * len(workers)
-        pending = {worker.receiver: index for index, worker in enumerate(workers)}
-        while pending:
-            now = time.monotonic()
-            expired = tuple(
-                receiver
-                for receiver, index in pending.items()
-                if workers[index].deadline <= now
-            )
-            for receiver in expired:
-                pending.pop(receiver, None)
-            if not pending:
-                break
-            nearest = min(
-                workers[index].deadline
-                for index in pending.values()
-            )
-            try:
-                ready = wait(tuple(pending), max(0.0, nearest - now))
-            except (OSError, ValueError):
-                break
-            for receiver in ready:
-                index = pending.pop(receiver)
-                try:
-                    succeeded, payload = receiver.recv()
-                except (EOFError, OSError):
-                    succeeded, payload = False, None
-                if succeeded is True:
-                    results[index] = payload
-        for index, worker in enumerate(workers):
-            self._finish_worker(worker, kill=results[index] is None)
-        return tuple(results)
+        with self._request_lock:
+            if not self.start():
+                return tuple(None for _request in requests)
+            results: list[object | None] = [None] * len(requests)
+            for offset in range(0, len(requests), MAX_PARALLEL_WINDOWS):
+                chunk = requests[offset : offset + MAX_PARALLEL_WINDOWS]
+                with self._active_lock:
+                    workers = tuple(
+                        self._slots.get(index) for index in range(len(chunk))
+                    )
+                if any(worker is None for worker in workers):
+                    continue
+                pending: dict[Connection, tuple[int, _ActiveWorker, SmartReconnectObservationJob]] = {}
+                now = time.monotonic()
+                for index, (worker, request) in enumerate(zip(workers, chunk)):
+                    assert worker is not None
+                    self._job_serial += 1
+                    job = SmartReconnectObservationJob(
+                        request_serial=self._request_serial,
+                        job_serial=self._job_serial,
+                        worker_epoch=worker.epoch,
+                        kind=request.stage,
+                        deadline_monotonic=now + timeout_seconds,
+                        request=request,
+                    )
+                    try:
+                        worker.connection.send(job)
+                    except (BrokenPipeError, EOFError, OSError):
+                        self._restart_worker(worker)
+                        continue
+                    pending[worker.connection] = (offset + index, worker, job)
+                while pending:
+                    now = time.monotonic()
+                    expired = tuple(
+                        connection
+                        for connection, (_index, _worker, job) in pending.items()
+                        if job.deadline_monotonic <= now
+                    )
+                    for connection in expired:
+                        _index, worker, _job = pending.pop(connection)
+                        self._restart_worker(worker)
+                    if not pending:
+                        break
+                    nearest = min(
+                        job.deadline_monotonic
+                        for _index, _worker, job in pending.values()
+                    )
+                    try:
+                        ready = wait(tuple(pending), max(0.0, nearest - now))
+                    except (OSError, ValueError):
+                        ready = ()
+                    for connection in ready:
+                        entry = pending.pop(connection, None)
+                        if entry is None:
+                            continue
+                        index, worker, job = entry
+                        try:
+                            reply = connection.recv()
+                        except (EOFError, OSError):
+                            reply = None
+                        if (
+                            isinstance(reply, _WorkerReply)
+                            and reply.request_serial == job.request_serial
+                            and reply.job_serial == job.job_serial
+                            and reply.worker_epoch == worker.epoch
+                            and reply.succeeded
+                        ):
+                            results[index] = reply.payload
+                        else:
+                            self._restart_worker(worker)
+            return tuple(results)
 
     def _request_bounded(
         self,
@@ -1074,41 +1962,199 @@ class WindowsSmartReconnectObservationBroker:
     def _complete_enumeration(
         self,
         raw: SmartReconnectEnumerationResult,
+        *,
+        shortcut_cache: dict[
+            str,
+            SmartReconnectShortcutObservation,
+        ] | None = None,
+        process_cache: dict[ProcessObservationCacheKey, str] | None = None,
+        role_cache: dict[RoleObservationCacheKey, str] | None = None,
+        role_cache_by_instance: dict[
+            WindowInstanceToken,
+            tuple[RoleObservationCacheKey, str],
+        ] | None = None,
+        shortcut_batch_available: list[bool] | None = None,
+        refresh_shortcuts: bool = True,
     ) -> SmartReconnectEnumerationResult:
-        shortcut_requests: list[SmartReconnectObservationRequest] = []
-        shortcut_indexes: list[int] = []
+        shortcut_cache = (
+            self._shortcut_cache if shortcut_cache is None else shortcut_cache
+        )
+        process_cache = (
+            self._process_cache if process_cache is None else process_cache
+        )
+        role_cache = self._role_cache if role_cache is None else role_cache
+        role_cache_by_instance = (
+            self._role_cache_by_instance
+            if role_cache_by_instance is None
+            else role_cache_by_instance
+        )
+        shortcut_batch_available = (
+            [True]
+            if shortcut_batch_available is None
+            else shortcut_batch_available
+        )
+        prior_shortcuts = tuple(shortcut_cache.values())
         shortcuts = list(raw.shortcuts)
+        unresolved_paths = frozenset(
+            item.path
+            for item in shortcuts
+            if not (
+                normalize_launch_fingerprint(item.fingerprint) is not None
+                and item.seal is not None
+                and not item.failure_codes
+            )
+        )
+        if (
+            not refresh_shortcuts
+            and unresolved_paths
+            and unresolved_paths <= frozenset(shortcut_cache)
+        ):
+            for index, item in enumerate(shortcuts):
+                cached = shortcut_cache.get(item.path)
+                if cached is not None:
+                    shortcuts[index] = cached
+            static_indexes: tuple[int, ...] = ()
+        else:
+            refresh_shortcuts = True
+            static_indexes = tuple(
+                index
+                for index, item in enumerate(shortcuts)
+                if not (
+                    normalize_launch_fingerprint(item.fingerprint) is not None
+                    and item.seal is not None
+                    and not item.failure_codes
+                )
+            )
+        static_results = self._request_bounded(
+            tuple(
+                SmartReconnectObservationRequest(
+                    stage="shortcut_static",
+                    reference_dir=self._reference_dir,
+                    title_keywords=self._title_keywords,
+                    shortcut_paths=(shortcuts[index].path,),
+                )
+                for index in static_indexes
+            ),
+            WINDOW_TIMEOUT_SECONDS,
+        )
+        for result_index, shortcut_index in enumerate(static_indexes):
+            result = (
+                static_results[result_index]
+                if result_index < len(static_results)
+                else None
+            )
+            if (
+                isinstance(result, SmartReconnectShortcutObservation)
+                and result.path == shortcuts[shortcut_index].path
+                and result.cache_key is not None
+                and not (
+                    set(result.failure_codes)
+                    - {"shortcut_observation_pending"}
+                )
+            ):
+                shortcuts[shortcut_index] = result
+            else:
+                shortcuts[shortcut_index] = SmartReconnectShortcutObservation(
+                    path=shortcuts[shortcut_index].path,
+                    fingerprint=None,
+                    seal=None,
+                    failure_codes=("shortcut_static_timeout",),
+                )
+        shortcut_indexes: list[int] = []
         for index, item in enumerate(shortcuts):
             if (
                 normalize_launch_fingerprint(item.fingerprint) is not None
                 and item.seal is not None
                 and not item.failure_codes
             ):
+                shortcut_cache[item.path] = item
+                continue
+            if item.cache_key is None:
+                continue
+            cached = shortcut_cache.get(item.path)
+            if (
+                cached is not None
+                and item.cache_key is not None
+                and cached.cache_key == item.cache_key
+                and normalize_launch_fingerprint(cached.fingerprint) is not None
+                and cached.seal is not None
+                and not cached.failure_codes
+            ):
+                shortcuts[index] = cached
                 continue
             shortcut_indexes.append(index)
-            shortcut_requests.append(
+        if shortcut_indexes and shortcut_batch_available[0]:
+            shortcut_batch_available[0] = False
+            raw_shortcut_result = self._request(
                 SmartReconnectObservationRequest(
                     stage="shortcut",
                     reference_dir=self._reference_dir,
                     title_keywords=self._title_keywords,
-                    shortcut_paths=(item.path,),
-                )
+                    shortcut_paths=tuple(
+                        shortcuts[index].path for index in shortcut_indexes
+                    ),
+                    shortcut_static_observations=tuple(
+                        shortcuts[index] for index in shortcut_indexes
+                    ),
+                ),
+                WINDOW_TIMEOUT_SECONDS
+                * (
+                    1
+                    + math.ceil(
+                        len(shortcut_indexes) / MAX_PARALLEL_WINDOWS
+                    )
+                ),
             )
-        shortcut_results = self._request_bounded(
-            tuple(shortcut_requests),
-            WINDOW_TIMEOUT_SECONDS,
-        )
-        for index, result in zip(shortcut_indexes, shortcut_results):
-            if isinstance(result, SmartReconnectShortcutObservation):
-                shortcuts[index] = result
-            else:
+            by_path = {
+                item.path: item
+                for item in raw_shortcut_result
+                if isinstance(item, SmartReconnectShortcutObservation)
+            } if isinstance(raw_shortcut_result, tuple) else {}
+            for index in shortcut_indexes:
+                result = by_path.get(shortcuts[index].path)
+                if (
+                    isinstance(result, SmartReconnectShortcutObservation)
+                    and result.cache_key == shortcuts[index].cache_key
+                ):
+                    shortcuts[index] = result
+                    if (
+                        result.cache_key is not None
+                        and result.seal is not None
+                        and not result.failure_codes
+                    ):
+                        shortcut_cache[result.path] = result
+                    continue
                 shortcuts[index] = SmartReconnectShortcutObservation(
                     path=shortcuts[index].path,
                     fingerprint=None,
                     seal=None,
                     failure_codes=("shortcut_observation_timeout",),
+                    cache_key=shortcuts[index].cache_key,
+                )
+        elif shortcut_indexes:
+            for index in shortcut_indexes:
+                shortcuts[index] = SmartReconnectShortcutObservation(
+                    path=shortcuts[index].path,
+                    fingerprint=None,
+                    seal=None,
+                    failure_codes=("shortcut_batch_deferred",),
+                    cache_key=shortcuts[index].cache_key,
                 )
 
+        changed_shortcuts = self._changed_shortcut_fingerprints(
+            prior_shortcuts,
+            tuple(shortcuts),
+        )
+        if changed_shortcuts:
+            for key, fingerprint in tuple(process_cache.items()):
+                if fingerprint in changed_shortcuts:
+                    process_cache.pop(key, None)
+            for key in tuple(role_cache):
+                if key.fingerprint in changed_shortcuts:
+                    role_cache.pop(key, None)
+            for instance, cached in tuple(role_cache_by_instance.items()):
+                if cached[0].fingerprint in changed_shortcuts:
+                    role_cache_by_instance.pop(instance, None)
         usable_paths = tuple(
             item.path
             for item in shortcuts
@@ -1116,34 +2162,95 @@ class WindowsSmartReconnectObservationBroker:
             and item.seal is not None
             and not item.failure_codes
         )
-        identity_requests: list[SmartReconnectObservationRequest] = []
         identity_indexes: list[int] = []
         windows = list(raw.windows)
         for index, window in enumerate(windows):
             if normalize_launch_fingerprint(window.launch_fingerprint) is not None:
                 continue
+            process_key: ProcessObservationCacheKey | None = None
+            if (
+                isinstance(window.process_id, int)
+                and not isinstance(window.process_id, bool)
+                and window.process_id > 0
+                and isinstance(window.process_lifecycle_token, int)
+                and not isinstance(window.process_lifecycle_token, bool)
+                and window.process_lifecycle_token > 0
+            ):
+                process_key = ProcessObservationCacheKey(
+                    window.process_id,
+                    window.process_lifecycle_token,
+                )
+            cached_fingerprint = (
+                process_cache.get(process_key)
+                if process_key is not None
+                else None
+            )
+            if cached_fingerprint is not None:
+                windows[index] = replace(
+                    window,
+                    launch_fingerprint=cached_fingerprint,
+                )
+                continue
             identity_indexes.append(index)
-            identity_requests.append(
+        if identity_indexes:
+            raw_identity_result = self._request(
                 SmartReconnectObservationRequest(
                     stage="identity",
                     reference_dir=self._reference_dir,
                     title_keywords=self._title_keywords,
                     shortcut_paths=usable_paths,
-                    window=window,
-                )
+                    windows=tuple(windows[index] for index in identity_indexes),
+                ),
+                WINDOW_TIMEOUT_SECONDS
+                * (
+                    1
+                    + math.ceil(
+                        len(identity_indexes) / MAX_PARALLEL_WINDOWS
+                    )
+                ),
             )
-        identity_results = self._request_bounded(
-            tuple(identity_requests),
-            WINDOW_TIMEOUT_SECONDS,
-        )
-        for index, result in zip(identity_indexes, identity_results):
-            if isinstance(result, WindowInfo):
-                windows[index] = result
-            else:
-                windows[index] = replace(
-                    windows[index],
-                    launch_fingerprint=None,
+            identity_results = (
+                raw_identity_result
+                if isinstance(raw_identity_result, tuple)
+                else ()
+            )
+            for result_index, window_index in enumerate(identity_indexes):
+                result = (
+                    identity_results[result_index]
+                    if result_index < len(identity_results)
+                    else None
                 )
+                if isinstance(result, WindowInfo):
+                    windows[window_index] = result
+                    fingerprint = normalize_launch_fingerprint(
+                        result.launch_fingerprint
+                    )
+                    if (
+                        fingerprint is not None
+                        and isinstance(result.process_id, int)
+                        and isinstance(result.process_lifecycle_token, int)
+                    ):
+                        try:
+                            process_cache[
+                                ProcessObservationCacheKey(
+                                    result.process_id,
+                                    result.process_lifecycle_token,
+                                )
+                            ] = fingerprint
+                        except (TypeError, ValueError):
+                            pass
+                else:
+                    windows[window_index] = replace(
+                        windows[window_index],
+                        launch_fingerprint=None,
+                    )
+        cached_shortcuts = {
+            item.path: item
+            for item in shortcuts
+            if item.cache_key is not None
+        }
+        shortcut_cache.clear()
+        shortcut_cache.update(cached_shortcuts)
         return SmartReconnectEnumerationResult(
             windows=tuple(windows),
             shortcuts=tuple(shortcuts),
@@ -1285,6 +2392,34 @@ class WindowsSmartReconnectObservationBroker:
             failure_codes=tuple(dict.fromkeys(failure_codes)),
         )
 
+    def _role_cache_key_for(
+        self,
+        instance: WindowInstanceToken,
+        fingerprint: str,
+        shortcuts: tuple[SmartReconnectShortcutObservation, ...],
+        source_generation: int,
+        role_region_sha256: str,
+    ) -> RoleObservationCacheKey | None:
+        matches = tuple(
+            item
+            for item in shortcuts
+            if normalize_launch_fingerprint(item.fingerprint) == fingerprint
+            and item.seal is not None
+            and not item.failure_codes
+        )
+        if len(matches) != 1:
+            return None
+        try:
+            return RoleObservationCacheKey(
+                instance=instance,
+                fingerprint=fingerprint,
+                shortcut_seal=matches[0].seal,
+                source_generation=source_generation,
+                role_region_sha256=role_region_sha256,
+            )
+        except (TypeError, ValueError):
+            return None
+
     def refresh(
         self,
         shortcut_paths: Iterable[Path] = (),
@@ -1296,10 +2431,20 @@ class WindowsSmartReconnectObservationBroker:
             )
         )
         with self._refresh_lock:
-            previous = self.latest_snapshot()
-            serial = self._next_request()
-            if serial is None:
+            refresh_state = self._next_request(normalized_paths)
+            if refresh_state is None:
                 return self._invalid_snapshot("observation_broker_closed")
+            (
+                serial,
+                previous,
+                role_source_generation,
+                shortcut_cache,
+                process_cache,
+                role_cache,
+                role_cache_by_instance,
+                refresh_shortcuts,
+            ) = refresh_state
+            shortcut_batch_available = [True]
             before = self._request(
                 self._enumeration_request(normalized_paths),
                 ENUMERATION_TIMEOUT_SECONDS,
@@ -1314,18 +2459,46 @@ class WindowsSmartReconnectObservationBroker:
                     serial,
                     *before.failure_codes,
                 )
-            before = self._complete_enumeration(before)
+            before = self._complete_enumeration(
+                before,
+                shortcut_cache=shortcut_cache,
+                process_cache=process_cache,
+                role_cache=role_cache,
+                role_cache_by_instance=role_cache_by_instance,
+                shortcut_batch_available=shortcut_batch_available,
+                refresh_shortcuts=refresh_shortcuts,
+            )
             unique_before, blocked, anonymous = self._unique_windows(
                 before.windows
             )
-            requests = tuple(
-                SmartReconnectObservationRequest(
+            requests_list: list[SmartReconnectObservationRequest] = []
+            for fingerprint, (window, instance) in unique_before.items():
+                role_cache_key: RoleObservationCacheKey | None = None
+                cached_role_id: str | None = None
+                prior_role_cache = role_cache_by_instance.get(instance)
+                if prior_role_cache is not None:
+                    prior_key = prior_role_cache[0]
+                    current_key = self._role_cache_key_for(
+                        instance,
+                        fingerprint,
+                        before.shortcuts,
+                        role_source_generation,
+                        prior_key.role_region_sha256,
+                    )
+                    if current_key == prior_key:
+                        cached_role_id = role_cache.get(prior_key)
+                        if cached_role_id is not None:
+                            role_cache_key = prior_key
+                requests_list.append(SmartReconnectObservationRequest(
                     stage="window",
                     reference_dir=self._reference_dir,
                     title_keywords=self._title_keywords,
                     shortcut_paths=normalized_paths,
                     shortcut_roots=self._shortcut_roots,
                     window=window,
+                    cached_role_id=cached_role_id,
+                    role_cache_hit=cached_role_id is not None,
+                    role_cache_key=role_cache_key,
                     visible_capture_enabled=self._visible_capture_enabled,
                     obscured_capture_enabled=(
                         self._obscured_capture_enabled
@@ -1333,9 +2506,8 @@ class WindowsSmartReconnectObservationBroker:
                     minimized_capture_enabled=(
                         self._minimized_capture_enabled
                     ),
-                )
-                for window, _instance in unique_before.values()
-            )
+                ))
+            requests = tuple(requests_list)
             observed = self._request_bounded(
                 requests,
                 WINDOW_TIMEOUT_SECONDS,
@@ -1351,7 +2523,15 @@ class WindowsSmartReconnectObservationBroker:
                 )
             if after.failure_codes:
                 return self._publish_global_failure(serial, *after.failure_codes)
-            after = self._complete_enumeration(after)
+            after = self._complete_enumeration(
+                after,
+                shortcut_cache=shortcut_cache,
+                process_cache=process_cache,
+                role_cache=role_cache,
+                role_cache_by_instance=role_cache_by_instance,
+                shortcut_batch_available=shortcut_batch_available,
+                refresh_shortcuts=False,
+            )
             unique_after, after_blocked, after_anonymous = self._unique_windows(
                 after.windows
             )
@@ -1394,6 +2574,78 @@ class WindowsSmartReconnectObservationBroker:
                 if "window_instance_incomplete" in item.failure_codes:
                     blocked_set.add(fingerprint)
                     continue
+                sample_sha256 = _capture_sha256(item.sample)
+                role_evidence_is_current = bool(
+                    item.freshness is ObservationFreshness.PROVEN_CURRENT
+                    and item.fresh_capture is True
+                    and item.capture_route == "visible"
+                    and sample_sha256 is not None
+                    and item.role_region_sha256 is not None
+                )
+                if not role_evidence_is_current:
+                    item = replace(
+                        item,
+                        recognition=_unknown_recognition(),
+                        fresh_capture=False,
+                        freshness=ObservationFreshness.UNPROVEN,
+                        role_id=None,
+                        role_cache_key=None,
+                        role_region_sha256=None,
+                        failure_codes=tuple(dict.fromkeys((
+                            *item.failure_codes,
+                            "desktop_pixels_unproven",
+                        ))),
+                    )
+                prior_role_cache = role_cache_by_instance.pop(
+                    instance,
+                    None,
+                )
+                if prior_role_cache is not None:
+                    role_cache.pop(prior_role_cache[0], None)
+                role_cache_key = (
+                    self._role_cache_key_for(
+                        instance,
+                        fingerprint,
+                        after.shortcuts,
+                        role_source_generation,
+                        item.role_region_sha256,
+                    )
+                    if role_evidence_is_current
+                    else None
+                )
+                process_cache_key = (
+                    ProcessObservationCacheKey(
+                        window.process_id,
+                        window.process_lifecycle_token,
+                    )
+                    if (
+                        isinstance(window.process_id, int)
+                        and not isinstance(window.process_id, bool)
+                        and window.process_id > 0
+                        and isinstance(window.process_lifecycle_token, int)
+                        and not isinstance(window.process_lifecycle_token, bool)
+                        and window.process_lifecycle_token > 0
+                    )
+                    else None
+                )
+                item = replace(
+                    item,
+                    role_cache_key=role_cache_key,
+                    process_cache_key=process_cache_key,
+                )
+                if (
+                    role_cache_key is not None
+                    and isinstance(item.role_id, str)
+                    and item.role_id.strip()
+                ):
+                    role_cache[role_cache_key] = item.role_id
+                    role_cache_by_instance[instance] = (
+                        role_cache_key,
+                        item.role_id,
+                    )
+                else:
+                    if role_cache_key is not None:
+                        role_cache.pop(role_cache_key, None)
                 results.append(item)
             results = [
                 item
@@ -1449,6 +2701,7 @@ class WindowsSmartReconnectObservationBroker:
             isolated = current_isolated + len(absent_blocked)
             snapshot = SmartReconnectObservationSnapshot(
                 generation=0,
+                request_serial=serial,
                 windows=tuple(results),
                 shortcuts=after.shortcuts,
                 blocked_fingerprints=frozenset(blocked_set),
@@ -1457,7 +2710,16 @@ class WindowsSmartReconnectObservationBroker:
                 failure_codes=(),
                 foreground_handle=after.foreground_handle,
             )
-            published = self._publish(serial, snapshot)
+            published = self._publish(
+                serial,
+                snapshot,
+                expected_role_source_generation=role_source_generation,
+                shortcut_cache=shortcut_cache,
+                process_cache=process_cache,
+                role_cache=role_cache,
+                role_cache_by_instance=role_cache_by_instance,
+                shortcut_catalog_paths=normalized_paths,
+            )
             return (
                 published
                 if published is not None
@@ -1469,44 +2731,159 @@ class WindowsSmartReconnectObservationBroker:
         serial: int,
         *failure_codes: str,
     ) -> SmartReconnectObservationSnapshot:
-        snapshot = SmartReconnectObservationSnapshot(
-            generation=0,
-            failure_codes=tuple(dict.fromkeys(failure_codes)),
-        )
-        published = self._publish(serial, snapshot)
-        return (
-            published
-            if published is not None
-            else self._invalid_snapshot("observation_request_superseded")
-        )
+        with self._action_gate:
+            with self._state_lock:
+                if self._closed or self._request_serial != serial:
+                    return self._invalid_snapshot("observation_request_superseded")
+                self._refresh_inflight = False
+                self._action_snapshot = None
+                self._action_lease = None
+                return self._invalid_snapshot(*failure_codes)
+
+    @staticmethod
+    def _static_state_for_snapshot(
+        snapshot: SmartReconnectObservationSnapshot,
+    ) -> dict[
+        str,
+        tuple[WindowInstanceToken, ShortcutSeal | None, str | None],
+    ]:
+        result: dict[
+            str,
+            tuple[WindowInstanceToken, ShortcutSeal | None, str | None],
+        ] = {}
+        for item in snapshot.windows:
+            fingerprint = normalize_launch_fingerprint(
+                item.window.launch_fingerprint
+            )
+            if fingerprint is None or item.instance is None:
+                continue
+            shortcut = snapshot.shortcut_for(fingerprint)
+            result[fingerprint] = (
+                item.instance,
+                shortcut.seal if shortcut is not None else None,
+                item.role_id,
+            )
+        return result
 
     def _publish(
         self,
         serial: int,
         snapshot: SmartReconnectObservationSnapshot,
+        *,
+        expected_role_source_generation: int | None = None,
+        shortcut_cache: dict[str, SmartReconnectShortcutObservation] | None = None,
+        process_cache: dict[ProcessObservationCacheKey, str] | None = None,
+        role_cache: dict[RoleObservationCacheKey, str] | None = None,
+        role_cache_by_instance: dict[
+            WindowInstanceToken,
+            tuple[RoleObservationCacheKey, str],
+        ] | None = None,
+        shortcut_catalog_paths: tuple[str, ...] = (),
     ) -> SmartReconnectObservationSnapshot | None:
-        with self._state_lock:
-            if self._closed or self._request_serial != serial:
-                return None
-            self._generation += 1
-            current = SmartReconnectObservationSnapshot(
-                generation=self._generation,
-                windows=snapshot.windows,
-                shortcuts=snapshot.shortcuts,
-                blocked_fingerprints=snapshot.blocked_fingerprints,
-                isolated_window_count=snapshot.isolated_window_count,
-                anonymous_isolated_window_count=(
-                    snapshot.anonymous_isolated_window_count
-                ),
-                failure_codes=snapshot.failure_codes,
-                foreground_handle=snapshot.foreground_handle,
-            )
-            self._latest = current
-            self._published_snapshot_without_wait = current
-            self._published_request_serial = serial
-            return current
+        with self._action_gate:
+            with self._state_lock:
+                expected_role_source_generation = (
+                    self._role_source_generation
+                    if expected_role_source_generation is None
+                    else expected_role_source_generation
+                )
+                shortcut_cache = (
+                    dict(self._shortcut_cache)
+                    if shortcut_cache is None
+                    else shortcut_cache
+                )
+                process_cache = (
+                    dict(self._process_cache)
+                    if process_cache is None
+                    else process_cache
+                )
+                role_cache = (
+                    dict(self._role_cache)
+                    if role_cache is None
+                    else role_cache
+                )
+                role_cache_by_instance = (
+                    dict(self._role_cache_by_instance)
+                    if role_cache_by_instance is None
+                    else role_cache_by_instance
+                )
+                if (
+                    self._closed
+                    or self._request_serial != serial
+                    or self._role_source_generation
+                    != expected_role_source_generation
+                ):
+                    return None
+                self._generation += 1
+                now = time.monotonic()
+                action_deadline = now + ACTION_LEASE_SECONDS
+                static_state = self._static_state_for_snapshot(snapshot)
+                changed_fingerprints = frozenset(
+                    fingerprint
+                    for fingerprint in (
+                        self._last_static_by_fingerprint.keys()
+                        | static_state.keys()
+                        | set(snapshot.blocked_fingerprints)
+                    )
+                    if (
+                        self._last_static_by_fingerprint.get(fingerprint)
+                        != static_state.get(fingerprint)
+                        or fingerprint in snapshot.blocked_fingerprints
+                    )
+                )
+                if self._stable_snapshot is None or changed_fingerprints:
+                    self._static_generation += 1
+                current = SmartReconnectObservationSnapshot(
+                    generation=self._generation,
+                    request_serial=serial,
+                    published_at_monotonic=now,
+                    action_deadline_monotonic=action_deadline,
+                    static_generation=self._static_generation,
+                    changed_fingerprints=changed_fingerprints,
+                    windows=snapshot.windows,
+                    shortcuts=snapshot.shortcuts,
+                    blocked_fingerprints=snapshot.blocked_fingerprints,
+                    isolated_window_count=snapshot.isolated_window_count,
+                    anonymous_isolated_window_count=(
+                        snapshot.anonymous_isolated_window_count
+                    ),
+                    failure_codes=snapshot.failure_codes,
+                    foreground_handle=snapshot.foreground_handle,
+                )
+                self._latest = current
+                self._stable_snapshot = current
+                self._action_snapshot = current
+                self._action_lease = ObservationActionLease(
+                    request_serial=serial,
+                    observation_generation=current.generation,
+                    deadline_monotonic=action_deadline,
+                )
+                self._last_static_by_fingerprint = static_state
+                self._published_snapshot_without_wait = current
+                self._published_request_serial = serial
+                self._refresh_inflight = False
+                live_role_keys = frozenset(
+                    item.role_cache_key
+                    for item in current.windows
+                    if item.role_cache_key is not None
+                )
+                self._shortcut_cache = dict(shortcut_cache)
+                self._process_cache = dict(process_cache)
+                self._role_cache = {
+                    key: value
+                    for key, value in role_cache.items()
+                    if key in live_role_keys
+                }
+                self._role_cache_by_instance = {
+                    instance: cached
+                    for instance, cached in role_cache_by_instance.items()
+                    if cached[0] in live_role_keys
+                }
+                self._shortcut_catalog_paths = shortcut_catalog_paths
+                self._shortcut_refresh_required = False
+                return current
 
-    def seal_witness(
+    def revalidate_reopen_seal(
         self,
         expected: ShortcutSeal,
     ) -> SmartReconnectSealWitness | None:
@@ -1518,7 +2895,7 @@ class WindowsSmartReconnectObservationBroker:
                     self._latest.generation
                 ):
                     return None
-                observation_generation = self._latest.generation
+                observation_generation = self._action_snapshot.generation
                 self._current_witnesses.pop(
                     expected.launch_fingerprint,
                     None,
@@ -1556,6 +2933,14 @@ class WindowsSmartReconnectObservationBroker:
                 )
                 return witness
 
+    def seal_witness(
+        self,
+        expected: ShortcutSeal,
+    ) -> SmartReconnectSealWitness | None:
+        """Compatibility alias; product code uses the reopen-only name."""
+
+        return self.revalidate_reopen_seal(expected)
+
     def witness_is_current(self, witness: SmartReconnectSealWitness) -> bool:
         with self._state_lock:
             return bool(
@@ -1588,16 +2973,23 @@ class WindowsSmartReconnectObservationBroker:
         )
 
     def close(self) -> bool:
-        with self._state_lock:
-            if not self._closed:
-                self._closed = True
-                self._request_serial += 1
-                self._current_witnesses.clear()
-                self._published_snapshot_without_wait = None
-                self._published_witnesses_without_wait = ()
+        with self._action_gate:
+            with self._state_lock:
+                if not self._closed:
+                    self._closed = True
+                    self._request_serial += 1
+                    self._current_witnesses.clear()
+                    self._action_snapshot = None
+                    self._action_lease = None
+                    self._refresh_inflight = False
+                    self._published_snapshot_without_wait = None
+                    self._published_witnesses_without_wait = ()
+        with self._pool_lock:
+            with self._active_lock:
+                active = tuple(self._active.values())
+            for worker in active:
+                self._finish_worker(worker, kill=False)
+            with self._state_lock:
+                self._started = False
         with self._active_lock:
-            active = tuple(self._active.values())
-        for worker in active:
-            self._finish_worker(worker, kill=True)
-        with self._active_lock:
-            return not self._active
+            return not self._active and not self._slots

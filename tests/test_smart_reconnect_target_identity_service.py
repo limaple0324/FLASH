@@ -60,6 +60,7 @@ class StaticObservationBroker:
     def __init__(self, snapshot):
         self.snapshot = snapshot
         self.refresh_calls = 0
+        self.stable_calls = 0
 
     def refresh(self, _paths=()):
         self.refresh_calls += 1
@@ -69,6 +70,10 @@ class StaticObservationBroker:
         return self.snapshot
 
     def current_snapshot(self):
+        return self.snapshot
+
+    def stable_snapshot(self):
+        self.stable_calls += 1
         return self.snapshot
 
 
@@ -243,6 +248,7 @@ def test_formal_broker_path_never_calls_direct_shortcut_sources(tmp_path):
     assert broker.refresh_calls == 1
     assert service.remember_verified_slot(FINGERPRINT, CHARACTER_ID, 0) is True
     assert broker.refresh_calls == 1
+    assert broker.stable_calls == 1
 
 
 def test_broker_catalog_resolves_unique_ungrouped_identity_without_ui_provider(

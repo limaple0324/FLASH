@@ -1,3 +1,4 @@
+import hashlib
 import json
 import multiprocessing
 import os
@@ -19,6 +20,7 @@ from core.smart_reconnect_authorization import (
 from core.target_window_contract import (
     ActualWindowContract,
     ActualWindowSnapshot,
+    ObservationFreshness,
 )
 from core.window_instance import WindowInstanceToken
 from core.window_registry import CharacterWindowRecord, WindowRegistry
@@ -48,6 +50,7 @@ from services.smart_reconnect_target_identity_service import (
 )
 from adapters.windows_window import Win32WindowBackend
 from adapters.game_screen_recognizer import ScreenRecognition
+from adapters.windows_background_capture import CaptureSample
 from adapters.windows_smart_reconnect_observation_broker import (
     SmartReconnectEnumerationResult,
     SmartReconnectObservationRequest,
@@ -179,6 +182,11 @@ class BrokerTargetWindowService:
 
     def actual_snapshot(self):
         observed = self.broker.refresh()
+        action_reader = getattr(self.broker, "action_snapshot", None)
+        action = action_reader() if callable(action_reader) else None
+        action_lease = (
+            action[1] if action is not None and action[0] is observed else None
+        )
         return ActualWindowSnapshot(
             ActualWindowSnapshot.SCHEMA_VERSION,
             targets=tuple(
@@ -197,6 +205,10 @@ class BrokerTargetWindowService:
             ),
             failure_codes=observed.failure_codes,
             observation_generation=observed.generation,
+            observation_request_serial=observed.request_serial,
+            observation_static_generation=observed.static_generation,
+            changed_fingerprints=observed.changed_fingerprints,
+            action_lease=action_lease,
         )
 
 
@@ -1319,7 +1331,7 @@ def install_pending_broker_path(fixture, *, generation=31):
                         ),
                     ),
                     instance=instance,
-                    sample=None,
+                    sample=CaptureSample(1, 1, b"\1\0\0\0", True),
                     recognition=ScreenRecognition(
                         ReconnectScreenState.CONNECTED,
                         1.0,
@@ -1329,6 +1341,9 @@ def install_pending_broker_path(fixture, *, generation=31):
                     fresh_capture=True,
                     capture_route="visible",
                     role_id=fixture.aliases[instance.handle],
+                    role_region_sha256=hashlib.sha256(
+                        fixture.aliases[instance.handle].encode("utf-8")
+                    ).hexdigest(),
                 ),
             ),
             shortcuts=(
@@ -1400,10 +1415,11 @@ def _formal_pending_observation_worker(
             for item in payload["windows"]
             if item["handle"] == window.handle
         )
+        sample = CaptureSample(1, 1, b"\1\0\0\0", True)
         return SmartReconnectWindowObservation(
             window=window,
             instance=WindowInstanceToken.from_window(window),
-            sample=None,
+            sample=sample,
             recognition=ScreenRecognition(
                 ReconnectScreenState.CONNECTED,
                 1.0,
@@ -1411,8 +1427,11 @@ def _formal_pending_observation_worker(
                 "connected",
             ),
             fresh_capture=True,
-            capture_route="print_window",
+            capture_route="visible",
             role_id=role_id,
+            role_region_sha256=hashlib.sha256(
+                role_id.encode("utf-8")
+            ).hexdigest(),
         )
     if request.stage == "seal":
         return request.expected_seal
@@ -1507,6 +1526,54 @@ def test_pending_window_has_zero_grant_until_second_independent_observation(
     assert fixture.identity.generation == second_generation
 
 
+def test_unproven_background_role_never_persists_or_authorizes(tmp_path):
+    fixture = build_pending_preparation_fixture(tmp_path)
+    broker = install_pending_broker_path(fixture)
+    observed = broker.snapshot.windows[0]
+    broker.snapshot = replace(
+        broker.snapshot,
+        windows=(replace(
+            observed,
+            sample=CaptureSample(1, 1, b"\1\0\0\0", True),
+            recognition=ScreenRecognition(
+                ReconnectScreenState.CONNECTED,
+                1.0,
+                None,
+                "connected",
+            ),
+            fresh_capture=False,
+            freshness=ObservationFreshness.UNPROVEN,
+            capture_route="obscured",
+            role_id="100古",
+            role_cache_key=None,
+        ),),
+    )
+    state_before = (
+        fixture.target_identity.state_path.read_bytes()
+        if fixture.target_identity.state_path.exists()
+        else None
+    )
+    generation_before = fixture.identity.generation
+
+    first = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+    second = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+
+    assert first.targets == ()
+    assert second.targets == ()
+    assert fixture.authorization.current_authorization().targets == ()
+    state_after = (
+        fixture.target_identity.state_path.read_bytes()
+        if fixture.target_identity.state_path.exists()
+        else None
+    )
+    assert state_after == state_before
+    assert fixture.identity.generation == generation_before
+
+
 def test_bare_level_100_remains_pending_and_never_receives_a_grant(tmp_path):
     fixture = build_pending_preparation_fixture(tmp_path)
     fixture.aliases[501] = "100"
@@ -1526,6 +1593,43 @@ def test_bare_level_100_remains_pending_and_never_receives_a_grant(tmp_path):
     assert saved["status"] == "pending"
     assert saved["verified_aliases"] == []
     assert saved["evidence_alias"] is None
+
+
+def test_unproven_print_window_role_writes_nothing_and_has_zero_grant(tmp_path):
+    fixture = build_pending_preparation_fixture(tmp_path)
+    broker = install_pending_broker_path(fixture)
+    observed = broker.snapshot.windows[0]
+    broker.snapshot = replace(
+        broker.snapshot,
+        windows=(
+            replace(
+                observed,
+                sample=CaptureSample(1, 1, b"\3\0\0\0", True),
+                recognition=ScreenRecognition(
+                    ReconnectScreenState.UNKNOWN,
+                    None,
+                    None,
+                    None,
+                ),
+                fresh_capture=False,
+                freshness=ObservationFreshness.UNPROVEN,
+                capture_route="print_window",
+            ),
+        ),
+    )
+    generation_before = fixture.identity.generation
+
+    first = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+    second = fixture.preparation.prepare(
+        launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+    )
+
+    assert first.targets == ()
+    assert second.targets == ()
+    assert fixture.target_identity.state_path.exists() is False
+    assert fixture.identity.generation == generation_before
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires spawn process broker")
@@ -1572,12 +1676,18 @@ def test_formal_spawn_broker_keeps_100_pending_and_confirms_full_names(
         full_second = full.preparation.prepare(
             launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
         )
+        confirmed_generation = full.identity.generation
+        full_third = full.preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
         full_state = json.loads(
             full.target_identity.state_path.read_text(encoding="utf-8")
         )["targets"]
 
         assert full_first.targets == ()
         assert len(full_second.targets) == 2
+        assert full_third is full_second
+        assert full.identity.generation == confirmed_generation
         assert {
             target.role_aliases for target in full_second.targets
         } == {("100古",), ("100靈",)}
@@ -1588,6 +1698,69 @@ def test_formal_spawn_broker_keeps_100_pending_and_confirms_full_names(
         assert full_broker.current_snapshot().generation >= 2
     finally:
         assert full_broker.close() is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires spawn process broker")
+def test_formal_broker_role_region_change_requires_two_new_observations(
+    tmp_path,
+):
+    fixture = build_pending_preparation_fixture(
+        tmp_path,
+        role_aliases=("100古",),
+    )
+    broker = install_formal_pending_broker_path(fixture)
+    payload_path = tmp_path / "formal-observation.json"
+    try:
+        first = fixture.preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
+        confirmed_old = fixture.preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
+        old_state = json.loads(
+            fixture.target_identity.state_path.read_text(encoding="utf-8")
+        )["targets"][fixture.fingerprints[0]]
+
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        payload["windows"][0]["role_id"] = "100靈"
+        payload_path.write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        switched_first = fixture.preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
+        pending_state = json.loads(
+            fixture.target_identity.state_path.read_text(encoding="utf-8")
+        )["targets"][fixture.fingerprints[0]]
+        switched_second = fixture.preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
+        confirmed_generation = fixture.identity.generation
+        switched_third = fixture.preparation.prepare(
+            launch_mode=ReconnectLaunchMode.IDENTITY_BOUND
+        )
+        confirmed_state = json.loads(
+            fixture.target_identity.state_path.read_text(encoding="utf-8")
+        )["targets"][fixture.fingerprints[0]]
+
+        assert first.targets == ()
+        assert len(confirmed_old.targets) == 1
+        assert old_state["status"] == "confirmed"
+        assert old_state["verified_aliases"] == ["100古"]
+        assert switched_first.targets == ()
+        assert pending_state["status"] == "pending"
+        assert pending_state["verified_aliases"] == []
+        assert pending_state["character_id"] == old_state["character_id"]
+        assert len(switched_second.targets) == 1
+        assert switched_second.targets[0].role_aliases == ("100靈",)
+        assert confirmed_state["status"] == "confirmed"
+        assert confirmed_state["verified_aliases"] == ["100靈"]
+        assert switched_third is switched_second
+        assert fixture.identity.generation == confirmed_generation
+    finally:
+        assert broker.close() is True
 
 
 def test_observation_generation_changes_before_persistence_write_nothing(
