@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shutil
 import subprocess
@@ -12,6 +13,41 @@ WINDOWS_COMMAND_FILES = (
     Path("tools/更新輔.cmd"),
     Path("tools/檢查輔同步狀態.cmd"),
 )
+
+
+def _workflow_step(workflow: str, name: str, next_name: str) -> str:
+    step = workflow.split(f"- name: {name}", 1)[1]
+    return step.split(f"- name: {next_name}", 1)[0]
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[int, str]]:
+    return {
+        path.relative_to(root).as_posix(): (
+            path.stat().st_size,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _write_key_values(path: Path, values: list[tuple[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(f"{key}={value}\n" for key, value in values),
+        encoding="utf-8-sig",
+    )
+
+
+def _write_sha256_manifest(root: Path, relative_paths: tuple[str, ...]) -> None:
+    lines = []
+    for relative_path in relative_paths:
+        payload = root / Path(relative_path)
+        lines.append(f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  {relative_path}")
+    (root / "輔系統" / "SHA256SUMS.txt").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8-sig",
+    )
 
 
 def test_windows_command_files_use_crlf_only():
@@ -580,19 +616,254 @@ def test_live_installer_workflow_uses_its_immediate_success_status():
 
 def test_live_installer_workflow_reads_unicode_shortcuts_with_shell_application():
     workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
-    installer_step = workflow.split(
-        "- name: Verify live install update rollback and desktop entries", 1
-    )[1]
+    installer_step = _workflow_step(
+        workflow,
+        "Verify live install update rollback and desktop entries",
+        "Upload Windows release bundle",
+    )
     shortcut_check = installer_step.split("$beforeHash", 1)[0]
 
     assert "$shellApp = New-Object -ComObject Shell.Application" in shortcut_check
-    assert "$desktopFolder = $shellApp.NameSpace($desktopRoot)" in shortcut_check
+    assert "$desktopFolder = $shellApp.NameSpace($Desktop)" in shortcut_check
     assert "$mainShortcut = $desktopFolder.ParseName('輔.lnk').GetLink" in shortcut_check
     assert "$updateShortcut = $desktopFolder.ParseName('更新輔.lnk').GetLink" in shortcut_check
-    assert "$mainShortcut.Path -ne (Join-Path $installRoot 'FLASH.exe')" in shortcut_check
-    assert "$updateShortcut.Path -ne (Join-Path $installRoot '更新輔.cmd')" in shortcut_check
+    assert "$mainShortcut.Path -ne (Join-Path $Install 'FLASH.exe')" in shortcut_check
+    assert "$updateShortcut.Path -ne (Join-Path $Install '更新輔.cmd')" in shortcut_check
+    assert "[string]$mainShortcut.WorkingDirectory -ne $Install" in shortcut_check
+    assert "[string]$updateShortcut.WorkingDirectory -ne $Install" in shortcut_check
+    assert "[string]$mainShortcut.Arguments" in shortcut_check
+    assert "[string]$updateShortcut.Arguments" in shortcut_check
     assert "WScript.Shell" not in shortcut_check
     assert "TargetPath" not in shortcut_check
+
+
+def test_live_install_validation_condition_is_exact_and_publish_remains_forbidden():
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    installer_step = _workflow_step(
+        workflow,
+        "Verify live install update rollback and desktop entries",
+        "Upload Windows release bundle",
+    )
+    condition = next(
+        line.strip()
+        for line in installer_step.splitlines()
+        if line.strip().startswith("if:")
+    )
+    assert condition == (
+        "if: env.FLASH_BUILD_KIND == 'main_release' || "
+        "env.FLASH_BUILD_KIND == 'sp1_release' || "
+        "env.FLASH_BUILD_KIND == 'validation_build'"
+    )
+    assert "sp1_snapshot" not in condition
+    assert "sp2_snapshot" not in condition
+    assert "sp3_snapshot" not in condition
+
+    metadata_step = _workflow_step(
+        workflow,
+        "Read delivery metadata",
+        "Build windowed executable",
+    )
+    validation_branch = metadata_step.split("else {", 1)[1]
+    assert "$buildKind = 'validation_build'" in validation_branch
+    assert "$publishTarget = 'none'" in validation_branch
+
+    publish_header = workflow.split("\n  publish:\n", 1)[1].split("    permissions:", 1)[0]
+    assert publish_header == (
+        "    name: Publish verified Windows updater files\n"
+        "    needs: test-and-build\n"
+        "    if: >-\n"
+        "      github.event_name == 'push' && github.ref == 'refs/heads/main' ||\n"
+        "      github.ref == 'refs/heads/sp1/completion-2026-07-25' &&\n"
+        "      (github.event_name == 'push' ||\n"
+        "      (github.event_name == 'workflow_dispatch' && inputs.publish_sp1))\n"
+    )
+    assert "validation_build" not in publish_header
+
+
+def test_live_install_validation_is_runner_temp_local_and_keeps_original_artifact():
+    workflow = Path(".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    installer_step = _workflow_step(
+        workflow,
+        "Verify live install update rollback and desktop entries",
+        "Upload Windows release bundle",
+    )
+    upload_step = _workflow_step(
+        workflow,
+        "Upload Windows release bundle",
+        "Publish verified Windows updater files",
+    )
+
+    assert "$runnerRoot = Get-NormalizedRoot $env:RUNNER_TEMP" in installer_step
+    assert installer_step.count("Assert-PathUnderRoot `") == 5
+    assert "-Path (Join-Path $validationRoot 'source')" in installer_step
+    assert "-Path (Join-Path $validationRoot 'install')" in installer_step
+    assert "-Path (Join-Path $validationRoot 'desktop')" in installer_step
+    assert "-Path (Join-Path $validationRoot 'temp')" in installer_step
+    assert "$candidateSnapshotBefore = Get-DirectorySnapshot $candidateRoot" in installer_step
+    assert "$candidateSnapshotAfter = Get-DirectorySnapshot $candidateRoot" in installer_step
+    assert "-Description 'Original release candidate'" in installer_step
+    assert "'build_kind=main_release'" in installer_step
+    assert "'publish_target=release/latest'" in installer_step
+    assert "Copy-ValidationFile" in installer_step
+    assert "Write-LiveManifest -Root $sourceRoot" in installer_step
+    assert "-ReleaseSourceDirectory $sourceRoot" in installer_step
+    assert "TestFailAfterReplacement 1" in installer_step
+    assert "$rollbackSucceeded = $?" in installer_step
+    assert "$rollbackExitCode = $LASTEXITCODE" in installer_step
+    assert "$updateSucceeded = $?" in installer_step
+    assert "$updateExitCode = $LASTEXITCODE" in installer_step
+    assert "-RelativePaths $installedPayloadPaths" in installer_step
+    assert "12 payload files plus manifest" in installer_step
+    assert "Get-ValidationProcesses" in installer_step
+    assert "Assert-NoValidationResidue" in installer_step
+    assert "Stop-Process" not in installer_step
+    assert "Invoke-WebRequest" not in installer_step
+    assert "Invoke-RestMethod" not in installer_step
+    assert "git " not in installer_step
+    assert "gh " not in installer_step
+    assert "release/*" in upload_step
+    assert "dist/*.zip*" in upload_step
+    assert "$sourceRoot" not in upload_step
+    assert "$validationRoot" not in upload_step
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows installer contracts")
+def test_live_install_validation_executes_formal_rollback_update_and_cleanup(tmp_path):
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+
+    running_flash = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "if(Get-Process -Name FLASH -ErrorAction SilentlyContinue){exit 10}",
+        ],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=10,
+        check=False,
+    )
+    if running_flash.returncode == 10:
+        pytest.skip("a real FLASH process is running")
+    assert running_flash.returncode == 0, running_flash.stdout + running_flash.stderr
+
+    repository = Path(__file__).resolve().parents[1]
+    workspace = tmp_path / "workflow"
+    candidate = workspace / "release"
+    candidate_system = candidate / "輔系統"
+    candidate_system.mkdir(parents=True)
+    (candidate / "FLASH.exe").write_bytes(b"new-validation-candidate")
+    (candidate / "sync_plus_icon.ico").write_bytes(b"validation-icon")
+    shutil.copy2(
+        repository / "tools" / "verify_windows_release.ps1",
+        candidate_system / "verify_windows_release.ps1",
+    )
+    (candidate / "分支驗證說明.txt").write_text(
+        "validation only\n",
+        encoding="utf-8-sig",
+    )
+    commit = "a" * 40
+    executable_hash = hashlib.sha256((candidate / "FLASH.exe").read_bytes()).hexdigest()
+    _write_key_values(
+        candidate_system / "BUILD_INFO.txt",
+        [
+            ("product", "輔"),
+            ("technical_name", "FLASH"),
+            ("version", "0.3.0"),
+            ("milestone", "SP3"),
+            ("build_kind", "validation_build"),
+            ("event_name", "pull_request"),
+            ("source_ref", "refs/pull/36/merge"),
+            ("source_branch", "repair/test"),
+            ("publish_target", "none"),
+            ("commit", commit),
+            ("run_id", "12345"),
+            ("built_utc", "2026-08-10T00:00:00Z"),
+            ("python", "Python 3.12.10"),
+            ("sha256", executable_hash),
+        ],
+    )
+    _write_sha256_manifest(
+        candidate,
+        (
+            "FLASH.exe",
+            "輔系統/BUILD_INFO.txt",
+            "sync_plus_icon.ico",
+            "輔系統/verify_windows_release.ps1",
+            "分支驗證說明.txt",
+        ),
+    )
+
+    required_tools = (
+        Path("tools/安裝輔.cmd"),
+        Path("tools/更新輔.cmd"),
+        Path("tools/輔系統/安裝輔.ps1"),
+        Path("tools/輔系統/輔更新核心.ps1"),
+        Path("tools/檢查輔同步狀態.cmd"),
+        Path("tools/檢查輔同步狀態.ps1"),
+    )
+    for relative_path in required_tools:
+        destination = workspace / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(repository / relative_path, destination)
+
+    workflow = (repository / ".github/workflows/build-windows.yml").read_text(
+        encoding="utf-8"
+    )
+    installer_step = _workflow_step(
+        workflow,
+        "Verify live install update rollback and desktop entries",
+        "Upload Windows release bundle",
+    )
+    script_body = textwrap.dedent(installer_step.split("        run: |\n", 1)[1])
+    script_path = workspace / "validation_install.ps1"
+    script_path.write_text(script_body, encoding="utf-8-sig")
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    candidate_before = _tree_snapshot(candidate)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "RUNNER_TEMP": str(runner_temp),
+            "FLASH_BUILD_KIND": "validation_build",
+            "FLASH_PUBLISH_TARGET": "none",
+            "GITHUB_SHA": commit,
+            "GITHUB_RUN_ID": "12345",
+        }
+    )
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+        ],
+        cwd=workspace,
+        env=environment,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=120,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Validation rollback restored the deliberately different payload." in result.stdout
+    assert "Validation normal update exactly matches" in result.stdout
+    assert "Original release candidate remained byte-for-byte unchanged." in result.stdout
+    assert _tree_snapshot(candidate) == candidate_before
+    candidate_info = (candidate_system / "BUILD_INFO.txt").read_text(encoding="utf-8-sig")
+    assert "build_kind=validation_build" in candidate_info
+    assert "publish_target=none" in candidate_info
+    assert "build_kind=main_release" not in candidate_info
+    assert not (runner_temp / "flash-live-validation").exists()
 
 
 def test_sp1_only_publication_has_a_separate_branch_and_verified_push_gate():
