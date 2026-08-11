@@ -547,8 +547,10 @@ def test_sync_controller_accepts_only_the_shared_target_provider():
             False,
             (0, 0, 900, 600),
             101,
-            None,
+            "ShockwaveFlash",
             "1" * 64,
+            201,
+            301,
         ),
         WindowInfo(
             12,
@@ -557,8 +559,10 @@ def test_sync_controller_accepts_only_the_shared_target_provider():
             False,
             (900, 0, 1800, 600),
             102,
-            None,
+            "ShockwaveFlash",
             "2" * 64,
+            202,
+            302,
         ),
     )
     messages = _MessageBackend()

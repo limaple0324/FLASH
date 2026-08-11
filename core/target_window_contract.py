@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping
 
-from core.smart_reconnect_authorization import _normalized_sha256
+from core.smart_reconnect_authorization import (
+    ShortcutFileIdentity,
+    ShortcutSeal,
+    _normalized_sha256,
+)
 from core.window_instance import WindowInstanceToken
 
 
@@ -16,6 +20,106 @@ class TargetWindowPhase(str, Enum):
     MINIMIZED = "minimized"
     OFFLINE = "offline"
     UNKNOWN = "unknown"
+
+
+class ObservationFreshness(str, Enum):
+    """Whether pixels prove the current desktop frame for this exact window."""
+
+    PROVEN_CURRENT = "proven_current"
+    UNPROVEN = "unproven"
+
+
+@dataclass(frozen=True, slots=True)
+class ShortcutObservationCacheKey:
+    normalized_path: str
+    file_identity: ShortcutFileIdentity
+    modified_ns: int
+    size: int
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.normalized_path, str) or not self.normalized_path:
+            raise ValueError("shortcut cache path must not be empty")
+        if not isinstance(self.file_identity, ShortcutFileIdentity):
+            raise TypeError("shortcut cache key requires file identity")
+        if self.file_identity.normalized_path != self.normalized_path:
+            raise ValueError("shortcut cache file identity path disagrees")
+        for value in (self.modified_ns, self.size):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("shortcut cache values must be non-negative")
+        digest = self.content_sha256.strip().casefold()
+        if (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("shortcut cache key requires a content SHA-256")
+        object.__setattr__(self, "content_sha256", digest)
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessObservationCacheKey:
+    process_id: int
+    process_lifecycle_token: int
+
+    def __post_init__(self) -> None:
+        for value in (self.process_id, self.process_lifecycle_token):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError("process cache values must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class RoleObservationCacheKey:
+    instance: WindowInstanceToken
+    fingerprint: str
+    shortcut_seal: ShortcutSeal
+    source_generation: int
+    role_region_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.instance, WindowInstanceToken):
+            raise TypeError("role cache key requires a complete window instance")
+        fingerprint = _normalized_sha256(self.fingerprint)
+        if fingerprint is None:
+            raise ValueError("role cache key requires a launch fingerprint")
+        if not isinstance(self.shortcut_seal, ShortcutSeal):
+            raise TypeError("role cache key requires a shortcut seal")
+        if self.shortcut_seal.launch_fingerprint != fingerprint:
+            raise ValueError("role cache shortcut seal disagrees")
+        if (
+            isinstance(self.source_generation, bool)
+            or not isinstance(self.source_generation, int)
+            or self.source_generation <= 0
+        ):
+            raise ValueError("role cache source generation must be positive")
+        role_region_sha256 = _normalized_sha256(self.role_region_sha256)
+        if role_region_sha256 is None:
+            raise ValueError("role cache key requires a role-region SHA-256")
+        object.__setattr__(self, "fingerprint", fingerprint)
+        object.__setattr__(
+            self,
+            "role_region_sha256",
+            role_region_sha256,
+        )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ObservationActionLease:
+    """Identity-only, non-forgeable lease for one published action snapshot."""
+
+    request_serial: int
+    observation_generation: int
+    deadline_monotonic: float
+
+    def __post_init__(self) -> None:
+        for value in (self.request_serial, self.observation_generation):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError("action lease serials must be positive")
+        if (
+            isinstance(self.deadline_monotonic, bool)
+            or not isinstance(self.deadline_monotonic, (int, float))
+            or self.deadline_monotonic <= 0
+        ):
+            raise ValueError("action lease deadline must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +237,11 @@ class ActualWindowSnapshot:
     isolated_window_count: int = 0
     anonymous_isolated_window_count: int = 0
     failure_codes: tuple[str, ...] = ()
+    observation_generation: int = 0
+    observation_request_serial: int = 0
+    observation_static_generation: int = 0
+    changed_fingerprints: frozenset[str] = frozenset()
+    action_lease: ObservationActionLease | None = None
 
     SCHEMA_VERSION = 1
 
@@ -164,6 +273,12 @@ class ActualWindowSnapshot:
                 self.anonymous_isolated_window_count,
                 "anonymous_isolated_window_count",
             ),
+            (self.observation_generation, "observation_generation"),
+            (self.observation_request_serial, "observation_request_serial"),
+            (
+                self.observation_static_generation,
+                "observation_static_generation",
+            ),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{field} must be a non-negative integer")
@@ -174,3 +289,23 @@ class ActualWindowSnapshot:
             raise ValueError("actual-window isolation counts disagree")
         object.__setattr__(self, "targets", targets)
         object.__setattr__(self, "blocked_fingerprints", blocked)
+        changed = frozenset(
+            normalized
+            for normalized in (
+                _normalized_sha256(value) for value in self.changed_fingerprints
+            )
+            if normalized is not None
+        )
+        if len(changed) != len(self.changed_fingerprints):
+            raise ValueError("changed actual-window fingerprints are invalid")
+        if self.action_lease is not None:
+            if not isinstance(self.action_lease, ObservationActionLease):
+                raise TypeError("actual-window action lease is invalid")
+            if (
+                self.action_lease.request_serial
+                != self.observation_request_serial
+                or self.action_lease.observation_generation
+                != self.observation_generation
+            ):
+                raise ValueError("actual-window action lease disagrees")
+        object.__setattr__(self, "changed_fingerprints", changed)

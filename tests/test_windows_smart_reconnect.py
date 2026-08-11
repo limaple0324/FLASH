@@ -1,6 +1,8 @@
 import ctypes
 import hashlib
+import inspect
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -33,7 +35,17 @@ from adapters.windows_smart_reconnect import (
     WindowInstanceToken,
     WindowsSmartReconnectController,
 )
+from adapters.windows_smart_reconnect_observation_broker import (
+    SmartReconnectEnumerationResult,
+    SmartReconnectObservationSnapshot,
+    SmartReconnectShortcutObservation,
+    SmartReconnectTcpBatchResult,
+    SmartReconnectTcpWindowObservation,
+    SmartReconnectWindowObservation,
+    WindowsSmartReconnectObservationBroker,
+)
 from adapters.windows_window import WindowInfo
+from config.config_manager import ConfigManager
 from core.reconnect_policy import ReconnectScreenState
 from core.smart_reconnect_authorization import (
     ReconnectAuthorizationTarget,
@@ -61,6 +73,14 @@ from services.smart_reconnect_evidence_store import (
 )
 from services.smart_reconnect_target_identity_service import (
     SmartReconnectTargetIdentity,
+)
+from core.target_window_contract import (
+    ObservationActionLease,
+    ObservationFreshness,
+    ShortcutObservationCacheKey,
+)
+from services.identity_data_transaction_coordinator import (
+    IdentityDataTransactionCoordinator,
 )
 from services.target_window_contract_service import ResolvedTargetWindows
 
@@ -108,6 +128,79 @@ class FakeWindowBackend:
 
     def top_window_at(self, _x, _y):
         return None
+
+
+class StaticControllerObservationBroker:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+        self.current = True
+        self.latest_calls = 0
+        self.refresh_calls = 0
+        self.seal_witness_calls = []
+        self.events = None
+        self.lease = ObservationActionLease(
+            1,
+            snapshot.generation,
+            time.monotonic() + 120,
+        )
+
+    def latest_snapshot(self):
+        self.latest_calls += 1
+        return self.snapshot
+
+    def current_snapshot(self):
+        self.latest_calls += 1
+        return self.snapshot if self.current else None
+
+    def stable_snapshot(self):
+        self.latest_calls += 1
+        return self.snapshot
+
+    def action_snapshot(self):
+        return (self.snapshot, self.lease) if self.current else None
+
+    def published_snapshot_without_wait(self):
+        return self.snapshot if self.current else None
+
+    def run_if_generation_current(self, generation, callback):
+        if not self.is_generation_current(generation):
+            return False, None
+        return True, callback()
+
+    def run_if_action_current(self, lease, callback):
+        if (
+            not self.current
+            or lease is not self.lease
+            or lease.deadline_monotonic <= time.monotonic()
+        ):
+            return False, None
+        return True, callback()
+
+    def seal_is_witnessed(self, expected):
+        return (
+            self.current
+            and self.lease.deadline_monotonic > time.monotonic()
+            and expected in self.seal_witness_calls
+        )
+
+    def seal_is_witnessed_without_wait(self, expected):
+        return expected in self.seal_witness_calls
+
+    def refresh(self, _paths=()):
+        self.refresh_calls += 1
+        raise AssertionError("controller must not refresh process observation")
+
+    def is_generation_current(self, generation):
+        return self.current and generation == self.snapshot.generation
+
+    def seal_witness(self, expected):
+        self.seal_witness_calls.append(expected)
+        if self.events is not None:
+            self.events.append(("seal_witness", expected))
+        return object()
+
+    def revalidate_reopen_seal(self, expected):
+        return self.seal_witness(expected)
 
 
 class FullyVisibleWindowBackend(FakeWindowBackend):
@@ -1729,6 +1822,7 @@ def make_controller(
     shortcut_seal_resolver=None,
     identity_generation_runner=None,
     identity_alias_catalog_provider=None,
+    observation_broker=None,
 ):
     if clock is None:
         default_time = [-5.0]
@@ -1958,6 +2052,7 @@ def make_controller(
             shortcut_seal_resolver=shortcut_seal_resolver,
             identity_generation_runner=identity_generation_runner,
             identity_alias_catalog_provider=identity_alias_catalog_provider,
+            observation_broker=observation_broker,
             evidence_recorder=evidence_recorder,
             evidence_required=evidence_required,
             evidence_initialization_failed=(
@@ -2126,6 +2221,1231 @@ def activate_current_window_snapshot(
     if prepared.success:
         fixture.controller.set_execution_enabled(True)
     return prepared
+
+
+def _controller_observation_snapshot(windows, *, generation=1):
+    return SmartReconnectObservationSnapshot(
+        generation=generation,
+        windows=tuple(
+            SmartReconnectWindowObservation(
+                window=window,
+                instance=WindowInstanceToken.from_window(window),
+                sample=CaptureSample(
+                    width=2,
+                    height=2,
+                    pixels=bytes([1, 0, 0, 255] * 4),
+                    api_succeeded=True,
+                ),
+                recognition=ScreenRecognition(
+                    state=ReconnectScreenState.CONNECTED,
+                    score=1.0,
+                    click_point=None,
+                    reference_name="connected",
+                ),
+                fresh_capture=True,
+                capture_route="visible",
+                role_id=None,
+            )
+            for window in windows
+        ),
+    )
+
+
+def _tcp_controller_observation_snapshot(
+    windows,
+    counts,
+    *,
+    generation,
+    static_generation=1,
+    failure_codes=(),
+):
+    snapshot = _controller_observation_snapshot(
+        windows,
+        generation=generation,
+    )
+    return replace(
+        snapshot,
+        request_serial=generation,
+        static_generation=static_generation,
+        shortcuts=tuple(
+            SmartReconnectShortcutObservation(
+                path=str(Path.cwd() / ".pytest-shortcuts" / f"{index}.lnk"),
+                fingerprint=window.launch_fingerprint,
+                seal=ShortcutSeal(
+                    ShortcutFileIdentity(
+                        str(
+                            Path.cwd()
+                            / ".pytest-shortcuts"
+                            / f"{index}.lnk"
+                        ),
+                        1,
+                        index,
+                    ),
+                    f"{index:064x}",
+                    window.launch_fingerprint,
+                ),
+            )
+            for index, window in enumerate(windows, start=1)
+        ),
+        windows=tuple(
+            replace(
+                observation,
+                tcp_established_connections=count,
+                tcp_failure_codes=tuple(failure_codes),
+            )
+            for observation, count in zip(snapshot.windows, counts)
+        ),
+    )
+
+
+def _set_controller_broker_snapshot(broker, snapshot):
+    broker.snapshot = snapshot
+    broker.lease = ObservationActionLease(
+        snapshot.request_serial,
+        snapshot.generation,
+        time.monotonic() + 120,
+    )
+
+
+def _formal_tcp_controller_chain_worker(request):
+    root = Path(request.reference_dir)
+    with (root / f"tcp-chain-{os.getpid()}.log").open(
+        "a",
+        encoding="ascii",
+    ) as stream:
+        stream.write(request.stage + "\n")
+    window = make_window(1)
+    if (
+        (root / "tcp-count.txt").is_file()
+        and (root / "tcp-count.txt").read_text(encoding="ascii").strip()
+        == "0"
+    ):
+        window = replace(
+            window,
+            rect=(25, 30, 925, 630),
+            minimized=True,
+        )
+    shortcut_path = os.path.normcase(
+        os.path.abspath(os.fspath(root / "role.lnk"))
+    )
+    if request.stage == "enumerate":
+        return SmartReconnectEnumerationResult(
+            windows=(replace(window, launch_fingerprint=None),),
+            shortcuts=(SmartReconnectShortcutObservation(
+                shortcut_path,
+                None,
+                None,
+                ("shortcut_observation_pending",),
+            ),),
+            foreground_handle=window.handle,
+        )
+    if request.stage == "shortcut_static":
+        path = request.shortcut_paths[0]
+        normalized = os.path.normcase(os.path.abspath(path))
+        content = Path(path).read_bytes()
+        stat = Path(path).stat()
+        return SmartReconnectShortcutObservation(
+            normalized,
+            None,
+            None,
+            ("shortcut_observation_pending",),
+            ShortcutObservationCacheKey(
+                normalized,
+                ShortcutFileIdentity(normalized, 1, 1),
+                stat.st_mtime_ns,
+                stat.st_size,
+                hashlib.sha256(content).hexdigest(),
+            ),
+        )
+    if request.stage == "shortcut":
+        return tuple(
+            SmartReconnectShortcutObservation(
+                item.path,
+                window.launch_fingerprint,
+                ShortcutSeal(
+                    ShortcutFileIdentity(
+                        str(Path.cwd() / ".pytest-shortcuts" / "1.lnk"),
+                        1,
+                        1,
+                    ),
+                    f"{1:064x}",
+                    window.launch_fingerprint,
+                ),
+                cache_key=item.cache_key,
+            )
+            for item in request.shortcut_static_observations
+        )
+    if request.stage == "identity":
+        return tuple(
+            replace(item, launch_fingerprint=window.launch_fingerprint)
+            for item in request.windows
+        )
+    if request.stage == "tcp":
+        count = int((root / "tcp-count.txt").read_text(encoding="ascii"))
+        return SmartReconnectTcpBatchResult((
+            SmartReconnectTcpWindowObservation(
+                WindowInstanceToken.from_window(window),
+                count,
+            ),
+        ))
+    if request.stage == "window":
+        return SmartReconnectWindowObservation(
+            window=window,
+            instance=WindowInstanceToken.from_window(window),
+            sample=CaptureSample(1, 1, b"\1\0\0\0", True),
+            recognition=ScreenRecognition(
+                ReconnectScreenState.UNKNOWN,
+                0.0,
+                None,
+                None,
+            ),
+            fresh_capture=True,
+            freshness=ObservationFreshness.PROVEN_CURRENT,
+            capture_route="visible",
+            role_id="001-test-identity",
+            role_region_sha256=hashlib.sha256(
+                b"formal-tcp-role-region"
+            ).hexdigest(),
+        )
+    if request.stage == "seal":
+        return request.expected_seal
+    raise AssertionError(request.stage)
+
+
+def test_formal_broker_refresh_chain_confirms_tcp_without_action(tmp_path):
+    now = [0.0]
+    window = make_window(1)
+    shortcut = tmp_path / "role.lnk"
+    shortcut.write_bytes(b"formal-tcp-chain")
+    count_path = tmp_path / "tcp-count.txt"
+    count_path.write_text("1", encoding="ascii")
+    broker = WindowsSmartReconnectObservationBroker(
+        reference_dir=tmp_path,
+        _worker_operation=_formal_tcp_controller_chain_worker,
+    )
+    assert broker.start() is True
+    initial_process_ids = tuple(
+        broker._slots[index].process.pid for index in range(4)
+    )
+    initial_epochs = tuple(broker._slot_epochs)
+    try:
+        first = broker.refresh((shortcut,))
+        fixture = make_controller(
+            [1],
+            windows=(window,),
+            expected_windows=1,
+            clock=lambda: now[0],
+            observation_broker=broker,
+        )
+        assert fixture.preparation is not None
+        fixture.preparation._generation = (
+            fixture.preparation._source.identity_generation
+        )
+        online = fixture.controller.reconnect()
+        current_batch = fixture.controller._authorization_batch
+        assert current_batch is not None
+        assert current_batch.targets, (
+            online.details,
+            current_batch,
+            fixture.preparation._targets,
+        )
+        assert current_batch.targets[0].shortcut_seal == first.shortcuts[0].seal
+        authorization_versions = [(current_batch.epoch, current_batch.batch_id)]
+        assert first.generation == 1
+        assert online.details["tcp_state_counts"] == {"known_online": 1}
+        evidence_before = None
+
+        count_path.write_text("0", encoding="ascii")
+        for observed_at in (0.0, 3.5, 7.0):
+            now[0] = observed_at
+            zero_snapshot = broker.refresh((shortcut,))
+            assert len(zero_snapshot.windows) == 1
+            assert zero_snapshot.windows[0].instance is not None
+            assert zero_snapshot.windows[0].instance.rect == (
+                25,
+                30,
+                925,
+                630,
+            )
+            assert zero_snapshot.windows[0].instance.minimized is True
+            fixture.preparation._generation = (
+                fixture.preparation._source.identity_generation
+            )
+            result = fixture.controller.reconnect()
+            current_batch = fixture.controller._authorization_batch
+            assert current_batch is not None
+            assert current_batch.targets[0].instance == (
+                WindowInstanceToken.from_window(window)
+            )
+            authorization_versions.append((
+                current_batch.epoch,
+                current_batch.batch_id,
+            ))
+            if observed_at == 0.0:
+                evidence_before = (
+                    dict(broker._role_cache),
+                    dict(broker._role_cache_by_instance),
+                    dict(fixture.controller._recent_login_role_ids),
+                    dict(fixture.controller._initial_login_authorizations),
+                    set(fixture.controller._character_selection_pending),
+                    dict(fixture.controller._character_selection_targets),
+                    dict(fixture.controller._terminal_ready_after),
+                    dict(fixture.controller._terminal_evidence),
+                    dict(fixture.controller._trusted_connected_evidence),
+                )
+
+        assert result.details["tcp_confirmed_windows"] == 1
+        assert result.details["tcp_suspected_windows"] == 0
+        assert result.details["actionable_windows"] == 0
+        assert result.details["clicked_windows"] == 0
+        assert result.details["restarted_windows"] == 0
+        assert fixture.mouse.clicks == []
+        assert tuple(
+            broker._slots[index].process.pid for index in range(4)
+        ) == initial_process_ids
+        assert tuple(broker._slot_epochs) == initial_epochs
+        assert len({epoch for epoch, _batch_id in authorization_versions}) == 4
+        assert len({batch_id for _epoch, batch_id in authorization_versions}) == 4
+        worker_events = tuple(
+            line
+            for path in tmp_path.glob("tcp-chain-*.log")
+            for line in path.read_text(encoding="ascii").splitlines()
+        )
+        assert worker_events.count("tcp") == 4
+        for stage in (
+            "enumerate",
+            "shortcut_static",
+            "shortcut",
+            "identity",
+            "window",
+        ):
+            assert stage in worker_events
+        assert evidence_before is not None
+        assert (
+            dict(broker._role_cache),
+            dict(broker._role_cache_by_instance),
+            dict(fixture.controller._recent_login_role_ids),
+            dict(fixture.controller._initial_login_authorizations),
+            set(fixture.controller._character_selection_pending),
+            dict(fixture.controller._character_selection_targets),
+            dict(fixture.controller._terminal_ready_after),
+            dict(fixture.controller._terminal_evidence),
+            dict(fixture.controller._trusted_connected_evidence),
+        ) == evidence_before
+    finally:
+        assert broker.close() is True
+
+
+def test_tcp_zero_requires_three_generations_and_seven_seconds_without_action():
+    now = [0.0]
+    window = make_window(1)
+    moved_minimized = replace(
+        window,
+        rect=(25, 30, 925, 630),
+        minimized=True,
+    )
+    broker = StaticControllerObservationBroker(
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (2,),
+            generation=1,
+        )
+    )
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        clock=lambda: now[0],
+        observation_broker=broker,
+    )
+
+    online = fixture.controller.check_connection()
+    assert online.details["tcp_state_counts"] == {"known_online": 1}
+
+    def zero_snapshot(generation):
+        snapshot = _tcp_controller_observation_snapshot(
+            (moved_minimized,),
+            (0,),
+            generation=generation,
+            static_generation=generation,
+        )
+        return replace(
+            snapshot,
+            windows=(replace(
+                snapshot.windows[0],
+                sample=None,
+                recognition=ScreenRecognition(
+                    ReconnectScreenState.UNKNOWN,
+                    0.0,
+                    None,
+                    None,
+                ),
+                fresh_capture=False,
+                freshness=ObservationFreshness.UNPROVEN,
+                capture_route="minimized",
+            ),),
+        )
+
+    for generation, observed_at in ((2, 0.0), (3, 3.5), (4, 7.0)):
+        batch = fixture.controller._authorization_batch
+        assert batch is not None
+        fixture.controller._bind_authorization_batch_locked(replace(batch))
+        now[0] = observed_at
+        next_snapshot = zero_snapshot(generation)
+        _set_controller_broker_snapshot(broker, next_snapshot)
+        result = fixture.controller.check_connection()
+        if generation == 2:
+            repeated = fixture.controller.check_connection()
+            assert repeated.details["tcp_suspected_windows"] == 1
+
+    # 600.047s/2382 ~= 0.25s samples; switch zero max 0; cleanup 0.75s
+    # never reached zero; two slow 3.36s refresh cycles are 6.72s, rounded
+    # to 7.0s, while a real disconnect stayed zero for more than 156s.
+    assert result.details["tcp_suspected_windows"] == 0
+    assert result.details["tcp_confirmed_windows"] == 1
+    assert result.details["actionable_windows"] == 0
+    assert result.details["clicked_windows"] == 0
+    assert result.details["restarted_windows"] == 0
+    assert result.details["tcp_state_counts"] == {"zero_confirmed": 1}
+    assert fixture.controller.state is ReconnectState.DISCONNECTED
+    assert fixture.mouse.clicks == []
+
+    now[0] = 8.0
+    _set_controller_broker_snapshot(
+        broker,
+        _tcp_controller_observation_snapshot(
+            (moved_minimized,),
+            (1,),
+            generation=5,
+        ),
+    )
+    returned = fixture.controller.check_connection()
+    assert returned.details["tcp_state_counts"] == {"known_online": 1}
+    now[0] = 20.0
+    _set_controller_broker_snapshot(broker, zero_snapshot(6))
+    new_candidate = fixture.controller.check_connection()
+    assert new_candidate.details["tcp_suspected_windows"] == 1
+    assert new_candidate.details["tcp_confirmed_windows"] == 0
+
+
+def test_tcp_unknown_gap_and_identity_change_restart_continuity():
+    now = [0.0]
+    window = make_window(1)
+    broker = StaticControllerObservationBroker(
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (1,),
+            generation=1,
+        )
+    )
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        clock=lambda: now[0],
+        observation_broker=broker,
+    )
+    fixture.controller.check_connection()
+
+    _set_controller_broker_snapshot(
+        broker,
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (0,),
+            generation=2,
+        ),
+    )
+    assert fixture.controller.check_connection().details[
+        "tcp_suspected_windows"
+    ] == 1
+
+    now[0] = 4.0
+    _set_controller_broker_snapshot(
+        broker,
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (None,),
+            generation=3,
+            failure_codes=("tcp_table_unavailable",),
+        ),
+    )
+    unavailable = fixture.controller.check_connection()
+    assert unavailable.details["tcp_suspected_windows"] == 0
+    assert unavailable.details["tcp_confirmed_windows"] == 0
+    assert unavailable.details["tcp_failure_codes"] == [
+        "tcp_table_unavailable"
+    ]
+    assert "tcp_table_unavailable" not in unavailable.details[
+        "failure_codes"
+    ]
+
+    now[0] = 20.0
+    _set_controller_broker_snapshot(
+        broker,
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (0,),
+            generation=5,
+        ),
+    )
+    gap = fixture.controller.check_connection()
+    assert gap.details["tcp_suspected_windows"] == 1
+    assert gap.details["tcp_confirmed_windows"] == 0
+
+    _set_controller_broker_snapshot(
+        broker,
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (0,),
+            generation=6,
+        ),
+    )
+    identity_changed = fixture.controller.reconnect()
+    assert identity_changed.details["tcp_suspected_windows"] == 0
+    assert identity_changed.details["tcp_confirmed_windows"] == 0
+    assert identity_changed.details["tcp_state_counts"] == {"unknown": 1}
+
+
+def test_tcp_shortcut_seal_mismatch_removes_known_online_state():
+    window = make_window(1)
+    broker = StaticControllerObservationBroker(
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (1,),
+            generation=1,
+        )
+    )
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        clock=lambda: 0.0,
+        observation_broker=broker,
+    )
+    fixture.controller.check_connection()
+    changed = _tcp_controller_observation_snapshot(
+        (window,),
+        (0,),
+        generation=2,
+    )
+    shortcut = changed.shortcuts[0]
+    assert shortcut.seal is not None
+    changed = replace(
+        changed,
+        shortcuts=(replace(
+            shortcut,
+            seal=replace(shortcut.seal, content_sha256="f" * 64),
+        ),),
+    )
+    _set_controller_broker_snapshot(broker, changed)
+
+    result = fixture.controller.check_connection()
+
+    assert result.details["tcp_suspected_windows"] == 0
+    assert result.details["tcp_confirmed_windows"] == 0
+    assert result.details["tcp_state_counts"] == {}
+    assert fixture.controller._tcp_instance_states == {}
+
+
+def test_tcp_never_online_zero_remains_unknown_without_candidate():
+    now = [0.0]
+    window = make_window(1)
+    broker = StaticControllerObservationBroker(
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (0,),
+            generation=1,
+        )
+    )
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        clock=lambda: now[0],
+        observation_broker=broker,
+    )
+
+    for generation, observed_at in ((1, 0.0), (2, 4.0), (3, 8.0)):
+        now[0] = observed_at
+        if generation > 1:
+            _set_controller_broker_snapshot(
+                broker,
+                _tcp_controller_observation_snapshot(
+                    (window,),
+                    (0,),
+                    generation=generation,
+                ),
+            )
+        result = fixture.controller.check_connection()
+        assert result.details["tcp_state_counts"] == {"unknown": 1}
+        assert result.details["tcp_suspected_windows"] == 0
+        assert result.details["tcp_confirmed_windows"] == 0
+
+
+def test_tcp_three_zero_generations_at_6_999_seconds_remain_suspected():
+    now = [0.0]
+    window = make_window(1)
+    broker = StaticControllerObservationBroker(
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (1,),
+            generation=1,
+        )
+    )
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        clock=lambda: now[0],
+        observation_broker=broker,
+    )
+    fixture.controller.check_connection()
+
+    for generation, observed_at in ((2, 0.0), (3, 3.5), (4, 6.999)):
+        now[0] = observed_at
+        _set_controller_broker_snapshot(
+            broker,
+            _tcp_controller_observation_snapshot(
+                (window,),
+                (0,),
+                generation=generation,
+            ),
+        )
+        result = fixture.controller.check_connection()
+
+    assert result.details["tcp_state_counts"] == {"zero_suspected": 1}
+    assert result.details["tcp_suspected_windows"] == 1
+    assert result.details["tcp_confirmed_windows"] == 0
+    assert result.details["actionable_windows"] == 0
+    assert result.details["clicked_windows"] == 0
+    assert result.details["restarted_windows"] == 0
+
+
+def test_tcp_positive_count_fluctuation_never_starts_zero_candidate():
+    now = [0.0]
+    window = make_window(1)
+    counts = (1, 3, 4, 2, 1)
+    broker = StaticControllerObservationBroker(
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (counts[0],),
+            generation=1,
+        )
+    )
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        clock=lambda: now[0],
+        observation_broker=broker,
+    )
+
+    for generation, count in enumerate(counts, start=1):
+        now[0] = float(generation)
+        if generation > 1:
+            _set_controller_broker_snapshot(
+                broker,
+                _tcp_controller_observation_snapshot(
+                    (window,),
+                    (count,),
+                    generation=generation,
+                ),
+            )
+        result = fixture.controller.check_connection()
+        assert result.details["tcp_state_counts"] == {"known_online": 1}
+        assert result.details["tcp_suspected_windows"] == 0
+        assert result.details["tcp_confirmed_windows"] == 0
+
+
+def test_tcp_multiple_zero_instances_never_confirm_or_act():
+    now = [0.0]
+    windows = (make_window(1), make_window(2))
+    broker = StaticControllerObservationBroker(
+        _tcp_controller_observation_snapshot(
+            windows,
+            (1, 2),
+            generation=1,
+        )
+    )
+    fixture = make_controller(
+        [1, 1],
+        windows=windows,
+        expected_windows=2,
+        clock=lambda: now[0],
+        observation_broker=broker,
+    )
+    fixture.controller.check_connection()
+
+    for generation, observed_at in ((2, 0.0), (3, 4.0), (4, 8.0)):
+        now[0] = observed_at
+        _set_controller_broker_snapshot(
+            broker,
+            _tcp_controller_observation_snapshot(
+                windows,
+                (0, 0),
+                generation=generation,
+            ),
+        )
+        result = fixture.controller.check_connection()
+
+    assert result.details["tcp_suspected_windows"] == 2
+    assert result.details["tcp_confirmed_windows"] == 0
+    assert result.details["actionable_windows"] == 0
+    assert result.details["clicked_windows"] == 0
+    assert result.details["restarted_windows"] == 0
+    assert result.details["tcp_failure_codes"] == [
+        "tcp_multiple_zero_instances_suppressed"
+    ]
+    assert fixture.mouse.clicks == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    (
+        ("handle", 101),
+        ("process_id", 202),
+        ("thread_id", 303),
+        ("window_class", "OtherFlashClass"),
+        ("process_lifecycle_token", 404),
+    ),
+)
+def test_tcp_core_instance_change_clears_known_online(
+    field_name,
+    replacement,
+):
+    window = make_window(1)
+    broker = StaticControllerObservationBroker(
+        _tcp_controller_observation_snapshot(
+            (window,),
+            (1,),
+            generation=1,
+        )
+    )
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        clock=lambda: 0.0,
+        observation_broker=broker,
+    )
+    fixture.controller.check_connection()
+    changed = replace(window, **{field_name: replacement})
+    _set_controller_broker_snapshot(
+        broker,
+        _tcp_controller_observation_snapshot(
+            (changed,),
+            (0,),
+            generation=2,
+        ),
+    )
+
+    result = fixture.controller.check_connection()
+
+    assert result.details["tcp_suspected_windows"] == 0
+    assert result.details["tcp_confirmed_windows"] == 0
+    assert fixture.controller._tcp_instance_states == {}
+
+
+def test_broker_passive_observation_reads_latest_without_refresh_or_direct_io():
+    window = make_window(1)
+    broker = StaticControllerObservationBroker(
+        _controller_observation_snapshot((window,), generation=7)
+    )
+
+    class ForbiddenWindowBackend:
+        def list_windows(self):
+            raise AssertionError("passive observation enumerated windows")
+
+    class ForbiddenCapture:
+        def capture(self, _handle):
+            raise AssertionError("passive observation captured a window")
+
+    controller = WindowsSmartReconnectController(
+        expected_windows=1,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=ForbiddenWindowBackend(),
+        capture_provider=ForbiddenCapture(),
+        recognizer=FakeRecognizer({}, {}),
+        mouse_backend=FakeMouseBackend(),
+        require_expected_window_count=False,
+        observation_broker=broker,
+    )
+
+    observed = controller.observe_screen_states(
+        (window.launch_fingerprint,)
+    )
+
+    assert observed == {
+        window.launch_fingerprint: ReconnectScreenState.CONNECTED,
+    }
+    assert broker.latest_calls == 1
+    assert broker.refresh_calls == 0
+
+
+def test_broker_passive_observation_keeps_stable_connected_snapshot_during_refresh():
+    window = make_window(1)
+    broker = StaticControllerObservationBroker(
+        _controller_observation_snapshot((window,), generation=8)
+    )
+    broker.current = False
+    controller = WindowsSmartReconnectController(
+        expected_windows=1,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=FakeWindowBackend((window,)),
+        capture_provider=FakeCaptureProvider({window.handle: 1}),
+        recognizer=FakeRecognizer({1: ReconnectScreenState.CONNECTED}, {}),
+        mouse_backend=FakeMouseBackend(),
+        require_expected_window_count=False,
+        observation_broker=broker,
+    )
+
+    observed = controller.observe_screen_states((window.launch_fingerprint,))
+
+    assert observed == {
+        window.launch_fingerprint: ReconnectScreenState.CONNECTED,
+    }
+
+
+def test_broker_generation_change_interleaves_without_deadlock_or_stale_input(
+    tmp_path,
+    monkeypatch,
+):
+    window = make_window(1)
+    fingerprint = window.launch_fingerprint
+    seal = ShortcutSeal(
+        ShortcutFileIdentity(
+            str(Path.cwd() / ".pytest-shortcuts" / "1.lnk"),
+            1,
+            1,
+        ),
+        f"{1:064x}",
+        fingerprint,
+    )
+    broker = WindowsSmartReconnectObservationBroker(reference_dir=tmp_path)
+    serial = broker._next_request()
+    published = broker._publish(
+        serial,
+        replace(
+            _controller_observation_snapshot((window,), generation=0),
+            shortcuts=(
+                SmartReconnectShortcutObservation(
+                    seal.file_identity.normalized_path,
+                    fingerprint,
+                    seal,
+                ),
+            ),
+        ),
+    )
+    assert published is not None
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        observation_broker=broker,
+    )
+    context = fixture.controller._action_context_for(
+        fingerprint,
+        WindowInstanceToken.from_window(window),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    delivered = []
+    outcomes = []
+    original_current = broker.current_snapshot
+
+    def blocked_current_snapshot():
+        snapshot = original_current()
+        if threading.current_thread().name == "authorized-delivery":
+            entered.set()
+            assert release.wait(2)
+        return snapshot
+
+    monkeypatch.setattr(broker, "current_snapshot", blocked_current_snapshot)
+    fixture.controller._broker_scan_generation = published.generation
+    worker = threading.Thread(
+        name="authorized-delivery",
+        target=lambda: outcomes.append(
+            fixture.controller._run_authorized_backend_call(
+                lambda: delivered.append("input"),
+                action_context=context,
+                expected_capture_settings_revision=None,
+                capture_route="visible",
+                expected_source_state_generation=None,
+            )
+        ),
+    )
+    worker.start()
+    assert entered.wait(2)
+
+    broker.set_capture_modes(
+        visible=False,
+        obscured=True,
+        minimized=True,
+    )
+    release.set()
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert outcomes == [(False, None)]
+    assert delivered == []
+    assert broker.current_snapshot() is None
+    assert broker.close() is True
+
+
+def test_scan_waiting_for_broker_holds_no_scan_config_or_identity_lock(
+    tmp_path,
+    monkeypatch,
+):
+    window = make_window(1)
+    broker = WindowsSmartReconnectObservationBroker(reference_dir=tmp_path)
+    serial = broker._next_request()
+    assert broker._publish(
+        serial,
+        _controller_observation_snapshot((window,), generation=0),
+    ) is not None
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        observation_broker=broker,
+    )
+    config = ConfigManager(tmp_path / "config" / "settings.json")
+    identity = IdentityDataTransactionCoordinator()
+    entered = threading.Event()
+    results = []
+    original_action = broker.action_snapshot
+
+    def announced_action_snapshot():
+        entered.set()
+        return original_action()
+
+    monkeypatch.setattr(
+        broker,
+        "action_snapshot",
+        announced_action_snapshot,
+    )
+    with broker._state_lock:
+        worker = threading.Thread(
+            target=lambda: results.append(
+                fixture.controller.check_connection()
+            )
+        )
+        worker.start()
+        assert entered.wait(2)
+        assert fixture.controller._scan_lock.acquire(timeout=0.5) is True
+        fixture.controller._scan_lock.release()
+        with config.resource_guard():
+            assert config.snapshot_state_locked().revision >= 0
+        assert identity.read_consistent(lambda: "identity-free") == (
+            "identity-free"
+        )
+
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert len(results) == 1
+    assert broker.close() is True
+
+
+def test_execution_stop_invalidates_real_broker_action_but_keeps_stable_view(
+    tmp_path,
+):
+    window = make_window(1)
+    broker = WindowsSmartReconnectObservationBroker(reference_dir=tmp_path)
+    serial = broker._next_request()
+    published = broker._publish(
+        serial,
+        _controller_observation_snapshot((window,), generation=0),
+    )
+    assert published is not None
+    fixture = make_controller(
+        [1],
+        windows=(window,),
+        expected_windows=1,
+        observation_broker=broker,
+    )
+    action = broker.action_snapshot()
+    assert action is not None
+
+    assert fixture.controller.set_execution_enabled(False) is True
+
+    assert broker.action_snapshot() is None
+    assert broker.run_if_action_current(action[1], lambda: "late") == (
+        False,
+        None,
+    )
+    assert broker.stable_snapshot() is published
+    assert broker.close() is True
+
+
+def test_broker_preparation_wait_does_not_hold_controller_scan_lock():
+    windows = (make_window(1), make_window(2))
+    broker = StaticControllerObservationBroker(
+        _controller_observation_snapshot(windows, generation=11)
+    )
+    fixture = make_controller(
+        [1, 1],
+        windows=windows,
+        expected_windows=2,
+        observation_broker=broker,
+    )
+    fixture.controller.set_execution_enabled(False)
+    original_prepare = fixture.preparation.prepare
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+
+    def blocked_prepare(**kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original_prepare(**kwargs)
+
+    fixture.preparation.prepare = blocked_prepare
+    worker = threading.Thread(
+        target=lambda: results.append(
+            fixture.controller.prepare_execution_snapshot()
+        )
+    )
+    worker.start()
+    assert entered.wait(2)
+
+    assert fixture.controller._scan_lock.acquire(timeout=0.5) is True
+    fixture.controller._scan_lock.release()
+    release.set()
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert len(results) == 1
+    assert results[0].success is True
+    assert broker.refresh_calls == 0
+
+
+def test_true_reopen_reads_broker_seal_witness_before_restarter(tmp_path):
+    window = make_window(1)
+    plan = make_group_plan(tmp_path, (window,), "witness")
+    target = plan.targets[0]
+    seal = ShortcutSeal(
+        ShortcutFileIdentity(target.shortcut_path, 1, 1),
+        f"{1:064x}",
+        window.launch_fingerprint,
+    )
+    observation = SmartReconnectObservationSnapshot(
+        generation=19,
+        windows=(
+            SmartReconnectWindowObservation(
+                window=window,
+                instance=WindowInstanceToken.from_window(window),
+                sample=CaptureSample(2, 2, bytes([2, 0, 0, 255] * 4), True),
+                recognition=ScreenRecognition(
+                    state=ReconnectScreenState.DISCONNECTED,
+                    score=1.0,
+                    click_point=(0.5, 0.5),
+                    reference_name="disconnected",
+                    battle_context=True,
+                ),
+                fresh_capture=True,
+                capture_route="print_window",
+                role_id=None,
+            ),
+        ),
+        shortcuts=(
+            SmartReconnectShortcutObservation(
+                str(target.shortcut_path),
+                window.launch_fingerprint,
+                seal,
+            ),
+        ),
+    )
+    broker = StaticControllerObservationBroker(observation)
+    events = []
+    broker.events = events
+
+    class WitnessRestarter(FakeClosedBattleRestarter):
+        def restart(self, current_window, current_target):
+            events.append(("restart", current_target.fingerprint))
+            return super().restart(current_window, current_target)
+
+    restarter = WitnessRestarter()
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        battle_restarter=restarter,
+        group_launch_plan=plan,
+        observation_broker=broker,
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert restarter.calls
+    restart_index = next(
+        index for index, event in enumerate(events) if event[0] == "restart"
+    )
+    assert any(
+        event[0] == "seal_witness" for event in events[:restart_index]
+    )
+    assert broker.seal_witness_calls[-1] == seal
+
+
+def test_action_lease_is_rechecked_at_click_leaf_and_normal_scan_reads_no_seal(
+    tmp_path,
+):
+    window = make_window(1)
+    plan = make_group_plan(tmp_path, (window,), "leaf-expiry")
+    target = plan.targets[0]
+    seal = ShortcutSeal(
+        ShortcutFileIdentity(target.shortcut_path, 1, 1),
+        f"{1:064x}",
+        window.launch_fingerprint,
+    )
+    observation = SmartReconnectObservationSnapshot(
+        generation=20,
+        windows=(
+            SmartReconnectWindowObservation(
+                window=window,
+                instance=WindowInstanceToken.from_window(window),
+                sample=CaptureSample(2, 2, bytes([2, 0, 0, 255] * 4), True),
+                recognition=ScreenRecognition(
+                    state=ReconnectScreenState.DISCONNECTED,
+                    score=1.0,
+                    click_point=(0.5, 0.5),
+                    reference_name="disconnected",
+                    battle_context=False,
+                ),
+                fresh_capture=True,
+                capture_route="visible",
+                role_id=None,
+            ),
+        ),
+        shortcuts=(
+            SmartReconnectShortcutObservation(
+                str(target.shortcut_path),
+                window.launch_fingerprint,
+                seal,
+            ),
+        ),
+    )
+    broker = StaticControllerObservationBroker(observation)
+    leaf_checks = []
+
+    def expire_at_leaf(lease, _callback):
+        leaf_checks.append(lease)
+        return False, None
+
+    broker.run_if_action_current = expire_at_leaf
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        group_launch_plan=plan,
+        observation_broker=broker,
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert leaf_checks and all(lease is broker.lease for lease in leaf_checks)
+    assert fixture.mouse.clicks == []
+    assert broker.seal_witness_calls == []
+
+
+def test_action_lease_expiring_while_capture_lock_waits_blocks_final_click(
+    tmp_path,
+):
+    window = make_window(1)
+    plan = make_group_plan(tmp_path, (window,), "leaf-lock-expiry")
+    target = plan.targets[0]
+    seal = ShortcutSeal(
+        ShortcutFileIdentity(target.shortcut_path, 1, 1),
+        f"{1:064x}",
+        window.launch_fingerprint,
+    )
+    observation = SmartReconnectObservationSnapshot(
+        generation=21,
+        windows=(
+            SmartReconnectWindowObservation(
+                window=window,
+                instance=WindowInstanceToken.from_window(window),
+                sample=CaptureSample(2, 2, bytes([2, 0, 0, 255] * 4), True),
+                recognition=ScreenRecognition(
+                    state=ReconnectScreenState.DISCONNECTED,
+                    score=1.0,
+                    click_point=(0.5, 0.5),
+                    reference_name="disconnected",
+                    battle_context=False,
+                ),
+                fresh_capture=True,
+                capture_route="visible",
+                role_id=None,
+            ),
+        ),
+        shortcuts=(
+            SmartReconnectShortcutObservation(
+                str(target.shortcut_path),
+                window.launch_fingerprint,
+                seal,
+            ),
+        ),
+    )
+    broker = StaticControllerObservationBroker(observation)
+    fixture = make_controller(
+        [2],
+        windows=[window],
+        expected_windows=1,
+        group_launch_plan=plan,
+        observation_broker=broker,
+    )
+    fixture.controller.reconnect()
+    broker.lease = ObservationActionLease(
+        2,
+        observation.generation,
+        time.monotonic() + 0.2,
+    )
+    first_check = threading.Event()
+    continue_after_first_check = threading.Event()
+    leaf_checks = []
+
+    def wait_after_first_check(lease, callback):
+        if (
+            not broker.current
+            or lease is not broker.lease
+            or lease.deadline_monotonic <= time.monotonic()
+        ):
+            return False, None
+        leaf_checks.append(lease)
+        first_check.set()
+        if not continue_after_first_check.wait(1):
+            return False, None
+        return True, callback()
+
+    broker.run_if_action_current = wait_after_first_check
+    outcomes = []
+    worker = threading.Thread(
+        target=lambda: outcomes.append(fixture.controller.reconnect()),
+        daemon=True,
+    )
+    worker.start()
+    assert first_check.wait(1) is True
+    fixture.controller._capture_settings_lock.acquire()
+    try:
+        continue_after_first_check.set()
+        while time.monotonic() <= broker.lease.deadline_monotonic:
+            time.sleep(0.005)
+    finally:
+        fixture.controller._capture_settings_lock.release()
+    worker.join(1)
+
+    assert worker.is_alive() is False
+    assert outcomes
+    assert leaf_checks == [broker.lease]
+    assert fixture.mouse.clicks == []
+
+
+def test_controller_never_fails_preparation_without_its_token():
+    source = inspect.getsource(WindowsSmartReconnectController)
+
+    assert "fail_preparation()" not in source
 
 
 def test_passive_observation_uses_explicit_ungrouped_candidates():

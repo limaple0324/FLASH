@@ -1,12 +1,38 @@
 import sys
 import uuid
+import inspect
+import threading
+import time
+import tkinter
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import main as main_module
+from adapters.game_screen_recognizer import ScreenRecognition
+from adapters.windows_launch_fingerprint import (
+    PowerShellLaunchFingerprintResolver,
+    PowerShellShortcutFingerprintResolver,
+)
+from adapters.windows_smart_reconnect import WindowsSmartReconnectController
+from adapters.windows_smart_reconnect_observation_broker import (
+    SmartReconnectObservationRequest,
+    SmartReconnectObservationSnapshot,
+    SmartReconnectShortcutObservation,
+    SmartReconnectWindowObservation,
+    WindowsSmartReconnectObservationBroker,
+    _execute_observation_request,
+    _observe_window,
+)
+from adapters.windows_window import WindowInfo
 from config.config_manager import ConfigManager
+from core.reconnect_policy import ReconnectScreenState
+from core.smart_reconnect_authorization import ShortcutFileIdentity, ShortcutSeal
 from core.sp1_boundaries import ExternalAdapter, OperationResult
+from core.window_instance import WindowInstanceToken
+from domain.group import CharacterGroup
 from main import (
     TARGET_WINDOW_FINGERPRINT_KEY,
     TARGET_WINDOW_KEY,
@@ -18,9 +44,22 @@ from main import (
 )
 from services.app_context import AppContext
 from services.role_id_template_service import RoleIdTemplateService
+from services.character_game_data_capture_service import (
+    CharacterGameDataCaptureService,
+)
+from services.group_configuration_service import GroupConfigurationService
+from services.group_launch_service import GroupLaunchService
+from services.game_operation_gate import GameOperationGate
 from services.smart_reconnect_preparation_service import (
     SmartReconnectPreparationService,
 )
+from services.smart_reconnect_target_identity_service import (
+    SmartReconnectTargetIdentityService,
+)
+from services.target_window_contract_service import (
+    TargetWindowContractService,
+)
+from workspace.service import WorkspaceService
 
 
 class FakeAdapter:
@@ -36,6 +75,21 @@ class FakeAdapter:
 
     def shutdown(self) -> None:
         return None
+
+
+def _startup_slot_worker(request: SmartReconnectObservationRequest):
+    if request.stage == "slow-slot":
+        time.sleep(2)
+    return request.stage
+
+
+@pytest.fixture(autouse=True)
+def close_process_observation_broker_after_test():
+    try:
+        yield
+    finally:
+        main_module.shutdown_smart_reconnect_monitor()
+        assert main_module.shutdown_smart_reconnect_observation_broker() is True
 
 
 def test_normalize_window_keywords_accepts_string_and_list():
@@ -86,18 +140,580 @@ def test_build_services_keeps_invalid_persisted_fingerprint_fail_closed(tmp_path
     assert result.code == "window.identity_invalid"
 
 
-def test_build_services_wires_role_template_reader_into_reconnect_preparation(
+def test_build_services_wires_process_observation_broker_into_reconnect_chain(
     tmp_path,
 ):
     build_services(root=tmp_path)
     role_templates = AppContext.get(RoleIdTemplateService)
+    broker = AppContext.get(WindowsSmartReconnectObservationBroker)
     preparation = AppContext.get(SmartReconnectPreparationService)
-    calls: list[int] = []
-    expected = object()
-    role_templates.read = lambda handle: calls.append(handle) or expected
+    target_identity = AppContext.get(SmartReconnectTargetIdentityService)
+    target_windows = AppContext.get(TargetWindowContractService)
+    controller = AppContext.get(WindowsSmartReconnectController)
 
-    assert preparation._role_identity_reader(4321) is expected
-    assert calls == [4321]
+    assert role_templates is not None
+    assert broker is not None
+    assert preparation._observation_broker is broker
+    assert preparation._role_identity_reader is None
+    assert target_identity._observation_broker is broker
+    assert target_windows._observation_broker is broker
+    assert controller._observation_broker is broker
+    assert broker._worker_operation is _execute_observation_request
+    assert len(broker._active) == 4
+    assert all(worker.process.is_alive() for worker in broker._active.values())
+    observation_source = inspect.getsource(_observe_window)
+    assert "role_id_region_sample(sample)" in observation_source
+    assert "WindowsRoleIdOcrReader().read(role_sample)" in observation_source
+    assert "RoleIdTemplateService().read" not in observation_source
+
+
+def test_build_services_registration_failure_closes_all_observation_slots(
+    tmp_path,
+    monkeypatch,
+):
+    product_type = WindowsSmartReconnectObservationBroker
+    created = []
+
+    class TrackedBroker(product_type):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    original_register = AppContext.register
+
+    def fail_broker_registration(key, value):
+        if key is TrackedBroker:
+            raise RuntimeError("registration failed")
+        return original_register(key, value)
+
+    monkeypatch.setattr(
+        main_module,
+        "WindowsSmartReconnectObservationBroker",
+        TrackedBroker,
+    )
+    monkeypatch.setattr(
+        AppContext,
+        "register",
+        staticmethod(fail_broker_registration),
+    )
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        build_services(root=tmp_path)
+
+    assert len(created) == 1
+    assert created[0]._active == {}
+    assert created[0]._slots == {}
+    assert created[0].close() is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Tk only")
+def test_real_tk_heartbeat_continues_while_one_observation_slot_rebuilds(
+    tmp_path,
+):
+    broker = WindowsSmartReconnectObservationBroker(
+        reference_dir=tmp_path,
+        _worker_operation=_startup_slot_worker,
+    )
+    assert broker.start() is True
+    warmup = tuple(
+        SmartReconnectObservationRequest(
+            stage=f"warm-{index}",
+            reference_dir=str(tmp_path),
+            title_keywords=("adobe flash player",),
+        )
+        for index in range(4)
+    )
+    assert broker._request_many(warmup, 2.0) == tuple(
+        request.stage for request in warmup
+    )
+    initial_epochs = tuple(broker._slot_epochs)
+    root = tkinter.Tk()
+    root.withdraw()
+    heartbeats = []
+    completed = threading.Event()
+    results = []
+
+    def heartbeat():
+        heartbeats.append(time.monotonic())
+        if not completed.is_set():
+            root.after(5, heartbeat)
+
+    requests = tuple(
+        SmartReconnectObservationRequest(
+            stage=("slow-slot" if index == 0 else f"fast-{index}"),
+            reference_dir=str(tmp_path),
+            title_keywords=("adobe flash player",),
+        )
+        for index in range(4)
+    )
+
+    def run_long_batch():
+        results.extend(broker._request_many(requests, 0.4))
+        completed.set()
+
+    worker = threading.Thread(target=run_long_batch)
+    try:
+        root.after(1, heartbeat)
+        worker.start()
+        deadline = time.monotonic() + 3
+        while not completed.is_set() and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.005)
+        worker.join(1)
+
+        assert completed.is_set()
+        assert worker.is_alive() is False
+        assert len(heartbeats) >= 5
+        assert results[0] is None
+        assert results[1:] == ["fast-1", "fast-2", "fast-3"]
+        assert broker._slot_epochs[0] == initial_epochs[0] + 1
+        assert tuple(broker._slot_epochs[1:]) == initial_epochs[1:]
+        assert len(broker._active) == 4
+    finally:
+        root.destroy()
+        assert broker.close() is True
+
+
+def test_main_freeze_support_precedes_tkinter_and_product_imports():
+    source = Path(main_module.__file__).read_text(encoding="utf-8-sig")
+
+    freeze_index = source.index("multiprocessing.freeze_support()")
+    assert freeze_index < source.index("from tkinter import")
+    assert freeze_index < source.index("from adapters.background_capability import")
+
+
+def test_application_shutdown_stops_monitor_before_observation_broker():
+    source = inspect.getsource(main_module._run_application)
+
+    assert source.index("shutdown_smart_reconnect_monitor") < source.index(
+        "shutdown_smart_reconnect_observation_broker"
+    ) < source.index("shutdown_sync_controllers")
+    broker_index = source.index("shutdown_smart_reconnect_observation_broker")
+    assert source.index(
+        "shutdown_smart_reconnect_monitor",
+        broker_index,
+    ) > broker_index
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="只適用真實 Tk 介面")
+def test_real_tk_build_services_timers_only_consume_published_broker_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    callbacks_scheduled = set()
+    callbacks_completed = set()
+    scheduled_callbacks = {}
+    accelerated = set()
+    original_after = tkinter.Misc.after
+
+    def recording_after(widget, milliseconds, callback=None, *args):
+        name = getattr(callback, "__name__", "")
+        if name in {
+            "poll_registered_obsidian_once",
+            "auto_read_missing_role_id",
+        }:
+            callbacks_scheduled.add(name)
+            scheduled_callback = callback
+            scheduled_callbacks[name] = scheduled_callback
+
+            def recorded_callback(*callback_args):
+                callbacks_completed.add(name)
+                return scheduled_callback(*callback_args)
+
+            if name not in accelerated:
+                accelerated.add(name)
+                milliseconds = 1
+            callback = recorded_callback
+        return original_after(widget, milliseconds, callback, *args)
+
+    def forbidden_read(*_args, **_kwargs):
+        raise AssertionError("Tk timer performed synchronous capture")
+
+    monkeypatch.setattr(tkinter.Misc, "after", recording_after)
+    monkeypatch.setattr(
+        CharacterGameDataCaptureService,
+        "read",
+        forbidden_read,
+    )
+    monkeypatch.setattr(RoleIdTemplateService, "read_if_missing", forbidden_read)
+    monkeypatch.setattr(main_module, "apply_window_icon", lambda _window: None)
+    monkeypatch.setattr(
+        main_module,
+        "configure_tk_window_app_identity",
+        lambda _window, _icon: None,
+    )
+    monkeypatch.setattr(main_module, "start_service", lambda _service: None)
+    monkeypatch.setattr(
+        main_module.SystemTrayController,
+        "start",
+        lambda _self: False,
+    )
+    paths, _logger = build_services(root=tmp_path)
+    broker = AppContext.get(WindowsSmartReconnectObservationBroker)
+    groups = AppContext.get(GroupConfigurationService)
+    workspace = AppContext.get(WorkspaceService)
+    shortcut = tmp_path / "timer-role.lnk"
+    shortcut.write_bytes(b"timer-role")
+    added = groups.add_shortcuts("timer-group", (shortcut,))
+    assert len(added) == 1
+    entry = added[0]
+    assert groups.set_role_id(
+        "timer-group",
+        entry.entry_id,
+        "already-known",
+    ) is True
+    workspace.set_current_group(CharacterGroup("timer-group", "timer-group"))
+    fingerprint = "a" * 64
+    observed_window = WindowInfo(
+        handle=9001,
+        title="Adobe Flash Player",
+        visible=True,
+        minimized=False,
+        rect=(0, 0, 800, 600),
+        process_id=9002,
+        launch_fingerprint=fingerprint,
+        thread_id=9003,
+        window_class="FlashWindow",
+        process_lifecycle_token=9004,
+    )
+    normalized_shortcut = str(shortcut.resolve())
+    seal = ShortcutSeal(
+        ShortcutFileIdentity(normalized_shortcut, 1, 1),
+        "b" * 64,
+        fingerprint,
+    )
+    serial = broker._next_request()
+    assert broker._publish(
+        serial,
+        SmartReconnectObservationSnapshot(
+            generation=0,
+            windows=(
+                SmartReconnectWindowObservation(
+                    window=observed_window,
+                    instance=WindowInstanceToken.from_window(observed_window),
+                    sample=None,
+                    recognition=ScreenRecognition(
+                        ReconnectScreenState.CONNECTED,
+                        1.0,
+                        None,
+                        "connected",
+                    ),
+                    fresh_capture=True,
+                    capture_route="visible",
+                    role_id="role-100",
+                ),
+            ),
+            shortcuts=(
+                SmartReconnectShortcutObservation(
+                    normalized_shortcut,
+                    fingerprint,
+                    seal,
+                ),
+            ),
+        ),
+    ) is not None
+    window = None
+    heartbeat = []
+    try:
+        window = main_module.create_main_window({}, paths)
+        assert groups.set_role_id("timer-group", entry.entry_id, "") is True
+        runtime_calls = {
+            "plan": 0,
+            "launch_resolver": 0,
+            "shortcut_resolver": 0,
+            "stop_wait": 0,
+            "gate_wait": 0,
+            "identity_rebuild": 0,
+        }
+        runtime_events = []
+
+        def counted(name, result):
+            def call(*_args, **_kwargs):
+                runtime_calls[name] += 1
+                runtime_events.append(name)
+                return result
+
+            return call
+
+        monkeypatch.setattr(
+            GroupLaunchService,
+            "plan",
+            counted(
+                "plan",
+                SimpleNamespace(ready=False, targets=()),
+            ),
+        )
+        monkeypatch.setattr(
+            PowerShellLaunchFingerprintResolver,
+            "resolve",
+            counted("launch_resolver", {}),
+        )
+        monkeypatch.setattr(
+            PowerShellShortcutFingerprintResolver,
+            "resolve",
+            counted("shortcut_resolver", {}),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "stop_service",
+            counted(
+                "stop_wait",
+                OperationResult(True, "test.stopped", "", {}),
+            ),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "_rebuild_group_input_identity",
+            counted("identity_rebuild", True),
+        )
+        game_gate = AppContext.get(GameOperationGate)
+        monkeypatch.setattr(
+            game_gate,
+            "close_and_wait",
+            counted("gate_wait", True),
+        )
+        window.after(1, lambda: heartbeat.append("alive"))
+        deadline = time.monotonic() + 0.5
+        while (
+            (
+                callbacks_completed
+                != {
+                    "poll_registered_obsidian_once",
+                    "auto_read_missing_role_id",
+                }
+                or not heartbeat
+            )
+            and time.monotonic() < deadline
+        ):
+            window.update()
+            time.sleep(0.005)
+
+        assert broker is not None
+        assert callbacks_scheduled == {
+            "poll_registered_obsidian_once",
+            "auto_read_missing_role_id",
+        }
+        assert callbacks_completed == callbacks_scheduled
+        assert heartbeat == ["alive"]
+        assert len(broker._active) == 4
+        assert all(worker.process.is_alive() for worker in broker._active.values())
+        assert groups.group("timer-group").entries[0].role_id == "role-100"
+        assert runtime_calls == {
+            "plan": 0,
+            "launch_resolver": 0,
+            "shortcut_resolver": 0,
+            "stop_wait": 0,
+            "gate_wait": 0,
+            "identity_rebuild": 0,
+        }
+        assert runtime_events == []
+
+        assert groups.set_role_id("timer-group", entry.entry_id, "") is True
+        automatic_ready = threading.Event()
+        user_write_done = threading.Event()
+        automatic_finished = threading.Event()
+        user_failures = []
+        race_heartbeat = []
+        original_run_if_generation_current = (
+            broker.run_if_generation_current
+        )
+
+        def barrier_run_if_generation_current(generation, callback):
+            if (
+                not automatic_ready.is_set()
+                and any(
+                    frame.function == "auto_read_missing_role_id"
+                    for frame in inspect.stack()
+                )
+            ):
+                automatic_ready.set()
+                assert user_write_done.wait(2)
+                result = original_run_if_generation_current(
+                    generation,
+                    callback,
+                )
+                automatic_finished.set()
+                return result
+            return original_run_if_generation_current(
+                generation,
+                callback,
+            )
+
+        monkeypatch.setattr(
+            broker,
+            "run_if_generation_current",
+            barrier_run_if_generation_current,
+        )
+
+        def write_user_role_first():
+            try:
+                assert automatic_ready.wait(2)
+                assert groups.set_role_id(
+                    "timer-group",
+                    entry.entry_id,
+                    "user-role",
+                ) is True
+            except Exception as error:
+                user_failures.append(error)
+            finally:
+                user_write_done.set()
+
+        user_writer = threading.Thread(target=write_user_role_first)
+        user_writer.start()
+        window.after(1, lambda: race_heartbeat.append("alive"))
+        window.after(
+            1,
+            scheduled_callbacks["auto_read_missing_role_id"],
+        )
+        deadline = time.monotonic() + 2.0
+        while (
+            (
+                not automatic_finished.is_set()
+                or not race_heartbeat
+            )
+            and time.monotonic() < deadline
+        ):
+            window.update()
+            time.sleep(0.005)
+        user_writer.join(2)
+
+        assert user_writer.is_alive() is False
+        assert user_failures == []
+        assert automatic_ready.is_set()
+        assert automatic_finished.is_set()
+        assert race_heartbeat == ["alive"]
+        assert groups.group("timer-group").entries[0].role_id == "user-role"
+        assert runtime_events == []
+        monkeypatch.setattr(
+            broker,
+            "run_if_generation_current",
+            original_run_if_generation_current,
+        )
+
+        assert groups.set_role_id("timer-group", entry.entry_id, "") is True
+        old_snapshot_returned = threading.Event()
+        replacement_published = threading.Event()
+        old_snapshot_released = threading.Event()
+        invalidation_failures = []
+        original_stable_snapshot = broker.stable_snapshot
+
+        def barrier_stable_snapshot():
+            snapshot = original_stable_snapshot()
+            if (
+                not old_snapshot_returned.is_set()
+                and any(
+                    frame.function == "auto_read_missing_role_id"
+                    for frame in inspect.stack()
+                )
+            ):
+                old_snapshot_returned.set()
+                assert replacement_published.wait(2)
+                old_snapshot_released.set()
+            return snapshot
+
+        monkeypatch.setattr(
+            broker,
+            "stable_snapshot",
+            barrier_stable_snapshot,
+        )
+
+        def publish_replacement():
+            try:
+                assert old_snapshot_returned.wait(2)
+                replacement_window = replace(
+                    observed_window,
+                    handle=9011,
+                    process_id=9012,
+                    thread_id=9013,
+                    process_lifecycle_token=9014,
+                )
+                replacement_serial = broker._next_request()
+                assert broker._publish(
+                    replacement_serial,
+                    SmartReconnectObservationSnapshot(
+                        generation=0,
+                        windows=(
+                            SmartReconnectWindowObservation(
+                                window=replacement_window,
+                                instance=WindowInstanceToken.from_window(
+                                    replacement_window
+                                ),
+                                sample=None,
+                                recognition=ScreenRecognition(
+                                    ReconnectScreenState.CONNECTED,
+                                    1.0,
+                                    None,
+                                    "connected",
+                                ),
+                                fresh_capture=True,
+                                capture_route="visible",
+                                role_id=None,
+                            ),
+                        ),
+                        shortcuts=(
+                            SmartReconnectShortcutObservation(
+                                normalized_shortcut,
+                                fingerprint,
+                                seal,
+                            ),
+                        ),
+                    ),
+                ) is not None
+            except Exception as error:
+                invalidation_failures.append(error)
+            finally:
+                replacement_published.set()
+
+        invalidator = threading.Thread(target=publish_replacement)
+        invalidator.start()
+        window.after(
+            1,
+            scheduled_callbacks["auto_read_missing_role_id"],
+        )
+        deadline = time.monotonic() + 2.0
+        while (
+            not old_snapshot_released.is_set()
+            and time.monotonic() < deadline
+        ):
+            window.update()
+            time.sleep(0.005)
+        invalidator.join(2)
+
+        assert invalidator.is_alive() is False
+        assert invalidation_failures == []
+        assert old_snapshot_returned.is_set()
+        assert old_snapshot_released.is_set()
+        assert groups.group("timer-group").entries[0].role_id == ""
+        assert runtime_events == []
+    finally:
+        if window is not None:
+            window.destroy()
+        main_module.shutdown_smart_reconnect_monitor()
+        assert main_module.shutdown_smart_reconnect_observation_broker() is True
+        main_module.shutdown_sync_controllers()
+        AppContext.clear()
+
+
+def test_timer_source_contains_no_direct_capture_or_role_read():
+    source = inspect.getsource(main_module.create_main_window)
+    obsidian = source[
+        source.index("def poll_registered_obsidian_once"):
+        source.index("def activity_progress_changed_handler")
+    ]
+    role_start = source.index("def auto_read_missing_role_id")
+    role = source[
+        role_start:
+        source.index("\n    auto_read_missing_role_id()", role_start)
+    ]
+
+    assert "capture_service.read(" not in obsidian
+    assert "role_id_template_service.read_if_missing(" not in role
+    assert ".stable_snapshot()" in obsidian
+    assert ".stable_snapshot()" in role
+    assert ".current_snapshot()" not in obsidian
+    assert ".current_snapshot()" not in role
+    assert "unique_window_for_group_entry" not in role
+    assert "group_launch_service.plan" not in role
 
 
 def test_unconfigured_window_detection_remains_unsafe():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,10 +9,17 @@ import pytest
 from PIL import Image
 
 import main as main_module
+from adapters.game_screen_recognizer import ScreenRecognition
+from adapters.windows_smart_reconnect_observation_broker import (
+    SmartReconnectObservationSnapshot,
+    SmartReconnectWindowObservation,
+    WindowsSmartReconnectObservationBroker,
+)
 from config.config_manager import ConfigManager
 from core.sp1_boundaries import ExternalAdapter, OperationResult
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+from core.window_instance import WindowInstanceToken
 from services.app_context import AppContext
 from services.background_image_service import BackgroundImageService
 from services.event_bus import EventBus
@@ -242,11 +250,20 @@ def test_background_image_runtime_verification_uses_real_service_without_ui(
 def test_run_shuts_down_adapter_after_normal_window_close(monkeypatch, tmp_path):
     adapter = RecordingAdapter()
     prepare_run(monkeypatch, tmp_path, adapter)
+    lock_releases = []
+    monkeypatch.setattr(
+        main_module,
+        "acquire_main_instance_lock",
+        lambda: SimpleNamespace(
+            release=lambda: lock_releases.append(True),
+        ),
+    )
     window = SimpleNamespace(mainloop=lambda: None)
     monkeypatch.setattr(main_module, "create_main_window", lambda status, paths: window)
 
     assert main_module.run(root=tmp_path) == 0
     assert adapter.shutdown_calls == 1
+    assert lock_releases == [True]
 
 
 def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
@@ -255,6 +272,7 @@ def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
 ):
     main_module.build_services(root=tmp_path)
     contract = AppContext.get(TargetWindowContractService)
+    broker = AppContext.get(WindowsSmartReconnectObservationBroker)
     reconnect = AppContext.get(main_module.WindowsSmartReconnectController)
     keyboard = AppContext.get(main_module.WindowsInputSyncController)
     pointer = AppContext.get(main_module.WindowsPointerSyncController)
@@ -299,11 +317,37 @@ def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
         other_group_window,
         safe_ungrouped_window,
     )
-    monkeypatch.setattr(
-        contract._window_backend,
-        "list_windows",
-        lambda: actual_windows,
+    immutable_observation = SmartReconnectObservationSnapshot(
+        generation=0,
+        windows=tuple(
+            SmartReconnectWindowObservation(
+                window=window,
+                instance=WindowInstanceToken.from_window(window),
+                sample=None,
+                recognition=ScreenRecognition(
+                    main_module.ReconnectScreenState.CONNECTED,
+                    1.0,
+                    None,
+                    "connected",
+                ),
+                fresh_capture=True,
+                capture_route="print_window",
+                role_id=None,
+            )
+            for window in actual_windows
+        ),
     )
+    published = []
+
+    def publish_observation(_shortcut_paths=()):
+        serial = broker._next_request()
+        current = broker._publish(serial, immutable_observation)
+        assert current is not None
+        published.append(current)
+        return current
+
+    monkeypatch.setattr(broker, "refresh", publish_observation)
+    assert contract._observation_broker is broker
     actual_provider = reconnect._target_windows_provider
     assert actual_provider is not None
     assert actual_provider.__self__ is contract
@@ -312,19 +356,29 @@ def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
         is TargetWindowContractService.actual_reconnect_targets
     )
 
-    actual_targets = actual_provider()
+    first_actual_targets = actual_provider()
+    second_actual_targets = actual_provider()
 
-    assert actual_targets.actual_window_snapshot is True
-    assert actual_targets == contract.actual_reconnect_targets()
+    assert first_actual_targets.actual_window_snapshot is True
+    assert second_actual_targets.actual_window_snapshot is True
+    assert first_actual_targets.windows == second_actual_targets.windows
+    assert (
+        second_actual_targets.observation_generation
+        > first_actual_targets.observation_generation
+    )
+    assert tuple(item.generation for item in published) == (
+        first_actual_targets.observation_generation,
+        second_actual_targets.observation_generation,
+    )
     assert tuple(
         (window.handle, window.launch_fingerprint)
-        for window in actual_targets.windows
+        for window in second_actual_targets.windows
     ) == tuple(
         (window.handle, window.launch_fingerprint)
         for window in actual_windows
     )
-    assert actual_targets.failure_codes == ()
-    assert actual_targets.blocked_fingerprints == frozenset()
+    assert second_actual_targets.failure_codes == ()
+    assert second_actual_targets.blocked_fingerprints == frozenset()
 
     grouped_calls = []
     monkeypatch.setattr(
@@ -440,6 +494,10 @@ def test_run_shutdown_uses_identity_safe_order(monkeypatch, tmp_path):
 
     for name, label in (
         ("shutdown_smart_reconnect_monitor", "smart_reconnect"),
+        (
+            "shutdown_smart_reconnect_observation_broker",
+            "observation_broker",
+        ),
         ("shutdown_sync_controllers", "sync_controllers"),
         ("shutdown_event_subscriptions", "event_subscriptions"),
         ("shutdown_external_adapter", "external_adapter"),
@@ -450,7 +508,7 @@ def test_run_shutdown_uses_identity_safe_order(monkeypatch, tmp_path):
         monkeypatch.setattr(
             main_module,
             name,
-            lambda _logger=None, label=label: calls.append(label),
+            lambda _logger=None, label=label: calls.append(label) or True,
         )
     monkeypatch.setattr(
         main_module,
@@ -465,6 +523,8 @@ def test_run_shutdown_uses_identity_safe_order(monkeypatch, tmp_path):
 
     assert main_module.run(self_check_only=True, root=tmp_path) == 0
     assert calls == [
+        "smart_reconnect",
+        "observation_broker",
         "smart_reconnect",
         "sync_controllers",
         "event_subscriptions",
@@ -502,28 +562,82 @@ def test_registry_save_failure_still_closes_identity_transactions(
 
 def test_obsidian_polling_reschedules_after_a_safe_cycle_failure_and_cancels_on_close():
     source = Path("main.py").read_text(encoding="utf-8")
-    window_setup = source[
-        source.index("def create_main_window("):
-        source.index("    def schedule_registered_obsidian_poll(")
-    ]
-    polling = source[
-        source.index("    def schedule_registered_obsidian_poll("):
-        source.index("    def activity_progress_changed_handler(")
-    ]
-    closing = source[
-        source.index("    def close_window("):
-        source.index("    window.protocol(")
-    ]
+    tree = ast.parse(source)
+    create_window = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "create_main_window"
+    )
+    nested = {
+        node.name: node
+        for node in create_window.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    schedule = nested["schedule_registered_obsidian_poll"]
+    polling = nested["poll_registered_obsidian_once"]
+    closing = nested["close_window"]
 
-    assert "if closing:" in polling
-    assert "def current_sync_target_windows()" in window_setup
-    assert "target_window_contract_service.reconnect_targets(" in window_setup
-    assert "smart_reconnect_controller.observe_screen_states(" in window_setup
-    assert "ReconnectScreenState.CONNECTED" in window_setup
-    assert "candidate_index = game_data_read_cursor % len(candidates)" in polling
-    assert "result = capture_service.read(selected.handle)" in polling
-    assert "except Exception as error:" in polling
-    assert "stage={stage}; candidate_index={candidate_index}" in polling
-    assert "finally:" in polling
-    assert "schedule_registered_obsidian_poll()" in polling
-    assert "window.after_cancel(game_data_read_after_id)" in closing
+    def call_path(call):
+        parts = []
+        node = call.func
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        return ".".join(reversed(parts))
+
+    schedule_calls = {
+        call_path(node)
+        for node in ast.walk(schedule)
+        if isinstance(node, ast.Call)
+    }
+    polling_calls = {
+        call_path(node)
+        for node in ast.walk(polling)
+        if isinstance(node, ast.Call)
+    }
+    closing_calls = {
+        call_path(node)
+        for node in ast.walk(closing)
+        if isinstance(node, ast.Call)
+    }
+    polling_source = ast.get_source_segment(source, polling)
+
+    assert any(
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "closing"
+        for node in schedule.body
+    )
+    assert "window.after" in schedule_calls
+    assert "current_sync_target_windows" in polling_calls
+    assert (
+        "smart_reconnect_observation_broker.stable_snapshot"
+        in polling_calls
+    )
+    assert (
+        "smart_reconnect_observation_broker.current_snapshot"
+        not in polling_calls
+    )
+    assert "published.window_for" in polling_calls
+    assert "schedule_registered_obsidian_poll" in polling_calls
+    assert "window.after_cancel" in closing_calls
+    assert any(
+        isinstance(node, ast.Name)
+        and node.id == "game_data_read_after_id"
+        for node in ast.walk(closing)
+    )
+    forbidden_calls = {
+        "capture_service.read",
+        "role_id_template_service.read_if_missing",
+        "PowerShellLaunchFingerprintResolver.resolve",
+        "PowerShellShortcutFingerprintResolver.resolve",
+    }
+    assert polling_calls.isdisjoint(forbidden_calls)
+    assert not any(path.endswith(".capture") for path in polling_calls)
+    assert polling_source is not None
+    assert "Win32" not in polling_source
+    assert "PowerShell" not in polling_source
+    assert "resolver" not in polling_source.casefold()

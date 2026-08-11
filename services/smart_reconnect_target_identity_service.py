@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
@@ -12,6 +13,10 @@ from uuid import uuid4
 from adapters.windows_launch_fingerprint import (
     ShortcutFingerprintResolver,
     normalize_launch_fingerprint,
+)
+from adapters.windows_smart_reconnect_observation_broker import (
+    SmartReconnectObservationSnapshot,
+    WindowsSmartReconnectObservationBroker,
 )
 from core.smart_reconnect_authorization import (
     ReconnectAuthorizationTarget,
@@ -42,6 +47,19 @@ def normalize_reconnect_role_alias(value: object) -> str | None:
     """Compatibility export for the controller's observed-name checks."""
 
     return normalize_identity_alias(value)
+
+
+def complete_reconnect_role_alias(value: object) -> str | None:
+    """Accept a complete named role, never a bare visible level."""
+
+    alias = normalize_identity_alias(value)
+    if alias is None or len(alias) < 3 or alias.isdecimal():
+        return None
+    return alias
+
+
+def _identity_path(value: object) -> Path:
+    return Path(os.path.normcase(os.path.abspath(os.fspath(value))))
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +96,7 @@ class SmartReconnectTargetIdentity:
         ):
             raise TypeError("importance must be CharacterImportance or None")
         shortcut_path = (
-            Path(self.shortcut_path).resolve(strict=False)
+            _identity_path(self.shortcut_path)
             if self.shortcut_path is not None
             else None
         )
@@ -152,7 +170,7 @@ class SmartReconnectPendingIdentityCandidate:
         fingerprint = normalize_launch_fingerprint(self.fingerprint)
         if fingerprint is None:
             raise ValueError("fingerprint must be a complete SHA-256 digest")
-        shortcut_path = Path(self.shortcut_path).resolve(strict=False)
+        shortcut_path = _identity_path(self.shortcut_path)
         if shortcut_path.suffix.casefold() != ".lnk":
             raise ValueError("shortcut_path must identify a Windows shortcut")
         object.__setattr__(self, "fingerprint", fingerprint)
@@ -175,19 +193,18 @@ class SmartReconnectIdentityEvidence:
             raise TypeError("instance must be a complete window instance")
         if not isinstance(self.shortcut_seal, ShortcutSeal):
             raise TypeError("shortcut_seal must be complete")
-        alias = normalize_identity_alias(self.role_alias)
+        alias = complete_reconnect_role_alias(self.role_alias)
         if (
             alias is None
-            or len(alias) < 3
             or any(character.isspace() for character in self.role_alias)
             or "..." in self.role_alias
             or "…" in self.role_alias
         ):
             raise ValueError("role_alias must be a complete stable identity")
-        expected_path = self.candidate.shortcut_path.resolve(strict=False)
-        actual_path = Path(
+        expected_path = _identity_path(self.candidate.shortcut_path)
+        actual_path = _identity_path(
             self.shortcut_seal.file_identity.normalized_path
-        ).resolve(strict=False)
+        )
         if (
             self.shortcut_seal.launch_fingerprint
             != self.candidate.fingerprint
@@ -252,6 +269,9 @@ class SmartReconnectTargetIdentityService:
         ungrouped_shortcut_catalog_provider: (
             Callable[[], Iterable[Path]] | None
         ) = None,
+        observation_broker: (
+            WindowsSmartReconnectObservationBroker | None
+        ) = None,
     ) -> None:
         if not isinstance(coordinator, IdentityDataTransactionCoordinator):
             raise TypeError("coordinator must be IdentityDataTransactionCoordinator")
@@ -289,6 +309,7 @@ class SmartReconnectTargetIdentityService:
         self._ungrouped_shortcut_catalog_provider = (
             ungrouped_shortcut_catalog_provider
         )
+        self._observation_broker = observation_broker
         self._state_path = Path(state_path)
         self._state_write_blocked = False
         # Construction has not published this service to any caller yet.  Read
@@ -310,10 +331,12 @@ class SmartReconnectTargetIdentityService:
         group_name: object,
     ) -> tuple[SmartReconnectTargetIdentity, ...]:
         source = self._capture_source()
+        observation = self._observation_for_source(source.value)
         try:
             targets = self.targets_for_group_from_source_snapshot(
                 group_name,
                 source.value,
+                observation_snapshot=observation,
             )
         except SmartReconnectTargetIdentityError:
             return ()
@@ -324,10 +347,12 @@ class SmartReconnectTargetIdentityService:
         if normalized is None:
             return None
         source = self._capture_source()
+        observation = self._observation_for_source(source.value)
         try:
             targets = self.targets_for_fingerprints_from_source_snapshot(
                 (normalized,),
                 source.value,
+                observation_snapshot=observation,
             )
         except SmartReconnectTargetIdentityError:
             return None
@@ -345,9 +370,11 @@ class SmartReconnectTargetIdentityService:
         """Resolve externally, then reject a result from a changed generation."""
 
         source = self._capture_source()
+        observation = self._observation_for_source(source.value)
         targets = self.targets_for_fingerprints_from_source_snapshot(
             fingerprints,
             source.value,
+            observation_snapshot=observation,
         )
         return targets if self._source_is_current(source.generation) else ()
 
@@ -362,16 +389,58 @@ class SmartReconnectTargetIdentityService:
             == expected_generation
         )
 
+    @staticmethod
+    def _source_shortcut_paths(
+        source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> tuple[Path, ...]:
+        return tuple(
+            dict.fromkeys(
+                Path(entry.shortcut_path)
+                for group in source.groups
+                for entry in group.entries
+            )
+        )
+
+    def _observation_for_source(
+        self,
+        source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> SmartReconnectObservationSnapshot | None:
+        broker = self._observation_broker
+        if broker is None:
+            return None
+        return broker.refresh(self._source_shortcut_paths(source))
+
+    def _latest_observation_for_source(
+        self,
+        source: SmartReconnectTargetIdentitySourceSnapshot,
+    ) -> SmartReconnectObservationSnapshot | None:
+        del source
+        broker = self._observation_broker
+        if broker is None:
+            return None
+        stable_reader = getattr(broker, "stable_snapshot", None)
+        return (
+            stable_reader()
+            if callable(stable_reader)
+            else broker.current_snapshot()
+        )
+
     def targets_for_group_from_source_snapshot(
         self,
         group_name: object,
         source: SmartReconnectTargetIdentitySourceSnapshot,
+        *,
+        observation_snapshot: SmartReconnectObservationSnapshot | None = None,
     ) -> tuple[SmartReconnectTargetIdentity, ...]:
         if not isinstance(source, SmartReconnectTargetIdentitySourceSnapshot):
             raise TypeError("source must be a target identity source snapshot")
         if not source.state_writable:
             return ()
-        return self._build_targets_from_source(group_name, source)
+        return self._build_targets_from_source(
+            group_name,
+            source,
+            observation_snapshot=observation_snapshot,
+        )
 
     def capture_source_snapshot_in_current(
         self,
@@ -392,6 +461,8 @@ class SmartReconnectTargetIdentityService:
         self,
         fingerprints: Iterable[object],
         source: SmartReconnectTargetIdentitySourceSnapshot,
+        *,
+        observation_snapshot: SmartReconnectObservationSnapshot | None = None,
     ) -> tuple[SmartReconnectTargetIdentity, ...]:
         """Resolve external shortcut evidence after releasing identity locks."""
 
@@ -409,12 +480,15 @@ class SmartReconnectTargetIdentityService:
         return self.resolve_for_fingerprints_from_source_snapshot(
             normalized,
             source,
+            observation_snapshot=observation_snapshot,
         ).targets
 
     def resolve_for_fingerprints_from_source_snapshot(
         self,
         fingerprints: Iterable[object],
         source: SmartReconnectTargetIdentitySourceSnapshot,
+        *,
+        observation_snapshot: SmartReconnectObservationSnapshot | None = None,
     ) -> SmartReconnectTargetResolution:
         """Return authorized identities and safe-to-observe unknown windows."""
 
@@ -431,7 +505,11 @@ class SmartReconnectTargetIdentityService:
                 if value is not None
             )
         )
-        return self._resolve_requested_targets_from_source(normalized, source)
+        return self._resolve_requested_targets_from_source(
+            normalized,
+            source,
+            observation_snapshot=observation_snapshot,
+        )
 
     def observed_identity_alias_catalog(self) -> tuple[tuple[str, str], ...]:
         """Return reliable screen aliases without making them target gates."""
@@ -477,9 +555,11 @@ class SmartReconnectTargetIdentityService:
         target: ReconnectAuthorizationTarget,
     ) -> bool:
         source = self._capture_source()
+        observation = self._observation_for_source(source.value)
         is_current = self.retained_target_is_current_from_source_snapshot(
             target,
             source.value,
+            observation_snapshot=observation,
         )
         return is_current and self._source_is_current(source.generation)
 
@@ -487,6 +567,8 @@ class SmartReconnectTargetIdentityService:
         self,
         target: ReconnectAuthorizationTarget,
         source: SmartReconnectTargetIdentitySourceSnapshot,
+        *,
+        observation_snapshot: SmartReconnectObservationSnapshot | None = None,
     ) -> bool:
         """Recheck one absent target using copied identity and external evidence."""
 
@@ -500,9 +582,9 @@ class SmartReconnectTargetIdentityService:
             or target.shortcut_seal is None
         ):
             return False
-        path = Path(
+        path = _identity_path(
             target.shortcut_seal.file_identity.normalized_path
-        ).resolve(strict=False)
+        )
         groups = source.groups
         saved_targets = source.saved_by_fingerprint()
         saved_for_target = saved_targets.get(target.fingerprint)
@@ -516,38 +598,59 @@ class SmartReconnectTargetIdentityService:
             ):
                 return False
         membership_paths = tuple(
-            entry.shortcut_path.resolve(strict=False)
+            _identity_path(entry.shortcut_path)
             for group in groups
             for entry in group.entries
         )
         catalog_provider = self._ungrouped_shortcut_catalog_provider
         catalog_paths: tuple[Path, ...] = ()
-        if catalog_provider is not None:
+        fingerprints_by_path: dict[Path, str] = {}
+        if observation_snapshot is not None:
+            if observation_snapshot.failure_codes:
+                return False
+            catalog_provider = lambda: ()
+            catalog_paths = tuple(
+                dict.fromkeys(
+                    _identity_path(item.path)
+                    for item in observation_snapshot.shortcuts
+                    if item.fingerprint is not None
+                    and item.seal is not None
+                    and not item.failure_codes
+                )
+            )
+            fingerprints_by_path = {
+                _identity_path(item.path): item.fingerprint
+                for item in observation_snapshot.shortcuts
+                if item.fingerprint is not None
+                and item.seal is not None
+                and not item.failure_codes
+            }
+        elif catalog_provider is not None:
             try:
                 catalog_paths = tuple(
                     dict.fromkeys(
-                        Path(item).resolve(strict=False)
+                        _identity_path(item)
                         for item in catalog_provider()
                     )
                 )
             except (OSError, RuntimeError, TypeError, ValueError):
                 return False
         paths = tuple(dict.fromkeys((*membership_paths, *catalog_paths, path)))
-        fingerprints_by_path: dict[Path, str] = {}
-        try:
-            resolved = self._resolver.resolve(paths)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            resolved = {}
-        if isinstance(resolved, Mapping):
-            requested_paths = frozenset(paths)
-            for raw_path, raw_fingerprint in resolved.items():
-                try:
-                    candidate = Path(raw_path).resolve(strict=False)
-                except (OSError, TypeError, ValueError):
-                    continue
-                fingerprint = normalize_launch_fingerprint(raw_fingerprint)
-                if candidate in requested_paths and fingerprint is not None:
-                    fingerprints_by_path[candidate] = fingerprint
+        if observation_snapshot is None:
+            try:
+                resolved = self._resolver.resolve(paths)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                resolved = {}
+            if isinstance(resolved, Mapping):
+                requested_paths = frozenset(paths)
+                for raw_path, raw_fingerprint in resolved.items():
+                    try:
+                        candidate = _identity_path(raw_path)
+                    except (OSError, TypeError, ValueError):
+                        continue
+                    fingerprint = normalize_launch_fingerprint(raw_fingerprint)
+                    if candidate in requested_paths and fingerprint is not None:
+                        fingerprints_by_path[candidate] = fingerprint
         matching_paths = frozenset(
             candidate
             for candidate in paths
@@ -564,7 +667,7 @@ class SmartReconnectTargetIdentityService:
             (group, entry)
             for group in groups
             for entry in group.entries
-            if entry.shortcut_path.resolve(strict=False) == path
+            if _identity_path(entry.shortcut_path) == path
         )
         if memberships:
             current_targets = tuple(
@@ -659,13 +762,15 @@ class SmartReconnectTargetIdentityService:
             and current.importance is target.importance
             and current.original_slot_index == target.original_slot_index
             and current.original_line_number == target.original_line_number
-            and current.shortcut_path.resolve(strict=False) == path
+            and _identity_path(current.shortcut_path) == path
         )
 
     def _resolve_requested_targets_from_source(
         self,
         fingerprints: tuple[str, ...],
         source: SmartReconnectTargetIdentitySourceSnapshot,
+        *,
+        observation_snapshot: SmartReconnectObservationSnapshot | None = None,
     ) -> SmartReconnectTargetResolution:
         requested = frozenset(fingerprints)
         if not requested:
@@ -683,16 +788,37 @@ class SmartReconnectTargetIdentityService:
         ] = {}
         for group in groups:
             for entry in group.entries:
-                path = entry.shortcut_path.resolve(strict=False)
+                path = _identity_path(entry.shortcut_path)
                 memberships_by_path.setdefault(path, []).append((group, entry))
 
         catalog_paths: tuple[Path, ...] = ()
         catalog_provider = self._ungrouped_shortcut_catalog_provider
-        if catalog_provider is not None:
+        fingerprints_by_path: dict[Path, str] = {}
+        broker_catalog = observation_snapshot is not None
+        if observation_snapshot is not None:
+            if observation_snapshot.failure_codes:
+                return SmartReconnectTargetResolution((), ())
+            catalog_paths = tuple(
+                dict.fromkeys(
+                    _identity_path(item.path)
+                    for item in observation_snapshot.shortcuts
+                    if item.fingerprint is not None
+                    and item.seal is not None
+                    and not item.failure_codes
+                )
+            )
+            fingerprints_by_path = {
+                _identity_path(item.path): item.fingerprint
+                for item in observation_snapshot.shortcuts
+                if item.fingerprint is not None
+                and item.seal is not None
+                and not item.failure_codes
+            }
+        elif catalog_provider is not None:
             try:
                 catalog_paths = tuple(
                     dict.fromkeys(
-                        Path(item).resolve(strict=False)
+                        _identity_path(item)
                         for item in catalog_provider()
                     )
                 )
@@ -702,21 +828,21 @@ class SmartReconnectTargetIdentityService:
             dict.fromkeys((*memberships_by_path, *catalog_paths))
         )
 
-        fingerprints_by_path: dict[Path, str] = {}
-        try:
-            raw = self._resolver.resolve(all_source_paths)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            raw = {}
-        if isinstance(raw, Mapping):
-            requested_paths = frozenset(all_source_paths)
-            for raw_path, raw_fingerprint in raw.items():
-                try:
-                    path = Path(raw_path).resolve(strict=False)
-                except (OSError, TypeError, ValueError):
-                    continue
-                resolved = normalize_launch_fingerprint(raw_fingerprint)
-                if path in requested_paths and resolved is not None:
-                    fingerprints_by_path[path] = resolved
+        if observation_snapshot is None:
+            try:
+                raw = self._resolver.resolve(all_source_paths)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                raw = {}
+            if isinstance(raw, Mapping):
+                requested_paths = frozenset(all_source_paths)
+                for raw_path, raw_fingerprint in raw.items():
+                    try:
+                        path = _identity_path(raw_path)
+                    except (OSError, TypeError, ValueError):
+                        continue
+                    resolved = normalize_launch_fingerprint(raw_fingerprint)
+                    if path in requested_paths and resolved is not None:
+                        fingerprints_by_path[path] = resolved
         paths_by_fingerprint: dict[str, list[Path]] = {}
         for path, fingerprint in fingerprints_by_path.items():
             paths_by_fingerprint.setdefault(fingerprint, []).append(path)
@@ -754,7 +880,7 @@ class SmartReconnectTargetIdentityService:
             if (
                 source_path_count > 1
                 or (
-                    catalog_provider is not None
+                    (catalog_provider is not None or broker_catalog)
                     and source_path_count != 1
                 )
             ):
@@ -813,6 +939,14 @@ class SmartReconnectTargetIdentityService:
                 records_by_id,
                 saved_targets,
                 source,
+                candidate_path=(
+                    unique_candidate.shortcut_path
+                    if (
+                        observation_snapshot is not None
+                        and unique_candidate is not None
+                    )
+                    else None
+                ),
             )
             if target is not None:
                 candidates[fingerprint] = target
@@ -854,10 +988,13 @@ class SmartReconnectTargetIdentityService:
         self,
         fingerprints: tuple[str, ...],
         source: SmartReconnectTargetIdentitySourceSnapshot,
+        *,
+        observation_snapshot: SmartReconnectObservationSnapshot | None = None,
     ) -> tuple[SmartReconnectTargetIdentity, ...]:
         return self._resolve_requested_targets_from_source(
             fingerprints,
             source,
+            observation_snapshot=observation_snapshot,
         ).targets
 
     @staticmethod
@@ -919,28 +1056,33 @@ class SmartReconnectTargetIdentityService:
         records_by_id: Mapping[str, tuple[object, ...]],
         saved_targets: Mapping[str, _SavedTargetState],
         source: SmartReconnectTargetIdentitySourceSnapshot,
+        *,
+        candidate_path: Path | None = None,
     ) -> SmartReconnectTargetIdentity | None:
-        provider = self._ungrouped_shortcut_provider
-        if provider is None:
-            return None
-        try:
-            candidate_path = provider(fingerprint)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            return None
-        if not isinstance(candidate_path, Path):
-            return None
-        path = candidate_path.resolve(strict=False)
+        if candidate_path is None:
+            provider = self._ungrouped_shortcut_provider
+            if provider is None:
+                return None
+            try:
+                candidate_path = provider(fingerprint)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return None
+            if not isinstance(candidate_path, Path):
+                return None
+            path = _identity_path(candidate_path)
+            try:
+                resolved = self._resolver.resolve((path,))
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return None
+            if (
+                not isinstance(resolved, Mapping)
+                or set(resolved) != {path}
+                or normalize_launch_fingerprint(resolved.get(path)) != fingerprint
+            ):
+                return None
+        else:
+            path = _identity_path(candidate_path)
         if path.suffix.casefold() != ".lnk":
-            return None
-        try:
-            resolved = self._resolver.resolve((path,))
-        except (OSError, RuntimeError, TypeError, ValueError):
-            return None
-        if (
-            not isinstance(resolved, Mapping)
-            or set(resolved) != {path}
-            or normalize_launch_fingerprint(resolved.get(path)) != fingerprint
-        ):
             return None
         saved = saved_targets.get(fingerprint)
         shortcut_identity = normalize_identity_alias(path.stem)
@@ -1328,6 +1470,8 @@ class SmartReconnectTargetIdentityService:
         self,
         group_name: object | None,
         source: SmartReconnectTargetIdentitySourceSnapshot,
+        *,
+        observation_snapshot: SmartReconnectObservationSnapshot | None = None,
     ) -> tuple[SmartReconnectTargetIdentity, ...]:
         groups = self._selected_groups_from_source(
             group_name,
@@ -1344,23 +1488,36 @@ class SmartReconnectTargetIdentityService:
                 "target identity group has no entries"
             )
         paths = tuple(
-            dict.fromkeys(entry.shortcut_path.resolve(strict=False) for _, entry in entries)
+            dict.fromkeys(_identity_path(entry.shortcut_path) for _, entry in entries)
         )
-        try:
-            raw_fingerprints = self._resolver.resolve(paths)
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
-            raise SmartReconnectTargetIdentityError(
-                "shortcut fingerprint resolution failed"
-            ) from error
-        if not isinstance(raw_fingerprints, Mapping):
-            raise SmartReconnectTargetIdentityError(
-                "shortcut fingerprint result is invalid"
-            )
-        fingerprints = {
-            path.resolve(strict=False): normalize_launch_fingerprint(value)
-            for path, value in raw_fingerprints.items()
-            if isinstance(path, Path)
-        }
+        if observation_snapshot is not None:
+            if observation_snapshot.failure_codes:
+                raise SmartReconnectTargetIdentityError(
+                    "observation source is unavailable"
+                )
+            fingerprints = {
+                _identity_path(item.path): item.fingerprint
+                for item in observation_snapshot.shortcuts
+                if item.fingerprint is not None
+                and item.seal is not None
+                and not item.failure_codes
+            }
+        else:
+            try:
+                raw_fingerprints = self._resolver.resolve(paths)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise SmartReconnectTargetIdentityError(
+                    "shortcut fingerprint resolution failed"
+                ) from error
+            if not isinstance(raw_fingerprints, Mapping):
+                raise SmartReconnectTargetIdentityError(
+                    "shortcut fingerprint result is invalid"
+                )
+            fingerprints = {
+                _identity_path(path): normalize_launch_fingerprint(value)
+                for path, value in raw_fingerprints.items()
+                if isinstance(path, Path)
+            }
         if any(fingerprints.get(path) is None for path in paths):
             raise SmartReconnectTargetIdentityError(
                 "shortcut fingerprint batch is incomplete"
@@ -1373,7 +1530,7 @@ class SmartReconnectTargetIdentityService:
         targets: list[SmartReconnectTargetIdentity] = []
         exact_memberships: set[tuple[str, str, Path]] = set()
         for group, entry in entries:
-            path = entry.shortcut_path.resolve(strict=False)
+            path = _identity_path(entry.shortcut_path)
             fingerprint = fingerprints.get(path)
             if fingerprint is None:
                 raise SmartReconnectTargetIdentityError(
@@ -1575,9 +1732,11 @@ class SmartReconnectTargetIdentityService:
             source = self._capture_source()
             if not source.value.state_writable:
                 return False
+            observation = self._latest_observation_for_source(source.value)
             targets = self.targets_for_fingerprints_from_source_snapshot(
                 (normalized,),
                 source.value,
+                observation_snapshot=observation,
             )
         except (
             IdentityTransactionError,
@@ -1728,7 +1887,7 @@ class SmartReconnectTargetIdentityService:
             if raw_path is not None:
                 if not isinstance(raw_path, str) or not raw_path.strip():
                     raise ValueError("target identity state entry is invalid")
-                shortcut_path = Path(raw_path).resolve(strict=False)
+                shortcut_path = _identity_path(raw_path)
                 if shortcut_path.suffix.casefold() != ".lnk":
                     raise ValueError("target identity state entry is invalid")
             instance = cls._parse_saved_instance(
@@ -2050,5 +2209,6 @@ __all__ = [
     "SmartReconnectTargetResolution",
     "SmartReconnectTargetIdentitySourceSnapshot",
     "SmartReconnectTargetIdentityService",
+    "complete_reconnect_role_alias",
     "normalize_reconnect_role_alias",
 ]

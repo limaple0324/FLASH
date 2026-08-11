@@ -5,6 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from adapters.windows_smart_reconnect_observation_broker import (
+    SmartReconnectObservationSnapshot,
+    SmartReconnectShortcutObservation,
+)
 from core.window_registry import CharacterWindowRecord, WindowRegistry
 from domain.character import Character, CharacterImportance
 from core.smart_reconnect_authorization import (
@@ -45,6 +49,32 @@ class StaticShortcutResolver:
             for path in paths
             if (resolved := Path(path).resolve(strict=False)) in self.values
         }
+
+
+class ForbiddenShortcutResolver:
+    def resolve(self, _paths):
+        raise AssertionError("formal identity resolution used direct resolver")
+
+
+class StaticObservationBroker:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+        self.refresh_calls = 0
+        self.stable_calls = 0
+
+    def refresh(self, _paths=()):
+        self.refresh_calls += 1
+        return self.snapshot
+
+    def latest_snapshot(self):
+        return self.snapshot
+
+    def current_snapshot(self):
+        return self.snapshot
+
+    def stable_snapshot(self):
+        self.stable_calls += 1
+        return self.snapshot
 
 
 class CoordinatorReadProbe:
@@ -151,6 +181,7 @@ def make_service(
     records=None,
     ungrouped_shortcut_provider=None,
     ungrouped_shortcut_catalog_provider=None,
+    observation_broker=None,
 ):
     coordinator = IdentityDataTransactionCoordinator()
     registry = StaticRegistry(records or (make_record(),))
@@ -170,7 +201,81 @@ def make_service(
         ungrouped_shortcut_catalog_provider=(
             ungrouped_shortcut_catalog_provider
         ),
+        observation_broker=observation_broker,
     )
+
+
+def broker_snapshot(path: Path, fingerprint: str = FINGERPRINT):
+    resolved = Path(path).resolve(strict=False)
+    seal = ShortcutSeal(
+        ShortcutFileIdentity(str(resolved), 91, 92),
+        "f" * 64,
+        fingerprint,
+    )
+    return SmartReconnectObservationSnapshot(
+        generation=3,
+        shortcuts=(
+            SmartReconnectShortcutObservation(
+                str(resolved),
+                fingerprint,
+                seal,
+            ),
+        ),
+    )
+
+
+def test_formal_broker_path_never_calls_direct_shortcut_sources(tmp_path):
+    shortcut = tmp_path / "role.lnk"
+    broker = StaticObservationBroker(broker_snapshot(shortcut))
+
+    def forbidden_provider(*_args):
+        raise AssertionError("formal identity resolution used UI provider")
+
+    service = make_service(
+        tmp_path,
+        (make_group("one", (make_entry(shortcut),)),),
+        ForbiddenShortcutResolver(),
+        ungrouped_shortcut_provider=forbidden_provider,
+        ungrouped_shortcut_catalog_provider=forbidden_provider,
+        observation_broker=broker,
+    )
+
+    target = service.target_for(FINGERPRINT)
+
+    assert target is not None
+    assert target.character_id == CHARACTER_ID
+    assert target.shortcut_path == shortcut.resolve(strict=False)
+    assert broker.refresh_calls == 1
+    assert service.remember_verified_slot(FINGERPRINT, CHARACTER_ID, 0) is True
+    assert broker.refresh_calls == 1
+    assert broker.stable_calls == 1
+
+
+def test_broker_catalog_resolves_unique_ungrouped_identity_without_ui_provider(
+    tmp_path,
+):
+    shortcut = tmp_path / "AlphaRole.lnk"
+    broker = StaticObservationBroker(broker_snapshot(shortcut))
+    service = make_service(
+        tmp_path,
+        (),
+        ForbiddenShortcutResolver(),
+        characters=(make_character(display_name="AlphaRole"),),
+        records=(make_record(display_name="AlphaRole", aliases=()),),
+        ungrouped_shortcut_provider=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("ungrouped provider was called")
+        ),
+        ungrouped_shortcut_catalog_provider=lambda: (_ for _ in ()).throw(
+            AssertionError("ungrouped catalog was called")
+        ),
+        observation_broker=broker,
+    )
+
+    target = service.target_for(FINGERPRINT)
+
+    assert target is not None
+    assert target.character_id == CHARACTER_ID
+    assert target.matches_observed_identity("AlphaRole") is True
 
 
 def test_public_target_reads_and_remember_resolve_outside_identity_lock(
@@ -1164,6 +1269,39 @@ def _record_complete_cycle(
         expected_source=source.value,
     )
     return source, resolution, candidates, result
+
+
+def test_bare_numeric_level_is_not_complete_identity_evidence(tmp_path):
+    service, fingerprints, _paths, instances, seals, _aliases = (
+        _pending_identity_fixture(tmp_path, ("100",))
+    )
+    source, _resolution, candidates = _source_and_candidates(
+        service,
+        fingerprints,
+    )
+
+    with pytest.raises(ValueError, match="complete stable identity"):
+        SmartReconnectIdentityEvidence(
+            candidates[0],
+            instances[0],
+            seals[0],
+            "100",
+        )
+    result = service.record_identity_evidence(
+        candidates,
+        (),
+        expected_generation=source.generation,
+        expected_config_revision=7,
+        expected_source=source.value,
+    )
+    saved = json.loads(service.state_path.read_text(encoding="utf-8"))[
+        "targets"
+    ][fingerprints[0]]
+
+    assert result.confirmed_fingerprints == frozenset()
+    assert saved["status"] == "pending"
+    assert saved["verified_aliases"] == []
+    assert service.target_for(fingerprints[0]) is None
 
 
 def test_pending_identity_requires_two_cycles_and_identical_third_is_noop(

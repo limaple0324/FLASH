@@ -234,6 +234,8 @@ def test_three_keyboard_and_mouse_actions_finish_without_per_role_rewrite(
             process_id=1000 + index,
             window_class="ShockwaveFlash",
             launch_fingerprint=f"{index:064x}",
+            thread_id=2000 + index,
+            process_lifecycle_token=3000 + index,
         )
         for index in range(1, 15)
     )
