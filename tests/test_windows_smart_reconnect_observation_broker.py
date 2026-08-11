@@ -1,5 +1,7 @@
+import base64
 import ctypes
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -41,6 +43,84 @@ pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows only")
 
 FINGERPRINT = "a" * 64
 SECOND_FINGERPRINT = "c" * 64
+
+
+def _create_real_windows_shortcuts(
+    specifications: tuple[tuple[Path, Path, str], ...],
+) -> None:
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$decoded = (
+    [Text.Encoding]::UTF8.GetString(
+        [Convert]::FromBase64String($env:FLASH_TEST_SHORTCUTS_B64)
+    ) | ConvertFrom-Json
+)
+$specifications = @($decoded)
+$shell = New-Object -ComObject WScript.Shell
+foreach ($specification in $specifications) {
+    $path = [string]$specification.Path
+    $target = [string]$specification.Target
+    $shortcut = $shell.CreateShortcut($path)
+    $shortcut.TargetPath = $target
+    $shortcut.Arguments = [string]$specification.Arguments
+    $shortcut.WorkingDirectory = [IO.Path]::GetDirectoryName($target)
+    $shortcut.Save()
+}
+"""
+    environment = os.environ.copy()
+    environment["FLASH_TEST_SHORTCUTS_B64"] = base64.b64encode(
+        json.dumps(
+            [
+                {
+                    "Path": os.fspath(path),
+                    "Target": os.fspath(target),
+                    "Arguments": arguments,
+                }
+                for path, target, arguments in specifications
+            ],
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).decode("ascii")
+    completed = broker_module._run_system_powershell(
+        (
+            broker_module._system_powershell_path(),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            base64.b64encode(script.encode("utf-16-le")).decode("ascii"),
+        ),
+        capture_output=True,
+        text=False,
+        timeout=10,
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert all(path.is_file() for path, _target, _arguments in specifications)
+
+
+def _windows_powershell_version() -> str:
+    completed = broker_module._run_system_powershell(
+        (
+            broker_module._system_powershell_path(),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$PSVersionTable.PSVersion.ToString()",
+        ),
+        capture_output=True,
+        text=False,
+        timeout=10,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    assert completed.returncode == 0
+    return completed.stdout.decode("utf-8-sig").strip()
 
 
 def _fake_window(offset: int = 0) -> WindowInfo:
@@ -1413,6 +1493,100 @@ def test_formal_item_timeout_isolates_prior_target_and_keeps_sibling(
     assert second.isolated_window_count == 1
     assert len(broker._active) == 4
     assert broker.close() is True
+
+
+def test_windows_powershell_51_expands_multiple_paths_for_both_identity_batches(
+    tmp_path,
+):
+    assert _windows_powershell_version().startswith("5.1")
+    sleeper = tmp_path / "sleeping_identity_target.py"
+    sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    identities = tuple(f"identity-{index:03d}" for index in range(127))
+    paths = tuple(tmp_path / f"identity-{index:03d}.lnk" for index in range(127))
+    arguments = tuple(
+        subprocess.list2cmdline((os.fspath(sleeper), identity))
+        for identity in identities
+    )
+    _create_real_windows_shortcuts(tuple(
+        (path, Path(sys.executable), value)
+        for path, value in zip(paths, arguments)
+    ))
+    expected_fingerprints = tuple(
+        hashlib.sha256(value.encode("utf-8")).hexdigest()
+        for value in arguments
+    )
+
+    static_observations = tuple(
+        _execute_observation_request(SmartReconnectObservationRequest(
+            stage="shortcut_static",
+            reference_dir=os.fspath(tmp_path),
+            title_keywords=("Adobe Flash Player",),
+            shortcut_paths=(os.fspath(path),),
+        ))
+        for path in paths
+    )
+    shortcut_observations = _execute_observation_request(
+        SmartReconnectObservationRequest(
+            stage="shortcut",
+            reference_dir=os.fspath(tmp_path),
+            title_keywords=("Adobe Flash Player",),
+            shortcut_paths=tuple(os.fspath(path) for path in paths),
+            shortcut_static_observations=static_observations,
+        )
+    )
+    assert isinstance(shortcut_observations, tuple)
+    assert len(shortcut_observations) == 127
+    assert tuple(item.fingerprint for item in shortcut_observations) == (
+        expected_fingerprints
+    )
+    assert all(item.seal is not None for item in shortcut_observations)
+    assert all(item.failure_codes == () for item in shortcut_observations)
+
+    children: list[subprocess.Popen] = []
+    try:
+        for identity in identities[:12]:
+            children.append(subprocess.Popen(
+                (sys.executable, os.fspath(sleeper), identity),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ))
+        assert len(children) == 12
+        assert all(child.poll() is None for child in children)
+        windows = tuple(
+            replace(
+                _fake_window(index),
+                process_id=child.pid,
+                launch_fingerprint=None,
+            )
+            for index, child in enumerate(children)
+        )
+        resolved_windows = _execute_observation_request(
+            SmartReconnectObservationRequest(
+                stage="identity",
+                reference_dir=os.fspath(tmp_path),
+                title_keywords=("Adobe Flash Player",),
+                shortcut_paths=tuple(os.fspath(path) for path in paths),
+                windows=windows,
+            )
+        )
+        assert isinstance(resolved_windows, tuple)
+        assert len(resolved_windows) == 12
+        assert tuple(
+            window.launch_fingerprint for window in resolved_windows
+        ) == expected_fingerprints[:12]
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+        for child in children:
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+        assert all(child.poll() is not None for child in children)
 
 
 def test_formal_complete_enumeration_accepts_bounded_partial_shortcut_batch(

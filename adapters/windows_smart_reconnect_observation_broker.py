@@ -370,11 +370,12 @@ try {
     $encoded = [string]$env:FLASH_SHORTCUT_PATHS_B64
     $paths = @()
     if (-not [string]::IsNullOrWhiteSpace($encoded)) {
-        $paths = @(
+        $decodedPaths = (
             [Text.Encoding]::UTF8.GetString(
                 [Convert]::FromBase64String($encoded)
-            ) | ConvertFrom-Json | ForEach-Object { [string]$_ }
+            ) | ConvertFrom-Json
         )
+        $paths = @($decodedPaths)
     }
     $itemScript = @'
 param([int]$Index, [string]$Path)
@@ -399,12 +400,15 @@ try {
     }
 } finally {
     $sha256.Dispose()
-}
+    }
 '@
     $active = New-Object System.Collections.ArrayList
     $next = 0
     while ($next -lt $paths.Count -or $active.Count -gt 0) {
-        while ($next -lt $paths.Count -and $active.Count -lt 4) {
+        # WScript.Shell is process-wide on Windows PowerShell 5.1. One
+        # isolated runspace at a time prevents one item from releasing the
+        # COM object while a sibling is still reading it.
+        while ($next -lt $paths.Count -and $active.Count -lt 1) {
             $runspace = [RunspaceFactory]::CreateRunspace()
             $runspace.ApartmentState = [Threading.ApartmentState]::STA
             $runspace.ThreadOptions = [Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
@@ -602,20 +606,19 @@ try {
         } | Sort-Object -Unique
     )
     $encoded = [string]$env:FLASH_SCOPED_SHORTCUT_PATHS_B64
-    $paths = @()
-    if (-not [string]::IsNullOrWhiteSpace($encoded)) {
-        $paths = @(
-            [Text.Encoding]::UTF8.GetString(
-                [Convert]::FromBase64String($encoded)
-            ) | ConvertFrom-Json | ForEach-Object { [string]$_ }
-        )
-    }
     $itemScript = @'
-param([int]$ProcessId, [string[]]$Paths)
+param([int]$ProcessId, [string]$EncodedPaths)
 $ErrorActionPreference = 'Stop'
+$decodedPaths = (
+    [Text.Encoding]::UTF8.GetString(
+        [Convert]::FromBase64String($EncodedPaths)
+    ) | ConvertFrom-Json
+)
+$paths = @($decodedPaths)
 $shell = New-Object -ComObject WScript.Shell
 $shortcuts = @()
-foreach ($path in $Paths) {
+foreach ($pathValue in $paths) {
+    $path = [string]$pathValue
     if (
         [IO.Path]::GetExtension($path) -ine '.lnk' -or
         -not (Test-Path -LiteralPath $path -PathType Leaf)
@@ -672,14 +675,17 @@ try {
     $active = New-Object System.Collections.ArrayList
     $next = 0
     while ($next -lt $pids.Count -or $active.Count -gt 0) {
-        while ($next -lt $pids.Count -and $active.Count -lt 4) {
+        # Every PID remains independently time-bounded, but WScript.Shell is
+        # process-wide on Windows PowerShell 5.1. Do not let one PID release
+        # the shared COM object while a sibling PID is still using it.
+        while ($next -lt $pids.Count -and $active.Count -lt 1) {
             $runspace = [RunspaceFactory]::CreateRunspace()
             $runspace.ApartmentState = [Threading.ApartmentState]::STA
             $runspace.ThreadOptions = [Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
             $runspace.Open()
             $powerShell = [PowerShell]::Create()
             $powerShell.Runspace = $runspace
-            [void]$powerShell.AddScript($itemScript).AddArgument($pids[$next]).AddArgument([string[]]$paths)
+            [void]$powerShell.AddScript($itemScript).AddArgument($pids[$next]).AddArgument([string]$encoded)
             $async = $powerShell.BeginInvoke()
             [void]$active.Add([pscustomobject]@{
                 PowerShell = $powerShell
