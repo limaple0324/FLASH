@@ -54,6 +54,7 @@ WINDOW_TIMEOUT_SECONDS = 3.0
 MAX_PARALLEL_WINDOWS = 4
 ACTION_LEASE_SECONDS = 30.0
 WORKER_STOP_SECONDS = 0.5
+_SHORTCUT_ARGUMENTS_MISSING = "shortcut_launch_arguments_missing"
 
 _RESULT = TypeVar("_RESULT")
 
@@ -388,7 +389,13 @@ if (
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($Path)
 $arguments = [string]$shortcut.Arguments
-if ([string]::IsNullOrWhiteSpace($arguments)) { return }
+if ([string]::IsNullOrWhiteSpace($arguments)) {
+    [pscustomobject]@{
+        Key = [string]$Index
+        EmptyArguments = $true
+    }
+    return
+}
 $sha256 = [Security.Cryptography.SHA256]::Create()
 try {
     $digest = $sha256.ComputeHash(
@@ -397,6 +404,7 @@ try {
     [pscustomobject]@{
         Key = [string]$Index
         Value = [BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant()
+        EmptyArguments = $false
     }
 } finally {
     $sha256.Dispose()
@@ -429,8 +437,13 @@ try {
             if ($task.Async.IsCompleted) {
                 try {
                     foreach ($item in @($task.PowerShell.EndInvoke($task.Async))) {
-                        if ($null -ne $item -and $item.Key -and $item.Value) {
-                            $resolved[[string]$item.Key] = [string]$item.Value
+                        if ($null -eq $item -or $null -eq $item.Key) { continue }
+                        $key = [string]$item.Key
+                        if ([string]::IsNullOrWhiteSpace($key)) { continue }
+                        if ($item.EmptyArguments -eq $true) {
+                            $resolved[$key] = $null
+                        } elseif ($item.Value) {
+                            $resolved[$key] = [string]$item.Value
                         }
                     }
                 } catch {
@@ -458,6 +471,74 @@ try {
 if ($abandoned.Count -gt 0) { [Environment]::Exit(0) }
 """
 
+    def resolve_with_terminal_negatives(
+        self,
+        shortcut_paths: Iterable[Path],
+    ) -> tuple[dict[Path, str], frozenset[Path]]:
+        """Return hashes plus paths proven to have no launch arguments."""
+
+        paths = tuple(Path(path) for path in shortcut_paths)
+        if os.name != "nt" or not paths:
+            return {}, frozenset()
+        encoded_paths = base64.b64encode(
+            json.dumps(
+                [str(path) for path in paths],
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).decode("ascii")
+        environment = os.environ.copy()
+        environment["FLASH_SHORTCUT_PATHS_B64"] = encoded_paths
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            completed = self._runner(
+                [
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    self._encoded_script(),
+                ],
+                capture_output=True,
+                text=False,
+                timeout=self._timeout_seconds,
+                env=environment,
+                creationflags=creation_flags,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return {}, frozenset()
+        if completed.returncode != 0:
+            return {}, frozenset()
+        try:
+            output = completed.stdout
+            if isinstance(output, bytes):
+                output = output.decode("utf-8-sig")
+            raw = json.loads(output.strip() or "{}")
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+            return {}, frozenset()
+        if not isinstance(raw, dict):
+            return {}, frozenset()
+
+        resolved: dict[Path, str] = {}
+        terminal_negatives: set[Path] = set()
+        for raw_index, value in raw.items():
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= index < len(paths):
+                continue
+            if value is None:
+                terminal_negatives.add(paths[index])
+                continue
+            fingerprint = normalize_launch_fingerprint(value)
+            if fingerprint is not None:
+                resolved[paths[index]] = fingerprint
+        return resolved, frozenset(terminal_negatives)
+
 
 def _shortcut_observations(
     paths: tuple[Path, ...],
@@ -472,21 +553,38 @@ def _shortcut_observations(
         ),
     )
     try:
-        raw = resolver.resolve(paths)
+        raw, terminal_negative_paths = (
+            resolver.resolve_with_terminal_negatives(paths)
+        )
     except _WorkerEnvironmentError:
         raise
     except Exception:
         raw = {}
+        terminal_negative_paths = frozenset()
     normalized_raw: dict[str, str] = {}
     for path, fingerprint in raw.items():
         normalized = normalize_launch_fingerprint(fingerprint)
         if normalized is not None:
             normalized_raw[_normalized_path(Path(path))] = normalized
+    normalized_terminal_negatives = frozenset(
+        _normalized_path(Path(path)) for path in terminal_negative_paths
+    )
     identity_provider = Win32ShortcutFileIdentityProvider()
     observations: list[SmartReconnectShortcutObservation] = []
     for path in paths:
         normalized_path = _normalized_path(path)
         fingerprint = normalized_raw.get(normalized_path)
+        if normalized_path in normalized_terminal_negatives:
+            observations.append(
+                SmartReconnectShortcutObservation(
+                    path=normalized_path,
+                    fingerprint=None,
+                    seal=None,
+                    failure_codes=(_SHORTCUT_ARGUMENTS_MISSING,),
+                    cache_key=_shortcut_cache_key(path),
+                )
+            )
+            continue
         if fingerprint is None:
             observations.append(
                 SmartReconnectShortcutObservation(
@@ -543,16 +641,22 @@ def _shortcut_observations_from_static(
         ),
     )
     try:
-        raw = resolver.resolve(paths)
+        raw, terminal_negative_paths = (
+            resolver.resolve_with_terminal_negatives(paths)
+        )
     except _WorkerEnvironmentError:
         raise
     except Exception:
         raw = {}
+        terminal_negative_paths = frozenset()
     normalized_raw = {
         _normalized_path(Path(path)): normalized
         for path, fingerprint in raw.items()
         if (normalized := normalize_launch_fingerprint(fingerprint)) is not None
     }
+    normalized_terminal_negatives = frozenset(
+        _normalized_path(Path(path)) for path in terminal_negative_paths
+    )
     results: list[SmartReconnectShortcutObservation] = []
     for static in static_observations:
         cache_key = static.cache_key
@@ -563,6 +667,14 @@ def _shortcut_observations_from_static(
                 fingerprint=None,
                 seal=None,
                 failure_codes=("shortcut_static_unresolved",),
+            ))
+            continue
+        if static.path in normalized_terminal_negatives:
+            results.append(replace(
+                static,
+                fingerprint=None,
+                seal=None,
+                failure_codes=(_SHORTCUT_ARGUMENTS_MISSING,),
             ))
             continue
         if fingerprint is None:
@@ -584,6 +696,36 @@ def _shortcut_observations_from_static(
             cache_key=cache_key,
         ))
     return tuple(results)
+
+
+def _shortcut_observation_is_resolved(
+    item: SmartReconnectShortcutObservation,
+) -> bool:
+    return (
+        normalize_launch_fingerprint(item.fingerprint) is not None
+        and item.seal is not None
+        and not item.failure_codes
+    )
+
+
+def _shortcut_observation_is_terminal_negative(
+    item: SmartReconnectShortcutObservation,
+) -> bool:
+    return (
+        item.cache_key is not None
+        and item.fingerprint is None
+        and item.seal is None
+        and item.failure_codes == (_SHORTCUT_ARGUMENTS_MISSING,)
+    )
+
+
+def _shortcut_observation_is_cacheable(
+    item: SmartReconnectShortcutObservation,
+) -> bool:
+    return (
+        _shortcut_observation_is_resolved(item)
+        or _shortcut_observation_is_terminal_negative(item)
+    )
 
 
 class _ScopedPowerShellLaunchFingerprintResolver:
@@ -1981,6 +2123,14 @@ class WindowsSmartReconnectObservationBroker:
         ] | None = None,
         shortcut_batch_available: list[bool] | None = None,
         refresh_shortcuts: bool = True,
+        expected_shortcut_cache_keys: dict[
+            str,
+            ShortcutObservationCacheKey,
+        ] | None = None,
+        shortcut_static_failures: dict[
+            str,
+            SmartReconnectShortcutObservation,
+        ] | None = None,
     ) -> SmartReconnectEnumerationResult:
         shortcut_cache = (
             self._shortcut_cache if shortcut_cache is None else shortcut_cache
@@ -1999,38 +2149,19 @@ class WindowsSmartReconnectObservationBroker:
             if shortcut_batch_available is None
             else shortcut_batch_available
         )
+        shortcut_static_failures = shortcut_static_failures or {}
         prior_shortcuts = tuple(shortcut_cache.values())
         shortcuts = list(raw.shortcuts)
-        unresolved_paths = frozenset(
-            item.path
-            for item in shortcuts
-            if not (
-                normalize_launch_fingerprint(item.fingerprint) is not None
-                and item.seal is not None
-                and not item.failure_codes
-            )
+        for index, item in enumerate(shortcuts):
+            failed = shortcut_static_failures.get(item.path)
+            if failed is not None:
+                shortcuts[index] = failed
+        static_indexes = tuple(
+            index
+            for index, item in enumerate(shortcuts)
+            if item.path not in shortcut_static_failures
+            and not _shortcut_observation_is_cacheable(item)
         )
-        if (
-            not refresh_shortcuts
-            and unresolved_paths
-            and unresolved_paths <= frozenset(shortcut_cache)
-        ):
-            for index, item in enumerate(shortcuts):
-                cached = shortcut_cache.get(item.path)
-                if cached is not None:
-                    shortcuts[index] = cached
-            static_indexes: tuple[int, ...] = ()
-        else:
-            refresh_shortcuts = True
-            static_indexes = tuple(
-                index
-                for index, item in enumerate(shortcuts)
-                if not (
-                    normalize_launch_fingerprint(item.fingerprint) is not None
-                    and item.seal is not None
-                    and not item.failure_codes
-                )
-            )
         static_results = self._request_bounded(
             tuple(
                 SmartReconnectObservationRequest(
@@ -2058,8 +2189,26 @@ class WindowsSmartReconnectObservationBroker:
                     - {"shortcut_observation_pending"}
                 )
             ):
-                shortcuts[shortcut_index] = result
+                expected_cache_key = (
+                    expected_shortcut_cache_keys.get(result.path)
+                    if expected_shortcut_cache_keys is not None
+                    else result.cache_key
+                )
+                if expected_cache_key == result.cache_key:
+                    shortcuts[shortcut_index] = result
+                else:
+                    shortcut_cache.pop(result.path, None)
+                    shortcuts[shortcut_index] = (
+                        SmartReconnectShortcutObservation(
+                            path=result.path,
+                            fingerprint=None,
+                            seal=None,
+                            failure_codes=("shortcut_static_unresolved",),
+                            cache_key=None,
+                        )
+                    )
             else:
+                shortcut_cache.pop(shortcuts[shortcut_index].path, None)
                 shortcuts[shortcut_index] = SmartReconnectShortcutObservation(
                     path=shortcuts[shortcut_index].path,
                     fingerprint=None,
@@ -2082,9 +2231,7 @@ class WindowsSmartReconnectObservationBroker:
                 cached is not None
                 and item.cache_key is not None
                 and cached.cache_key == item.cache_key
-                and normalize_launch_fingerprint(cached.fingerprint) is not None
-                and cached.seal is not None
-                and not cached.failure_codes
+                and _shortcut_observation_is_cacheable(cached)
             ):
                 shortcuts[index] = cached
                 continue
@@ -2123,11 +2270,7 @@ class WindowsSmartReconnectObservationBroker:
                     and result.cache_key == shortcuts[index].cache_key
                 ):
                     shortcuts[index] = result
-                    if (
-                        result.cache_key is not None
-                        and result.seal is not None
-                        and not result.failure_codes
-                    ):
+                    if _shortcut_observation_is_cacheable(result):
                         shortcut_cache[result.path] = result
                     continue
                 shortcuts[index] = SmartReconnectShortcutObservation(
@@ -2253,7 +2396,7 @@ class WindowsSmartReconnectObservationBroker:
         cached_shortcuts = {
             item.path: item
             for item in shortcuts
-            if item.cache_key is not None
+            if _shortcut_observation_is_cacheable(item)
         }
         shortcut_cache.clear()
         shortcut_cache.update(cached_shortcuts)
@@ -2474,6 +2617,17 @@ class WindowsSmartReconnectObservationBroker:
                 shortcut_batch_available=shortcut_batch_available,
                 refresh_shortcuts=refresh_shortcuts,
             )
+            before_static_failures = {
+                item.path: item
+                for item in before.shortcuts
+                if item.cache_key is None
+                and "shortcut_static_timeout" in item.failure_codes
+            }
+            before_shortcut_cache_keys = {
+                item.path: item.cache_key
+                for item in before.shortcuts
+                if item.cache_key is not None
+            }
             unique_before, blocked, anonymous = self._unique_windows(
                 before.windows
             )
@@ -2537,6 +2691,8 @@ class WindowsSmartReconnectObservationBroker:
                 role_cache_by_instance=role_cache_by_instance,
                 shortcut_batch_available=shortcut_batch_available,
                 refresh_shortcuts=False,
+                expected_shortcut_cache_keys=before_shortcut_cache_keys,
+                shortcut_static_failures=before_static_failures,
             )
             unique_after, after_blocked, after_anonymous = self._unique_windows(
                 after.windows

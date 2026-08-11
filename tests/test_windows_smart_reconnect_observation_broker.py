@@ -614,6 +614,133 @@ def _steady_fourteen_worker(request: SmartReconnectObservationRequest):
     raise AssertionError(request.stage)
 
 
+def _formal_shortcut_cache_worker(
+    request: SmartReconnectObservationRequest,
+):
+    root = Path(request.reference_dir)
+    state = json.loads(
+        (root / "formal-shortcut-state.json").read_text(encoding="utf-8")
+    )
+    fingerprints = state["fingerprints"]
+    _record_worker_event(root, request.stage)
+    if request.stage == "enumerate":
+        cycle = _advance_enumeration_counter(root)
+        replacement_marker = root / "replace-between-enumerations.json"
+        if cycle % 2 == 1 and replacement_marker.is_file():
+            replacement = json.loads(
+                replacement_marker.read_text(encoding="utf-8")
+            )
+            os.replace(
+                root / replacement["replacement"],
+                root / replacement["target"],
+            )
+            replacement_marker.unlink()
+            _record_worker_event(root, "between-replaced")
+        windows = tuple(
+            _scenario_window(fingerprints[name], index)
+            for index, name in enumerate(state["window_shortcuts"])
+        )
+        return SmartReconnectEnumerationResult(
+            windows=windows,
+            shortcuts=tuple(
+                SmartReconnectShortcutObservation(
+                    path=os.path.normcase(os.path.abspath(path)),
+                    fingerprint=None,
+                    seal=None,
+                    failure_codes=("shortcut_observation_pending",),
+                )
+                for path in request.shortcut_paths
+            ),
+            foreground_handle=windows[-1].handle,
+        )
+    if request.stage == "shortcut_static":
+        path = Path(request.shortcut_paths[0])
+        _record_worker_event(root, f"shortcut-static-path:{path.name}")
+        hang_marker = root / "hang-shortcut-static.txt"
+        if (
+            hang_marker.is_file()
+            and hang_marker.read_text(encoding="ascii") == path.name
+        ):
+            hang_marker.unlink()
+            time.sleep(5)
+        return _execute_observation_request(request)
+    if request.stage == "shortcut":
+        names = tuple(Path(path).name for path in request.shortcut_paths)
+        with (root / "formal-shortcut-batches.jsonl").open(
+            "a",
+            encoding="ascii",
+        ) as stream:
+            stream.write(json.dumps(names) + "\n")
+        static_by_path = {
+            item.path: item for item in request.shortcut_static_observations
+        }
+        results = []
+        for path in request.shortcut_paths:
+            normalized = os.path.normcase(os.path.abspath(path))
+            static = static_by_path[normalized]
+            cache_key = static.cache_key
+            assert cache_key is not None
+            fingerprint = fingerprints[Path(path).name]
+            if fingerprint is None:
+                results.append(replace(
+                    static,
+                    fingerprint=None,
+                    seal=None,
+                    failure_codes=("shortcut_launch_arguments_missing",),
+                ))
+            else:
+                results.append(SmartReconnectShortcutObservation(
+                    path=normalized,
+                    fingerprint=fingerprint,
+                    seal=ShortcutSeal(
+                        cache_key.file_identity,
+                        cache_key.content_sha256,
+                        fingerprint,
+                    ),
+                    cache_key=cache_key,
+                ))
+        return tuple(results)
+    if request.stage == "window":
+        window = request.window
+        assert window is not None
+        if not request.role_cache_hit:
+            _record_worker_event(root, "role-read")
+        index = window.process_id - 2101
+        return SmartReconnectWindowObservation(
+            window=window,
+            instance=WindowInstanceToken.from_window(window),
+            sample=CaptureSample(1, 1, bytes((index + 1, 0, 0, 0)), True),
+            recognition=ScreenRecognition(
+                ReconnectScreenState.CONNECTED,
+                1.0,
+                None,
+                "connected",
+            ),
+            fresh_capture=True,
+            capture_route="visible",
+            role_id=request.cached_role_id or f"100角色{index}",
+            freshness=ObservationFreshness.PROVEN_CURRENT,
+            role_region_sha256=hashlib.sha256(
+                f"formal-role-{index}".encode("ascii")
+            ).hexdigest(),
+        )
+    if request.stage == "identity":
+        return request.windows
+    if request.stage == "seal":
+        return request.expected_seal
+    raise AssertionError(request.stage)
+
+
+def _formal_shortcut_batches(root: Path) -> tuple[tuple[str, ...], ...]:
+    path = root / "formal-shortcut-batches.jsonl"
+    if not path.is_file():
+        return ()
+    return tuple(
+        tuple(json.loads(line))
+        for line in path.read_text(encoding="ascii").splitlines()
+    )
+
+
 def _role_generation_barrier_worker(
     request: SmartReconnectObservationRequest,
 ):
@@ -844,19 +971,19 @@ def test_fourteen_window_steady_refresh_reuses_four_workers_and_static_caches(
     assert len(process_starts) == 4
     assert first_counts.get("enumerate", 0) == 2
     assert first_counts.get("shortcut", 0) == 1
-    assert first_counts.get("shortcut_static", 0) == 14
+    assert first_counts.get("shortcut_static", 0) == 28
     assert first_counts.get("identity", 0) == 1
     assert first_counts.get("role-read", 0) == 14
     assert second_counts.get("shortcut", 0) == 1
     assert second_counts.get("enumerate", 0) == 4
-    assert second_counts.get("shortcut_static", 0) == 14
+    assert second_counts.get("shortcut_static", 0) == 56
     assert second_counts.get("identity", 0) == 1
     assert second_counts.get("role-read", 0) == 14
     assert first.windows[0].sample != second.windows[0].sample
     assert first.windows[0].role_id == second.windows[0].role_id
     assert steady_third_counts.get("enumerate", 0) == 6
     assert steady_third_counts.get("role-read", 0) == 14
-    assert steady_third_counts.get("shortcut_static", 0) == 14
+    assert steady_third_counts.get("shortcut_static", 0) == 84
     assert steady_third_counts.get("shortcut", 0) == 1
     assert steady_third_counts.get("identity", 0) == 1
     assert (
@@ -866,7 +993,7 @@ def test_fourteen_window_steady_refresh_reuses_four_workers_and_static_caches(
     assert (
         steady_third_counts.get("shortcut_static", 0)
         - second_counts.get("shortcut_static", 0)
-    ) == 0
+    ) == 28
     assert (
         steady_third_counts.get("shortcut", 0)
         - second_counts.get("shortcut", 0)
@@ -879,10 +1006,10 @@ def test_fourteen_window_steady_refresh_reuses_four_workers_and_static_caches(
     assert fourth_counts.get("role-read", 0) == 28
     assert fourth_counts.get("shortcut", 0) == 1
     assert fourth_counts.get("enumerate", 0) == 8
-    assert fourth_counts.get("shortcut_static", 0) == 14
+    assert fourth_counts.get("shortcut_static", 0) == 112
     assert fourth_counts.get("identity", 0) == 1
     assert fifth_counts.get("enumerate", 0) == 10
-    assert fifth_counts.get("shortcut_static", 0) == 28
+    assert fifth_counts.get("shortcut_static", 0) == 140
     assert fifth_counts.get("shortcut", 0) == 1
     assert broker._active == {}
 
@@ -1501,18 +1628,22 @@ def test_windows_powershell_51_expands_multiple_paths_for_both_identity_batches(
     assert _windows_powershell_version().startswith("5.1")
     sleeper = tmp_path / "sleeping_identity_target.py"
     sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
-    identities = tuple(f"identity-{index:03d}" for index in range(127))
-    paths = tuple(tmp_path / f"identity-{index:03d}.lnk" for index in range(127))
+    identities = tuple(f"identity-{index:03d}" for index in range(128))
+    paths = tuple(tmp_path / f"identity-{index:03d}.lnk" for index in range(128))
     arguments = tuple(
-        subprocess.list2cmdline((os.fspath(sleeper), identity))
-        for identity in identities
+        (
+            subprocess.list2cmdline((os.fspath(sleeper), identity))
+            if index < 119
+            else ""
+        )
+        for index, identity in enumerate(identities)
     )
     _create_real_windows_shortcuts(tuple(
         (path, Path(sys.executable), value)
         for path, value in zip(paths, arguments)
     ))
     expected_fingerprints = tuple(
-        hashlib.sha256(value.encode("utf-8")).hexdigest()
+        hashlib.sha256(value.encode("utf-8")).hexdigest() if value else None
         for value in arguments
     )
 
@@ -1535,12 +1666,17 @@ def test_windows_powershell_51_expands_multiple_paths_for_both_identity_batches(
         )
     )
     assert isinstance(shortcut_observations, tuple)
-    assert len(shortcut_observations) == 127
+    assert len(shortcut_observations) == 128
     assert tuple(item.fingerprint for item in shortcut_observations) == (
         expected_fingerprints
     )
-    assert all(item.seal is not None for item in shortcut_observations)
-    assert all(item.failure_codes == () for item in shortcut_observations)
+    assert all(item.seal is not None for item in shortcut_observations[:119])
+    assert all(item.failure_codes == () for item in shortcut_observations[:119])
+    assert all(item.seal is None for item in shortcut_observations[119:])
+    assert all(
+        item.failure_codes == ("shortcut_launch_arguments_missing",)
+        for item in shortcut_observations[119:]
+    )
 
     children: list[subprocess.Popen] = []
     try:
@@ -1587,6 +1723,453 @@ def test_windows_powershell_51_expands_multiple_paths_for_both_identity_batches(
                 child.kill()
                 child.wait(timeout=5)
         assert all(child.poll() is not None for child in children)
+
+
+def test_formal_refresh_revalidates_large_shortcut_cache_with_four_workers(
+    tmp_path,
+    monkeypatch,
+    request,
+):
+    paths = tuple(tmp_path / f"role-{index:03d}.lnk" for index in range(128))
+    for index, path in enumerate(paths):
+        path.write_bytes(f"shortcut-{index:03d}".encode("ascii").ljust(64, b"x"))
+    fingerprints = {
+        path.name: (
+            hashlib.sha256(f"arguments-{index:03d}".encode("ascii")).hexdigest()
+            if index < 119
+            else None
+        )
+        for index, path in enumerate(paths)
+    }
+    state_path = tmp_path / "formal-shortcut-state.json"
+
+    def write_state():
+        state_path.write_text(
+            json.dumps({
+                "fingerprints": fingerprints,
+                "window_shortcuts": [paths[0].name, paths[1].name],
+            }),
+            encoding="utf-8",
+        )
+
+    write_state()
+    monkeypatch.setattr(broker_module, "WINDOW_TIMEOUT_SECONDS", 1.0)
+    broker = WindowsSmartReconnectObservationBroker(
+        reference_dir=tmp_path,
+        _worker_operation=_formal_shortcut_cache_worker,
+    )
+    request.addfinalizer(broker.close)
+    broker.set_identity_source(1, 1)
+    process_starts = []
+    base_process = broker_module.multiprocessing.process.BaseProcess
+    original_start = base_process.start
+
+    def counted_start(process):
+        result = original_start(process)
+        process_starts.append(process.pid)
+        return result
+
+    monkeypatch.setattr(base_process, "start", counted_start)
+    assert broker.start() is True
+    assert len(broker._active) == 4
+    initial_pids = tuple(
+        broker._slots[index].process.pid for index in range(4)
+    )
+    initial_epochs = tuple(broker._slot_epochs)
+
+    first = broker.refresh(paths)
+    first_counts = _worker_event_counts(tmp_path)
+    assert len(first.shortcuts) == 128
+    assert all(item.failure_codes == () for item in first.shortcuts[:119])
+    assert all(item.seal is not None for item in first.shortcuts[:119])
+    assert all(
+        item.failure_codes == ("shortcut_launch_arguments_missing",)
+        for item in first.shortcuts[119:]
+    )
+    assert all(item.seal is None for item in first.shortcuts[119:])
+    assert first_counts.get("shortcut_static", 0) == 256
+    assert first_counts.get("shortcut", 0) == 1
+    assert first_counts.get("role-read", 0) == 2
+    assert _formal_shortcut_batches(tmp_path) == (
+        tuple(path.name for path in paths),
+    )
+
+    prior_counts = first_counts
+    prior_batch_count = len(_formal_shortcut_batches(tmp_path))
+    for _cycle in range(3):
+        steady = broker.refresh(paths)
+        current_counts = _worker_event_counts(tmp_path)
+        assert len(steady.windows) == 2
+        assert (
+            current_counts.get("shortcut_static", 0)
+            - prior_counts.get("shortcut_static", 0)
+        ) == 256
+        assert (
+            current_counts.get("shortcut", 0)
+            - prior_counts.get("shortcut", 0)
+        ) == 0
+        assert (
+            current_counts.get("role-read", 0)
+            - prior_counts.get("role-read", 0)
+        ) == 0
+        assert len(_formal_shortcut_batches(tmp_path)) == prior_batch_count
+        assert len(process_starts) == 4
+        assert tuple(broker._slot_epochs) == initial_epochs
+        assert tuple(
+            broker._slots[index].process.pid for index in range(4)
+        ) == initial_pids
+        prior_counts = current_counts
+
+    added = tmp_path / "role-128.lnk"
+    added.write_bytes(b"added-shortcut".ljust(64, b"x"))
+    fingerprints[added.name] = hashlib.sha256(b"added-arguments").hexdigest()
+    write_state()
+    current_paths = paths + (added,)
+    prior_batch_count = len(_formal_shortcut_batches(tmp_path))
+    added_snapshot = broker.refresh(current_paths)
+    assert len(_formal_shortcut_batches(tmp_path)) == prior_batch_count + 1
+    assert _formal_shortcut_batches(tmp_path)[-1] == (added.name,)
+    assert added_snapshot.shortcuts[-1].fingerprint == fingerprints[added.name]
+
+    content_path = paths[2]
+    old_content_key = _shortcut_cache_key(content_path)
+    old_content_stat = content_path.stat()
+    changed_content = bytearray(content_path.read_bytes())
+    changed_content[-1] ^= 1
+    content_path.write_bytes(changed_content)
+    os.utime(
+        content_path,
+        ns=(old_content_stat.st_atime_ns, old_content_stat.st_mtime_ns),
+    )
+    new_content_key = _shortcut_cache_key(content_path)
+    assert old_content_key is not None and new_content_key is not None
+    assert old_content_key.modified_ns == new_content_key.modified_ns
+    assert old_content_key.size == new_content_key.size
+    assert old_content_key.file_identity == new_content_key.file_identity
+    assert old_content_key.content_sha256 != new_content_key.content_sha256
+    prior_batch_count = len(_formal_shortcut_batches(tmp_path))
+    broker.refresh(current_paths)
+    assert len(_formal_shortcut_batches(tmp_path)) == prior_batch_count + 1
+    assert _formal_shortcut_batches(tmp_path)[-1] == (content_path.name,)
+
+    identity_path = paths[3]
+    replacement = tmp_path / "atomic-replacement.tmp"
+    replacement.write_bytes(identity_path.read_bytes())
+    identity_stat = identity_path.stat()
+    os.utime(
+        replacement,
+        ns=(identity_stat.st_atime_ns, identity_stat.st_mtime_ns),
+    )
+    old_identity_key = _shortcut_cache_key(identity_path)
+    os.replace(replacement, identity_path)
+    new_identity_key = _shortcut_cache_key(identity_path)
+    assert old_identity_key is not None and new_identity_key is not None
+    assert old_identity_key.modified_ns == new_identity_key.modified_ns
+    assert old_identity_key.size == new_identity_key.size
+    assert old_identity_key.content_sha256 == new_identity_key.content_sha256
+    assert old_identity_key.file_identity != new_identity_key.file_identity
+    prior_batch_count = len(_formal_shortcut_batches(tmp_path))
+    broker.refresh(current_paths)
+    assert len(_formal_shortcut_batches(tmp_path)) == prior_batch_count + 1
+    assert _formal_shortcut_batches(tmp_path)[-1] == (identity_path.name,)
+
+    negative_path = paths[119]
+    negative_path.write_bytes(b"negative-now-positive".ljust(64, b"x"))
+    fingerprints[negative_path.name] = hashlib.sha256(
+        b"negative-now-positive-arguments"
+    ).hexdigest()
+    write_state()
+    prior_batch_count = len(_formal_shortcut_batches(tmp_path))
+    negative_changed = broker.refresh(current_paths)
+    assert len(_formal_shortcut_batches(tmp_path)) == prior_batch_count + 1
+    assert _formal_shortcut_batches(tmp_path)[-1] == (negative_path.name,)
+    negative_observation = next(
+        item for item in negative_changed.shortcuts
+        if item.path == os.path.normcase(os.path.abspath(negative_path))
+    )
+    assert negative_observation.fingerprint == fingerprints[negative_path.name]
+    assert negative_observation.failure_codes == ()
+
+    deleted_path = paths[4]
+    deleted_path.unlink()
+    prior_batch_count = len(_formal_shortcut_batches(tmp_path))
+    deleted = broker.refresh(current_paths)
+    assert len(_formal_shortcut_batches(tmp_path)) == prior_batch_count
+    deleted_observation = next(
+        item for item in deleted.shortcuts
+        if item.path == os.path.normcase(os.path.abspath(deleted_path))
+    )
+    assert deleted_observation.seal is None
+    assert deleted_observation.failure_codes == ("shortcut_static_timeout",)
+    assert os.path.normcase(os.path.abspath(deleted_path)) not in (
+        broker._shortcut_cache
+    )
+
+    between_path = paths[0]
+    between_replacement = tmp_path / "between-replacement.tmp"
+    between_replacement.write_bytes(b"between-replacement".ljust(64, b"x"))
+    (tmp_path / "replace-between-enumerations.json").write_text(
+        json.dumps({
+            "replacement": between_replacement.name,
+            "target": between_path.name,
+        }),
+        encoding="utf-8",
+    )
+    prior_batch_count = len(_formal_shortcut_batches(tmp_path))
+    between = broker.refresh(current_paths)
+    assert len(_formal_shortcut_batches(tmp_path)) == prior_batch_count
+    assert between.blocked_fingerprints == frozenset((fingerprints[paths[0].name],))
+    assert tuple(
+        item.window.launch_fingerprint for item in between.windows
+    ) == (fingerprints[paths[1].name],)
+    between_observation = next(
+        item for item in between.shortcuts
+        if item.path == os.path.normcase(os.path.abspath(between_path))
+    )
+    assert between_observation.seal is None
+    assert between_observation.failure_codes == ("shortcut_static_unresolved",)
+
+    prior_batch_count = len(_formal_shortcut_batches(tmp_path))
+    recovered = broker.refresh(current_paths)
+    assert len(recovered.windows) == 2
+    assert len(_formal_shortcut_batches(tmp_path)) == prior_batch_count + 1
+    assert _formal_shortcut_batches(tmp_path)[-1] == (between_path.name,)
+
+    hang_path = paths[5]
+    (tmp_path / "hang-shortcut-static.txt").write_text(
+        hang_path.name,
+        encoding="ascii",
+    )
+    before_hang_pids = tuple(
+        broker._slots[index].process.pid for index in range(4)
+    )
+    before_hang_epochs = tuple(broker._slot_epochs)
+    before_hang_starts = len(process_starts)
+    before_hang_counts = _worker_event_counts(tmp_path)
+    prior_batch_count = len(_formal_shortcut_batches(tmp_path))
+    hung = broker.refresh(current_paths)
+    after_hang_pids = tuple(
+        broker._slots[index].process.pid for index in range(4)
+    )
+    after_hang_epochs = tuple(broker._slot_epochs)
+    after_hang_counts = _worker_event_counts(tmp_path)
+    assert len(hung.windows) == 2
+    assert len(_formal_shortcut_batches(tmp_path)) == prior_batch_count
+    assert (
+        after_hang_counts.get(f"shortcut-static-path:{hang_path.name}", 0)
+        - before_hang_counts.get(f"shortcut-static-path:{hang_path.name}", 0)
+    ) == 1
+    assert len(process_starts) == before_hang_starts + 1
+    changed_slots = tuple(
+        index
+        for index in range(4)
+        if after_hang_pids[index] != before_hang_pids[index]
+    )
+    assert len(changed_slots) == 1
+    assert sum(
+        after_hang_epochs[index] - before_hang_epochs[index]
+        for index in range(4)
+    ) == 1
+    assert len(broker._active) == 4
+
+    known_process_ids = tuple(
+        process_id for process_id in process_starts if process_id is not None
+    )
+    assert broker.close() is True
+    assert broker._active == {}
+    assert all(not _process_is_alive(process_id) for process_id in known_process_ids)
+
+
+def test_shortcut_terminal_negative_cache_is_incremental_and_retries_transients(
+    tmp_path,
+    monkeypatch,
+):
+    paths = tuple(tmp_path / f"negative-{index}.lnk" for index in range(3))
+    for index, path in enumerate(paths):
+        path.write_bytes(f"empty-{index}".encode("ascii"))
+    normalized_paths = tuple(
+        os.path.normcase(os.path.abspath(path)) for path in paths
+    )
+    modes = {path: "negative" for path in normalized_paths}
+    fingerprints = {
+        path: f"{index + 20:064x}"
+        for index, path in enumerate(normalized_paths)
+    }
+    shortcut_batches = []
+
+    def raw_enumeration():
+        return SmartReconnectEnumerationResult(
+            windows=(),
+            shortcuts=tuple(
+                SmartReconnectShortcutObservation(
+                    path=path,
+                    fingerprint=None,
+                    seal=None,
+                    failure_codes=("shortcut_observation_pending",),
+                )
+                for path in normalized_paths
+            ),
+        )
+
+    def resolve_static(request):
+        path = request.shortcut_paths[0]
+        cache_key = _shortcut_cache_key(Path(path))
+        return SmartReconnectShortcutObservation(
+            path=path,
+            fingerprint=None,
+            seal=None,
+            failure_codes=(
+                ("shortcut_observation_pending",)
+                if cache_key is not None
+                else ("shortcut_static_unresolved",)
+            ),
+            cache_key=cache_key,
+        )
+
+    def resolve_shortcut_batch(request, _timeout):
+        assert request.stage == "shortcut"
+        shortcut_batches.append(request.shortcut_paths)
+        static_by_path = {
+            item.path: item for item in request.shortcut_static_observations
+        }
+        results = []
+        for path in request.shortcut_paths:
+            static = static_by_path[path]
+            mode = modes[path]
+            if mode == "timeout":
+                continue
+            if mode == "exception":
+                results.append(replace(
+                    static,
+                    fingerprint=None,
+                    seal=None,
+                    failure_codes=("shortcut_identity_unresolved",),
+                ))
+                continue
+            if mode == "negative":
+                results.append(replace(
+                    static,
+                    fingerprint=None,
+                    seal=None,
+                    failure_codes=("shortcut_launch_arguments_missing",),
+                ))
+                continue
+            assert mode == "positive"
+            cache_key = static.cache_key
+            assert cache_key is not None
+            fingerprint = fingerprints[path]
+            results.append(SmartReconnectShortcutObservation(
+                path=path,
+                fingerprint=fingerprint,
+                seal=ShortcutSeal(
+                    cache_key.file_identity,
+                    cache_key.content_sha256,
+                    fingerprint,
+                ),
+                cache_key=cache_key,
+            ))
+        return tuple(results)
+
+    broker = WindowsSmartReconnectObservationBroker(reference_dir=tmp_path)
+    monkeypatch.setattr(
+        broker,
+        "_request_bounded",
+        lambda requests, _timeout: tuple(
+            resolve_static(request) for request in requests
+        ),
+    )
+    monkeypatch.setattr(broker, "_request", resolve_shortcut_batch)
+    shortcut_cache = {}
+
+    first = broker._complete_enumeration(
+        raw_enumeration(),
+        shortcut_cache=shortcut_cache,
+        refresh_shortcuts=True,
+    )
+    assert shortcut_batches == [normalized_paths]
+    assert tuple(item.failure_codes for item in first.shortcuts) == (
+        ("shortcut_launch_arguments_missing",),
+    ) * 3
+    assert frozenset(shortcut_cache) == frozenset(normalized_paths)
+
+    for _cycle in range(3):
+        steady = broker._complete_enumeration(
+            raw_enumeration(),
+            shortcut_cache=shortcut_cache,
+            refresh_shortcuts=True,
+        )
+        assert tuple(item.failure_codes for item in steady.shortcuts) == (
+            ("shortcut_launch_arguments_missing",),
+        ) * 3
+    assert shortcut_batches == [normalized_paths]
+
+    paths[0].write_bytes(b"now-has-launch-arguments")
+    modes[normalized_paths[0]] = "positive"
+    changed = broker._complete_enumeration(
+        raw_enumeration(),
+        shortcut_cache=shortcut_cache,
+        refresh_shortcuts=True,
+    )
+    assert shortcut_batches[-1] == (normalized_paths[0],)
+    assert changed.shortcuts[0].fingerprint == fingerprints[normalized_paths[0]]
+    assert changed.shortcuts[0].failure_codes == ()
+
+    paths[1].write_bytes(b"temporary-timeout")
+    modes[normalized_paths[1]] = "timeout"
+    timed_out = broker._complete_enumeration(
+        raw_enumeration(),
+        shortcut_cache=shortcut_cache,
+        refresh_shortcuts=True,
+    )
+    assert shortcut_batches[-1] == (normalized_paths[1],)
+    assert timed_out.shortcuts[1].failure_codes == (
+        "shortcut_observation_timeout",
+    )
+    assert normalized_paths[1] not in shortcut_cache
+    modes[normalized_paths[1]] = "negative"
+    retried_timeout = broker._complete_enumeration(
+        raw_enumeration(),
+        shortcut_cache=shortcut_cache,
+        refresh_shortcuts=False,
+    )
+    assert shortcut_batches[-1] == (normalized_paths[1],)
+    assert retried_timeout.shortcuts[1].failure_codes == (
+        "shortcut_launch_arguments_missing",
+    )
+    assert normalized_paths[1] in shortcut_cache
+
+    paths[2].write_bytes(b"temporary-exception")
+    modes[normalized_paths[2]] = "exception"
+    failed = broker._complete_enumeration(
+        raw_enumeration(),
+        shortcut_cache=shortcut_cache,
+        refresh_shortcuts=True,
+    )
+    assert shortcut_batches[-1] == (normalized_paths[2],)
+    assert failed.shortcuts[2].failure_codes == (
+        "shortcut_identity_unresolved",
+    )
+    assert normalized_paths[2] not in shortcut_cache
+    modes[normalized_paths[2]] = "negative"
+    retried_exception = broker._complete_enumeration(
+        raw_enumeration(),
+        shortcut_cache=shortcut_cache,
+        refresh_shortcuts=False,
+    )
+    assert shortcut_batches[-1] == (normalized_paths[2],)
+    assert retried_exception.shortcuts[2].failure_codes == (
+        "shortcut_launch_arguments_missing",
+    )
+    assert normalized_paths[2] in shortcut_cache
+    assert shortcut_batches == [
+        normalized_paths,
+        (normalized_paths[0],),
+        (normalized_paths[1],),
+        (normalized_paths[1],),
+        (normalized_paths[2],),
+        (normalized_paths[2],),
+    ]
+    assert broker.close() is True
 
 
 def test_formal_complete_enumeration_accepts_bounded_partial_shortcut_batch(
