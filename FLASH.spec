@@ -52,21 +52,9 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-splash = Splash(
-    'assets/flash_icon.png',
-    binaries=a.binaries,
-    datas=a.datas,
-    text_pos=(48, 224),
-    text_size=12,
-    text_color='white',
-    text_default='輔正在啟動，請稍候…',
-)
-
 exe = EXE(
     pyz,
     a.scripts,
-    splash,
-    splash.binaries,
     a.binaries,
     a.datas,
     [],

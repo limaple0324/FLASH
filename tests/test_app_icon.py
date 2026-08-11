@@ -59,9 +59,9 @@ def test_windows_build_uses_the_confirmed_icon():
     assert "for page in range(1, 11)" in spec
     assert "full_window_page_10.png" not in spec
     assert "icon='assets/flash_icon.ico'" in spec
-    assert "splash = Splash(" in spec
-    assert "text_default='輔正在啟動，請稍候…'" in spec
-    assert "splash.binaries" in spec
+    assert "Splash(" not in spec
+    assert "輔正在啟動" not in spec
+    assert "splash.binaries" not in spec
 
 
 def test_packaged_splash_close_is_safe_and_idempotent(monkeypatch):
