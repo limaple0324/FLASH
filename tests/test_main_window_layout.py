@@ -2,6 +2,62 @@ import ast
 from pathlib import Path
 
 
+def test_main_window_is_first_shown_from_idle_after_full_construction():
+    source = Path("main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    create_main_window = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "create_main_window"
+    )
+
+    def is_window_method_call(node, method):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "window"
+            and node.func.attr == method
+        )
+
+    # 第一次修正只移除封裝啟動畫面，漏掉根視窗在約4200行同步建構前過早顯示。
+    direct_deiconify_calls = [
+        node
+        for node in ast.walk(create_main_window)
+        if is_window_method_call(node, "deiconify")
+    ]
+    assert direct_deiconify_calls == []
+
+    withdraw_index = next(
+        index
+        for index, statement in enumerate(create_main_window.body)
+        if isinstance(statement, ast.Expr)
+        and is_window_method_call(statement.value, "withdraw")
+    )
+    scheduled_show_calls = [
+        (index, statement.value)
+        for index, statement in enumerate(create_main_window.body)
+        if isinstance(statement, ast.Expr)
+        and is_window_method_call(statement.value, "after_idle")
+        and len(statement.value.args) == 1
+        and isinstance(statement.value.args[0], ast.Attribute)
+        and isinstance(statement.value.args[0].value, ast.Name)
+        and statement.value.args[0].value.id == "window"
+        and statement.value.args[0].attr == "deiconify"
+    ]
+
+    assert len(scheduled_show_calls) == 1
+    scheduled_show_index, scheduled_show = scheduled_show_calls[0]
+    assert withdraw_index < scheduled_show_index
+    assert scheduled_show_index == len(create_main_window.body) - 2
+    assert scheduled_show.keywords == []
+    final_statement = create_main_window.body[-1]
+    assert isinstance(final_statement, ast.Return)
+    assert isinstance(final_statement.value, ast.Name)
+    assert final_statement.value.id == "window"
+
+
 def test_main_window_uses_home_view():
     source = Path("main.py").read_text(encoding="utf-8")
 

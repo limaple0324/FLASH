@@ -2595,7 +2595,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         window,
         taskbar_icon_resource(),
     )
-    window.deiconify()
 
     config = AppContext.get(ConfigManager)
     identity_data_transaction_coordinator = AppContext.get(
@@ -6836,6 +6835,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window._deferred_sync_monitor = deferred_sync_monitor
     window._windows_app_identity = window_identity
     window._system_tray_controller = tray_controller
+    window.after_idle(window.deiconify)
     return window
 
 
