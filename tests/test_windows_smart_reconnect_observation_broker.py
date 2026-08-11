@@ -3,6 +3,7 @@ import ctypes
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -20,11 +21,15 @@ from adapters.windows_smart_reconnect_observation_broker import (
     SmartReconnectObservationRequest,
     SmartReconnectObservationSnapshot,
     SmartReconnectShortcutObservation,
+    SmartReconnectTcpBatchResult,
+    SmartReconnectTcpWindowObservation,
     SmartReconnectWindowObservation,
     WindowsSmartReconnectObservationBroker,
     _discover_shortcut_paths,
+    _is_external_ipv4_remote_address,
     _shortcut_cache_key,
     _execute_observation_request,
+    _observe_ipv4_tcp_table,
     _observe_window,
 )
 from adapters.windows_window import WindowInfo
@@ -186,6 +191,86 @@ def _advance_enumeration_counter(root: Path) -> int:
     return value
 
 
+def _tcp_online_batch(
+    request: SmartReconnectObservationRequest,
+) -> SmartReconnectTcpBatchResult:
+    return SmartReconnectTcpBatchResult(tuple(
+        SmartReconnectTcpWindowObservation(
+            WindowInstanceToken.from_window(window),
+            1,
+        )
+        for window in request.windows
+    ))
+
+
+def test_tcp_provider_is_called_once_for_the_complete_pid_batch(monkeypatch):
+    windows = (
+        _scenario_window(FINGERPRINT, 0),
+        _scenario_window(SECOND_FINGERPRINT, 1),
+    )
+    calls = []
+
+    def provider(process_ids):
+        calls.append(tuple(process_ids))
+        return {windows[0].process_id: 3, windows[1].process_id: 0}
+
+    monkeypatch.setattr(
+        broker_module,
+        "_ipv4_established_counts_by_pid",
+        provider,
+    )
+
+    result = _observe_ipv4_tcp_table(SmartReconnectObservationRequest(
+        stage="tcp",
+        reference_dir=".",
+        title_keywords=(),
+        windows=windows,
+    ))
+
+    assert calls == [tuple(window.process_id for window in windows)]
+    assert tuple(
+        item.established_connections for item in result.observations
+    ) == (3, 0)
+    assert result.failure_codes == ()
+
+
+def test_tcp_provider_error_is_unknown_and_duplicate_instance_is_rejected(
+    monkeypatch,
+):
+    window = _scenario_window(FINGERPRINT, 0)
+
+    def unavailable(_process_ids):
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(
+        broker_module,
+        "_ipv4_established_counts_by_pid",
+        unavailable,
+    )
+    result = _observe_ipv4_tcp_table(SmartReconnectObservationRequest(
+        stage="tcp",
+        reference_dir=".",
+        title_keywords=(),
+        windows=(window,),
+    ))
+    observation = result.observations[0]
+
+    assert observation.established_connections is None
+    assert observation.failure_codes == ("tcp_table_unavailable",)
+    with pytest.raises(ValueError, match="duplicate window instance"):
+        SmartReconnectTcpBatchResult((observation, observation))
+
+
+def test_tcp_remote_filter_excludes_unspecified_and_loopback():
+    assert _is_external_ipv4_remote_address(socket.htonl(0)) is False
+    assert _is_external_ipv4_remote_address(
+        socket.htonl(0x7F010203)
+    ) is False
+    assert _is_external_ipv4_remote_address(
+        socket.htonl(0x08080808)
+    ) is True
+
+
 def _scenario_worker(request: SmartReconnectObservationRequest):
     root = Path(request.reference_dir)
     name = root.name
@@ -193,6 +278,19 @@ def _scenario_worker(request: SmartReconnectObservationRequest):
         cycle = _advance_enumeration_counter(root)
         first = _scenario_window(FINGERPRINT, 0)
         second = _scenario_window(SECOND_FINGERPRINT, 1)
+        if name == "instance-change" and cycle == 1:
+            first = replace(first, rect=(20, 20, 920, 620))
+        elif name.startswith("instance-change-") and cycle == 1:
+            field_name = name.removeprefix("instance-change-")
+            replacements = {
+                "handle": first.handle + 100,
+                "process_id": first.process_id + 100,
+                "thread_id": first.thread_id + 100,
+                "process_lifecycle_token": (
+                    first.process_lifecycle_token + 100
+                ),
+            }
+            first = replace(first, **{field_name: replacements[field_name]})
         first_digest = (
             "d" if name.startswith("shortcut-change") and cycle == 1 else "a"
         )
@@ -232,6 +330,8 @@ def _scenario_worker(request: SmartReconnectObservationRequest):
             ),
             foreground_handle=second.handle,
         )
+    if request.stage == "tcp":
+        return _tcp_online_batch(request)
     if request.stage == "window":
         window = request.window
         assert window is not None
@@ -324,6 +424,8 @@ def _attributable_item_hang_worker(
             ),
             foreground_handle=second.handle,
         )
+    if request.stage == "tcp":
+        return _tcp_online_batch(request)
     if request.stage == "shortcut_static":
         path = request.shortcut_paths[0]
         if kind.startswith("lnk-hang") and path.endswith("first.lnk"):
@@ -460,6 +562,26 @@ def _fake_worker(request: SmartReconnectObservationRequest):
             capture_route="visible",
             role_id="100古",
             role_region_sha256=hashlib.sha256(b"fake-role-region").hexdigest(),
+        )
+    if request.stage == "tcp":
+        root_path = Path(root)
+        count_path = root_path / "tcp-count.txt"
+        value = (
+            count_path.read_text(encoding="ascii").strip()
+            if count_path.is_file()
+            else "1"
+        )
+        failure = ("tcp_table_unavailable",) if value == "unknown" else ()
+        return SmartReconnectTcpBatchResult(
+            tuple(
+                SmartReconnectTcpWindowObservation(
+                    WindowInstanceToken.from_window(window),
+                    None if failure else int(value),
+                    failure,
+                )
+                for window in request.windows
+            ),
+            failure,
         )
     if request.stage == "seal":
         return request.expected_seal
@@ -609,6 +731,14 @@ def _steady_fourteen_worker(request: SmartReconnectObservationRequest):
                 f"role-region-{index}".encode("ascii")
             ).hexdigest(),
         )
+    if request.stage == "tcp":
+        return SmartReconnectTcpBatchResult(tuple(
+            SmartReconnectTcpWindowObservation(
+                WindowInstanceToken.from_window(window),
+                1,
+            )
+            for window in request.windows
+        ))
     if request.stage == "seal":
         return request.expected_seal
     raise AssertionError(request.stage)
@@ -653,6 +783,8 @@ def _formal_shortcut_cache_worker(
             ),
             foreground_handle=windows[-1].handle,
         )
+    if request.stage == "tcp":
+        return _tcp_online_batch(request)
     if request.stage == "shortcut_static":
         path = Path(request.shortcut_paths[0])
         _record_worker_event(root, f"shortcut-static-path:{path.name}")
@@ -758,6 +890,8 @@ def _role_generation_barrier_worker(
             ),),
             foreground_handle=window.handle,
         )
+    if request.stage == "tcp":
+        return _tcp_online_batch(request)
     if request.stage == "window":
         if int((root / "enumeration.count").read_text(encoding="ascii")) >= 3:
             (root / "role-entered").write_text("1", encoding="ascii")
@@ -803,6 +937,8 @@ def _unproven_role_worker(request: SmartReconnectObservationRequest):
             ),),
             foreground_handle=window.handle,
         )
+    if request.stage == "tcp":
+        return _tcp_online_batch(request)
     if request.stage == "window":
         instance = WindowInstanceToken.from_window(window)
         return SmartReconnectWindowObservation(
@@ -973,11 +1109,13 @@ def test_fourteen_window_steady_refresh_reuses_four_workers_and_static_caches(
     assert first_counts.get("shortcut", 0) == 1
     assert first_counts.get("shortcut_static", 0) == 28
     assert first_counts.get("identity", 0) == 1
+    assert first_counts.get("tcp", 0) == 1
     assert first_counts.get("role-read", 0) == 14
     assert second_counts.get("shortcut", 0) == 1
     assert second_counts.get("enumerate", 0) == 4
     assert second_counts.get("shortcut_static", 0) == 56
     assert second_counts.get("identity", 0) == 1
+    assert second_counts.get("tcp", 0) == 2
     assert second_counts.get("role-read", 0) == 14
     assert first.windows[0].sample != second.windows[0].sample
     assert first.windows[0].role_id == second.windows[0].role_id
@@ -986,6 +1124,7 @@ def test_fourteen_window_steady_refresh_reuses_four_workers_and_static_caches(
     assert steady_third_counts.get("shortcut_static", 0) == 84
     assert steady_third_counts.get("shortcut", 0) == 1
     assert steady_third_counts.get("identity", 0) == 1
+    assert steady_third_counts.get("tcp", 0) == 3
     assert (
         steady_third_counts.get("role-read", 0)
         - second_counts.get("role-read", 0)
@@ -1008,9 +1147,17 @@ def test_fourteen_window_steady_refresh_reuses_four_workers_and_static_caches(
     assert fourth_counts.get("enumerate", 0) == 8
     assert fourth_counts.get("shortcut_static", 0) == 112
     assert fourth_counts.get("identity", 0) == 1
+    assert fourth_counts.get("tcp", 0) == 4
     assert fifth_counts.get("enumerate", 0) == 10
     assert fifth_counts.get("shortcut_static", 0) == 140
     assert fifth_counts.get("shortcut", 0) == 1
+    assert fifth_counts.get("tcp", 0) == 5
+    assert all(
+        item.tcp_established_connections == 1
+        and item.tcp_failure_codes == ()
+        for snapshot in (first, second, steady_third, fourth, fifth)
+        for item in snapshot.windows
+    )
     assert broker._active == {}
 
 
@@ -1317,6 +1464,58 @@ def test_window_closed_between_enumerations_is_counted_locally(tmp_path):
         item.window.launch_fingerprint for item in snapshot.windows
     ) == (SECOND_FINGERPRINT,)
     assert snapshot.isolated_window_count == 1
+    assert broker.close() is True
+
+
+def test_tcp_observation_is_not_published_across_full_instance_change(
+    tmp_path,
+):
+    root = tmp_path / "instance-change"
+    root.mkdir()
+    broker = WindowsSmartReconnectObservationBroker(
+        reference_dir=root,
+        _worker_operation=_scenario_worker,
+    )
+
+    snapshot = broker.refresh()
+
+    assert snapshot.failure_codes == ()
+    assert snapshot.blocked_fingerprints == frozenset((FINGERPRINT,))
+    assert tuple(
+        item.window.launch_fingerprint for item in snapshot.windows
+    ) == (SECOND_FINGERPRINT,)
+    assert snapshot.windows[0].tcp_established_connections == 1
+    assert broker.close() is True
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "handle",
+        "process_id",
+        "thread_id",
+        "process_lifecycle_token",
+    ),
+)
+def test_tcp_observation_is_not_published_across_core_instance_change(
+    tmp_path,
+    field_name,
+):
+    root = tmp_path / f"instance-change-{field_name}"
+    root.mkdir()
+    broker = WindowsSmartReconnectObservationBroker(
+        reference_dir=root,
+        _worker_operation=_scenario_worker,
+    )
+
+    snapshot = broker.refresh()
+
+    assert snapshot.failure_codes == ()
+    assert snapshot.blocked_fingerprints == frozenset((FINGERPRINT,))
+    assert tuple(
+        item.window.launch_fingerprint for item in snapshot.windows
+    ) == (SECOND_FINGERPRINT,)
+    assert snapshot.windows[0].tcp_established_connections == 1
     assert broker.close() is True
 
 

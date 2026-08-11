@@ -120,6 +120,18 @@ ACTION_CONFIRMATION_FRAMES = 2
 TERMINAL_CONFIRMATION_FRAMES = 3
 TERMINAL_CONFIRMATION_SECONDS = 4.0
 TRUSTED_CONNECTED_EVIDENCE_MAX_AGE_SECONDS = 10.0
+# 7.0 seconds is deliberate: the real-machine normal sample was 600.047
+# seconds / 2382 samples (about 0.25 seconds); four image switches and two
+# line switches had a longest zero run of 0; endpoint cleanup from 4 to 2 took
+# about 0.75 seconds without reaching zero; production refresh starts were
+# about 3.10-3.36 seconds apart, so two complete slow cycles are 6.72 seconds
+# and round up to 7.0; the real disconnect stayed at zero for over 156 seconds.
+TCP_DISCONNECT_CONFIRMATION_GENERATIONS = 3
+TCP_DISCONNECT_CONFIRMATION_SECONDS = 7.0
+TCP_STATE_KNOWN_ONLINE = "known_online"
+TCP_STATE_ZERO_SUSPECTED = "zero_suspected"
+TCP_STATE_ZERO_CONFIRMED = "zero_confirmed"
+TCP_STATE_UNKNOWN = "unknown"
 CAPTURE_ROUTE_VISIBLE = "visible"
 CAPTURE_ROUTE_OBSCURED = "obscured"
 CAPTURE_ROUTE_MINIMIZED = "minimized"
@@ -1814,6 +1826,10 @@ class ReconnectBatchResult:
     failure_codes: tuple[str, ...]
     capture_diagnostics: tuple[CaptureDiagnostic, ...] = ()
     timing_diagnostics: tuple[ReconnectTimingDiagnostic, ...] = ()
+    tcp_suspected_windows: int = 0
+    tcp_confirmed_windows: int = 0
+    tcp_state_counts: tuple[tuple[str, int], ...] = ()
+    tcp_failure_codes: tuple[str, ...] = ()
 
     @property
     def all_connected(self) -> bool:
@@ -1823,6 +1839,8 @@ class ReconnectBatchResult:
             and self.connected_windows == self.discovered_windows
             and self.unknown_windows == 0
             and self.source_missing_windows == 0
+            and self.tcp_suspected_windows == 0
+            and self.tcp_confirmed_windows == 0
             and not self.failure_codes
         )
 
@@ -1858,6 +1876,10 @@ class ReconnectBatchResult:
             "timing_diagnostics": [
                 item.to_dict() for item in self.timing_diagnostics
             ],
+            "tcp_suspected_windows": self.tcp_suspected_windows,
+            "tcp_confirmed_windows": self.tcp_confirmed_windows,
+            "tcp_state_counts": dict(self.tcp_state_counts),
+            "tcp_failure_codes": list(self.tcp_failure_codes),
             "raw_arguments_emitted": False,
             "fingerprints_emitted": False,
             "captured_pixels_persisted": False,
@@ -1887,6 +1909,78 @@ class _TerminalEvidence:
     first_seen: float
     last_digest: bytes
     changing_frames: int
+
+
+@dataclass(slots=True)
+class _TcpInstanceState:
+    stable_identity: tuple[int, int, int, str, int]
+    instance: WindowInstanceToken
+    known_online: bool = False
+    first_zero_generation: int | None = None
+    last_zero_generation: int | None = None
+    first_zero_at: float | None = None
+    consecutive_zero_generations: int = 0
+
+    def clear_zero_candidate(self) -> None:
+        self.first_zero_generation = None
+        self.last_zero_generation = None
+        self.first_zero_at = None
+        self.consecutive_zero_generations = 0
+
+
+def _tcp_stable_instance_identity(
+    instance: WindowInstanceToken,
+) -> tuple[int, int, int, str, int]:
+    """Ignore position/minimized state while retaining process identity."""
+
+    return (
+        instance.handle,
+        instance.process_id,
+        instance.thread_id,
+        instance.window_class,
+        instance.process_lifecycle_token,
+    )
+
+
+def _tcp_authorization_content_key(
+    batch: ReconnectAuthorizationBatch,
+) -> tuple[object, ...]:
+    target_keys = tuple(sorted(
+        (
+            normalize_launch_fingerprint(target.fingerprint),
+            _tcp_stable_instance_identity(target.instance),
+            target.character_id,
+            target.role_aliases,
+            target.importance,
+            target.original_slot_index,
+            target.original_line_number,
+            target.source_generation,
+            (
+                None
+                if target.shortcut_seal is None
+                else (
+                    target.shortcut_seal.file_identity.normalized_path,
+                    target.shortcut_seal.file_identity.volume_serial_number,
+                    target.shortcut_seal.file_identity.file_index,
+                    target.shortcut_seal.content_sha256,
+                    target.shortcut_seal.launch_fingerprint,
+                )
+            ),
+        )
+        for target in batch.targets
+    ))
+    return (
+        batch.launch_mode,
+        batch.source.identity_generation,
+        batch.source.config_revision,
+        batch.source.group_id,
+        batch.source.group_name,
+        batch.source.character_ids,
+        target_keys,
+        tuple(sorted(batch.isolated_fingerprints)),
+        batch.isolated_window_count,
+        batch.anonymous_isolated_window_count,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2562,6 +2656,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             SmartReconnectObservationSnapshot | None
         ) = None
         self._broker_scan_thread_id: int | None = None
+        self._tcp_state_lock = threading.RLock()
+        self._tcp_authority_binding: tuple[object, ...] | None = None
+        self._tcp_instance_states: dict[str, _TcpInstanceState] = {}
+        self._tcp_last_snapshot_generation: int | None = None
+        self._tcp_last_result: tuple[
+            int,
+            int,
+            tuple[tuple[str, int], ...],
+            tuple[str, ...],
+        ] = (0, 0, (), ())
         # A continuing source failure is one revocation edge.  Keep its
         # identity until a complete authority source observes that identity
         # again, so repeated scans of the same missing role do not keep
@@ -2784,6 +2888,169 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def _source_state_generation_snapshot(self) -> int:
         with self._source_authority_lock:
             return self._source_state_generation
+
+    def _clear_tcp_disconnect_state(self) -> None:
+        with self._tcp_state_lock:
+            self._tcp_authority_binding = None
+            self._tcp_instance_states.clear()
+            self._tcp_last_snapshot_generation = None
+            self._tcp_last_result = (0, 0, (), ())
+
+    def _tcp_authority_token(
+        self,
+        source_state_generation: int,
+    ) -> tuple[object, ...] | None:
+        batch = self._authorization_batch
+        coordinator = self._authorization
+        if (
+            batch is None
+            or coordinator is None
+            or coordinator.current_authorization() != batch
+            or not self._identity_generation_is_current(batch)
+        ):
+            return None
+        return (
+            source_state_generation,
+            _tcp_authorization_content_key(batch),
+        )
+
+    def _tcp_disconnect_counts(
+        self,
+        snapshot: SmartReconnectObservationSnapshot | None,
+        source_state_generation: int,
+        observed_at: float,
+    ) -> tuple[
+        int,
+        int,
+        tuple[tuple[str, int], ...],
+        tuple[str, ...],
+    ]:
+        if snapshot is None or snapshot.generation <= 0:
+            self._clear_tcp_disconnect_state()
+            return (0, 0, (), ())
+        authority = self._tcp_authority_token(source_state_generation)
+        if authority is None:
+            self._clear_tcp_disconnect_state()
+            return (0, 0, (), ("tcp_authority_unavailable",))
+        with self._tcp_state_lock:
+            if self._tcp_authority_binding != authority:
+                self._tcp_instance_states.clear()
+                self._tcp_last_snapshot_generation = None
+                self._tcp_last_result = (0, 0, (), ())
+                self._tcp_authority_binding = authority
+            generation = snapshot.generation
+            if self._tcp_last_snapshot_generation == generation:
+                return self._tcp_last_result
+            generation_is_consecutive = bool(
+                self._tcp_last_snapshot_generation is None
+                or generation == self._tcp_last_snapshot_generation + 1
+            )
+            if not generation_is_consecutive:
+                for state in self._tcp_instance_states.values():
+                    state.clear_zero_candidate()
+            batch = self._authorization_batch
+            authorized_targets = {
+                target.fingerprint: target
+                for target in batch.targets
+            } if batch is not None else {}
+            observations = {}
+            for item in snapshot.windows:
+                instance = item.instance
+                fingerprint = normalize_launch_fingerprint(
+                    item.window.launch_fingerprint
+                )
+                target = authorized_targets.get(fingerprint or "")
+                shortcut = snapshot.shortcut_for(fingerprint or "")
+                if (
+                    instance is None
+                    or target is None
+                    or shortcut is None
+                    or shortcut.failure_codes
+                    or shortcut.seal != target.shortcut_seal
+                    or _tcp_stable_instance_identity(instance)
+                    != _tcp_stable_instance_identity(target.instance)
+                ):
+                    continue
+                observations[fingerprint] = item
+            current_fingerprints = frozenset(observations)
+            self._tcp_instance_states = {
+                fingerprint: state
+                for fingerprint, state in self._tcp_instance_states.items()
+                if fingerprint in current_fingerprints
+            }
+            failures: list[str] = []
+            eligible_zero_fingerprints = frozenset(
+                fingerprint
+                for fingerprint, item in observations.items()
+                if item.tcp_established_connections == 0
+                and not item.tcp_failure_codes
+                and (
+                    state := self._tcp_instance_states.get(fingerprint)
+                ) is not None
+                and state.known_online
+            )
+            suppress_confirmation = len(eligible_zero_fingerprints) > 1
+            if suppress_confirmation:
+                failures.append("tcp_multiple_zero_instances_suppressed")
+            states = Counter()
+            for fingerprint, item in observations.items():
+                failures.extend(item.tcp_failure_codes)
+                instance = item.instance
+                assert instance is not None
+                stable_identity = _tcp_stable_instance_identity(instance)
+                state = self._tcp_instance_states.get(fingerprint)
+                if state is None or state.stable_identity != stable_identity:
+                    state = _TcpInstanceState(stable_identity, instance)
+                    self._tcp_instance_states[fingerprint] = state
+                else:
+                    state.instance = instance
+                count = item.tcp_established_connections
+                if item.tcp_failure_codes or count is None:
+                    state.clear_zero_candidate()
+                    states[TCP_STATE_UNKNOWN] += 1
+                    continue
+                if count > 0:
+                    state.known_online = True
+                    state.clear_zero_candidate()
+                    states[TCP_STATE_KNOWN_ONLINE] += 1
+                    continue
+                if not state.known_online:
+                    state.clear_zero_candidate()
+                    states[TCP_STATE_UNKNOWN] += 1
+                    continue
+                if state.last_zero_generation != generation - 1:
+                    state.first_zero_generation = generation
+                    state.first_zero_at = observed_at
+                    state.consecutive_zero_generations = 1
+                else:
+                    state.consecutive_zero_generations += 1
+                state.last_zero_generation = generation
+                first_zero_at = (
+                    state.first_zero_at
+                    if state.first_zero_at is not None
+                    else observed_at
+                )
+                duration = max(0.0, observed_at - first_zero_at)
+                confirmed = bool(
+                    not suppress_confirmation
+                    and state.consecutive_zero_generations
+                    >= TCP_DISCONNECT_CONFIRMATION_GENERATIONS
+                    and duration >= TCP_DISCONNECT_CONFIRMATION_SECONDS
+                )
+                states[
+                    TCP_STATE_ZERO_CONFIRMED
+                    if confirmed
+                    else TCP_STATE_ZERO_SUSPECTED
+                ] += 1
+            self._tcp_last_snapshot_generation = generation
+            result = (
+                states.get(TCP_STATE_ZERO_SUSPECTED, 0),
+                states.get(TCP_STATE_ZERO_CONFIRMED, 0),
+                tuple(sorted(states.items())),
+                tuple(dict.fromkeys(failures)),
+            )
+            self._tcp_last_result = result
+            return result
 
     def _identity_generation_is_current(
         self,
@@ -5101,6 +5368,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
     def _clear_execution_authority_locked(self) -> None:
+        self._clear_tcp_disconnect_state()
         self._revoke_capture_authority()
         self._authorization_batch = None
         self._authorization_contexts.clear()
@@ -5147,6 +5415,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or coordinator.current_authorization() != batch
         ):
             raise ValueError("authorization batch is not the current product batch")
+        previous_batch = self._authorization_batch
+        previous_tcp_authority = (
+            _tcp_authorization_content_key(previous_batch)
+            if previous_batch is not None
+            else None
+        )
+        next_tcp_authority = _tcp_authorization_content_key(batch)
+        if (
+            previous_tcp_authority is not None
+            and previous_tcp_authority != next_tcp_authority
+        ):
+            self._clear_tcp_disconnect_state()
         contexts = {
             target.fingerprint: ReconnectActionContext.from_batch_target(
                 batch,
@@ -5364,6 +5644,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         *,
         preserve_pending_diagnostics: bool = False,
     ) -> None:
+        self._clear_tcp_disconnect_state()
         if self._authorization is not None:
             self._authorization.revoke(reason)
         self._authorization_batch = None
@@ -5671,6 +5952,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         # authorization check must fail even while the remaining revocation is
         # waiting for the scan's read-only work to finish.
         self._execution_enabled.clear()
+        self._clear_tcp_disconnect_state()
         self._record_evidence_monitoring_state(False)
         if self._observation_broker is not None:
             invalidate_observation_action = getattr(
@@ -6901,7 +7183,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         tuple[str, ...],
         frozenset[str],
     ]:
-        """Reject every full-instance change until a new complete batch is published."""
+        """Reject stable identity changes; action paths still recheck full tokens."""
         snapshot = self._activation_snapshot_instances
         if snapshot is None:
             return candidate_windows, blocked_fingerprints, (), frozenset()
@@ -6935,16 +7217,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             changed = {
                 fingerprint
                 for fingerprint in present & allowed
-                if complete_instances[fingerprint][1]
-                != snapshot[fingerprint]
+                if _tcp_stable_instance_identity(
+                    complete_instances[fingerprint][1]
+                )
+                != _tcp_stable_instance_identity(snapshot[fingerprint])
             }
             isolated_changed = {
                 fingerprint
                 for fingerprint in present & isolated
                 if (
                     fingerprint in self._activation_isolated_instances
-                    and self._activation_isolated_instances[fingerprint]
-                    != complete_instances[fingerprint][1]
+                    and _tcp_stable_instance_identity(
+                        self._activation_isolated_instances[fingerprint]
+                    )
+                    != _tcp_stable_instance_identity(
+                        complete_instances[fingerprint][1]
+                    )
                 )
             }
             recovered_window_blocks = (
@@ -9863,6 +10151,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     else self._prepare_product_authorization_locked()
                 )
             if batch is None:
+                self._clear_tcp_disconnect_state()
                 result = ReconnectBatchResult(
                     expected_windows=self._expected_windows,
                     discovered_windows=0,
@@ -9918,6 +10207,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         ):
             rebound = self._prepare_product_authorization_locked()
             if rebound is None:
+                self._clear_tcp_disconnect_state()
                 result = ReconnectBatchResult(
                     expected_windows=self._expected_windows,
                     discovered_windows=0,
@@ -10044,6 +10334,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
         state_before = self._runtime_state_signature()
         now = self._monotonic_clock()
+        (
+            tcp_suspected_windows,
+            tcp_confirmed_windows,
+            tcp_state_counts,
+            tcp_failure_codes,
+        ) = self._tcp_disconnect_counts(
+            self._broker_scan_snapshot,
+            scan_source_state_generation,
+            now,
+        )
         group_failures = (
             []
             if self._candidate_source_is_actual
@@ -10190,6 +10490,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 timing_diagnostics=(
                     self.anonymous_reconnect_timing_diagnostics()
                 ),
+                tcp_suspected_windows=tcp_suspected_windows,
+                tcp_confirmed_windows=tcp_confirmed_windows,
+                tcp_state_counts=tcp_state_counts,
+                tcp_failure_codes=tcp_failure_codes,
             )
             self._last_result = result
             self._publish_reconnecting_fingerprints(
@@ -12032,6 +12336,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 failures.append("capture_mode_disabled")
             next_check_seconds = self._policy.retry_interval_seconds
 
+        if source_changed_during_scan:
+            self._clear_tcp_disconnect_state()
+            tcp_suspected_windows = 0
+            tcp_confirmed_windows = 0
+            tcp_state_counts = ()
+            tcp_failure_codes = ("tcp_authority_changed",)
+        elif tcp_suspected_windows or tcp_confirmed_windows:
+            next_check_seconds = min(
+                next_check_seconds,
+                self._policy.progress_interval_seconds,
+            )
+
         if not self._evidence_available():
             failures.append("evidence_recording_unavailable")
         result = ReconnectBatchResult(
@@ -12057,6 +12373,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             timing_diagnostics=(
                 self.anonymous_reconnect_timing_diagnostics()
             ),
+            tcp_suspected_windows=tcp_suspected_windows,
+            tcp_confirmed_windows=tcp_confirmed_windows,
+            tcp_state_counts=tcp_state_counts,
+            tcp_failure_codes=tcp_failure_codes,
         )
         (
             latest_capture_settings,
@@ -12131,6 +12451,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         elif result.progressed:
             self._state = ReconnectState.RECONNECTING
         elif actionable or battle_actionable:
+            self._state = ReconnectState.DISCONNECTED
+        elif result.tcp_confirmed_windows:
             self._state = ReconnectState.DISCONNECTED
         else:
             self._state = ReconnectState.FAILED

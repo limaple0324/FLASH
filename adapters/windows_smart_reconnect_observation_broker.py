@@ -9,9 +9,11 @@ import json
 import math
 import multiprocessing
 import os
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field, replace
+from ctypes import wintypes
 from multiprocessing.connection import Connection, wait
 from pathlib import Path
 from threading import Lock, RLock
@@ -55,6 +57,10 @@ MAX_PARALLEL_WINDOWS = 4
 ACTION_LEASE_SECONDS = 30.0
 WORKER_STOP_SECONDS = 0.5
 _SHORTCUT_ARGUMENTS_MISSING = "shortcut_launch_arguments_missing"
+_AF_INET = 2
+_TCP_TABLE_OWNER_PID_ALL = 5
+_MIB_TCP_STATE_ESTAB = 5
+_ERROR_INSUFFICIENT_BUFFER = 122
 
 _RESULT = TypeVar("_RESULT")
 
@@ -76,6 +82,106 @@ def _capture_sha256(sample: CaptureSample | None) -> str | None:
     digest.update(sample.height.to_bytes(8, "little", signed=True))
     digest.update(sample.pixels)
     return digest.hexdigest()
+
+
+class _MibTcpRowOwnerPid(ctypes.Structure):
+    _fields_ = (
+        ("state", wintypes.DWORD),
+        ("local_address", wintypes.DWORD),
+        ("local_port", wintypes.DWORD),
+        ("remote_address", wintypes.DWORD),
+        ("remote_port", wintypes.DWORD),
+        ("owning_process_id", wintypes.DWORD),
+    )
+
+
+def _is_external_ipv4_remote_address(remote_address: int) -> bool:
+    host_order = socket.ntohl(int(remote_address))
+    return host_order != 0 and (host_order >> 24) != 127
+
+
+def _ipv4_established_counts_by_pid(
+    process_ids: Iterable[int],
+) -> dict[int, int]:
+    """Read one IPv4 owner-PID table and return only aggregate PID counts."""
+
+    requested = frozenset(
+        value
+        for value in process_ids
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    )
+    if not requested:
+        return {}
+    if os.name != "nt":
+        raise OSError("IPv4 TCP owner table is available only on Windows")
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        raise OSError("Windows system root is unavailable")
+    dll_path = os.path.join(system_root, "System32", "iphlpapi.dll")
+    if not os.path.isabs(dll_path):
+        raise OSError("Windows system directory is not absolute")
+    iphlpapi = ctypes.WinDLL(
+        dll_path,
+        use_last_error=True,
+    )
+    get_table = iphlpapi.GetExtendedTcpTable
+    get_table.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.ULONG),
+        wintypes.BOOL,
+        wintypes.ULONG,
+        ctypes.c_int,
+        wintypes.ULONG,
+    )
+    get_table.restype = wintypes.DWORD
+    size = wintypes.ULONG(0)
+    status = get_table(
+        None,
+        ctypes.byref(size),
+        False,
+        _AF_INET,
+        _TCP_TABLE_OWNER_PID_ALL,
+        0,
+    )
+    if status not in (0, _ERROR_INSUFFICIENT_BUFFER) or size.value < 4:
+        raise OSError(int(status), "GetExtendedTcpTable size query failed")
+    for _attempt in range(3):
+        buffer = (ctypes.c_ubyte * size.value)()
+        status = get_table(
+            buffer,
+            ctypes.byref(size),
+            False,
+            _AF_INET,
+            _TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+        if status == _ERROR_INSUFFICIENT_BUFFER:
+            continue
+        if status != 0:
+            raise OSError(int(status), "GetExtendedTcpTable failed")
+        entry_count = ctypes.cast(
+            buffer,
+            ctypes.POINTER(wintypes.DWORD),
+        ).contents.value
+        row_size = ctypes.sizeof(_MibTcpRowOwnerPid)
+        first_row = ctypes.sizeof(wintypes.DWORD)
+        if first_row + entry_count * row_size > len(buffer):
+            raise OSError("GetExtendedTcpTable returned a truncated table")
+        counts = {process_id: 0 for process_id in requested}
+        for index in range(entry_count):
+            row = _MibTcpRowOwnerPid.from_buffer_copy(
+                buffer,
+                first_row + index * row_size,
+            )
+            process_id = int(row.owning_process_id)
+            if (
+                process_id in requested
+                and int(row.state) == _MIB_TCP_STATE_ESTAB
+                and _is_external_ipv4_remote_address(row.remote_address)
+            ):
+                counts[process_id] += 1
+        return counts
+    raise OSError(_ERROR_INSUFFICIENT_BUFFER, "TCP table kept changing size")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +207,8 @@ class SmartReconnectWindowObservation:
     process_cache_key: ProcessObservationCacheKey | None = None
     role_cache_key: RoleObservationCacheKey | None = None
     role_region_sha256: str | None = None
+    tcp_established_connections: int | None = None
+    tcp_failure_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         freshness = self.freshness
@@ -128,6 +236,53 @@ class SmartReconnectWindowObservation:
                 "role_region_sha256",
                 role_region_sha256,
             )
+        if (
+            self.tcp_established_connections is not None
+            and (
+                isinstance(self.tcp_established_connections, bool)
+                or not isinstance(self.tcp_established_connections, int)
+                or self.tcp_established_connections < 0
+            )
+        ):
+            raise ValueError("TCP established connection count is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SmartReconnectTcpWindowObservation:
+    instance: WindowInstanceToken
+    established_connections: int | None
+    failure_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.instance, WindowInstanceToken):
+            raise TypeError("TCP observation requires a complete window instance")
+        if (
+            self.established_connections is not None
+            and (
+                isinstance(self.established_connections, bool)
+                or not isinstance(self.established_connections, int)
+                or self.established_connections < 0
+            )
+        ):
+            raise ValueError("TCP established connection count is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SmartReconnectTcpBatchResult:
+    observations: tuple[SmartReconnectTcpWindowObservation, ...]
+    failure_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        observations = tuple(self.observations)
+        if any(
+            not isinstance(item, SmartReconnectTcpWindowObservation)
+            for item in observations
+        ):
+            raise TypeError("TCP batch contains an invalid observation")
+        instances = tuple(item.instance for item in observations)
+        if len(instances) != len(set(instances)):
+            raise ValueError("TCP batch contains a duplicate window instance")
+        object.__setattr__(self, "observations", observations)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1092,6 +1247,38 @@ def _resolve_window_identities(
     )
 
 
+def _observe_ipv4_tcp_table(
+    request: SmartReconnectObservationRequest,
+) -> SmartReconnectTcpBatchResult:
+    instances = tuple(dict.fromkeys(
+        instance
+        for window in request.windows
+        if (instance := WindowInstanceToken.from_window(window)) is not None
+    ))
+    if not instances:
+        return SmartReconnectTcpBatchResult(())
+    try:
+        counts = _ipv4_established_counts_by_pid(
+            tuple(instance.process_id for instance in instances)
+        )
+    except Exception:
+        failure = ("tcp_table_unavailable",)
+        return SmartReconnectTcpBatchResult(
+            tuple(
+                SmartReconnectTcpWindowObservation(instance, None, failure)
+                for instance in instances
+            ),
+            failure,
+        )
+    return SmartReconnectTcpBatchResult(tuple(
+        SmartReconnectTcpWindowObservation(
+            instance,
+            counts.get(instance.process_id, 0),
+        )
+        for instance in instances
+    ))
+
+
 def _observe_window(
     request: SmartReconnectObservationRequest,
 ) -> SmartReconnectWindowObservation:
@@ -1283,6 +1470,8 @@ def _execute_observation_request(
         return _resolve_shortcut_static_observation(request)
     if request.stage == "identity":
         return _resolve_window_identities(request)
+    if request.stage == "tcp":
+        return _observe_ipv4_tcp_table(request)
     if request.stage == "window":
         return _observe_window(request)
     if request.stage == "seal":
@@ -2631,6 +2820,33 @@ class WindowsSmartReconnectObservationBroker:
             unique_before, blocked, anonymous = self._unique_windows(
                 before.windows
             )
+            tcp_batch = self._request(
+                SmartReconnectObservationRequest(
+                    stage="tcp",
+                    reference_dir=self._reference_dir,
+                    title_keywords=self._title_keywords,
+                    windows=tuple(
+                        window for window, _instance in unique_before.values()
+                    ),
+                ),
+                WINDOW_TIMEOUT_SECONDS,
+            )
+            if not isinstance(tcp_batch, SmartReconnectTcpBatchResult):
+                failure = ("tcp_table_timeout",)
+                tcp_batch = SmartReconnectTcpBatchResult(
+                    tuple(
+                        SmartReconnectTcpWindowObservation(
+                            instance,
+                            None,
+                            failure,
+                        )
+                        for _window, instance in unique_before.values()
+                    ),
+                    failure,
+                )
+            tcp_by_instance = {
+                item.instance: item for item in tcp_batch.observations
+            }
             requests_list: list[SmartReconnectObservationRequest] = []
             for fingerprint, (window, instance) in unique_before.items():
                 role_cache_key: RoleObservationCacheKey | None = None
@@ -2736,6 +2952,20 @@ class WindowsSmartReconnectObservationBroker:
                 if "window_instance_incomplete" in item.failure_codes:
                     blocked_set.add(fingerprint)
                     continue
+                tcp_observation = tcp_by_instance.get(instance)
+                item = replace(
+                    item,
+                    tcp_established_connections=(
+                        tcp_observation.established_connections
+                        if tcp_observation is not None
+                        else None
+                    ),
+                    tcp_failure_codes=(
+                        tcp_observation.failure_codes
+                        if tcp_observation is not None
+                        else ("tcp_observation_missing",)
+                    ),
+                )
                 sample_sha256 = _capture_sha256(item.sample)
                 role_evidence_is_current = bool(
                     item.freshness is ObservationFreshness.PROVEN_CURRENT
