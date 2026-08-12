@@ -176,10 +176,6 @@ class FarmTimerService:
             timer.timer_id: timer for timer in self._load()
         }
 
-    @property
-    def state_path(self) -> Path | None:
-        return self._state_path
-
     def set_clipboard_writer(
         self,
         writer: Callable[[str], object] | None,
@@ -525,9 +521,3 @@ class FarmTimerService:
             return False
         self._record(timer.character_name, "已複製正確代碼")
         return True
-
-    def timers(self) -> tuple[FarmTimer, ...]:
-        with self._lock:
-            return tuple(
-                self._timers[key] for key in sorted(self._timers)
-            )

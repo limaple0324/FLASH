@@ -49,8 +49,10 @@ def test_pending_operations_survive_restart_and_keep_original_order(tmp_path):
 
 
 def test_pending_has_no_expiry_and_is_not_removed_when_not_ready(tmp_path):
+    failures = []
     service = DeferredSyncOperationService(
-        state_path=tmp_path / "deferred.json"
+        state_path=tmp_path / "deferred.json",
+        on_failure=failures.append,
     )
     service.enqueue(
         "角色甲",
@@ -67,7 +69,7 @@ def test_pending_has_no_expiry_and_is_not_removed_when_not_ready(tmp_path):
         )
 
     assert service.pending("角色甲") == 1
-    assert service.failures() == ()
+    assert failures == []
 
 
 def test_unsafe_first_operation_permanently_cancels_all_later_items():

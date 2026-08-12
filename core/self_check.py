@@ -10,7 +10,7 @@ from cards.history_store import CardHistoryStore
 from cards.settings import CardDisplaySettings, CardDisplaySettingsResolution
 from config.config_manager import ConfigManager
 from config.path_manager import PathManager
-from core.sp1_boundaries import ExternalAdapter, RecoveryBoundary, SmartReconnectBoundary
+from core.sp1_boundaries import ExternalAdapter, SmartReconnectBoundary
 from core.target_window_observation import TargetWindowObservation
 from core.version import MILESTONE
 from core.window_registry import WindowRegistry
@@ -67,7 +67,6 @@ class SelfCheck:
                 "card_preview_selection",
                 self._check_card_preview_selection,
             ),
-            self._run("recovery_boundary", lambda: self._check_optional(RecoveryBoundary)),
             self._run("smart_reconnect_boundary", lambda: self._check_optional(SmartReconnectBoundary)),
             self._run("external_adapter", lambda: self._check_optional(ExternalAdapter)),
         ]

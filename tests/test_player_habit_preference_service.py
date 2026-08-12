@@ -1,9 +1,11 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from habit.preference_models import (
     HabitDecision,
     HabitKind,
     PlayerHabitCandidate,
+    PlayerHabitObservation,
 )
 from habit.preference_service import PlayerHabitPreferenceService
 from habit.preference_store import PlayerHabitStore
@@ -20,15 +22,41 @@ def _service(tmp_path) -> PlayerHabitPreferenceService:
     )
 
 
+def _with_observations(service, *observations):
+    memory = service.snapshot()
+    service.store.save(
+        replace(memory, observations=memory.observations + tuple(observations))
+    )
+    return PlayerHabitPreferenceService(service.store)
+
+
+def _activity_time(observed_at, *, is_exception=False):
+    return PlayerHabitObservation(
+        observed_at,
+        HabitKind.ACTIVITY_TIME,
+        "神秘考官",
+        (observed_at.strftime("%H:%M"),),
+        is_exception,
+    )
+
+
+def _character_order(observed_at, values):
+    return PlayerHabitObservation(
+        observed_at,
+        HabitKind.CHARACTER_ORDER,
+        "每日活動",
+        values,
+    )
+
+
 def _record_confirmed_activity_pattern(
     service: PlayerHabitPreferenceService,
     start: datetime,
-) -> None:
-    for day in range(7):
-        service.record_activity_time(
-            "神秘考官",
-            start + timedelta(days=day),
-        )
+) -> PlayerHabitPreferenceService:
+    return _with_observations(
+        service,
+        *(_activity_time(start + timedelta(days=day)) for day in range(7)),
+    )
 
 
 def test_default_rule_observes_seven_days_and_reviews_on_day_eight(
@@ -36,7 +64,7 @@ def test_default_rule_observes_seven_days_and_reviews_on_day_eight(
 ) -> None:
     service = _service(tmp_path)
     start = datetime(2026, 7, 1, 19, 50, tzinfo=TAIPEI)
-    _record_confirmed_activity_pattern(service, start)
+    service = _record_confirmed_activity_pattern(service, start)
 
     assert service.candidates(start + timedelta(days=6)) == ()
 
@@ -56,25 +84,25 @@ def test_exception_observations_do_not_count_and_observation_days_are_adjustable
     service = _service(tmp_path)
     service.set_observation_days(10)
     start = datetime(2026, 7, 1, 19, 50, tzinfo=TAIPEI)
-    for day in range(6):
-        service.record_activity_time(
-            "神秘考官",
-            start + timedelta(days=day),
-        )
-    service.record_activity_time(
-        "神秘考官",
-        start + timedelta(days=6, minutes=1),
-        is_exception=True,
-    )
-    service.record_activity_time(
-        "神秘考官",
-        start + timedelta(days=6, minutes=2),
-        is_exception=True,
+    service = _with_observations(
+        service,
+        *(_activity_time(start + timedelta(days=day)) for day in range(6)),
+        _activity_time(
+            start + timedelta(days=6, minutes=1),
+            is_exception=True,
+        ),
+        _activity_time(
+            start + timedelta(days=6, minutes=2),
+            is_exception=True,
+        ),
     )
 
     assert service.candidates(start + timedelta(days=10)) == ()
 
-    service.record_activity_time("神秘考官", start + timedelta(days=7))
+    service = _with_observations(
+        service,
+        _activity_time(start + timedelta(days=7)),
+    )
     assert len(service.candidates(start + timedelta(days=10))) == 1
 
 
@@ -84,17 +112,23 @@ def test_two_fully_qualified_opposite_patterns_are_not_suggested(
     service = _service(tmp_path)
     service.set_observation_days(7)
     start = datetime(2026, 7, 1, 12, 0, tzinfo=TAIPEI)
-    for day in range(7):
-        service.record_character_order(
-            "每日活動",
-            ("主號", "分號"),
-            start + timedelta(days=day),
-        )
-        service.record_character_order(
-            "每日活動",
-            ("分號", "主號"),
-            start + timedelta(days=day, minutes=1),
-        )
+    service = _with_observations(
+        service,
+        *(
+            observation
+            for day in range(7)
+            for observation in (
+                _character_order(
+                    start + timedelta(days=day),
+                    ("主號", "分號"),
+                ),
+                _character_order(
+                    start + timedelta(days=day, minutes=1),
+                    ("分號", "主號"),
+                ),
+            )
+        ),
+    )
     assert service.candidates(start + timedelta(days=7)) == ()
 
 
@@ -169,7 +203,8 @@ def test_saved_preferences_can_be_modified_removed_and_cleared(tmp_path) -> None
     assert changed.values == ("19:55",)
     assert service.remove_preference("second") is True
     assert service.remove_preference("missing") is False
-    assert service.clear_preferences() == 1
+    service.store.save(replace(service.snapshot(), preferences=()))
+    service = PlayerHabitPreferenceService(service.store)
     assert service.snapshot().preferences == ()
 
 
@@ -210,7 +245,7 @@ def test_expired_raw_observations_and_temporary_decisions_are_cleaned(
     service = _service(tmp_path)
     old = datetime(2026, 6, 1, 19, 50, tzinfo=TAIPEI)
     now = datetime(2026, 7, 20, 19, 50, tzinfo=TAIPEI)
-    service.record_activity_time("神秘考官", old)
+    service = _with_observations(service, _activity_time(old))
     candidate = PlayerHabitCandidate(
         "old-rejection",
         HabitKind.ACTIVITY_TIME,
@@ -231,7 +266,7 @@ def test_expired_raw_observations_and_temporary_decisions_are_cleaned(
 def test_clear_all_removes_observations_and_saved_preferences(tmp_path) -> None:
     service = _service(tmp_path)
     now = datetime(2026, 7, 20, 19, 50, tzinfo=TAIPEI)
-    service.record_activity_time("神秘考官", now)
+    service = _with_observations(service, _activity_time(now))
     candidate = PlayerHabitCandidate(
         "saved",
         HabitKind.ACTIVITY_TIME,

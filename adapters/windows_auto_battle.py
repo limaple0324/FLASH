@@ -20,21 +20,6 @@ class AutoBattleEvidence:
     red_x_box: tuple[int, int, int, int] | None = None
     battle_button_box: tuple[int, int, int, int] | None = None
 
-    @property
-    def red_x_center(self) -> tuple[float, float] | None:
-        if self.red_x_box is None:
-            return None
-        left, top, right, bottom = self.red_x_box
-        return ((left + right) / 2, (top + bottom) / 2)
-
-    @property
-    def battle_button_center(self) -> tuple[float, float] | None:
-        if self.battle_button_box is None:
-            return None
-        left, top, right, bottom = self.battle_button_box
-        return ((left + right) / 2, (top + bottom) / 2)
-
-
 class AutoBattleRecognizer:
     """以使用者保存的真圖驗證，未取得完整匹配框時一律拒絕。"""
 

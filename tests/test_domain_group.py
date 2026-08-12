@@ -18,14 +18,6 @@ def test_group_is_the_primary_container_for_multiple_characters():
     assert [item["display_name"] for item in group.to_dict()["characters"]] == ["敖云一煞", "120古"]
 
 
-def test_group_add_character_returns_a_new_group_without_mutating_the_original():
-    group = CharacterGroup(group_id="dimension", name="魔心次元組")
-    updated = group.add_character(_character("c", "次元角色"))
-
-    assert group.character_ids == ()
-    assert updated.character_ids == ("c",)
-
-
 def test_group_rejects_duplicate_character_identity():
     character = _character("same", "角色")
     with pytest.raises(ValueError):

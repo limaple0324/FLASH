@@ -56,7 +56,6 @@ class ReconnectPolicy:
     announcement_transition_wait_seconds: int = 5
     connected_poll_seconds: int = 5
     maximum_attempts: int | None = None
-    requires_reconnect_button: bool = False
     announcement_close_allowed: bool = True
 
     def __post_init__(self) -> None:

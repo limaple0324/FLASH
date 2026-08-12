@@ -104,8 +104,6 @@ from services.game_time_timed_click_service import (
 )
 from services.smart_reconnect_monitor import (
     DEFAULT_SMART_RECONNECT_INTERVAL_MS,
-    SMART_RECONNECT_MODE_BALANCED,
-    SMART_RECONNECT_MODE_HIGH_PERFORMANCE,
 )
 from services.smart_reconnect_capture_settings_service import (
     MINIMIZED_CAPTURE_MODE,
@@ -116,26 +114,11 @@ from services.smart_reconnect_capture_settings_service import (
 from workspace.models import WorkspaceState
 
 
-try:
-    import psutil  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover - optional dependency
-    psutil = None
-
-
 INPUT_POLICY_LABELS = {
     "foreground_only": "僅允許前台",
     "foreground_background": "允許前台與背景",
     "all": "全部允許（含最小化）",
 }
-
-SMART_RECONNECT_CPU_WARNING_PERCENTAGE = 80
-SMART_RECONNECT_CPU_WARNING_COLOR = "#D64545"
-SMART_RECONNECT_CPU_POLL_DELAY_MS = 2_000
-SMART_RECONNECT_MODE_LABELS = {
-    SMART_RECONNECT_MODE_BALANCED: "省電模式",
-    SMART_RECONNECT_MODE_HIGH_PERFORMANCE: "高效能模式",
-}
-SMART_RECONNECT_MODE_VALUES = tuple(SMART_RECONNECT_MODE_LABELS.keys())
 
 BACKGROUND_PAGE_LABELS = {
     "home": "首頁",
@@ -223,37 +206,6 @@ UI_THEME_PALETTES = {
 }
 
 
-def theme_palette(name: object) -> dict[str, str]:
-    key = name if isinstance(name, str) else ""
-    selected = UI_THEME_PALETTES.get(key, UI_THEME_PALETTES["classic_gold"])
-    return dict(selected)
-
-
-def _blend_hex_color(base: str, backdrop: str, opacity: int) -> str:
-    """Blend a legacy UI color over the visible background."""
-    normalized_opacity = max(0, min(100, int(opacity))) / 100
-
-    def rgb(value: str) -> tuple[int, int, int]:
-        return tuple(
-            int(value[index : index + 2], 16)
-            for index in (1, 3, 5)
-        )
-
-    base_rgb = rgb(base)
-    backdrop_rgb = rgb(backdrop)
-    blended = tuple(
-        round(
-            backdrop_channel * (1 - normalized_opacity)
-            + base_channel * normalized_opacity
-        )
-        for base_channel, backdrop_channel in zip(
-            base_rgb,
-            backdrop_rgb,
-        )
-    )
-    return "#" + "".join(f"{channel:02X}" for channel in blended)
-
-
 def _average_image_color(image: Image.Image) -> str:
     mean = ImageStat.Stat(image.convert("RGB")).mean
     return "#" + "".join(
@@ -325,36 +277,6 @@ def _background_crop_boxes(
         sidebar_y + sidebar_height,
     )
     return content, sidebar
-
-
-def _feature_card_control_offsets(
-    toggle_width: int,
-    *,
-    edge_inset: int = 8,
-    control_gap: int = 6,
-) -> tuple[int, int]:
-    """Return right-aligned offsets for toggle and settings controls."""
-    width = max(1, int(toggle_width))
-    inset = max(0, int(edge_inset))
-    gap = max(0, int(control_gap))
-    return -inset, -(inset + gap + width)
-
-
-def _feature_card_content_pady(
-    current_pady: int,
-    controls_required_height: int,
-    *,
-    control_top: int = 6,
-    content_gap: int = 8,
-) -> int:
-    """Keep card content below the right-side settings/collapse controls."""
-    current = max(0, int(current_pady))
-    controls_bottom = (
-        max(0, int(control_top))
-        + max(1, int(controls_required_height))
-        + max(0, int(content_gap))
-    )
-    return max(current, controls_bottom)
 
 
 def _collapsed_card_title_pady(
@@ -550,58 +472,6 @@ class _FeatureCardWidgets:
     ] = field(default_factory=list)
 
 
-def _characters(status: dict[str, object]) -> list[dict[str, object]]:
-    registry = status.get("window_registry", {})
-    if not isinstance(registry, dict):
-        return []
-    characters = registry.get("characters", [])
-    if not isinstance(characters, list):
-        return []
-    return [item for item in characters if isinstance(item, dict)]
-
-
-def _group_text(status: dict[str, object]) -> str:
-    characters = _characters(status)
-    if not characters:
-        return "目前組別\n尚未設定"
-
-    groups = sorted(
-        {
-            str(item.get("group")).strip()
-            for item in characters
-            if isinstance(item.get("group"), str)
-            and str(item.get("group")).strip()
-        }
-    )
-    names = [
-        str(item.get("display_name")).strip()
-        for item in characters
-        if isinstance(item.get("display_name"), str)
-        and str(item.get("display_name")).strip()
-    ]
-    title = "、".join(groups) if groups else "未分組"
-    preview = "、".join(names[:3])
-    if len(names) > 3:
-        preview += f" 等 {len(names)} 個角色"
-    return f"目前組別\n{title}\n{preview}"
-
-
-def _status_text(status: dict[str, object]) -> str:
-    if not bool(status.get("self_check_passed", False)):
-        return "目前狀態\n● 需要檢查"
-    target = status.get("target_window", {})
-    if isinstance(target, dict) and bool(target.get("safe", False)):
-        return "目前狀態\n● 已找到遊戲視窗"
-    return "目前狀態\n● 已準備完成"
-
-
-def _workspace_text(status: dict[str, object]) -> str:
-    characters = _characters(status)
-    if characters:
-        return f"工作區\n已載入 {len(characters)} 個角色"
-    return "工作區\n等待設定組別"
-
-
 def _card_text(
     status: dict[str, object],
     card_view_state: CardViewState | None = None,
@@ -626,19 +496,6 @@ def _card_text(
     if isinstance(target, dict) and target.get("configured") is False:
         return "提醒卡\n尚未設定遊戲主視窗"
     return "提醒卡\n系統正常"
-
-
-def _workspace_state_text(state: WorkspaceState) -> str:
-    if not isinstance(state, WorkspaceState):
-        raise TypeError("state must be WorkspaceState.")
-    group = state.current_group.name if state.current_group is not None else "尚未選擇"
-    activity = (
-        state.current_activity.name
-        if state.current_activity is not None
-        else "等待可信遊戲進度"
-    )
-    next_step = state.next_step or "尚未提供"
-    return f"目前組別：{group}\n目前活動：{activity}\n下一步：{next_step}"
 
 
 def _activity_schedule_visible_items(
@@ -734,20 +591,6 @@ def _selected_sync_key_summary(keys: Iterable[str]) -> str:
         if shortcut.key in selected
     )
     return "未勾選" if not ordered else "、".join(ordered)
-
-
-def smart_reconnect_cpu_usage_percent() -> float | None:
-    if psutil is None:
-        return None
-    try:
-        value = psutil.cpu_percent(interval=0.0)
-    except Exception:
-        return None
-    if not isinstance(value, (int, float)):
-        return None
-    if value < 0 or value > 100:
-        return None
-    return float(value)
 
 
 class HomeView:
@@ -947,10 +790,6 @@ class HomeView:
         smart_reconnect_interval_ms: int = DEFAULT_SMART_RECONNECT_INTERVAL_MS,
         on_smart_reconnect_interval_change: (
             Callable[[int], object] | None
-        ) = None,
-        smart_reconnect_mode: str = SMART_RECONNECT_MODE_BALANCED,
-        on_smart_reconnect_mode_change: (
-            Callable[[str], object] | None
         ) = None,
         smart_reconnect_capture_modes: Mapping[str, bool] | None = None,
         on_smart_reconnect_capture_modes_change: (
@@ -1339,14 +1178,6 @@ class HomeView:
         self.on_smart_reconnect_interval_change = (
             on_smart_reconnect_interval_change
         )
-        self.smart_reconnect_mode = (
-            smart_reconnect_mode
-            if smart_reconnect_mode in SMART_RECONNECT_MODE_VALUES
-            else SMART_RECONNECT_MODE_BALANCED
-        )
-        self.on_smart_reconnect_mode_change = (
-            on_smart_reconnect_mode_change
-        )
         self.smart_reconnect_capture_modes = (
             SmartReconnectCaptureSettings.from_value(
                 smart_reconnect_capture_modes
@@ -1488,7 +1319,6 @@ class HomeView:
         self._feature_card_variable: StringVar | None = None
         self._feature_card_selector: OptionMenu | None = None
         self._feature_card_choice_ids: dict[str, str] = {}
-        self._feature_card_selected_id: str | None = None
         self._feature_card_settings_dialog: Frame | None = None
         self._feature_card_title_entry: Entry | None = None
         self._feature_card_status_label: Label | None = None
@@ -1511,7 +1341,6 @@ class HomeView:
         self._card_background_cancel_button: Button | None = None
         self._card_background_progress_bar: Progressbar | None = None
         self._navigation_buttons: dict[str, Button] = {}
-        self._navigation_frame: Frame | None = None
         self._workspace_label: Label | None = None
         self._activity_schedule_label: Label | None = None
         self._activity_description_variable: StringVar | None = None
@@ -1523,7 +1352,6 @@ class HomeView:
         self._game_data_status_text = "尚未安全讀取"
         self._card_actions_frame: Frame | None = None
         self._target_label: Label | None = None
-        self._group_value_label: Label | None = None
         self._group_variable: StringVar | None = None
         self._card_seconds_entry: Entry | None = None
         self._habit_observation_days_entry: Entry | None = None
@@ -1546,17 +1374,6 @@ class HomeView:
         self._smart_reconnect_label: Label | None = None
         self._smart_reconnect_button: Button | None = None
         self._smart_reconnect_interval_entry: Entry | None = None
-        self._smart_reconnect_mode_variable: StringVar | None = None
-        self._smart_reconnect_mode_label_to_value: dict[str, str] = {}
-        self._smart_reconnect_mode_value_to_label: dict[str, str] = (
-            {
-                value: label
-                for value, label in SMART_RECONNECT_MODE_LABELS.items()
-            }
-        )
-        self._smart_reconnect_mode_value: str = self.smart_reconnect_mode
-        self._smart_reconnect_cpu_label: Label | None = None
-        self._smart_reconnect_cpu_after_id: str | None = None
         self._smart_reconnect_capture_mode_variables: dict[str, IntVar] = {}
         self._smart_reconnect_capture_mode_status_label: Label | None = None
         self._reconnect_failure_card: Frame | None = None
@@ -1565,7 +1382,6 @@ class HomeView:
         self._last_group_role_statuses: (
             tuple[GroupRoleStatus, ...] | None
         ) = None
-        self._home_activity_heading: Label | None = None
         self._auto_click_interval_entry: Entry | None = None
         self._auto_click_button_variable: StringVar | None = None
         self._auto_click_forever_variable: IntVar | None = None
@@ -1603,7 +1419,6 @@ class HomeView:
         self._window_size_after_id: str | None = None
         self._game_time_offset_entry: Entry | None = None
         self._game_time_auto_variable: IntVar | None = None
-        self._game_time_sidebar_card: Frame | None = None
         self._game_time_title_label: Label | None = None
         self._game_time_value_label: Label | None = None
         self._game_time_after_id: str | None = None
@@ -1632,9 +1447,6 @@ class HomeView:
         self._ui_font_variable: StringVar | None = None
         self._sidebar_font_size_variable: StringVar | None = None
         self._content_font_size_variable: StringVar | None = None
-        self._ui_font_menu: OptionMenu | None = None
-        self._sidebar_font_size_menu: OptionMenu | None = None
-        self._content_font_size_menu: OptionMenu | None = None
         self._font_status_label: Label | None = None
         self._sidebar: Frame | None = None
         self._content_root: Frame | None = None
@@ -2711,7 +2523,6 @@ class HomeView:
             ("settings", "設定"),
         )
         navigation_frame = Frame(sidebar, bg=SIDEBAR)
-        self._navigation_frame = navigation_frame
         navigation_frame.pack(side=TOP, fill=X)
         for key, label in page_specs:
             button = Button(
@@ -3817,41 +3628,6 @@ class HomeView:
         self._schedule_background_widget_images(delay_ms=60)
         return "break"
 
-    def _build_group_summary(self, parent) -> None:
-        group_card = Frame(
-            parent,
-            bg=SIDEBAR_GROUP,
-            highlightbackground="#2A4B69",
-            highlightthickness=1,
-        )
-        group_card.pack(fill=X, pady=(0, 16))
-        accent = Frame(group_card, bg=PRIMARY, width=4)
-        accent.pack(side=LEFT, fill=Y)
-        accent.pack_propagate(False)
-        details = Frame(group_card, bg=SIDEBAR_GROUP, padx=12, pady=10)
-        details.pack(side=LEFT, fill=X, expand=True)
-        Label(
-            details,
-            text="目前組別",
-            font=("Microsoft JhengHei UI", 9),
-            bg=SIDEBAR_GROUP,
-            fg=SIDEBAR_MUTED,
-            anchor="w",
-        ).pack(fill=X)
-
-        current_group = self.current_group_name or "尚未選擇組別"
-        self._group_value_label = Label(
-            details,
-            text=current_group,
-            font=("Microsoft JhengHei UI", 14, "bold"),
-            bg=SIDEBAR_GROUP,
-            fg="#FFFFFF",
-            anchor="w",
-            justify=LEFT,
-            wraplength=118,
-        )
-        self._group_value_label.pack(fill=X, pady=(3, 0))
-
     def _page_heading(self, parent, title: str, subtitle: str) -> None:
         heading = Label(
             parent,
@@ -4027,9 +3803,6 @@ class HomeView:
                 f"下一步：{state.next_step or '尚未提供'}",
             )
         )
-
-    def _current_group_summary_text(self) -> str:
-        return self._home_overview_text()
 
     def refresh_current_group_summary(self) -> str:
         text = self._home_overview_text()
@@ -5510,7 +5283,6 @@ class HomeView:
             highlightthickness=1,
         )
         card.pack(side=BOTTOM, fill=X, pady=(12, 0))
-        self._game_time_sidebar_card = card
         self._game_time_title_label = Label(
             card,
             text="遊戲時間",
@@ -7026,7 +6798,6 @@ class HomeView:
             *(choice.display_name for choice in self.ui_font_choices),
             command=self._change_ui_font_selection,
         )
-        self._ui_font_menu = font_menu
         font_menu.configure(
             font=("Microsoft JhengHei UI", 10),
             bg=BACKGROUND,
@@ -7062,7 +6833,6 @@ class HomeView:
             *(str(size) for size in SIDEBAR_FONT_SIZES),
             command=self._change_sidebar_font_size_selection,
         )
-        self._sidebar_font_size_menu = sidebar_size_menu
         sidebar_size_menu.configure(
             font=("Microsoft JhengHei UI", 10),
             bg=BACKGROUND,
@@ -7098,7 +6868,6 @@ class HomeView:
             *(str(size) for size in CONTENT_FONT_SIZES),
             command=self._change_content_font_size_selection,
         )
-        self._content_font_size_menu = content_size_menu
         content_size_menu.configure(
             font=("Microsoft JhengHei UI", 10),
             bg=BACKGROUND,
@@ -7821,9 +7590,6 @@ class HomeView:
             master=self.parent,
             value=initial_label,
         )
-        self._feature_card_selected_id = self._feature_card_choice_ids.get(
-            initial_label
-        )
         selector_row = Frame(layout_card, bg=SURFACE)
         selector_row.pack(fill=X)
         selector = OptionMenu(
@@ -8049,7 +7815,6 @@ class HomeView:
             and self._pending_card_title_reset_id != card_id
         ):
             self._pending_card_title_reset_id = None
-        self._feature_card_selected_id = card_id
         widgets = self._feature_cards.get(card_id)
         entry = self._feature_card_title_entry
         if widgets is None or entry is None:
@@ -8817,7 +8582,6 @@ class HomeView:
         preference: FeatureCardPreference,
     ) -> None:
         try:
-            self._feature_card_selected_id = card_id
             if self._feature_card_title_entry is not None:
                 self._feature_card_title_entry.delete(0, "end")
                 self._feature_card_title_entry.insert(
@@ -10143,8 +9907,6 @@ class HomeView:
         self.current_group_name = selected_name
         if self._group_variable is not None:
             self._group_variable.set(selected_name)
-        if self._group_value_label is not None:
-            self._group_value_label.configure(text=selected_name)
         if self._group_name_entry is not None:
             self._group_name_entry.delete(0, "end")
             self._group_name_entry.insert(0, selected_name)

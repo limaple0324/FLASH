@@ -23,9 +23,6 @@ class KeyboardStateBackend(Protocol):
     def foreground_game_handle(self) -> int | None:
         """Return the exact foreground game HWND captured with the key."""
 
-    def foreground_is_game(self) -> bool:
-        """Return whether the foreground window is a confirmed game window."""
-
     def is_down(self, virtual_key: int) -> bool:
         """Return the current high-bit state of a virtual key."""
 
@@ -119,9 +116,6 @@ class Win32KeyboardStateBackend:
         ):
             return None
         return handle
-
-    def foreground_is_game(self) -> bool:
-        return self.foreground_game_handle() is not None
 
     def is_down(self, virtual_key: int) -> bool:
         user32 = self._user32()

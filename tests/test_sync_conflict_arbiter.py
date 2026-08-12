@@ -5,21 +5,26 @@ from services.sync_conflict_arbiter import SyncConflictArbiter
 
 
 def test_first_different_operation_wins_and_conflict_is_recorded():
-    arbiter = SyncConflictArbiter(clock=lambda: 12.5)
+    conflicts = []
+    arbiter = SyncConflictArbiter(
+        clock=lambda: 12.5,
+        on_conflict=conflicts.append,
+    )
     first = arbiter.try_begin("角色甲", "key:B")
 
     second = arbiter.try_begin("角色甲", "key:C")
 
     assert first is not None
     assert second is None
-    assert arbiter.records()[0].target_id == "角色甲"
-    assert arbiter.records()[0].active_operation == "key:B"
-    assert arbiter.records()[0].skipped_operation == "key:C"
-    assert arbiter.records()[0].occurred_at == 12.5
+    assert conflicts[0].target_id == "角色甲"
+    assert conflicts[0].active_operation == "key:B"
+    assert conflicts[0].skipped_operation == "key:C"
+    assert conflicts[0].occurred_at == 12.5
 
 
 def test_different_roles_and_same_operations_are_not_conflicts():
-    arbiter = SyncConflictArbiter()
+    conflicts = []
+    arbiter = SyncConflictArbiter(on_conflict=conflicts.append)
     first = arbiter.try_begin("角色甲", "key:B")
     other = arbiter.try_begin("角色乙", "key:C")
     acquired = []
@@ -34,7 +39,7 @@ def test_different_roles_and_same_operations_are_not_conflicts():
     assert first is not None
     assert other is not None
     assert acquired == []
-    assert arbiter.records() == ()
+    assert conflicts == []
     first.release()
     thread.join(1.0)
     assert len(acquired) == 1
@@ -45,7 +50,8 @@ def test_different_roles_and_same_operations_are_not_conflicts():
 
 
 def test_same_operation_queue_preserves_arrival_order_and_runs_twice():
-    arbiter = SyncConflictArbiter()
+    conflicts = []
+    arbiter = SyncConflictArbiter(on_conflict=conflicts.append)
     first = arbiter.try_begin("角色甲", "key:B")
     order = []
 
@@ -66,4 +72,4 @@ def test_same_operation_queue_preserves_arrival_order_and_runs_twice():
     third.join(1.0)
 
     assert order == [2, 3]
-    assert arbiter.records() == ()
+    assert conflicts == []

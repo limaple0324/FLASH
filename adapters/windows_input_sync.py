@@ -39,9 +39,6 @@ from core.reconnect_policy import ReconnectScreenState
 
 
 APPROVED_SYNC_KEYS = frozenset(GAME_SHORTCUT_BY_KEY)
-# Retained as a compatibility name for older callers; the value now contains
-# the complete player-confirmed catalog rather than only B and C.
-APPROVED_TEST_KEYS = APPROVED_SYNC_KEYS
 _KEY_ALIASES = {
     "CTRL+UP": "CTRL+↑",
     "CTRL+DOWN": "CTRL+↓",
@@ -428,10 +425,6 @@ class WindowsInputSyncController:
         finally:
             if lease is not None:
                 lease.release()
-    @property
-    def expected_windows(self) -> int:
-        return self._expected_windows
-
     def set_expected_windows(self, expected_windows: int) -> None:
         if (
             isinstance(expected_windows, bool)
@@ -953,9 +946,6 @@ class WindowsInputSyncController:
             if responsive
         )
 
-    def _all_title_matching_windows(self) -> tuple[WindowInfo, ...]:
-        return self._candidate_windows()
-
     def _base_result(
         self,
         *,
@@ -1186,7 +1176,7 @@ class WindowsInputSyncController:
             identity_windows = (
                 windows
                 if self._target_windows_provider is not None
-                else self._all_title_matching_windows()
+                else self._candidate_windows()
             )
             unresolved_title_identity = any(
                 not isinstance(window.process_id, int)

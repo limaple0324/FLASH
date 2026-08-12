@@ -10,7 +10,6 @@ from core.sp1_boundaries import ExternalAdapter, OperationResult
 from main import (
     TARGET_WINDOW_FINGERPRINT_KEY,
     TARGET_WINDOW_KEY,
-    _normalize_window_fingerprint,
     _normalize_window_keywords,
     build_services,
     detect_target_window,
@@ -38,13 +37,6 @@ def test_normalize_window_keywords_accepts_string_and_list():
     assert _normalize_window_keywords("  game  ") == ["game"]
     assert _normalize_window_keywords([" game ", "", 123, "server"]) == ["game", "server"]
     assert _normalize_window_keywords({"game": True}) == []
-
-
-def test_normalize_window_fingerprint_accepts_only_complete_sha256():
-    assert _normalize_window_fingerprint("  " + "A" * 64 + "  ") == "a" * 64
-    assert _normalize_window_fingerprint("a" * 63) is None
-    assert _normalize_window_fingerprint("g" * 64) is None
-    assert _normalize_window_fingerprint(123) is None
 
 
 def test_build_services_connects_persisted_fingerprint_to_window_adapter(tmp_path):

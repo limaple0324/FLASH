@@ -29,10 +29,6 @@ FORCE_LOGIN_CLICK_POINT: NormalizedPoint = (0.505, 0.856)
 # screenshots include the 45-pixel Windows title bar. This targets the centre
 # of the confirmed "?? button in 14_force_login_timeout.png.
 FORCE_LOGIN_TIMEOUT_CLICK_POINT: NormalizedPoint = (0.500, 0.547)
-# Legacy fixed digit area retained only as a fail-closed fallback.  The route
-# status line is centered as a whole, so different character-name lengths move
-# the number horizontally.
-ROUTE_DIGIT_REGION: NormalizedRect = (0.449, 0.311, 0.462, 0.342)
 ROUTE_PREFIX_REFERENCE_REGION: NormalizedRect = (
     555 / 1351,
     293 / 936,
@@ -269,7 +265,6 @@ BATTLE_WAITING_MAXIMUM_SCORE = 15.0
 BATTLE_WAITING_MAXIMUM_EDGE_SCORE = 12.0
 BATTLE_WAITING_CLIENT_TOP_RATIO = 28 / 629
 CLIENT_REFERENCE_TOP_RADIUS_PIXELS = 2
-ACTIVITY_PANEL_LIVE_REFERENCE_FILE = "07_post_login_activity_popup.png"
 ACTIVITY_PANEL_LIVE_REGIONS: tuple[NormalizedRect, ...] = (
     (0.110, 0.130, 0.320, 0.242),
     (0.340, 0.130, 0.660, 0.242),
@@ -277,11 +272,6 @@ ACTIVITY_PANEL_LIVE_REGIONS: tuple[NormalizedRect, ...] = (
     (0.108, 0.835, 0.895, 0.968),
     (0.180, 0.280, 0.480, 0.780),
     (0.520, 0.280, 0.820, 0.780),
-)
-ACTIVITY_PANEL_LIVE_MAXIMUM_SCORE = 18.0
-ACTIVITY_PANEL_LIVE_MAXIMUM_EDGE_SCORE = 24.0
-AUTO_DUNGEON_PANEL_LIVE_REFERENCE_FILE = (
-    "12_post_login_auto_dungeon_popup.png"
 )
 AUTO_DUNGEON_PANEL_LIVE_REGIONS: tuple[NormalizedRect, ...] = (
     (0.118, 0.135, 0.320, 0.235),
@@ -292,8 +282,6 @@ AUTO_DUNGEON_PANEL_LIVE_REGIONS: tuple[NormalizedRect, ...] = (
     (0.180, 0.280, 0.480, 0.780),
     (0.520, 0.280, 0.820, 0.780),
 )
-AUTO_DUNGEON_PANEL_LIVE_MAXIMUM_SCORE = 10.0
-AUTO_DUNGEON_PANEL_LIVE_MAXIMUM_EDGE_SCORE = 18.0
 CONNECTED_UNKNOWN_OVERLAY_REGION: NormalizedRect = (
     0.250,
     0.250,
@@ -610,11 +598,6 @@ class ScreenRecognition:
     recent_login_role: str | None = None
     line_scroll_delta: int = 0
 
-    @property
-    def recognized(self) -> bool:
-        return self.state is not ReconnectScreenState.UNKNOWN
-
-
 class ReferenceScreenRecognizer:
     """Classify one capture against the confirmed screen references."""
 
@@ -747,14 +730,6 @@ class ReferenceScreenRecognizer:
     def _binary_text(image: Image.Image) -> Image.Image:
         return ImageOps.grayscale(image).point(
             lambda value: 255 if value >= 170 else 0
-        )
-
-    @classmethod
-    def _text_signature(cls, image: Image.Image) -> Image.Image:
-        return ImageOps.fit(
-            cls._binary_text(image),
-            (128, 32),
-            method=Image.Resampling.BILINEAR,
         )
 
     @classmethod
@@ -1055,8 +1030,6 @@ class ReferenceScreenRecognizer:
     def _line_selection_target(
         self,
         candidate: Image.Image,
-        *,
-        exact_reference_match: bool,
     ) -> tuple[
         int | None,
         NormalizedPoint | None,
@@ -2299,18 +2272,6 @@ class ReferenceScreenRecognizer:
                 break
         return best, best_crop, best_box
 
-    def _disconnect_overlay_score(
-        self,
-        candidate: Image.Image,
-        reference: Image.Image,
-    ) -> float:
-        """Compare stable dialog pixels across bounded position/scale drift."""
-        score, _crop, _box = self._best_disconnect_overlay_match(
-            candidate,
-            reference,
-        )
-        return score
-
     def _disconnect_overlay_has_structure(
         self,
         candidate: Image.Image,
@@ -3298,10 +3259,6 @@ class ReferenceScreenRecognizer:
                 line_scroll_delta,
             ) = self._line_selection_target(
                 candidate,
-                exact_reference_match=(
-                    definition.filename == "03_line_selection_dialog.png"
-                    and score <= 1.0
-                ),
             )
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
             character_candidates = self._character_selection_candidates(

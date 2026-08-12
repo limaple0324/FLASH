@@ -11,16 +11,6 @@ from enum import Enum
 from typing import Mapping, Protocol, runtime_checkable
 
 
-class RecoveryState(str, Enum):
-    """Observable recovery lifecycle states."""
-
-    IDLE = "idle"
-    DETECTING = "detecting"
-    RECOVERING = "recovering"
-    RECOVERED = "recovered"
-    FAILED = "failed"
-
-
 class ReconnectState(str, Enum):
     """Observable smart reconnect lifecycle states."""
 
@@ -39,21 +29,6 @@ class OperationResult:
     code: str
     message: str = ""
     details: Mapping[str, object] | None = None
-
-
-@runtime_checkable
-class RecoveryBoundary(Protocol):
-    """Contract for restoring FLASH to a known safe state."""
-
-    @property
-    def state(self) -> RecoveryState:
-        """Return the current recovery state."""
-
-    def detect(self) -> OperationResult:
-        """Detect whether recovery is required without changing state."""
-
-    def recover(self) -> OperationResult:
-        """Attempt recovery and return a structured result."""
 
 
 @runtime_checkable

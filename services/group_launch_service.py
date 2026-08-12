@@ -187,16 +187,6 @@ class GroupLaunchService:
             return None
         return name
 
-    def _payload(self) -> Mapping[str, object] | None:
-        path = self._legacy_config_path
-        if path is None or not path.is_file():
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return None
-        return payload if isinstance(payload, Mapping) else None
-
     @staticmethod
     def _path_signature(path: Path | None) -> tuple[int, int] | None:
         if path is None:
@@ -206,14 +196,6 @@ class GroupLaunchService:
         except OSError:
             return None
         return stat.st_mtime_ns, stat.st_size
-
-    def _signature(
-        self,
-    ) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
-        return (
-            self._path_signature(self._legacy_config_path),
-            self._path_signature(self._legacy_layout_config_path),
-        )
 
     @staticmethod
     def _placement(value: object) -> SavedWindowPlacement | None:
@@ -308,7 +290,10 @@ class GroupLaunchService:
         cleaned_group = self._clean_name(group_name)
         if cleaned_group is None:
             return GroupLaunchPlan("", failure_codes=("group_name_invalid",))
-        signature = self._signature()
+        signature = (
+            self._path_signature(self._legacy_config_path),
+            self._path_signature(self._legacy_layout_config_path),
+        )
         if signature != self._cache_signature:
             self._cache.clear()
             self._cache_signature = signature
@@ -316,7 +301,7 @@ class GroupLaunchService:
         if cached is not None:
             return cached
 
-        payload = self._payload()
+        payload = self._read_payload(self._legacy_config_path)
         if payload is None:
             plan = GroupLaunchPlan(
                 cleaned_group,

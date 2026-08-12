@@ -43,19 +43,14 @@ class DeferredSyncOperationService:
         on_failure: (
             Callable[[DeferredSyncFailureRecord], object] | None
         ) = None,
-        maximum_failure_records: int = 1000,
         state_path: Path | None = None,
     ) -> None:
-        if maximum_failure_records <= 0:
-            raise ValueError("maximum_failure_records must be positive.")
         self._clock = clock
         self._on_failure = on_failure
-        self._maximum_failure_records = int(maximum_failure_records)
         self._lock = threading.RLock()
         self._next_sequence = 1
         self._queues: dict[str, deque[_DeferredOperation]] = {}
         self._processing: set[str] = set()
-        self._failures: list[DeferredSyncFailureRecord] = []
         self._state_path = Path(state_path) if state_path is not None else None
         self._handlers: dict[
             str,
@@ -202,10 +197,6 @@ class DeferredSyncOperationService:
         with self._lock:
             return tuple(self._queues)
 
-    def failures(self) -> tuple[DeferredSyncFailureRecord, ...]:
-        with self._lock:
-            return tuple(self._failures)
-
     def _record_failure(
         self,
         item: _DeferredOperation,
@@ -218,24 +209,11 @@ class DeferredSyncOperationService:
             failure_code,
             self._clock(),
         )
-        with self._lock:
-            self._failures.append(record)
-            if len(self._failures) > self._maximum_failure_records:
-                del self._failures[
-                    : len(self._failures) - self._maximum_failure_records
-                ]
         if self._on_failure is not None:
             try:
                 self._on_failure(record)
             except Exception:
                 pass
-
-    def _fail_target(self, target_id: str) -> None:
-        with self._lock:
-            queue = self._queues.pop(target_id, deque())
-            self._save()
-        for item in queue:
-            self._record_failure(item, "reconnect_failed")
 
     def _drain_target(self, target_id: str) -> None:
         try:

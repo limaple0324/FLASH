@@ -54,17 +54,6 @@ class ReconnectFailureStatusService:
                 return True
             return False
 
-    def clear_prefix(self, prefix: object) -> int:
-        if not isinstance(prefix, str) or not prefix:
-            return 0
-        with self._lock:
-            keys = tuple(key for key in self._items if key.startswith(prefix))
-            for key in keys:
-                self._items.pop(key, None)
-            if keys:
-                self._revision += 1
-            return len(keys)
-
     def snapshot(self) -> tuple[ReconnectFailureStatus, ...]:
         with self._lock:
             return tuple(
@@ -73,9 +62,6 @@ class ReconnectFailureStatusService:
                     key=lambda item: (item.revision, item.message),
                 )
             )
-
-    def messages(self) -> tuple[str, ...]:
-        return tuple(item.message for item in self.snapshot())
 
     def has(self, key: object) -> bool:
         if not isinstance(key, str) or not key.strip():

@@ -12,13 +12,6 @@ SMART_RECONNECT_CAPTURE_MODES_KEY = "smart_reconnect_capture_modes"
 VISIBLE_CAPTURE_MODE = "visible"
 OBSCURED_CAPTURE_MODE = "obscured"
 MINIMIZED_CAPTURE_MODE = "minimized"
-SMART_RECONNECT_CAPTURE_MODE_KEYS = (
-    VISIBLE_CAPTURE_MODE,
-    OBSCURED_CAPTURE_MODE,
-    MINIMIZED_CAPTURE_MODE,
-)
-
-
 @dataclass(frozen=True, slots=True)
 class SmartReconnectCaptureSettings:
     """Three independently controlled ways to inspect a game window."""
@@ -53,12 +46,6 @@ class SmartReconnectCaptureSettings:
             OBSCURED_CAPTURE_MODE: self.obscured,
             MINIMIZED_CAPTURE_MODE: self.minimized,
         }
-
-    def enabled(self, mode: str) -> bool:
-        if mode not in SMART_RECONNECT_CAPTURE_MODE_KEYS:
-            return False
-        return bool(getattr(self, mode))
-
 
 class SmartReconnectCaptureSettingsService:
     """Load and atomically persist the smart-reconnect capture selection."""

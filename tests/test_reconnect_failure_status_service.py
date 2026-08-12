@@ -11,7 +11,9 @@ def test_same_role_updates_one_status_row() -> None:
     service.report("role:a", "120古")
     service.report("role:a", "120古")
 
-    assert service.messages() == ("120古－重連失敗",)
+    assert tuple(item.message for item in service.snapshot()) == (
+        "120古－重連失敗",
+    )
 
 
 def test_independent_roles_remain_independent_and_clear_on_success() -> None:
@@ -20,7 +22,9 @@ def test_independent_roles_remain_independent_and_clear_on_success() -> None:
     service.report("role:b", "120靈")
 
     assert service.clear("role:a") is True
-    assert service.messages() == ("120靈－重連失敗",)
+    assert tuple(item.message for item in service.snapshot()) == (
+        "120靈－重連失敗",
+    )
     assert service.clear("role:a") is False
 
 

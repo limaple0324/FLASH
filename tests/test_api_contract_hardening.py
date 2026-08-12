@@ -1227,7 +1227,6 @@ def test_group_choice_exposes_real_members_without_paths(tmp_path):
         )
     service = GroupSelectionService(
         registry,
-        legacy_config_path=configuration.path,
         configuration=configuration,
     )
 

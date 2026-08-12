@@ -1,8 +1,9 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from cards.history_store import CardHistoryStore
 from cards.service import CardService
-from habit.preference_models import HabitDecision
+from habit.preference_models import HabitDecision, HabitKind, PlayerHabitObservation
 from habit.preference_service import PlayerHabitPreferenceService
 from habit.preference_store import PlayerHabitStore
 from services.card_coordinator import CardCoordinator
@@ -26,8 +27,22 @@ def _ready_habits(tmp_path) -> tuple[PlayerHabitPreferenceService, datetime]:
     )
     service.set_observation_days(7)
     start = datetime(2026, 7, 1, 19, 50, tzinfo=TAIPEI)
-    for day in range(7):
-        service.record_activity_time("神秘考官", start + timedelta(days=day))
+    memory = service.snapshot()
+    service.store.save(
+        replace(
+            memory,
+            observations=tuple(
+                PlayerHabitObservation(
+                    start + timedelta(days=day),
+                    HabitKind.ACTIVITY_TIME,
+                    "神秘考官",
+                    ("19:50",),
+                )
+                for day in range(7)
+            ),
+        )
+    )
+    service = PlayerHabitPreferenceService(service.store)
     return service, start + timedelta(days=7)
 
 

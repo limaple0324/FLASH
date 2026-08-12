@@ -180,10 +180,6 @@ class SmartReconnectReplayReport:
     scenario_tags: tuple[str, ...]
     findings: tuple[ReplayFinding, ...]
 
-    @property
-    def acceptance_eligible(self) -> bool:
-        return not self.findings and self.pending_actions == 0
-
 
 @dataclass(frozen=True, slots=True)
 class ReplayCycleResult:
@@ -401,7 +397,6 @@ class SmartReconnectEvidenceRecorder:
             float(wall_clock()), timezone.utc
         ).strftime("%Y%m%dT%H%M%SZ")
         self.path = self._directory / f"{stamp}-{self._session_id}.jsonl"
-        self._source_identity = source_identity
         self._auto_battle_required = bool(auto_battle_required)
         self._sequence = 0
         self._window_ids: dict[str, str] = {}
@@ -424,7 +419,6 @@ class SmartReconnectEvidenceRecorder:
         self._window_state_restored: dict[str, bool] = {}
         self._active_external_obstacles: dict[str, set[str]] = {}
         self._pending_post_action_observations: dict[str, int] = {}
-        self._action_intents: dict[int, tuple[str, int, str, str]] = {}
         self._monitoring_enabled = False
         self._append(
             {
@@ -1002,12 +996,6 @@ class SmartReconnectEvidenceRecorder:
                 ),
             }
             self._append(payload, durable=True)
-            self._action_intents[sequence] = (
-                window_id,
-                cycle,
-                safe_state or ReconnectScreenState.UNKNOWN.value,
-                safe_action or "unknown_action",
-            )
             return sequence
 
     def record_external_obstacle(

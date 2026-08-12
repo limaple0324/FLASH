@@ -116,54 +116,6 @@ class PlayerHabitPreferenceService:
     def set_observation_days(self, days: int) -> PlayerHabitMemory:
         return self._save(settings=PlayerHabitSettings(days))
 
-    def record_activity_time(
-        self,
-        activity_id: str,
-        observed_at: datetime,
-        *,
-        is_exception: bool = False,
-        source_event_id: str | None = None,
-    ) -> PlayerHabitObservation:
-        value = observed_at.strftime("%H:%M")
-        return self._record(
-            PlayerHabitObservation(
-                observed_at=observed_at,
-                kind=HabitKind.ACTIVITY_TIME,
-                subject=activity_id,
-                values=(value,),
-                is_exception=is_exception,
-                source_event_ids=(
-                    (source_event_id.strip(),)
-                    if source_event_id is not None
-                    else ()
-                ),
-            )
-        )
-
-    def record_character_order(
-        self,
-        context_id: str,
-        character_ids: tuple[str, ...],
-        observed_at: datetime,
-        *,
-        is_exception: bool = False,
-        source_event_id: str | None = None,
-    ) -> PlayerHabitObservation:
-        return self._record(
-            PlayerHabitObservation(
-                observed_at=observed_at,
-                kind=HabitKind.CHARACTER_ORDER,
-                subject=context_id,
-                values=character_ids,
-                is_exception=is_exception,
-                source_event_ids=(
-                    (source_event_id.strip(),)
-                    if source_event_id is not None
-                    else ()
-                ),
-            )
-        )
-
     def record_activity_completion(
         self,
         activity_id: str,
@@ -233,15 +185,6 @@ class PlayerHabitPreferenceService:
             observations=retained + (activity_time, daily_order)
         )
         return activity_time, daily_order
-
-    def _record(
-        self,
-        observation: PlayerHabitObservation,
-    ) -> PlayerHabitObservation:
-        self._save(
-            observations=self._memory.observations + (observation,)
-        )
-        return observation
 
     def candidates(self, as_of: datetime) -> tuple[PlayerHabitCandidate, ...]:
         if as_of.tzinfo is None or as_of.utcoffset() is None:
@@ -418,12 +361,6 @@ class PlayerHabitPreferenceService:
             return False
         self._save(preferences=remaining)
         return True
-
-    def clear_preferences(self) -> int:
-        count = len(self._memory.preferences)
-        if count:
-            self._save(preferences=())
-        return count
 
     def remove_observation(self, observation_id: str) -> bool:
         observation_id = observation_id.strip()

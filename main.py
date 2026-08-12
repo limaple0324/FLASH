@@ -290,7 +290,6 @@ from ui.home import (
     SmartReconnectToggleViewResult,
     SyncToggleViewResult,
     UI_THEME_LABELS,
-    theme_palette,
 )
 from ui.builtin_card_preview_catalog import (
     BUILTIN_CARD_PREVIEW_PROFILE_ID,
@@ -574,10 +573,6 @@ def _normalize_window_keywords(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item.strip() for item in value if isinstance(item, str) and item.strip()]
-
-
-def _normalize_window_fingerprint(value: object) -> str | None:
-    return normalize_launch_fingerprint(value)
 
 
 def apply_smart_reconnect_snapshot_transition(
@@ -998,29 +993,6 @@ def handle_group_role_status_change(
     return progress_changes
 
 
-def _sync_scope_has_all_safe_windows(
-    expected_fingerprints: tuple[str, ...],
-    windows: tuple[WindowInfo, ...],
-) -> bool:
-    """Require one safe, unique window for every selected sync role."""
-    expected = frozenset(expected_fingerprints)
-    actual = tuple(
-        fingerprint
-        for window in windows
-        if (
-            fingerprint := normalize_launch_fingerprint(
-                window.launch_fingerprint
-            )
-        ) is not None
-    )
-    return (
-        bool(expected)
-        and len(expected) == len(expected_fingerprints)
-        and len(actual) == len(expected)
-        and frozenset(actual) == expected
-    )
-
-
 def _connected_sync_fingerprints(
     scoped_fingerprints: tuple[str, ...],
     windows: tuple[WindowInfo, ...],
@@ -1280,7 +1252,6 @@ def build_services(
     )
     group_selection_service = GroupSelectionService(
         registry,
-        legacy_config_path=group_configuration_service.path,
         configuration=group_configuration_service,
     )
     group_launch_service = GroupLaunchService(
@@ -5159,20 +5130,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             )
         return True
 
-    def change_smart_reconnect_mode(mode: str) -> bool:
-        if config is None or smart_reconnect_monitor is None:
-            return False
-        normalized = normalize_smart_reconnect_mode(mode)
-        if not smart_reconnect_monitor.set_monitor_mode(normalized):
-            return False
-        config.set(SMART_RECONNECT_MODE_KEY, normalized)
-        if logger is not None:
-            logger.info(
-                "Smart reconnect monitoring mode changed; "
-                f"mode={normalized}"
-            )
-        return True
-
     def change_smart_reconnect_status_colors(value: object) -> bool:
         if config is None or not isinstance(value, dict):
             return False
@@ -5577,16 +5534,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             if smart_reconnect_monitor is not None
             else DEFAULT_SMART_RECONNECT_INTERVAL_MS
         ),
-        smart_reconnect_mode=(
-            smart_reconnect_monitor.monitor_mode
-            if smart_reconnect_monitor is not None
-            else SMART_RECONNECT_MODE_BALANCED
-        ),
         on_smart_reconnect_interval_change=(
             change_smart_reconnect_interval
-        ),
-        on_smart_reconnect_mode_change=(
-            change_smart_reconnect_mode
         ),
         smart_reconnect_capture_modes=(
             smart_reconnect_capture_settings_service.snapshot().to_dict()

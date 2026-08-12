@@ -8,6 +8,7 @@ from tkinter import DISABLED, Button, Checkbutton, Entry, Label, TclError, Tk
 import pytest
 
 from PIL import Image
+import ui.home as home_module
 
 from core.target_window_observation import TargetWindowObservation
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
@@ -37,19 +38,14 @@ from ui.home import (
     HomeView,
     _background_crop_boxes,
     _background_region,
-    _blend_hex_color,
     _collapsed_card_title_pady,
     _contrast_ratio,
     _status_text_color,
     _contain_geometry,
-    _feature_card_content_pady,
-    _feature_card_control_offsets,
     _reordered_entry_ids,
     _safe_character_lines,
     _selected_sync_key_summary,
     _should_reset_feature_card_title,
-    _workspace_state_text,
-    theme_palette,
 )
 from workspace.models import WorkspaceState
 
@@ -411,8 +407,7 @@ def test_game_time_sidebar_has_only_title_and_current_value_at_900x620() -> None
         view._poll_game_time()
         root.update()
 
-        card = view._game_time_sidebar_card
-        assert card is not None
+        card = view._game_time_title_label.master
         visible_children = tuple(
             child
             for child in card.winfo_children()
@@ -465,8 +460,8 @@ def test_game_time_sidebar_has_only_title_and_current_value_at_900x620() -> None
         assert changes == [(250, False)]
 
         assert (
-            view._navigation_frame.winfo_rooty()
-            + view._navigation_frame.winfo_height()
+            view._navigation_buttons["home"].master.winfo_rooty()
+            + view._navigation_buttons["home"].master.winfo_height()
             <= card.winfo_rooty()
         )
         assert (
@@ -518,7 +513,7 @@ def test_current_group_page_replaces_sidebar_duplicate() -> None:
     assert '("groups", "目前組別")' in source
     assert "主控：" in source
     assert "視窗數：" in source
-    assert "_current_group_summary_text" in source
+    assert "refresh_current_group_summary" in source
 
 
 def test_failed_group_change_keeps_previous_group_selected() -> None:
@@ -554,7 +549,6 @@ def test_successful_group_change_shows_warning_message() -> None:
     )
     view.current_group_name = "甲組"
     view._group_variable = _ValueStub("乙組")
-    view._group_value_label = _ConfigureStub()
     view._group_name_entry = _EntryStub("甲組")
     messages: list[str] = []
     view._show_group_selection_message = (
@@ -1062,7 +1056,6 @@ def test_feature_cards_share_persistent_collapse_drag_and_customization() -> Non
     assert "card_id=card_id" in source
     assert 'card_id == "groups.current"' in source
     assert "_should_reset_feature_card_title" in source
-    assert "_feature_card_control_offsets" in source
     assert "on_save_feature_card_settings" in source
     assert "clear_background=bool(clear_background)" in source
     for card_id in (
@@ -1361,9 +1354,7 @@ def test_background_contain_geometry_never_crops_or_upscales() -> None:
     assert _contain_geometry((200, 100), (100, 100)) == (100, 50, 0, 25)
 
 
-def test_background_region_opacity_blends_legacy_color_over_image() -> None:
-    assert _blend_hex_color("#C9A35D", "#000000", 0) == "#000000"
-    assert _blend_hex_color("#C9A35D", "#000000", 100) == "#C9A35D"
+def test_background_geometry_keeps_contrast_and_containment() -> None:
     assert _contrast_ratio("#000000", "#FFFFFF") == 21
     assert _contain_geometry((100, 200), (100, 100)) == (50, 100, 25, 0)
     assert _contain_geometry((80, 60), (320, 240)) == (80, 60, 120, 90)
@@ -1523,16 +1514,6 @@ def test_card_title_reset_only_survives_when_default_text_is_unchanged() -> None
     assert _should_reset_feature_card_title(True, "原名稱", "原名稱")
     assert not _should_reset_feature_card_title(True, "新名稱", "原名稱")
     assert not _should_reset_feature_card_title(False, "原名稱", "原名稱")
-
-
-def test_feature_card_buttons_and_collapsed_title_keep_safe_spacing() -> None:
-    toggle_offset, settings_offset = _feature_card_control_offsets(62)
-
-    assert toggle_offset == -8
-    assert settings_offset == -76
-    assert abs(settings_offset) - abs(toggle_offset) - 62 == 6
-    assert _feature_card_content_pady(12, 37) >= 6 + 37 + 8
-    assert _feature_card_content_pady(80, 37) == 80
 
 
 def test_full_home_build_keeps_grid_and_pack_cards_safe_when_settings_toggle():
@@ -1970,27 +1951,32 @@ def test_four_player_selectable_themes_have_complete_palettes() -> None:
         "舊版金色",
         "極簡黑白",
     )
-    for name in UI_THEME_LABELS:
-        palette = theme_palette(name)
-        assert {
-            "background",
-            "surface",
-            "sidebar",
-            "sidebar_active",
-            "sidebar_group",
-            "sidebar_muted",
-            "primary",
-            "primary_hover",
-            "text",
-            "muted",
-            "border",
-            "success",
-            "warning",
-        } == set(palette)
-    assert theme_palette(None) == theme_palette("classic_gold")
-    assert theme_palette("classic_gold")["background"] == "#C9A35D"
-    assert theme_palette("classic_gold")["surface"] == "#EAD3A0"
-    assert theme_palette("classic_gold")["border"] == "#80591F"
+    try:
+        for name in UI_THEME_LABELS:
+            assert home_module._apply_theme_palette(name) == name
+            palette = home_module.UI_THEME_PALETTES[name]
+            assert {
+                "background",
+                "surface",
+                "sidebar",
+                "sidebar_active",
+                "sidebar_group",
+                "sidebar_muted",
+                "primary",
+                "primary_hover",
+                "text",
+                "muted",
+                "border",
+                "success",
+                "warning",
+            } == set(palette)
+            assert home_module.BACKGROUND == palette["background"]
+        assert home_module._apply_theme_palette(None) == "classic_gold"
+        assert home_module.BACKGROUND == "#C9A35D"
+        assert home_module.SURFACE == "#EAD3A0"
+        assert home_module.BORDER == "#80591F"
+    finally:
+        home_module._apply_theme_palette("classic_gold")
 
 
 def test_group_page_stop_sync_never_toggles_sync_on() -> None:
@@ -2030,10 +2016,16 @@ def test_character_page_uses_confirmed_note_field() -> None:
 
 
 def test_workspace_player_text_does_not_expose_ids() -> None:
-    text = _workspace_state_text(WorkspaceState(next_step="選擇組別"))
+    view = object.__new__(HomeView)
+    view.workspace_state = WorkspaceState(next_step="選擇組別")
+    view.current_group_name = None
+    view.group_entries_provider = None
+    text = view._home_overview_text()
 
     assert text == (
         "目前組別：尚未選擇\n"
+        "主控：尚未設定\n"
+        "視窗數：0\n"
         "目前活動：等待可信遊戲進度\n"
         "下一步：選擇組別"
     )

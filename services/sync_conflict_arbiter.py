@@ -41,13 +41,6 @@ class SyncOperationLease:
         self._released = True
         self._arbiter._release(self._target_id, self._operation)
 
-    def __enter__(self) -> "SyncOperationLease":
-        return self
-
-    def __exit__(self, _type, _value, _traceback) -> None:
-        self.release()
-
-
 class SyncConflictArbiter:
     """Keep the first different operation active for each unique role."""
 
@@ -56,16 +49,11 @@ class SyncConflictArbiter:
         *,
         clock: Callable[[], float] = time.time,
         on_conflict: Callable[[SyncConflictRecord], object] | None = None,
-        maximum_records: int = 1000,
     ) -> None:
-        if maximum_records <= 0:
-            raise ValueError("maximum_records must be positive.")
         self._clock = clock
         self._on_conflict = on_conflict
-        self._maximum_records = int(maximum_records)
         self._lock = threading.RLock()
         self._active: dict[str, _TargetQueue] = {}
-        self._records: list[SyncConflictRecord] = []
 
     def try_begin(
         self,
@@ -93,11 +81,6 @@ class SyncConflictArbiter:
                     operation,
                     self._clock(),
                 )
-                self._records.append(conflict)
-                if len(self._records) > self._maximum_records:
-                    del self._records[
-                        : len(self._records) - self._maximum_records
-                    ]
         if conflict is not None:
             if self._on_conflict is not None:
                 try:
@@ -120,10 +103,6 @@ class SyncConflictArbiter:
                 active.waiters.popleft().set()
             else:
                 self._active.pop(target_id, None)
-
-    def records(self) -> tuple[SyncConflictRecord, ...]:
-        with self._lock:
-            return tuple(self._records)
 
     def waiting_count(self, target_id: str) -> int:
         with self._lock:

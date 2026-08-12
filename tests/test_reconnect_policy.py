@@ -19,7 +19,6 @@ def test_confirmed_policy_uses_one_minute_unlimited_retry_without_button():
     assert policy.announcement_transition_wait_seconds == 5
     assert policy.connected_poll_seconds == 5
     assert policy.maximum_attempts is None
-    assert policy.requires_reconnect_button is False
     assert policy.announcement_close_allowed is True
 
 

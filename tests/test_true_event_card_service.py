@@ -26,7 +26,7 @@ from main import (
     build_services,
 )
 from services.app_context import AppContext
-from services.farm_timer_service import FarmTimerService
+from services.farm_timer_service import FarmPlantingConfirmed, FarmTimerService
 
 
 def _context(tmp_path):
@@ -197,4 +197,17 @@ def test_build_services_registers_real_event_and_farm_state_in_managed_data(
     assert true_events.state_path == (
         paths.data_dir() / TRUE_EVENT_CARD_STATE_FILENAME
     )
-    assert farm.state_path == paths.data_dir() / FARM_TIMER_STATE_FILENAME
+    farm.start(
+        FarmPlantingConfirmed(
+            "timer-role-a",
+            CharacterGroup(
+                "group-14",
+                "14支",
+                (Character("role-a", "120古", 120),),
+            ),
+            "role-a",
+            datetime(2026, 7, 29, 1, 0, tzinfo=timezone.utc),
+            "正確代碼",
+        )
+    )
+    assert (paths.data_dir() / FARM_TIMER_STATE_FILENAME).is_file()

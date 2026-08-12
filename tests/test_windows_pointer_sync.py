@@ -487,30 +487,6 @@ def test_only_configured_controller_can_start_pointer_sync():
     assert messages.sent == []
 
 
-def test_group_member_remains_known_when_the_configured_group_is_incomplete():
-    windows = [_window(1), _window(2), _window(99)]
-    backend = Windows(windows, foreground=1)
-    controller = WindowsPointerSyncController(
-        expected_windows=3,
-        title_keywords=("Adobe Flash Player",),
-        window_backend=backend,
-        message_backend=Messages(),
-    )
-    controller.set_allowed_fingerprints(
-        (
-            f"{1:064x}",
-            f"{2:064x}",
-            f"{3:064x}",
-        )
-    )
-
-    assert controller.source_is_eligible(1) is False
-    assert controller.source_is_group_member(1) is True
-
-    backend.foreground = 99
-    assert controller.source_is_group_member(99) is False
-
-
 def test_identity_mismatch_sends_nothing():
     windows = [_window(1), _window(2)]
     messages = Messages()

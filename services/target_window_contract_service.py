@@ -164,9 +164,6 @@ class TargetWindowContractService:
         self._scope_cache[group_name] = (resolved_signature, scope)
         return self._scope_cache[group_name]
 
-    def _scope(self, group_name: str) -> SyncScope:
-        return self._resolved_scope(group_name)[1]
-
     def snapshot(
         self,
         group_name: object,

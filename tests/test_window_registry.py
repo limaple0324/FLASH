@@ -41,7 +41,7 @@ def test_confirm_window_records_current_observation():
     assert record.process_id == 9520
     assert record.confirmed is True
     assert record.last_seen_utc
-    assert [item.character_id for item in registry.characters_for_handle(321)] == ["160-ancient"]
+    assert registry.get("160-ancient").handle == 321
 
 
 def test_multiple_characters_can_share_one_game_window():
@@ -58,7 +58,11 @@ def test_multiple_characters_can_share_one_game_window():
             health=WindowHealth.READY,
         )
 
-    residents = registry.characters_for_handle(321)
+    residents = tuple(
+        item
+        for item in registry.all()
+        if item.confirmed and item.handle == 321
+    )
     assert [item.character_id for item in residents] == [
         "character-a",
         "character-b",
@@ -92,8 +96,8 @@ def test_character_rebind_replaces_only_its_own_current_window():
 
     assert rebound.handle == 999
     assert registry.get("character-b").handle == 321
-    assert [item.character_id for item in registry.characters_for_handle(321)] == ["character-b"]
-    assert [item.character_id for item in registry.characters_for_handle(999)] == ["character-a"]
+    assert registry.get("character-a").handle == 999
+    assert registry.get("character-b").handle == 321
 
 
 def test_one_character_offline_does_not_remove_other_window_residents():
@@ -112,7 +116,11 @@ def test_one_character_offline_does_not_remove_other_window_residents():
 
     assert registry.get("character-a").handle is None
     assert registry.get("character-b").handle == 321
-    assert [item.character_id for item in registry.characters_for_handle(321)] == ["character-b"]
+    assert tuple(
+        item.character_id
+        for item in registry.all()
+        if item.confirmed and item.handle == 321
+    ) == ("character-b",)
 
 
 def test_duplicate_character_id_cannot_change_identity_silently():
@@ -121,34 +129,6 @@ def test_duplicate_character_id_cannot_change_identity_silently():
 
     with pytest.raises(ValueError):
         registry.register_character("160-ancient", "120古")
-
-
-def test_rename_keeps_identity_and_saves_previous_name_as_alias():
-    registry = WindowRegistry()
-    original = registry.register_character(None, "160古")
-
-    renamed = registry.rename_character(original.character_id, "160戰神")
-
-    assert renamed.character_id == original.character_id
-    assert renamed.display_name == "160戰神"
-    assert renamed.aliases == ("160古",)
-
-
-def test_repeated_rename_keeps_unique_alias_history():
-    registry = WindowRegistry()
-    record = registry.register_character("character-a", "160古")
-    registry.rename_character(record.character_id, "160古神")
-    renamed = registry.rename_character(record.character_id, "160戰神")
-
-    assert renamed.aliases == ("160古", "160古神")
-
-
-def test_locked_character_rejects_rename():
-    registry = WindowRegistry()
-    record = registry.register_character("main-character", "主號", locked=True)
-
-    with pytest.raises(PermissionError):
-        registry.rename_character(record.character_id, "主號改名")
 
 
 def test_invalid_window_observation_is_rejected():

@@ -29,12 +29,12 @@ from main import (
     SMART_RECONNECT_AUTO_BATTLE_ENABLED_KEY,
     SMART_RECONNECT_INTERVAL_MS_KEY,
     SMART_RECONNECT_INTERVAL_MIGRATION_KEY,
+    SMART_RECONNECT_MODE_KEY,
     SYNC_KEYS_COLLAPSED_KEY,
     TIMED_CLICK_SETTINGS_KEY,
     UI_THEME_CLASSIC_GOLD_MIGRATION_KEY,
     UI_THEME_KEY,
     _connected_sync_fingerprints,
-    _sync_scope_has_all_safe_windows,
     build_services,
     apply_auto_battle_after_game_launch,
     apply_smart_reconnect_auto_battle_setting,
@@ -55,7 +55,10 @@ from services.target_window_contract_service import (
     ResolvedTargetWindows,
     TargetWindowContractService,
 )
-from services.smart_reconnect_monitor import SmartReconnectMonitor
+from services.smart_reconnect_monitor import (
+    SMART_RECONNECT_MODE_HIGH_PERFORMANCE,
+    SmartReconnectMonitor,
+)
 from services.ungrouped_window_service import UngroupedWindowService
 from services.smart_reconnect_capture_settings_service import (
     SMART_RECONNECT_CAPTURE_MODES_KEY,
@@ -201,24 +204,6 @@ def test_registered_primary_requires_character_and_registry_identity_agreement()
         mismatched,
         (),
     ) == ()
-
-
-def test_sync_scope_requires_every_safe_window_with_matching_identity():
-    first = "a" * 64
-    second = "b" * 64
-
-    assert _sync_scope_has_all_safe_windows(
-        (first, second),
-        (_SyncWindow(first), _SyncWindow(second)),
-    )
-    assert not _sync_scope_has_all_safe_windows(
-        (first, second),
-        (_SyncWindow(first),),
-    )
-    assert not _sync_scope_has_all_safe_windows(
-        (first, second),
-        (_SyncWindow(first), _SyncWindow(first)),
-    )
 
 
 def test_partial_connected_sync_requires_controller_and_keeps_scope_order():
@@ -607,7 +592,10 @@ def test_deferred_keyboard_and_pointer_use_separate_connected_screen_gate():
         for window in synced
     }
     reconnecting: set[str] = set()
-    deferred = DeferredSyncOperationService()
+    deferred_failures = []
+    deferred = DeferredSyncOperationService(
+        on_failure=deferred_failures.append,
+    )
     backend = _InstanceWindowBackend(synced)
     messages = _InstanceMessages()
     keyboard = WindowsInputSyncController(
@@ -695,7 +683,7 @@ def test_deferred_keyboard_and_pointer_use_separate_connected_screen_gate():
         wait_until_drained()
         assert sorted(handle for handle, _key in messages.keys) == [1, 2]
         assert [item[0] for item in messages.pointers] == [2, 2]
-        assert deferred.failures() == ()
+        assert deferred_failures == []
 
         messages.keys.clear()
         messages.pointers.clear()
@@ -718,7 +706,7 @@ def test_deferred_keyboard_and_pointer_use_separate_connected_screen_gate():
         assert messages.keys == []
         assert messages.pointers == []
         assert {
-            failure.failure_code for failure in deferred.failures()
+            failure.failure_code for failure in deferred_failures
         } >= {"operation_screen_not_safe"}
     finally:
         assert keyboard.close() is True
@@ -1379,6 +1367,8 @@ def test_formal_deferred_gate_reobserves_connected_before_each_delivery(
     reconnect = AppContext.get(WindowsSmartReconnectController)
     target_service = AppContext.get(TargetWindowContractService)
     deferred = AppContext.get(DeferredSyncOperationService)
+    deferred_failures = []
+    deferred._on_failure = deferred_failures.append
     raw, synced = _shared_launcher_sync_windows(2)
     contract = ResolvedTargetWindows(
         windows=raw,
@@ -1475,14 +1465,14 @@ def test_formal_deferred_gate_reobserves_connected_before_each_delivery(
             is ReconnectScreenState.CONNECTED
         )
         screen_state["value"] = ReconnectScreenState.UNKNOWN
-        failure_count = len(deferred.failures())
+        failure_count = len(deferred_failures)
         enqueue_pair()
         process_ready_and_wait()
         assert messages.keys == []
         assert messages.pointers == []
         assert {
             failure.failure_code
-            for failure in deferred.failures()[failure_count:]
+            for failure in deferred_failures[failure_count:]
         } == {"operation_screen_not_safe"}
         assert observed[-2:] == [
             ReconnectScreenState.UNKNOWN,
@@ -1613,6 +1603,26 @@ def test_smart_reconnect_monitor_restores_saved_interval(tmp_path):
     assert config.get(SMART_RECONNECT_INTERVAL_MS_KEY) == 2750
     assert config.get(SMART_RECONNECT_INTERVAL_MIGRATION_KEY) is True
     assert monitor.monitor_interval_ms == 2750
+
+
+def test_smart_reconnect_monitor_restores_saved_service_mode(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                SMART_RECONNECT_MODE_KEY:
+                    SMART_RECONNECT_MODE_HIGH_PERFORMANCE,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    build_services(root=tmp_path)
+
+    monitor = AppContext.get(SmartReconnectMonitor)
+    assert monitor.monitor_mode == SMART_RECONNECT_MODE_HIGH_PERFORMANCE
 
 
 def test_smart_reconnect_controller_restores_saved_capture_modes(tmp_path):

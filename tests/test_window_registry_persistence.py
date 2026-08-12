@@ -7,7 +7,6 @@ from core.window_registry_store import WindowRegistryStore
 def test_registry_round_trip_preserves_identity_but_not_stale_handle(tmp_path):
     registry = WindowRegistry()
     created = registry.register_character("160", "160古")
-    registry.rename_character("160", "160戰神")
     registry.confirm_window(
         "160",
         handle=321,
@@ -22,8 +21,8 @@ def test_registry_round_trip_preserves_identity_but_not_stale_handle(tmp_path):
     restored = store.load().get("160")
 
     assert restored.character_id == created.character_id
-    assert restored.display_name == "160戰神"
-    assert restored.aliases == ("160古",)
+    assert restored.display_name == "160古"
+    assert restored.aliases == ()
     assert restored.handle is None
     assert restored.process_id == 654
     assert restored.window_class == "ShockwaveFlash"

@@ -12,8 +12,7 @@ def test_daily_activity_can_describe_guard_without_ui_rules():
         max_completions=16,
     )
 
-    assert activity.applies_to_all_characters is True
-    assert activity.applies_to("any-character") is True
+    assert activity.applicable_character_ids == ()
     assert activity.to_dict()["max_completions"] == 16
     assert activity.to_dict()["reset_rule"] == "每日00:00"
 
@@ -28,8 +27,7 @@ def test_activity_can_limit_itself_to_selected_characters():
         applicable_character_ids=("level-160-a",),
     )
 
-    assert activity.applies_to("level-160-a") is True
-    assert activity.applies_to("level-120-a") is False
+    assert activity.applicable_character_ids == ("level-160-a",)
 
 
 @pytest.mark.parametrize("maximum", [0, -1, True, 1.5])

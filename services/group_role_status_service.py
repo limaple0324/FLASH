@@ -166,7 +166,6 @@ class GroupRoleStatusService:
             raise TypeError("event_bus must be EventBus.")
         self._event_bus = event_bus
         self._lock = threading.RLock()
-        self._group_name: str | None = None
         self._rows: tuple[GroupRoleStatus, ...] = ()
         self._launching_until: dict[str, float] = {}
 
@@ -184,7 +183,6 @@ class GroupRoleStatusService:
 
     def clear_cache(self) -> None:
         with self._lock:
-            self._group_name = None
             self._rows = ()
 
     def _candidate_windows(self) -> tuple[WindowInfo, ...]:
@@ -233,13 +231,11 @@ class GroupRoleStatusService:
     def refresh(self, group_name: object) -> tuple[GroupRoleStatus, ...]:
         if not isinstance(group_name, str) or not group_name.strip():
             with self._lock:
-                self._group_name = None
                 self._rows = ()
             return ()
         plan = self._launch_service.plan(group_name.strip())
         if not plan.ready:
             with self._lock:
-                self._group_name = group_name.strip()
                 self._rows = ()
             return ()
 
@@ -326,7 +322,6 @@ class GroupRoleStatusService:
             previous = {
                 item.action_id: item.status for item in self._rows
             }
-            self._group_name = plan.group_name
             self._rows = result
         for item in result:
             previous_status = previous.get(item.action_id)

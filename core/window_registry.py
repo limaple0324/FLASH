@@ -106,25 +106,6 @@ class WindowRegistry:
         self._records[character_id] = record
         return record
 
-    def rename_character(self, character_id: str, new_display_name: str) -> CharacterWindowRecord:
-        current = self.get(character_id)
-        new_name = self._clean(new_display_name, "new_display_name")
-        if current.locked:
-            raise PermissionError("Character identity is locked; rename requires player unlock.")
-        if new_name == current.display_name:
-            return current
-        aliases = tuple(dict.fromkeys((*current.aliases, current.display_name)))
-        record = CharacterWindowRecord(
-            **{
-                **current.to_dict(),
-                "display_name": new_name,
-                "aliases": aliases,
-                "health": current.health,
-            }
-        )
-        self._records[character_id] = record
-        return record
-
     def set_note(
         self,
         character_id: str,
@@ -173,16 +154,6 @@ class WindowRegistry:
         )
         self._records[current.character_id] = record
         return record
-
-    def characters_for_handle(self, handle: int) -> tuple[CharacterWindowRecord, ...]:
-        """Return all currently confirmed characters associated with a live window."""
-        if handle <= 0:
-            return ()
-        return tuple(
-            record
-            for record in self.all()
-            if record.confirmed and record.handle == handle
-        )
 
     def confirm_window(
         self,

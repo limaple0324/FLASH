@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 from core.window_registry import WindowRegistry
 from domain.character import Character
@@ -100,23 +98,12 @@ class GroupSelectionService:
         self,
         registry: WindowRegistry,
         *,
-        legacy_config_path: Path | None = None,
         configuration: GroupConfigurationService | None = None,
     ) -> None:
         if not isinstance(registry, WindowRegistry):
             raise TypeError("registry must be WindowRegistry.")
         self._registry = registry
         self._configuration = configuration
-        self._legacy_config_path = (
-            Path(legacy_config_path)
-            if legacy_config_path is not None
-            else default_legacy_group_config_path()
-        )
-        self._legacy_active_group: str | None = None
-
-    @staticmethod
-    def _group_id(name: str) -> str:
-        return GroupConfigurationService.group_id_for_name(name)
 
     @staticmethod
     def _clean_name(value: object) -> str | None:
@@ -127,46 +114,8 @@ class GroupSelectionService:
             return None
         return name
 
-    def _legacy_groups(self) -> dict[str, int]:
-        path = self._legacy_config_path
-        if path is None or not path.exists():
-            return {}
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return {}
-        if not isinstance(payload, Mapping):
-            return {}
-
-        app_state = payload.get("app_state")
-        if isinstance(app_state, Mapping):
-            self._legacy_active_group = self._clean_name(
-                app_state.get("active_group_name")
-            )
-
-        raw_groups = payload.get("groups")
-        if not isinstance(raw_groups, list):
-            return {}
-
-        groups: dict[str, int] = {}
-        for raw_group in raw_groups:
-            if not isinstance(raw_group, Mapping):
-                continue
-            name = self._clean_name(raw_group.get("name"))
-            if name is None:
-                continue
-            launch_entries = raw_group.get("launch_entries")
-            count = len(launch_entries) if isinstance(launch_entries, list) else 0
-            groups[name] = max(groups.get(name, 0), count)
-        return groups
-
     def choices(self) -> tuple[PlayerGroupChoice, ...]:
-        legacy_counts = self._legacy_groups()
-        counts = (
-            dict(legacy_counts)
-            if self._configuration is None
-            else {}
-        )
+        counts: dict[str, int] = {}
         configured_members: dict[str, tuple[PlayerGroupMember, ...]] = {}
         configured_group_ids: dict[str, str] = {}
         if self._configuration is not None:
@@ -226,7 +175,7 @@ class GroupSelectionService:
             PlayerGroupChoice(
                 group_id=configured_group_ids.get(
                     name,
-                    self._group_id(name),
+                    GroupConfigurationService.group_id_for_name(name),
                 ),
                 name=name,
                 character_count=(
@@ -253,9 +202,6 @@ class GroupSelectionService:
         if configured is not None:
             return configured
         choices = self.choices()
-        legacy = self.find(self._legacy_active_group)
-        if legacy is not None:
-            return legacy
         return choices[0] if choices else None
 
     @staticmethod

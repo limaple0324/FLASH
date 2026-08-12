@@ -119,6 +119,14 @@ def _service(tmp_path) -> ActivityProgressService:
     return service
 
 
+def _progress(service, activity_id="farm", subject_id="character-a"):
+    return next(
+        item
+        for item in service.all()
+        if item.activity_id == activity_id and item.subject_id == subject_id
+    )
+
+
 def test_group_role_subject_resolution_requires_unique_nonempty_registered_identity():
     change = _change(ROLE_STATUS_DISCONNECTED)
     assert resolve_group_role_progress_subject_id(
@@ -184,11 +192,11 @@ def test_group_status_routes_disconnect_reconnect_closed_and_open(tmp_path):
         subject_id_resolver=resolver,
         occurred_at=disconnected_at,
     )
-    assert service.get("farm", "character-a").interruption.reason is (
+    assert _progress(service).interruption.reason is (
         ActivityInterruptionReason.DISCONNECTED
     )
     assert (
-        service.get("farm", "character-a").interruption.occurred_at
+        _progress(service).interruption.occurred_at
         == disconnected_at
     )
     route_group_role_status_to_activity_progress(
@@ -197,18 +205,18 @@ def test_group_status_routes_disconnect_reconnect_closed_and_open(tmp_path):
         subject_id_resolver=resolver,
         occurred_at=reopened_at,
     )
-    assert service.get("farm", "character-a").interruption is None
+    assert _progress(service).interruption is None
     route_group_role_status_to_activity_progress(
         _change(ROLE_STATUS_RECONNECTING),
         activity_progress_service=service,
         subject_id_resolver=resolver,
         occurred_at=reconnecting_at,
     )
-    assert service.get("farm", "character-a").interruption.reason is (
+    assert _progress(service).interruption.reason is (
         ActivityInterruptionReason.DISCONNECTED
     )
     assert (
-        service.get("farm", "character-a").interruption.occurred_at
+        _progress(service).interruption.occurred_at
         == reconnecting_at
     )
     route_group_role_status_to_activity_progress(
@@ -217,11 +225,11 @@ def test_group_status_routes_disconnect_reconnect_closed_and_open(tmp_path):
         subject_id_resolver=resolver,
         occurred_at=closed_at,
     )
-    assert service.get("farm", "character-a").interruption.reason is (
+    assert _progress(service).interruption.reason is (
         ActivityInterruptionReason.GAME_CLOSED
     )
     assert (
-        service.get("farm", "character-a").interruption.occurred_at
+        _progress(service).interruption.occurred_at
         == closed_at
     )
     route_group_role_status_to_activity_progress(
@@ -230,13 +238,13 @@ def test_group_status_routes_disconnect_reconnect_closed_and_open(tmp_path):
         subject_id_resolver=resolver,
         occurred_at=datetime(2026, 7, 11, 20, 9, tzinfo=TAIPEI_TIMEZONE),
     )
-    assert service.get("farm", "character-a").interruption is None
+    assert _progress(service).interruption is None
 
 
 def test_non_group_or_unresolved_status_does_not_change_activity_progress(tmp_path):
     """Only closing 輔 emits no game-role status, so progress stays unchanged."""
     service = _service(tmp_path)
-    before = service.get("farm", "character-a")
+    before = _progress(service)
     at = datetime(2026, 7, 11, 20, 5, tzinfo=TAIPEI_TIMEZONE)
     only_closing_fu_non_game_status_event = object()
 
@@ -264,7 +272,7 @@ def test_non_group_or_unresolved_status_does_not_change_activity_progress(tmp_pa
         subject_id_resolver=lambda _change: None,
         occurred_at=at,
     ) == ()
-    assert service.get("farm", "character-a") == before
+    assert _progress(service) == before
 
     class FailingStore(ActivityProgressStore):
         def __init__(self, path):
@@ -302,7 +310,7 @@ def test_non_group_or_unresolved_status_does_not_change_activity_progress(tmp_pa
     )
     failing_service.start("farm", "character-a", at)
     progress_changes.clear()
-    before_failed_route = failing_service.get("farm", "character-a")
+    before_failed_route = _progress(failing_service)
     failing_store.fail_saves = True
     logger = Logger()
     card_changes = []
@@ -316,7 +324,7 @@ def test_non_group_or_unresolved_status_does_not_change_activity_progress(tmp_pa
         logger=logger,
         on_role_status_card=card_changes.append,
     ) == ()
-    assert failing_service.get("farm", "character-a") == before_failed_route
+    assert _progress(failing_service) == before_failed_route
     assert progress_changes == []
     assert card_changes == [change]
     assert len(logger.messages) == 1

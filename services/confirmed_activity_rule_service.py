@@ -106,10 +106,6 @@ class ConfirmedActivityRuleService:
             self._artifact_prompts,
         ) = self._load()
 
-    @property
-    def state_path(self) -> Path | None:
-        return self._state_path
-
     def records(self) -> tuple[ConfirmedActivityRecord, ...]:
         with self._lock:
             return tuple(
@@ -120,16 +116,6 @@ class ConfirmedActivityRuleService:
         record_id = _required_text(record_id, "record_id")
         with self._lock:
             return self._records.get(record_id)
-
-    def fantasy_collection_count(self, subject_id: str, day: date) -> int:
-        subject_id = _required_text(subject_id, "subject_id")
-        if not isinstance(day, date) or isinstance(day, datetime):
-            raise TypeError("day must be date.")
-        with self._lock:
-            return self._fantasy_collections.get(
-                self._fantasy_count_key(subject_id, day),
-                0,
-            )
 
     def register_group(self, group: CharacterGroup) -> bool:
         """登記唯一目前群組；歷史活動仍保留在各自紀錄中。"""
@@ -636,25 +622,6 @@ class ConfirmedActivityRuleService:
             ConfirmedActivityRuleChange(activity, subject_id, event.observed_at)
         )
         return True
-
-    @staticmethod
-    def _latest_active_record(
-        records: Mapping[str, ConfirmedActivityRecord],
-        activity: ConfirmedActivityKind,
-        scope_id: str,
-    ) -> ConfirmedActivityRecord | None:
-        candidates = tuple(
-            record
-            for record in records.values()
-            if record.activity is activity
-            and record.scope_id == scope_id
-            and record.completed_at is None
-        )
-        return max(
-            candidates,
-            key=lambda record: record.started_at or datetime.min.replace(tzinfo=timezone.utc),
-            default=None,
-        )
 
     @staticmethod
     def _uncompleted_records(

@@ -1693,11 +1693,6 @@ def test_character_selection_match_without_level_card_yields_to_gameplay(
 
     monkeypatch.setattr(
         recognizer,
-        "_disconnect_overlay_score",
-        lambda *_args: 255.0,
-    )
-    monkeypatch.setattr(
-        recognizer,
         "_battle_context_score",
         lambda *_args: 255.0,
     )
@@ -2427,7 +2422,6 @@ def test_line_selection_complete_recent_absence_is_the_only_line_one_fallback(
     with Image.open(REFERENCE_DIR / "03_line_selection_dialog.png") as source:
         target = recognizer._line_selection_target(
             source.convert("RGB"),
-            exact_reference_match=False,
         )
 
     assert target == (1, LINE_ROUTE_CLICK_POINTS[1], False, None, 0)
@@ -2461,12 +2455,10 @@ def test_line_selection_recent_eight_scrolls_until_exact_button_is_visible(
     with Image.open(REFERENCE_DIR / "03_line_selection_dialog.png") as source:
         first = recognizer._line_selection_target(
             source.convert("RGB"),
-            exact_reference_match=False,
         )
         visible[0] = ((8, (0.5, 0.722)),)
         second = recognizer._line_selection_target(
             source.convert("RGB"),
-            exact_reference_match=False,
         )
 
     assert first == (8, None, True, "120福", -120)
@@ -2510,11 +2502,6 @@ def test_line_selection_modal_takes_priority_over_login_background(monkeypatch):
     line_reference = recognizer._reference(line_definition.filename)
     monkeypatch.setattr(
         recognizer,
-        "_disconnect_overlay_score",
-        lambda _candidate, _reference: 255.0,
-    )
-    monkeypatch.setattr(
-        recognizer,
         "_region_score",
         lambda _candidate, reference, _region: (
             8.0
@@ -2551,11 +2538,6 @@ def test_invalid_lower_score_does_not_mask_valid_connected_match(monkeypatch):
     )
     connected_reference = recognizer._reference(
         connected_definition.filename
-    )
-    monkeypatch.setattr(
-        recognizer,
-        "_disconnect_overlay_score",
-        lambda _candidate, _reference: 255.0,
     )
     monkeypatch.setattr(
         recognizer,

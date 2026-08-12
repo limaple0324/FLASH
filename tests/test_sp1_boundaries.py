@@ -2,21 +2,8 @@ from core.sp1_boundaries import (
     ExternalAdapter,
     OperationResult,
     ReconnectState,
-    RecoveryBoundary,
-    RecoveryState,
     SmartReconnectBoundary,
 )
-
-
-class FakeRecovery:
-    state = RecoveryState.IDLE
-
-    def detect(self) -> OperationResult:
-        return OperationResult(True, "no_recovery_needed")
-
-    def recover(self) -> OperationResult:
-        self.state = RecoveryState.RECOVERED
-        return OperationResult(True, "recovered")
 
 
 class FakeReconnect:
@@ -41,16 +28,12 @@ class FakeAdapter:
 
 
 def test_runtime_boundary_contracts():
-    recovery = FakeRecovery()
     reconnect = FakeReconnect()
     adapter = FakeAdapter()
 
-    assert isinstance(recovery, RecoveryBoundary)
     assert isinstance(reconnect, SmartReconnectBoundary)
     assert isinstance(adapter, ExternalAdapter)
 
-    assert recovery.detect().success is True
-    assert recovery.recover().code == "recovered"
     assert reconnect.check_connection().code == "connected"
     assert reconnect.reconnect().success is True
     assert adapter.health_check().success is True

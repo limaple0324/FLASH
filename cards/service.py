@@ -147,10 +147,6 @@ class CardService:
         with self._lock:
             return tuple(entry.card for entry in self._entries)
 
-    def _ordered_entries(self) -> list[CardLifecycle]:
-        with self._lock:
-            return self._ordered_entries_unlocked()
-
     def _ordered_entries_unlocked(self) -> list[CardLifecycle]:
         indexed = tuple(enumerate(self._entries))
         return [

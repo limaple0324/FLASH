@@ -264,11 +264,6 @@ class Win32WindowBackend:
         finally:
             kernel32.CloseHandle(handle)
 
-    def invalidate_identity_cache(self) -> None:
-        """Forget lifecycle snapshots only at an explicit configuration gate."""
-        with self._fingerprint_cache_lock:
-            self._fingerprint_cache.clear()
-
     def _resolve_cached_fingerprints(
         self,
         process_ids: Iterable[int],

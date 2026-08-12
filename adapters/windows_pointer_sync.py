@@ -1054,9 +1054,6 @@ class WindowsPointerSyncController:
             scheduled_windows=max(0, scheduled_windows),
         )
 
-    def _all_title_matching_windows(self) -> tuple[WindowInfo, ...]:
-        return self._candidate_windows()
-
     def _candidate_windows(self) -> tuple[WindowInfo, ...]:
         if self._target_windows_provider is not None:
             try:
@@ -1140,37 +1137,6 @@ class WindowsPointerSyncController:
             )
         )
 
-    def source_is_group_member(self, source_handle: int) -> bool:
-        """Identify one foreground group member without requiring a full group."""
-        if (
-            self._allowed_fingerprint_set is None
-            or self._window_backend.foreground_handle() != source_handle
-        ):
-            return False
-        all_windows = self._windows()
-        source_matches = tuple(
-            window
-            for window in all_windows
-            if window.handle == source_handle
-        )
-        if len(source_matches) != 1:
-            return False
-        fingerprint = normalize_launch_fingerprint(
-            source_matches[0].launch_fingerprint
-        )
-        if fingerprint not in self._allowed_fingerprint_set:
-            return False
-        return (
-            sum(
-                normalize_launch_fingerprint(
-                    window.launch_fingerprint
-                )
-                == fingerprint
-                for window in all_windows
-            )
-            == 1
-        )
-
     def source_must_block_physical_fallback(
         self,
         source_handle: int,
@@ -1181,7 +1147,7 @@ class WindowsPointerSyncController:
         try:
             matches = tuple(
                 window
-                for window in self._all_title_matching_windows()
+                for window in self._candidate_windows()
                 if window.handle == source_handle
             )
         except Exception:
@@ -1442,7 +1408,7 @@ class WindowsPointerSyncController:
             identity_windows = (
                 windows
                 if self._target_windows_provider is not None
-                else self._all_title_matching_windows()
+                else self._candidate_windows()
             )
             unresolved_title_identity = any(
                 not isinstance(window.process_id, int)

@@ -29,7 +29,6 @@ def test_self_check_passes_for_bootstrapped_core(tmp_path):
     assert "window.not_observed" not in checks["target_window_state"]["message"]
     assert checks["card_history"]["passed"] is True
     assert "Card history loaded" in checks["card_history"]["message"]
-    assert "not registered yet" in checks["recovery_boundary"]["message"]
     assert (
         checks["smart_reconnect_boundary"]["message"]
         == "Registered SmartReconnectBoundary implementation is valid."

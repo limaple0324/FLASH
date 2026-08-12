@@ -46,6 +46,14 @@ def _completed_definition() -> ActivityDefinition:
     )
 
 
+def _progress(service, activity_id, subject_id):
+    return next(
+        item
+        for item in service.all()
+        if item.activity_id == activity_id and item.subject_id == subject_id
+    )
+
+
 def test_service_persists_start_and_completion(tmp_path):
     path = tmp_path / "activity_progress.json"
     service = ActivityProgressService(ActivityProgressStore(path))
@@ -58,7 +66,7 @@ def test_service_persists_start_and_completion(tmp_path):
 
     assert completed.current_count == 1
     assert completed.status is ActivityStatus.STANDBY
-    assert reloaded.get("farm", "character-a") == completed
+    assert _progress(reloaded, "farm", "character-a") == completed
 
 
 def test_service_resets_registered_daily_progress_after_midnight(tmp_path):
@@ -128,9 +136,11 @@ def test_each_real_change_is_saved_before_one_event(tmp_path):
         "completion_recorded",
     ]
     assert all(isinstance(change, ActivityProgressChange) for change in changes)
-    assert ActivityProgressService(
-        ActivityProgressStore(path)
-    ).get("farm", "character-a") == changes[-1].current
+    assert _progress(
+        ActivityProgressService(ActivityProgressStore(path)),
+        "farm",
+        "character-a",
+    ) == changes[-1].current
     assert disk_snapshots[-1][0] == changes[-1].current
 
 
@@ -206,14 +216,14 @@ def test_role_interruption_updates_only_running_exact_subject_and_persists(tmp_p
 
     assert {item.activity_id for item in changed} == {"farm", "raid"}
     assert (
-        service.get("farm", "character-a").interruption.reason
+        _progress(service, "farm", "character-a").interruption.reason
         is ActivityInterruptionReason.DISCONNECTED
     )
-    assert service.get("raid", "character-a").interruption is not None
-    assert service.get("farm", "character-b").interruption is None
-    assert service.get("completed", "character-a").interruption is None
+    assert _progress(service, "raid", "character-a").interruption is not None
+    assert _progress(service, "farm", "character-b").interruption is None
+    assert _progress(service, "completed", "character-a").interruption is None
     assert (
-        reloaded.get("farm", "character-a").interruption.reason
+        _progress(reloaded, "farm", "character-a").interruption.reason
         is ActivityInterruptionReason.DISCONNECTED
     )
 
@@ -238,18 +248,18 @@ def test_open_role_clears_only_exact_subject_interruption(tmp_path):
         ActivityInterruptionReason.GAME_CLOSED,
         disconnected,
     )
-    before_reopen = service.get("farm", "character-a")
+    before_reopen = _progress(service, "farm", "character-a")
 
     changed = service.clear_interruption("character-a", reopened)
 
     assert len(changed) == 1
-    restored = service.get("farm", "character-a")
+    restored = _progress(service, "farm", "character-a")
     assert restored.status is ActivityStatus.RUNNING
     assert restored.started_at == before_reopen.started_at == started
     assert restored.current_count == before_reopen.current_count
     assert restored.period_started_on == before_reopen.period_started_on
     assert restored.interruption is None
-    assert service.get("farm", "character-b").interruption.reason is (
+    assert _progress(service, "farm", "character-b").interruption.reason is (
         ActivityInterruptionReason.GAME_CLOSED
     )
 

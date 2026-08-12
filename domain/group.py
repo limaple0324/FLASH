@@ -32,15 +32,6 @@ class CharacterGroup:
     def character_ids(self) -> tuple[str, ...]:
         return tuple(item.character_id for item in self.characters)
 
-    def add_character(self, character: Character) -> "CharacterGroup":
-        if character.character_id in self.character_ids:
-            return self
-        return CharacterGroup(
-            group_id=self.group_id,
-            name=self.name,
-            characters=(*self.characters, character),
-        )
-
     def to_dict(self) -> dict[str, object]:
         return {
             "group_id": self.group_id,

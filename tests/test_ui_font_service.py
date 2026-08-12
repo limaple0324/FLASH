@@ -6,7 +6,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from tkinter import Button, Label, TclError, Tk, font as tkfont
+from tkinter import Button, Label, OptionMenu, TclError, Tk, font as tkfont
 
 import pytest
 
@@ -561,8 +561,7 @@ def test_real_tk_900x620_all_eight_fonts_and_three_size_stages() -> None:
             view._poll_game_time()
             root.update()
 
-            game_time_card = view._game_time_sidebar_card
-            assert game_time_card is not None
+            game_time_card = view._game_time_title_label.master
             assert tuple(game_time_card.winfo_children()) == (
                 view._game_time_title_label,
                 view._game_time_value_label,
@@ -606,6 +605,14 @@ def test_real_tk_900x620_all_eight_fonts_and_three_size_stages() -> None:
                 False,
                 persist=False,
             )
+            ui_font_menu = next(
+                widget
+                for widget in _descendants(theme_card.frame)
+                if isinstance(widget, OptionMenu)
+                and str(widget.cget("textvariable"))
+                == str(view._ui_font_variable)
+            )
+            navigation_frame = view._navigation_buttons["home"].master
             all_widgets = _descendants(view._root)
             buttons = tuple(
                 widget for widget in all_widgets if isinstance(widget, Button)
@@ -754,8 +761,8 @@ def test_real_tk_900x620_all_eight_fonts_and_three_size_stages() -> None:
                         == sidebar_size
                     )
                     assert (
-                        view._navigation_frame.winfo_rooty()
-                        + view._navigation_frame.winfo_height()
+                        navigation_frame.winfo_rooty()
+                        + navigation_frame.winfo_height()
                         <= game_time_card.winfo_rooty()
                     )
                     assert (
@@ -793,12 +800,12 @@ def test_real_tk_900x620_all_eight_fonts_and_three_size_stages() -> None:
                         == content_size
                     )
                     assert (
-                        _font_actual(root, view._ui_font_menu)["size"]
+                        _font_actual(root, ui_font_menu)["size"]
                         == content_size
                     )
                     assert (
-                        view._ui_font_menu.winfo_reqwidth()
-                        <= view._ui_font_menu.winfo_width()
+                        ui_font_menu.winfo_reqwidth()
+                        <= ui_font_menu.winfo_width()
                     )
                     settings_heading = next(
                         label
@@ -817,7 +824,7 @@ def test_real_tk_900x620_all_eight_fonts_and_three_size_stages() -> None:
                 for widget in _descendants(view._root)
                 if isinstance(widget, Button)
             ) == button_commands
-            assert view._navigation_frame.winfo_children()[0] is view._navigation_buttons["home"]
+            assert navigation_frame.winfo_children()[0] is view._navigation_buttons["home"]
             assert not any(
                 isinstance(widget, Label) and widget.cget("text") == "輔"
                 for widget in view._sidebar.winfo_children()

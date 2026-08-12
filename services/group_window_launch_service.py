@@ -582,12 +582,6 @@ class GroupWindowLaunchService:
 
     def stop(self, timeout_seconds: float = 5.0) -> bool:
         self._stop_event.set()
-        return self.join(timeout_seconds=timeout_seconds)
-
-    def cancel(self, timeout_seconds: float = 5.0) -> bool:
-        return self.stop(timeout_seconds=timeout_seconds)
-
-    def join(self, timeout_seconds: float = 5.0) -> bool:
         with self._lock:
             thread = self._thread
         if thread is None:

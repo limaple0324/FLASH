@@ -55,13 +55,6 @@ class ActivityDefinition:
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "applicable_character_ids", character_ids)
 
-    @property
-    def applies_to_all_characters(self) -> bool:
-        return not self.applicable_character_ids
-
-    def applies_to(self, character_id: str) -> bool:
-        return self.applies_to_all_characters or character_id.strip() in self.applicable_character_ids
-
     def to_dict(self) -> dict[str, object]:
         return {
             "activity_id": self.activity_id,

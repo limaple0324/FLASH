@@ -20,9 +20,6 @@ class FakeKeyboardState:
         self.foreground_handle = 101
         self.down = set()
 
-    def foreground_is_game(self):
-        return self.foreground
-
     def foreground_game_handle(self):
         return self.foreground_handle if self.foreground else None
 

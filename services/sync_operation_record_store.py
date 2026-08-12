@@ -561,12 +561,6 @@ class SyncOperationRecordStore:
             written.append(path)
         return tuple(written)
 
-    def _append_daily_record(self, item: SyncOperationRecord) -> Path:
-        paths = self._append_daily_records((item,))
-        if not paths:
-            raise OSError("daily operation record was not written.")
-        return paths[0]
-
     def ensure_daily_file(self) -> Path:
         self.flush()
         now = self._now_provider().astimezone()

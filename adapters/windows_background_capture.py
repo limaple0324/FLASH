@@ -1477,21 +1477,6 @@ class Win32TemporarilyRevealedCaptureProvider:
             )
         )
 
-    @classmethod
-    def _same_process_window(
-        cls,
-        user32,
-        hwnd,
-        process_id: int,
-    ) -> bool:
-        try:
-            return bool(
-                user32.IsWindow(hwnd)
-                and cls._window_pid(user32, hwnd) == process_id
-            )
-        except OSError:
-            return False
-
     @staticmethod
     def _window_rect(user32, hwnd) -> tuple[int, int, int, int] | None:
         rect = wintypes.RECT()

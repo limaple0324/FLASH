@@ -57,18 +57,13 @@ class ActivityProgressService:
             except KeyError as exc:
                 raise KeyError(f"Unknown activity: {activity_id}") from exc
 
-    def get(self, activity_id: str, subject_id: str) -> ActivityProgress:
-        with self._lock:
-            key = (activity_id.strip(), subject_id.strip())
-            progress = self._progress.get(key)
-            if progress is None:
-                progress = ActivityProgress(activity_id=key[0], subject_id=key[1])
-            return progress
-
     def start(self, activity_id: str, subject_id: str, at: datetime) -> ActivityProgress:
         with self._lock:
             self.definition(activity_id)
-            previous = self.get(activity_id, subject_id)
+            key = (activity_id.strip(), subject_id.strip())
+            previous = self._progress.get(key) or ActivityProgress(
+                activity_id=key[0], subject_id=key[1]
+            )
             progress = previous.start(at)
             return self._replace(previous, progress, "started", at)
 
@@ -80,7 +75,10 @@ class ActivityProgressService:
     ) -> ActivityProgress:
         with self._lock:
             definition = self.definition(activity_id)
-            previous = self.get(activity_id, subject_id)
+            key = (activity_id.strip(), subject_id.strip())
+            previous = self._progress.get(key) or ActivityProgress(
+                activity_id=key[0], subject_id=key[1]
+            )
             progress = previous.record_completion(definition, at)
             return self._replace(
                 previous,

@@ -1,15 +1,13 @@
-from datetime import date, datetime
+from datetime import date
 
 import pytest
 
 from domain.activity_schedule import (
     ActivityScheduleCatalog,
-    GLOBAL_SUBJECT_ID,
     ReminderScope,
     ScheduledActivityRule,
     build_confirmed_activity_catalog,
 )
-from domain.progress import TAIPEI_TIMEZONE
 from main import build_services
 from services.activity_progress_service import ActivityProgressService
 from services.app_context import AppContext
@@ -51,14 +49,13 @@ def test_catalog_preserves_all_confirmed_timed_activity_facts():
         assert rule.local_end.strftime("%H:%M") == local_end
         assert rule.reminder_lead_minutes == 5
         assert rule.reminder_enabled is True
-        assert rule.is_ready_for_reminders is True
+        assert rule.local_start is not None
         assert rule.definition.reset_rule.value == "每日00:00"
 
     magic_soldiers = catalog.get("magic-soldiers")
     assert magic_soldiers.local_start is None
     assert magic_soldiers.local_end is None
     assert magic_soldiers.reminder_enabled is False
-    assert magic_soldiers.is_ready_for_reminders is False
 
 
 def test_sunday_1420_alternates_from_the_supplied_anchor_week():
@@ -79,15 +76,12 @@ def test_confirmed_level_restrictions_do_not_guess_other_activity_audiences():
     magic_soldiers = catalog.get("magic-soldiers")
     hall = catalog.get("hall-of-demons")
 
-    assert world_boss.level_eligibility(160) is True
-    assert world_boss.level_eligibility(120) is False
-    assert magic_soldiers.level_eligibility(120) is True
-    assert magic_soldiers.level_eligibility(160) is True
-    assert magic_soldiers.level_eligibility(100) is False
+    assert world_boss.eligible_levels == (160,)
+    assert magic_soldiers.eligible_levels == (120, 160)
     assert magic_soldiers.local_start is None
-    assert magic_soldiers.is_ready_for_reminders is False
-    assert hall.level_eligibility(160) is None
-    assert hall.is_ready_for_reminders is True
+    assert hall.eligible_levels == ()
+    assert hall.reminder_enabled is True
+    assert hall.local_start is not None
     assert hall.reminder_scope is ReminderScope.UNCONFIRMED
 
 
@@ -96,25 +90,8 @@ def test_mystery_examiner_is_one_shared_daily_subject():
 
     assert rule.reminder_scope is ReminderScope.GLOBAL_ONCE
     assert rule.definition.max_completions == 1
-    assert rule.progress_subject_id("ignored-character") == GLOBAL_SUBJECT_ID
-    assert rule.is_ready_for_reminders is True
-
-
-def test_unconfirmed_subject_scope_fails_closed():
-    rule = build_confirmed_activity_catalog().get("world-boss")
-
-    with pytest.raises(ValueError, match="not confirmed"):
-        rule.progress_subject_id("level-160-character")
-
-
-def test_next_timed_activity_uses_taipei_time_and_skips_untimed_requirement():
-    catalog = build_confirmed_activity_catalog()
-    after = datetime(2026, 7, 26, 14, 10, tzinfo=TAIPEI_TIMEZONE)
-
-    occurrence, rule = catalog.next_timed_after(after)
-
-    assert occurrence == datetime(2026, 7, 26, 14, 20, tzinfo=TAIPEI_TIMEZONE)
-    assert rule.activity_id == "fantasy-realm-alternating-1420"
+    assert rule.reminder_enabled is True
+    assert rule.local_start is not None
 
 
 def test_build_services_registers_catalog_and_all_progress_definitions(tmp_path):

@@ -109,7 +109,6 @@ def test_red_x_requires_current_full_image_box_in_approved_search_area() -> None
     evidence = recognizer.read(full)
     assert evidence.disabled
     assert evidence.red_x_box == (810, 500, 875, 571)
-    assert evidence.red_x_center == (842.5, 535.5)
     outside = Image.new("RGB", (900, 600), "#112233")
     outside.paste(template, (200, 100))
     assert not recognizer.read(outside).disabled
@@ -730,7 +729,6 @@ def test_private_battle_auto_button_source_has_exact_hash_and_box() -> None:
     assert evidence.enabled is False
     assert evidence.disabled is False
     assert evidence.battle_button_box == (1148, 498, 1272, 546)
-    assert evidence.battle_button_center == (1210.0, 522.0)
 
 
 @pytest.mark.parametrize(

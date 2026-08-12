@@ -104,7 +104,6 @@ def test_each_character_matures_independently_at_exactly_forty_minutes(tmp_path)
     )
     assert len(overnight_mature) == 1
     assert overnight_mature[0].card_id == overnight_timer.card_id
-    assert overnight_service.timers()[0].timer_id == overnight_timer.timer_id
 
 
 def test_maturity_priority_and_loss_stages_update_the_same_card(tmp_path):
@@ -170,7 +169,6 @@ def test_timer_state_survives_restart_without_repeating_same_stage(tmp_path):
     elevated = reloaded.poll(planted_at + timedelta(minutes=50))
     assert len(elevated) == 1
     assert elevated[0].priority_reason is CardPriorityReason.TIME_LIMIT
-    assert len(reloaded.timers()) == 1
 
 
 def test_unconfirmed_or_empty_code_is_rejected_before_timer_exists(tmp_path):
@@ -190,7 +188,7 @@ def test_unconfirmed_or_empty_code_is_rejected_before_timer_exists(tmp_path):
     else:
         raise AssertionError("empty code must be rejected")
 
-    assert service.timers() == ()
+    assert not (tmp_path / "farm.json").exists()
 
 
 def test_game_close_pauses_farm_but_disconnect_does_not_and_reopen_reemits_stage(
@@ -237,13 +235,16 @@ def test_poll_keeps_all_timers_and_cards_unchanged_when_one_atomic_save_fails(
     def fail_save(_timers):
         raise OSError("save failed")
 
+    original_save = service._save
     monkeypatch.setattr(service, "_save", fail_save)
     with pytest.raises(OSError):
         service.poll(planted_at + timedelta(minutes=40))
 
-    assert [timer.emitted_stage for timer in service.timers()] == [
-        "等待中",
-        "等待中",
-    ]
     assert cards.cards == ()
     assert [entry[2] for entry in records] == ["已開始獨立計時", "已開始獨立計時"]
+    monkeypatch.setattr(service, "_save", original_save)
+    retried = service.poll(planted_at + timedelta(minutes=40))
+    assert {card.affected_character_ids for card in retried} == {
+        ("role-a",),
+        ("role-b",),
+    }

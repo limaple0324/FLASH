@@ -11,7 +11,6 @@ from domain.progress import TAIPEI_TIMEZONE
 
 
 ALL_WEEKDAYS = tuple(range(7))
-GLOBAL_SUBJECT_ID = "global"
 
 
 class ReminderScope(str, Enum):
@@ -94,14 +93,6 @@ class ScheduledActivityRule:
     def activity_id(self) -> str:
         return self.definition.activity_id
 
-    @property
-    def is_timed(self) -> bool:
-        return self.local_start is not None
-
-    @property
-    def is_ready_for_reminders(self) -> bool:
-        return self.reminder_enabled and self.local_start is not None
-
     def occurs_on(self, local_date: date) -> bool:
         if local_date.weekday() not in self.weekdays:
             return False
@@ -134,24 +125,6 @@ class ScheduledActivityRule:
         if self.local_end is None:
             return start
         return f"{start}–{self.local_end.strftime('%H:%M')}"
-
-    def level_eligibility(self, level: int) -> bool | None:
-        if isinstance(level, bool) or not isinstance(level, int) or level <= 0:
-            raise ValueError("level must be a positive integer.")
-        if self.eligible_levels:
-            return level in self.eligible_levels
-        if self.reminder_scope is ReminderScope.GLOBAL_ONCE:
-            return True
-        return None
-
-    def progress_subject_id(self, subject_id: str | None = None) -> str:
-        if self.reminder_scope is ReminderScope.GLOBAL_ONCE:
-            return GLOBAL_SUBJECT_ID
-        if self.reminder_scope is ReminderScope.UNCONFIRMED:
-            raise ValueError("Participation scope is not confirmed.")
-        if subject_id is None or not subject_id.strip():
-            raise ValueError("subject_id is required for per-subject progress.")
-        return subject_id.strip()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -192,22 +165,6 @@ class ActivityScheduleCatalog:
 
     def due_on(self, local_date: date) -> tuple[ScheduledActivityRule, ...]:
         return tuple(rule for rule in self._rules if rule.occurs_on(local_date))
-
-    def next_timed_after(self, after: datetime) -> tuple[datetime, ScheduledActivityRule]:
-        if after.tzinfo is None or after.utcoffset() is None:
-            raise ValueError("after must include timezone information.")
-        local_after = after.astimezone(TAIPEI_TIMEZONE)
-        candidates: list[tuple[datetime, ScheduledActivityRule]] = []
-        for offset in range(0, 22):
-            local_date = local_after.date() + timedelta(days=offset)
-            for rule in self._rules:
-                occurrence = rule.occurrence_on(local_date)
-                if occurrence is not None and occurrence > local_after:
-                    candidates.append((occurrence, rule))
-            if candidates:
-                return min(candidates, key=lambda item: (item[0], item[1].activity_id))
-        raise RuntimeError("No timed activity found in the supported schedule horizon.")
-
 
 def _activity(
     activity_id: str,
