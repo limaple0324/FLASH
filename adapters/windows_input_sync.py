@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import ctypes
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
@@ -20,7 +21,12 @@ from adapters.windows_launch_fingerprint import (
     PowerShellLaunchFingerprintResolver,
     normalize_launch_fingerprint,
 )
-from adapters.windows_window import Win32WindowBackend, WindowBackend, WindowInfo
+from adapters.windows_window import (
+    Win32WindowBackend,
+    WindowBackend,
+    WindowInfo,
+    complete_window_instance_identity,
+)
 from domain.game_shortcuts import GAME_SHORTCUT_BY_KEY
 from domain.sync_target_settings import SyncTargetSettings
 from services.sync_conflict_arbiter import SyncConflictArbiter
@@ -346,6 +352,9 @@ class WindowsInputSyncController:
         screen_state_provider: (
             Callable[[str], ReconnectScreenState | None] | None
         ) = None,
+        deferred_screen_state_provider: (
+            Callable[[str], ReconnectScreenState | None] | None
+        ) = None,
         target_windows_provider: (
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
@@ -370,12 +379,18 @@ class WindowsInputSyncController:
         self._preflight_timeout_ms = max(1, int(preflight_timeout_ms))
         self._allowed_fingerprints: tuple[str, ...] | None = None
         self._allowed_fingerprint_set: frozenset[str] | None = None
+        self._allowed_instance_identities: dict[str, tuple[object, ...]] | None = None
         self._controller_fingerprint: str | None = None
         self._conflict_arbiter = conflict_arbiter
         self._deferred_service = deferred_service
         self._reconnecting_provider = reconnecting_provider or (lambda: ())
         self._role_operation_callback = role_operation_callback
         self._screen_state_provider = screen_state_provider
+        self._deferred_screen_state_provider = (
+            deferred_screen_state_provider
+            if deferred_screen_state_provider is not None
+            else screen_state_provider
+        )
         self._target_windows_provider = target_windows_provider
         self._operation_gate = operation_gate
         self._target_settings: dict[str, SyncTargetSettings] = {}
@@ -433,6 +448,7 @@ class WindowsInputSyncController:
         if fingerprints is None:
             self._allowed_fingerprints = None
             self._allowed_fingerprint_set = None
+            self._allowed_instance_identities = None
             self._controller_fingerprint = None
             self._target_settings = {}
             self.invalidate_scheduled()
@@ -456,6 +472,7 @@ class WindowsInputSyncController:
         )
         self._allowed_fingerprints = ordered
         self._allowed_fingerprint_set = frozenset(ordered)
+        self._allowed_instance_identities = None
         if self._controller_fingerprint not in self._allowed_fingerprint_set:
             self._controller_fingerprint = None
         self._target_settings = {
@@ -464,6 +481,36 @@ class WindowsInputSyncController:
             if fingerprint in self._allowed_fingerprint_set
         }
         self.invalidate_scheduled()
+
+    def set_allowed_window_instances(
+        self,
+        windows: Iterable[WindowInfo] | None,
+    ) -> None:
+        """Configure only a complete, current set of target instances."""
+
+        if windows is None:
+            self.set_allowed_fingerprints(None)
+            return
+        identities: dict[str, tuple[object, ...]] = {}
+        for window in tuple(windows):
+            identity = complete_window_instance_identity(window)
+            if identity is None:
+                raise ValueError("window instances must be complete and unique")
+            fingerprint = identity[0]
+            if fingerprint in identities or identity in identities.values():
+                raise ValueError("window instances must be complete and unique")
+            identities[fingerprint] = identity
+        if not identities:
+            raise ValueError("window instances must be complete and unique")
+        self.set_allowed_fingerprints(tuple(identities))
+        self._allowed_instance_identities = identities
+
+    def _configured_instance_is_current(self, window: WindowInfo) -> bool:
+        configured = self._allowed_instance_identities
+        if configured is None:
+            return True
+        identity = complete_window_instance_identity(window)
+        return identity is not None and configured.get(identity[0]) == identity
 
     def set_target_settings(
         self,
@@ -531,6 +578,9 @@ class WindowsInputSyncController:
         screen_state_provider: (
             Callable[[str], ReconnectScreenState | None] | None
         ) = None,
+        deferred_screen_state_provider: (
+            Callable[[str], ReconnectScreenState | None] | None
+        ) = None,
         window_backend: WindowBackend | None = None,
         target_windows_provider: (
             Callable[[], Iterable[WindowInfo]] | None
@@ -553,6 +603,7 @@ class WindowsInputSyncController:
             reconnecting_provider=reconnecting_provider,
             role_operation_callback=role_operation_callback,
             screen_state_provider=screen_state_provider,
+            deferred_screen_state_provider=deferred_screen_state_provider,
             target_windows_provider=target_windows_provider,
             operation_gate=operation_gate,
             require_expected_window_count=require_expected_window_count,
@@ -581,18 +632,18 @@ class WindowsInputSyncController:
         normalized_key: str,
         virtual_keys: tuple[int, ...],
     ) -> bool:
-        if (
-            self._screen_state_provider is None
-            or self._screen_state_provider(fingerprint)
-            is not ReconnectScreenState.CONNECTED
-        ):
-            return False
         matches = tuple(
             window
-            for window in self._all_title_matching_windows()
+            for window in self._matching_windows()
             if normalize_launch_fingerprint(window.launch_fingerprint)
             == fingerprint
         )
+        if (
+            self._deferred_screen_state_provider is None
+            or self._deferred_screen_state_provider(fingerprint)
+            is not ReconnectScreenState.CONNECTED
+        ):
+            return False
         if len(matches) != 1:
             return False
         window = matches[0]
@@ -682,6 +733,12 @@ class WindowsInputSyncController:
                     return
             except Exception:
                 return
+        matches = tuple(
+            window
+            for window in self._matching_windows()
+            if normalize_launch_fingerprint(window.launch_fingerprint)
+            == fingerprint
+        )
         if (
             self._screen_state_provider is not None
             and self._screen_state_provider(fingerprint)
@@ -716,12 +773,6 @@ class WindowsInputSyncController:
                 "延遲到期時斷線，等待重連後補做",
             )
             return
-        matches = tuple(
-            window
-            for window in self._all_title_matching_windows()
-            if normalize_launch_fingerprint(window.launch_fingerprint)
-            == fingerprint
-        )
         if len(matches) != 1:
             self._record_role_operation(
                 fingerprint,
@@ -792,7 +843,25 @@ class WindowsInputSyncController:
                 or normalize_launch_fingerprint(window.launch_fingerprint)
                 in self._allowed_fingerprint_set
             )
+            and self._configured_instance_is_current(window)
         )
+        if self._allowed_instance_identities is not None:
+            identity_counts = Counter(
+                complete_window_instance_identity(window)[0]
+                for window in windows
+                if complete_window_instance_identity(window) is not None
+            )
+            handle_counts = Counter(window.handle for window in windows)
+            windows = tuple(
+                window
+                for window in windows
+                if (
+                    (identity := complete_window_instance_identity(window))
+                    is not None
+                    and identity_counts[identity[0]] == 1
+                    and handle_counts[window.handle] == 1
+                )
+            )
         order = (
             {
                 fingerprint: index
@@ -827,9 +896,21 @@ class WindowsInputSyncController:
     def _candidate_windows(self) -> tuple[WindowInfo, ...]:
         if self._target_windows_provider is not None:
             try:
-                return tuple(self._target_windows_provider())
+                windows = tuple(self._target_windows_provider())
             except Exception:
                 return ()
+            if (
+                self._controller_fingerprint is not None
+                and (
+                    not windows
+                    or normalize_launch_fingerprint(
+                        windows[0].launch_fingerprint
+                    )
+                    != self._controller_fingerprint
+                )
+            ):
+                return ()
+            return windows
         return tuple(
             window
             for window in self._window_backend.list_windows()
@@ -1051,9 +1132,13 @@ class WindowsInputSyncController:
             and not isinstance(window.process_id, bool)
             and window.process_id > 0
         ]
-        process_identity_valid = not (
-            len(process_ids) != len(windows)
-            or len(set(process_ids)) != len(process_ids)
+        process_identity_valid = (
+            all(self._configured_instance_is_current(window) for window in windows)
+            if self._allowed_instance_identities is not None
+            else not (
+                len(process_ids) != len(windows)
+                or len(set(process_ids)) != len(process_ids)
+            )
         )
         if not process_identity_valid:
             failures.append("process_identity_missing_or_duplicate")
@@ -1098,6 +1183,11 @@ class WindowsInputSyncController:
         )
         unresolved_title_identity = False
         if partial_reconnect_candidate:
+            identity_windows = (
+                windows
+                if self._target_windows_provider is not None
+                else self._all_title_matching_windows()
+            )
             unresolved_title_identity = any(
                 not isinstance(window.process_id, int)
                 or isinstance(window.process_id, bool)
@@ -1106,7 +1196,7 @@ class WindowsInputSyncController:
                     window.launch_fingerprint
                 )
                 is None
-                for window in self._all_title_matching_windows()
+                for window in identity_windows
             )
         safe_partial_reconnect = (
             partial_reconnect_candidate

@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from collections import Counter
+from dataclasses import dataclass, replace
+from hashlib import sha256
+from pathlib import Path
 
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
-from adapters.windows_window import WindowBackend, WindowInfo
+from adapters.windows_window import (
+    WindowBackend,
+    WindowInfo,
+    complete_window_instance_identity,
+    monitored_window_instance_fingerprint,
+)
 from core.target_window_contract import (
     TargetWindowContract,
     TargetWindowPhase,
@@ -16,7 +25,7 @@ from services.group_configuration_service import (
     GroupConfigurationEntry,
     GroupConfigurationService,
 )
-from services.sync_scope_service import SyncScopeService
+from services.sync_scope_service import SyncScope, SyncScopeService
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +35,10 @@ class ResolvedTargetWindows:
     windows: tuple[WindowInfo, ...]
     failure_codes: tuple[str, ...] = ()
     blocked_fingerprints: frozenset[str] = frozenset()
+    sync_windows: tuple[WindowInfo, ...] = ()
+    sync_entry_ids: tuple[str, ...] = ()
+    sync_scope_entry_ids: tuple[str, ...] = ()
+    sync_controller_entry_id: str | None = None
 
 
 class TargetWindowContractService:
@@ -53,30 +66,113 @@ class TargetWindowContractService:
             raise ValueError("title_keywords must not be empty.")
         self._scope_cache: dict[
             str,
-            tuple[tuple[int, int] | None, object],
+            tuple[tuple[object, ...], SyncScope],
         ] = {}
 
-    def _scope(self, group_name: str):
+    @staticmethod
+    def _file_evidence(path: Path) -> tuple[object, ...]:
+        candidate = Path(path)
         try:
-            stat = self._configuration.path.stat()
-            signature: tuple[int, int] | None = (
-                stat.st_mtime_ns,
-                stat.st_size,
+            with candidate.open("rb") as stream:
+                before = os.fstat(stream.fileno())
+                resolved_path = str(candidate.resolve(strict=True))
+                digest = sha256()
+                for chunk in iter(lambda: stream.read(65536), b""):
+                    digest.update(chunk)
+                after = os.fstat(stream.fileno())
+        except OSError as error:
+            return (
+                str(candidate),
+                False,
+                type(error).__name__,
+                getattr(error, "errno", None),
+                getattr(error, "winerror", None),
             )
-        except OSError:
-            signature = None
-        cached = self._scope_cache.get(group_name)
-        if cached is not None and cached[0] == signature:
-            return cached[1]
+        return (
+            str(candidate),
+            resolved_path,
+            True,
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+            digest.hexdigest(),
+        )
+
+    def _scope_signature(
+        self,
+        shortcut_paths: tuple[Path, ...],
+    ) -> tuple[object, ...]:
+        return (
+            GroupConfigurationService.SCHEMA_VERSION,
+            self._file_evidence(self._configuration.path),
+            tuple(
+                self._file_evidence(path)
+                for path in shortcut_paths
+            ),
+        )
+
+    def _resolved_scope(
+        self,
+        group_name: str,
+    ) -> tuple[tuple[object, ...], SyncScope]:
+        inputs = self._scope_service.inputs(group_name)
+        observed_signature = self._scope_signature(inputs.shortcut_paths)
+        try:
+            cached = self._scope_cache[group_name]
+        except KeyError:
+            cached = None
+        if (
+            cached is not None
+            and cached[0] == observed_signature
+            and cached[1].controller_entry_id == inputs.controller_entry_id
+            and cached[1].entry_ids == inputs.entry_ids
+            and cached[1].shortcut_paths == inputs.shortcut_paths
+        ):
+            return cached
+
         scope = self._scope_service.scope(group_name)
-        self._scope_cache[group_name] = (signature, scope)
-        return scope
+        resolved_signature = self._scope_signature(scope.shortcut_paths)
+        if (
+            observed_signature != resolved_signature
+            or scope.controller_entry_id != inputs.controller_entry_id
+            or scope.entry_ids != inputs.entry_ids
+            or scope.shortcut_paths != inputs.shortcut_paths
+        ):
+            return (
+                resolved_signature,
+                replace(
+                    scope,
+                    failure_codes=tuple(
+                        dict.fromkeys(
+                            (
+                                *scope.failure_codes,
+                                "scope_evidence_changed_during_resolution",
+                            )
+                        )
+                    ),
+                ),
+            )
+        self._scope_cache[group_name] = (resolved_signature, scope)
+        return self._scope_cache[group_name]
+
+    def _scope(self, group_name: str) -> SyncScope:
+        return self._resolved_scope(group_name)[1]
 
     def snapshot(
         self,
         group_name: object,
         *,
         expanded_sync_scope: bool = True,
+        _resolved_scope: tuple[tuple[object, ...], SyncScope] | None = None,
     ) -> TargetWindowSnapshot:
         if not isinstance(group_name, str) or not group_name.strip():
             return TargetWindowSnapshot(
@@ -106,9 +202,15 @@ class TargetWindowContractService:
                 entry_candidates.setdefault(entry.entry_id, []).append(
                     (configured_group.name, entry)
                 )
-        scope = self._scope(name)
+        scope_signature, scope = (
+            _resolved_scope
+            if _resolved_scope is not None
+            else self._resolved_scope(name)
+        )
         if scope.ready:
-            fingerprint_by_id = dict(zip(scope.entry_ids, scope.fingerprints))
+            fingerprint_by_id = dict(
+                zip(scope.entry_ids, scope.entry_fingerprints)
+            )
             selected_ids = (
                 scope.entry_ids
                 if expanded_sync_scope
@@ -215,6 +317,19 @@ class TargetWindowContractService:
                 character_identity_ambiguous,
             ) in resolved_entries
         )
+        if self._scope_signature(scope.shortcut_paths) != scope_signature:
+            return TargetWindowSnapshot(
+                TargetWindowSnapshot.SCHEMA_VERSION,
+                name,
+                failure_codes=tuple(
+                    dict.fromkeys(
+                        (
+                            *snapshot_failures,
+                            "scope_evidence_changed_during_snapshot",
+                        )
+                    )
+                ),
+            )
         if len(targets) != len(selected_ids):
             snapshot_failures = tuple(
                 dict.fromkeys((*snapshot_failures, "target_entry_unresolved"))
@@ -248,82 +363,173 @@ class TargetWindowContractService:
         expanded_sync_scope: bool = True,
     ) -> ResolvedTargetWindows:
         """Keep uniquely resolved open roles while isolating unsafe siblings."""
+        normalized_group_name = (
+            group_name.strip()
+            if isinstance(group_name, str) and group_name.strip()
+            else ""
+        )
+        resolved_scope = (
+            self._resolved_scope(normalized_group_name)
+            if normalized_group_name
+            else (
+                (),
+                SyncScope(
+                    "",
+                    failure_codes=("group_name_invalid",),
+                ),
+            )
+        )
         snapshot = self.snapshot(
             group_name,
             expanded_sync_scope=expanded_sync_scope,
+            _resolved_scope=(resolved_scope if normalized_group_name else None),
         )
         failures = list(snapshot.failure_codes)
         for target in snapshot.targets:
             failures.extend(target.failure_codes)
+        scope = resolved_scope[1]
+        safe_pairs: list[tuple[str, WindowInfo, str]] = []
+        scoped_resolution = (
+            scope.ready
+            and len(snapshot.targets) == len(scope.entry_ids)
+        )
+        if scoped_resolution:
+            for entry_id, target in zip(scope.entry_ids, snapshot.targets):
+                window = self._safe_window_for_target(target)
+                if window is None:
+                    continue
+                monitor_fingerprint = monitored_window_instance_fingerprint(
+                    window
+                )
+                if monitor_fingerprint is None:
+                    continue
+                safe_pairs.append((entry_id, window, monitor_fingerprint))
+
+        if safe_pairs:
+            handles = Counter(window.handle for _entry, window, _id in safe_pairs)
+            stable_instances = Counter(
+                complete_window_instance_identity(window)[:6]
+                for _entry, window, _id in safe_pairs
+                if complete_window_instance_identity(window) is not None
+            )
+            monitor_ids = Counter(
+                monitor_fingerprint
+                for _entry, _window, monitor_fingerprint in safe_pairs
+            )
+            conflicts = {
+                entry_id
+                for entry_id, window, monitor_fingerprint in safe_pairs
+                if (
+                    handles[window.handle] != 1
+                    or complete_window_instance_identity(window) is None
+                    or stable_instances[
+                        complete_window_instance_identity(window)[:6]
+                    ] != 1
+                    or monitor_ids[monitor_fingerprint] != 1
+                )
+            }
+            if conflicts:
+                failures.append("window_identity_duplicate")
+            safe_pairs = [
+                item for item in safe_pairs if item[0] not in conflicts
+            ]
+
+        if scoped_resolution:
+            windows = tuple(window for _entry, window, _id in safe_pairs)
+            controller_is_safe = any(
+                entry_id == scope.controller_entry_id
+                for entry_id, _window, _identity in safe_pairs
+            )
+            if controller_is_safe:
+                sync_windows = tuple(
+                    replace(window, launch_fingerprint=monitor_fingerprint)
+                    for _entry, window, monitor_fingerprint in safe_pairs
+                )
+                sync_entry_ids = tuple(
+                    entry_id for entry_id, _window, _id in safe_pairs
+                )
+            else:
+                sync_windows = ()
+                sync_entry_ids = ()
+        else:
+            windows = self._safe_windows(snapshot)
+            sync_windows = ()
+            sync_entry_ids = ()
+
+        safe_source_fingerprints = {
+            fingerprint
+            for window in windows
+            if (
+                fingerprint := normalize_launch_fingerprint(
+                    window.launch_fingerprint
+                )
+            ) is not None
+        }
         blocked_fingerprints = frozenset(
             target.fingerprint
             for target in snapshot.targets
             if target.fingerprint is not None
             and target.failure_codes
             and target.failure_codes != ("window_offline",)
+            and target.fingerprint not in safe_source_fingerprints
         )
         return ResolvedTargetWindows(
-            self._safe_windows(snapshot),
-            tuple(dict.fromkeys(failures)),
-            blocked_fingerprints,
+            windows=windows,
+            failure_codes=tuple(dict.fromkeys(failures)),
+            blocked_fingerprints=blocked_fingerprints,
+            sync_windows=sync_windows,
+            sync_entry_ids=sync_entry_ids,
+            sync_scope_entry_ids=(
+                tuple(scope.entry_ids) if scope.ready else ()
+            ),
+            sync_controller_entry_id=(
+                scope.controller_entry_id if scope.ready else None
+            ),
         )
 
     @staticmethod
     def _has_complete_window_instance(window: WindowInfo) -> bool:
+        return complete_window_instance_identity(window) is not None
+
+    @staticmethod
+    def _safe_window_for_target(target: TargetWindowContract) -> WindowInfo | None:
+        if (
+            not target.safe
+            or target.handle is None
+            or target.rect is None
+            or target.fingerprint is None
+        ):
+            return None
+        window = WindowInfo(
+            handle=target.handle,
+            title="",
+            visible=target.visible,
+            minimized=target.phase is TargetWindowPhase.MINIMIZED,
+            rect=target.rect,
+            process_id=target.process_id,
+            launch_fingerprint=target.fingerprint,
+            thread_id=target.thread_id,
+            window_class=target.window_class,
+            process_lifecycle_token=target.process_lifecycle_token,
+        )
         return (
-            isinstance(window.handle, int)
-            and not isinstance(window.handle, bool)
-            and window.handle > 0
-            and isinstance(window.process_id, int)
-            and not isinstance(window.process_id, bool)
-            and window.process_id > 0
-            and isinstance(window.thread_id, int)
-            and not isinstance(window.thread_id, bool)
-            and window.thread_id > 0
-            and isinstance(window.window_class, str)
-            and bool(window.window_class.strip())
-            and isinstance(window.process_lifecycle_token, int)
-            and not isinstance(window.process_lifecycle_token, bool)
-            and window.process_lifecycle_token > 0
-            and isinstance(window.rect, tuple)
-            and len(window.rect) == 4
-            and all(
-                isinstance(value, int) and not isinstance(value, bool)
-                for value in window.rect
-            )
-            and type(window.minimized) is bool
+            window
+            if TargetWindowContractService._has_complete_window_instance(window)
+            else None
         )
 
     @staticmethod
     def _safe_windows(
         snapshot: TargetWindowSnapshot,
     ) -> tuple[WindowInfo, ...]:
-        windows = tuple(
-            WindowInfo(
-                handle=target.handle,
-                title="",
-                visible=target.visible,
-                minimized=target.phase is TargetWindowPhase.MINIMIZED,
-                rect=target.rect,
-                process_id=target.process_id,
-                launch_fingerprint=target.fingerprint,
-                thread_id=target.thread_id,
-                window_class=target.window_class,
-                process_lifecycle_token=(
-                    target.process_lifecycle_token
-                ),
-            )
-            for target in snapshot.safe_targets
-            if target.handle is not None
-            and target.rect is not None
-            and target.fingerprint is not None
-        )
         return tuple(
             window
-            for window in windows
-            if TargetWindowContractService._has_complete_window_instance(
-                window
-            )
+            for target in snapshot.safe_targets
+            if (
+                window := TargetWindowContractService._safe_window_for_target(
+                    target
+                )
+            ) is not None
         )
 
     def _resolve_entry(
@@ -361,8 +567,40 @@ class TargetWindowContractService:
             failures = ("window_offline",)
             phase = TargetWindowPhase.OFFLINE
         elif len(matches) != 1:
-            failures = ("window_identity_duplicate",)
-            phase = TargetWindowPhase.UNKNOWN
+            confirmed_matches = tuple(
+                candidate
+                for candidate in matches
+                if (
+                    record is not None
+                    and record.confirmed is True
+                    and record.group == group_name
+                    and isinstance(record.handle, int)
+                    and not isinstance(record.handle, bool)
+                    and record.handle > 0
+                    and isinstance(record.process_id, int)
+                    and not isinstance(record.process_id, bool)
+                    and record.process_id > 0
+                    and isinstance(record.window_class, str)
+                    and bool(record.window_class.strip())
+                    and candidate.handle == record.handle
+                    and candidate.process_id == record.process_id
+                    and candidate.window_class == record.window_class
+                )
+            )
+            if len(confirmed_matches) != 1:
+                failures = ("window_identity_duplicate",)
+                phase = TargetWindowPhase.UNKNOWN
+            else:
+                window = confirmed_matches[0]
+                if not self._has_complete_window_instance(window):
+                    failures = ("window_instance_incomplete",)
+                    phase = TargetWindowPhase.UNKNOWN
+                elif window.minimized:
+                    phase = TargetWindowPhase.MINIMIZED
+                elif window.handle == foreground_handle:
+                    phase = TargetWindowPhase.FOREGROUND
+                else:
+                    phase = TargetWindowPhase.BACKGROUND
         else:
             window = matches[0]
             if not self._has_complete_window_instance(window):

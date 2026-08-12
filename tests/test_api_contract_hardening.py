@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from dataclasses import replace
 
 from adapters.windows_input_sync import (
@@ -17,7 +18,7 @@ from cards.priority import CardPriorityReason
 from cards.service import CardService
 from config.config_manager import ConfigManager
 from core.target_window_contract import TargetWindowPhase
-from core.window_registry import WindowRegistry
+from core.window_registry import WindowHealth, WindowRegistry
 from domain.activity import ActivityDefinition, ActivityType, ResetRule
 from domain.group import CharacterGroup
 from services.data_contract_migration_service import (
@@ -46,6 +47,27 @@ class _Resolver:
             path: hashlib.sha256(str(path).encode()).hexdigest()
             for path in paths
         }
+
+
+class _SharedFingerprintResolver:
+    def resolve(self, paths):
+        return {path: "a" * 64 for path in paths}
+
+
+class _ShortcutContentResolver:
+    def __init__(self):
+        self.calls = 0
+
+    def resolve(self, paths):
+        self.calls += 1
+        resolved = {}
+        for path in paths:
+            try:
+                content = path.read_bytes()
+            except OSError:
+                continue
+            resolved[path] = hashlib.sha256(content).hexdigest()
+        return resolved
 
 
 class _WindowBackend:
@@ -90,9 +112,24 @@ class _WindowBackend:
         return None
 
 
+class _MutatingWindowBackend(_WindowBackend):
+    def __init__(self, windows, foreground, mutate):
+        super().__init__(windows, foreground)
+        self._mutate = mutate
+        self._mutated = False
+
+    def list_windows(self):
+        windows = super().list_windows()
+        if not self._mutated:
+            self._mutated = True
+            self._mutate()
+        return windows
+
+
 class _MessageBackend:
     def __init__(self):
         self.sent = []
+        self.pointers = []
 
     def is_window(self, _handle):
         return True
@@ -108,12 +145,21 @@ class _MessageBackend:
         self.sent.append((handle, keys))
         return True
 
+    def send_pointer(self, handle, x_ratio, y_ratio, event):
+        self.pointers.append((handle, x_ratio, y_ratio, event))
+        return True
 
-def _configured_group(tmp_path):
+
+def _configured_group(
+    tmp_path,
+    *,
+    names=("主號", "分號"),
+    resolver=None,
+):
     shortcuts = []
-    for name in ("主號", "分號"):
+    for name in names:
         shortcut = tmp_path / f"{name}.lnk"
-        shortcut.write_bytes(b"shortcut")
+        shortcut.write_bytes(f"shortcut:{name}".encode("utf-8"))
         shortcuts.append(shortcut)
     legacy = tmp_path / "legacy.json"
     legacy.write_text(
@@ -123,8 +169,11 @@ def _configured_group(tmp_path):
                     {
                         "name": "測試組",
                         "launch_entries": [
-                            {"path": str(shortcuts[0]), "role": "主控"},
-                            {"path": str(shortcuts[1]), "role": "同步"},
+                            {
+                                "path": str(shortcut),
+                                "role": "主控" if index == 0 else "同步",
+                            }
+                            for index, shortcut in enumerate(shortcuts)
                         ],
                     }
                 ]
@@ -137,10 +186,30 @@ def _configured_group(tmp_path):
         tmp_path / "groups.json",
         legacy_config_path=legacy,
     )
-    resolver = _Resolver()
-    scope_service = SyncScopeService(configuration, resolver)
+    scope_service = SyncScopeService(
+        configuration,
+        resolver or _Resolver(),
+    )
     scope = scope_service.scope("測試組")
     return configuration, scope_service, scope
+
+
+def _complete_windows_for_scope(scope):
+    return tuple(
+        WindowInfo(
+            11 + index,
+            "Adobe Flash Player 11",
+            True,
+            False,
+            (index * 900, 0, (index + 1) * 900, 600),
+            101 + index,
+            "Flash",
+            fingerprint,
+            1001 + index,
+            100001 + index,
+        )
+        for index, fingerprint in enumerate(scope.fingerprints)
+    )
 
 
 def test_event_bus_deduplicates_unsubscribes_and_isolates_handlers():
@@ -219,6 +288,269 @@ def test_target_window_contract_is_shared_versioned_and_player_safe(tmp_path):
         11,
         12,
     )
+
+
+def test_scope_cache_tracks_group_version_and_controller_shortcut_evidence(
+    tmp_path,
+):
+    resolver = _ShortcutContentResolver()
+    configuration, scope_service, scope = _configured_group(
+        tmp_path,
+        names=("主控", "跟隨甲", "跟隨乙"),
+        resolver=resolver,
+    )
+    group_name = configuration.groups()[0].name
+    entries = configuration.group(group_name).entries
+    entry_ids = tuple(entry.entry_id for entry in entries)
+    backend = _WindowBackend(
+        _complete_windows_for_scope(scope),
+        foreground=11,
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        backend,
+    )
+
+    assert service.reconnect_targets(group_name).sync_entry_ids == entry_ids
+    initial = service.reconnect_targets(group_name)
+    assert initial.sync_scope_entry_ids == entry_ids
+    assert initial.sync_controller_entry_id == entry_ids[0]
+    cached_calls = resolver.calls
+    assert service.reconnect_targets(group_name).sync_entry_ids == entry_ids
+    assert resolver.calls == cached_calls
+
+    configuration_content = configuration.path.read_bytes()
+    configuration_stat = configuration.path.stat()
+    changed_configuration = bytearray(configuration_content)
+    whitespace_index = changed_configuration.index(ord("\n"))
+    changed_configuration[whitespace_index] = ord(" ")
+    configuration.path.write_bytes(changed_configuration)
+    os.utime(
+        configuration.path,
+        ns=(configuration_stat.st_atime_ns, configuration_stat.st_mtime_ns),
+    )
+    assert configuration.path.stat().st_size == configuration_stat.st_size
+    assert configuration.path.stat().st_mtime_ns == configuration_stat.st_mtime_ns
+    assert service.reconnect_targets(group_name).sync_entry_ids == entry_ids
+    assert resolver.calls > cached_calls
+
+    controller_path = entries[0].shortcut_path
+    original_content = controller_path.read_bytes()
+    replacement = tmp_path / "controller-replacement.tmp"
+    replacement.write_bytes(original_content)
+    cached_calls = resolver.calls
+    replacement.replace(controller_path)
+    assert service.reconnect_targets(group_name).sync_entry_ids == entry_ids
+    assert resolver.calls > cached_calls
+
+    controller_stat = controller_path.stat()
+    changed_controller_content = bytearray(original_content)
+    changed_controller_content[-1] = (
+        changed_controller_content[-1] + 1
+    ) % 256
+    controller_path.write_bytes(changed_controller_content)
+    os.utime(
+        controller_path,
+        ns=(controller_stat.st_atime_ns, controller_stat.st_mtime_ns),
+    )
+    assert controller_path.stat().st_size == controller_stat.st_size
+    assert controller_path.stat().st_mtime_ns == controller_stat.st_mtime_ns
+    identity_changed = service.reconnect_targets(group_name)
+    assert identity_changed.sync_entry_ids == ()
+    assert tuple(window.handle for window in identity_changed.windows) == (12, 13)
+
+    controller_path.write_bytes(original_content)
+    assert service.reconnect_targets(group_name).sync_entry_ids == entry_ids
+
+    case_renamed_path = controller_path.with_suffix(".LNK")
+    cached_calls = resolver.calls
+    controller_path.rename(case_renamed_path)
+    assert service.reconnect_targets(group_name).sync_entry_ids == entry_ids
+    assert resolver.calls > cached_calls
+    case_renamed_path.rename(controller_path)
+    assert service.reconnect_targets(group_name).sync_entry_ids == entry_ids
+
+    renamed_path = controller_path.with_name("renamed-controller.lnk")
+    controller_path.rename(renamed_path)
+    assert service.reconnect_targets(group_name).sync_entry_ids == ()
+    renamed_path.rename(controller_path)
+    assert service.reconnect_targets(group_name).sync_entry_ids == entry_ids
+
+    controller_path.unlink()
+    assert service.reconnect_targets(group_name).sync_entry_ids == ()
+    fresh_service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        backend,
+    )
+    assert fresh_service.reconnect_targets(group_name).sync_entry_ids == ()
+
+
+def test_scope_cache_isolates_one_follower_and_restores_original_slot_order(
+    tmp_path,
+):
+    resolver = _ShortcutContentResolver()
+    configuration, scope_service, scope = _configured_group(
+        tmp_path,
+        names=("主控", "跟隨甲", "跟隨乙"),
+        resolver=resolver,
+    )
+    group_name = configuration.groups()[0].name
+    entries = configuration.group(group_name).entries
+    entry_ids = tuple(entry.entry_id for entry in entries)
+    backend = _WindowBackend(
+        _complete_windows_for_scope(scope),
+        foreground=11,
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        backend,
+    )
+
+    assert service.reconnect_targets(group_name).sync_entry_ids == entry_ids
+    follower_path = entries[1].shortcut_path
+    follower_content = follower_path.read_bytes()
+    follower_path.unlink()
+
+    isolated = service.reconnect_targets(group_name)
+    assert isolated.sync_entry_ids == (entry_ids[0], entry_ids[2])
+    assert tuple(window.handle for window in isolated.sync_windows) == (11, 13)
+    assert "shortcut_identity_unresolved" in isolated.failure_codes
+
+    follower_path.write_bytes(follower_content)
+    restored = service.reconnect_targets(group_name)
+    assert restored.sync_entry_ids == entry_ids
+    assert tuple(window.handle for window in restored.sync_windows) == (
+        11,
+        12,
+        13,
+    )
+
+
+def test_reconnect_targets_never_mix_snapshot_with_changed_scope_evidence(
+    tmp_path,
+):
+    resolver = _ShortcutContentResolver()
+    configuration, scope_service, scope = _configured_group(
+        tmp_path,
+        names=("主控", "跟隨甲", "跟隨乙"),
+        resolver=resolver,
+    )
+    group_name = configuration.groups()[0].name
+    controller_path = configuration.group(group_name).entries[0].shortcut_path
+    original_content = controller_path.read_bytes()
+    changed_content = bytearray(original_content)
+    changed_content[-1] = (changed_content[-1] + 1) % 256
+    backend = _MutatingWindowBackend(
+        _complete_windows_for_scope(scope),
+        11,
+        lambda: controller_path.write_bytes(changed_content),
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        backend,
+    )
+
+    resolved = service.reconnect_targets(group_name)
+
+    assert resolved.windows == ()
+    assert resolved.sync_windows == ()
+    assert resolved.sync_entry_ids == ()
+    assert "scope_evidence_changed_during_snapshot" in resolved.failure_codes
+
+
+def test_controller_shortcut_loss_stops_keyboard_and_pointer_target_providers(
+    tmp_path,
+):
+    resolver = _ShortcutContentResolver()
+    configuration, scope_service, scope = _configured_group(
+        tmp_path,
+        names=("主控", "跟隨甲", "跟隨乙"),
+        resolver=resolver,
+    )
+    group_name = configuration.groups()[0].name
+    window_backend = _WindowBackend(
+        _complete_windows_for_scope(scope),
+        foreground=11,
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        window_backend,
+    )
+    provider = lambda: service.reconnect_targets(group_name).sync_windows
+    initial_windows = provider()
+    messages = _MessageBackend()
+    keyboard = WindowsInputSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=window_backend,
+        message_backend=messages,
+        target_windows_provider=provider,
+        require_expected_window_count=False,
+    )
+    pointer = WindowsPointerSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=window_backend,
+        message_backend=messages,
+        target_windows_provider=provider,
+        require_expected_window_count=False,
+    )
+    for controller in (keyboard, pointer):
+        controller.set_allowed_window_instances(initial_windows)
+        controller.set_controller_fingerprint(
+            initial_windows[0].launch_fingerprint
+        )
+
+    try:
+        assert keyboard.send_approved_key(
+            "B",
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            exclude_foreground=True,
+            source_handle=11,
+        ).sent_windows == 2
+        assert pointer.send_click(
+            source_handle=11,
+            x_ratio=0.5,
+            y_ratio=0.5,
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            include_source=False,
+        ).sent_windows == 2
+
+        configuration.group(group_name).entries[0].shortcut_path.unlink()
+        window_backend.foreground = 12
+        messages.sent.clear()
+        messages.pointers.clear()
+        assert keyboard.send_approved_key(
+            "B",
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            source_handle=12,
+        ).sent_windows == 0
+        assert pointer.send_click(
+            source_handle=12,
+            x_ratio=0.5,
+            y_ratio=0.5,
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            include_source=False,
+        ).sent_windows == 0
+        assert messages.sent == []
+        assert messages.pointers == []
+    finally:
+        assert keyboard.close() is True
+        assert pointer.close() is True
 
 
 def test_target_window_enumeration_failure_fails_closed(tmp_path):
@@ -517,6 +849,181 @@ def test_reconnect_targets_isolate_duplicate_role_without_hiding_safe_sibling(
     assert reconnect_targets.blocked_fingerprints == frozenset(
         {scope.fingerprints[1]}
     )
+
+
+def test_reconnect_targets_bind_shared_launcher_digest_to_confirmed_instances(
+    tmp_path,
+):
+    configuration, _scope_service, _scope = _configured_group(tmp_path)
+    group_name = configuration.groups()[0].name
+    scope_service = SyncScopeService(
+        configuration,
+        _SharedFingerprintResolver(),
+    )
+    entries = configuration.group(group_name).entries
+    source_fingerprint = "a" * 64
+    windows = (
+        WindowInfo(
+            11,
+            "Adobe Flash Player 11",
+            True,
+            False,
+            (0, 0, 900, 600),
+            701,
+            "Flash",
+            source_fingerprint,
+            1701,
+            900001,
+        ),
+        WindowInfo(
+            12,
+            "Adobe Flash Player 11",
+            True,
+            False,
+            (900, 0, 1800, 600),
+            701,
+            "Flash",
+            source_fingerprint,
+            1702,
+            900001,
+        ),
+        WindowInfo(
+            13,
+            "Adobe Flash Player 11",
+            True,
+            False,
+            (1800, 0, 2700, 600),
+            701,
+            "Flash",
+            source_fingerprint,
+            1703,
+            900001,
+        ),
+    )
+    registry = WindowRegistry()
+    for entry, window in zip(entries, windows[:2]):
+        registry.register_character(
+            entry.entry_id,
+            entry.display_name,
+            group=group_name,
+            role=entry.role,
+        )
+        registry.confirm_window(
+            entry.entry_id,
+            handle=window.handle,
+            process_id=window.process_id,
+            window_class=window.window_class,
+            rect=window.rect,
+            health=WindowHealth.READY,
+        )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        registry,
+        _WindowBackend(windows, foreground=11),
+    )
+
+    resolved = service.reconnect_targets(group_name)
+
+    assert tuple(window.handle for window in resolved.windows) == (11, 12)
+    assert resolved.sync_entry_ids == tuple(entry.entry_id for entry in entries)
+    assert tuple(window.handle for window in resolved.sync_windows) == (11, 12)
+    assert len(
+        {
+            window.launch_fingerprint for window in resolved.sync_windows
+        }
+    ) == 2
+    assert all(
+        window.launch_fingerprint != source_fingerprint
+        for window in resolved.sync_windows
+    )
+
+
+def test_shared_launcher_incomplete_or_conflicting_instance_isolated(tmp_path):
+    configuration, _scope_service, _scope = _configured_group(tmp_path)
+    group_name = configuration.groups()[0].name
+    scope_service = SyncScopeService(
+        configuration,
+        _SharedFingerprintResolver(),
+    )
+    entries = configuration.group(group_name).entries
+    source_fingerprint = "a" * 64
+    windows = (
+        WindowInfo(
+            11,
+            "Adobe Flash Player 11",
+            True,
+            False,
+            (0, 0, 900, 600),
+            701,
+            "Flash",
+            source_fingerprint,
+            1701,
+            900001,
+        ),
+        WindowInfo(
+            12,
+            "Adobe Flash Player 11",
+            True,
+            False,
+            (900, 0, 1800, 600),
+            701,
+            "Flash",
+            source_fingerprint,
+            1702,
+            900001,
+        ),
+    )
+    registry = WindowRegistry()
+    first = entries[0]
+    registry.register_character(
+        first.entry_id,
+        first.display_name,
+        group=group_name,
+        role=first.role,
+    )
+    registry.confirm_window(
+        first.entry_id,
+        handle=11,
+        process_id=701,
+        window_class="Flash",
+        rect=windows[0].rect,
+        health=WindowHealth.READY,
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        registry,
+        _WindowBackend(windows, foreground=11),
+    )
+
+    isolated = service.reconnect_targets(group_name)
+
+    assert tuple(window.handle for window in isolated.windows) == (11,)
+    assert isolated.sync_entry_ids == (first.entry_id,)
+    assert "window_identity_duplicate" in isolated.failure_codes
+
+    second = entries[1]
+    registry.register_character(
+        second.entry_id,
+        second.display_name,
+        group=group_name,
+        role=second.role,
+    )
+    registry.confirm_window(
+        second.entry_id,
+        handle=11,
+        process_id=701,
+        window_class="Flash",
+        rect=windows[0].rect,
+        health=WindowHealth.READY,
+    )
+
+    conflicted = service.reconnect_targets(group_name)
+
+    assert conflicted.windows == ()
+    assert conflicted.sync_windows == ()
+    assert "window_identity_duplicate" in conflicted.failure_codes
 
 
 def test_sync_controller_accepts_only_the_shared_target_provider():

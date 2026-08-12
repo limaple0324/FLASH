@@ -7,6 +7,8 @@ explicit operation areas before future automation is allowed.
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Callable, Iterable, Protocol
@@ -73,6 +75,90 @@ class WindowInfo:
     launch_fingerprint: str | None = None
     thread_id: int | None = None
     process_lifecycle_token: int | None = None
+
+
+def complete_window_instance_identity(
+    window: WindowInfo,
+) -> tuple[
+    str,
+    int,
+    int,
+    int,
+    str,
+    int,
+    tuple[int, int, int, int],
+    bool,
+] | None:
+    """Return the complete, current identity required for a safe window action.
+
+    The launch fingerprint identifies an executable, not a top-level window.  A
+    caller may therefore use the immutable portion to name one monitored
+    instance while retaining the complete tuple for every dispatch recheck.
+    """
+
+    if not isinstance(window, WindowInfo):
+        return None
+    fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
+    if (
+        fingerprint is None
+        or not isinstance(window.handle, int)
+        or isinstance(window.handle, bool)
+        or window.handle <= 0
+        or not isinstance(window.process_id, int)
+        or isinstance(window.process_id, bool)
+        or window.process_id <= 0
+        or not isinstance(window.thread_id, int)
+        or isinstance(window.thread_id, bool)
+        or window.thread_id <= 0
+        or not isinstance(window.window_class, str)
+        or not window.window_class.strip()
+        or not isinstance(window.process_lifecycle_token, int)
+        or isinstance(window.process_lifecycle_token, bool)
+        or window.process_lifecycle_token <= 0
+        or not isinstance(window.rect, tuple)
+        or len(window.rect) != 4
+        or any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in window.rect
+        )
+        or window.rect[2] <= window.rect[0]
+        or window.rect[3] <= window.rect[1]
+        or type(window.minimized) is not bool
+    ):
+        return None
+    return (
+        fingerprint,
+        window.handle,
+        window.process_id,
+        window.thread_id,
+        window.window_class,
+        window.process_lifecycle_token,
+        window.rect,
+        window.minimized,
+    )
+
+
+def monitored_window_instance_fingerprint(window: WindowInfo) -> str | None:
+    """Derive the stable anonymous identity for one complete live instance.
+
+    Geometry and minimized state remain part of
+    :func:`complete_window_instance_identity` and are rechecked before input.
+    They are deliberately excluded from this name so a reversible move or
+    restore cannot silently become a different monitored role.
+    """
+
+    identity = complete_window_instance_identity(window)
+    if identity is None:
+        return None
+    encoded = json.dumps(
+        (
+            "smart-reconnect-activation-v1",
+            *identity[:6],
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

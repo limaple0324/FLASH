@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from adapters.windows_launch_fingerprint import (
     ShortcutFingerprintResolver,
@@ -18,12 +19,39 @@ class SyncScope:
     fingerprints: tuple[str, ...] = ()
     failure_codes: tuple[str, ...] = ()
     entry_ids: tuple[str, ...] = ()
+    shortcut_paths: tuple[Path, ...] = ()
+    entry_fingerprints: tuple[str | None, ...] = ()
+    isolated_entry_ids: tuple[str, ...] = ()
 
     @property
     def ready(self) -> bool:
         return (
             self.controller_entry_id is not None
             and bool(self.fingerprints)
+            and bool(self.entry_ids)
+            and self.entry_ids[0] == self.controller_entry_id
+            and len(self.shortcut_paths) == len(self.entry_ids)
+            and len(self.entry_fingerprints) == len(self.entry_ids)
+            and self.entry_fingerprints[0] is not None
+            and not self.failure_codes
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SyncScopeInputs:
+    group_name: str
+    controller_entry_id: str | None = None
+    entry_ids: tuple[str, ...] = ()
+    shortcut_paths: tuple[Path, ...] = ()
+    failure_codes: tuple[str, ...] = ()
+
+    @property
+    def ready(self) -> bool:
+        return (
+            self.controller_entry_id is not None
+            and bool(self.entry_ids)
+            and self.entry_ids[0] == self.controller_entry_id
+            and len(self.shortcut_paths) == len(self.entry_ids)
             and not self.failure_codes
         )
 
@@ -39,18 +67,21 @@ class SyncScopeService:
         self._configuration = configuration
         self._fingerprint_resolver = fingerprint_resolver
 
-    def scope(self, group_name: object) -> SyncScope:
+    def inputs(self, group_name: object) -> SyncScopeInputs:
         if not isinstance(group_name, str) or not group_name.strip():
-            return SyncScope("", failure_codes=("group_name_invalid",))
+            return SyncScopeInputs(
+                "",
+                failure_codes=("group_name_invalid",),
+            )
         name = group_name.strip()
         selected = self._configuration.group(name)
         if selected is None or not selected.entries:
-            return SyncScope(
+            return SyncScopeInputs(
                 name,
                 failure_codes=("group_entries_unavailable",),
             )
         if selected.main_entry is None:
-            return SyncScope(
+            return SyncScopeInputs(
                 name,
                 failure_codes=("group_controller_unavailable",),
             )
@@ -65,41 +96,81 @@ class SyncScopeService:
                     current is not None
                     and current.shortcut_path != entry.shortcut_path
                 ):
-                    return SyncScope(
+                    return SyncScopeInputs(
                         name,
                         controller,
+                        entry_ids=ordered_ids,
                         failure_codes=(
                             "sync_identity_path_conflict",
                         ),
                     )
                 entry_by_id[entry.entry_id] = entry
         if any(entry_id not in entry_by_id for entry_id in ordered_ids):
-            return SyncScope(
+            return SyncScopeInputs(
                 name,
                 controller,
+                entry_ids=ordered_ids,
                 failure_codes=("sync_identity_unresolved",),
             )
         paths = tuple(entry_by_id[entry_id].shortcut_path for entry_id in ordered_ids)
+        return SyncScopeInputs(
+            name,
+            controller,
+            ordered_ids,
+            paths,
+        )
+
+    def scope(self, group_name: object) -> SyncScope:
+        inputs = self.inputs(group_name)
+        if not inputs.ready:
+            return SyncScope(
+                inputs.group_name,
+                inputs.controller_entry_id,
+                failure_codes=inputs.failure_codes,
+                entry_ids=inputs.entry_ids,
+                shortcut_paths=inputs.shortcut_paths,
+            )
+        paths = inputs.shortcut_paths
         resolved = self._fingerprint_resolver.resolve(paths)
-        fingerprints = tuple(
+        entry_fingerprints = tuple(
             normalize_launch_fingerprint(resolved.get(path))
             for path in paths
         )
-        if any(fingerprint is None for fingerprint in fingerprints):
+        fingerprints = tuple(
+            fingerprint
+            for fingerprint in entry_fingerprints
+            if fingerprint is not None
+        )
+        isolated_entry_ids = tuple(
+            entry_id
+            for entry_id, fingerprint in zip(
+                inputs.entry_ids,
+                entry_fingerprints,
+            )
+            if fingerprint is None
+        )
+        if not entry_fingerprints or entry_fingerprints[0] is None:
             return SyncScope(
-                name,
-                controller,
+                inputs.group_name,
+                inputs.controller_entry_id,
+                fingerprints,
                 failure_codes=("shortcut_identity_unresolved",),
+                entry_ids=inputs.entry_ids,
+                shortcut_paths=paths,
+                entry_fingerprints=entry_fingerprints,
+                isolated_entry_ids=isolated_entry_ids,
             )
-        if len(fingerprints) != len(set(fingerprints)):
-            return SyncScope(
-                name,
-                controller,
-                failure_codes=("shortcut_identity_duplicate",),
-            )
+        # A launch digest identifies the executable image, not one live
+        # top-level game window.  Keep ordered duplicate digests here; the
+        # target-window contract later binds each configured entry to exactly
+        # one player-confirmed complete window instance before any controller
+        # receives an allowed identity.
         return SyncScope(
-            name,
-            controller,
-            tuple(fingerprint for fingerprint in fingerprints if fingerprint),
-            entry_ids=ordered_ids,
+            inputs.group_name,
+            inputs.controller_entry_id,
+            fingerprints,
+            entry_ids=inputs.entry_ids,
+            shortcut_paths=paths,
+            entry_fingerprints=entry_fingerprints,
+            isolated_entry_ids=isolated_entry_ids,
         )

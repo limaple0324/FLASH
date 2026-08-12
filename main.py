@@ -12,7 +12,6 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
 from time import monotonic
 from tkinter import PhotoImage, TclError, Tk, filedialog, messagebox
 
@@ -52,6 +51,7 @@ from adapters.windows_window import (
     Win32WindowBackend,
     WindowInfo,
     WindowsWindowAdapter,
+    complete_window_instance_identity,
 )
 from adapters.windows_client_size import Win32WindowClientSizeBackend
 from adapters.windows_work_area import WindowsWorkAreaReader
@@ -268,6 +268,7 @@ from services.data_contract_migration_service import (
     DataContractMigrationService,
 )
 from services.target_window_contract_service import (
+    ResolvedTargetWindows,
     TargetWindowContractService,
 )
 from services.true_event_card_service import TrueEventCardService
@@ -1026,13 +1027,19 @@ def _connected_sync_fingerprints(
 ) -> tuple[str, ...]:
     """依組別固定順序保留目前唯一且已連線的安全身分。"""
 
-    normalized_scope = tuple(
-        fingerprint
+    normalized_values = tuple(
+        normalize_launch_fingerprint(value)
         for value in scoped_fingerprints
-        if (fingerprint := normalize_launch_fingerprint(value)) is not None
     )
-    if len(normalized_scope) != len(set(normalized_scope)):
+    if (
+        not normalized_values
+        or any(value is None for value in normalized_values)
+        or len(normalized_values) != len(set(normalized_values))
+    ):
         return ()
+    normalized_scope = tuple(
+        value for value in normalized_values if value is not None
+    )
     observed: dict[str, int] = {}
     for window in windows:
         fingerprint = normalize_launch_fingerprint(
@@ -1040,11 +1047,113 @@ def _connected_sync_fingerprints(
         )
         if fingerprint in normalized_scope:
             observed[fingerprint] = observed.get(fingerprint, 0) + 1
-    return tuple(
+    connected = tuple(
         fingerprint
         for fingerprint in normalized_scope
         if observed.get(fingerprint) == 1
     )
+    if not connected or connected[0] != normalized_scope[0]:
+        return ()
+    return connected
+
+
+def resolve_complete_sync_instance_windows(
+    scoped_entry_ids: tuple[str, ...],
+    resolved_entry_ids: tuple[str, ...],
+    resolved_windows: tuple[WindowInfo, ...],
+    *,
+    controller_entry_id: str | None,
+) -> tuple[WindowInfo, ...]:
+    """Order only complete, one-entry-per-instance sync targets.
+
+    Launcher digests can be shared by many Flash windows.  The target contract
+    supplies instance-local digests only after matching each group entry to its
+    player-confirmed full window instance; this helper rejects any collapse or
+    replacement before the sync controllers receive the collection.
+    """
+
+    if (
+        not isinstance(controller_entry_id, str)
+        or not controller_entry_id.strip()
+        or not scoped_entry_ids
+        or scoped_entry_ids[0] != controller_entry_id
+        or len(resolved_entry_ids) != len(resolved_windows)
+        or len(set(scoped_entry_ids)) != len(scoped_entry_ids)
+        or len(set(resolved_entry_ids)) != len(resolved_entry_ids)
+        or not set(resolved_entry_ids).issubset(scoped_entry_ids)
+    ):
+        return ()
+    by_entry: dict[str, WindowInfo] = {}
+    instance_names: set[str] = set()
+    instance_keys: set[tuple[object, ...]] = set()
+    for entry_id, window in zip(resolved_entry_ids, resolved_windows):
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            return ()
+        identity = complete_window_instance_identity(window)
+        if identity is None:
+            return ()
+        instance_name = identity[0]
+        stable_instance = identity[1:6]
+        if (
+            entry_id in by_entry
+            or instance_name in instance_names
+            or stable_instance in instance_keys
+        ):
+            return ()
+        by_entry[entry_id] = window
+        instance_names.add(instance_name)
+        instance_keys.add(stable_instance)
+    if controller_entry_id not in by_entry:
+        return ()
+    return tuple(
+        by_entry[entry_id]
+        for entry_id in scoped_entry_ids
+        if entry_id in by_entry
+    )
+
+
+def resolve_connected_sync_target_contract(
+    target_service: TargetWindowContractService | None,
+    group_name: object,
+) -> tuple[ResolvedTargetWindows, tuple[WindowInfo, ...]]:
+    """Resolve one immutable, identity-safe target contract subset.
+
+    Basic keyboard and pointer synchronization intentionally depends only on
+    the target-window identity contract.  Screen recognition belongs to smart
+    reconnect and must not turn a safely resolved live game window into an
+    ineligible basic-input target.
+    """
+
+    if target_service is None:
+        return ResolvedTargetWindows(()), ()
+    resolved = target_service.reconnect_targets(group_name)
+    safe_windows = resolve_complete_sync_instance_windows(
+        resolved.sync_scope_entry_ids,
+        resolved.sync_entry_ids,
+        resolved.sync_windows,
+        controller_entry_id=resolved.sync_controller_entry_id,
+    )
+    return resolved, safe_windows
+
+
+class ConnectedSyncTargetContractProvider:
+    """Publish identity-safe basic-sync windows from one target contract."""
+
+    def __init__(
+        self,
+        target_service: TargetWindowContractService | None,
+        group_name_provider: Callable[[], object],
+    ) -> None:
+        self._target_service = target_service
+        self._group_name_provider = group_name_provider
+
+    def windows(self) -> tuple[WindowInfo, ...]:
+        group_name = self._group_name_provider()
+        _resolved, safe_windows = resolve_connected_sync_target_contract(
+            self._target_service,
+            group_name,
+        )
+        return safe_windows
 
 
 def build_services(
@@ -1508,75 +1617,7 @@ def build_services(
         )
 
     def current_sync_target_windows() -> tuple[WindowInfo, ...]:
-        if target_window_contract_service is None:
-            return ()
-        candidates = target_window_contract_service.reconnect_targets(
-            current_group_name()
-        ).windows
-        if any(not isinstance(window, WindowInfo) for window in candidates):
-            return ()
-        requested = tuple(
-            fingerprint for window in candidates
-            if (fingerprint := normalize_launch_fingerprint(window.launch_fingerprint))
-            is not None
-        )
-        states = reconnect_controller.observe_screen_states(
-            requested, candidate_windows=candidates
-        )
-        return tuple(
-            window for window in candidates
-            if states.get(normalize_launch_fingerprint(window.launch_fingerprint))
-            is ReconnectScreenState.CONNECTED
-        )
-
-    sync_screen_state_lock = Lock()
-    sync_screen_state_cache: dict[str, object] = {
-        "group_name": None,
-        "expires_at": 0.0,
-        "states": {},
-    }
-
-    def current_sync_screen_state(
-        fingerprint: str,
-    ) -> ReconnectScreenState:
-        normalized = normalize_launch_fingerprint(fingerprint)
-        if normalized is None:
-            return ReconnectScreenState.UNKNOWN
-        group_name = current_group_name()
-        now = monotonic()
-        with sync_screen_state_lock:
-            states = sync_screen_state_cache["states"]
-            if (
-                sync_screen_state_cache["group_name"] == group_name
-                and now < float(sync_screen_state_cache["expires_at"])
-                and isinstance(states, dict)
-            ):
-                return states.get(normalized, ReconnectScreenState.UNKNOWN)
-            candidates = (
-                target_window_contract_service.reconnect_targets(group_name).windows
-                if target_window_contract_service is not None else ()
-            )
-            requested = tuple(
-                candidate_fingerprint
-                for window in candidates
-                if (
-                    candidate_fingerprint := normalize_launch_fingerprint(
-                        window.launch_fingerprint
-                    )
-                ) is not None
-            )
-            observed = reconnect_controller.observe_screen_states(
-                requested,
-                candidate_windows=candidates,
-            )
-            sync_screen_state_cache.update(
-                {
-                    "group_name": group_name,
-                    "expires_at": now + 0.75,
-                    "states": observed,
-                }
-            )
-            return observed.get(normalized, ReconnectScreenState.UNKNOWN)
+        return connected_sync_contract_provider.windows()
 
     AppContext.register(SyncOperationRecordStore, operation_record_store)
 
@@ -1611,6 +1652,48 @@ def build_services(
         ),
         registered_role_provider=registered_reconnect_roles,
     )
+    connected_sync_contract_provider = ConnectedSyncTargetContractProvider(
+        target_window_contract_service,
+        current_group_name,
+    )
+
+    def current_deferred_sync_screen_state(
+        fingerprint: str,
+    ) -> ReconnectScreenState:
+        """Recognize screens only for the final deferred-delivery safety gate."""
+
+        normalized = normalize_launch_fingerprint(fingerprint)
+        group_name = current_group_name()
+        if normalized is None or target_window_contract_service is None:
+            return ReconnectScreenState.UNKNOWN
+        try:
+            resolved = target_window_contract_service.reconnect_targets(
+                group_name
+            )
+            safe_windows = resolve_complete_sync_instance_windows(
+                resolved.sync_scope_entry_ids,
+                resolved.sync_entry_ids,
+                resolved.sync_windows,
+                controller_entry_id=resolved.sync_controller_entry_id,
+            )
+            allowed = {
+                safe_fingerprint
+                for window in safe_windows
+                if (
+                    safe_fingerprint := normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    )
+                )
+                is not None
+            }
+            if normalized not in allowed:
+                return ReconnectScreenState.UNKNOWN
+            observed = reconnect_controller.observe_window_instance_states(
+                resolved.windows
+            )
+            return observed.get(normalized, ReconnectScreenState.UNKNOWN)
+        except Exception:
+            return ReconnectScreenState.UNKNOWN
 
     def registered_game_data_window(window_handle: int) -> RegisteredGameDataWindow | None:
         group_name = current_group_name()
@@ -1756,7 +1839,9 @@ def build_services(
                     f"{operation}－{outcome}",
                 )
             ),
-            screen_state_provider=current_sync_screen_state,
+            deferred_screen_state_provider=(
+                current_deferred_sync_screen_state
+            ),
         ),
     )
     AppContext.register(
@@ -1778,7 +1863,9 @@ def build_services(
                     f"{operation}－{outcome}",
                 )
             ),
-            screen_state_provider=current_sync_screen_state,
+            deferred_screen_state_provider=(
+                current_deferred_sync_screen_state
+            ),
         ),
     )
     AppContext.register(
@@ -2396,40 +2483,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     def current_sync_target_windows() -> tuple[WindowInfo, ...]:
         """Return only registered targets currently confirmed as connected."""
-        if (
-            target_window_contract_service is None
-            or smart_reconnect_controller is None
-        ):
-            return ()
-        candidates = target_window_contract_service.reconnect_targets(
-            current_workspace_group_name()
-        ).windows
-        if any(not isinstance(candidate, WindowInfo) for candidate in candidates):
-            return ()
-        requested = tuple(
-            fingerprint
-            for candidate in candidates
-            if (
-                fingerprint := normalize_launch_fingerprint(
-                    candidate.launch_fingerprint
-                )
-            )
-            is not None
+        _resolved, connected = resolve_connected_sync_target_contract(
+            target_window_contract_service,
+            current_workspace_group_name(),
         )
-        states = smart_reconnect_controller.observe_screen_states(
-            requested,
-            candidate_windows=candidates,
-        )
-        return tuple(
-            candidate
-            for candidate in candidates
-            if states.get(
-                normalize_launch_fingerprint(
-                    candidate.launch_fingerprint
-                )
-            )
-            is ReconnectScreenState.CONNECTED
-        )
+        return connected
 
     def mark_tray_operations_running() -> None:
         if tray_controller is not None:
@@ -3198,80 +3256,141 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         return tuple(resolved)
 
     def apply_group_identity(choice) -> GroupLaunchPlan | None:
+        nonlocal sync_connected_fingerprints
+        nonlocal sync_connected_instance_signature
         plan = selected_group_plan(choice)
         if plan is None:
             return None
-        scope = (
-            sync_scope_service.scope(choice.name)
-            if sync_scope_service is not None
-            else None
-        )
-        if scope is None or not scope.ready:
+        if target_window_contract_service is None:
             return None
+        resolved_targets = target_window_contract_service.reconnect_targets(
+            choice.name
+        )
+        scope_entry_ids = resolved_targets.sync_scope_entry_ids
+        controller_entry_id = resolved_targets.sync_controller_entry_id
         scoped_entries = scoped_group_entries(
             choice.name,
-            scope.entry_ids,
+            scope_entry_ids,
         )
         if (
             scoped_entries is None
-            or len(scoped_entries) != len(scope.fingerprints)
+            or len(scoped_entries) != len(scope_entry_ids)
         ):
             return None
-        target_settings = {
-            fingerprint: entry.sync_settings
-            for entry, fingerprint in zip(
-                scoped_entries,
-                scope.fingerprints,
-            )
+        instance_windows = resolve_complete_sync_instance_windows(
+            scope_entry_ids,
+            resolved_targets.sync_entry_ids,
+            resolved_targets.sync_windows,
+            controller_entry_id=controller_entry_id,
+        )
+        if not instance_windows:
+            return None
+        entry_by_id = {
+            entry.entry_id: entry for entry in scoped_entries
         }
+        instance_by_entry = dict(
+            zip(
+                resolved_targets.sync_entry_ids,
+                resolved_targets.sync_windows,
+            )
+        )
+        target_settings = {
+            identity[0]: entry_by_id[entry_id].sync_settings
+            for entry_id, window in instance_by_entry.items()
+            if entry_id in entry_by_id
+            and window in instance_windows
+            and (
+                identity := complete_window_instance_identity(window)
+            ) is not None
+        }
+        if len(target_settings) != len(instance_windows):
+            return None
+        instance_fingerprints = tuple(
+            complete_window_instance_identity(window)[0]
+            for window in instance_windows
+        )
+        sync_connected_fingerprints = None
+        sync_connected_instance_signature = None
         if input_controller is not None:
-            input_controller.set_expected_windows(len(scope.fingerprints))
-            input_controller.set_allowed_fingerprints(scope.fingerprints)
+            input_controller.set_expected_windows(len(instance_windows))
+            input_controller.set_allowed_window_instances(instance_windows)
             input_controller.set_target_settings(target_settings)
             input_controller.set_controller_fingerprint(
-                scope.fingerprints[0]
+                instance_fingerprints[0]
             )
             if pointer_sync_controller is not None:
                 pointer_sync_controller.set_expected_windows(
-                    len(scope.fingerprints)
+                    len(instance_windows)
                 )
-                pointer_sync_controller.set_allowed_fingerprints(
-                    scope.fingerprints
+                pointer_sync_controller.set_allowed_window_instances(
+                    instance_windows
                 )
                 pointer_sync_controller.set_target_settings(
                     target_settings
                 )
                 pointer_sync_controller.set_controller_fingerprint(
-                    scope.fingerprints[0]
+                    instance_fingerprints[0]
                 )
         return plan
 
     sync_connected_fingerprints: tuple[str, ...] | None = None
+    sync_connected_instance_signature: tuple[tuple[object, ...], ...] | None = None
 
     def apply_connected_sync_identity(
         choice,
         connected_windows: tuple[WindowInfo, ...] | None = None,
+        *,
+        resolved_targets: ResolvedTargetWindows | None = None,
     ) -> bool:
         """Only the currently connected and already scoped windows may sync."""
         if input_controller is None or pointer_sync_controller is None:
             return False
-        scope = sync_scope_service.scope(choice.name) if sync_scope_service else None
-        if scope is None or not scope.ready:
+        if (resolved_targets is None) != (connected_windows is None):
+            return False
+        if resolved_targets is None:
+            resolved_targets, connected_windows = (
+                resolve_connected_sync_target_contract(
+                    target_window_contract_service,
+                    choice.name,
+                )
+            )
+        scope_entry_ids = resolved_targets.sync_scope_entry_ids
+        controller_entry_id = resolved_targets.sync_controller_entry_id
+        scope_windows = resolve_complete_sync_instance_windows(
+            scope_entry_ids,
+            resolved_targets.sync_entry_ids,
+            resolved_targets.sync_windows,
+            controller_entry_id=controller_entry_id,
+        )
+        if not scope_windows:
             return False
         fingerprints = _connected_sync_fingerprints(
-            scope.fingerprints,
             tuple(
-                connected_windows
-                if connected_windows is not None
-                else current_sync_target_windows()
+                complete_window_instance_identity(window)[0]
+                for window in scope_windows
+            ),
+            tuple(
+                connected_windows if connected_windows is not None else ()
             ),
         )
-        entries = scoped_group_entries(choice.name, scope.entry_ids)
+        entries = scoped_group_entries(choice.name, scope_entry_ids)
         if entries is None:
             return False
+        entry_by_id = {entry.entry_id: entry for entry in entries}
+        window_by_entry = dict(
+            zip(
+                resolved_targets.sync_entry_ids,
+                resolved_targets.sync_windows,
+            )
+        )
         settings_by_fingerprint = {
-            fingerprint: entry.sync_settings
-            for entry, fingerprint in zip(entries, scope.fingerprints)
+            identity[0]: entry_by_id[entry_id].sync_settings
+            for entry_id, window in window_by_entry.items()
+            if entry_id in entry_by_id
+            and window in scope_windows
+            and (
+                identity := complete_window_instance_identity(window)
+            ) is not None
         }
         settings = {
             fingerprint: settings_by_fingerprint[fingerprint]
@@ -3280,22 +3399,37 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         }
         if len(settings) != len(fingerprints):
             return False
+        connected_windows_by_fingerprint = {
+            complete_window_instance_identity(window)[0]: window
+            for window in scope_windows
+            if complete_window_instance_identity(window) is not None
+            and complete_window_instance_identity(window)[0] in fingerprints
+        }
+        active_windows = tuple(
+            connected_windows_by_fingerprint[fingerprint]
+            for fingerprint in fingerprints
+            if fingerprint in connected_windows_by_fingerprint
+        )
+        instance_signature = tuple(
+            complete_window_instance_identity(window)
+            for window in active_windows
+        )
         nonlocal sync_connected_fingerprints
-        if sync_connected_fingerprints == fingerprints:
+        nonlocal sync_connected_instance_signature
+        if (
+            sync_connected_fingerprints == fingerprints
+            and sync_connected_instance_signature == instance_signature
+        ):
             return True
         if not fingerprints:
-            for controller in (input_controller, pointer_sync_controller):
-                controller.set_allowed_fingerprints(())
-                controller.set_target_settings({})
-                controller.invalidate_scheduled()
-            sync_connected_fingerprints = fingerprints
-            return True
+            return False
         for controller in (input_controller, pointer_sync_controller):
-            controller.set_expected_windows(len(fingerprints))
-            controller.set_allowed_fingerprints(fingerprints)
+            controller.set_expected_windows(len(active_windows))
+            controller.set_allowed_window_instances(active_windows)
             controller.set_target_settings(settings)
             controller.set_controller_fingerprint(fingerprints[0])
         sync_connected_fingerprints = fingerprints
+        sync_connected_instance_signature = instance_signature
         return True
 
     def group_identity_failure_message(choice) -> str:
@@ -3318,10 +3452,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         return "目前組別無法完整對應到唯一遊戲視窗；維持安全停止。"
 
     def clear_group_identity() -> None:
+        nonlocal sync_connected_fingerprints
+        nonlocal sync_connected_instance_signature
         if input_controller is not None:
-            input_controller.set_allowed_fingerprints(None)
+            input_controller.set_allowed_window_instances(None)
         if pointer_sync_controller is not None:
-            pointer_sync_controller.set_allowed_fingerprints(None)
+            pointer_sync_controller.set_allowed_window_instances(None)
+        sync_connected_fingerprints = None
+        sync_connected_instance_signature = None
 
     def close_group_operation_gate() -> bool:
         return (
@@ -4640,6 +4778,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     def current_target_handles() -> tuple[int, ...]:
         """Keep hot input polling within the current group without rescanning."""
+        nonlocal sync_connected_fingerprints
+        nonlocal sync_connected_instance_signature
         if (
             target_window_contract_service is None
             or workspace_service is None
@@ -4657,12 +4797,40 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             and now < float(sync_source_handle_cache["expires_at"])
         ):
             return tuple(sync_source_handle_cache["handles"])
-        connected_windows = current_sync_target_windows()
+        resolved_targets, connected_windows = (
+            resolve_connected_sync_target_contract(
+                target_window_contract_service,
+                group_name,
+            )
+        )
         handles = tuple(window.handle for window in connected_windows)
-        if sync_session_state["enabled"] and group_selection_service is not None:
-            choice = group_selection_service.find(group_name)
-            if choice is not None:
-                apply_connected_sync_identity(choice, connected_windows)
+        if sync_session_state["enabled"]:
+            choice = (
+                group_selection_service.find(group_name)
+                if group_selection_service is not None
+                else None
+            )
+            if choice is None or not apply_connected_sync_identity(
+                choice,
+                connected_windows,
+                resolved_targets=resolved_targets,
+            ):
+                sync_session_state["enabled"] = False
+                sync_connected_fingerprints = None
+                sync_connected_instance_signature = None
+                if input_controller is not None:
+                    input_controller.set_allowed_window_instances(None)
+                if pointer_sync_controller is not None:
+                    pointer_sync_controller.set_allowed_window_instances(None)
+                if (
+                    keyboard_sync_monitor is not None
+                    and mouse_sync_monitor is not None
+                ):
+                    stop_input_sync_pair(
+                        keyboard_sync_monitor,
+                        mouse_sync_monitor,
+                    )
+                handles = ()
         sync_source_handle_cache.update(
             {
                 "group_name": group_name,
@@ -4794,6 +4962,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
 
     def change_keyboard_sync(enabled: bool) -> SyncToggleViewResult:
+        nonlocal sync_connected_fingerprints
+        nonlocal sync_connected_instance_signature
         if (
             keyboard_sync_monitor is None
             or mouse_sync_monitor is None
@@ -4808,6 +4978,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         auto_click_service.invalidate_direct_sync()
         if not enabled:
             sync_session_state["enabled"] = False
+            input_controller.set_allowed_window_instances(None)
+            pointer_sync_controller.set_allowed_window_instances(None)
+            sync_connected_fingerprints = None
+            sync_connected_instance_signature = None
             cleanup_stopped = stop_input_sync_pair(
                 keyboard_sync_monitor,
                 mouse_sync_monitor,

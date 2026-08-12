@@ -1,5 +1,7 @@
 import json
+from dataclasses import replace
 from pathlib import Path
+from time import monotonic, sleep
 from types import SimpleNamespace
 
 from adapters.windows_input_sync import (
@@ -8,11 +10,17 @@ from adapters.windows_input_sync import (
 )
 from adapters.windows_pointer_sync import WindowsPointerSyncController
 from adapters.windows_smart_reconnect import WindowsSmartReconnectController
+from adapters.windows_window import (
+    WindowInfo,
+    monitored_window_instance_fingerprint,
+)
 from config.config_manager import ConfigManager
+from core.reconnect_policy import ReconnectScreenState
 from core.sp1_boundaries import SmartReconnectBoundary
 from core.window_registry import CharacterWindowRecord
 from domain.character import Character, CharacterImportance
 from main import (
+    ConnectedSyncTargetContractProvider,
     GAME_TIME_AUTO_UPDATE_KEY,
     GAME_TIME_OFFSET_MS_KEY,
     INPUT_POLICY_KEY,
@@ -32,12 +40,21 @@ from main import (
     apply_smart_reconnect_auto_battle_setting,
     apply_smart_reconnect_snapshot_transition,
     normalize_smart_reconnect_auto_battle_enabled,
+    resolve_connected_sync_target_contract,
+    resolve_complete_sync_instance_windows,
     resolve_registered_reconnect_roles,
     group_role_action_started_game,
     group_window_launch_started_game,
     stop_input_sync_pair,
 )
 from services.app_context import AppContext
+from services.deferred_sync_operation_service import (
+    DeferredSyncOperationService,
+)
+from services.target_window_contract_service import (
+    ResolvedTargetWindows,
+    TargetWindowContractService,
+)
 from services.smart_reconnect_monitor import SmartReconnectMonitor
 from services.ungrouped_window_service import UngroupedWindowService
 from services.smart_reconnect_capture_settings_service import (
@@ -56,6 +73,70 @@ from services.game_operation_gate import GameOperationGate
 class _SyncWindow:
     def __init__(self, fingerprint: str) -> None:
         self.launch_fingerprint = fingerprint
+
+
+class _InstanceWindowBackend:
+    def __init__(self, windows, foreground=1) -> None:
+        self.windows = list(windows)
+        self.foreground = foreground
+
+    def list_windows(self):
+        return list(self.windows)
+
+    def foreground_handle(self):
+        return self.foreground
+
+
+class _InstanceMessages:
+    def __init__(self) -> None:
+        self.keys = []
+        self.pointers = []
+
+    def is_window(self, _handle):
+        return True
+
+    def probe_responsive(self, _handle, _timeout):
+        return True
+
+    def send_virtual_key(self, handle, key):
+        self.keys.append((handle, key))
+        return True
+
+    def send_key_chord(self, handle, keys):
+        self.keys.append((handle, keys))
+        return True
+
+    def send_pointer(self, handle, x_ratio, y_ratio, event):
+        self.pointers.append((handle, x_ratio, y_ratio, event))
+        return True
+
+
+def _shared_launcher_sync_windows(count: int):
+    source = "a" * 64
+    raw = tuple(
+        WindowInfo(
+            handle=index,
+            title="Adobe Flash Player 11",
+            visible=True,
+            minimized=False,
+            rect=((index - 1) * 100, 0, index * 100, 100),
+            process_id=777,
+            window_class="Flash",
+            launch_fingerprint=source,
+            thread_id=1700 + index,
+            process_lifecycle_token=900001,
+        )
+        for index in range(1, count + 1)
+    )
+    synced = tuple(
+        replace(
+            window,
+            launch_fingerprint=monitored_window_instance_fingerprint(window),
+        )
+        for window in raw
+    )
+    assert all(window.launch_fingerprint is not None for window in synced)
+    return raw, synced
 
 
 def test_registered_reconnect_roles_cross_check_all_confirmed_primary_records():
@@ -140,7 +221,7 @@ def test_sync_scope_requires_every_safe_window_with_matching_identity():
     )
 
 
-def test_partial_connected_sync_tracks_three_roles_in_stable_scope_order():
+def test_partial_connected_sync_requires_controller_and_keeps_scope_order():
     first = "a" * 64
     second = "b" * 64
     third = "c" * 64
@@ -153,12 +234,766 @@ def test_partial_connected_sync_tracks_three_roles_in_stable_scope_order():
     assert _connected_sync_fingerprints(
         scope,
         (_SyncWindow(second),),
-    ) == (second,)
+    ) == ()
     assert _connected_sync_fingerprints(scope, ()) == ()
     assert _connected_sync_fingerprints(
         scope,
         (_SyncWindow(first), _SyncWindow(first), _SyncWindow(third)),
-    ) == (third,)
+    ) == ()
+
+
+def test_complete_instance_scope_preserves_shared_launcher_windows_and_rejects_conflicts():
+    _raw, synced = _shared_launcher_sync_windows(15)
+    entry_ids = tuple(f"entry-{index}" for index in range(15))
+
+    resolved = resolve_complete_sync_instance_windows(
+        entry_ids,
+        entry_ids,
+        synced,
+        controller_entry_id=entry_ids[0],
+    )
+
+    assert tuple(window.handle for window in resolved) == tuple(range(1, 16))
+    assert len({window.launch_fingerprint for window in resolved}) == 15
+    assert resolve_complete_sync_instance_windows(
+        entry_ids,
+        entry_ids,
+        (synced[0], synced[0], *synced[2:]),
+        controller_entry_id=entry_ids[0],
+    ) == ()
+    assert resolve_complete_sync_instance_windows(
+        entry_ids,
+        (entry_ids[0], entry_ids[0], *entry_ids[2:]),
+        synced,
+        controller_entry_id=entry_ids[0],
+    ) == ()
+
+
+def test_partial_instance_scope_requires_controller_and_restores_slot_order():
+    _raw, synced = _shared_launcher_sync_windows(3)
+    entry_ids = ("controller", "follower-a", "follower-b")
+
+    isolated = resolve_complete_sync_instance_windows(
+        entry_ids,
+        (entry_ids[2], entry_ids[0]),
+        (synced[2], synced[0]),
+        controller_entry_id=entry_ids[0],
+    )
+    assert tuple(window.handle for window in isolated) == (1, 3)
+
+    assert resolve_complete_sync_instance_windows(
+        entry_ids,
+        entry_ids[1:],
+        synced[1:],
+        controller_entry_id=entry_ids[0],
+    ) == ()
+
+    restored = resolve_complete_sync_instance_windows(
+        entry_ids,
+        (entry_ids[2], entry_ids[0], entry_ids[1]),
+        (synced[2], synced[0], synced[1]),
+        controller_entry_id=entry_ids[0],
+    )
+    assert tuple(window.handle for window in restored) == (1, 2, 3)
+
+
+def test_complete_instance_scope_rejects_stale_controller_contract():
+    _raw, synced = _shared_launcher_sync_windows(2)
+    old_scope = ("old-controller", "new-controller")
+    new_scope = ("new-controller", "old-controller")
+    new_resolution = (synced[1], synced[0])
+
+    assert resolve_complete_sync_instance_windows(
+        old_scope,
+        new_scope,
+        new_resolution,
+        controller_entry_id="new-controller",
+    ) == ()
+    assert tuple(
+        window.handle
+        for window in resolve_complete_sync_instance_windows(
+            new_scope,
+            new_scope,
+            new_resolution,
+            controller_entry_id="new-controller",
+        )
+    ) == (2, 1)
+
+
+def test_group_identity_uses_one_resolved_scope_contract():
+    source = Path("main.py").read_text(encoding="utf-8")
+    apply_group_source = source[
+        source.index("    def apply_group_identity("):
+        source.index("    sync_connected_fingerprints:")
+    ]
+    apply_connected_source = source[
+        source.index("    def apply_connected_sync_identity("):
+        source.index("    def group_identity_failure_message(")
+    ]
+
+    for function_source in (apply_group_source, apply_connected_source):
+        assert "sync_scope_service.scope(choice.name)" not in function_source
+        assert "resolved_targets.sync_scope_entry_ids" in function_source
+        assert "resolved_targets.sync_controller_entry_id" in function_source
+    assert "current_sync_target_windows()" not in apply_connected_source
+    assert "target_window_contract_service.reconnect_targets(" not in (
+        apply_connected_source
+    )
+    assert apply_connected_source.count(
+        "resolve_connected_sync_target_contract("
+    ) == 1
+
+
+def test_connected_sync_contract_switches_controller_between_operations_only():
+    raw, synced = _shared_launcher_sync_windows(2)
+    old_contract = ResolvedTargetWindows(
+        windows=raw,
+        sync_windows=synced,
+        sync_entry_ids=("controller-a", "controller-b"),
+        sync_scope_entry_ids=("controller-a", "controller-b"),
+        sync_controller_entry_id="controller-a",
+    )
+    new_contract = ResolvedTargetWindows(
+        windows=(raw[1], raw[0]),
+        sync_windows=(synced[1], synced[0]),
+        sync_entry_ids=("controller-b", "controller-a"),
+        sync_scope_entry_ids=("controller-b", "controller-a"),
+        sync_controller_entry_id="controller-b",
+    )
+
+    class ContractService:
+        def __init__(self):
+            self.calls = 0
+
+        def reconnect_targets(self, _group_name):
+            result = (old_contract, new_contract)[min(self.calls, 1)]
+            self.calls += 1
+            return result
+
+    service = ContractService()
+
+    first_contract, first_connected = resolve_connected_sync_target_contract(
+        service,
+        "group",
+    )
+    assert service.calls == 1
+    assert first_contract.sync_controller_entry_id == "controller-a"
+    assert tuple(window.handle for window in first_connected) == (1, 2)
+    assert tuple(
+        window.handle
+        for window in resolve_complete_sync_instance_windows(
+            first_contract.sync_scope_entry_ids,
+            first_contract.sync_entry_ids,
+            first_contract.sync_windows,
+            controller_entry_id=first_contract.sync_controller_entry_id,
+        )
+    ) == (1, 2)
+
+    second_contract, second_connected = resolve_connected_sync_target_contract(
+        service,
+        "group",
+    )
+    assert service.calls == 2
+    assert second_contract.sync_controller_entry_id == "controller-b"
+    assert tuple(window.handle for window in second_connected) == (2, 1)
+    assert tuple(
+        window.handle
+        for window in resolve_complete_sync_instance_windows(
+            second_contract.sync_scope_entry_ids,
+            second_contract.sync_entry_ids,
+            second_contract.sync_windows,
+            controller_entry_id=second_contract.sync_controller_entry_id,
+        )
+    ) == (2, 1)
+
+
+def test_keyboard_and_pointer_reject_a_controller_switch_on_next_operation():
+    raw, synced = _shared_launcher_sync_windows(2)
+    old_contract = ResolvedTargetWindows(
+        windows=raw,
+        sync_windows=synced,
+        sync_entry_ids=("controller-a", "controller-b"),
+        sync_scope_entry_ids=("controller-a", "controller-b"),
+        sync_controller_entry_id="controller-a",
+    )
+    new_contract = ResolvedTargetWindows(
+        windows=(raw[1], raw[0]),
+        sync_windows=(synced[1], synced[0]),
+        sync_entry_ids=("controller-b", "controller-a"),
+        sync_scope_entry_ids=("controller-b", "controller-a"),
+        sync_controller_entry_id="controller-b",
+    )
+
+    class ContractService:
+        def __init__(self):
+            self.calls = 0
+
+        def reconnect_targets(self, _group_name):
+            result = (old_contract, new_contract)[min(self.calls, 1)]
+            self.calls += 1
+            return result
+
+    for controller_type in (
+        WindowsInputSyncController,
+        WindowsPointerSyncController,
+    ):
+        service = ContractService()
+        provider = ConnectedSyncTargetContractProvider(
+            service,
+            lambda: "group",
+        )
+        backend = _InstanceWindowBackend(synced)
+        messages = _InstanceMessages()
+        controller = controller_type(
+            expected_windows=2,
+            title_keywords=("Adobe Flash Player",),
+            window_backend=backend,
+            message_backend=messages,
+            target_windows_provider=provider.windows,
+            require_expected_window_count=False,
+        )
+        try:
+            controller.set_allowed_window_instances(synced)
+            controller.set_controller_fingerprint(
+                synced[0].launch_fingerprint
+            )
+            if controller_type is WindowsInputSyncController:
+                first = controller.send_approved_key(
+                    "B",
+                    policy=WindowInputPolicy.ALL,
+                    execute=True,
+                    source_handle=1,
+                )
+                messages.keys.clear()
+                second = controller.send_approved_key(
+                    "B",
+                    policy=WindowInputPolicy.ALL,
+                    execute=True,
+                    source_handle=1,
+                )
+                assert first.sent_windows == 2
+                assert second.sent_windows == 0
+                assert messages.keys == []
+            else:
+                first = controller.send_click(
+                    source_handle=1,
+                    x_ratio=0.5,
+                    y_ratio=0.5,
+                    policy=WindowInputPolicy.ALL,
+                    execute=True,
+                    include_source=False,
+                )
+                messages.pointers.clear()
+                second = controller.send_click(
+                    source_handle=1,
+                    x_ratio=0.5,
+                    y_ratio=0.5,
+                    policy=WindowInputPolicy.ALL,
+                    execute=True,
+                    include_source=False,
+                )
+                assert first.sent_windows == 1
+                assert second.sent_windows == 0
+                assert messages.pointers == []
+            assert service.calls == 2
+        finally:
+            assert controller.close() is True
+
+
+def test_unknown_reconnect_screen_does_not_block_basic_keyboard_and_pointer_delivery():
+    raw, synced = _shared_launcher_sync_windows(3)
+    contract = ResolvedTargetWindows(
+        windows=raw,
+        sync_windows=synced,
+        sync_entry_ids=("controller", "follower-a", "follower-b"),
+        sync_scope_entry_ids=("controller", "follower-a", "follower-b"),
+        sync_controller_entry_id="controller",
+    )
+
+    class ContractService:
+        def reconnect_targets(self, _group_name):
+            return contract
+
+    class UnknownScreenObserver:
+        def __init__(self):
+            self.calls = 0
+
+        def observe_window_instance_states(self, _windows):
+            self.calls += 1
+            return {
+                window.launch_fingerprint: ReconnectScreenState.UNKNOWN
+                for window in synced
+            }
+
+    observer = UnknownScreenObserver()
+    provider = ConnectedSyncTargetContractProvider(
+        ContractService(),
+        lambda: "group",
+    )
+    backend = _InstanceWindowBackend(synced)
+    messages = _InstanceMessages()
+    keyboard = WindowsInputSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        target_windows_provider=provider.windows,
+        require_expected_window_count=False,
+    )
+    pointer = WindowsPointerSyncController(
+        expected_windows=3,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        target_windows_provider=provider.windows,
+        require_expected_window_count=False,
+    )
+    try:
+        for controller in (keyboard, pointer):
+            controller.set_allowed_window_instances(synced)
+            controller.set_controller_fingerprint(
+                synced[0].launch_fingerprint
+            )
+
+        assert observer.observe_window_instance_states(raw) == {
+            window.launch_fingerprint: ReconnectScreenState.UNKNOWN
+            for window in synced
+        }
+        assert observer.calls == 1
+        key_result = keyboard.send_approved_key(
+            "B",
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            source_handle=1,
+        )
+        pointer_result = pointer.send_click(
+            source_handle=1,
+            x_ratio=0.5,
+            y_ratio=0.5,
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            include_source=False,
+        )
+
+        assert key_result.sent_windows == 3
+        assert [handle for handle, _key in messages.keys] == [1, 2, 3]
+        assert pointer_result.sent_windows == 2
+        assert [item[0] for item in messages.pointers] == [2, 2, 3, 3]
+    finally:
+        assert keyboard.close() is True
+        assert pointer.close() is True
+
+
+def test_deferred_keyboard_and_pointer_use_separate_connected_screen_gate():
+    raw, synced = _shared_launcher_sync_windows(2)
+    contract = ResolvedTargetWindows(
+        windows=raw,
+        sync_windows=synced,
+        sync_entry_ids=("controller", "follower"),
+        sync_scope_entry_ids=("controller", "follower"),
+        sync_controller_entry_id="controller",
+    )
+
+    class ContractService:
+        def reconnect_targets(self, _group_name):
+            return contract
+
+    provider = ConnectedSyncTargetContractProvider(
+        ContractService(),
+        lambda: "group",
+    )
+    states = {
+        window.launch_fingerprint: ReconnectScreenState.UNKNOWN
+        for window in synced
+    }
+    reconnecting: set[str] = set()
+    deferred = DeferredSyncOperationService()
+    backend = _InstanceWindowBackend(synced)
+    messages = _InstanceMessages()
+    keyboard = WindowsInputSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: tuple(reconnecting),
+        deferred_screen_state_provider=states.get,
+        target_windows_provider=provider.windows,
+        require_expected_window_count=False,
+    )
+    pointer = WindowsPointerSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        deferred_service=deferred,
+        reconnecting_provider=lambda: tuple(reconnecting),
+        deferred_screen_state_provider=states.get,
+        target_windows_provider=provider.windows,
+        require_expected_window_count=False,
+    )
+
+    def send_pair():
+        key_result = keyboard.send_approved_key(
+            "B",
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            source_handle=1,
+        )
+        pointer_result = pointer.send_click(
+            source_handle=1,
+            x_ratio=0.5,
+            y_ratio=0.5,
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            include_source=False,
+        )
+        return key_result, pointer_result
+
+    def wait_until_drained() -> None:
+        deadline = monotonic() + 2.0
+        while deferred.pending() and monotonic() < deadline:
+            sleep(0.01)
+        assert deferred.pending() == 0
+
+    try:
+        for controller in (keyboard, pointer):
+            controller.set_allowed_window_instances(synced)
+            controller.set_controller_fingerprint(
+                synced[0].launch_fingerprint
+            )
+
+        immediate_key, immediate_pointer = send_pair()
+        assert immediate_key.sent_windows == 2
+        assert immediate_pointer.sent_windows == 1
+        assert sorted(handle for handle, _key in messages.keys) == [1, 2]
+        assert [item[0] for item in messages.pointers] == [2, 2]
+        assert deferred.pending() == 0
+
+        messages.keys.clear()
+        messages.pointers.clear()
+        reconnecting.add(synced[1].launch_fingerprint)
+        deferred_key, deferred_pointer = send_pair()
+        assert deferred_key.sent_windows == 0
+        assert deferred_pointer.sent_windows == 0
+        assert messages.keys == []
+        assert messages.pointers == []
+        assert deferred.pending() == 3
+
+        reconnecting.clear()
+        states.update(
+            {
+                fingerprint: ReconnectScreenState.CONNECTED
+                for fingerprint in states
+            }
+        )
+        deferred.process_ready(
+            reconnecting_targets=(),
+            failed_targets=(),
+            ready_targets=tuple(states),
+        )
+        wait_until_drained()
+        assert sorted(handle for handle, _key in messages.keys) == [1, 2]
+        assert [item[0] for item in messages.pointers] == [2, 2]
+        assert deferred.failures() == ()
+
+        messages.keys.clear()
+        messages.pointers.clear()
+        states.update(
+            {
+                fingerprint: ReconnectScreenState.UNKNOWN
+                for fingerprint in states
+            }
+        )
+        reconnecting.add(synced[1].launch_fingerprint)
+        send_pair()
+        assert deferred.pending() == 3
+        reconnecting.clear()
+        deferred.process_ready(
+            reconnecting_targets=(),
+            failed_targets=(),
+            ready_targets=tuple(states),
+        )
+        wait_until_drained()
+        assert messages.keys == []
+        assert messages.pointers == []
+        assert {
+            failure.failure_code for failure in deferred.failures()
+        } >= {"operation_screen_not_safe"}
+    finally:
+        assert keyboard.close() is True
+        assert pointer.close() is True
+
+
+def test_missing_controller_contract_stops_keyboard_and_pointer_without_promotion():
+    raw, synced = _shared_launcher_sync_windows(2)
+    missing_controller = ResolvedTargetWindows(
+        windows=(raw[1],),
+        sync_windows=(),
+        sync_entry_ids=(),
+        sync_scope_entry_ids=("controller", "follower"),
+        sync_controller_entry_id="controller",
+    )
+
+    class ContractService:
+        def reconnect_targets(self, _group_name):
+            return missing_controller
+
+    provider = ConnectedSyncTargetContractProvider(
+        ContractService(),
+        lambda: "group",
+    )
+    backend = _InstanceWindowBackend((synced[1],), foreground=2)
+    messages = _InstanceMessages()
+
+    for controller_type in (
+        WindowsInputSyncController,
+        WindowsPointerSyncController,
+    ):
+        controller = controller_type(
+            expected_windows=2,
+            title_keywords=("Adobe Flash Player",),
+            window_backend=backend,
+            message_backend=messages,
+            target_windows_provider=provider.windows,
+            require_expected_window_count=False,
+        )
+        try:
+            controller.set_allowed_window_instances(synced)
+            controller.set_controller_fingerprint(
+                synced[0].launch_fingerprint
+            )
+            if controller_type is WindowsInputSyncController:
+                result = controller.send_approved_key(
+                    "B",
+                    policy=WindowInputPolicy.ALL,
+                    execute=True,
+                    source_handle=2,
+                )
+                assert result.sent_windows == 0
+                assert messages.keys == []
+            else:
+                result = controller.send_click(
+                    source_handle=2,
+                    x_ratio=0.5,
+                    y_ratio=0.5,
+                    policy=WindowInputPolicy.ALL,
+                    execute=True,
+                    include_source=False,
+                )
+                assert result.sent_windows == 0
+                assert messages.pointers == []
+            assert provider.windows() == ()
+        finally:
+            assert controller.close() is True
+
+
+def test_single_follower_isolated_then_restored_in_original_delivery_order():
+    raw, synced = _shared_launcher_sync_windows(3)
+    scope = ("controller", "follower-a", "follower-b")
+    partial = ResolvedTargetWindows(
+        windows=(raw[2], raw[0]),
+        sync_windows=(synced[2], synced[0]),
+        sync_entry_ids=("follower-b", "controller"),
+        sync_scope_entry_ids=scope,
+        sync_controller_entry_id="controller",
+    )
+    restored = ResolvedTargetWindows(
+        windows=(raw[2], raw[0], raw[1]),
+        sync_windows=(synced[2], synced[0], synced[1]),
+        sync_entry_ids=("follower-b", "controller", "follower-a"),
+        sync_scope_entry_ids=scope,
+        sync_controller_entry_id="controller",
+    )
+
+    class ContractService:
+        contract = partial
+
+        def reconnect_targets(self, _group_name):
+            return self.contract
+
+    service = ContractService()
+    provider = ConnectedSyncTargetContractProvider(service, lambda: "group")
+    backend = _InstanceWindowBackend(synced)
+    messages = _InstanceMessages()
+    keyboard = WindowsInputSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        target_windows_provider=provider.windows,
+        require_expected_window_count=False,
+    )
+    pointer = WindowsPointerSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        target_windows_provider=provider.windows,
+        require_expected_window_count=False,
+    )
+    try:
+        partial_windows = provider.windows()
+        assert tuple(window.handle for window in partial_windows) == (1, 3)
+        for controller in (keyboard, pointer):
+            controller.set_allowed_window_instances(partial_windows)
+            controller.set_controller_fingerprint(
+                partial_windows[0].launch_fingerprint
+            )
+
+        partial_key = keyboard.send_approved_key(
+            "B",
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            source_handle=1,
+        )
+        partial_pointer = pointer.send_click(
+            source_handle=1,
+            x_ratio=0.5,
+            y_ratio=0.5,
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            include_source=False,
+        )
+        assert partial_key.sent_windows == 2
+        assert [handle for handle, _key in messages.keys] == [1, 3]
+        assert partial_pointer.sent_windows == 1
+        assert [item[0] for item in messages.pointers] == [3, 3]
+
+        service.contract = restored
+        restored_windows = provider.windows()
+        assert tuple(window.handle for window in restored_windows) == (1, 2, 3)
+        for controller in (keyboard, pointer):
+            controller.set_expected_windows(3)
+            controller.set_allowed_window_instances(restored_windows)
+            controller.set_controller_fingerprint(
+                restored_windows[0].launch_fingerprint
+            )
+        messages.keys.clear()
+        messages.pointers.clear()
+
+        restored_key = keyboard.send_approved_key(
+            "B",
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            source_handle=1,
+        )
+        restored_pointer = pointer.send_click(
+            source_handle=1,
+            x_ratio=0.5,
+            y_ratio=0.5,
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            include_source=False,
+        )
+        assert restored_key.sent_windows == 3
+        assert [handle for handle, _key in messages.keys] == [1, 2, 3]
+        assert restored_pointer.sent_windows == 2
+        assert [item[0] for item in messages.pointers] == [2, 2, 3, 3]
+    finally:
+        assert keyboard.close() is True
+        assert pointer.close() is True
+
+
+def test_keyboard_and_pointer_sync_use_complete_instance_scope_for_nine_and_fifteen_shared_launchers():
+    for count in (9, 15):
+        _raw, synced = _shared_launcher_sync_windows(count)
+        backend = _InstanceWindowBackend(synced)
+        messages = _InstanceMessages()
+        keyboard = WindowsInputSyncController(
+            expected_windows=count,
+            title_keywords=("Adobe Flash Player",),
+            window_backend=backend,
+            message_backend=messages,
+            target_windows_provider=lambda: tuple(backend.windows),
+            require_expected_window_count=False,
+        )
+        pointer = WindowsPointerSyncController(
+            expected_windows=count,
+            title_keywords=("Adobe Flash Player",),
+            window_backend=backend,
+            message_backend=messages,
+            target_windows_provider=lambda: tuple(backend.windows),
+            require_expected_window_count=False,
+        )
+        try:
+            for controller in (keyboard, pointer):
+                controller.set_allowed_window_instances(synced)
+                controller.set_controller_fingerprint(
+                    synced[0].launch_fingerprint
+                )
+
+            key_result = keyboard.send_approved_key(
+                "B",
+                policy=WindowInputPolicy.ALL,
+                execute=True,
+                source_handle=1,
+            )
+            pointer_result = pointer.send_click(
+                source_handle=1,
+                x_ratio=0.5,
+                y_ratio=0.5,
+                policy=WindowInputPolicy.ALL,
+                execute=True,
+                include_source=False,
+            )
+
+            assert key_result.sent_windows == count
+            assert {handle for handle, _key in messages.keys} == set(
+                range(1, count + 1)
+            )
+            assert pointer_result.sent_windows == count - 1
+            assert {item[0] for item in messages.pointers} == set(
+                range(2, count + 1)
+            )
+
+            foreign_raw = WindowInfo(
+                handle=count + 1,
+                title="Adobe Flash Player 11",
+                visible=True,
+                minimized=False,
+                rect=(count * 100, 0, (count + 1) * 100, 100),
+                process_id=777,
+                window_class="Flash",
+                launch_fingerprint="a" * 64,
+                thread_id=1800 + count,
+                process_lifecycle_token=900001,
+            )
+            foreign = replace(
+                foreign_raw,
+                launch_fingerprint=monitored_window_instance_fingerprint(
+                    foreign_raw
+                ),
+            )
+            backend.windows.append(foreign)
+            messages.keys.clear()
+            result_after_foreign = keyboard.send_approved_key(
+                "B",
+                policy=WindowInputPolicy.ALL,
+                execute=True,
+                source_handle=1,
+            )
+            assert result_after_foreign.sent_windows == count
+            assert all(handle <= count for handle, _key in messages.keys)
+
+            backend.windows.append(synced[0])
+            messages.keys.clear()
+            conflict_result = keyboard.send_approved_key(
+                "B",
+                policy=WindowInputPolicy.ALL,
+                execute=True,
+                source_handle=1,
+            )
+            assert conflict_result.sent_windows == 0
+            assert messages.keys == []
+
+            keyboard.set_allowed_window_instances(None)
+            pointer.set_allowed_window_instances(None)
+            assert keyboard._allowed_instance_identities is None
+            assert pointer._allowed_instance_identities is None
+        finally:
+            assert keyboard.close() is True
+            assert pointer.close() is True
 
 
 def test_group_identity_failure_explains_cross_group_ambiguity():
@@ -484,6 +1319,7 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
 
     config = AppContext.get(ConfigManager)
     controller = AppContext.get(WindowsInputSyncController)
+    pointer = AppContext.get(WindowsPointerSyncController)
     reconnect = AppContext.get(WindowsSmartReconnectController)
     reconnect_boundary = AppContext.get(SmartReconnectBoundary)
     reconnect_monitor = AppContext.get(SmartReconnectMonitor)
@@ -514,6 +1350,14 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
         "repeat_interval_ms": 250,
     }
     assert isinstance(controller, WindowsInputSyncController)
+    assert isinstance(pointer, WindowsPointerSyncController)
+    assert controller._screen_state_provider is None
+    assert pointer._screen_state_provider is None
+    assert controller._deferred_screen_state_provider is not None
+    assert (
+        controller._deferred_screen_state_provider
+        is pointer._deferred_screen_state_provider
+    )
     assert isinstance(reconnect, WindowsSmartReconnectController)
     assert reconnect_boundary is reconnect
     assert reconnect.auto_battle_enabled is True
@@ -524,6 +1368,135 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
         == SmartReconnectCaptureSettings()
     )
     assert reconnect.capture_settings == SmartReconnectCaptureSettings()
+
+
+def test_formal_deferred_gate_reobserves_connected_before_each_delivery(
+    tmp_path,
+):
+    build_services(root=tmp_path)
+    keyboard = AppContext.get(WindowsInputSyncController)
+    pointer = AppContext.get(WindowsPointerSyncController)
+    reconnect = AppContext.get(WindowsSmartReconnectController)
+    target_service = AppContext.get(TargetWindowContractService)
+    deferred = AppContext.get(DeferredSyncOperationService)
+    raw, synced = _shared_launcher_sync_windows(2)
+    contract = ResolvedTargetWindows(
+        windows=raw,
+        sync_windows=synced,
+        sync_entry_ids=("controller", "follower"),
+        sync_scope_entry_ids=("controller", "follower"),
+        sync_controller_entry_id="controller",
+    )
+    screen_state = {"value": ReconnectScreenState.UNKNOWN}
+    observed: list[ReconnectScreenState] = []
+
+    def observe_window_instance_states(windows):
+        value = screen_state["value"]
+        observed.append(value)
+        return {
+            monitored_window_instance_fingerprint(window): value
+            for window in windows
+        }
+
+    target_service.reconnect_targets = (
+        lambda _group_name, **_kwargs: contract
+    )
+    reconnect.observe_window_instance_states = observe_window_instance_states
+    backend = _InstanceWindowBackend(synced)
+    messages = _InstanceMessages()
+    for controller in (keyboard, pointer):
+        controller._window_backend = backend
+        controller._message_backend = messages
+        controller.set_expected_windows(2)
+        controller.set_allowed_window_instances(synced)
+        controller.set_controller_fingerprint(
+            synced[0].launch_fingerprint
+        )
+
+    def enqueue_pair() -> None:
+        deferred.enqueue(
+            synced[0].launch_fingerprint,
+            "key:B",
+            kind="keyboard",
+            payload={"key": "B"},
+        )
+        deferred.enqueue(
+            synced[1].launch_fingerprint,
+            "pointer:click:0.5000:0.5000",
+            kind="pointer",
+            payload={
+                "x_ratio": 0.5,
+                "y_ratio": 0.5,
+                "event": "click",
+            },
+        )
+
+    def process_ready_and_wait() -> None:
+        deferred.process_ready(
+            reconnecting_targets=(),
+            failed_targets=(),
+            ready_targets=tuple(
+                window.launch_fingerprint for window in synced
+            ),
+        )
+        deadline = monotonic() + 2.0
+        while deferred.pending() and monotonic() < deadline:
+            sleep(0.01)
+        assert deferred.pending() == 0
+
+    try:
+        assert keyboard._screen_state_provider is None
+        assert pointer._screen_state_provider is None
+        immediate_key = keyboard.send_approved_key(
+            "B",
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            source_handle=1,
+        )
+        immediate_pointer = pointer.send_click(
+            source_handle=1,
+            x_ratio=0.5,
+            y_ratio=0.5,
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            include_source=False,
+        )
+        assert immediate_key.sent_windows == 2
+        assert immediate_pointer.sent_windows == 1
+        assert observed == []
+
+        messages.keys.clear()
+        messages.pointers.clear()
+        screen_state["value"] = ReconnectScreenState.CONNECTED
+        assert (
+            keyboard._deferred_screen_state_provider(
+                synced[0].launch_fingerprint
+            )
+            is ReconnectScreenState.CONNECTED
+        )
+        screen_state["value"] = ReconnectScreenState.UNKNOWN
+        failure_count = len(deferred.failures())
+        enqueue_pair()
+        process_ready_and_wait()
+        assert messages.keys == []
+        assert messages.pointers == []
+        assert {
+            failure.failure_code
+            for failure in deferred.failures()[failure_count:]
+        } == {"operation_screen_not_safe"}
+        assert observed[-2:] == [
+            ReconnectScreenState.UNKNOWN,
+            ReconnectScreenState.UNKNOWN,
+        ]
+
+        screen_state["value"] = ReconnectScreenState.CONNECTED
+        enqueue_pair()
+        process_ready_and_wait()
+        assert messages.keys == [(1, 0x42)]
+        assert [item[0] for item in messages.pointers] == [2, 2]
+    finally:
+        assert keyboard.close() is True
+        assert pointer.close() is True
 
 
 def test_build_services_wires_registered_primary_and_unique_ungrouped_shortcut(
@@ -722,6 +1695,18 @@ def test_main_window_polling_uses_a_throttled_current_group_handle_cache():
         'execution_enabled_provider=lambda: bool('
     ) == 2
     assert 'sync_session_state["enabled"] = False' in source
+    handle_source = source[
+        source.index("    def current_target_handles("):
+        source.index("    def log_keyboard_sync_result(")
+    ]
+    assert "if choice is None or not apply_connected_sync_identity(" in handle_source
+    assert handle_source.count("resolve_connected_sync_target_contract(") == 1
+    assert "resolved_targets=resolved_targets" in handle_source
+    assert 'sync_session_state["enabled"] = False' in handle_source
+    assert "sync_connected_fingerprints = None" in handle_source
+    assert "sync_connected_instance_signature = None" in handle_source
+    assert "stop_input_sync_pair(" in handle_source
+    assert "handles = ()" in handle_source
     assert 'sync_source_handle_cache: dict[str, object]' in source
     assert '"expires_at": now + 0.25' in source
     assert "target_windows_provider=current_sync_target_windows" in source

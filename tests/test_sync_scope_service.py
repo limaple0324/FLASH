@@ -13,6 +13,11 @@ class Resolver:
         }
 
 
+class SharedResolver:
+    def resolve(self, paths):
+        return {path: "a" * 64 for path in paths}
+
+
 def _shortcut(tmp_path, name):
     path = tmp_path / f"{name}.lnk"
     path.write_bytes(b"shortcut")
@@ -63,6 +68,42 @@ def test_scope_recursively_expands_cross_group_and_deduplicates(tmp_path):
     )
     assert len(scope.fingerprints) == 6
     assert len(scope.fingerprints) == len(set(scope.fingerprints))
+
+
+def test_scope_keeps_shared_launcher_digests_until_live_instance_binding(
+    tmp_path,
+):
+    first, second = [_shortcut(tmp_path, name) for name in ("甲", "乙")]
+    legacy = tmp_path / "shared-launcher.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "共用啟動檔組",
+                        "launch_entries": [
+                            {"path": str(first)},
+                            {"path": str(second)},
+                        ],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    configuration = GroupConfigurationService(
+        tmp_path / "groups.json",
+        legacy_config_path=legacy,
+    )
+
+    scope = SyncScopeService(configuration, SharedResolver()).scope(
+        "共用啟動檔組"
+    )
+
+    assert scope.ready is True
+    assert len(scope.entry_ids) == 2
+    assert scope.fingerprints == ("a" * 64, "a" * 64)
 
 
 def test_reordering_launch_sequence_does_not_change_sync_controller(
