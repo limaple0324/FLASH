@@ -252,7 +252,7 @@ def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
     pointer = AppContext.get(main_module.WindowsPointerSyncController)
     unscoped = reconnect._target_windows_provider()
     assert isinstance(unscoped, ResolvedTargetWindows)
-    assert unscoped.failure_codes == ("group_name_invalid",)
+    assert unscoped.global_failure_codes == ("group_name_invalid",)
     strict_targets = ("strict-target",)
     strict_contract = ResolvedTargetWindows(strict_targets)
     monkeypatch.setattr(

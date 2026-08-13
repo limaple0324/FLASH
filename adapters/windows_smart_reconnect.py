@@ -10614,11 +10614,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
         # Auto-battle evidence remains isolated per role.
         if mutation_execute and self.auto_battle_execution_allowed():
+            tcp_non_operable_instances = frozenset(
+                state.instance
+                for state in self._tcp_s.values()
+                if state.zero_count > 0
+            )
             for window, fingerprint, item in recognized:
                 if (
                     fingerprint in terminal_completed_fingerprints
                     or fingerprint in self._login_only_recovery_fingerprints
                     or fingerprint in self._tcp_timeout_isolated
+                    or WindowInstanceToken.from_window(window)
+                    in tcp_non_operable_instances
                     or (
                         active_recovery_owner is not None
                         and fingerprint != active_recovery_owner

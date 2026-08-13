@@ -292,6 +292,7 @@ def test_reopen_refuses_unexpected_or_incomplete_live_candidate(tmp_path):
 
 
 def test_reopen_refuses_owner_self_reopen_before_shortcut_delivery(tmp_path):
+    now = [0.0]
     owner = _window()
     reopened_owner = _window(
         handle=22,
@@ -309,7 +310,8 @@ def test_reopen_refuses_owner_self_reopen_before_shortcut_delivery(tmp_path):
         opener,
         absence_stability_seconds=0.1,
         poll_seconds=0.05,
-        sleeper=lambda _seconds: None,
+        monotonic_clock=lambda: now[0],
+        sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
     )
 
     result = restarter.reopen_missing(_target(tmp_path), ())

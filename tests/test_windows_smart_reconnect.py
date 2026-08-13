@@ -1993,7 +1993,11 @@ def test_multiple_tcp_zero_queues_only_first_plan_owner_for_mutation(
 
     assert restarted.details["restarted_windows"] == 1
     assert [call[0] for call in restarter.calls] == [windows[0]]
-    assert restarter.reopen_calls == []
+    assert len(restarter.reopen_calls) == 1
+    assert restarter.reopen_calls[0][0].fingerprint == (
+        windows[0].launch_fingerprint
+    )
+    assert restarter.reopen_calls[0][1] == (windows[1],)
     assert fixture.mouse.clicks == []
     assert auto_calls == []
     peer_state = next(
@@ -2069,7 +2073,11 @@ def test_confirmed_tcp_restarts_only_the_single_contract_target(tmp_path):
     result = fixture.controller.reconnect()
 
     assert [call[0] for call in restarter.calls] == [windows[0]]
-    assert restarter.reopen_calls == []
+    assert len(restarter.reopen_calls) == 1
+    assert restarter.reopen_calls[0][0].fingerprint == (
+        windows[0].launch_fingerprint
+    )
+    assert restarter.reopen_calls[0][1] == tuple(windows[1:])
     assert fixture.mouse.clicks == []
     assert fixture.mouse.expected_process_ids == []
     assert tcp.calls == [frozenset({101, 102, 103})] * 6
@@ -2187,9 +2195,14 @@ def test_slow_tcp_restart_consumes_the_original_sixty_second_budget(tmp_path):
     counts = {window.process_id: 1}
 
     class SlowRestarter(FakeBattleRestarter):
-        def restart(self, window_arg, target, **kwargs):
+        def close_verified(self, window_arg, candidate_windows, **kwargs):
+            result = super().close_verified(
+                window_arg,
+                candidate_windows,
+                **kwargs,
+            )
             now[0] += 61.0
-            return super().restart(window_arg, target, **kwargs)
+            return result
 
     def tcp_connection_counts(process_ids):
         return {process_id: counts.get(process_id, 0) for process_id in process_ids}
@@ -3086,12 +3099,13 @@ def test_pending_reopen_ignores_mapped_duplicate_sibling_only(tmp_path):
         )
     }
     fixture.controller._target_windows_provider = lambda: provider_state["value"]
+    reopen_count_before_retry = len(restarter.reopen_calls)
 
     fixture.controller.reconnect()
 
-    assert len(restarter.reopen_calls) == 1
-    assert restarter.reopen_calls[0][0].fingerprint == old.launch_fingerprint
-    assert restarter.reopen_calls[0][1] == (peers[0], peers[1])
+    assert len(restarter.reopen_calls) == reopen_count_before_retry + 1
+    assert restarter.reopen_calls[-1][0].fingerprint == old.launch_fingerprint
+    assert restarter.reopen_calls[-1][1] == (peers[1],)
     assert fixture.mouse.clicks == []
 
 
@@ -3642,8 +3656,8 @@ def test_isolated_target_source_failure_prevents_false_connected_result():
         windows=[windows[0]],
         expected_windows=2,
         target_windows_provider=lambda: ResolvedTargetWindows(
-            (windows[0],),
-            ("window_identity_duplicate",),
+            windows=(windows[0],),
+            global_failure_codes=("window_identity_duplicate",),
         ),
     )
     fixture.controller.set_allowed_fingerprints(selected)
@@ -3664,9 +3678,7 @@ def test_single_blocked_source_window_isolated_while_healthy_window_recovers():
     blocked = make_window(2, fingerprint="b" * 64)
     provider_state = {
         "value": ResolvedTargetWindows(
-            (healthy,),
-            ("window_identity_duplicate",),
-            frozenset({blocked.launch_fingerprint}),
+            windows=(healthy,),
             target_failure_evidence=(
                 tcp_target_failure(
                     "entry-blocked",
@@ -3707,8 +3719,7 @@ def test_offline_target_source_failure_prevents_false_connected_result():
         windows=windows,
         expected_windows=2,
         target_windows_provider=lambda: ResolvedTargetWindows(
-            tuple(windows),
-            ("window_offline",),
+            windows=tuple(windows),
             target_failure_evidence=(
                 tcp_target_failure(
                     "entry-missing",
@@ -3771,9 +3782,7 @@ def test_scoped_source_failure_revokes_only_affected_connected_evidence(
         failure_codes[0] if failure_codes else "window_identity_duplicate"
     )
     provider_state["value"] = ResolvedTargetWindows(
-        (windows[0],),
-        (local_failure_code,),
-        frozenset({affected}),
+        windows=(windows[0],),
         target_failure_evidence=(
             tcp_target_failure("entry-1", affected, local_failure_code),
         ),
@@ -3814,9 +3823,7 @@ def test_scoped_source_subset_without_failure_revokes_missing_evidence():
 
     missing = windows[1].launch_fingerprint
     provider_state["value"] = ResolvedTargetWindows(
-        (windows[0],),
-        ("window_offline",),
-        frozenset({missing}),
+        windows=(windows[0],),
         target_failure_evidence=(
             tcp_target_failure("entry-1", missing, "window_offline"),
         ),
@@ -3852,9 +3859,7 @@ def test_scoped_source_subset_without_failure_keeps_source_generation():
 
     missing = windows[1].launch_fingerprint
     provider_state["value"] = ResolvedTargetWindows(
-        (windows[0],),
-        ("window_offline",),
-        frozenset({missing}),
+        windows=(windows[0],),
         target_failure_evidence=(
             tcp_target_failure("entry-1", missing, "window_offline"),
         ),
@@ -4290,8 +4295,8 @@ def test_source_failure_blocks_final_click_for_a_selected_group():
         windows=[windows[0]],
         expected_windows=2,
         target_windows_provider=lambda: ResolvedTargetWindows(
-            (windows[0],),
-            ("unidentified_candidate_window",),
+            windows=(windows[0],),
+            global_failure_codes=("unidentified_candidate_window",),
         ),
     )
     fixture.controller.set_allowed_fingerprints(selected)
@@ -4804,6 +4809,7 @@ def test_missing_reopen_retries_immediately_without_touching_other_roles(
     now[0] = 5.0
     first = fixture.controller.reconnect()
     assert first.details["restarted_windows"] == 1
+    reopen_count_after_initial_restart = len(restarter.reopen_calls)
     fixture.controller._window_backend.windows = [windows[1]]
     provider_state["value"] = tcp_missing_target(
         [windows[1]],
@@ -4823,7 +4829,7 @@ def test_missing_reopen_retries_immediately_without_touching_other_roles(
     assert retry.details["restarted_windows"] == 1
     assert no_duplicate.details["restarted_windows"] == 0
     assert next_retry.details["restarted_windows"] == 1
-    assert len(restarter.reopen_calls) == 2
+    assert len(restarter.reopen_calls) == reopen_count_after_initial_restart + 2
 
 
 def test_failed_battle_restart_is_attempted_once_until_new_disconnect_event(
@@ -4943,9 +4949,14 @@ def test_failed_battle_restart_public_flow_keeps_same_event_one_shot(
     else:
         generation_before = fixture.controller._source_state_generation
         provider_state["value"] = ResolvedTargetWindows(
-            tuple(windows),
-            ("window_identity_blocked",),
-            frozenset({windows[0].launch_fingerprint}),
+            windows=tuple(windows),
+            target_failure_evidence=(
+                tcp_target_failure(
+                    "entry-0",
+                    windows[0].launch_fingerprint,
+                    "window_identity_blocked",
+                ),
+            ),
         )
         now[0] = 6.0
         fixture.controller.reconnect()
@@ -8082,9 +8093,14 @@ def test_duplicate_identity_never_triggers_missing_role_reopen(tmp_path):
         battle_restarter=restarter,
         group_launch_plan=plan,
         target_windows_provider=lambda: ResolvedTargetWindows(
-            (windows[1],),
-            ("window_identity_duplicate",),
-            frozenset({blocked}),
+            windows=(windows[1],),
+            target_failure_evidence=(
+                tcp_target_failure(
+                    "entry-0",
+                    blocked,
+                    "window_identity_duplicate",
+                ),
+            ),
         ),
     )
     fixture.controller._pending_reopen_fingerprints.add(blocked)
@@ -9529,6 +9545,7 @@ def test_source_revocation_before_pending_reopen_blocks_old_scan(
     fixture.controller.reconnect()
     original_backend_call = fixture.controller._run_authorized_backend_call
     revoked = []
+    reopen_count_before_revocation = len(restarter.reopen_calls)
 
     def revoke_source_at_final_boundary(callback, **kwargs):
         if not revoked:
@@ -9550,7 +9567,7 @@ def test_source_revocation_before_pending_reopen_blocks_old_scan(
 
     assert revoked == [{present_fingerprint: ReconnectScreenState.UNKNOWN}]
     assert result.details["restarted_windows"] == 0
-    assert restarter.reopen_calls == []
+    assert len(restarter.reopen_calls) == reopen_count_before_revocation
     assert missing_fingerprint in fixture.controller._pending_reopen_fingerprints
 
 

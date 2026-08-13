@@ -3,7 +3,10 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-from adapters.windows_window import WindowInfo
+from adapters.windows_window import (
+    WindowInfo,
+    monitored_window_instance_fingerprint,
+)
 from core.reconnect_policy import ReconnectScreenState
 from services.target_window_contract_service import ResolvedTargetWindows
 from main import (
@@ -206,7 +209,14 @@ def test_role_id_read_uses_the_entry_safe_window_not_groupwide_failure():
     target_service = SimpleNamespace(
         reconnect_targets=lambda group_name: ResolvedTargetWindows(
             windows=(window,),
-            sync_windows=(window,),
+            sync_windows=(
+                replace(
+                    window,
+                    launch_fingerprint=(
+                        monitored_window_instance_fingerprint(window)
+                    ),
+                ),
+            ),
             sync_entry_ids=("entry-a",),
             sync_scope_entry_ids=("entry-a",),
             sync_controller_entry_id="entry-a",
@@ -344,7 +354,14 @@ def test_role_id_is_automatically_read_only_for_connected_missing_roles():
     target_service = SimpleNamespace(
         reconnect_targets=lambda group_name: ResolvedTargetWindows(
             windows=(window,),
-            sync_windows=(window,),
+            sync_windows=(
+                replace(
+                    window,
+                    launch_fingerprint=(
+                        monitored_window_instance_fingerprint(window)
+                    ),
+                ),
+            ),
             sync_entry_ids=("entry-a",),
             sync_scope_entry_ids=("entry-a",),
             sync_controller_entry_id="entry-a",
@@ -519,7 +536,14 @@ def test_role_id_auto_read_never_persists_after_contract_identity_changes():
             paired_entry = next(contract_entries)
             return ResolvedTargetWindows(
                 windows=(resolved,),
-                sync_windows=(resolved,),
+                sync_windows=(
+                    replace(
+                        resolved,
+                        launch_fingerprint=(
+                            monitored_window_instance_fingerprint(resolved)
+                        ),
+                    ),
+                ),
                 sync_entry_ids=(paired_entry,),
                 sync_scope_entry_ids=(paired_entry,),
                 sync_controller_entry_id=paired_entry,

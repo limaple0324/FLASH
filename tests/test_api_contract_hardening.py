@@ -418,9 +418,11 @@ def test_scope_cache_isolates_one_follower_and_restores_original_slot_order(
     isolated = service.reconnect_targets(group_name)
     assert isolated.sync_entry_ids == (entry_ids[0], entry_ids[2])
     assert tuple(window.handle for window in isolated.sync_windows) == (11, 13)
-    assert tuple(
-        item.failure_codes for item in isolated.target_failure_evidence
-    ) == (("shortcut_identity_unresolved",),)
+    assert isolated.target_failure_evidence == ()
+    assert isolated.global_failure_codes == (
+        "shortcut_identity_unresolved",
+        "unattributed_candidate_window",
+    )
 
     follower_path.write_bytes(follower_content)
     restored = service.reconnect_targets(group_name)
@@ -1018,9 +1020,10 @@ def test_shared_launcher_incomplete_or_conflicting_instance_isolated(tmp_path):
 
     assert tuple(window.handle for window in isolated.windows) == (11,)
     assert isolated.sync_entry_ids == (first.entry_id,)
-    assert any(
-        "window_identity_duplicate" in item.failure_codes
-        for item in isolated.target_failure_evidence
+    assert isolated.target_failure_evidence == ()
+    assert isolated.global_failure_codes == (
+        "window_identity_duplicate",
+        "unattributed_candidate_window",
     )
 
     second = entries[1]
