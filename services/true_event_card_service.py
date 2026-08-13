@@ -70,10 +70,6 @@ class TrueEventCardService:
         self._lock = threading.RLock()
         self._role_statuses, self._emitted_events = self._load_state()
 
-    @property
-    def state_path(self) -> Path | None:
-        return self._state_path
-
     def _load_state(self) -> tuple[dict[str, str], dict[str, datetime]]:
         if self._state_path is None or not self._state_path.is_file():
             return {}, {}

@@ -224,8 +224,6 @@ class PlayerHabitPreferenceService:
                     kind=kind,
                     subject=subject,
                     values=values,
-                    occurrence_count=len(observations),
-                    distinct_days=len(days),
                     first_observed_on=first,
                     last_observed_on=last,
                 )

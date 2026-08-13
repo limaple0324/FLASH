@@ -74,8 +74,6 @@ def test_default_rule_observes_seven_days_and_reviews_on_day_eight(
     assert candidates[0].kind is HabitKind.ACTIVITY_TIME
     assert candidates[0].subject == "神秘考官"
     assert candidates[0].values == ("19:50",)
-    assert candidates[0].occurrence_count == 7
-    assert candidates[0].distinct_days == 7
 
 
 def test_exception_observations_do_not_count_and_observation_days_are_adjustable(
@@ -142,8 +140,6 @@ def test_four_confirmed_player_choices_are_persistent_and_filter_reminders(
         kind=HabitKind.CHARACTER_ORDER,
         subject="每日活動",
         values=("主號", "分號"),
-        occurrence_count=10,
-        distinct_days=8,
         first_observed_on=datetime(2026, 7, 1).date(),
         last_observed_on=datetime(2026, 7, 8).date(),
     )
@@ -177,8 +173,6 @@ def test_saved_preferences_can_be_modified_removed_and_cleared(tmp_path) -> None
         HabitKind.ACTIVITY_TIME,
         "神秘考官",
         ("19:50",),
-        10,
-        8,
         decided_at.date(),
         decided_at.date(),
     )
@@ -187,8 +181,6 @@ def test_saved_preferences_can_be_modified_removed_and_cleared(tmp_path) -> None
         HabitKind.CHARACTER_ORDER,
         "每日活動",
         ("主號", "分號"),
-        10,
-        8,
         decided_at.date(),
         decided_at.date(),
     )
@@ -251,8 +243,6 @@ def test_expired_raw_observations_and_temporary_decisions_are_cleaned(
         HabitKind.ACTIVITY_TIME,
         "神秘考官",
         ("19:50",),
-        7,
-        7,
         old.date(),
         old.date(),
     )
@@ -272,8 +262,6 @@ def test_clear_all_removes_observations_and_saved_preferences(tmp_path) -> None:
         HabitKind.ACTIVITY_TIME,
         "神秘考官",
         ("19:50",),
-        7,
-        7,
         now.date(),
         now.date(),
     )
@@ -292,8 +280,6 @@ def test_settings_view_exposes_editable_preference_values(tmp_path) -> None:
         HabitKind.CHARACTER_ORDER,
         "每日活動",
         ("主號", "分號"),
-        10,
-        8,
         decided_at.date(),
         decided_at.date(),
     )

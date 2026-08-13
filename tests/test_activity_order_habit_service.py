@@ -1,119 +1,77 @@
-from datetime import date, timedelta
+import json
+from datetime import date
 
-from habit.models import HabitReviewState
-from habit.service import ActivityOrderHabitService
+from habit.models import ActivityOrderHabitMemory, ActivityOrderObservation
 from habit.store import ActivityOrderHabitStore
 from main import ACTIVITY_ORDER_HABIT_FILENAME, build_services
 
 
-def _service(tmp_path) -> ActivityOrderHabitService:
-    return ActivityOrderHabitService(
-        ActivityOrderHabitStore(tmp_path / "activity_order_habit.json")
+def _memory() -> ActivityOrderHabitMemory:
+    return ActivityOrderHabitMemory(
+        observations=(
+            ActivityOrderObservation(
+                observed_on=date(2026, 7, 1),
+                activity_ids=("hall-of-demons", "magic-soldiers"),
+            ),
+        ),
+        accepted_order=("hall-of-demons", "magic-soldiers"),
+        paused=True,
+        dismissed_through=date(2026, 7, 1),
     )
 
 
-def _record_week(service: ActivityOrderHabitService, start: date) -> None:
-    for offset in range(7):
-        service.record_daily_order(
-            start + timedelta(days=offset),
-            ("hall-of-demons", "magic-soldiers"),
-        )
-
-
-def test_first_seven_days_only_observe_and_eighth_day_is_ready_for_review(tmp_path):
-    service = _service(tmp_path)
-    start = date(2026, 7, 1)
-    _record_week(service, start)
-
-    day_seven = service.review(date(2026, 7, 7))
-    day_eight = service.review(date(2026, 7, 8))
-
-    assert day_seven.state is HabitReviewState.OBSERVING
-    assert day_eight.state is HabitReviewState.REVIEW_READY
-    assert day_eight.valid_observed_days == 7
-    assert day_eight.order_counts == (
-        (("hall-of-demons", "magic-soldiers"), 7),
-    )
-
-
-def test_exception_day_is_saved_but_does_not_count_toward_review(tmp_path):
-    service = _service(tmp_path)
-    start = date(2026, 7, 1)
-    _record_week(service, start)
-    service.record_daily_order(
-        date(2026, 7, 7),
-        ("magic-soldiers", "hall-of-demons"),
-        is_exception=True,
-    )
-
-    review = service.review(date(2026, 7, 8))
-
-    assert review.total_observed_days == 7
-    assert review.valid_observed_days == 6
-    assert review.state is HabitReviewState.OBSERVING
-
-
-def test_same_day_observation_can_be_corrected_without_duplicate_day(tmp_path):
-    service = _service(tmp_path)
-    observed_on = date(2026, 7, 1)
-
-    service.record_daily_order(observed_on, ("first", "second"))
-    corrected = service.record_daily_order(observed_on, ("second", "first"))
-
-    assert corrected.activity_ids == ("second", "first")
-    assert len(service.snapshot().observations) == 1
-
-
-def test_accept_modify_pause_resume_and_clear_are_persistent(tmp_path):
+def test_store_roundtrip_preserves_the_existing_schema_and_model(tmp_path) -> None:
     path = tmp_path / "activity_order_habit.json"
-    service = ActivityOrderHabitService(ActivityOrderHabitStore(path))
-    service.record_daily_order(date(2026, 7, 1), ("first", "second"))
+    store = ActivityOrderHabitStore(path)
+    memory = _memory()
 
-    service.accept(("first", "second"))
-    assert service.review(date(2026, 7, 8)).state is HabitReviewState.ACCEPTED
-    service.modify(("second", "first"))
-    service.set_paused(True)
-    assert service.review(date(2026, 7, 8)).state is HabitReviewState.PAUSED
-    service.set_paused(False)
+    store.save(memory)
 
-    reloaded = ActivityOrderHabitService(ActivityOrderHabitStore(path))
-    assert reloaded.snapshot().accepted_order == ("second", "first")
-    assert reloaded.review(date(2026, 7, 8)).state is HabitReviewState.ACCEPTED
-
-    reloaded.clear_all()
-    assert reloaded.snapshot().observations == ()
-    assert ActivityOrderHabitService(
-        ActivityOrderHabitStore(path)
-    ).snapshot().accepted_order is None
+    assert store.load() == memory
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "activity_order": memory.to_dict(),
+    }
 
 
-def test_dismiss_review_does_not_delete_observations_or_auto_accept(tmp_path):
-    service = _service(tmp_path)
-    start = date(2026, 7, 1)
-    _record_week(service, start)
+def test_store_loads_an_existing_activity_order_file(tmp_path) -> None:
+    path = tmp_path / "activity_order_habit.json"
+    memory = _memory()
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "activity_order": memory.to_dict(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
-    service.dismiss_review()
-    review = service.review(date(2026, 7, 8))
-
-    assert review.state is HabitReviewState.DISMISSED
-    assert review.valid_observed_days == 7
-    assert review.accepted_order is None
-
-
-def test_remove_observation_supports_player_correction(tmp_path):
-    service = _service(tmp_path)
-    observed_on = date(2026, 7, 1)
-    service.record_daily_order(observed_on, ("first",))
-
-    assert service.remove_observation(observed_on) is True
-    assert service.remove_observation(observed_on) is False
-    assert service.snapshot().observations == ()
+    assert ActivityOrderHabitStore(path).load() == memory
 
 
-def test_build_services_loads_managed_activity_order_habits(
+def test_corrupt_main_file_is_isolated_and_valid_backup_is_restored(tmp_path) -> None:
+    path = tmp_path / "activity_order_habit.json"
+    store = ActivityOrderHabitStore(path)
+    memory = _memory()
+    store.save(memory)
+    store.backup_path.write_bytes(path.read_bytes())
+    path.write_text("not-json", encoding="utf-8")
+
+    restored = ActivityOrderHabitStore(path)
+
+    assert restored.load() == memory
+    assert restored.recovered_from_corruption is True
+    assert restored.recovered_from_backup is True
+    assert restored.corrupt_backup is not None
+    assert restored.corrupt_backup.read_text(encoding="utf-8") == "not-json"
+
+
+def test_build_services_loads_managed_activity_order_habits_once(
     tmp_path,
     monkeypatch,
-):
+) -> None:
     loaded_paths = []
     original_load = ActivityOrderHabitStore.load
 

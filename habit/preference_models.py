@@ -160,8 +160,6 @@ class PlayerHabitCandidate:
     kind: HabitKind
     subject: str
     values: tuple[str, ...]
-    occurrence_count: int
-    distinct_days: int
     first_observed_on: date
     last_observed_on: date
 
@@ -183,10 +181,6 @@ class PlayerHabitCandidate:
             "values",
             _required_values(tuple(self.values), "values"),
         )
-        for field in ("occurrence_count", "distinct_days"):
-            value = getattr(self, field)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f"{field} must be a positive integer.")
         if not isinstance(self.first_observed_on, date) or not isinstance(
             self.last_observed_on,
             date,

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 
 from cards.history_store import CardHistoryStore
 from cards.priority import CardPriorityReason
@@ -194,9 +195,14 @@ def test_build_services_registers_real_event_and_farm_state_in_managed_data(
     true_events = AppContext.get(TrueEventCardService)
     farm = AppContext.get(FarmTimerService)
 
-    assert true_events.state_path == (
-        paths.data_dir() / TRUE_EVENT_CARD_STATE_FILENAME
+    true_events.handle_role_status(
+        _role_change(ROLE_STATUS_DISCONNECTED, ROLE_STATUS_OPEN),
+        occurred_at=datetime(2026, 7, 29, 1, 0, tzinfo=timezone.utc),
     )
+    true_event_state = paths.data_dir() / TRUE_EVENT_CARD_STATE_FILENAME
+    assert json.loads(true_event_state.read_text(encoding="utf-8"))[
+        "schema_version"
+    ] == 1
     farm.start(
         FarmPlantingConfirmed(
             "timer-role-a",
