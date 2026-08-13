@@ -167,7 +167,6 @@ def test_shared_shortcut_never_moves_character_identity_to_another_group(
     assert registry.get(entry_id).note == "甲組資料"
     choice = GroupSelectionService(
         registry,
-        legacy_config_path=configuration.path,
         configuration=configuration,
     ).find("乙組")
     assert choice.members[0].character_id is None
@@ -247,7 +246,6 @@ def test_detaching_removed_entries_preserves_identity_and_note_without_ghost_gro
     restored = registry_store.load()
     choices = GroupSelectionService(
         registry,
-        legacy_config_path=tmp_path / "legacy.json",
         configuration=configuration,
     ).choices()
 
