@@ -51,7 +51,6 @@ class WindowsSystemTrayBackend:
         self._stop_requested = threading.Event()
         self._start_error: Exception | None = None
         self._hwnd = 0
-        self._icon = 0
         self._class_name = f"FU-SystemTray-{id(self):X}"
         self._wnd_proc = None
         self._tooltip = "輔"
@@ -324,7 +323,6 @@ class WindowsSystemTrayBackend:
             user32.DestroyWindow(hwnd)
             user32.UnregisterClassW(self._class_name, instance)
             raise OSError("confirmed system tray icon could not be loaded")
-        self._icon = int(icon)
         tray_data = NOTIFYICONDATAW()
         tray_data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         tray_data.hWnd = hwnd
@@ -361,7 +359,6 @@ class WindowsSystemTrayBackend:
             )
             user32.DestroyIcon(icon)
             user32.UnregisterClassW(self._class_name, instance)
-            self._icon = 0
 
 
 class SystemTrayController:
@@ -388,25 +385,15 @@ class SystemTrayController:
         self._poll_ms = max(20, int(poll_ms))
         self._poll_id = None
         self._running = False
-        self._window_visible = True
         self._operations_stopped = bool(operations_stopped)
-        self._exiting = False
 
     @property
     def running(self) -> bool:
         return self._running
 
     @property
-    def window_visible(self) -> bool:
-        return self._window_visible
-
-    @property
     def operations_stopped(self) -> bool:
         return self._operations_stopped
-
-    @property
-    def exiting(self) -> bool:
-        return self._exiting
 
     def mark_operations_running(self) -> None:
         self._operations_stopped = False
@@ -433,18 +420,14 @@ class SystemTrayController:
         if not self._running:
             return
         for event in self._backend.poll_events():
-            if event is SystemTrayEvent.SHOW:
+            if event in (SystemTrayEvent.SHOW, SystemTrayEvent.RESTORE):
                 self.restore()
             elif event is SystemTrayEvent.HIDE:
                 self.hide()
-            elif event is SystemTrayEvent.RESTORE:
-                self.restore()
             elif event is SystemTrayEvent.STOP_ALL:
                 self._operations_stopped = bool(self._on_stop_all())
             elif event is SystemTrayEvent.EXIT:
-                self._exiting = True
-                if self._on_exit() is False:
-                    self._exiting = False
+                self._on_exit()
         self._schedule_poll()
 
     def handle_unmap(self, _event=None) -> None:
@@ -464,15 +447,6 @@ class SystemTrayController:
     def hide(self) -> None:
         try:
             self._window.withdraw()
-            self._window_visible = False
-        except Exception:
-            return
-
-    def show(self) -> None:
-        try:
-            self._window.deiconify()
-            self._window.state("normal")
-            self._window_visible = True
         except Exception:
             return
 
@@ -482,7 +456,6 @@ class SystemTrayController:
             self._window.state("normal")
             self._window.lift()
             self._window.focus_force()
-            self._window_visible = True
         except Exception:
             return
 

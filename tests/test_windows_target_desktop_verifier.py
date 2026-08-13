@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -62,12 +63,14 @@ def make_verifier(windows, captures, *, expected=None, foreground=None):
 
 def test_verifier_accepts_strict_one_to_one_identity_and_capture():
     windows = [
+        replace(make_window(0, "0" * 64), title="Unrelated window"),
         make_window(1, "1" * 64),
         make_window(2, "2" * 64, minimized=True),
     ]
     verifier = make_verifier(
         windows,
         {1: (916, 629), 2: (911, 629)},
+        expected=2,
         foreground=1,
     )
 
@@ -75,6 +78,7 @@ def test_verifier_accepts_strict_one_to_one_identity_and_capture():
     payload = result.to_dict()
 
     assert result.passed is True
+    assert result.discovered_windows == 2
     assert result.individually_selected == 2
     assert result.unique_selected_windows == 2
     assert result.captures_passed == 2

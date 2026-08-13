@@ -136,7 +136,6 @@ def test_tray_menu_show_hide_restore_and_stop_all_share_state(
     assert window.deiconified == 2
     assert window.lifted == 2
     assert window.focused == 2
-    assert controller.window_visible is True
     assert stop_all_calls == [True]
     assert controller.operations_stopped is True
     controller.mark_operations_running()
@@ -238,7 +237,6 @@ def test_failed_exit_callback_keeps_controller_available(tmp_path):
     controller.poll()
 
     assert controller.running is True
-    assert controller.exiting is False
     assert window.after_calls[-1][1] == 100
 
 

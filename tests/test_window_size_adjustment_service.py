@@ -119,7 +119,6 @@ def test_current_group_resizes_only_open_members_and_skips_matching_size():
     ).apply_current_group("14支", 1000, 700)
 
     assert result.success is True
-    assert result.matched_count == 2
     assert result.changed_count == 1
     assert sizes.resize_calls == [(10, 1000, 700)]
 
@@ -137,7 +136,6 @@ def test_all_flash_resizes_each_uniquely_identified_window():
     ).apply_all(1000, 700)
 
     assert result.success is True
-    assert result.matched_count == 2
     assert result.changed_count == 2
     assert sizes.resize_calls == [
         (10, 1000, 700),

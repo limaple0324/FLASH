@@ -143,15 +143,12 @@ class TargetDesktopVerifier:
             capture_backend=WindowsBackgroundCaptureBackend(),
         )
 
-    def _matching_windows(self) -> list[WindowInfo]:
-        return [
+    def verify(self) -> TargetDesktopVerification:
+        windows = [
             window
             for window in self._window_backend.list_windows()
             if all(keyword in window.title.casefold() for keyword in self._keywords)
         ]
-
-    def verify(self) -> TargetDesktopVerification:
-        windows = self._matching_windows()
         failures: list[str] = []
 
         if len(windows) != self._expected_windows:

@@ -28,7 +28,6 @@ class WindowSizeAdjustmentResult:
     action: str
     width: int = DEFAULT_FLASH_CLIENT_WIDTH
     height: int = DEFAULT_FLASH_CLIENT_HEIGHT
-    matched_count: int = 0
     changed_count: int = 0
     failure_code: str | None = None
 
@@ -193,7 +192,6 @@ class WindowSizeAdjustmentService:
             "read_main",
             width=size[0],
             height=size[1],
-            matched_count=1,
         )
 
     def _apply(
@@ -228,7 +226,6 @@ class WindowSizeAdjustmentService:
                     action,
                     width=width,
                     height=height,
-                    matched_count=len(windows),
                     failure_code="window_size_read_failed",
                 )
             sizes[window.handle] = size
@@ -246,7 +243,6 @@ class WindowSizeAdjustmentService:
                     action,
                     width=width,
                     height=height,
-                    matched_count=len(windows),
                     changed_count=changed,
                     failure_code="window_resize_failed",
                 )
@@ -256,7 +252,6 @@ class WindowSizeAdjustmentService:
             action,
             width=width,
             height=height,
-            matched_count=len(windows),
             changed_count=changed,
         )
 
