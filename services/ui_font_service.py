@@ -265,19 +265,6 @@ class UIFontService:
             for font_id, display_name in UI_FONT_OPTIONS
         )
 
-    def family_for(self, font_id: object) -> str:
-        normalized = normalize_ui_font_id(font_id)
-        if not self.loaded:
-            return UI_FONT_FALLBACK_FAMILY
-        return next(
-            (
-                asset.ui_family
-                for asset in self._assets
-                if asset.font_id == normalized
-            ),
-            UI_FONT_FALLBACK_FAMILY,
-        )
-
     def load_all(self) -> UIFontLoadResult:
         if self.loaded:
             return self._result

@@ -85,10 +85,6 @@ class ObsidianPageDefinition:
         return sum(node.expected_lit for node in self.topology)
 
     @property
-    def expected_unlit_nodes(self) -> int:
-        return len(self.topology) - self.expected_opened_nodes
-
-    @property
     def page_shape_signature(self) -> str:
         payload = json.dumps(
             {

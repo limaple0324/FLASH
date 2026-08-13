@@ -75,7 +75,3 @@ def validate_git_changes(changes: list[GitChange], owned_files: list[str], forbi
         if "160000" in modes: errors.append(f"拒絕子模組: {','.join(change.paths)}")
         if "100755" in modes: errors.append(f"拒絕可執行檔模式: {','.join(change.paths)}")
     return paths_ok and not errors, errors
-
-
-def ensure_scope(paths: list[str], owned_files: list[str], forbidden: list[str]) -> tuple[bool, list[str]]:
-    return validate_modified_paths(paths, owned_files, forbidden)

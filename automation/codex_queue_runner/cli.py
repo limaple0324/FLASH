@@ -33,9 +33,6 @@ class RunnerConfig:
     openai_secret_available: bool = False
     lease_seconds: int = 3600
 
-    @property
-    def dry_run(self) -> bool: return self.mode == "dry-run"
-
 
 def _number(value: str, name: str) -> int:
     found = _NUMBER.fullmatch(value.strip())
