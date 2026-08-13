@@ -14,23 +14,14 @@ class FarmTimerMonitor:
         service: FarmTimerService,
         schedule: Callable[[int, Callable[[], None]], object],
         cancel: Callable[[object], None],
-        *,
-        interval_ms: int = 15000,
     ) -> None:
         if not isinstance(service, FarmTimerService):
             raise TypeError("service must be FarmTimerService.")
         if not callable(schedule) or not callable(cancel):
             raise TypeError("schedule and cancel must be callable.")
-        if (
-            isinstance(interval_ms, bool)
-            or not isinstance(interval_ms, int)
-            or interval_ms < 1
-        ):
-            raise ValueError("interval_ms must be a positive integer.")
         self._service = service
         self._schedule = schedule
         self._cancel = cancel
-        self._interval_ms = interval_ms
         self._scheduled: object | None = None
         self._running = False
 
@@ -45,7 +36,7 @@ class FarmTimerMonitor:
         self._service.poll(datetime.now(timezone.utc))
         if self._running:
             self._scheduled = self._schedule(
-                self._interval_ms,
+                15000,
                 self._tick,
             )
 

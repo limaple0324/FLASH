@@ -29,7 +29,6 @@ def test_monitor_checks_immediately_and_cancels_one_pending_callback(tmp_path):
         service,
         schedule,
         cancelled.append,
-        interval_ms=15000,
     )
 
     assert monitor.start() is True
