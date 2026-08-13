@@ -1288,18 +1288,37 @@ def test_only_two_real_launch_results_feed_the_shared_auto_battle_helper():
     assert "apply_auto_battle_after_game_launch" in single_role
 
 
-def test_smart_reconnect_enable_callback_never_reads_group_or_launch_plan():
+def test_smart_reconnect_enable_binds_current_group_before_opening_gate():
     source = Path("main.py").read_text(encoding="utf-8")
     function_source = source[
         source.index("    def change_smart_reconnect("):
         source.index("    def change_smart_reconnect_auto_battle(")
     ]
 
-    assert "group_selection_service" not in function_source
-    assert "group_launch_service" not in function_source
-    assert "current_workspace_group_name" not in function_source
-    assert "selected_group_plan" not in function_source
-    assert "set_group_launch_plan" not in function_source
+    current_index = function_source.index(
+        "config.get(CURRENT_GROUP_NAME_KEY"
+    )
+    workspace_index = function_source.index("workspace_service.snapshot()")
+    choice_index = function_source.index("group_selection_service.find(")
+    close_index = function_source.index("close_group_operation_gate()")
+    apply_index = function_source.index("apply_group_identity(choice)")
+    transition_index = function_source.index(
+        "apply_smart_reconnect_snapshot_transition("
+    )
+    reopen_index = function_source.index("reopen_group_operation_gate()")
+    save_index = function_source.index("config.update_values(")
+    assert (
+        current_index
+        < workspace_index
+        < choice_index
+        < close_index
+        < apply_index
+        < transition_index
+        < reopen_index
+        < save_index
+    )
+    assert "restore_group_identity(choice)" in function_source
+    assert "clear_group_identity()" in function_source
 
 
 def test_build_services_registers_input_controller_and_safe_default(tmp_path):
@@ -1924,7 +1943,9 @@ def test_role_identity_refresh_only_rebinds_current_group_and_reopens_gate():
     assert "config.get(CURRENT_GROUP_NAME_KEY" in refresh
     assert "!= group_name" in refresh
     assert "close_group_operation_gate()" in refresh
-    assert "finally:" in refresh
+    assert "finally:" not in refresh
+    assert "applied = apply_group_identity(choice) is not None" in refresh
+    assert "clear_group_identity()" in refresh
     assert "reopen_group_operation_gate()" in refresh
 
 

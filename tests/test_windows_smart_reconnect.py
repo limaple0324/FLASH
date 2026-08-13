@@ -1504,7 +1504,6 @@ def make_controller(
     registered_role_provider=None,
     ungrouped_shortcut_provider=None,
     tcp_connection_count_provider=None,
-    tcp_reopen_enabled=False,
 ):
     if clock is None:
         default_time = [-5.0]
@@ -1569,7 +1568,6 @@ def make_controller(
             registered_role_provider=registered_role_provider,
             operation_gate=operation_gate,
             tcp_connection_count_provider=tcp_connection_count_provider,
-            tcp_reopen_enabled=tcp_reopen_enabled,
         )
     if group_launch_plan is not None:
         controller.set_group_launch_plan(group_launch_plan)
@@ -1626,6 +1624,17 @@ def make_group_plan(tmp_path, windows, group_name="current"):
                 window.launch_fingerprint,
             )
             for index, window in enumerate(windows, start=1)
+        ),
+    )
+
+
+def make_tcp_group_plan(tmp_path, windows, group_name="current"):
+    plan = make_group_plan(tmp_path, windows, group_name)
+    return replace(
+        plan,
+        targets=tuple(
+            replace(target, entry_id=f"entry-{index}")
+            for index, target in enumerate(plan.targets)
         ),
     )
 
@@ -1831,7 +1840,15 @@ def test_multiple_tcp_zero_processes_never_confirm_or_trigger_actions():
     windows = [make_window(1, process_id=101), make_window(2, process_id=202)]
     now = [0.0]
     tcp = SequenceTcpCounts(
-        [{101: 1, 202: 1}, {101: 0, 202: 0}, {101: 0, 202: 0}, {101: 0, 202: 0}]
+        [
+            {101: 1, 202: 1},
+            {101: 0, 202: 0},
+            {101: 0, 202: 0},
+            {101: 0, 202: 0},
+            {101: 0, 202: 1},
+            {101: 0, 202: 1},
+            {101: 0, 202: 1},
+        ]
     )
     fixture = make_controller(
         [1, 1],
@@ -1851,8 +1868,62 @@ def test_multiple_tcp_zero_processes_never_confirm_or_trigger_actions():
         result.details["failure_codes"] == ["tcp_multiple_zero_suppressed"]
         for result in results
     )
+    unique = []
+    for observed_at in (21.0, 25.0, 29.0):
+        now[0] = observed_at
+        unique.append(fixture.controller.check_connection())
+    assert [result.details["failure_codes"] for result in unique] == [
+        ["tcp_disconnect_suspected"],
+        ["tcp_disconnect_suspected"],
+        ["tcp_disconnect_confirmed"],
+    ]
     assert fixture.mouse.clicks == []
     assert fixture.mouse.expected_process_ids == []
+
+
+def test_multiple_tcp_zero_vetoes_every_mutation_for_actionable_frames(
+    tmp_path,
+):
+    windows = [make_window(index, process_id=100 + index) for index in (1, 2)]
+    restarter = FakeBattleRestarter()
+    tcp = SequenceTcpCounts(
+        [
+            {101: 1, 102: 1},
+            {101: 0, 102: 0},
+            {101: 0, 102: 0},
+        ]
+    )
+    fixture = make_controller(
+        [2, 1],
+        windows=windows,
+        expected_windows=2,
+        battle_markers=(2,),
+        battle_restarter=restarter,
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
+        target_windows_provider=lambda: tcp_resolved_targets(windows),
+        tcp_connection_count_provider=tcp,
+    )
+    auto_calls = []
+    fixture.controller._run_auto_battle_for_connected = (
+        lambda *args, **kwargs: auto_calls.append(args) or True
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    fixture.controller.check_connection()
+    first = fixture.controller.reconnect()
+    second = fixture.controller.reconnect()
+
+    assert first.details["failure_codes"] == [
+        "tcp_multiple_zero_suppressed"
+    ]
+    assert second.details["failure_codes"] == [
+        "tcp_multiple_zero_suppressed"
+    ]
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+    assert fixture.mouse.clicks == []
+    assert auto_calls == []
+    assert fixture.controller._action_confirmations == {}
 
 
 def tcp_resolved_targets(windows, *, sync_windows=None, entry_ids=None):
@@ -1875,7 +1946,7 @@ def test_confirmed_tcp_restarts_only_the_single_contract_target(tmp_path):
     now = [0.0]
     tcp = SequenceTcpCounts(
         [{101: 1, 102: 1, 103: 1}]
-        + [{101: 0, 102: 1, 103: 1}] * 4
+        + [{101: 0, 102: 1, 103: 1}] * 5
     )
     fixture = make_controller(
         [1, 1, 1],
@@ -1883,23 +1954,195 @@ def test_confirmed_tcp_restarts_only_the_single_contract_target(tmp_path):
         expected_windows=3,
         clock=lambda: now[0],
         tcp_connection_count_provider=tcp,
-        tcp_reopen_enabled=True,
         target_windows_provider=lambda: resolved,
         battle_restarter=restarter,
-        group_launch_plan=make_group_plan(tmp_path, windows),
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
     )
 
+    assert activate_current_window_snapshot(fixture).success is True
     for observed_at in (0.0, 1.0, 4.0, 8.0):
         now[0] = observed_at
         fixture.controller.check_connection()
+    now[0] = 9.0
+    result = fixture.controller.reconnect()
 
     assert [call[0] for call in restarter.calls] == [windows[0]]
     assert restarter.reopen_calls == []
     assert fixture.mouse.clicks == []
     assert fixture.mouse.expected_process_ids == []
-    assert tcp.calls == [frozenset({101, 102, 103})] * 4 + [frozenset({101})]
-    assert fixture.controller._tcp_gen == 4
-    assert set(fixture.controller._tcp_j) == {windows[0].launch_fingerprint}
+    assert tcp.calls == [frozenset({101, 102, 103})] * 6
+    assert fixture.controller._tcp_gen == 5
+    assert result.code == "reconnect.progressed"
+    assert result.details["all_connected"] is False
+    assert result.details["restarted_windows"] == 1
+    assert "tcp_disconnect_confirmed" not in result.details["failure_codes"]
+    assert fixture.controller._pending_reopen_fingerprints == {
+        windows[0].launch_fingerprint
+    }
+    assert fixture.controller._login_only_recovery_fingerprints == {
+        windows[0].launch_fingerprint
+    }
+
+
+def test_confirmed_tcp_restarts_from_a_fresh_unknown_game_frame(tmp_path):
+    windows = [make_window(index, process_id=100 + index) for index in (1, 2, 3)]
+    restarter = FakeBattleRestarter()
+    now = [0.0]
+    fixture = make_controller(
+        [255, 1, 1],
+        windows=windows,
+        expected_windows=3,
+        clock=lambda: now[0],
+        tcp_connection_count_provider=SequenceTcpCounts(
+            [{101: 1, 102: 1, 103: 1}]
+            + [{101: 0, 102: 1, 103: 1}] * 5
+        ),
+        target_windows_provider=lambda: tcp_resolved_targets(windows),
+        battle_restarter=restarter,
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    for observed_at in (0.0, 1.0, 4.0, 8.0):
+        now[0] = observed_at
+        fixture.controller.check_connection()
+    now[0] = 9.0
+    result = fixture.controller.reconnect()
+
+    assert result.code == "reconnect.progressed_with_isolation"
+    assert result.details["restarted_windows"] == 1
+    assert "screen_unknown" in result.details["failure_codes"]
+    assert [call[0] for call in restarter.calls] == [windows[0]]
+    assert fixture.mouse.clicks == []
+
+
+def test_tcp_formal_chain_maps_source_and_monitored_fingerprints_by_token(
+    tmp_path,
+):
+    windows = [make_window(index, process_id=100 + index) for index in (1, 2)]
+    monitored = [
+        replace(window, launch_fingerprint=f"{index + 8:x}" * 64)
+        for index, window in enumerate(windows)
+    ]
+    resolved = tcp_resolved_targets(windows, sync_windows=monitored)
+    restarter = FakeBattleRestarter()
+    now = [0.0]
+    tcp = SequenceTcpCounts(
+        [{101: 1, 102: 1}] + [{101: 0, 102: 1}] * 5
+    )
+    fixture = make_controller(
+        [1, 1],
+        windows=windows,
+        expected_windows=2,
+        clock=lambda: now[0],
+        tcp_connection_count_provider=tcp,
+        target_windows_provider=lambda: resolved,
+        battle_restarter=restarter,
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    for observed_at in (0.0, 1.0, 4.0, 8.0):
+        now[0] = observed_at
+        fixture.controller.check_connection()
+    now[0] = 9.0
+    result = fixture.controller.reconnect()
+
+    assert result.details["restarted_windows"] == 1
+    assert [call[0] for call in restarter.calls] == [windows[0]]
+    assert fixture.controller._pending_reopen_fingerprints == {
+        windows[0].launch_fingerprint
+    }
+
+
+def test_disable_preserves_plan_but_discards_tcp_authorization_history(
+    tmp_path,
+):
+    window = make_window(1, process_id=101)
+    plan = make_tcp_group_plan(tmp_path, [window])
+    now = [0.0]
+    tcp = SequenceTcpCounts(
+        [{101: 1}, {101: 0}, {101: 0}, {101: 1}]
+        + [{101: 0}] * 3
+    )
+    fixture = make_controller(
+        [1],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        tcp_connection_count_provider=tcp,
+        target_windows_provider=lambda: tcp_resolved_targets([window]),
+        group_launch_plan=plan,
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.check_connection()
+    now[0] = 1.0
+    fixture.controller.check_connection()
+    now[0] = 4.0
+    fixture.controller.check_connection()
+    assert next(iter(fixture.controller._tcp_s.values())).zero_count == 2
+
+    fixture.controller.set_execution_enabled(False)
+    assert fixture.controller._group_launch_plan == plan
+    assert fixture.controller._tcp_s == {}
+    assert not fixture.controller._execution_enabled.is_set()
+    assert fixture.controller.prepare_execution_snapshot().success is True
+    fixture.controller.set_execution_enabled(True)
+
+    observed = []
+    for observed_at in (8.0, 9.0, 13.0, 17.0):
+        now[0] = observed_at
+        observed.append(fixture.controller.check_connection())
+    assert [item.details["failure_codes"] for item in observed] == [
+        [],
+        ["tcp_disconnect_suspected"],
+        ["tcp_disconnect_suspected"],
+        ["tcp_disconnect_confirmed"],
+    ]
+
+
+def test_same_window_token_cannot_reuse_tcp_history_across_entry_changes(
+    tmp_path,
+):
+    window = make_window(1, process_id=101)
+    resolved = [tcp_resolved_targets([window])]
+    now = [0.0]
+    fixture = make_controller(
+        [1],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        tcp_connection_count_provider=SequenceTcpCounts(
+            [{101: 1}, {101: 0}, {101: 0}, {101: 0}, {101: 0}]
+        ),
+        target_windows_provider=lambda: resolved[0],
+        group_launch_plan=make_tcp_group_plan(tmp_path, [window]),
+    )
+    fixture.controller.check_connection()
+    for observed_at in (1.0, 4.0):
+        now[0] = observed_at
+        fixture.controller.check_connection()
+    state = next(iter(fixture.controller._tcp_s.values()))
+    assert state.entry_id == "entry-0"
+    assert state.zero_count == 2
+
+    resolved[0] = tcp_resolved_targets(
+        [window], entry_ids=("replacement-entry",)
+    )
+    now[0] = 8.0
+    changed = fixture.controller.check_connection()
+    state = next(iter(fixture.controller._tcp_s.values()))
+    assert changed.details["failure_codes"] == []
+    assert state.entry_id == "replacement-entry"
+    assert state.zero_count == 0
+
+    resolved[0] = tcp_resolved_targets([window])
+    now[0] = 20.0
+    restored = fixture.controller.check_connection()
+    state = next(iter(fixture.controller._tcp_s.values()))
+    assert restored.details["failure_codes"] == []
+    assert state.entry_id == "entry-0"
+    assert state.zero_count == 0
 
 
 def test_failed_tcp_restart_never_creates_login_session(tmp_path):
@@ -1910,17 +2153,72 @@ def test_failed_tcp_restart_never_creates_login_session(tmp_path):
         clock=lambda: now[0],
         tcp_connection_count_provider=SequenceTcpCounts(
             [{101: 1, 102: 1, 103: 1}]
-            + [{101: 0, 102: 1, 103: 1}] * 4),
-        tcp_reopen_enabled=True,
+            + [{101: 0, 102: 1, 103: 1}] * 5),
         target_windows_provider=lambda: tcp_resolved_targets(windows),
         battle_restarter=FakeBattleRestarter(succeeds=False),
-        group_launch_plan=make_group_plan(tmp_path, windows),
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
     )
+    assert activate_current_window_snapshot(fixture).success is True
     for observed_at in (0.0, 1.0, 4.0, 8.0):
         now[0] = observed_at
         fixture.controller.check_connection()
+    now[0] = 9.0
+    fixture.controller.reconnect()
 
-    assert fixture.controller._tcp_j == {}
+    assert fixture.controller._pending_reopen_fingerprints == set()
+    assert fixture.controller._login_only_recovery_fingerprints == set()
+
+
+def test_tcp_restart_attempt_is_once_until_tcp_recovers_and_reconfirms(
+    tmp_path,
+):
+    window = make_window(1, process_id=101)
+    now = [0.0]
+    restarter = FakeBattleRestarter(succeeds=False)
+    tcp = SequenceTcpCounts(
+        [{101: 1}]
+        + [{101: 0}] * 7
+        + [{101: 1}]
+        + [{101: 0}] * 5
+    )
+    fixture = make_controller(
+        [255],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        tcp_connection_count_provider=tcp,
+        target_windows_provider=lambda: tcp_resolved_targets([window]),
+        battle_restarter=restarter,
+        group_launch_plan=make_tcp_group_plan(tmp_path, [window]),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    for observed_at, execute in (
+        (0.0, False),
+        (1.0, False),
+        (4.0, False),
+        (8.0, False),
+        (9.0, True),
+        (10.0, True),
+        (11.0, True),
+    ):
+        now[0] = observed_at
+        (fixture.controller.reconnect if execute else
+         fixture.controller.check_connection)()
+    assert len(restarter.calls) == 1
+
+    now[0] = 12.0
+    fixture.controller.check_connection()
+    for observed_at, execute in (
+        (20.0, False),
+        (24.0, False),
+        (28.0, False),
+        (29.0, True),
+    ):
+        now[0] = observed_at
+        (fixture.controller.reconnect if execute else
+         fixture.controller.check_connection)()
+    assert len(restarter.calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -1961,10 +2259,9 @@ def test_confirmed_tcp_rechecks_identity_and_unique_entry_before_restart(
         tcp_connection_count_provider=SequenceTcpCounts(
             [{101: 1, 102: 1, 103: 1}] + [{101: 0, 102: 1, 103: 1}] * 3
         ),
-        tcp_reopen_enabled=True,
         target_windows_provider=provider,
         battle_restarter=restarter,
-        group_launch_plan=make_group_plan(tmp_path, windows),
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
     )
     for observed_at in (0.0, 1.0, 4.0, 8.0):
         now[0] = observed_at
@@ -1975,53 +2272,22 @@ def test_confirmed_tcp_rechecks_identity_and_unique_entry_before_restart(
     assert fixture.mouse.clicks == []
 
 
-@pytest.mark.parametrize("fresh", [{101: 1}, None, {101: -1}])
-def test_confirmed_tcp_requires_fresh_exact_zero_before_restart(tmp_path, fresh):
+@pytest.mark.parametrize(
+    "final",
+    [
+        {101: 1, 102: 1, 103: 1},
+        None,
+        {101: -1, 102: 1, 103: 1},
+        {101: 0, 102: 0, 103: 1},
+    ],
+)
+def test_confirmed_tcp_requires_fresh_exact_zero_before_restart(tmp_path, final):
     windows = [make_window(index, process_id=100 + index) for index in (1, 2, 3)]
-    restarter = FakeBattleRestarter()
-    tcp = SequenceTcpCounts(
-        [{101: 1, 102: 1, 103: 1}]
-        + [{101: 0, 102: 1, 103: 1}] * 3
-        + [fresh]
-    )
-    now = [0.0]
-    fixture = make_controller(
-        [1, 1, 1],
-        windows=windows,
-        expected_windows=3,
-        clock=lambda: now[0],
-        tcp_connection_count_provider=tcp,
-        tcp_reopen_enabled=True,
-        target_windows_provider=lambda: tcp_resolved_targets(windows),
-        battle_restarter=restarter,
-        group_launch_plan=make_group_plan(tmp_path, windows),
-    )
-
-    for observed_at in (0.0, 1.0, 4.0, 8.0):
-        now[0] = observed_at
-        fixture.controller.check_connection()
-
-    assert restarter.calls == []
-    assert tcp.calls[-1] == frozenset({101})
-    assert fixture.controller._tcp_gen == 4
-
-
-def test_confirmed_tcp_rechecks_entry_on_final_restart_contract(tmp_path):
-    windows = [make_window(index, process_id=100 + index) for index in (1, 2, 3)]
-    resolved = tcp_resolved_targets(windows)
-    rebound = tcp_resolved_targets(
-        windows, entry_ids=("replacement-entry", "entry-1", "entry-2")
-    )
-    provider_calls = [0]
-
-    def provider():
-        provider_calls[0] += 1
-        return rebound if provider_calls[0] == 6 else resolved
-
     restarter = FakeBattleRestarter()
     tcp = SequenceTcpCounts(
         [{101: 1, 102: 1, 103: 1}]
         + [{101: 0, 102: 1, 103: 1}] * 4
+        + [final]
     )
     now = [0.0]
     fixture = make_controller(
@@ -2030,34 +2296,140 @@ def test_confirmed_tcp_rechecks_entry_on_final_restart_contract(tmp_path):
         expected_windows=3,
         clock=lambda: now[0],
         tcp_connection_count_provider=tcp,
-        tcp_reopen_enabled=True,
-        target_windows_provider=provider,
+        target_windows_provider=lambda: tcp_resolved_targets(windows),
         battle_restarter=restarter,
-        group_launch_plan=make_group_plan(tmp_path, windows),
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
     )
 
+    assert activate_current_window_snapshot(fixture).success is True
     for observed_at in (0.0, 1.0, 4.0, 8.0):
         now[0] = observed_at
         fixture.controller.check_connection()
+    now[0] = 9.0
+    fixture.controller.reconnect()
 
-    assert provider_calls == [6]
-    assert tcp.calls[-1] == frozenset({101})
+    assert restarter.calls == []
+    assert tcp.calls[-1] == frozenset({101, 102, 103})
+    assert fixture.controller._tcp_gen == 5
+
+
+def test_failed_final_tcp_query_does_not_consume_later_reconfirmed_event(
+    tmp_path,
+):
+    window = make_window(1, process_id=101)
+    restarter = FakeBattleRestarter()
+    now = [0.0]
+    tcp = SequenceTcpCounts(
+        [{101: 1}] + [{101: 0}] * 4 + [None] + [{101: 0}] * 5
+    )
+    fixture = make_controller(
+        [1],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        tcp_connection_count_provider=tcp,
+        target_windows_provider=lambda: tcp_resolved_targets([window]),
+        battle_restarter=restarter,
+        group_launch_plan=make_tcp_group_plan(tmp_path, [window]),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+    for observed_at in (0.0, 1.0, 4.0, 8.0):
+        now[0] = observed_at
+        fixture.controller.check_connection()
+    now[0] = 9.0
+    fixture.controller.reconnect()
+    assert restarter.calls == []
+    assert fixture.controller._battle_restart_attempts == {}
+
+    for observed_at in (10.0, 14.0, 18.0):
+        now[0] = observed_at
+        fixture.controller.check_connection()
+    now[0] = 19.0
+    fixture.controller.reconnect()
+    assert [call[0] for call in restarter.calls] == [window]
+
+
+@pytest.mark.parametrize("change", ["target_entry", "peer_token"])
+def test_confirmed_tcp_rechecks_complete_final_restart_contract(
+    tmp_path,
+    change,
+):
+    windows = [make_window(index, process_id=100 + index) for index in (1, 2, 3)]
+    resolved = tcp_resolved_targets(windows)
+    rebound = (
+        tcp_resolved_targets(
+            windows, entry_ids=("replacement-entry", "entry-1", "entry-2")
+        )
+        if change == "target_entry"
+        else tcp_resolved_targets(
+            [windows[0], replace(
+                windows[1], process_lifecycle_token=999999
+            ), windows[2]]
+        )
+    )
+    provider_calls = [0]
+    final_query_seen = [False]
+
+    def provider():
+        provider_calls[0] += 1
+        return rebound if final_query_seen[0] else resolved
+
+    restarter = FakeBattleRestarter()
+    tcp_calls = [0]
+
+    def tcp(process_ids):
+        tcp_calls[0] += 1
+        if tcp_calls[0] == 6:
+            final_query_seen[0] = True
+        return (
+            {101: 1, 102: 1, 103: 1}
+            if tcp_calls[0] == 1
+            else {101: 0, 102: 1, 103: 1}
+        )
+    now = [0.0]
+    fixture = make_controller(
+        [1, 1, 1],
+        windows=windows,
+        expected_windows=3,
+        clock=lambda: now[0],
+        tcp_connection_count_provider=tcp,
+        target_windows_provider=provider,
+        battle_restarter=restarter,
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
+    )
+
+    assert activate_current_window_snapshot(fixture).success is True
+    for observed_at in (0.0, 1.0, 4.0, 8.0):
+        now[0] = observed_at
+        fixture.controller.check_connection()
+    now[0] = 9.0
+    fixture.controller.reconnect()
+
+    assert provider_calls[0] >= 7
+    assert tcp_calls == [6]
     assert restarter.calls == []
     assert restarter.reopen_calls == []
 
 
-def tcp_login_fixture(tmp_path, *, candidates, extra_states=(1, 1)):
+def tcp_login_fixture(
+    tmp_path,
+    *,
+    candidates,
+    extra_states=(1, 1),
+    target_importance=CharacterImportance.PRIMARY,
+):
     old = make_window(1, process_id=101)
     new = replace(old, handle=11, process_id=111, thread_id=211,
                   process_lifecycle_token=311)
     peers = [make_window(i, process_id=100 + i) for i in (2, 3)]
+    initial_windows = [old, *peers]
     windows = [new, *peers]
     plan = GroupLaunchPlan(
         "current",
         (GroupLaunchTarget(1, "AlphaHero", tmp_path / "a.lnk",
                            old.launch_fingerprint, entry_id="entry-0",
                            role_id="AlphaHero", registered_level=120,
-                           importance=CharacterImportance.PRIMARY),
+                           importance=target_importance),
          *tuple(GroupLaunchTarget(i, f"peer-{i}", tmp_path / f"p{i}.lnk",
                                   peers[i - 2].launch_fingerprint,
                                   entry_id=f"entry-{i - 1}")
@@ -2076,16 +2448,43 @@ def tcp_login_fixture(tmp_path, *, candidates, extra_states=(1, 1)):
             return ScreenRecognition(ReconnectScreenState.CONNECTED, 0.0, None,
                                      "connected")
 
-    resolved = tcp_resolved_targets(windows)
-    fixture = make_controller(
-        [3, *extra_states], windows=windows, expected_windows=3,
-        recognizer=LoginRecognizer(), group_launch_plan=plan,
-        target_windows_provider=lambda: resolved,
+    resolved = [tcp_resolved_targets(initial_windows)]
+    now = [0.0]
+    tcp = SequenceTcpCounts(
+        [{101: 1, 102: 1, 103: 1}]
+        + [{101: 0, 102: 1, 103: 1}] * 5
+        + [{111: 1, 102: 1, 103: 1}] * 40
     )
-    fixture.controller._tcp_j = {old.launch_fingerprint: ("entry-0",
-                                                           WindowInstanceToken.from_window(old))}
-    fixture.controller._pending_reconnect_fingerprints.add(old.launch_fingerprint)
-    fixture.controller._pending_reopen_fingerprints.add(old.launch_fingerprint)
+    fixture = make_controller(
+        [1, 1, 1], windows=initial_windows, expected_windows=3,
+        recognizer=LoginRecognizer(), group_launch_plan=plan,
+        target_windows_provider=lambda: resolved[0],
+        clock=lambda: now[0],
+        tcp_connection_count_provider=tcp,
+        battle_restarter=FakeBattleRestarter(),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+    for observed_at in (0.0, 1.0, 4.0, 8.0):
+        now[0] = observed_at
+        fixture.controller.check_connection()
+    now[0] = 9.0
+    restarted = fixture.controller.reconnect()
+    assert restarted.details["restarted_windows"] == 1
+    resolved[0] = tcp_resolved_targets(windows)
+    fixture.controller._window_backend.windows = list(windows)
+    fixture.capture.states.update(
+        {new.handle: 3, **{
+            peer.handle: marker
+            for peer, marker in zip(peers, extra_states)
+        }}
+    )
+    tick = [9.0]
+
+    def progress_clock():
+        tick[0] += 5.0
+        return tick[0]
+
+    fixture.controller._monotonic_clock = progress_clock
     return fixture, old, new, peers, frames
 
 
@@ -2114,10 +2513,13 @@ def test_tcp_expected_reopen_absence_keeps_strict_job_until_new_window(tmp_path)
     fixture.controller._reopen_retry_after[fp] = 999.0
 
     absent = fixture.controller.reconnect()
-    assert set(fixture.controller._tcp_j) == {fp}
+    assert fixture.controller._login_only_recovery_fingerprints == {fp}
     assert set(fixture.controller._pending_reopen_fingerprints) == {fp}
     assert absent.details["clicked_windows"] == 0
     assert fixture.mouse.clicks == []
+    second_absent = fixture.controller.reconnect()
+    assert second_absent.details["clicked_windows"] == 0
+    assert fixture.controller._pending_reopen_fingerprints == {fp}
 
     state[0] = tcp_resolved_targets([new, *peers])
     fixture.capture.states[new.handle] = 3
@@ -2145,7 +2547,6 @@ def test_tcp_unsafe_reopen_absence_revokes_job_and_all_authority(tmp_path, unsaf
     )
     fixture.controller._primary_entry_authorized.update(peer_fps)
     fixture.controller._primary_connected_fingerprints.update(peer_fps)
-    fixture.controller._tcp_done.update(peer_fps)
     if unsafe == "duplicate":
         bad = tcp_resolved_targets((peers[0], peers[0]))
     else:
@@ -2153,7 +2554,7 @@ def test_tcp_unsafe_reopen_absence_revokes_job_and_all_authority(tmp_path, unsaf
     fixture.controller._target_windows_provider = lambda: bad
     fixture.controller.reconnect()
 
-    assert fixture.controller._tcp_j == {}
+    assert fixture.controller._login_only_recovery_fingerprints == set()
     assert fp not in fixture.controller._pending_reconnect_fingerprints
     assert fp not in fixture.controller._pending_reopen_fingerprints
     assert fp not in fixture.controller._active_automation_fingerprints
@@ -2163,7 +2564,6 @@ def test_tcp_unsafe_reopen_absence_revokes_job_and_all_authority(tmp_path, unsaf
     assert fixture.controller._initial_login_authorizations == {}
     assert fixture.controller._primary_entry_authorized == set()
     assert fixture.controller._primary_connected_fingerprints == set()
-    assert fixture.controller._tcp_done == set()
     assert not fixture.controller._execution_enabled.is_set()
     fixture.controller._target_windows_provider = lambda: tcp_resolved_targets(
         [new, *peers]
@@ -2236,9 +2636,9 @@ def test_tcp_login_contract_change_blocks_every_click(tmp_path, unsafe):
         resolved = None
     else:
         resolved = tcp_resolved_targets([new, *peers])
-        fixture.controller._tcp_j[peers[0].launch_fingerprint] = (
-            "entry-1", WindowInstanceToken.from_window(peers[0])
-        )
+        peer = peers[0].launch_fingerprint
+        fixture.controller._pending_reopen_fingerprints.add(peer)
+        fixture.controller._login_only_recovery_fingerprints.add(peer)
     fixture.controller._target_windows_provider = lambda: resolved
 
     fixture.controller.reconnect()
@@ -2306,7 +2706,13 @@ def test_tcp_login_requires_one_same_entry_role_target(tmp_path, bad_target):
     fixture.controller.reconnect()
     fixture.controller.reconnect()
 
-    assert old.launch_fingerprint in fixture.controller._tcp_j
+    if bad_target == "missing_role":
+        assert old.launch_fingerprint in (
+            fixture.controller._login_only_recovery_fingerprints
+        )
+    else:
+        assert fixture.controller._login_only_recovery_fingerprints == set()
+        assert not fixture.controller._execution_enabled.is_set()
     assert fixture.mouse.clicks == []
 
 
@@ -2403,18 +2809,67 @@ def test_tcp_connected_terminal_never_runs_post_login_or_auto_battle(tmp_path):
     fixture.controller._run_auto_battle_for_connected = (
         lambda *args, **kwargs: auto_calls.append(args) or True
     )
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    baseline_clicks = list(fixture.mouse.clicks)
     fixture.controller._primary_entry_authorized.add(fingerprint)
     complete_with_fresh_connected_frames(fixture, handle=new.handle)
-    fixture.controller.reconnect()
 
-    assert fingerprint not in fixture.controller._tcp_j
+    assert fingerprint in fixture.controller._login_only_recovery_fingerprints
     assert all(call[0].handle != new.handle for call in auto_calls)
+    assert auto_calls == []
+    assert fingerprint not in fixture.controller._pending_reopen_fingerprints
+    auto_calls.clear()
+    fixture.controller.reconnect()
     assert {call[0].handle for call in auto_calls} == {2, 3}
     fixture.capture.states[new.handle] = 6
     fixture.controller.reconnect()
     fixture.controller.reconnect()
-    assert fixture.mouse.clicks == []
+    assert fixture.mouse.clicks == baseline_clicks
     assert all(call[0].handle != new.handle for call in auto_calls)
+
+
+@pytest.mark.parametrize(
+    "target_importance",
+    [CharacterImportance.SECONDARY, None],
+)
+def test_tcp_non_primary_role_reaches_connected_terminal(
+    tmp_path,
+    target_importance,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        target_importance,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, old, new, peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+        target_importance=target_importance,
+    )
+    fingerprint = old.launch_fingerprint
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    fixture.capture.states[new.handle] = 5
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    complete_with_fresh_connected_frames(fixture, handle=new.handle)
+
+    assert fingerprint not in fixture.controller._pending_reopen_fingerprints
+    assert fingerprint not in fixture.controller._pending_reconnect_fingerprints
+    assert fingerprint not in fixture.controller._active_automation_fingerprints
+    assert fingerprint not in fixture.controller._reconnect_entry_authorized
+    assert fingerprint in fixture.controller._login_only_recovery_fingerprints
+    calls = []
+    fixture.controller._run_auto_battle_for_connected = (
+        lambda *args, **kwargs: calls.append(args[0].handle) or True
+    )
+    fixture.controller.reconnect()
+    assert set(calls) == {peer.handle for peer in peers}
 
 
 def test_non_tcp_auto_battle_remains_unchanged_after_tcp_completion(tmp_path):
@@ -2426,14 +2881,16 @@ def test_non_tcp_auto_battle_remains_unchanged_after_tcp_completion(tmp_path):
     )
     calls = []
     fixture.controller.set_auto_battle_enabled(True)
-    fixture.controller._tcp_j.clear()
-    fixture.controller._tcp_done.clear()
+    fixture.controller._login_only_recovery_fingerprints.clear()
     fixture.controller._pending_reconnect_fingerprints.clear()
     fixture.controller._pending_reopen_fingerprints.clear()
     fixture.capture.states[new.handle] = 1
     fixture.controller._run_auto_battle_for_connected = (
         lambda *args, **kwargs: calls.append(args[0].handle) or True
     )
+    fixture.controller.reconnect()
+    fixture.controller._clear_reconnect_session(_old.launch_fingerprint)
+    calls.clear()
     fixture.controller.reconnect()
     assert set(calls) == {new.handle, *(peer.handle for peer in peers)}
 
@@ -2446,13 +2903,13 @@ def test_tcp_login_session_clears_on_stop_group_switch_and_revocation(tmp_path):
         tmp_path, candidates=(target,)
     )
     fixture.controller.set_execution_enabled(False)
-    assert fixture.controller._tcp_j == {}
+    assert fixture.controller._login_only_recovery_fingerprints == set()
 
     fixture, old, _new, peers, _frames = tcp_login_fixture(
         tmp_path, candidates=(target,)
     )
     fixture.controller.set_group_launch_plan(make_group_plan(tmp_path, peers, "next"))
-    assert fixture.controller._tcp_j == {}
+    assert fixture.controller._login_only_recovery_fingerprints == set()
 
     fixture, old, _new, _peers, _frames = tcp_login_fixture(
         tmp_path, candidates=(target,)
@@ -2461,7 +2918,56 @@ def test_tcp_login_session_clears_on_stop_group_switch_and_revocation(tmp_path):
         fixture.controller._mark_fingerprints_unknown_locked(
             (old.launch_fingerprint,), revoke_runtime_authority=True
         )
-    assert fixture.controller._tcp_j == {}
+    assert fixture.controller._login_only_recovery_fingerprints == set()
+
+
+def test_clearing_group_plan_revokes_snapshot_and_all_mutations(tmp_path):
+    window = make_window(1)
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [2, 2],
+        windows=[window],
+        expected_windows=1,
+        points={2: (0.5, 0.5)},
+        battle_restarter=restarter,
+        group_launch_plan=make_tcp_group_plan(tmp_path, [window]),
+        target_windows_provider=lambda: tcp_resolved_targets([window]),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.set_group_launch_plan(None)
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert fixture.controller._group_launch_plan is None
+    assert fixture.controller._activation_snapshot_instances is None
+    assert fixture.controller._tcp_s == {}
+    assert not fixture.controller._execution_enabled.is_set()
+    assert fixture.mouse.clicks == []
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
+def test_switching_group_plan_drops_old_initial_login_authority(tmp_path):
+    window = make_window(1)
+    fixture = make_controller(
+        [3],
+        windows=[window],
+        expected_windows=1,
+        group_launch_plan=make_tcp_group_plan(tmp_path, [window], "old"),
+        target_windows_provider=lambda: tcp_resolved_targets([window]),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+    assert fixture.controller._initial_login_authorizations
+
+    fixture.controller.set_group_launch_plan(
+        make_tcp_group_plan(tmp_path, [window], "new")
+    )
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert fixture.controller._initial_login_authorizations == {}
+    assert fixture.mouse.clicks == []
 
 
 @pytest.mark.parametrize(
@@ -2479,10 +2985,9 @@ def test_tcp_unknown_or_normal_never_restarts(observations, tmp_path):
         windows=windows,
         expected_windows=3,
         tcp_connection_count_provider=SequenceTcpCounts(observations),
-        tcp_reopen_enabled=True,
         target_windows_provider=lambda: tcp_resolved_targets(windows),
         battle_restarter=restarter,
-        group_launch_plan=make_group_plan(tmp_path, windows),
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
     )
 
     fixture.controller.check_connection()
@@ -3760,6 +4265,9 @@ def test_failed_battle_restart_is_attempted_once_until_new_disconnect_event(
         battle_restarter=restarter,
         group_launch_plan=plan,
         failure_status_service=ReconnectFailureStatusService(),
+        tcp_connection_count_provider=lambda process_ids: {
+            process_id: 1 for process_id in process_ids
+        },
     )
 
     fixture.controller.reconnect()
@@ -5078,7 +5586,7 @@ def test_stop_revokes_snapshot_and_initial_login_authorization():
     assert fixture.mouse.clicks == []
 
 
-def test_snapshot_battle_without_unique_ungrouped_shortcut_never_restarts(tmp_path):
+def test_snapshot_battle_with_unsafe_group_plan_stays_disabled(tmp_path):
     window = make_window(1, fingerprint="a" * 64)
     restarter = FakeBattleRestarter()
     fixture = make_controller(
@@ -5089,14 +5597,13 @@ def test_snapshot_battle_without_unique_ungrouped_shortcut_never_restarts(tmp_pa
         battle_restarter=restarter,
         group_launch_plan=make_group_plan(tmp_path, [window]),
     )
-    activate_current_window_snapshot(fixture)
+    prepared = activate_current_window_snapshot(fixture)
 
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert "battle_restart_identity_unresolved" in result.details[
-        "failure_codes"
-    ]
+    assert prepared.success is False
+    assert prepared.code == "reconnect.snapshot_identity_unsafe"
     assert result.details["restarted_windows"] == 0
     assert restarter.calls == []
     assert restarter.reopen_calls == []
@@ -5219,7 +5726,6 @@ def test_real_controller_uses_guarded_fresh_background_capture(monkeypatch):
     assert controller._primary_capture_is_fresh_without_visibility is False
     assert controller._tcp_counts is tcp_provider
     assert callable(controller._tcp_counts)
-    assert controller._tcp_reopen is False
     assert tcp_queries == []
 
 

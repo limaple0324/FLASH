@@ -239,7 +239,6 @@ class _TcpState:
     zero_since: float | None = None
     zero_count: int = 0
     gen: int = 0
-    restarted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1869,6 +1868,9 @@ class ReconnectBatchResult:
             self.discovered_windows > 0
             and self.validated_windows == self.discovered_windows
             and self.connected_windows == self.discovered_windows
+            and self.actionable_windows == 0
+            and self.clicked_windows == 0
+            and self.restarted_windows == 0
             and self.unknown_windows == 0
             and self.source_missing_windows == 0
             and not self.failure_codes
@@ -2311,7 +2313,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         tcp_connection_count_provider: (
             Callable[[frozenset[int]], dict[int, int] | None] | None
         ) = None,
-        tcp_reopen_enabled=False,
     ):
         if expected_windows <= 0:
             raise ValueError("expected_windows must be positive")
@@ -2432,6 +2433,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._recent_login_role_ids: dict[str, str] = {}
         self._primary_entry_authorized: set[str] = set()
         self._primary_connected_fingerprints: set[str] = set()
+        self._reconnect_entry_authorized: set[str] = set()
         self._reconnect_timing_flows: dict[
             tuple[str, str],
             _ReconnectTimingFlow,
@@ -2494,12 +2496,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             _TrustedConnectedEvidence,
         ] = {}
         self._tcp_counts = tcp_connection_count_provider
-        self._tcp_reopen = bool(tcp_reopen_enabled)
         self._tcp_gen = 0
         self._tcp_s = {}
         self._tcp_v = None
-        self._tcp_j = {}
-        self._tcp_done = set()
         self._source_state_generation = 0
         # A continuing source failure is one revocation edge.  Keep its
         # identity until a complete authority source observes that identity
@@ -2511,9 +2510,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             _ActionConfirmation,
         ] = {}
         self._battle_restart_attempts: dict[
-            str,
+            tuple[str, bool],
             _BattleRestartEvent,
         ] = {}
+        # A role restarted through the formal reconnect chain may be restored
+        # only through login and character selection.  It must not inherit
+        # post-login or auto-battle authority from unrelated roles.
+        self._login_only_recovery_fingerprints: set[str] = set()
         # One delivered timeout confirmation may not be repeated merely
         # because capture routing, settings, or source generation changes.
         # The event is intentionally bound only to immutable window-session
@@ -2612,7 +2615,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             evidence_required=True,
             evidence_initialization_failed=evidence_initialization_failed,
             tcp_connection_count_provider=_ipv4_established_counts_by_pid,
-            tcp_reopen_enabled=False,
         )
 
     @property
@@ -2740,11 +2742,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._auto_battle_button_windows.clear()
             self._auto_battle_attempted_actions.clear()
             self._auto_battle_confirmed_instances.clear()
+            self._reconnect_entry_authorized.clear()
+            self._login_only_recovery_fingerprints.clear()
             self._flow_pause_until.clear()
             self._last_trusted_capture_routes.clear()
             self._trusted_connected_evidence.clear()
-            self._tcp_j.clear()
-            self._tcp_done.clear()
         self._publish_reconnecting_fingerprints()
         self._persist_runtime_state()
 
@@ -3059,6 +3061,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._recent_login_role_ids.pop(fingerprint, None)
         self._primary_entry_authorized.discard(fingerprint)
         self._primary_connected_fingerprints.discard(fingerprint)
+        self._reconnect_entry_authorized.discard(fingerprint)
 
     def _check_reconnect_timing_deadlines(self, now: float) -> None:
         for (fingerprint, lifecycle), flow in tuple(
@@ -3421,11 +3424,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         source_state_generation: int,
         input_channel: str = "window_message",
         identity_verified_override: bool | None = None,
+        allow_unknown: bool = False,
     ) -> tuple[bool, int | None, str | None]:
-        if item.state in {
-            ReconnectScreenState.UNKNOWN,
-            ReconnectScreenState.CHECK_DISABLED,
-        }:
+        if (
+            item.state is ReconnectScreenState.CHECK_DISABLED
+            or item.state is ReconnectScreenState.UNKNOWN
+            and not allow_unknown
+        ):
             return False, None, None
         recorder = self._evidence_recorder
         if recorder is None:
@@ -4627,6 +4632,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     "目前遊戲視窗不完整或身分重複，沒有啟用智慧重連。",
                     "window_identity_unsafe",
                 )
+            plan = self._group_launch_plan
+            if plan is not None:
+                if (
+                    set(plan.fingerprints) != set(complete_instances)
+                    or not isinstance(self._tcp_v, ResolvedTargetWindows)
+                    or any(
+                        not target.entry_id
+                        or self._tcp_id(
+                            self._tcp_v,
+                            target.fingerprint,
+                            complete_instances[target.fingerprint][1],
+                        ) != target.entry_id
+                        for target in plan.targets
+                    )
+                ):
+                    return self._snapshot_failure(
+                        "reconnect.snapshot_identity_unsafe",
+                        "The selected group does not match the safe target contract.",
+                        "window_identity_unsafe",
+                    )
             instance_index: dict[
                 tuple[str, int, int, int, str, int], str
             ] = {}
@@ -4649,8 +4674,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 instance_index[instance_key] = monitor_fingerprint
 
             self._revoke_capture_authority()
-            self._group_launch_plan = None
-            self._runtime_scope_token = None
+            self._tcp_s.clear()
+            if plan is None:
+                self._runtime_scope_token = None
             self._allowed_fingerprints = frozenset(complete_instances)
             self._activation_snapshot_instances = {
                 fingerprint: instance
@@ -4734,6 +4760,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             previous_scope = self._allowed_fingerprints
             previous_token = self._runtime_scope_token
             if plan is None:
+                # Clearing the selected-group identity is a hard revocation,
+                # not an ordinary monitor stop.  No old snapshot or TCP
+                # observation may remain executable after the outer gate is
+                # reopened.
+                self.set_execution_enabled(False)
                 self._group_launch_plan = None
                 self.set_allowed_fingerprints(None)
                 self._runtime_scope_token = None
@@ -4754,6 +4785,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 # A group switch is a new reconnect context even when the two
                 # groups share one role or the entire fingerprint set.
                 self._retain_runtime_scope(frozenset())
+                self._initial_login_authorizations.clear()
+                self._tcp_s.clear()
             elif previous_scope != self._allowed_fingerprints:
                 self._retain_runtime_scope(self._allowed_fingerprints)
 
@@ -4817,6 +4850,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 | set(self._force_login_timeout_attempts)
                 | self._primary_entry_authorized
                 | self._primary_connected_fingerprints
+                | self._reconnect_entry_authorized
+                | self._login_only_recovery_fingerprints
                 | {
                     fingerprint
                     for fingerprint, _lifecycle
@@ -4824,15 +4859,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 }
             )
             removed = tracked - fingerprints
-            if set(self._tcp_j) - fingerprints:
-                self._tcp_j.clear()
-            self._tcp_done.intersection_update(fingerprints)
             self._pending_reconnect_fingerprints.intersection_update(fingerprints)
             self._active_automation_fingerprints.intersection_update(fingerprints)
             self._pending_reopen_fingerprints.intersection_update(fingerprints)
             self._character_selection_pending.intersection_update(fingerprints)
             self._primary_entry_authorized.intersection_update(fingerprints)
             self._primary_connected_fingerprints.intersection_update(
+                fingerprints
+            )
+            self._reconnect_entry_authorized.intersection_update(
+                fingerprints
+            )
+            self._login_only_recovery_fingerprints.intersection_update(
                 fingerprints
             )
             for mapping in (
@@ -4886,16 +4924,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._recent_login_role_ids.clear()
             self._primary_entry_authorized.clear()
             self._primary_connected_fingerprints.clear()
+            self._reconnect_entry_authorized.clear()
             self._reconnect_timing_flows.clear()
             self._initial_login_authorizations.clear()
             self._force_login_timeout_attempts.clear()
+            self._tcp_s.clear()
             self._activation_snapshot_instances = None
             self._activation_snapshot_source_fingerprints = None
             self._activation_snapshot_instance_index = None
             self._activation_snapshot_direct_identity_collisions = frozenset()
-            self._allowed_fingerprints = None
-            self._group_launch_plan = None
-            self._runtime_scope_token = None
+            plan = self._group_launch_plan
+            self._allowed_fingerprints = (
+                plan.fingerprints if plan is not None else None
+            )
             with self._source_authority_lock:
                 self._source_state_generation += 1
                 self._source_revoked_fingerprints.clear()
@@ -5600,10 +5641,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
     def _tcp_failures(
         self, windows: tuple[WindowInfo, ...], now: float,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], tuple[str, _TcpState] | None]:
         provider = self._tcp_counts
         if provider is None:
-            return ()
+            return (), None
         self._tcp_gen += 1
         g = self._tcp_gen
         live: dict[str, _TcpState] = {}
@@ -5612,9 +5653,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             token = WindowInstanceToken.from_window(window)
             if fp is None or token is None:
                 continue
+            entry_id = self._tcp_id(self._tcp_v, fp, token)
             state = self._tcp_s.get(fp)
-            if state is None or state.instance != token:
-                state = _TcpState(token, self._tcp_id(self._tcp_v, fp, token))
+            if (
+                state is None
+                or state.instance != token
+                or state.entry_id != entry_id
+            ):
+                state = _TcpState(token, entry_id)
             live[fp] = state
         self._tcp_s = live
         try:
@@ -5633,25 +5679,29 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 state.zero_since = None
                 state.zero_count = 0
                 state.gen = g
-            return ("tcp_observation_unavailable",)
+            return ("tcp_observation_unavailable",), None
         zero = []
         for fp, state in live.items():
             if counts[state.instance.process_id] > 0:
-                state.restarted = False
                 state.online = True
                 state.zero_since = None
                 state.zero_count = 0
                 state.gen = g
-            elif state.online:
+                if (
+                    self._battle_restart_attempts.get((fp, True))
+                    == _BattleRestartEvent.from_instance(state.instance)
+                ):
+                    self._battle_restart_attempts.pop((fp, True), None)
+            else:
                 zero.append((fp, state))
         if len(zero) > 1:
             for _fp, state in zero:
-                state.zero_since = now
-                state.zero_count = 1
+                state.zero_since = None
+                state.zero_count = 0
                 state.gen = g
-            return ("tcp_multiple_zero_suppressed",)
-        if not zero:
-            return ()
+            return ("tcp_multiple_zero_suppressed",), None
+        if not zero or not zero[0][1].online:
+            return (), None
         state = zero[0][1]
         if state.zero_since is None or state.gen != g - 1:
             state.zero_since = now
@@ -5663,8 +5713,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             state.zero_count >= _TCP_N
             and now - state.zero_since >= _TCP_T
         ):
-            return ("tcp_disconnect_confirmed",)
-        return ("tcp_disconnect_suspected",)
+            return ("tcp_disconnect_confirmed",), zero[0]
+        return ("tcp_disconnect_suspected",), None
 
     def _candidate_windows(self) -> tuple[WindowInfo, ...]:
         return self._candidate_window_set()[0]
@@ -5681,53 +5731,24 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         ):
             return None
         matches = tuple(
-            entry_id for entry_id, window in zip(
-                resolved.sync_entry_ids, resolved.sync_windows)
-            if normalize_launch_fingerprint(window.launch_fingerprint) == fp
-            and WindowInstanceToken.from_window(window) == token
+            (entry_id, window)
+            for entry_id, window in zip(
+                resolved.sync_entry_ids, resolved.sync_windows
+            )
+            if WindowInstanceToken.from_window(window) == token
         )
-        return matches[0] if len(matches) == 1 else None
-
-    def _restart_tcp_target(self) -> None:
-        if not self._tcp_reopen:
-            return
-        found = tuple(
-            item for item in self._tcp_s.items()
-            if item[1].zero_since is not None
-            and item[1].zero_count >= _TCP_N
-        )
-        if len(found) != 1:
-            return
-        fp, s = found[0]
-        p = self._target_windows_provider
-        try:
-            view = p() if p else None
-        except Exception:
-            view = None
-        if (
-            s.entry_id is None or s.restarted
-            or self._tcp_id(view, fp, s.instance) != s.entry_id
-        ):
-            return
-        p = self._tcp_counts
-        pid = s.instance.process_id
-        try:
-            n = p(frozenset({pid})) if p else None
-        except Exception:
-            n = None
-        if (
-            not isinstance(n, dict)
-            or type(n.get(pid)) is not int
-            or n[pid] != 0
-        ):
-            return
-        s.restarted = True
-        result = self._restart_failed_role(
-            fp, tcp_instance=s.instance, tcp_entry=s.entry_id
-        )
-        if result.success and s.entry_id:
-            self._tcp_j = {fp: (s.entry_id, s.instance)}
-            self._tcp_done.discard(fp)
+        if len(matches) != 1:
+            return None
+        entry_id, sync_window = matches[0]
+        source_fingerprints = {
+            normalize_launch_fingerprint(window.launch_fingerprint)
+            for window in resolved.windows
+            if WindowInstanceToken.from_window(window) == token
+        }
+        allowed = source_fingerprints | {
+            normalize_launch_fingerprint(sync_window.launch_fingerprint)
+        }
+        return entry_id if fp in allowed and None not in allowed else None
 
     def _activation_direct_identity_collisions(
         self,
@@ -6133,13 +6154,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
     def _target_for_fingerprint(self, fingerprint: str):
         plan = self._group_launch_plan
-        login = self._tcp_j.get(fingerprint)
-        if login is not None and plan is not None:
-            matches = tuple(
-                t for t in plan.targets
-                if t.fingerprint == fingerprint and t.entry_id == login[0]
-            )
-            return matches[0] if len(matches) == 1 else None
         return (
             plan.target_for_fingerprint(fingerprint)
             if plan is not None
@@ -6186,18 +6200,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
 
     @staticmethod
-    def _action_signature_is_complete(item: ScreenRecognition) -> bool:
+    def _action_signature_is_complete(
+        item: ScreenRecognition,
+        *,
+        require_point: bool = True,
+    ) -> bool:
         point = item.click_point
         return bool(
             isinstance(item.reference_name, str)
             and item.reference_name.strip()
-            and isinstance(point, tuple)
-            and len(point) == 2
-            and all(
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and 0.0 <= value <= 1.0
-                for value in point
+            and (
+                not require_point
+                or isinstance(point, tuple)
+                and len(point) == 2
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and 0.0 <= value <= 1.0
+                    for value in point
+                )
             )
         )
 
@@ -6277,9 +6298,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._terminal_ready_after.pop(fingerprint, None)
         self._terminal_evidence.pop(fingerprint, None)
         self._recent_login_role_ids.pop(fingerprint, None)
-        self._battle_restart_attempts.pop(fingerprint, None)
+        self._reconnect_entry_authorized.discard(fingerprint)
+        if fingerprint not in self._login_only_recovery_fingerprints:
+            self._battle_restart_attempts.pop((fingerprint, False), None)
+            self._battle_restart_attempts.pop((fingerprint, True), None)
         self._force_login_timeout_attempts.pop(fingerprint, None)
-        self._tcp_j.pop(fingerprint, None)
         self._clear_action_confirmation(fingerprint)
 
     def _action_is_confirmed(
@@ -6291,6 +6314,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         capture_route: str | None,
         capture_settings_revision: int,
         source_state_generation: int,
+        confirmation_signature: tuple[object, ...] | None = None,
     ) -> bool:
         if instance is None or capture_route is None:
             self._clear_action_confirmation(fingerprint)
@@ -6320,7 +6344,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 with self._screen_state_lock:
                     self._clear_action_confirmation(fingerprint)
                 return False
-            signature = self._action_signature(item)
+            signature = (
+                confirmation_signature
+                if confirmation_signature is not None
+                else self._action_signature(item)
+            )
             with self._screen_state_lock:
                 previous = self._action_confirmations.get(fingerprint)
                 count = (
@@ -6567,7 +6595,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         target = self._target_for_fingerprint(fingerprint)
         plan = self._group_launch_plan
         candidates = tuple(item.character_candidates)
-        tcp_login = fingerprint in self._tcp_j
         identity = (
             item.character_identity.strip().casefold()
             if isinstance(item.character_identity, str)
@@ -6578,19 +6605,34 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             fingerprint
         )
         reconnect_session = self._has_reconnect_session(fingerprint)
-        if tcp_login:
-            if target is None or not target.role_id:
+        if (
+            plan is not None
+            and fingerprint in self._pending_reopen_fingerprints
+            and fingerprint in self._login_only_recovery_fingerprints
+        ):
+            if target is None or not target.entry_id or not target.role_id:
                 return None
             exact = tuple(
-                c for c in candidates if isinstance(c.identity, str)
-                and c.identity.strip().casefold() in self._identity_values(target)
+                candidate
+                for candidate in candidates
+                if isinstance(candidate.identity, str)
+                and candidate.identity.strip().casefold()
+                in self._identity_values(target)
             )
             if len(exact) != 1:
-                if any(c.identity for c in candidates):
+                if any(candidate.identity for candidate in candidates):
                     return None
                 level = target.registered_level
-                exact = tuple(c for c in candidates if c.level == level)
-                if level is None or len(exact) != 1 or any(c.level is None for c in candidates):
+                exact = tuple(
+                    candidate
+                    for candidate in candidates
+                    if candidate.level == level
+                )
+                if (
+                    level is None
+                    or len(exact) != 1
+                    or any(candidate.level is None for candidate in candidates)
+                ):
                     return None
             candidates = exact
             item = replace(item, character_candidates=candidates)
@@ -7034,15 +7076,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 self._mark_fingerprints_unknown_locked((fingerprint,))
             return None
         window, instance = current
-        if self._tcp_j and set(self._tcp_j) != {fingerprint}:
-            return None
-        login = self._tcp_j.get(fingerprint)
-        if login is not None and (
-            len(self._tcp_j) != 1
-            or instance == login[1]
-            or self._tcp_id(self._tcp_v, fingerprint, instance) != login[0]
-        ):
-            return None
+        plan = self._group_launch_plan
+        if isinstance(self._tcp_v, ResolvedTargetWindows) and plan is not None:
+            target = plan.target_for_fingerprint(fingerprint)
+            if (
+                target is None
+                or not target.entry_id
+                or self._tcp_id(self._tcp_v, fingerprint, instance)
+                != target.entry_id
+            ):
+                return None
         snapshot = self._activation_snapshot_instances
         if (
             snapshot is not None
@@ -7065,6 +7108,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         expected_capture_settings_revision: int,
         expected_capture_route: str | None,
         expected_source_state_generation: int,
+        *,
+        require_recognition_match: bool = True,
     ) -> str | None:
         if not self._capture_authority_is_current(
             expected_capture_settings_revision,
@@ -7129,7 +7174,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             fingerprint,
             current,
         )
-        if self._action_signature(current) != self._action_signature(expected):
+        if (
+            require_recognition_match
+            and self._action_signature(current)
+            != self._action_signature(expected)
+        ):
             return None
         if (
             self._current_action_window(expected_instance, fingerprint)
@@ -7230,8 +7279,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         expected_capture_settings_revision: int | None = None,
         capture_route: str | None = None,
         expected_source_state_generation: int | None = None,
-        tcp_instance: WindowInstanceToken | None = None,
-        tcp_entry: str | None = None,
     ) -> BattleRestartResult:
         if self._evidence_required:
             # This legacy helper has no current screen, no two-frame decision
@@ -7282,15 +7329,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if normalize_launch_fingerprint(window.launch_fingerprint)
             == fingerprint
         )
-        if tcp_instance is not None and (
-            len(matches) != 1 or WindowInstanceToken.from_window(matches[0])
-            != tcp_instance
-            or tcp_entry is not None
-            and self._tcp_id(
-                self._tcp_v, fingerprint, tcp_instance
-            ) != tcp_entry
-        ):
-            return BattleRestartResult(False, "tcp_restart_identity_changed")
         if len(matches) > 1:
             self._clear_action_confirmation(fingerprint)
             return BattleRestartResult(
@@ -7562,10 +7600,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             }
             self._primary_entry_authorized.discard(normalized)
             self._primary_connected_fingerprints.discard(normalized)
+            self._reconnect_entry_authorized.discard(normalized)
             self._character_selection_pending.discard(normalized)
             self._character_selection_targets.pop(normalized, None)
             if revoke_runtime_authority:
-                self._tcp_j.pop(normalized, None)
+                self._login_only_recovery_fingerprints.discard(normalized)
                 self._pending_reconnect_fingerprints.discard(normalized)
                 self._pending_reopen_fingerprints.discard(normalized)
                 self._active_automation_fingerprints.discard(normalized)
@@ -8087,8 +8126,45 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             source_failures,
             blocked_fingerprints,
         )
+        runtime_authority_revoked = False
+        pending_reopen = frozenset(self._pending_reopen_fingerprints)
+        formal_reopen = (
+            pending_reopen & self._login_only_recovery_fingerprints
+        )
+        plan = self._group_launch_plan
+        resolved_contract = self._tcp_v
+        contract_plan_unsafe = bool(
+            formal_reopen
+            and (
+                len(formal_reopen) != 1
+                or plan is None
+                or not isinstance(resolved_contract, ResolvedTargetWindows)
+                or tuple(target.entry_id for target in plan.targets)
+                != resolved_contract.sync_scope_entry_ids
+                or not plan.targets
+                or plan.targets[0].entry_id
+                != resolved_contract.sync_controller_entry_id
+            )
+        )
+        expected_reopen_absence = bool(
+            len(pending_reopen) == 1
+            and source_failure_affected_fingerprints == pending_reopen
+            and not blocked_fingerprints
+            and not snapshot_failures
+            and not contract_plan_unsafe
+            and set(source_failures).issubset({"window_offline"})
+            and self._unique_complete_candidate_instances(candidate_windows)
+            is not None
+        )
         if source_failure_affected_fingerprints:
-            if (
+            if formal_reopen and not expected_reopen_absence:
+                # A single-role restart may preserve authority only while that
+                # exact role is the sole, ordinary missing member.  Any other
+                # source drift revokes the entire batch and requires a new
+                # explicit enable before mutations can resume.
+                self.set_execution_enabled(False)
+                runtime_authority_revoked = True
+            elif (
                 self._allowed_fingerprints is not None
                 and (
                     not source_failures
@@ -8103,9 +8179,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     refresh_source_generation=False,
                 )
             else:
-                preserve_pending_reopen = bool(
-                    self._pending_reopen_fingerprints
-                    & source_failure_affected_fingerprints
+                preserve_pending_reopen = (
+                    expected_reopen_absence
+                    if formal_reopen
+                    else bool(
+                        pending_reopen
+                        & source_failure_affected_fingerprints
+                    )
                 )
                 self._revoke_source_failure_evidence(
                     source_failure_affected_fingerprints,
@@ -8116,6 +8196,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     revoke_runtime_authority=not preserve_pending_reopen,
                     refresh_source_generation=True,
                 )
+        if contract_plan_unsafe and not runtime_authority_revoked:
+            self.set_execution_enabled(False)
+            runtime_authority_revoked = True
         scan_source_state_generation = (
             self._source_state_generation_snapshot()
         )
@@ -8126,29 +8209,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             (source_failures and not isolated_source_block)
             or (blocked_fingerprints and not isolated_source_block)
             or snapshot_failures
+            or contract_plan_unsafe
             or self._unique_complete_candidate_instances(
                 candidate_windows
             )
             is None
         )
-        keep = bool(
-            self._tcp_j
-            and set(self._tcp_j) == self._pending_reopen_fingerprints
-            == set(source_failure_affected_fingerprints)
-            and not source_identity_unsafe and not blocked_fingerprints
-            and group_failures == ["group_identity_set_mismatch"]
-        )
         if source_identity_unsafe or group_failures:
             self._tcp_s.clear()
-            if self._tcp_j and not keep:
-                self._execution_enabled.clear()
-                self._revoke_capture_authority()
-                for item in (self._auto_battle_evidence, self._initial_login_authorizations, self._primary_entry_authorized, self._primary_connected_fingerprints):
-                    item.clear()
-                source_identity_unsafe = True
             tcp_failures: tuple[str, ...] = ()
+            tcp_evidence = None
         else:
-            tcp_failures = self._tcp_failures(windows, now)
+            tcp_failures, tcp_evidence = self._tcp_failures(windows, now)
+        mutation_veto = bool(
+            runtime_authority_revoked
+            or "tcp_multiple_zero_suppressed" in tcp_failures
+        )
+        mutation_execute = execute and not mutation_veto
+        if mutation_veto:
+            self._clear_action_confirmation()
         if source_identity_unsafe:
             # A source-reported failure or unsafe live instance interrupts
             # every pending action frame.  No safe-looking peer may rebuild
@@ -8159,8 +8238,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             retried_reopens = 0
             retry_failures: list[str] = []
             pending_reopen_delay = None
-            self._pending_reopen_fingerprints.clear()
-            self._reopen_retry_after.clear()
         else:
             reopen_safety_failures = self._reopen_safety_failures(
                 candidate_windows,
@@ -8173,7 +8250,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     candidate_windows=candidate_windows,
                     source_failures=source_failures,
                     blocked_fingerprints=blocked_fingerprints,
-                    execute=execute,
+                    execute=mutation_execute,
                     now=now,
                     expected_capture_settings_revision=(
                         capture_settings_revision
@@ -8291,6 +8368,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             | self._pending_reopen_fingerprints
             | self._active_automation_fingerprints
         )
+        initial_reopen_scope = frozenset(
+            self._pending_reopen_fingerprints
+        )
         missing_pending_reopen_targets = (
             self._pending_reopen_fingerprints - live_fingerprints
         )
@@ -8329,6 +8409,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         ] = {}
         auto_battle_capture_samples: dict[str, object | None] = {}
         confirmed_action_instances: dict[str, WindowInstanceToken] = {}
+        tcp_action_entries: dict[
+            str, tuple[str, WindowInstanceToken]
+        ] = {}
         initial_authorized_action_fingerprints: set[str] = set()
         pending_confirmation_delays: list[int] = []
         pending_action_wait_delays: list[int] = []
@@ -8348,7 +8431,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             ) = self._capture_and_recognize(
                 window,
                 fingerprint,
-                execute=execute,
+                execute=mutation_execute,
                 expected_source_state_generation=(
                     scan_source_state_generation
                 ),
@@ -8442,6 +8525,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         self._has_reconnect_session(fingerprint)
                         or initial_login_authorized
                     )
+                    and not (
+                        fingerprint
+                        in self._login_only_recovery_fingerprints
+                        and (
+                            (target := self._target_for_fingerprint(
+                                fingerprint
+                            )) is None
+                            or target.importance
+                            is not CharacterImportance.PRIMARY
+                        )
+                    )
                 ):
                     self._start_reconnect_timing(
                         fingerprint,
@@ -8458,7 +8552,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 captured_windows += 1
             else:
                 self._clear_action_confirmation(fingerprint)
-            tcp = fingerprint in self._tcp_j
             if recognition.state is ReconnectScreenState.CONNECTED:
                 self._initial_login_authorizations.pop(
                     fingerprint,
@@ -8475,37 +8568,44 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             fingerprint,
                             now,
                         )
+                    primary_entry_authorized = (
+                        fingerprint in self._primary_entry_authorized
+                    )
+                    reconnect_entry_authorized = (
+                        fingerprint in self._reconnect_entry_authorized
+                    )
                     if (
                         fingerprint in self._terminal_ready_after
                         and self._terminal_completion_confirmed(
-                        fingerprint,
-                        window,
-                        sample,
-                        now,
-                        )
-                        and fingerprint
-                        in self._primary_entry_authorized
-                    ):
-                        self._complete_reconnect_timing(
                             fingerprint,
-                            "start_game_to_primary_connected",
+                            window,
+                            sample,
                             now,
                         )
-                        self._primary_connected_fingerprints.add(
-                            fingerprint
+                        and (
+                            primary_entry_authorized
+                            or reconnect_entry_authorized
                         )
-                        if tcp or not self._auto_battle_enabled:
+                    ):
+                        if primary_entry_authorized:
                             self._complete_reconnect_timing(
                                 fingerprint,
-                                "disconnect_to_primary_auto",
+                                "start_game_to_primary_connected",
                                 now,
                             )
+                            self._primary_connected_fingerprints.add(
+                                fingerprint
+                            )
+                            if not self._auto_battle_enabled:
+                                self._complete_reconnect_timing(
+                                    fingerprint,
+                                    "disconnect_to_primary_auto",
+                                    now,
+                                )
                         self._clear_reconnect_session(fingerprint)
                         self._clear_reconnect_failure(fingerprint)
-                        if tcp:
-                            self._tcp_done.add(fingerprint)
-                        if (
-                            tcp or not self._auto_battle_enabled
+                        if primary_entry_authorized and (
+                            not self._auto_battle_enabled
                             or (
                                 fingerprint,
                                 "disconnect_to_primary_auto",
@@ -8544,15 +8644,23 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 recognition,
                 initial_login_authorized=initial_login_authorized,
             )
+            if (
+                fingerprint in self._pending_reopen_fingerprints
+                and fingerprint in self._login_only_recovery_fingerprints
+                and recognition.state in _POST
+            ):
+                recognition = replace(recognition, click_point=None)
+            if (
+                recognition.state is ReconnectScreenState.DISCONNECTED
+                and fingerprint not in self._pending_reopen_fingerprints
+            ):
+                # A later ordinary disconnect is a new non-restart flow and
+                # may use the existing post-login/auto-battle policy again.
+                self._login_only_recovery_fingerprints.discard(fingerprint)
             recognition = self._recognition_for_preferred_line(
                 fingerprint,
                 recognition,
             )
-            if (
-                fingerprint in self._tcp_j
-                and recognition.state in _POST
-            ):
-                recognition = replace(recognition, click_point=None)
             if (
                 recognition.state is ReconnectScreenState.FORCE_LOGIN_TIMEOUT
                 and instance is not None
@@ -8608,31 +8716,52 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         now,
                     )
             action = self._policy.decide(recognition.state).action
+            tcp_action = bool(
+                tcp_evidence is not None
+                and tcp_evidence[0] == fingerprint
+                and tcp_evidence[1].entry_id is not None
+                and tcp_evidence[1].instance == instance
+                and not self._has_reconnect_session(fingerprint)
+                and self._tcp_id(
+                    self._tcp_v,
+                    fingerprint,
+                    tcp_evidence[1].instance,
+                ) == tcp_evidence[1].entry_id
+            )
             is_action_candidate = (
-                action in ACTIONABLE_RECONNECT_ACTIONS
-                and (not self._tcp_j or set(self._tcp_j) == {fingerprint})
-                and recognition.click_point is not None
-                and (
-                    recognition.state is ReconnectScreenState.DISCONNECTED
-                    or (
-                        recognition.state in _SESSION_ONLY_STATES
-                        and (
-                            self._has_reconnect_session(fingerprint)
-                            or initial_login_authorized
+                tcp_action
+                or (
+                    action in ACTIONABLE_RECONNECT_ACTIONS
+                    and recognition.click_point is not None
+                    and (
+                        recognition.state is ReconnectScreenState.DISCONNECTED
+                        or (
+                            recognition.state in _SESSION_ONLY_STATES
+                            and (
+                                self._has_reconnect_session(fingerprint)
+                                or initial_login_authorized
+                            )
                         )
                     )
                 )
             )
             action_evidence_complete = (
-                fresh_capture
+                not mutation_veto
+                and fresh_capture
                 and instance is not None
                 and capture_route is not None
-                and self._action_signature_is_complete(recognition)
-                and recognition.state
-                not in {
-                    ReconnectScreenState.UNKNOWN,
-                    ReconnectScreenState.CHECK_DISABLED,
-                }
+                and (
+                    tcp_action
+                    or self._action_signature_is_complete(recognition)
+                )
+                and (
+                    tcp_action
+                    or recognition.state
+                    not in {
+                        ReconnectScreenState.UNKNOWN,
+                        ReconnectScreenState.CHECK_DISABLED,
+                    }
+                )
                 and is_action_candidate
             )
             if not action_evidence_complete:
@@ -8664,11 +8793,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     source_state_generation=(
                         scan_source_state_generation
                     ),
+                    confirmation_signature=(
+                        (
+                            "tcp_disconnect_confirmed",
+                            tcp_evidence[1].entry_id,
+                            tcp_evidence[1].instance,
+                        )
+                        if tcp_action and tcp_evidence is not None
+                        else None
+                    ),
                 )
             ):
                 confirmed_action_instances[fingerprint] = instance
+                if tcp_action and tcp_evidence is not None:
+                    tcp_action_entries[fingerprint] = (
+                        tcp_evidence[1].entry_id,
+                        tcp_evidence[1].instance,
+                    )
                 if (
-                    execute
+                    mutation_execute
                     and recognition.state
                     is ReconnectScreenState.DISCONNECTED
                 ):
@@ -8676,6 +8819,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     self._primary_connected_fingerprints.discard(
                         fingerprint
                     )
+                    self._reconnect_entry_authorized.discard(fingerprint)
                     self._start_reconnect_timing(
                         fingerprint,
                         "disconnect_to_primary_auto",
@@ -8705,10 +8849,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if recognition.state not in {
                 ReconnectScreenState.DISCONNECTED,
                 ReconnectScreenState.UNKNOWN,
-            }:
+            } and not tcp_action:
                 # Only a newly proven non-disconnect state ends the current
                 # disconnect event.  UNKNOWN never re-arms a restart.
-                self._battle_restart_attempts.pop(fingerprint, None)
+                self._battle_restart_attempts.pop((fingerprint, False), None)
             if recognition.state is not ReconnectScreenState.CHARACTER_SELECTION:
                 self._character_selection_pending.discard(fingerprint)
                 self._character_selection_targets.pop(fingerprint, None)
@@ -8742,6 +8886,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
         if settings_changed_during_scan or source_changed_during_scan:
             confirmed_action_instances.clear()
+            tcp_action_entries.clear()
             recognized = [
                 (
                     window,
@@ -8763,7 +8908,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             ]
 
         if (
-            execute
+            mutation_execute
             and not settings_changed_during_scan
             and not source_changed_during_scan
         ):
@@ -8798,6 +8943,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         self._publish_reconnecting_fingerprints(now)
             if settings_changed_during_scan or source_changed_during_scan:
                 confirmed_action_instances.clear()
+                tcp_action_entries.clear()
                 recognized = [
                     (
                         window,
@@ -8845,6 +8991,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             failures.append("screen_unknown")
         if disabled_windows:
             failures.append("capture_mode_disabled")
+        scoped_recovery_targets = (
+            (
+                set(initial_reopen_scope)
+                | set(self._pending_reopen_fingerprints)
+            )
+            & self._login_only_recovery_fingerprints
+        ) | set(tcp_action_entries)
+        operation_scope = (
+            frozenset(scoped_recovery_targets)
+            if len(scoped_recovery_targets) == 1
+            else None
+        )
+        if operation_scope is not None:
+            for other in tuple(self._action_confirmations):
+                if other not in operation_scope:
+                    self._clear_action_confirmation(other)
         # Identity and group completeness were already validated before any
         # capture.  A capture or recognition failure is local to that exact
         # window: it must never receive input, but it must not prevent another
@@ -8862,6 +9024,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             in ACTIONABLE_RECONNECT_ACTIONS
             and item.click_point is not None
             and fingerprint in confirmed_action_instances
+            and (operation_scope is None or fingerprint in operation_scope)
             and (
                 item.state is ReconnectScreenState.DISCONNECTED
                 or self._has_reconnect_session(fingerprint)
@@ -8901,17 +9064,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 confirmed_action_instances[fingerprint],
             )
             for window, fingerprint, item in recognized
-            if item.state is ReconnectScreenState.DISCONNECTED
-            and item.battle_context
+            if (
+                item.state is ReconnectScreenState.DISCONNECTED
+                and item.battle_context
+                or fingerprint in tcp_action_entries
+            )
             and fingerprint in confirmed_action_instances
+            and (operation_scope is None or fingerprint in operation_scope)
         ]
         clicked_windows = 0
         restarted_windows = retried_reopens
         battle_restart_attempted = False
+        tcp_restart_progressed = False
         invalid_targets = 0
         unresponsive_targets = 0
         delivery_failures = 0
-        if execute:
+        if mutation_execute:
             for window, fingerprint, item, instance in battle_actionable:
                 if not self._execution_allowed():
                     break
@@ -8962,9 +9130,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     and now < retry[1]
                 ):
                     continue
+                tcp_entry = tcp_action_entries.get(fingerprint)
                 restart_event = _BattleRestartEvent.from_instance(instance)
+                restart_event_key = (fingerprint, tcp_entry is not None)
                 if (
-                    self._battle_restart_attempts.get(fingerprint)
+                    self._battle_restart_attempts.get(restart_event_key)
                     == restart_event
                 ):
                     continue
@@ -8978,6 +9148,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 if (
                     self._battle_restarter is None
                     or target is None
+                    or (
+                        tcp_entry is not None
+                        and target.entry_id != tcp_entry[0]
+                    )
                     or (
                         plan is None
                         and (
@@ -9005,14 +9179,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         confirmation.source_state_generation
                     ),
                     input_channel="window_control",
+                    allow_unknown=tcp_entry is not None,
                 )
                 if not evidence_ready:
                     failures.append("evidence_recording_unavailable")
                     self._clear_action_confirmation(fingerprint)
                     continue
                 battle_restart_attempted = True
+                final_tcp_contract: ResolvedTargetWindows | None = None
 
                 def restart_confirmed_battle_window():
+                    nonlocal final_tcp_contract
                     current_capture_route = self._action_still_matches(
                         instance,
                         fingerprint,
@@ -9020,6 +9197,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         capture_settings_revision,
                         capture_route,
                         confirmation.source_state_generation,
+                        require_recognition_match=tcp_entry is None,
                     )
                     if current_capture_route != capture_route:
                         return None
@@ -9029,10 +9207,82 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     )
                     if refreshed_window is None:
                         return None
+                    if tcp_entry is not None:
+                        resolved = self._tcp_v
+                        if (
+                            tcp_entry[1] != instance
+                            or self._tcp_id(
+                                resolved,
+                                fingerprint,
+                                instance,
+                            ) != tcp_entry[0]
+                            or not isinstance(resolved, ResolvedTargetWindows)
+                        ):
+                            return None
+                        tokens = tuple(
+                            WindowInstanceToken.from_window(candidate)
+                            for candidate in resolved.sync_windows
+                        )
+                        if any(token is None for token in tokens):
+                            return None
+                        process_ids = frozenset(
+                            token.process_id for token in tokens
+                            if token is not None
+                        )
+                        provider = self._tcp_counts
+                        try:
+                            counts = provider(process_ids) if provider else None
+                        except Exception:
+                            counts = None
+                        counts_valid = isinstance(counts, dict) and not any(
+                                type(counts.get(pid)) is not int
+                                or counts[pid] < 0
+                                for pid in process_ids
+                            )
+                        unique_target_zero = bool(
+                            counts_valid
+                            and counts.get(instance.process_id) == 0
+                            and sum(counts[pid] == 0 for pid in process_ids)
+                            == 1
+                        )
+                        if not unique_target_zero:
+                            # A final unknown, recovered or non-unique sample
+                            # breaks the consecutive authorization sequence but
+                            # does not consume this restart event.
+                            for state in self._tcp_s.values():
+                                pid = state.instance.process_id
+                                if pid not in process_ids:
+                                    continue
+                                state.zero_since = None
+                                state.zero_count = 0
+                                if counts_valid and counts[pid] > 0:
+                                    state.online = True
+                            return None
+                        refreshed_window = self._current_action_window(
+                            instance,
+                            fingerprint,
+                        )
+                        if (
+                            refreshed_window is None
+                            or self._tcp_v != resolved
+                            or self._tcp_id(
+                                self._tcp_v,
+                                fingerprint,
+                                instance,
+                            ) != tcp_entry[0]
+                        ):
+                            return None
+                        final_tcp_contract = resolved
                     authorized, restart = self._run_authorized_backend_call(
-                        lambda: self._battle_restarter.restart(
-                            refreshed_window,
-                            target,
+                        lambda: (
+                            self._battle_restart_attempts.__setitem__(
+                                restart_event_key,
+                                restart_event,
+                            )
+                            or self._battle_restarter.restart(
+                                refreshed_window,
+                                target,
+                            )
                         ),
                         expected_capture_settings_revision=(
                             capture_settings_revision
@@ -9045,6 +9295,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             lambda: (
                                 self._action_confirmations.get(fingerprint)
                                 == confirmation
+                                and (
+                                    tcp_entry is None
+                                    or self._tcp_v == final_tcp_contract
+                                    and self._tcp_id(
+                                        final_tcp_contract,
+                                        fingerprint,
+                                        instance,
+                                    ) == tcp_entry[0]
+                                )
                                 and (
                                     (
                                         self._group_launch_plan is plan
@@ -9074,10 +9333,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     )
                     return restart if authorized else None
 
-                # Mark before entering the mutation boundary.  One confirmed
-                # disconnect event can authorize at most one restart attempt,
-                # even when that attempt reports failure.
-                self._battle_restart_attempts[fingerprint] = restart_event
                 permitted, mutation_result = self._run_game_mutation(
                     "smart-reconnect-battle-restart",
                     restart_confirmed_battle_window,
@@ -9182,6 +9437,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         )
                     continue
                 restarted_windows += 1
+                if tcp_entry is not None:
+                    tcp_restart_progressed = True
+                    self._login_only_recovery_fingerprints.add(fingerprint)
                 self._pending_reopen_fingerprints.add(fingerprint)
                 self._reopen_retry_after[fingerprint] = (
                     mutation_completed_at
@@ -9192,6 +9450,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     mutation_completed_at
                     + POST_LOGIN_AUTOMATION_GRACE_SECONDS
                 )
+            if tcp_restart_progressed:
+                failures = [
+                    code
+                    for code in failures
+                    if code != "tcp_disconnect_confirmed"
+                ]
             for window, fingerprint, item, confirmed_instance in actionable:
                 if not self._execution_allowed():
                     break
@@ -9581,6 +9845,27 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         )
                     if item.state is ReconnectScreenState.CHARACTER_SELECTION:
                         if item.character_slot_selected is True:
+                            reconnect_target = self._target_for_fingerprint(
+                                fingerprint
+                            )
+                            if (
+                                fingerprint
+                                in self._login_only_recovery_fingerprints
+                                and reconnect_target is not None
+                                and isinstance(
+                                    item.character_target_key,
+                                    str,
+                                )
+                                and item.character_target_key.strip().casefold()
+                                == reconnect_target.role_id.strip().casefold()
+                            ):
+                                self._reconnect_entry_authorized.add(
+                                    fingerprint
+                                )
+                            else:
+                                self._reconnect_entry_authorized.discard(
+                                    fingerprint
+                                )
                             if (
                                 item.character_importance
                                 is CharacterImportance.PRIMARY
@@ -9635,12 +9920,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             fingerprint,
                             mutation_completed_at,
                         )
-                    if fingerprint not in self._tcp_j:
-                        self._active_automation_fingerprints.add(fingerprint)
-                        self._active_automation_until[fingerprint] = (
-                            mutation_completed_at
-                            + POST_LOGIN_AUTOMATION_GRACE_SECONDS
-                        )
+                    self._active_automation_fingerprints.add(fingerprint)
+                    self._active_automation_until[fingerprint] = (
+                        mutation_completed_at
+                        + POST_LOGIN_AUTOMATION_GRACE_SECONDS
+                    )
                 else:
                     if not click_result.delivery_uncertain:
                         delivery_failures += 1
@@ -9662,7 +9946,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._policy.decide(item.state)
             for _window, _fingerprint, item in recognized
         ]
-        if battle_actionable and restarted_windows == 0 and execute:
+        if battle_actionable and restarted_windows == 0 and mutation_execute:
             next_check_seconds = (
                 self._policy.progress_interval_seconds
                 if battle_restart_attempted
@@ -9714,9 +9998,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             next_check_seconds = self._policy.retry_interval_seconds
 
         # Auto-battle evidence remains isolated per role.
-        if execute and self.auto_battle_execution_allowed():
+        if mutation_execute and self.auto_battle_execution_allowed():
             for window, fingerprint, item in recognized:
-                if fingerprint in self._tcp_j or fingerprint in self._tcp_done:
+                if (
+                    fingerprint in self._login_only_recovery_fingerprints
+                    or operation_scope is not None
+                    and fingerprint not in operation_scope
+                ):
                     continue
                 if fingerprint in direct_identity_collisions:
                     # The activation snapshot still identifies the original
@@ -9947,8 +10235,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
     def check_connection(self) -> OperationResult:
         result = self._scan(execute=False)
-        if "tcp_disconnect_confirmed" in result.failure_codes:
-            self._restart_tcp_target()
         if result.all_connected:
             return OperationResult(
                 True,

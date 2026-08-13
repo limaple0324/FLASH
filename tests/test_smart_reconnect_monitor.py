@@ -1034,3 +1034,32 @@ def test_stop_timeout_remains_running_and_disables_all_execution():
     boundary.release.set()
     assert monitor.stop(timeout_seconds=1) is True
     assert monitor.running is False
+
+
+def test_runtime_status_reports_a_started_restart_as_reconnecting():
+    monitor = SmartReconnectMonitor(FakeBoundary([]))
+    monitor._thread = type(
+        "AliveThread",
+        (),
+        {"is_alive": lambda self: True},
+    )()
+
+    monitor._set_runtime_status(
+        OperationResult(
+            True,
+            "reconnect.progressed",
+            details={
+                "all_connected": False,
+                "connected_windows": 3,
+                "actionable_windows": 1,
+                "clicked_windows": 0,
+                "restarted_windows": 1,
+                "state_counts": {"connected": 3},
+                "failure_codes": [],
+            },
+        )
+    )
+
+    assert monitor.runtime_status == (
+        smart_reconnect_monitor_module.SMART_RECONNECT_STATUS_RECONNECTING
+    )

@@ -250,14 +250,18 @@ def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
     reconnect = AppContext.get(main_module.WindowsSmartReconnectController)
     keyboard = AppContext.get(main_module.WindowsInputSyncController)
     pointer = AppContext.get(main_module.WindowsPointerSyncController)
+    unscoped = reconnect._target_windows_provider()
+    assert isinstance(unscoped, ResolvedTargetWindows)
+    assert unscoped.failure_codes == ("group_name_invalid",)
     strict_targets = ("strict-target",)
+    strict_contract = ResolvedTargetWindows(strict_targets)
     monkeypatch.setattr(
         contract,
         "reconnect_targets",
-        lambda _group_name: ResolvedTargetWindows(strict_targets),
+        lambda _group_name: strict_contract,
     )
 
-    assert reconnect._target_windows_provider is None
+    assert reconnect._target_windows_provider() is strict_contract
     assert reconnect._require_expected_window_count is False
     # 未驗證的測試替身不得進入同步目標集合。
     assert keyboard._target_windows_provider() == ()

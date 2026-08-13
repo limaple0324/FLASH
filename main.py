@@ -1599,6 +1599,11 @@ def build_services(
             group_configuration_service.groups(),
         )
 
+    def current_reconnect_target_windows() -> ResolvedTargetWindows:
+        return target_window_contract_service.reconnect_targets(
+            current_group_name()
+        )
+
     reconnect_controller = WindowsSmartReconnectController.for_real_windows(
         reference_dir=resource_path(RECONNECT_REFERENCE_DIR),
         state_path=paths.data_dir() / RECONNECT_STATE_FILENAME,
@@ -1622,6 +1627,7 @@ def build_services(
             )
         ),
         registered_role_provider=registered_reconnect_roles,
+        target_windows_provider=current_reconnect_target_windows,
     )
     connected_sync_contract_provider = ConnectedSyncTargetContractProvider(
         target_window_contract_service,
@@ -3302,6 +3308,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 pointer_sync_controller.set_controller_fingerprint(
                     instance_fingerprints[0]
                 )
+        if smart_reconnect_controller is not None:
+            smart_reconnect_controller.set_group_launch_plan(plan)
         return plan
 
     sync_connected_fingerprints: tuple[str, ...] | None = None
@@ -3429,6 +3437,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             input_controller.set_allowed_window_instances(None)
         if pointer_sync_controller is not None:
             pointer_sync_controller.set_allowed_window_instances(None)
+        if smart_reconnect_controller is not None:
+            smart_reconnect_controller.set_group_launch_plan(None)
         sync_connected_fingerprints = None
         sync_connected_instance_signature = None
 
@@ -4360,12 +4370,20 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         choice = group_selection_service.find(group_name)
         if choice is None or not close_group_operation_gate():
             return False
+        applied = False
         try:
-            return apply_group_identity(choice) is not None
+            applied = apply_group_identity(choice) is not None
+        except Exception:
+            applied = False
+        if applied:
+            reopen_group_operation_gate()
+            return True
+        try:
+            clear_group_identity()
         except Exception:
             return False
-        finally:
-            reopen_group_operation_gate()
+        reopen_group_operation_gate()
+        return False
 
     def capture_sync_base_point(group_name: str) -> str:
         if (
@@ -5046,6 +5064,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             config is None
             or smart_reconnect_monitor is None
             or smart_reconnect_controller is None
+            or workspace_service is None
+            or group_selection_service is None
         ):
             return SmartReconnectToggleViewResult(
                 False,
@@ -5053,24 +5073,115 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "智慧重連服務尚未正確設定，沒有啟用。",
             )
         if enabled:
-            transition = apply_smart_reconnect_snapshot_transition(
-                True,
-                smart_reconnect_controller,
-                smart_reconnect_monitor,
-                start_monitor=start_service,
-                stop_monitor=lambda _monitor: stop_service(
-                    smart_reconnect_monitor,
-                    timeout_seconds=1.0,
-                ),
+            current_group = config.get(CURRENT_GROUP_NAME_KEY, "")
+            published_group = workspace_service.snapshot().current_group
+            published_group_name = (
+                published_group.name if published_group is not None else ""
             )
-            if not transition.success:
+            choice = (
+                group_selection_service.find(current_group)
+                if group_selection_service is not None
+                and isinstance(current_group, str)
+                and current_group.strip()
+                and current_group == published_group_name
+                else None
+            )
+            if choice is None or not close_group_operation_gate():
+                return SmartReconnectToggleViewResult(
+                    False,
+                    False,
+                    "目前組別的安全視窗身分尚未完成，智慧重連未啟用。",
+                )
+            transition = SmartReconnectToggleViewResult(
+                False,
+                False,
+                "目前組別的安全視窗身分尚未完成，智慧重連未啟用。",
+            )
+            try:
+                identity_ready = apply_group_identity(choice) is not None
+                if identity_ready:
+                    transition = apply_smart_reconnect_snapshot_transition(
+                        True,
+                        smart_reconnect_controller,
+                        smart_reconnect_monitor,
+                        start_monitor=start_service,
+                        stop_monitor=lambda _monitor: stop_service(
+                            smart_reconnect_monitor,
+                            timeout_seconds=1.0,
+                        ),
+                    )
+            except Exception:
+                identity_ready = False
+            if not identity_ready or not transition.success:
+                if not restore_group_identity(choice):
+                    try:
+                        clear_group_identity()
+                    except Exception:
+                        pass
+                    return transition
+                try:
+                    reopen_group_operation_gate()
+                except Exception:
+                    return transition
                 return transition
-            config.update_values(
-                {
-                    SMART_RECONNECT_ENABLED_KEY: True,
-                    SMART_RECONNECT_CONSENT_KEY: True,
-                }
-            )
+            try:
+                reopen_group_operation_gate()
+            except Exception:
+                gate_closed = close_group_operation_gate()
+                apply_smart_reconnect_snapshot_transition(
+                    False,
+                    smart_reconnect_controller,
+                    smart_reconnect_monitor,
+                    start_monitor=start_service,
+                    stop_monitor=lambda _monitor: stop_service(
+                        smart_reconnect_monitor,
+                        timeout_seconds=1.0,
+                    ),
+                )
+                restore_group_identity(choice)
+                return SmartReconnectToggleViewResult(
+                    False,
+                    False,
+                    "安全操作閘門無法開啟，智慧重連已停止。",
+                )
+            try:
+                config.update_values(
+                    {
+                        SMART_RECONNECT_ENABLED_KEY: True,
+                        SMART_RECONNECT_CONSENT_KEY: True,
+                    }
+                )
+            except Exception:
+                gate_closed = close_group_operation_gate()
+                apply_smart_reconnect_snapshot_transition(
+                    False,
+                    smart_reconnect_controller,
+                    smart_reconnect_monitor,
+                    start_monitor=start_service,
+                    stop_monitor=lambda _monitor: stop_service(
+                        smart_reconnect_monitor,
+                        timeout_seconds=1.0,
+                    ),
+                )
+                try:
+                    config.update_values(
+                        {
+                            SMART_RECONNECT_ENABLED_KEY: False,
+                            SMART_RECONNECT_CONSENT_KEY: False,
+                        }
+                    )
+                except Exception:
+                    pass
+                if gate_closed and restore_group_identity(choice):
+                    try:
+                        reopen_group_operation_gate()
+                    except Exception:
+                        pass
+                return SmartReconnectToggleViewResult(
+                    False,
+                    False,
+                    "智慧重連設定無法保存，監看已停止。",
+                )
             if logger is not None:
                 logger.info("Smart reconnect explicitly enabled by the player.")
             mark_tray_operations_running()
