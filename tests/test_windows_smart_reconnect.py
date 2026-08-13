@@ -33,7 +33,10 @@ from adapters.windows_smart_reconnect import (
     WindowInstanceToken,
     WindowsSmartReconnectController,
 )
-from adapters.windows_window import WindowInfo
+from adapters.windows_window import (
+    WindowInfo,
+    monitored_window_instance_fingerprint,
+)
 from core.reconnect_policy import ReconnectScreenState
 from core.sp1_boundaries import ReconnectState
 from domain.character import CharacterImportance
@@ -5974,6 +5977,236 @@ def test_activation_snapshot_rejects_empty_and_all_incomplete_windows():
     assert incomplete.controller.prepare_execution_snapshot().code == (
         "reconnect.snapshot_identity_unsafe"
     )
+
+
+def test_group_activation_snapshot_excludes_only_unique_empty_offline_entry(
+    tmp_path,
+):
+    active = [
+        make_window(1, fingerprint="a" * 64),
+        make_window(2, fingerprint="b" * 64),
+    ]
+    offline = make_window(3, fingerprint="c" * 64)
+    plan = make_tcp_group_plan(tmp_path, [*active, offline])
+    resolved = tcp_resolved_targets(
+        active,
+        sync_windows=tuple(
+            replace(
+                window,
+                launch_fingerprint=monitored_window_instance_fingerprint(
+                    window
+                ),
+            )
+            for window in active
+        ),
+        entry_ids=("entry-0", "entry-1"),
+        scope_entry_ids=("entry-0", "entry-1", "entry-2"),
+        target_failures=(
+            tcp_target_failure(
+                "entry-2",
+                offline.launch_fingerprint,
+                "window_offline",
+            ),
+        ),
+    )
+    fixture = make_controller(
+        [1, 1],
+        windows=active,
+        expected_windows=3,
+        group_launch_plan=plan,
+        target_windows_provider=lambda: resolved,
+    )
+
+    prepared = activate_current_window_snapshot(fixture)
+
+    assert prepared.success is True
+    assert prepared.details["window_count"] == 2
+    assert prepared.details["isolated_window_count"] == 1
+    assert tuple(
+        fixture.controller._activation_snapshot_source_fingerprints.values()
+    ) == tuple(window.launch_fingerprint for window in active)
+    assert all(
+        monitored_window.launch_fingerprint == monitor_fingerprint
+        for monitor_fingerprint, (monitored_window, _instance)
+        in fixture.controller._activation_snapshot_candidate_instances(
+            active
+        )[0].items()
+    )
+    assert len(fixture.controller._activation_snapshot_instances) == 2
+
+
+@pytest.mark.parametrize(
+    "unsafe_evidence",
+    (
+        "other-code",
+        "multiple-codes",
+        "candidate-window",
+        "duplicate-entry",
+        "unknown-entry",
+        "fingerprint-mismatch",
+    ),
+)
+def test_group_activation_snapshot_rejects_non_pure_offline_evidence(
+    tmp_path,
+    unsafe_evidence,
+):
+    active = [
+        make_window(1, fingerprint="a" * 64),
+        make_window(2, fingerprint="b" * 64),
+    ]
+    offline = make_window(3, fingerprint="c" * 64)
+    plan = make_tcp_group_plan(tmp_path, [*active, offline])
+    entry_id = "entry-2"
+    fingerprint = offline.launch_fingerprint
+    failure_codes = ("window_offline",)
+    candidates = ()
+    if unsafe_evidence == "other-code":
+        failure_codes = ("window_identity_duplicate",)
+    elif unsafe_evidence == "multiple-codes":
+        failure_codes = ("window_offline", "window_instance_incomplete")
+    elif unsafe_evidence == "candidate-window":
+        candidates = (offline,)
+    elif unsafe_evidence == "unknown-entry":
+        entry_id = "entry-unknown"
+    elif unsafe_evidence == "fingerprint-mismatch":
+        fingerprint = "d" * 64
+    evidence = tcp_target_failure(
+        entry_id,
+        fingerprint,
+        *failure_codes,
+        candidate_windows=candidates,
+    )
+    target_failures = (
+        (evidence, evidence)
+        if unsafe_evidence == "duplicate-entry"
+        else (evidence,)
+    )
+    resolved = tcp_resolved_targets(
+        active,
+        entry_ids=("entry-0", "entry-1"),
+        scope_entry_ids=("entry-0", "entry-1", "entry-2"),
+        target_failures=target_failures,
+    )
+    fixture = make_controller(
+        [1, 1],
+        windows=active,
+        expected_windows=3,
+        group_launch_plan=plan,
+        target_windows_provider=lambda: resolved,
+    )
+    fixture.controller.set_execution_enabled(False)
+
+    prepared = fixture.controller.prepare_execution_snapshot()
+
+    assert prepared.success is False
+    assert prepared.code == "reconnect.snapshot_identity_unsafe"
+    assert prepared.details["failure_codes"] == ["window_identity_unsafe"]
+    assert fixture.controller._activation_snapshot_instances is None
+
+
+@pytest.mark.parametrize(
+    "unsafe_contract",
+    (
+        "sync-entry-missing",
+        "sync-entry-extra",
+        "sync-entry-reordered",
+        "sync-entry-duplicate",
+        "sync-window-length",
+        "sync-window-hwnd",
+        "sync-window-pid",
+        "sync-window-lifecycle",
+        "sync-window-fingerprint",
+        "raw-fingerprint-mismatch",
+        "incomplete-instance",
+        "duplicate-hwnd",
+        "duplicate-pid",
+        "duplicate-lifecycle",
+        "tcp-entry-mismatch",
+    ),
+)
+def test_group_activation_snapshot_rejects_unproven_required_entry(
+    tmp_path,
+    monkeypatch,
+    unsafe_contract,
+):
+    planned = [
+        make_window(1, fingerprint="a" * 64),
+        make_window(2, fingerprint="b" * 64),
+    ]
+    windows = list(planned)
+    sync_windows = [
+        replace(
+            window,
+            launch_fingerprint=monitored_window_instance_fingerprint(window),
+        )
+        for window in planned
+    ]
+    entry_ids = ("entry-0", "entry-1")
+    if unsafe_contract == "sync-entry-missing":
+        entry_ids = ("entry-0",)
+    elif unsafe_contract == "sync-entry-extra":
+        entry_ids = ("entry-0", "entry-1", "entry-extra")
+    elif unsafe_contract == "sync-entry-reordered":
+        entry_ids = ("entry-1", "entry-0")
+    elif unsafe_contract == "sync-entry-duplicate":
+        entry_ids = ("entry-0", "entry-0")
+    elif unsafe_contract == "sync-window-length":
+        sync_windows = sync_windows[:1]
+    elif unsafe_contract == "sync-window-hwnd":
+        sync_windows[0] = replace(sync_windows[0], handle=99)
+    elif unsafe_contract == "sync-window-pid":
+        sync_windows[0] = replace(sync_windows[0], process_id=999)
+    elif unsafe_contract == "sync-window-lifecycle":
+        sync_windows[0] = replace(
+            sync_windows[0],
+            process_lifecycle_token=99999,
+        )
+    elif unsafe_contract == "sync-window-fingerprint":
+        sync_windows[0] = replace(
+            sync_windows[0],
+            launch_fingerprint="d" * 64,
+        )
+    elif unsafe_contract == "raw-fingerprint-mismatch":
+        windows[0] = replace(windows[0], launch_fingerprint="d" * 64)
+    elif unsafe_contract == "incomplete-instance":
+        windows[0] = replace(windows[0], process_id=0)
+    elif unsafe_contract == "duplicate-hwnd":
+        windows[1] = replace(windows[1], handle=windows[0].handle)
+    elif unsafe_contract == "duplicate-pid":
+        windows[1] = replace(windows[1], process_id=windows[0].process_id)
+    elif unsafe_contract == "duplicate-lifecycle":
+        windows[1] = replace(
+            windows[1],
+            process_lifecycle_token=windows[0].process_lifecycle_token,
+        )
+    plan = make_tcp_group_plan(tmp_path, planned)
+    resolved = tcp_resolved_targets(
+        windows,
+        sync_windows=sync_windows,
+        entry_ids=entry_ids,
+        scope_entry_ids=("entry-0", "entry-1"),
+    )
+    fixture = make_controller(
+        [1, 1],
+        windows=windows,
+        expected_windows=2,
+        group_launch_plan=plan,
+        target_windows_provider=lambda: resolved,
+    )
+    if unsafe_contract == "tcp-entry-mismatch":
+        monkeypatch.setattr(
+            fixture.controller,
+            "_tcp_id",
+            lambda *_args: "entry-wrong",
+        )
+    fixture.controller.set_execution_enabled(False)
+
+    prepared = fixture.controller.prepare_execution_snapshot()
+
+    assert prepared.success is False
+    assert prepared.code == "reconnect.snapshot_identity_unsafe"
+    assert prepared.details["failure_codes"] == ["window_identity_unsafe"]
+    assert fixture.controller._activation_snapshot_instances is None
 
 
 def test_activation_snapshot_isolates_one_incomplete_shared_executable_window():
