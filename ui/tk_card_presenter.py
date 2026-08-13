@@ -21,23 +21,12 @@ class TkCardTextSettings:
     horizontal_padding: int = 8
     vertical_padding: int = 5
     card_width: int = 160
-    font_size: int | None = None
-    line_spacing: int = 0
 
     def __post_init__(self) -> None:
         if not self.muted_foreground:
             object.__setattr__(self, "muted_foreground", self.foreground)
         if not self.accent:
             object.__setattr__(self, "accent", self.foreground)
-        if self.font_size is not None:
-            if (
-                isinstance(self.font_size, bool)
-                or not isinstance(self.font_size, int)
-                or self.font_size < 1
-            ):
-                raise ValueError("font_size must be a positive integer.")
-            object.__setattr__(self, "title_size", self.font_size)
-            object.__setattr__(self, "body_size", self.font_size)
         for field in (
             "background",
             "foreground",
@@ -62,12 +51,6 @@ class TkCardTextSettings:
                 or value < 1
             ):
                 raise ValueError(f"{field} must be a positive integer.")
-        if (
-            isinstance(self.line_spacing, bool)
-            or not isinstance(self.line_spacing, int)
-            or self.line_spacing < 0
-        ):
-            raise ValueError("line_spacing must be a non-negative integer.")
 
 
 class TkWidget(Protocol):
@@ -106,7 +89,6 @@ class _RenderedCard:
     group: TkWidget
     title: TkWidget
     progress: TkWidget
-    next_step: TkWidget
     actions: tuple[TkWidget, ...]
 
 
@@ -188,15 +170,6 @@ class TkCardContentPresenter:
             justify="center",
             wraplength=settings.card_width - 2 * settings.horizontal_padding,
         )
-        next_step = self._widgets.label(
-            frame,
-            background=settings.background,
-            foreground=settings.accent,
-            font=(settings.font_family, settings.body_size),
-            anchor="center",
-            justify="center",
-            wraplength=settings.card_width - 2 * settings.horizontal_padding,
-        )
         action_buttons = tuple(
             self._widgets.button(
                 frame,
@@ -211,7 +184,7 @@ class TkCardContentPresenter:
             )
             for _index in range(4)
         )
-        for label in (group, title, progress, next_step):
+        for label in (group, title, progress):
             label.pack(
                 fill="x",
                 padx=settings.horizontal_padding,
@@ -223,7 +196,6 @@ class TkCardContentPresenter:
             group=group,
             title=title,
             progress=progress,
-            next_step=next_step,
             actions=action_buttons,
         )
         setattr(window, _WINDOW_STATE_ATTRIBUTE, rendered)
@@ -272,7 +244,6 @@ class TkCardContentPresenter:
         if content.name_only:
             rendered.group.pack_forget()
             rendered.progress.pack_forget()
-            rendered.next_step.pack_forget()
             rendered.title.pack(
                 fill="x",
                 padx=self._settings.horizontal_padding,
@@ -287,7 +258,6 @@ class TkCardContentPresenter:
             return
         rendered.group.configure(text=content.group_name)
         rendered.progress.configure(text=content.current_progress)
-        rendered.next_step.pack_forget()
         for label in (
             rendered.group,
             rendered.title,

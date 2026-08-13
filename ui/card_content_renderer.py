@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
 
 from cards.view_state import CardViewItem
 from cards.models import CardAction
@@ -32,17 +31,3 @@ class CardContent:
             name_only=card.name_only,
             actions=card.actions,
         )
-
-
-class CardContentPresenter(Protocol):
-    def render(self, window: Any, content: CardContent) -> None: ...
-
-
-class CardContentRenderer:
-    def __init__(self, presenter: CardContentPresenter) -> None:
-        if not callable(getattr(presenter, "render", None)):
-            raise TypeError("presenter must provide a callable render method.")
-        self._presenter = presenter
-
-    def __call__(self, window: Any, card: CardViewItem) -> None:
-        self._presenter.render(window, CardContent.from_card(card))

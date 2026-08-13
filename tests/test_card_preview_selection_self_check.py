@@ -23,10 +23,10 @@ def _catalog() -> CardPreviewCatalog:
                     background="#102030",
                     foreground="#ffffff",
                     font_family="Microsoft JhengHei UI",
-                    font_size=12,
+                    title_size=12,
+                    body_size=12,
                     horizontal_padding=12,
                     vertical_padding=8,
-                    line_spacing=4,
                 ),
             ),
         )

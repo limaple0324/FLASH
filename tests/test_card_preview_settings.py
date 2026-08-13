@@ -10,10 +10,10 @@ def _text(*, background: str = "#102030") -> TkCardTextSettings:
         background=background,
         foreground="#f0f0f0",
         font_family="Microsoft JhengHei UI",
-        font_size=12,
+        title_size=12,
+        body_size=12,
         horizontal_padding=14,
         vertical_padding=10,
-        line_spacing=4,
     )
 
 

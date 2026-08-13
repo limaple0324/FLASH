@@ -157,12 +157,11 @@ def test_name_only_activity_card_can_be_closed_without_opening_details() -> None
     runtime.start()
     cards.upsert(reminder, shown_at=datetime.now(timezone.utc))
     button = widgets.widgets[1]
-    labels = widgets.widgets[2:6]
+    labels = widgets.widgets[2:5]
 
     assert [widget.options.get("text") for widget in labels] == [
         None,
         "諸魔殿",
-        None,
         None,
     ]
     assert callable(button.options["command"])
@@ -215,7 +214,7 @@ def test_card_actions_are_rendered_and_dispatched_without_opening_a_page() -> No
 
     runtime.start()
     cards.upsert(cards_with_action, shown_at=datetime.now(timezone.utc))
-    action_button = widgets.widgets[6]
+    action_button = widgets.widgets[5]
 
     assert action_button.options["text"] == "採用"
     assert callable(action_button.options["command"])
