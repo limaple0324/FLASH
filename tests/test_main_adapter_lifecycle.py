@@ -347,6 +347,10 @@ def test_obsidian_polling_reschedules_after_a_safe_cycle_failure_and_cancels_on_
         source.index("    def schedule_registered_obsidian_poll("):
         source.index("    def activity_progress_changed_handler(")
     ]
+    screen_observation = source[
+        source.index("    def auto_read_missing_role_id("):
+        source.index("    auto_read_missing_role_id()")
+    ]
     closing = source[
         source.index("    def close_window("):
         source.index("    window.protocol(")
@@ -355,8 +359,11 @@ def test_obsidian_polling_reschedules_after_a_safe_cycle_failure_and_cancels_on_
     assert "if closing:" in polling
     assert "def current_sync_target_windows()" in window_setup
     assert "target_window_contract_service.reconnect_targets(" in window_setup
-    assert "smart_reconnect_controller.observe_screen_states(" in window_setup
-    assert "ReconnectScreenState.CONNECTED" in window_setup
+    assert (
+        "smart_reconnect_controller.observe_screen_states("
+        in screen_observation
+    )
+    assert "ReconnectScreenState.CONNECTED" in screen_observation
     assert "candidate_index = game_data_read_cursor % len(candidates)" in polling
     assert "result = capture_service.read(selected.handle)" in polling
     assert "except Exception as error:" in polling
