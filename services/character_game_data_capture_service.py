@@ -142,7 +142,6 @@ class GameDataReadStatus(str, Enum):
 class GameDataReadResult:
     status: GameDataReadStatus
     page: VerifiedGameDataPage | None = None
-    update: CharacterGameDataUpdateResult | None = None
     error: str | None = None
 
 
@@ -260,22 +259,11 @@ class CharacterGameDataCaptureService:
             return GameDataReadResult(
                 GameDataReadStatus.UNCHANGED,
                 page=page,
-                update=update,
             )
         return GameDataReadResult(
             GameDataReadStatus.UPDATED,
             page=page,
-            update=update,
         )
-
-    def clear_window(self, window_handle: int) -> None:
-        prefix = int(window_handle)
-        with self._signature_lock:
-            self._signatures = {
-                key: value
-                for key, value in self._signatures.items()
-                if key[0] != prefix
-            }
 
     def _apply(
         self,

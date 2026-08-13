@@ -217,7 +217,7 @@ def test_life_soul_second_page_updates_only_that_pet_page(tmp_path) -> None:
 
     result = service.update("char-a", life_souls=updated)
 
-    assert result.changed_sections == ("命魂",)
+    assert result.changed is True
     record = store.load()[0]
     assert record.life_souls[0].souls[0].name == "命魂名稱"
     assert record.life_souls[1].souls[0].name == "命魂更新"
@@ -291,7 +291,7 @@ def test_obsidian_pages_preserve_other_pages_and_replace_only_current_page(tmp_p
     service.update("char-a", obsidian=fourth)
     result = service.update("char-a", obsidian=refreshed_first)
 
-    assert result.changed_sections == ("黑曜石",)
+    assert result.changed is True
     pages = store.load()[0].obsidian.pages
     assert pages == (refreshed_first, fourth)
 

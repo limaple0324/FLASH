@@ -61,8 +61,13 @@ def test_three_feature_hotkeys_toggle_on_independent_rising_edges() -> None:
     scheduler.fire()
     keys.down.add(0x71)
     scheduler.fire()
+    keys.down.clear()
+    scheduler.fire()
+    keys.down.add(0x70)
+    scheduler.fire()
+    scheduler.fire()
 
-    assert toggles == ["sync", "reconnect"]
+    assert toggles == ["sync", "reconnect", "auto_click"]
 
 
 def test_unset_or_invalid_hotkey_never_toggles() -> None:

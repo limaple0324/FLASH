@@ -99,15 +99,10 @@ class WindowsTimedClickBackend:
         message_backend: PointerMessageBackend,
         *,
         point_reader: CursorClientPointReader | None = None,
-        responsiveness_timeout_ms: int = 1_000,
     ) -> None:
         self._window_backend = window_backend
         self._message_backend = message_backend
         self._point_reader = point_reader or Win32CursorClientPointReader()
-        self._responsiveness_timeout_ms = max(
-            1,
-            int(responsiveness_timeout_ms),
-        )
 
     @staticmethod
     def _allowed(values: Iterable[str]) -> tuple[str, ...]:
@@ -203,7 +198,7 @@ class WindowsTimedClickBackend:
             not self._message_backend.is_window(handle)
             or not self._message_backend.probe_responsive(
                 handle,
-                self._responsiveness_timeout_ms,
+                1_000,
             )
         ):
             return None

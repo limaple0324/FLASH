@@ -104,12 +104,6 @@ class PetTalentSnapshot:
     def complete(self) -> bool:
         return {item.page_number for item in self.pages} == {1, 2, 3, 4}
 
-    def page(self, page_number: int) -> PetTalentPageSnapshot | None:
-        return next(
-            (item for item in self.pages if item.page_number == page_number),
-            None,
-        )
-
     def to_dict(self) -> dict[str, object]:
         return {"pages": [item.to_dict() for item in self.pages]}
 
@@ -223,18 +217,6 @@ class ObsidianPagesSnapshot:
     @property
     def total_unlit_nodes(self) -> int:
         return sum(item.unlit_nodes for item in self.pages)
-
-    def page(self, page_number: int) -> ObsidianSnapshot | None:
-        if (
-            isinstance(page_number, bool)
-            or not isinstance(page_number, int)
-            or not 1 <= page_number <= 10
-        ):
-            raise ValueError("page_number must be between 1 and 10.")
-        return next(
-            (item for item in self.pages if item.opened_page == page_number),
-            None,
-        )
 
     def to_dict(self) -> dict[str, object]:
         return {"pages": [item.to_dict() for item in self.pages]}

@@ -44,11 +44,13 @@ class Points:
 class Messages:
     def __init__(self):
         self.sent = []
+        self.responsiveness_timeouts = []
 
     def is_window(self, _handle):
         return True
 
-    def probe_responsive(self, _handle, _timeout):
+    def probe_responsive(self, _handle, timeout):
+        self.responsiveness_timeouts.append(timeout)
         return True
 
     def send_pointer(self, handle, x_ratio, y_ratio, event):
@@ -80,6 +82,7 @@ def test_capture_and_click_stay_on_the_same_unique_fingerprint():
         "move",
         "left_up",
     ]
+    assert messages.responsiveness_timeouts == [1_000]
 
 
 def test_duplicate_or_changed_identity_never_receives_input():

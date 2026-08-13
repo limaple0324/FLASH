@@ -42,7 +42,6 @@ class AutoClickSettings:
 class AutoClickSnapshot:
     running: bool
     sent_count: int
-    settings: AutoClickSettings
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,7 +214,6 @@ class AutoClickService:
         return AutoClickSnapshot(
             self._running,
             self._sent_count,
-            self._settings,
         )
 
     def subscribe(
@@ -224,13 +222,6 @@ class AutoClickService:
     ) -> None:
         if callback not in self._subscribers:
             self._subscribers.append(callback)
-
-    def unsubscribe(
-        self,
-        callback: Callable[[AutoClickSnapshot], None],
-    ) -> None:
-        if callback in self._subscribers:
-            self._subscribers.remove(callback)
 
     def _notify(self) -> None:
         snapshot = self.snapshot()
@@ -264,13 +255,6 @@ class AutoClickService:
         if was_running:
             self._notify()
         return was_running
-
-    def toggle(self, settings: AutoClickSettings) -> bool:
-        if self._running:
-            self.stop()
-            return False
-        self.start(settings)
-        return True
 
     def configure_direct_left_sync(
         self,
@@ -514,79 +498,3 @@ class AutoClickService:
             self._settings.interval_ms,
             self._tick,
         )
-
-
-class FunctionKeyStateBackend(Protocol):
-    def is_down(self, virtual_key: int) -> bool:
-        """Return the high-bit key state."""
-
-
-class Win32FunctionKeyStateBackend:
-    def is_down(self, virtual_key: int) -> bool:
-        if os.name != "nt":
-            return False
-        user32 = ctypes.windll.user32
-        user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
-        user32.GetAsyncKeyState.restype = ctypes.c_short
-        return bool(user32.GetAsyncKeyState(int(virtual_key)) & 0x8000)
-
-
-class AutoClickHotkeyMonitor:
-    """Use the confirmed legacy F1 rising edge to toggle continuous clicking."""
-
-    VK_F1 = 0x70
-
-    def __init__(
-        self,
-        toggle: Callable[[], None],
-        *,
-        schedule: Callable[[int, Callable[[], None]], object],
-        cancel: Callable[[object], None],
-        state_backend: FunctionKeyStateBackend | None = None,
-        interval_ms: int = 20,
-    ) -> None:
-        self._toggle = toggle
-        self._schedule = schedule
-        self._cancel = cancel
-        self._state_backend = state_backend or Win32FunctionKeyStateBackend()
-        self._interval_ms = max(10, int(interval_ms))
-        self._running = False
-        self._was_down = False
-        self._after_id: object | None = None
-
-    def start(self) -> bool:
-        if self._running:
-            return False
-        self._running = True
-        self._was_down = False
-        self._schedule_next()
-        return True
-
-    def stop(self) -> bool:
-        was_running = self._running
-        self._running = False
-        if self._after_id is not None:
-            try:
-                self._cancel(self._after_id)
-            except Exception:
-                pass
-            self._after_id = None
-        self._was_down = False
-        return was_running
-
-    def _schedule_next(self) -> None:
-        if self._running:
-            self._after_id = self._schedule(
-                self._interval_ms,
-                self.poll,
-            )
-
-    def poll(self) -> None:
-        self._after_id = None
-        if not self._running:
-            return
-        is_down = self._state_backend.is_down(self.VK_F1)
-        if is_down and not self._was_down:
-            self._toggle()
-        self._was_down = is_down
-        self._schedule_next()

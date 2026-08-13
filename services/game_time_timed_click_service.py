@@ -190,12 +190,6 @@ class GameTimeTimedClickService:
         self._active_receipts: list[TimedClickPressReceipt] = []
         self._active_operation_leases: dict[int, GameOperationLease] = {}
 
-    def set_result_callback(
-        self,
-        callback: Callable[[GameTimeTimedClickResult], object] | None,
-    ) -> None:
-        self._result_callback = callback
-
     def configure_game_time(
         self,
         *,
@@ -215,9 +209,6 @@ class GameTimeTimedClickService:
             + (now_ns // 1_000_000) % 1000
         )
         return (total_ms + self._offset_ms) % DAY_MS
-
-    def current_time_text(self) -> str:
-        return game_time_ms_to_text(self.current_time_ms())
 
     def snapshot(self) -> GameTimeTimedClickSnapshot:
         current = self.current_time_ms()

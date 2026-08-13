@@ -157,7 +157,9 @@ def test_recognizer_page_does_not_contain_character_identity(tmp_path) -> None:
     assert not hasattr(page, "character_id")
     assert result.status is GameDataReadStatus.UPDATED
     assert provider.handles == [123]
-    assert service._update_service.store.load()[0].character_id == "char-a"
+    assert CharacterGameDataStore(
+        tmp_path / "character_game_data.json"
+    ).load()[0].character_id == "char-a"
 
 
 def test_capture_rejects_missing_verified_window_binding(tmp_path) -> None:
@@ -174,7 +176,9 @@ def test_capture_rejects_missing_verified_window_binding(tmp_path) -> None:
     assert result.status is GameDataReadStatus.TARGET_NOT_ELIGIBLE
     assert result.error
     assert provider.handles == []
-    assert service._update_service.store.load() == ()
+    assert CharacterGameDataStore(
+        tmp_path / "character_game_data.json"
+    ).load() == ()
 
 
 def test_capture_rejects_late_identity_change_before_any_write(tmp_path) -> None:
@@ -199,7 +203,9 @@ def test_capture_rejects_late_identity_change_before_any_write(tmp_path) -> None
 
     assert result.status is GameDataReadStatus.TARGET_NOT_ELIGIBLE
     assert len(calls) == 2
-    assert service._update_service.store.load() == ()
+    assert CharacterGameDataStore(
+        tmp_path / "character_game_data.json"
+    ).load() == ()
 
 
 def test_capture_rejects_any_late_window_identity_change_before_any_write(tmp_path) -> None:
@@ -221,7 +227,9 @@ def test_capture_rejects_any_late_window_identity_change_before_any_write(tmp_pa
         )
         result = service.read(123)
         assert result.status is GameDataReadStatus.TARGET_NOT_ELIGIBLE
-        assert service._update_service.store.load() == ()
+        assert CharacterGameDataStore(
+            tmp_path / "character_game_data.json"
+        ).load() == ()
 
 
 def test_signature_cache_isolated_by_reliable_logical_page_identity(tmp_path) -> None:
@@ -275,7 +283,9 @@ def test_unrecognized_page_does_not_create_data(tmp_path) -> None:
     result = service.read(123)
 
     assert result.status is GameDataReadStatus.PAGE_UNRECOGNIZED
-    assert service._update_service.store.load() == ()
+    assert CharacterGameDataStore(
+        tmp_path / "character_game_data.json"
+    ).load() == ()
 
 
 def test_invalid_recognizer_result_is_not_saved_or_raised(tmp_path) -> None:
@@ -286,7 +296,9 @@ def test_invalid_recognizer_result_is_not_saved_or_raised(tmp_path) -> None:
 
     assert result.status is GameDataReadStatus.PAGE_UNRECOGNIZED
     assert provider.handles == [123]
-    assert service._update_service.store.load() == ()
+    assert CharacterGameDataStore(
+        tmp_path / "character_game_data.json"
+    ).load() == ()
 
 
 def test_recognizer_error_is_returned_without_writing(tmp_path) -> None:
@@ -304,4 +316,6 @@ def test_recognizer_error_is_returned_without_writing(tmp_path) -> None:
 
     assert result.status is GameDataReadStatus.PAGE_UNRECOGNIZED
     assert result.error == "測試辨識錯誤"
-    assert service._update_service.store.load() == ()
+    assert CharacterGameDataStore(
+        tmp_path / "character_game_data.json"
+    ).load() == ()

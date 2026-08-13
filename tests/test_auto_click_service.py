@@ -1,7 +1,6 @@
 import threading
 
 from services.auto_click_service import (
-    AutoClickHotkeyMonitor,
     AutoClickPointerSource,
     AutoClickService,
     AutoClickSettings,
@@ -35,14 +34,6 @@ class Clicker:
     def click(self, button):
         self.buttons.append(button)
         return self.results.pop(0) if self.results else True
-
-
-class Keys:
-    def __init__(self):
-        self.down = False
-
-    def is_down(self, _key):
-        return self.down
 
 
 def test_continuous_click_uses_legacy_defaults_and_stops_explicitly():
@@ -122,29 +113,6 @@ def test_physical_auto_click_stops_when_another_game_operation_is_active():
     assert service.running is False
     assert scheduler.calls == []
     active.release()
-
-
-def test_f1_toggles_once_per_rising_edge():
-    scheduler = Scheduler()
-    keys = Keys()
-    toggles = []
-    monitor = AutoClickHotkeyMonitor(
-        lambda: toggles.append("toggle"),
-        schedule=scheduler.schedule,
-        cancel=scheduler.cancel,
-        state_backend=keys,
-    )
-    monitor.start()
-
-    keys.down = True
-    scheduler.fire()
-    scheduler.fire()
-    keys.down = False
-    scheduler.fire()
-    keys.down = True
-    scheduler.fire()
-
-    assert toggles == ["toggle", "toggle"]
 
 
 def test_left_click_uses_ordered_direct_sync_without_physical_mouse_event():

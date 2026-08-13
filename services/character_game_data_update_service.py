@@ -23,10 +23,7 @@ _UNSET = object()
 
 @dataclass(frozen=True, slots=True)
 class CharacterGameDataUpdateResult:
-    character_id: str
     changed: bool
-    record: CharacterGameData
-    changed_sections: tuple[str, ...] = ()
 
 
 class CharacterGameDataUpdateService:
@@ -37,10 +34,6 @@ class CharacterGameDataUpdateService:
             raise TypeError("store must be CharacterGameDataStore.")
         self._store = store
         self._update_lock = RLock()
-
-    @property
-    def store(self) -> CharacterGameDataStore:
-        return self._store
 
     def update(
         self,
@@ -135,9 +128,7 @@ class CharacterGameDataUpdateService:
         )
         if existing is not None and next_record == existing:
             return CharacterGameDataUpdateResult(
-                character_id=next_record.character_id,
                 changed=False,
-                record=existing,
             )
 
         next_records = tuple(
@@ -147,10 +138,7 @@ class CharacterGameDataUpdateService:
         ) + (next_record,)
         self._store.save(next_records)
         return CharacterGameDataUpdateResult(
-            character_id=next_record.character_id,
             changed=True,
-            record=next_record,
-            changed_sections=self._changed_sections(existing, next_record),
         )
 
     @staticmethod
@@ -250,30 +238,3 @@ class CharacterGameDataUpdateService:
             else:
                 merged[match_index] = item
         return tuple(sorted(merged, key=lambda item: (item.identity_key, item.page_number)))
-
-    @staticmethod
-    def _changed_sections(
-        old: CharacterGameData | None,
-        new: CharacterGameData,
-    ) -> tuple[str, ...]:
-        if old is None:
-            return tuple(
-                name
-                for name, value in (
-                    ("寵物天賦", new.pet_talent),
-                    ("黑曜石", new.obsidian),
-                    ("命魂", new.life_souls),
-                    ("魂器", new.artifact),
-                )
-                if value is not None and value != ()
-            )
-        changed: list[str] = []
-        if old.pet_talent != new.pet_talent:
-            changed.append("寵物天賦")
-        if old.obsidian != new.obsidian:
-            changed.append("黑曜石")
-        if old.life_souls != new.life_souls or old.cultivated_pet_count != new.cultivated_pet_count:
-            changed.append("命魂")
-        if old.artifact != new.artifact:
-            changed.append("魂器")
-        return tuple(changed)
