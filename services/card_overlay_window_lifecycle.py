@@ -22,10 +22,6 @@ class CardOverlayWindowLifecycle:
         self._windows = windows
         self._visible: dict[str, PositionedCard] = {}
 
-    @property
-    def visible_card_ids(self) -> tuple[str, ...]:
-        return tuple(self._visible)
-
     @staticmethod
     def _validated_items(
         layout: CardOverlayLayout,

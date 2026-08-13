@@ -42,10 +42,6 @@ class WindowsCardOverlayPort:
         self._window_factory = window_factory or _default_window_factory
         self._windows: dict[str, CardWindow] = {}
 
-    @property
-    def open_card_ids(self) -> tuple[str, ...]:
-        return tuple(self._windows)
-
     @staticmethod
     def _validated_item(item: PositionedCard) -> PositionedCard:
         if not isinstance(item, PositionedCard):

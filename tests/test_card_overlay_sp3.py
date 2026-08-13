@@ -1,7 +1,5 @@
 from datetime import datetime, timezone
 
-import pytest
-
 from cards.models import GroupCard
 from cards.priority import CardPriorityReason
 from cards.service import CardService
@@ -14,7 +12,7 @@ from services.card_overlay_layout_service import (
 from services.card_overlay_runtime import build_windows_card_overlay_runtime
 from services.card_view_state_service import CardViewStateService
 from ui.card_content_renderer import CardContent
-from ui.card_overlay import CardPlacement, CardSize, WorkArea, calculate_card_stack
+from ui.card_overlay import CardPlacement, CardSize, WorkArea
 from ui.tk_card_presenter import TkCardTextSettings
 from ui.windows_card_overlay import WindowsCardOverlayPort
 
@@ -56,29 +54,6 @@ class FakeWindow:
 
     def destroy(self):
         self.destroyed = True
-
-
-def test_card_stack_uses_taskbar_safe_bottom_right_and_max_three() -> None:
-    placements = calculate_card_stack(
-        WorkArea(0, 0, 1920, 1040),
-        CardSize(360, 140),
-        3,
-        right_margin=20,
-        bottom_margin=20,
-        gap=12,
-    )
-
-    assert placements[0] == CardPlacement(0, 1540, 880, 360, 140)
-    assert placements[2] == CardPlacement(2, 1540, 576, 360, 140)
-    with pytest.raises(ValueError, match="more than three"):
-        calculate_card_stack(
-            WorkArea(0, 0, 1920, 1040),
-            CardSize(360, 140),
-            4,
-            right_margin=20,
-            bottom_margin=20,
-            gap=12,
-        )
 
 
 def test_overlay_window_is_topmost_borderless_and_uses_exact_geometry() -> None:

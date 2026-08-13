@@ -11,11 +11,10 @@ from services.card_overlay_layout_service import (
     CardViewStateSource,
     WorkAreaSource,
 )
-from services.card_overlay_runtime import build_selected_card_overlay_runtime
+from services.card_overlay_runtime import build_windows_card_overlay_runtime
 from services.card_overlay_selection_coordinator import (
     CardOverlaySelectionCoordinator,
 )
-from services.card_preview_adapter import SelectedCardPreview
 from services.card_preview_selection_service import CardPreviewSelectionService
 from ui.card_preview_settings import CardPreviewProfile
 from ui.tk_card_presenter import TkWidgetFactory
@@ -44,15 +43,11 @@ def build_windows_card_overlay_selection_coordinator(
             bottom_margin=profile.bottom_margin,
             gap=profile.gap,
         )
-        selected = SelectedCardPreview(
-            profile=profile,
-            layout=layout,
-            text=profile.text,
-        )
-        return build_selected_card_overlay_runtime(
+        return build_windows_card_overlay_runtime(
             master,
             cards,
-            selected,
+            layout,
+            profile.text,
             window_factory=window_factory,
             widget_factory=widget_factory,
             on_action=on_action,

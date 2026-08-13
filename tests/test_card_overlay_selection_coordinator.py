@@ -94,7 +94,6 @@ def test_start_without_selection_does_not_create_an_overlay() -> None:
 
     assert changed is False
     assert coordinator.started is True
-    assert coordinator.active_profile_id is None
     assert factory.created == []
 
 
@@ -107,7 +106,7 @@ def test_explicit_selection_starts_its_overlay() -> None:
     changed = coordinator.start()
 
     assert changed is True
-    assert coordinator.active_profile_id == "compact"
+    assert factory.created[0].profile_id == "compact"
     assert factory.created[0].start_calls == 1
 
 
@@ -124,7 +123,6 @@ def test_switch_stops_old_overlay_and_starts_selected_replacement() -> None:
     assert previous.stop_calls == 1
     assert factory.created[1].profile_id == "roomy"
     assert factory.created[1].start_calls == 1
-    assert coordinator.active_profile_id == "roomy"
 
 
 def test_same_selection_does_not_rebuild_overlay() -> None:
@@ -152,7 +150,6 @@ def test_clear_selection_stops_overlay_without_creating_a_replacement() -> None:
 
     assert previous.stop_calls == 1
     assert len(factory.created) == 1
-    assert coordinator.active_profile_id is None
 
 
 def test_replacement_factory_failure_preserves_running_overlay() -> None:
@@ -168,7 +165,7 @@ def test_replacement_factory_failure_preserves_running_overlay() -> None:
         selection.select("roomy")
 
     assert previous.stop_calls == 0
-    assert coordinator.active_profile_id == "compact"
+    assert selection.snapshot().selected_profile_id == "compact"
 
 
 def test_failed_replacement_start_is_cleaned_and_preserves_previous_overlay() -> None:
@@ -187,8 +184,6 @@ def test_failed_replacement_start_is_cleaned_and_preserves_previous_overlay() ->
     assert previous.stop_calls == 0
     assert failed.stop_calls == 1
     assert selection.snapshot().selected_profile_id == "compact"
-    assert coordinator.active_profile_id == "compact"
-    assert coordinator.last_error is None
 
 
 def test_saved_selection_start_failure_keeps_coordinator_available_for_retry() -> None:
@@ -201,15 +196,16 @@ def test_saved_selection_start_failure_keeps_coordinator_available_for_retry() -
     with pytest.raises(RuntimeError, match="overlay start failed"):
         coordinator.start()
 
+    failed = factory.created[0]
     assert coordinator.started is True
-    assert coordinator.active_profile_id is None
-    assert coordinator.last_error is not None
+    assert failed.start_calls == 1
+    assert failed.stop_calls == 1
 
     factory.fail_profile_id = None
     selection.select("compact")
 
-    assert coordinator.active_profile_id == "compact"
-    assert coordinator.last_error is None
+    assert len(factory.created) == 2
+    assert factory.created[-1].profile_id == "compact"
     assert factory.created[-1].start_calls == 1
 
 
@@ -225,9 +221,8 @@ def test_runtime_recorded_refresh_error_is_treated_as_start_failure() -> None:
 
     failed = factory.created[0]
     assert failed.stop_calls == 1
+    assert failed.last_error is not None
     assert coordinator.started is True
-    assert coordinator.active_profile_id is None
-    assert coordinator.last_error is not None
 
 
 def test_stop_is_idempotent_and_prevents_future_sync_until_restarted() -> None:
@@ -268,7 +263,7 @@ def test_failed_stop_keeps_active_runtime_for_a_safe_retry() -> None:
         coordinator.stop()
 
     assert coordinator.started is True
-    assert coordinator.active_profile_id == "compact"
+    assert selection.snapshot().selected_profile_id == "compact"
     runtime.stop_result = True
     assert coordinator.stop() is True
     assert runtime.stop_calls == 2

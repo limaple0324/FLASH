@@ -162,7 +162,6 @@ def test_unselected_assembly_starts_silently_without_windows_api_or_window() -> 
 
     coordinator.start()
 
-    assert coordinator.active_profile_id is None
     assert work_area.calls == 0
     assert windows.windows == []
 
@@ -174,8 +173,8 @@ def test_selected_profile_builds_complete_positioned_window_and_content() -> Non
 
     coordinator.start()
 
-    assert coordinator.active_profile_id == "compact"
     assert work_area.calls == 1
+    assert len(windows.windows) == 1
     assert ("geometry", "320x120+1584+904") in (
         windows.windows[0].operations
     )
@@ -196,7 +195,7 @@ def test_switching_selection_replaces_window_with_new_profile_settings() -> None
     selection.select("roomy")
 
     assert previous.operations[-1] == ("destroy",)
-    assert coordinator.active_profile_id == "roomy"
+    assert len(windows.windows) == 2
     assert ("geometry", "400x120+1504+904") in (
         windows.windows[1].operations
     )
