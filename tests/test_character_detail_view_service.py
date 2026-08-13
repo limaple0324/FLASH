@@ -108,3 +108,16 @@ def test_detail_snapshot_is_read_only(tmp_path) -> None:
 def test_detail_service_requires_existing_read_only_services(tmp_path) -> None:
     with pytest.raises(TypeError, match="CharacterViewService"):
         CharacterDetailViewService(object())
+
+
+def test_detail_service_rejects_an_invalid_summary_type() -> None:
+    class InvalidSummaryService(CharacterViewService):
+        def all_with_identities(self, group_name=None):
+            return (("stable-character", object()),)
+
+    service = CharacterDetailViewService(
+        InvalidSummaryService(WindowRegistry(), ())
+    )
+
+    with pytest.raises(TypeError, match="PlayerCharacterView"):
+        service.all_with_identities()

@@ -24,25 +24,6 @@ class PlayerCharacterDetail:
     note: str | None
     game_data: CharacterGameDataView | None = None
 
-    @classmethod
-    def from_summary(
-        cls,
-        summary: PlayerCharacterView,
-        game_data: CharacterGameDataView | None = None,
-    ) -> "PlayerCharacterDetail":
-        if not isinstance(summary, PlayerCharacterView):
-            raise TypeError("summary must be PlayerCharacterView.")
-        return cls(
-            display_name=summary.display_name,
-            group=summary.group,
-            level=summary.level,
-            importance=summary.importance,
-            role=summary.role,
-            note=summary.note,
-            game_data=game_data,
-        )
-
-
 class CharacterDetailViewService:
     """建立角色詳細快照，只加入玩家已確認的延伸資料摘要。"""
 
@@ -72,12 +53,19 @@ class CharacterDetailViewService:
         for character_id, summary in self._characters.all_with_identities(
             group_name
         ):
+            if not isinstance(summary, PlayerCharacterView):
+                raise TypeError("summary must be PlayerCharacterView.")
             details.append(
                 (
                     character_id,
-                    PlayerCharacterDetail.from_summary(
-                        summary,
-                        (
+                    PlayerCharacterDetail(
+                        display_name=summary.display_name,
+                        group=summary.group,
+                        level=summary.level,
+                        importance=summary.importance,
+                        role=summary.role,
+                        note=summary.note,
+                        game_data=(
                             self._game_data.get(character_id)
                             if self._game_data is not None
                             else None

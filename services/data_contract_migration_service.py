@@ -1,27 +1,14 @@
-"""Central version and migration rules for persisted application contracts."""
+"""Central version checks for persisted application contracts."""
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Mapping
 
 from config.config_manager import ConfigManager
 
 
-Migration = Callable[[dict[str, object]], dict[str, object]]
-
-
-@dataclass(frozen=True, slots=True)
-class DataContractVersionState:
-    schema_version: int
-    component_versions: Mapping[str, int]
-
-    SCHEMA_VERSION = 1
-
-
 class DataContractMigrationService:
-    """Reject future data and migrate older payloads one declared step at a time."""
+    """Normalize known versions and reject unsupported contract drift."""
 
     SETTINGS_KEY = "data_contract_versions"
     CURRENT_VERSIONS = {
@@ -35,19 +22,7 @@ class DataContractMigrationService:
 
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
-        self._state = self._load_state()
-
-    @property
-    def state(self) -> DataContractVersionState:
-        return self._state
-
-    def current_version(self, component: str) -> int:
-        try:
-            return self.CURRENT_VERSIONS[component]
-        except KeyError as error:
-            raise ValueError(
-                f"unknown data contract component: {component}"
-            ) from error
+        self._load_state()
 
     def verify_supported_versions(
         self,
@@ -60,23 +35,7 @@ class DataContractMigrationService:
                     f"data contract version drift: {component}"
                 )
 
-    def migrate_component(
-        self,
-        component: str,
-        payload: Mapping[str, object],
-        *,
-        migrations: Mapping[int, Migration],
-        version_key: str = "schema_version",
-    ) -> dict[str, object]:
-        return self.migrate_payload(
-            component,
-            payload,
-            current_version=self.current_version(component),
-            migrations=migrations,
-            version_key=version_key,
-        )
-
-    def _load_state(self) -> DataContractVersionState:
+    def _load_state(self) -> None:
         raw = self._config.get(self.SETTINGS_KEY, {})
         stored = raw if isinstance(raw, Mapping) else {}
         normalized: dict[str, int] = {}
@@ -94,46 +53,3 @@ class DataContractMigrationService:
                 )
             normalized[component] = current
         self._config.update_values({self.SETTINGS_KEY: normalized})
-        return DataContractVersionState(
-            DataContractVersionState.SCHEMA_VERSION,
-            normalized,
-        )
-
-    @staticmethod
-    def migrate_payload(
-        component: str,
-        payload: Mapping[str, object],
-        *,
-        current_version: int,
-        migrations: Mapping[int, Migration],
-        version_key: str = "schema_version",
-    ) -> dict[str, object]:
-        if not isinstance(payload, Mapping):
-            raise TypeError(f"{component} payload must be an object.")
-        migrated = deepcopy(dict(payload))
-        version = migrated.get(version_key)
-        if (
-            isinstance(version, bool)
-            or not isinstance(version, int)
-            or version <= 0
-        ):
-            raise ValueError(f"{component} version is invalid.")
-        if version > current_version:
-            raise ValueError(f"{component} version is newer than this app.")
-        while version < current_version:
-            migration = migrations.get(version)
-            if migration is None:
-                raise ValueError(
-                    f"{component} has no migration from version {version}."
-                )
-            migrated = migration(deepcopy(migrated))
-            next_version = migrated.get(version_key)
-            if (
-                isinstance(next_version, bool)
-                or not isinstance(next_version, int)
-                or next_version <= version
-                or next_version > current_version
-            ):
-                raise ValueError(f"{component} migration is invalid.")
-            version = next_version
-        return migrated

@@ -22,16 +22,6 @@ class UiCallbackDispatcher:
         self._pause_generation = 0
         self._lock = threading.RLock()
 
-    @property
-    def closed(self) -> bool:
-        with self._lock:
-            return self._closed
-
-    @property
-    def pending_count(self) -> int:
-        with self._lock:
-            return len(self._pending)
-
     def dispatch(self, callback: Callable[[], None]) -> object | None:
         if not callable(callback):
             raise TypeError("callback must be callable.")

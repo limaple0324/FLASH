@@ -563,21 +563,23 @@ def test_export_and_import_restores_images_scope_and_display_settings(
 
     result = restored_service.import_settings(backup)
     settings = restored_service.settings()
+    page_paths = dict(settings.page_paths)
+    card_paths = dict(settings.card_paths)
 
     assert result.succeeded is True
     assert settings.global_path is not None
-    assert settings.for_page("characters") is not None
-    assert settings.for_page("records") == settings.for_page("characters")
-    assert settings.for_card("sync.reconnect") is not None
+    assert page_paths["characters"] is not None
+    assert page_paths["records"] == page_paths["characters"]
+    assert card_paths["sync.reconnect"] is not None
     assert settings.fill_color == "#102030"
     assert settings.sidebar_opacity == 12
     assert settings.panel_opacity == 34
     assert settings.role_row_opacity == 56
     with Image.open(settings.global_path) as restored_global:
         assert restored_global.size == (22, 14)
-    with Image.open(settings.for_page("characters")) as restored_page:
+    with Image.open(page_paths["characters"]) as restored_page:
         assert restored_page.size == (18, 30)
-    with Image.open(settings.for_card("sync.reconnect")) as restored_card:
+    with Image.open(card_paths["sync.reconnect"]) as restored_card:
         assert restored_card.size == (9, 7)
 
 

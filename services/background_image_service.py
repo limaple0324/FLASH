@@ -95,13 +95,6 @@ class BackgroundSettings:
     panel_opacity: int
     role_row_opacity: int
 
-    def for_page(self, page: str) -> Path | None:
-        return dict(self.page_paths).get(page, self.global_path)
-
-    def for_card(self, card_id: str) -> Path | None:
-        return dict(self.card_paths).get(card_id)
-
-
 @dataclass(frozen=True, slots=True)
 class BackgroundMetadata:
     original_name: str

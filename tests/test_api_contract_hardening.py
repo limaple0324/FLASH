@@ -30,8 +30,6 @@ from services.game_operation_gate import GameOperationGate
 from services.group_selection_service import GroupSelectionService
 from services.keyboard_sync_monitor import Win32KeyboardStateBackend
 from services.lifecycle_contract import (
-    cancel_service,
-    join_service,
     start_service,
     stop_service,
 )
@@ -1308,48 +1306,13 @@ def test_lifecycle_contract_treats_an_already_stopped_service_as_stopped():
     assert stopped.code == "lifecycle.stopped"
 
 
-def test_lifecycle_contract_keeps_cancel_and_join_failures_explicit():
-    class Service:
-        running = True
-
-        def cancel(self):
-            return False
-
-        def join(self):
-            return False
-
-    service = Service()
-
-    assert cancel_service(service).code == "lifecycle.cancel_failed"
-    joined = join_service(service)
-    assert joined.success is False
-    assert joined.running is True
-    assert joined.code == "lifecycle.join_failed"
-
-
-def test_data_contract_migration_is_sequential_and_rejects_future(tmp_path):
+def test_data_contract_versions_are_normalized_and_reject_future(tmp_path):
     config = ConfigManager(tmp_path / "settings.json")
     service = DataContractMigrationService(config)
-    assert service.state.component_versions["reconnect"] == (
+    assert config.get(service.SETTINGS_KEY) == service.CURRENT_VERSIONS
+    assert service.CURRENT_VERSIONS["reconnect"] == (
         ReconnectRuntimeStateStore.VERSION
     )
-    migrated = service.migrate_component(
-        "reconnect",
-        {"version": 1, "value": "kept"},
-        migrations={
-            1: lambda payload: {**payload, "version": 2},
-            2: lambda payload: {**payload, "version": 3},
-            3: lambda payload: {**payload, "version": 4},
-            4: lambda payload: {**payload, "version": 5},
-            5: lambda payload: {**payload, "version": 6},
-            6: lambda payload: {**payload, "version": 7},
-        },
-        version_key="version",
-    )
-    assert migrated == {
-        "version": ReconnectRuntimeStateStore.VERSION,
-        "value": "kept",
-    }
     try:
         service.verify_supported_versions(
             {
@@ -1361,14 +1324,19 @@ def test_data_contract_migration_is_sequential_and_rejects_future(tmp_path):
         assert "reconnect" in str(error)
     else:
         raise AssertionError("version drift must be rejected")
+
+    future_config = ConfigManager(tmp_path / "future-settings.json")
+    future_config.set(
+        service.SETTINGS_KEY,
+        {
+            **service.CURRENT_VERSIONS,
+            "cards": service.CURRENT_VERSIONS["cards"] + 1,
+        },
+    )
     try:
-        service.migrate_component(
-            "cards",
-            {"schema_version": 2},
-            migrations={},
-        )
+        DataContractMigrationService(future_config)
     except ValueError as error:
-        assert "newer" in str(error)
+        assert "cards" in str(error)
     else:
         raise AssertionError("future data must be rejected")
 

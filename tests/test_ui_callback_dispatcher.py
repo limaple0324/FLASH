@@ -30,17 +30,17 @@ def test_pause_cancels_queued_callbacks_and_resume_accepts_new_work():
     calls = []
     first = dispatcher.dispatch(lambda: calls.append("first"))
 
-    assert dispatcher.pending_count == 1
+    assert first in scheduler.callbacks
     dispatcher.pause()
     assert scheduler.cancelled == [first]
-    assert dispatcher.pending_count == 0
+    assert first not in scheduler.callbacks
     assert dispatcher.dispatch(lambda: calls.append("blocked")) is None
 
     assert dispatcher.resume() is True
     second = dispatcher.dispatch(lambda: calls.append("second"))
     scheduler.run(second)
     assert calls == ["second"]
-    assert dispatcher.pending_count == 0
+    assert scheduler.callbacks == {}
 
 
 def test_close_prevents_callbacks_even_if_scheduler_delivers_late():
@@ -57,7 +57,6 @@ def test_close_prevents_callbacks_even_if_scheduler_delivers_late():
     guarded()
 
     assert calls == []
-    assert dispatcher.closed is True
     assert dispatcher.resume() is False
     assert dispatcher.dispatch(lambda: calls.append("never")) is None
 
@@ -71,7 +70,6 @@ def test_scheduler_failure_is_isolated_without_a_pending_token():
     )
 
     assert dispatcher.dispatch(lambda: None) is None
-    assert dispatcher.pending_count == 0
 
 
 def test_worker_dispatch_does_not_deadlock_main_thread_callback():
@@ -91,7 +89,8 @@ def test_worker_dispatch_does_not_deadlock_main_thread_callback():
         thread.join(1)
         return "callback-1"
 
-    dispatcher = UiCallbackDispatcher(schedule, lambda _token: None)
+    cancelled = []
+    dispatcher = UiCallbackDispatcher(schedule, cancelled.append)
     calls = []
 
     token = dispatcher.dispatch(lambda: calls.append("completed"))
@@ -100,7 +99,8 @@ def test_worker_dispatch_does_not_deadlock_main_thread_callback():
     assert callback_finished_before_schedule_returned is True
     assert callback_finished.is_set()
     assert calls == ["completed"]
-    assert dispatcher.pending_count == 0
+    dispatcher.pause()
+    assert cancelled == []
 
 
 def test_pause_resume_rejects_dispatch_started_before_pause():
@@ -134,7 +134,6 @@ def test_pause_resume_rejects_dispatch_started_before_pause():
     assert worker.is_alive() is False
     assert result == [None]
     assert cancelled == ["callback-1"]
-    assert dispatcher.pending_count == 0
 
     scheduled_callback["callback"]()
     assert calls == []

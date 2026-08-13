@@ -16,14 +16,6 @@ class EventSubscriptionScope:
         self._subscriptions: list[tuple[str, Callable[[Any], None]]] = []
         self._closed = False
 
-    @property
-    def closed(self) -> bool:
-        return self._closed
-
-    @property
-    def count(self) -> int:
-        return len(self._subscriptions)
-
     def subscribe(
         self,
         event_name: str,

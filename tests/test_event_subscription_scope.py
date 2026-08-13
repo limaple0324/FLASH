@@ -12,14 +12,12 @@ def test_scope_deduplicates_and_closes_all_subscriptions_once():
 
     assert scope.subscribe("changed", handler) is True
     assert scope.subscribe("changed", handler) is False
-    assert scope.count == 1
     bus.publish("changed", 1)
     assert calls == [1]
 
     assert scope.close() is True
     assert scope.close() is True
-    assert scope.closed is True
-    assert scope.count == 0
+    assert scope.subscribe("changed", handler) is False
     bus.publish("changed", 2)
     assert calls == [1]
 
@@ -57,7 +55,12 @@ def test_partial_close_failure_restores_removed_subscriptions():
     bus.failed_handler = first
 
     assert scope.close() is False
-    assert scope.closed is False
-    assert scope.count == 2
+    additional_calls = []
+    assert scope.subscribe(
+        "additional",
+        additional_calls.append,
+    ) is True
+    bus.publish("additional", 4)
+    assert additional_calls == [4]
     bus.publish("changed", 3)
     assert calls == [("first", 3), ("second", 3)]
