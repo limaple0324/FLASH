@@ -44,7 +44,6 @@ class GroupConfiguration:
     launch_hotkey: str = ""
     master_locked: bool = True
     sync_base_point: tuple[int, int] | None = None
-    entry_order_customized: bool = False
 
     @property
     def main_entry(self) -> GroupConfigurationEntry | None:
@@ -816,9 +815,6 @@ class GroupConfigurationService:
                     ),
                     sync_base_point=self._clean_sync_base_point(
                         raw_group
-                    ),
-                    entry_order_customized=bool(
-                        raw_group.get("entry_order_customized", False)
                     ),
                 )
             )

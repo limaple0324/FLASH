@@ -298,8 +298,9 @@ def test_successful_group_launch_records_exact_ownership_for_safe_stop(
         )
     )
     closer = Closer((1, 2, 99))
+    managed_path = tmp_path / "managed.json"
     managed = ManagedGameProcessService(
-        tmp_path / "managed.json",
+        managed_path,
         windows,
         close_backend=closer,
     )
@@ -312,12 +313,28 @@ def test_successful_group_launch_records_exact_ownership_for_safe_stop(
 
     launched = service._run("兩支")
     assert launched.success is True
-    assert len(managed.records()) == 2
+    assert len(
+        json.loads(managed_path.read_text(encoding="utf-8"))["windows"]
+    ) == 2
+
+    restored = ManagedGameProcessService(
+        managed_path,
+        windows,
+        close_backend=closer,
+    )
+    service = GroupWindowLaunchService(
+        launch,
+        windows,
+        placement_backend=Placer(),
+        managed_process_service=restored,
+    )
 
     stopped = service._run_stop_all("全部受管遊戲")
 
-    assert len(managed.records()) == 0
+    assert json.loads(
+        managed_path.read_text(encoding="utf-8")
+    )["windows"] == []
     assert stopped.success is True
     assert stopped.stopped_count == 2
-    assert closer.closed == [1, 2]
+    assert set(closer.closed) == {1, 2}
     assert 99 in closer.handles

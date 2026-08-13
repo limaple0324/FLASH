@@ -84,14 +84,14 @@ def test_records_are_atomic_persistent_and_stop_only_exact_managed_windows(
         close_backend=closer,
     )
 
-    assert len(restored.records()) == 2
+    assert len(json.loads(path.read_text(encoding="utf-8"))["windows"]) == 2
     result = restored.stop_all()
 
     assert result.success is True
     assert result.stopped_count == 2
     assert set(closer.closed) == {11, 22}
     assert 99 in closer.handles
-    assert restored.records() == ()
+    assert json.loads(path.read_text(encoding="utf-8"))["windows"] == []
 
 
 def test_identity_drift_is_never_closed_and_invalid_record_is_removed(
@@ -121,10 +121,10 @@ def test_identity_drift_is_never_closed_and_invalid_record_is_removed(
     result = restored.stop_all()
 
     assert result.success is False
-    assert result.failed_count == 1
+    assert result.failure_code == "managed_game_stop_partial"
     assert closer.closed == []
     assert closer.handles == {33}
-    assert restored.records() == ()
+    assert json.loads(path.read_text(encoding="utf-8"))["windows"] == []
 
 
 def test_corrupt_state_fails_closed_without_overwriting_or_closing(tmp_path):

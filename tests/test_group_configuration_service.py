@@ -346,7 +346,6 @@ def test_reorder_entries_is_atomic_persistent_and_keeps_main_identity(
     assert tuple(entry.entry_id for entry in reloaded.entries) == proposed
     assert reordered.main_entry.entry_id == main_id
     assert reloaded.main_entry.entry_id == main_id
-    assert reordered.entry_order_customized is True
     assert service.reorder_group_entries("14支", proposed) is False
     assert service.reorder_group_entries(
         "14支",

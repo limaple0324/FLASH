@@ -31,35 +31,8 @@ class ManagedGameWindow:
 @dataclass(frozen=True, slots=True)
 class ManagedGameStopResult:
     success: bool
-    total_count: int = 0
     stopped_count: int = 0
-    stale_count: int = 0
-    failed_count: int = 0
     failure_code: str | None = None
-
-    @property
-    def player_message(self) -> str:
-        if self.success:
-            if self.total_count == 0:
-                return "目前沒有由「輔」管理的遊戲視窗。"
-            return (
-                f"已停止 {self.stopped_count} 個受管遊戲視窗；"
-                "其他視窗保持不變。"
-            )
-        messages = {
-            "managed_game_stop_partial": (
-                f"已停止 {self.stopped_count} 個受管遊戲視窗，"
-                f"{self.failed_count} 個身分或關閉狀態無法確認；"
-                "未確認的視窗保持不變。"
-            ),
-            "managed_game_state_unavailable": (
-                "受管遊戲紀錄無法讀取，沒有關閉任何遊戲視窗。"
-            ),
-        }
-        return messages.get(
-            self.failure_code,
-            "停止全部未完成，未確認的遊戲視窗保持不變。",
-        )
 
 
 class ManagedGameProcessService:
@@ -193,10 +166,6 @@ class ManagedGameProcessService:
             except OSError:
                 pass
 
-    def records(self) -> tuple[ManagedGameWindow, ...]:
-        with self._lock:
-            return tuple(self._records.values())
-
     def remember_group_windows(
         self,
         group_name: object,
@@ -326,8 +295,6 @@ class ManagedGameProcessService:
         except Exception:
             return ManagedGameStopResult(
                 False,
-                total_count=len(records),
-                failed_count=len(records),
                 failure_code="managed_game_state_unavailable",
             )
 
@@ -382,10 +349,7 @@ class ManagedGameProcessService:
 
         return ManagedGameStopResult(
             failed == 0,
-            total_count=len(records),
             stopped_count=len(stopped),
-            stale_count=len(stale),
-            failed_count=failed,
             failure_code=(
                 None if failed == 0 else "managed_game_stop_partial"
             ),

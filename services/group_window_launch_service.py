@@ -480,7 +480,6 @@ class GroupWindowLaunchService:
         return GroupWindowLaunchResult(
             result.success,
             "",
-            total_count=result.total_count,
             stopped_count=result.stopped_count,
             failure_code=result.failure_code,
             action="stop",
