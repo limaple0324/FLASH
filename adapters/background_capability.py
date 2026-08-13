@@ -26,27 +26,12 @@ class CapabilityResult:
     state: CapabilityState
     message: str
 
-    @property
-    def supported(self) -> bool:
-        return self.state is CapabilityState.SUPPORTED
-
 
 @dataclass(frozen=True, slots=True)
 class BackgroundCapabilityReport:
     background_capture: CapabilityResult
     background_input: CapabilityResult
     minimized_input: CapabilityResult
-
-    @property
-    def fully_supported(self) -> bool:
-        return all(
-            item.supported
-            for item in (
-                self.background_capture,
-                self.background_input,
-                self.minimized_input,
-            )
-        )
 
     def to_dict(self) -> dict[str, object]:
         def serialize(result: CapabilityResult) -> dict[str, object]:
@@ -55,7 +40,14 @@ class BackgroundCapabilityReport:
             return payload
 
         return {
-            "fully_supported": self.fully_supported,
+            "fully_supported": all(
+                item.state is CapabilityState.SUPPORTED
+                for item in (
+                    self.background_capture,
+                    self.background_input,
+                    self.minimized_input,
+                )
+            ),
             "capabilities": {
                 "background_capture": serialize(self.background_capture),
                 "background_input": serialize(self.background_input),

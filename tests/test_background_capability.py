@@ -33,7 +33,7 @@ def test_probe_does_not_run_without_selected_window():
 
     report = BackgroundCapabilityProbe(backend).run(None)
 
-    assert report.fully_supported is False
+    assert report.to_dict()["fully_supported"] is False
     assert backend.calls == []
     assert report.background_capture.state is CapabilityState.UNTESTED
     assert report.background_input.state is CapabilityState.UNTESTED
@@ -45,7 +45,7 @@ def test_probe_reports_full_background_support():
 
     report = BackgroundCapabilityProbe(backend).run(321)
 
-    assert report.fully_supported is True
+    assert report.to_dict()["fully_supported"] is True
     assert all(item[1] == 321 for item in backend.calls)
     assert report.background_capture.state is CapabilityState.SUPPORTED
     assert report.background_input.state is CapabilityState.SUPPORTED
@@ -57,7 +57,7 @@ def test_probe_keeps_partial_support_explicit():
 
     report = BackgroundCapabilityProbe(backend).run(321)
 
-    assert report.fully_supported is False
+    assert report.to_dict()["fully_supported"] is False
     assert report.background_capture.state is CapabilityState.SUPPORTED
     assert report.background_input.state is CapabilityState.UNSUPPORTED
     assert report.minimized_input.state is CapabilityState.UNKNOWN
@@ -68,7 +68,7 @@ def test_probe_converts_backend_exception_to_report():
 
     report = BackgroundCapabilityProbe(backend).run(321)
 
-    assert report.fully_supported is False
+    assert report.to_dict()["fully_supported"] is False
     assert report.background_input.state is CapabilityState.ERROR
     assert "probe failed" in report.background_input.message
 

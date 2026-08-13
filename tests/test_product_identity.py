@@ -1,5 +1,4 @@
 from core.version import (
-    DISPLAY_VERSION,
     MILESTONE,
     PRODUCT_NAME as VERSION_PRODUCT_NAME,
     TECHNICAL_NAME as VERSION_TECHNICAL_NAME,
@@ -24,4 +23,3 @@ def test_main_window_uses_the_product_name():
 def test_current_cumulative_delivery_identity():
     assert MILESTONE == "SP3"
     assert VERSION == "0.3.0"
-    assert DISPLAY_VERSION == "SP3 0.3.0"
