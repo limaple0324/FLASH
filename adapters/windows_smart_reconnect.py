@@ -4797,7 +4797,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     "window_identity_unsafe",
                 )
             plan = self._group_launch_plan
-            contract_isolated_window_count = 0
+            contract_isolated_window_count = len(target_failures)
             if plan is not None:
                 verified = self._verified_group_activation_snapshot(
                     self._tcp_v,
