@@ -32,7 +32,6 @@ a = Analysis(
         ('assets/flash_icon.png', 'assets'),
         ('assets/flash_icon.ico', 'assets'),
         ('assets/reconnect_reference', 'assets/reconnect_reference'),
-        ('assets/reconnect_reference/auto_battle', 'assets/reconnect_reference/auto_battle'),
         ('assets/role_id_ocr', 'assets/role_id_ocr'),
         ('assets/ui_fonts', 'assets/ui_fonts'),
     ] + obsidian_reference_datas + rapidocr_datas,

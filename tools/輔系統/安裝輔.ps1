@@ -117,17 +117,6 @@ function Invoke-BundleVerifier([string]$Root, [string]$Description) {
     & $verifier -NoLaunch
 }
 
-function Copy-DirectoryContents([string]$Source, [string]$Destination) {
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {
-        Copy-Item `
-            -LiteralPath $item.FullName `
-            -Destination $Destination `
-            -Recurse `
-            -Force
-    }
-}
-
 function Read-KeyValueFile([string]$Path, [string]$Description) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "$Description 不存在：$Path"
@@ -275,7 +264,14 @@ $success = $false
 
 try {
     Write-Host "建立完整安裝暫存：$stageDir"
-    Copy-DirectoryContents -Source $SourceDir -Destination $stageDir
+    New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $SourceDir -Force) {
+        Copy-Item `
+            -LiteralPath $item.FullName `
+            -Destination $stageDir `
+            -Recurse `
+            -Force
+    }
     Invoke-BundleVerifier -Root $stageDir -Description "安裝暫存驗證"
 
     if (Test-Path -LiteralPath $InstallDir) {

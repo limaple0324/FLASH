@@ -59,7 +59,6 @@ $InstallDir = [IO.Path]::GetFullPath($InstallDirectory).TrimEnd(
     [IO.Path]::AltDirectorySeparatorChar
 )
 $SystemDir = Join-Path $InstallDir "輔系統"
-$ExePath = Join-Path $InstallDir "FLASH.exe"
 $LogPath = Join-Path $InstallDir "更新紀錄.txt"
 $LockPath = Join-Path $SystemDir "更新鎖定.lock"
 $TransactionBase = Join-Path $SystemDir "更新交易"
