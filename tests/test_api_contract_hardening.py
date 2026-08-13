@@ -356,7 +356,7 @@ def test_scope_cache_tracks_group_version_and_controller_shortcut_evidence(
     assert controller_path.stat().st_size == controller_stat.st_size
     assert controller_path.stat().st_mtime_ns == controller_stat.st_mtime_ns
     identity_changed = service.reconnect_targets(group_name)
-    assert identity_changed.sync_entry_ids == ()
+    assert identity_changed.sync_entry_ids == entry_ids[1:]
     assert tuple(window.handle for window in identity_changed.windows) == (12, 13)
 
     controller_path.write_bytes(original_content)
@@ -418,7 +418,9 @@ def test_scope_cache_isolates_one_follower_and_restores_original_slot_order(
     isolated = service.reconnect_targets(group_name)
     assert isolated.sync_entry_ids == (entry_ids[0], entry_ids[2])
     assert tuple(window.handle for window in isolated.sync_windows) == (11, 13)
-    assert "shortcut_identity_unresolved" in isolated.failure_codes
+    assert tuple(
+        item.failure_codes for item in isolated.target_failure_evidence
+    ) == (("shortcut_identity_unresolved",),)
 
     follower_path.write_bytes(follower_content)
     restored = service.reconnect_targets(group_name)
@@ -461,7 +463,9 @@ def test_reconnect_targets_never_mix_snapshot_with_changed_scope_evidence(
     assert resolved.windows == ()
     assert resolved.sync_windows == ()
     assert resolved.sync_entry_ids == ()
-    assert "scope_evidence_changed_during_snapshot" in resolved.failure_codes
+    assert "scope_evidence_changed_during_snapshot" in (
+        resolved.global_failure_codes
+    )
 
 
 def test_controller_shortcut_loss_stops_keyboard_and_pointer_target_providers(
@@ -717,10 +721,17 @@ def test_reconnect_targets_keep_safe_role_when_other_window_is_unidentified(
     reconnect_targets = service.reconnect_targets(group_name)
 
     assert tuple(window.handle for window in reconnect_targets.windows) == (11,)
-    assert reconnect_targets.failure_codes == (
+    assert reconnect_targets.global_failure_codes == (
         "unidentified_candidate_window",
-        "window_offline",
     )
+    assert tuple(
+        (item.entry_id, item.fingerprint, item.failure_codes)
+        for item in reconnect_targets.target_failure_evidence
+    ) == ((
+        scope.entry_ids[1],
+        scope.fingerprints[1],
+        ("window_offline",),
+    ),)
 
 
 def test_reconnect_targets_keep_offline_evidence_without_blocking_safe_sibling(
@@ -748,8 +759,15 @@ def test_reconnect_targets_keep_offline_evidence_without_blocking_safe_sibling(
     reconnect_targets = service.reconnect_targets(group_name)
 
     assert tuple(window.handle for window in reconnect_targets.windows) == (11,)
-    assert reconnect_targets.failure_codes == ("window_offline",)
-    assert reconnect_targets.blocked_fingerprints == frozenset()
+    assert tuple(
+        (item.entry_id, item.fingerprint, item.failure_codes)
+        for item in reconnect_targets.target_failure_evidence
+    ) == ((
+        scope.entry_ids[1],
+        scope.fingerprints[1],
+        ("window_offline",),
+    ),)
+    assert reconnect_targets.global_failure_codes == ()
 
 
 def test_reconnect_targets_reject_incomplete_instance_before_capture(tmp_path):
@@ -789,10 +807,7 @@ def test_reconnect_targets_reject_incomplete_instance_before_capture(tmp_path):
 
         assert reconnect_targets.windows == ()
         assert "window_instance_incomplete" in (
-            reconnect_targets.failure_codes
-        )
-        assert reconnect_targets.blocked_fingerprints == frozenset(
-            {scope.fingerprints[0]}
+            reconnect_targets.global_failure_codes
         )
 
 
@@ -843,10 +858,14 @@ def test_reconnect_targets_isolate_duplicate_role_without_hiding_safe_sibling(
     reconnect_targets = service.reconnect_targets(group_name)
 
     assert tuple(window.handle for window in reconnect_targets.windows) == (11,)
-    assert reconnect_targets.failure_codes == ("window_identity_duplicate",)
-    assert reconnect_targets.blocked_fingerprints == frozenset(
-        {scope.fingerprints[1]}
-    )
+    assert tuple(
+        (item.entry_id, item.fingerprint, item.failure_codes)
+        for item in reconnect_targets.target_failure_evidence
+    ) == ((
+        scope.entry_ids[1],
+        scope.fingerprints[1],
+        ("window_identity_duplicate",),
+    ),)
 
 
 def test_reconnect_targets_bind_shared_launcher_digest_to_confirmed_instances(
@@ -999,7 +1018,10 @@ def test_shared_launcher_incomplete_or_conflicting_instance_isolated(tmp_path):
 
     assert tuple(window.handle for window in isolated.windows) == (11,)
     assert isolated.sync_entry_ids == (first.entry_id,)
-    assert "window_identity_duplicate" in isolated.failure_codes
+    assert any(
+        "window_identity_duplicate" in item.failure_codes
+        for item in isolated.target_failure_evidence
+    )
 
     second = entries[1]
     registry.register_character(
@@ -1021,7 +1043,7 @@ def test_shared_launcher_incomplete_or_conflicting_instance_isolated(tmp_path):
 
     assert conflicted.windows == ()
     assert conflicted.sync_windows == ()
-    assert "window_identity_duplicate" in conflicted.failure_codes
+    assert "window_identity_duplicate" in conflicted.global_failure_codes
 
 
 def test_sync_controller_accepts_only_the_shared_target_provider():
@@ -1073,7 +1095,7 @@ def test_sync_controller_accepts_only_the_shared_target_provider():
         assert controller.close() is True
 
 
-def test_sync_pointer_and_reconnect_receive_the_same_target_set():
+def test_sync_pointer_uses_its_candidate_set_without_reconnect_test_helper():
     windows = (
         WindowInfo(
             11,
@@ -1112,19 +1134,9 @@ def test_sync_pointer_and_reconnect_receive_the_same_target_set():
         message_backend=object(),
         target_windows_provider=provider,
     )
-    reconnect = WindowsSmartReconnectController(
-        expected_windows=2,
-        title_keywords=("Adobe Flash Player",),
-        window_backend=backend,
-        capture_provider=object(),
-        recognizer=object(),
-        mouse_backend=object(),
-        target_windows_provider=provider,
-    )
     try:
         assert keyboard._candidate_windows() == windows
         assert pointer._candidate_windows() == windows
-        assert reconnect._candidate_windows() == windows
     finally:
         assert keyboard.close() is True
         assert pointer.close() is True

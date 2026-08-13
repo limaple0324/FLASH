@@ -38,6 +38,7 @@ from adapters.windows_launch_fingerprint import (
 from adapters.windows_smart_reconnect import (
     ReconnectRuntimeStateStore,
     RegisteredReconnectRole,
+    WindowInstanceToken,
     WindowsSmartReconnectController,
 )
 from adapters.windows_pointer_sync import (
@@ -52,6 +53,7 @@ from adapters.windows_window import (
     WindowInfo,
     WindowsWindowAdapter,
     complete_window_instance_identity,
+    monitored_window_instance_fingerprint,
 )
 from adapters.windows_client_size import Win32WindowClientSizeBackend
 from adapters.windows_work_area import WindowsWorkAreaReader
@@ -1108,6 +1110,164 @@ def resolve_connected_sync_target_contract(
     return resolved, safe_windows
 
 
+def resolve_complete_reconnect_window_for_entry(
+    group_name: str,
+    entry_id: str,
+    group_launch_service: GroupLaunchService,
+    target_service: TargetWindowContractService,
+) -> WindowInfo | None:
+    """Return the real complete contract window for one unique group entry."""
+
+    if not isinstance(group_name, str) or not group_name.strip():
+        return None
+    if not isinstance(entry_id, str) or not entry_id.strip():
+        return None
+    plan = group_launch_service.plan(group_name)
+    if not plan.ready:
+        return None
+    targets = tuple(
+        target for target in plan.targets if target.entry_id == entry_id
+    )
+    if len(targets) != 1:
+        return None
+    target = targets[0]
+    resolved = target_service.reconnect_targets(group_name)
+    if tuple(getattr(resolved, "global_failure_codes", ())):
+        return None
+    if tuple(getattr(resolved, "sync_scope_entry_ids", ())) != tuple(
+        item.entry_id for item in plan.targets
+    ):
+        return None
+    contract_windows = tuple(getattr(resolved, "windows", ()))
+    contract_entries = tuple(getattr(resolved, "sync_entry_ids", ()))
+    contract_sync_windows = tuple(
+        getattr(resolved, "sync_windows", ())
+    )
+    if not (
+        contract_entries
+        and len(contract_entries)
+        == len(contract_windows)
+        == len(contract_sync_windows)
+    ):
+        return None
+    matches = tuple(
+        window
+        for paired_entry_id, window, sync_window in zip(
+            contract_entries,
+            contract_windows,
+            contract_sync_windows,
+        )
+        if (
+            paired_entry_id == entry_id
+            and normalize_launch_fingerprint(window.launch_fingerprint)
+            == target.fingerprint
+            and complete_window_instance_identity(window) is not None
+            and complete_window_instance_identity(sync_window) is not None
+            and WindowInstanceToken.from_window(window)
+            == WindowInstanceToken.from_window(sync_window)
+            and monitored_window_instance_fingerprint(window)
+            == normalize_launch_fingerprint(sync_window.launch_fingerprint)
+        )
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def auto_read_missing_role_id_once(
+    group_name: str,
+    entry_id: str,
+    group_configuration_service: GroupConfigurationService,
+    group_launch_service: GroupLaunchService,
+    target_window_contract_service: TargetWindowContractService,
+    role_id_template_service: RoleIdTemplateService,
+    smart_reconnect_controller: WindowsSmartReconnectController,
+    *,
+    refresh: Callable[[], None] | None = None,
+) -> bool:
+    """Read one blank role ID only from a complete CONNECTED target window."""
+
+    group = group_configuration_service.group(group_name)
+    if group is None:
+        return False
+    entries = tuple(
+        entry for entry in group.entries if entry.entry_id == entry_id
+    )
+    if len(entries) != 1 or entries[0].role_id.strip():
+        return False
+    entry = entries[0]
+    window = resolve_complete_reconnect_window_for_entry(
+        group_name,
+        entry_id,
+        group_launch_service,
+        target_window_contract_service,
+    )
+    if window is None or window.minimized:
+        return False
+    fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
+    instance = WindowInstanceToken.from_window(window)
+    if fingerprint is None or instance is None:
+        return False
+    screen_state = smart_reconnect_controller.observe_screen_states(
+        (fingerprint,),
+        candidate_windows=(window,),
+    ).get(fingerprint)
+    if screen_state is not ReconnectScreenState.CONNECTED:
+        return False
+    result = role_id_template_service.read_if_missing(
+        window.handle,
+        existing_role_id=entry.role_id,
+    )
+    if not result.success:
+        return False
+    # OCR is intentionally outside the target-contract resolver. Re-resolve
+    # after it and require the same complete instance before a value read from
+    # an old image can be written into a replacement entry/window.
+    refreshed_window = resolve_complete_reconnect_window_for_entry(
+        group_name,
+        entry_id,
+        group_launch_service,
+        target_window_contract_service,
+    )
+    refreshed_fingerprint = (
+        normalize_launch_fingerprint(refreshed_window.launch_fingerprint)
+        if refreshed_window is not None
+        else None
+    )
+    if (
+        refreshed_window is None
+        or refreshed_window.minimized
+        or refreshed_fingerprint != fingerprint
+        or WindowInstanceToken.from_window(refreshed_window) != instance
+    ):
+        return False
+    refreshed_state = smart_reconnect_controller.observe_screen_states(
+        (fingerprint,),
+        candidate_windows=(refreshed_window,),
+    ).get(fingerprint)
+    if refreshed_state is not ReconnectScreenState.CONNECTED:
+        return False
+    latest_group = group_configuration_service.group(group_name)
+    latest_entries = (
+        tuple(
+            item
+            for item in latest_group.entries
+            if item.entry_id == entry_id
+        )
+        if latest_group is not None
+        else ()
+    )
+    if len(latest_entries) != 1 or latest_entries[0].role_id.strip():
+        return False
+    if not group_configuration_service.set_role_id(
+        group_name,
+        entry_id,
+        result.role_id,
+    ):
+        return False
+    if refresh is not None:
+        refresh()
+    return True
+
+
 class ConnectedSyncTargetContractProvider:
     """Publish identity-safe basic-sync windows from one target contract."""
 
@@ -1743,9 +1903,6 @@ def build_services(
                 candidate_windows=windows,
             )
         ),
-    )
-    reconnect_controller.set_ungrouped_shortcut_provider(
-        ungrouped_window_service.shortcut_for
     )
     AppContext.register(UngroupedWindowService, ungrouped_window_service)
     deferred_sync_service = DeferredSyncOperationService(
@@ -4269,77 +4426,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         detach_group_entries(group_name, removed_entry_ids)
         return finish_group_management(group_name)
 
-    def unique_window_for_group_entry(
-        group_name: str,
-        entry_id: str,
-    ):
-        if (
-            group_configuration_service is None
-            or group_launch_service is None
-            or target_window_contract_service is None
-        ):
-            return None
-        group = group_configuration_service.group(group_name)
-        plan = group_launch_service.plan(group_name)
-        if group is None or not plan.ready:
-            return None
-        entry = next(
-            (
-                item
-                for item in group.entries
-                if item.entry_id == entry_id
-            ),
-            None,
-        )
-        if entry is None:
-            return None
-        normalized_path = str(
-            entry.shortcut_path.resolve(strict=False)
-        ).casefold()
-        target = next(
-            (
-                item
-                for item in plan.targets
-                if str(
-                    item.shortcut_path.resolve(strict=False)
-                ).casefold()
-                == normalized_path
-            ),
-            None,
-        )
-        if target is None:
-            return None
-        snapshot = target_window_contract_service.snapshot(
-            group_name,
-            expanded_sync_scope=False,
-        )
-        contract = next(
-            (
-                item
-                for item in snapshot.targets
-                if item.fingerprint == target.fingerprint
-                and item.safe
-            ),
-            None,
-        )
-        if (
-            contract is None
-            or contract.handle is None
-            or contract.rect is None
-            or contract.fingerprint is None
-        ):
-            return None
-        return WindowInfo(
-            contract.handle,
-            "",
-            contract.visible,
-            contract.phase.value == "minimized",
-            contract.rect,
-            contract.process_id,
-            None,
-            contract.fingerprint,
-        )
-
     def refresh_group_sync_identity(group_name: str) -> bool:
         if (
             group_selection_service is None
@@ -4374,9 +4460,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         group = group_configuration_service.group(group_name)
         if group is None or group.main_entry is None:
             return "目前組別沒有可用的主窗口。"
-        window_info = unique_window_for_group_entry(
+        window_info = resolve_complete_reconnect_window_for_entry(
             group_name,
             group.main_entry.entry_id,
+            group_launch_service,
+            target_window_contract_service,
         )
         if window_info is None:
             return "無法唯一確認主窗口，未保存基準點。"
@@ -4413,7 +4501,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         )
         if entry is None:
             return "找不到這個角色，未保存偏移。"
-        window_info = unique_window_for_group_entry(group_name, entry_id)
+        window_info = resolve_complete_reconnect_window_for_entry(
+            group_name,
+            entry_id,
+            group_launch_service,
+            target_window_contract_service,
+        )
         if window_info is None:
             return "無法唯一確認角色窗口，未保存偏移。"
         point = sync_calibration_backend.cursor_client_point(
@@ -4493,7 +4586,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             or group_configuration_service is None
         ):
             return "角色ID校正尚未準備完成。"
-        window_info = unique_window_for_group_entry(group_name, entry_id)
+        window_info = resolve_complete_reconnect_window_for_entry(
+            group_name,
+            entry_id,
+            group_launch_service,
+            target_window_contract_service,
+        )
         if window_info is None:
             return "無法唯一確認角色窗口，未校正角色ID。"
         result = role_id_template_service.calibrate(
@@ -4515,7 +4613,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             or group_configuration_service is None
         ):
             return "角色ID讀取尚未準備完成。"
-        window_info = unique_window_for_group_entry(group_name, entry_id)
+        window_info = resolve_complete_reconnect_window_for_entry(
+            group_name,
+            entry_id,
+            group_launch_service,
+            target_window_contract_service,
+        )
         if window_info is None:
             return "無法唯一確認角色窗口，未讀取角色ID。"
         result = role_id_template_service.read(
@@ -6010,6 +6113,12 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     role_id_auto_read_id: str | None = None
     role_id_auto_read_cursor = 0
 
+    def refresh_auto_read_role_id(group_name: str) -> None:
+        refresh_group_sync_identity(group_name)
+        if home_view is not None:
+            home_view.refresh_group_entries()
+            home_view.refresh_group_role_statuses()
+
     def auto_read_missing_role_id() -> None:
         """只讀取一個可見且已進遊戲的空白角色名稱。"""
         nonlocal role_id_auto_read_id, role_id_auto_read_cursor
@@ -6036,51 +6145,16 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 role_id_auto_read_cursor % len(missing_entries)
             ]
             role_id_auto_read_cursor += 1
-            window_info = unique_window_for_group_entry(
+            auto_read_missing_role_id_once(
                 group_name,
                 entry.entry_id,
+                group_configuration_service,
+                group_launch_service,
+                target_window_contract_service,
+                role_id_template_service,
+                smart_reconnect_controller,
+                refresh=lambda: refresh_auto_read_role_id(group_name),
             )
-            if window_info is None or window_info.minimized:
-                return
-            fingerprint = normalize_launch_fingerprint(
-                window_info.launch_fingerprint
-            )
-            if fingerprint is None:
-                return
-            screen_state = smart_reconnect_controller.observe_screen_states(
-                (fingerprint,),
-                candidate_windows=(window_info,),
-            ).get(fingerprint)
-            if screen_state is not ReconnectScreenState.CONNECTED:
-                return
-            result = role_id_template_service.read_if_missing(
-                window_info.handle,
-                existing_role_id=entry.role_id,
-            )
-            if result.success:
-                latest_group = group_configuration_service.group(group_name)
-                latest_entry = (
-                    next(
-                        (
-                            item
-                            for item in latest_group.entries
-                            if item.entry_id == entry.entry_id
-                        ),
-                        None,
-                    )
-                    if latest_group is not None
-                    else None
-                )
-                if latest_entry is not None and not latest_entry.role_id.strip():
-                    saved = group_configuration_service.set_role_id(
-                        group_name,
-                        entry.entry_id,
-                        result.role_id,
-                    )
-                    if saved:
-                        refresh_group_sync_identity(group_name)
-                        home_view.refresh_group_entries()
-                        home_view.refresh_group_role_statuses()
         except Exception:
             if logger is not None:
                 logger.warning("自動讀取遊戲內角色名稱失敗。")

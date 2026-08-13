@@ -111,6 +111,14 @@ def test_run_once_uses_result_delay_and_logs_only_aggregate_state():
                     "next_check_seconds": 2,
                     "state_counts": {"connected": 1, "disconnected": 1},
                     "failure_codes": [],
+                    "tcp_observation": {
+                        "generation": 7,
+                        "observed_at_monotonic": 12.5,
+                        "query_succeeded": True,
+                        "observed_window_count": 2,
+                        "zero_window_count": 1,
+                        "confirmed_window_count": 1,
+                    },
                 },
             )
         ]
@@ -128,8 +136,12 @@ def test_run_once_uses_result_delay_and_logs_only_aggregate_state():
     assert "connected=1" in logger.info_messages[0]
     assert "clicked=1" in logger.info_messages[0]
     assert "failure_codes=none" in logger.info_messages[0]
+    assert "generation=7" in logger.info_messages[0]
+    assert "query_succeeded=True" in logger.info_messages[0]
+    assert "confirmed_window_count=1" in logger.info_messages[0]
     assert "handle" not in logger.info_messages[0]
     assert "fingerprint" not in logger.info_messages[0]
+    assert "process_id" not in logger.info_messages[0]
 
 
 def test_repeated_identical_state_does_not_spam_log():
@@ -148,6 +160,71 @@ def test_repeated_identical_state_does_not_spam_log():
     monitor.run_once()
 
     assert len(logger.info_messages) == 1
+
+
+def test_tcp_summary_logs_state_changes_without_generation_log_spam():
+    details = {
+        "next_check_seconds": 2,
+        "state_counts": {"reconnecting": 1},
+        "failure_codes": ["tcp_disconnect_suspected"],
+    }
+    results = [
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                **details,
+                "tcp_observation": {
+                    "generation": 3,
+                    "observed_at_monotonic": 10.0,
+                    "query_succeeded": True,
+                    "observed_window_count": 2,
+                    "zero_window_count": 1,
+                    "confirmed_window_count": 0,
+                },
+            },
+        ),
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                **details,
+                "tcp_observation": {
+                    "generation": 4,
+                    "observed_at_monotonic": 12.0,
+                    "query_succeeded": True,
+                    "observed_window_count": 2,
+                    "zero_window_count": 1,
+                    "confirmed_window_count": 0,
+                },
+            },
+        ),
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                **details,
+                "tcp_observation": {
+                    "generation": 5,
+                    "observed_at_monotonic": 14.0,
+                    "query_succeeded": True,
+                    "observed_window_count": 2,
+                    "zero_window_count": 2,
+                    "confirmed_window_count": 1,
+                },
+            },
+        ),
+    ]
+    logger = RecordingLogger()
+    monitor = SmartReconnectMonitor(FakeBoundary(results), logger=logger)
+
+    monitor.run_once()
+    monitor.run_once()
+    monitor.run_once()
+
+    assert len(logger.info_messages) == 2
+    assert "generation=3" in logger.info_messages[0]
+    assert "generation=5" in logger.info_messages[1]
 
 
 def test_runtime_status_separates_waiting_recovery_from_real_failure():
@@ -300,6 +377,37 @@ def test_runtime_status_does_not_hide_real_safety_failure(failure_code):
     )
 
     assert monitor.runtime_status == "重連失敗"
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    (
+        "tcp_observation_unavailable",
+        "tcp_disconnect_suspected",
+        "tcp_disconnect_confirmed",
+    ),
+)
+def test_runtime_status_keeps_tcp_observation_recovery_reconnecting(failure_code):
+    monitor = SmartReconnectMonitor(FakeBoundary([]))
+    monitor._thread = type(
+        "AliveThread",
+        (),
+        {"is_alive": lambda self: True},
+    )()
+
+    monitor._set_runtime_status(
+        OperationResult(
+            False,
+            "reconnect.waiting",
+            details={
+                "state_counts": {"reconnecting": 1},
+                "failure_codes": [failure_code],
+            },
+        ),
+        now=100.0,
+    )
+
+    assert monitor.runtime_status == "重連中"
 
 
 def test_repeated_recovery_state_does_not_refresh_progress_deadline():
@@ -548,7 +656,7 @@ def test_only_complete_healthy_connected_scan_uses_saved_monitoring_interval():
     assert monitor.run_once()[1] == 2.0
 
 
-def test_passive_waiting_respects_controller_delay_or_safe_fallback():
+def test_passive_waiting_stays_within_two_second_monitor_cadence():
     monitor = SmartReconnectMonitor(
         FakeBoundary(
             [
@@ -564,8 +672,8 @@ def test_passive_waiting_respects_controller_delay_or_safe_fallback():
         monitor_interval_ms=1500,
     )
 
-    assert monitor.run_once()[1] == 60
-    assert monitor.run_once()[1] == 17
+    assert monitor.run_once()[1] == 2
+    assert monitor.run_once()[1] == 2
 
 
 def test_unknown_or_capture_failure_respects_controller_delay():
@@ -676,7 +784,7 @@ def test_reconnect_progress_clears_stalled_disconnect_monitoring(
     assert logger.error_messages == []
 
 
-def test_connected_code_without_complete_health_evidence_keeps_controller_delay():
+def test_connected_code_without_complete_health_evidence_stays_within_two_seconds():
     incomplete_or_failed = [
         {"next_check_seconds": 21},
         {
@@ -706,15 +814,10 @@ def test_connected_code_without_complete_health_evidence_keeps_controller_delay(
         monitor_interval_ms=1500,
     )
 
-    assert [monitor.run_once()[1] for _ in incomplete_or_failed] == [
-        21,
-        2,
-        2,
-        2,
-    ]
+    assert [monitor.run_once()[1] for _ in incomplete_or_failed] == [2, 2, 2, 2]
 
 
-def test_full_health_waits_30_minutes_before_downgrade(monkeypatch):
+def test_full_health_stays_within_two_second_monitor_cadence(monkeypatch):
     healthy = OperationResult(
         True,
         "reconnect.connected",
@@ -734,7 +837,7 @@ def test_full_health_waits_30_minutes_before_downgrade(monkeypatch):
 
     assert monitor.run_once()[1] == 2
     assert monitor.run_once()[1] == 2
-    assert monitor.run_once()[1] == 60
+    assert monitor.run_once()[1] == 2
 
 
 def test_monitoring_interval_can_change_without_restarting_monitor():
@@ -1056,6 +1159,32 @@ def test_runtime_status_reports_a_started_restart_as_reconnecting():
                 "restarted_windows": 1,
                 "state_counts": {"connected": 3},
                 "failure_codes": [],
+            },
+        )
+    )
+
+    assert monitor.runtime_status == (
+        smart_reconnect_monitor_module.SMART_RECONNECT_STATUS_RECONNECTING
+    )
+
+
+def test_timeout_diagnostic_with_peer_progress_stays_reconnecting():
+    monitor = SmartReconnectMonitor(FakeBoundary([]))
+    monitor._thread = type(
+        "AliveThread",
+        (),
+        {"is_alive": lambda self: True},
+    )()
+
+    monitor._set_runtime_status(
+        OperationResult(
+            True,
+            "reconnect.progressed_with_isolation",
+            details={
+                "connected_windows": 1,
+                "restarted_windows": 1,
+                "clicked_windows": 0,
+                "failure_codes": ["tcp_reconnect_timeout"],
             },
         )
     )

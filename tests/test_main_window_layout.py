@@ -1,5 +1,15 @@
 import ast
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+
+from adapters.windows_window import WindowInfo
+from core.reconnect_policy import ReconnectScreenState
+from services.target_window_contract_service import ResolvedTargetWindows
+from main import (
+    auto_read_missing_role_id_once,
+    resolve_complete_reconnect_window_for_entry,
+)
 
 
 def test_main_window_uses_home_view():
@@ -169,15 +179,105 @@ def test_selected_group_plan_returns_scoped_registered_role_metadata():
 
 
 def test_role_id_read_uses_the_entry_safe_window_not_groupwide_failure():
-    source = Path("main.py").read_text(encoding="utf-8")
-    function_source = source[
-        source.index("    def unique_window_for_group_entry("):
-        source.index("    def refresh_group_sync_identity(")
-    ]
+    fingerprint = "a" * 64
+    window = WindowInfo(
+        11,
+        "Adobe Flash Player 11",
+        True,
+        False,
+        (0, 0, 900, 600),
+        101,
+        "Flash",
+        fingerprint,
+        1001,
+        100001,
+    )
+    launch_service = SimpleNamespace(
+        plan=lambda group_name: SimpleNamespace(
+            ready=True,
+            targets=(
+                SimpleNamespace(
+                    entry_id="entry-a",
+                    fingerprint=fingerprint,
+                ),
+            ),
+        )
+    )
+    target_service = SimpleNamespace(
+        reconnect_targets=lambda group_name: ResolvedTargetWindows(
+            windows=(window,),
+            sync_windows=(window,),
+            sync_entry_ids=("entry-a",),
+            sync_scope_entry_ids=("entry-a",),
+            sync_controller_entry_id="entry-a",
+        )
+    )
 
-    assert "target_window_contract_service.snapshot(" in function_source
-    assert "and item.safe" in function_source
-    assert "if snapshot.failure_codes:" not in function_source
+    assert resolve_complete_reconnect_window_for_entry(
+        "測試組",
+        "entry-a",
+        launch_service,
+        target_service,
+    ) is window
+
+
+def test_role_id_resolver_requires_current_entry_pair_and_safe_contract():
+    fingerprint = "f" * 64
+    window = WindowInfo(
+        21,
+        "Adobe Flash Player 11",
+        True,
+        False,
+        (0, 0, 900, 600),
+        201,
+        "Flash",
+        fingerprint,
+        2001,
+        200001,
+    )
+    launch_service = SimpleNamespace(
+        plan=lambda _group_name: SimpleNamespace(
+            ready=True,
+            targets=(
+                SimpleNamespace(entry_id="entry-a", fingerprint=fingerprint),
+            ),
+        )
+    )
+    contracts = (
+        ResolvedTargetWindows(
+            windows=(window,),
+            sync_windows=(window,),
+            sync_entry_ids=("entry-b",),
+            sync_scope_entry_ids=("entry-a", "entry-b"),
+            sync_controller_entry_id="entry-a",
+        ),
+        ResolvedTargetWindows(
+            windows=(window,),
+            sync_windows=(window,),
+            sync_entry_ids=("entry-a",),
+            sync_scope_entry_ids=("entry-a",),
+            sync_controller_entry_id="entry-a",
+            global_failure_codes=("target_window_provider_failed",),
+        ),
+        ResolvedTargetWindows(
+            windows=(window,),
+            sync_windows=(replace(window, process_id=202),),
+            sync_entry_ids=("entry-a",),
+            sync_scope_entry_ids=("entry-a",),
+            sync_controller_entry_id="entry-a",
+        ),
+    )
+
+    for contract in contracts:
+        target_service = SimpleNamespace(
+            reconnect_targets=lambda _group_name, value=contract: value
+        )
+        assert resolve_complete_reconnect_window_for_entry(
+            "測試組",
+            "entry-a",
+            launch_service,
+            target_service,
+        ) is None
 
 
 def test_role_id_calibration_uses_only_the_visible_game_text():
@@ -193,21 +293,265 @@ def test_role_id_calibration_uses_only_the_visible_game_text():
 
 
 def test_role_id_is_automatically_read_only_for_connected_missing_roles():
-    source = Path("main.py").read_text(encoding="utf-8")
-    function_source = source[
-        source.index("    def auto_read_missing_role_id("):
-        source.index("    player_habit_reminder_service = (")
-    ]
+    fingerprint = "b" * 64
+    window = WindowInfo(
+        11,
+        "Adobe Flash Player 11",
+        True,
+        False,
+        (0, 0, 900, 600),
+        101,
+        "Flash",
+        fingerprint,
+        1001,
+        100001,
+    )
+    entry = SimpleNamespace(entry_id="entry-a", role_id="")
 
-    assert "if not entry.role_id.strip()" in function_source
-    assert "window_info is None or window_info.minimized" in function_source
-    assert "screen_state is not ReconnectScreenState.CONNECTED" in function_source
-    assert "role_id_template_service.read_if_missing(" in function_source
-    assert "existing_role_id=entry.role_id" in function_source
-    assert "group_configuration_service.set_role_id(" in function_source
-    assert "entry.display_name" not in function_source
-    assert "window.after(" in function_source
-    assert "window.after_cancel(role_id_auto_read_id)" in source
+    class _Configuration:
+        def __init__(self) -> None:
+            self.set_calls = []
+
+        def group(self, group_name):
+            return SimpleNamespace(entries=(entry,))
+
+        def set_role_id(self, group_name, entry_id, role_id):
+            self.set_calls.append((group_name, entry_id, role_id))
+            entry.role_id = role_id
+            return True
+
+    class _Controller:
+        def __init__(self) -> None:
+            self.observed = []
+
+        def observe_screen_states(self, fingerprints, *, candidate_windows):
+            self.observed.append((fingerprints, candidate_windows))
+            return {fingerprint: ReconnectScreenState.CONNECTED}
+
+    configuration = _Configuration()
+    controller = _Controller()
+    launch_service = SimpleNamespace(
+        plan=lambda group_name: SimpleNamespace(
+            ready=True,
+            targets=(
+                SimpleNamespace(
+                    entry_id="entry-a",
+                    fingerprint=fingerprint,
+                ),
+            ),
+        )
+    )
+    target_service = SimpleNamespace(
+        reconnect_targets=lambda group_name: ResolvedTargetWindows(
+            windows=(window,),
+            sync_windows=(window,),
+            sync_entry_ids=("entry-a",),
+            sync_scope_entry_ids=("entry-a",),
+            sync_controller_entry_id="entry-a",
+        )
+    )
+    class _RoleIdService:
+        def __init__(self) -> None:
+            self.read_calls = []
+
+        def read_if_missing(self, handle, *, existing_role_id):
+            self.read_calls.append((handle, existing_role_id))
+            return SimpleNamespace(success=True, role_id="原角色")
+
+    role_id_service = _RoleIdService()
+    refreshed = []
+
+    assert auto_read_missing_role_id_once(
+        "測試組",
+        "entry-a",
+        configuration,
+        launch_service,
+        target_service,
+        role_id_service,
+        controller,
+        refresh=lambda: refreshed.append(True),
+    ) is True
+    assert controller.observed == [
+        ((fingerprint,), (window,)),
+        ((fingerprint,), (window,)),
+    ]
+    assert role_id_service.read_calls == [(window.handle, "")]
+    assert configuration.set_calls == [("測試組", "entry-a", "原角色")]
+    assert refreshed == [True]
+
+
+def test_role_id_auto_read_rechecks_blank_before_persisting():
+    fingerprint = "c" * 64
+    window = WindowInfo(
+        12,
+        "Adobe Flash Player 11",
+        True,
+        False,
+        (0, 0, 900, 600),
+        102,
+        "Flash",
+        fingerprint,
+        1002,
+        100002,
+    )
+    entry = SimpleNamespace(entry_id="entry-c", role_id="")
+
+    class _Configuration:
+        def __init__(self) -> None:
+            self.set_calls = []
+
+        def group(self, group_name):
+            return SimpleNamespace(entries=(entry,))
+
+        def set_role_id(self, group_name, entry_id, role_id):
+            self.set_calls.append((group_name, entry_id, role_id))
+            return True
+
+    class _RoleIdService:
+        def read_if_missing(self, handle, *, existing_role_id):
+            entry.role_id = "已由其他流程保存"
+            return SimpleNamespace(success=True, role_id="錯誤覆蓋")
+
+    configuration = _Configuration()
+    refreshed = []
+    assert auto_read_missing_role_id_once(
+        "測試組",
+        "entry-c",
+        configuration,
+        SimpleNamespace(
+            plan=lambda group_name: SimpleNamespace(
+                ready=True,
+                targets=(
+                    SimpleNamespace(
+                        entry_id="entry-c",
+                        fingerprint=fingerprint,
+                    ),
+                ),
+            )
+        ),
+        SimpleNamespace(
+            reconnect_targets=lambda group_name: ResolvedTargetWindows(
+                windows=(window,),
+                sync_windows=(window,),
+                sync_entry_ids=("entry-c",),
+                sync_scope_entry_ids=("entry-c",),
+                sync_controller_entry_id="entry-c",
+            )
+        ),
+        _RoleIdService(),
+        SimpleNamespace(
+            observe_screen_states=lambda fingerprints, *, candidate_windows: {
+                fingerprint: ReconnectScreenState.CONNECTED
+            }
+        ),
+        refresh=lambda: refreshed.append(True),
+    ) is False
+    assert configuration.set_calls == []
+    assert refreshed == []
+
+
+def test_role_id_auto_read_never_persists_after_contract_identity_changes():
+    fingerprint = "d" * 64
+    original = WindowInfo(
+        13,
+        "Adobe Flash Player 11",
+        True,
+        False,
+        (0, 0, 900, 600),
+        103,
+        "Flash",
+        fingerprint,
+        1003,
+        100003,
+    )
+    cases = {
+        "token": (
+            replace(original, process_id=104, process_lifecycle_token=100004),
+            ("entry-a", fingerprint),
+            ReconnectScreenState.CONNECTED,
+        ),
+        "entry": (
+            original,
+            ("entry-b", fingerprint),
+            ReconnectScreenState.CONNECTED,
+        ),
+        "fingerprint": (
+            replace(original, launch_fingerprint="e" * 64),
+            ("entry-a", "e" * 64),
+            ReconnectScreenState.CONNECTED,
+        ),
+        "connected": (
+            original,
+            ("entry-a", fingerprint),
+            ReconnectScreenState.UNKNOWN,
+        ),
+    }
+    for _name, (refreshed, refreshed_target, final_state) in cases.items():
+        entry = SimpleNamespace(entry_id="entry-a", role_id="")
+        set_calls = []
+        resolutions = iter((original, refreshed))
+        contract_entries = iter(("entry-a", refreshed_target[0]))
+        plans = iter((
+            ("entry-a", fingerprint),
+            refreshed_target,
+        ))
+
+        configuration = SimpleNamespace(
+            group=lambda _group_name: SimpleNamespace(entries=(entry,)),
+            set_role_id=lambda *args: set_calls.append(args) or True,
+        )
+        def plan(group_name):
+            next_plan = next(plans)
+            return SimpleNamespace(
+                ready=True,
+                targets=(
+                    SimpleNamespace(
+                        entry_id=next_plan[0],
+                        fingerprint=next_plan[1],
+                    ),
+                ),
+            )
+
+        launch_service = SimpleNamespace(plan=plan)
+
+        def reconnect_targets(_group_name):
+            resolved = next(resolutions)
+            paired_entry = next(contract_entries)
+            return ResolvedTargetWindows(
+                windows=(resolved,),
+                sync_windows=(resolved,),
+                sync_entry_ids=(paired_entry,),
+                sync_scope_entry_ids=(paired_entry,),
+                sync_controller_entry_id=paired_entry,
+            )
+
+        target_service = SimpleNamespace(reconnect_targets=reconnect_targets)
+        observed_states = iter((ReconnectScreenState.CONNECTED, final_state))
+        controller = SimpleNamespace(
+            observe_screen_states=lambda fingerprints, *, candidate_windows: {
+                fingerprint: next(observed_states)
+                for fingerprint in fingerprints
+            }
+        )
+        reads = []
+        role_id_service = SimpleNamespace(
+            read_if_missing=lambda handle, *, existing_role_id: (
+                reads.append((handle, existing_role_id))
+                or SimpleNamespace(success=True, role_id="原角色")
+            )
+        )
+
+        assert auto_read_missing_role_id_once(
+            "測試組",
+            "entry-a",
+            configuration,
+            launch_service,
+            target_service,
+            role_id_service,
+            controller,
+        ) is False
+        assert reads == [(original.handle, "")]
+        assert set_calls == []
 
 
 def test_cancelled_bulk_shortcut_selection_has_no_side_effects():

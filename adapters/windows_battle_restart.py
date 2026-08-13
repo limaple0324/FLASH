@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import time
+from collections import Counter
 from dataclasses import dataclass
 from ctypes import wintypes
 from typing import Callable, Iterable, Protocol
@@ -14,20 +15,15 @@ from adapters.windows_launch_fingerprint import (
     ShortcutFingerprintResolver,
     normalize_launch_fingerprint,
 )
-from adapters.windows_window import WindowBackend, WindowInfo
+from adapters.windows_window import (
+    WindowBackend,
+    WindowInfo,
+    complete_window_instance_identity,
+)
 from services.group_launch_service import GroupLaunchTarget
 
 
-WindowInstanceIdentity = tuple[
-    int,
-    int,
-    int,
-    str,
-    tuple[int, int, int, int],
-    bool,
-    int,
-    str,
-]
+WindowInstanceIdentity = tuple[object, ...]
 WindowInstanceIdentityProvider = Callable[
     [int],
     WindowInstanceIdentity | None,
@@ -247,73 +243,71 @@ class WindowsBattleWindowRestarter:
         self._monotonic_clock = monotonic_clock
         self._sleeper = sleeper
 
-    def restart(
+    def close_verified(
         self,
         window: WindowInfo,
-        target: GroupLaunchTarget,
+        candidate_windows: Iterable[WindowInfo],
+        *,
+        deadline: float | None = None,
     ) -> BattleRestartResult:
-        fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
-        expected_identity = self._window_instance_identity(window)
-        if expected_identity is None or fingerprint != target.fingerprint:
-            return BattleRestartResult(
-                False,
-                "battle_window_identity_invalid",
-            )
+        """Close one exact member of a static, current contract collection.
 
+        The controller owns the semantic before/after contract transition.  At
+        this native boundary we only accept the exact complete collection it
+        already resolved, then re-enumerate immediately before WM_CLOSE.
+        """
+
+        expected_identity = self._window_instance_identity(window)
+        if expected_identity is None:
+            return BattleRestartResult(False, "battle_window_identity_invalid")
+        try:
+            expected_candidates = tuple(candidate_windows)
+        except Exception:
+            return BattleRestartResult(False, "battle_window_enumeration_failed")
+        if self._candidate_collection_failure(
+            expected_candidates,
+            expected_candidates,
+        ) is not None:
+            return BattleRestartResult(False, "battle_contract_identity_changed")
+        if not self._deadline_current(deadline):
+            return BattleRestartResult(False, "tcp_reconnect_timeout")
         try:
             candidates = self._live_candidate_windows()
         except Exception:
-            return BattleRestartResult(
-                False,
-                "battle_window_enumeration_failed",
-            )
-        failure_code = self._candidate_collection_failure(candidates)
+            return BattleRestartResult(False, "battle_window_enumeration_failed")
+        failure_code = self._candidate_collection_failure(
+            candidates,
+            expected_candidates,
+        )
         if failure_code is not None:
             return BattleRestartResult(False, failure_code)
-        exact = tuple(
-            candidate
-            for candidate in candidates
-            if self._window_instance_identity(candidate) == expected_identity
-        )
-        if len(exact) != 1:
-            return BattleRestartResult(
-                False,
-                "battle_window_identity_changed",
-            )
+        if not self._identity_occurs_once(expected_identity, candidates):
+            return BattleRestartResult(False, "battle_window_identity_changed")
         if not self._close_backend.is_window(window.handle):
-            return BattleRestartResult(
-                False,
-                "battle_window_missing",
-            )
-        # IsWindow proves only that an HWND currently exists. Re-enumerate
-        # after that probe and immediately before WM_CLOSE so a handle reused
-        # by another process/thread/window instance is never closed.
+            return BattleRestartResult(False, "battle_window_missing")
         try:
             final_candidates = self._live_candidate_windows()
         except Exception:
-            return BattleRestartResult(
-                False,
-                "battle_window_enumeration_failed",
-            )
-        failure_code = self._candidate_collection_failure(final_candidates)
+            return BattleRestartResult(False, "battle_window_enumeration_failed")
+        failure_code = self._candidate_collection_failure(
+            final_candidates,
+            expected_candidates,
+        )
         if failure_code is not None:
             return BattleRestartResult(False, failure_code)
-        final_exact = tuple(
-            candidate
-            for candidate in final_candidates
-            if self._window_instance_identity(candidate) == expected_identity
-        )
-        if len(final_exact) != 1:
-            return BattleRestartResult(
-                False,
-                "battle_window_identity_changed",
-            )
+        if not self._identity_occurs_once(expected_identity, final_candidates):
+            return BattleRestartResult(False, "battle_window_identity_changed")
+        if not self._deadline_current(deadline):
+            return BattleRestartResult(False, "tcp_reconnect_timeout")
         try:
             closed, close_failure = (
                 self._close_backend.close_window_if_instance_matches(
                     window.handle,
                     expected_identity,
-                    self._current_window_instance_identity,
+                    lambda handle: self._current_window_instance_identity(
+                        handle,
+                        expected_candidates,
+                    ),
                 )
             )
         except Exception:
@@ -325,132 +319,98 @@ class WindowsBattleWindowRestarter:
                 close_failure or "battle_window_close_failed",
             )
 
-        deadline = self._monotonic_clock() + self._close_timeout_seconds
+        close_deadline = self._monotonic_clock() + self._close_timeout_seconds
         while self._close_backend.is_window(window.handle):
-            if self._monotonic_clock() >= deadline:
+            if not self._deadline_current(deadline):
+                return BattleRestartResult(
+                    False,
+                    "tcp_reconnect_timeout",
+                    window_closed=True,
+                )
+            if self._monotonic_clock() >= close_deadline:
                 return BattleRestartResult(
                     False,
                     "battle_window_close_timeout",
+                    window_closed=True,
                 )
             self._sleeper(self._poll_seconds)
-
-        # A self-reopening player may need several scheduler turns after
-        # WM_CLOSE. Require the target to remain safely absent for a bounded
-        # interval before authorizing a new shortcut.
-        failure_code = self._stable_target_absence_failure(
-            target,
-            ignored_closed_handle=window.handle,
-        )
-        if failure_code is not None:
-            return BattleRestartResult(
-                False,
-                failure_code,
-                window_closed=True,
-            )
-        try:
-            opened, open_failure = (
-                self._open_backend.open_shortcut_if_target_absent(
-                    target,
-                    lambda: self._live_target_failure(
-                        target,
-                        ignored_closed_handle=window.handle,
-                    ),
-                )
-            )
-        except Exception:
-            opened = False
-            open_failure = "battle_shortcut_open_failed"
-        if not opened:
-            return BattleRestartResult(
-                False,
-                open_failure or "battle_shortcut_open_failed",
-                window_closed=True,
-            )
-        return BattleRestartResult(
-            True,
-            window_closed=True,
-            shortcut_open_requested=True,
-        )
+        return BattleRestartResult(True, window_closed=True)
 
     @staticmethod
     def _window_instance_identity(
         window: WindowInfo,
     ) -> WindowInstanceIdentity | None:
-        fingerprint = normalize_launch_fingerprint(
-            window.launch_fingerprint
-        )
-        if (
-            not isinstance(window.handle, int)
-            or isinstance(window.handle, bool)
-            or window.handle <= 0
-            or not isinstance(window.process_id, int)
-            or isinstance(window.process_id, bool)
-            or window.process_id <= 0
-            or not isinstance(window.thread_id, int)
-            or isinstance(window.thread_id, bool)
-            or window.thread_id <= 0
-            or not isinstance(window.window_class, str)
-            or not window.window_class.strip()
-            or not isinstance(window.process_lifecycle_token, int)
-            or isinstance(window.process_lifecycle_token, bool)
-            or window.process_lifecycle_token <= 0
-            or not isinstance(window.rect, tuple)
-            or len(window.rect) != 4
-            or any(
-                not isinstance(value, int) or isinstance(value, bool)
-                for value in window.rect
-            )
-            or window.rect[2] <= window.rect[0]
-            or window.rect[3] <= window.rect[1]
-            or type(window.minimized) is not bool
-            or fingerprint is None
-        ):
-            return None
-        return (
-            window.handle,
-            window.process_id,
-            window.thread_id,
-            window.window_class,
-            window.rect,
-            window.minimized,
-            window.process_lifecycle_token,
-            fingerprint,
-        )
+        return complete_window_instance_identity(window)
+
+    def _deadline_current(self, deadline: float | None) -> bool:
+        return deadline is None or self._monotonic_clock() < deadline
+
+    @classmethod
+    def _identity_occurs_once(
+        cls,
+        identity: WindowInstanceIdentity,
+        candidates: Iterable[WindowInfo],
+    ) -> bool:
+        return sum(
+            cls._window_instance_identity(candidate) == identity
+            for candidate in candidates
+        ) == 1
 
     @classmethod
     def _candidate_collection_failure(
         cls,
         candidates: tuple[WindowInfo, ...],
+        expected_candidates: tuple[WindowInfo, ...],
     ) -> str | None:
-        identities = tuple(
+        """Require a full immutable collection, not a fingerprint allowlist."""
+
+        actual_identities = tuple(
+            cls._window_instance_identity(candidate) for candidate in candidates
+        )
+        expected_identities = tuple(
             cls._window_instance_identity(candidate)
-            for candidate in candidates
+            for candidate in expected_candidates
         )
-        if any(identity is None for identity in identities):
-            return "battle_window_existing_state_unknown"
-        complete = tuple(
-            identity for identity in identities if identity is not None
-        )
-        handles = tuple(identity[0] for identity in complete)
-        process_ids = tuple(identity[1] for identity in complete)
-        fingerprints = tuple(identity[-1] for identity in complete)
         if (
-            len(handles) != len(set(handles))
-            or len(process_ids) != len(set(process_ids))
-            or len(fingerprints) != len(set(fingerprints))
+            any(identity is None for identity in actual_identities)
+            or any(identity is None for identity in expected_identities)
         ):
-            return "battle_window_identity_duplicate"
+            return "battle_window_existing_state_unknown"
+        actual = tuple(
+            identity for identity in actual_identities if identity is not None
+        )
+        expected = tuple(
+            identity
+            for identity in expected_identities
+            if identity is not None
+        )
+        for identities in (actual, expected):
+            handles = tuple(identity[1] for identity in identities)
+            process_ids = tuple(identity[2] for identity in identities)
+            stable_tokens = tuple(identity[:6] for identity in identities)
+            if (
+                len(handles) != len(set(handles))
+                or len(process_ids) != len(set(process_ids))
+                or len(stable_tokens) != len(set(stable_tokens))
+            ):
+                return "battle_window_identity_duplicate"
+        if Counter(actual) != Counter(expected):
+            return "battle_contract_identity_changed"
         return None
 
     def _current_window_instance_identity(
         self,
         handle: int,
+        expected_candidates: tuple[WindowInfo, ...],
     ) -> WindowInstanceIdentity | None:
         try:
             candidates = self._live_candidate_windows()
         except Exception:
             return None
-        if self._candidate_collection_failure(candidates) is not None:
+        if self._candidate_collection_failure(
+            candidates,
+            expected_candidates,
+        ) is not None:
             return None
         exact = tuple(
             candidate
@@ -465,16 +425,18 @@ class WindowsBattleWindowRestarter:
     def _missing_target_failure(
         target: GroupLaunchTarget,
         candidates: tuple[WindowInfo, ...],
+        expected_candidates: tuple[WindowInfo, ...],
     ) -> str | None:
         collection_failure = (
             WindowsBattleWindowRestarter._candidate_collection_failure(
-                candidates
+                candidates,
+                expected_candidates,
             )
         )
         if collection_failure is not None:
             return collection_failure
         fingerprints = tuple(
-            WindowsBattleWindowRestarter._window_instance_identity(window)[-1]
+            WindowsBattleWindowRestarter._window_instance_identity(window)[0]
             for window in candidates
         )
         if target.fingerprint in fingerprints:
@@ -494,29 +456,28 @@ class WindowsBattleWindowRestarter:
     def _live_target_failure(
         self,
         target: GroupLaunchTarget,
-        *,
-        ignored_closed_handle: int | None = None,
+        expected_candidates: tuple[WindowInfo, ...],
+        deadline: float | None,
     ) -> str | None:
+        if not self._deadline_current(deadline):
+            return "tcp_reconnect_timeout"
         try:
-            candidates = tuple(
-                candidate
-                for candidate in self._live_candidate_windows()
-                if (
-                    candidate.handle != ignored_closed_handle
-                    or self._close_backend.is_window(candidate.handle)
-                )
-            )
+            candidates = self._live_candidate_windows()
         except Exception:
             return "battle_window_enumeration_failed"
-        return self._missing_target_failure(target, candidates)
+        return self._missing_target_failure(
+            target,
+            candidates,
+            expected_candidates,
+        )
 
     def _stable_target_absence_failure(
         self,
         target: GroupLaunchTarget,
-        *,
-        ignored_closed_handle: int | None = None,
+        expected_candidates: tuple[WindowInfo, ...],
+        owner_deadline: float | None,
     ) -> str | None:
-        deadline = (
+        stability_deadline = (
             self._monotonic_clock() + self._absence_stability_seconds
         )
         maximum_checks = max(
@@ -530,11 +491,12 @@ class WindowsBattleWindowRestarter:
         for _check in range(maximum_checks):
             failure_code = self._live_target_failure(
                 target,
-                ignored_closed_handle=ignored_closed_handle,
+                expected_candidates,
+                owner_deadline,
             )
             if failure_code is not None:
                 return failure_code
-            remaining = deadline - self._monotonic_clock()
+            remaining = stability_deadline - self._monotonic_clock()
             if remaining <= 0:
                 return None
             self._sleeper(min(self._poll_seconds, remaining))
@@ -546,6 +508,8 @@ class WindowsBattleWindowRestarter:
         self,
         target: GroupLaunchTarget,
         candidate_windows: Iterable[WindowInfo],
+        *,
+        deadline: float | None = None,
     ) -> BattleRestartResult:
         """Retry one shortcut only after a fresh fail-closed enumeration."""
         try:
@@ -555,7 +519,9 @@ class WindowsBattleWindowRestarter:
                 False,
                 "battle_window_enumeration_failed",
             )
-        failure_code = self._missing_target_failure(target, candidates)
+        if not self._deadline_current(deadline):
+            return BattleRestartResult(False, "tcp_reconnect_timeout")
+        failure_code = self._missing_target_failure(target, candidates, candidates)
         if failure_code is not None:
             return BattleRestartResult(
                 False,
@@ -567,6 +533,8 @@ class WindowsBattleWindowRestarter:
         # self-reopens; the opener performs one more check at delivery.
         failure_code = self._stable_target_absence_failure(
             target,
+            candidates,
+            deadline,
         )
         if failure_code is not None:
             return BattleRestartResult(False, failure_code)
@@ -575,7 +543,11 @@ class WindowsBattleWindowRestarter:
             opened, open_failure = (
                 self._open_backend.open_shortcut_if_target_absent(
                     target,
-                    lambda: self._live_target_failure(target),
+                    lambda: self._live_target_failure(
+                        target,
+                        candidates,
+                        deadline,
+                    ),
                 )
             )
         except Exception:

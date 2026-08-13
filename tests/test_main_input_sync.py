@@ -1508,19 +1508,16 @@ def test_formal_deferred_gate_reobserves_connected_before_each_delivery(
         assert pointer.close() is True
 
 
-def test_build_services_wires_registered_primary_and_unique_ungrouped_shortcut(
+def test_build_services_wires_registered_roles_without_ungrouped_reconnect_path(
     tmp_path,
 ):
     build_services(root=tmp_path)
 
     reconnect = AppContext.get(WindowsSmartReconnectController)
     ungrouped = AppContext.get(UngroupedWindowService)
-    shortcut_provider = reconnect._ungrouped_shortcut_provider
 
     assert callable(reconnect._registered_role_provider)
-    assert shortcut_provider is not None
-    assert shortcut_provider.__self__ is ungrouped
-    assert shortcut_provider.__func__ is UngroupedWindowService.shortcut_for
+    assert ungrouped is not None
 
 
 def test_build_services_preserves_explicit_saved_auto_battle_off(tmp_path):

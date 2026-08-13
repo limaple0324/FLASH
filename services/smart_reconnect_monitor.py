@@ -13,7 +13,6 @@ from services.logger_service import LoggerService
 DEFAULT_SMART_RECONNECT_INTERVAL_MS = 2000
 MINIMUM_SMART_RECONNECT_INTERVAL_MS = 500
 MAXIMUM_SMART_RECONNECT_INTERVAL_MS = 60_000
-FULLY_CONNECTED_STABLE_SECONDS = 30 * 60
 RECOVERY_POLL_SECONDS = 2.0
 SMART_RECONNECT_MODE_BALANCED = "balanced"
 SMART_RECONNECT_MODE_HIGH_PERFORMANCE = "high_performance"
@@ -32,7 +31,20 @@ _RECOVERY_RESULT_CODES = frozenset(
     }
 )
 _TRANSIENT_RECOVERY_FAILURE_CODES = frozenset(
-    {"capture_failed", "screen_unknown"}
+    {
+        "capture_failed",
+        "screen_unknown",
+        "tcp_observation_unavailable",
+        "tcp_disconnect_suspected",
+        "tcp_disconnect_confirmed",
+    }
+)
+_TCP_TRANSIENT_RECOVERY_FAILURE_CODES = frozenset(
+    {
+        "tcp_observation_unavailable",
+        "tcp_disconnect_suspected",
+        "tcp_disconnect_confirmed",
+    }
 )
 
 
@@ -97,7 +109,6 @@ class SmartReconnectMonitor:
         self._last_signature: tuple[object, ...] | None = None
         self._disconnected_without_progress_at: float | None = None
         self._disconnected_without_progress_reported = False
-        self._fully_connected_stable_from: float | None = None
         self._runtime_status: str | None = None
         self._runtime_recovery_progress_at: float | None = None
         self._runtime_connected_high_watermark: int | None = None
@@ -199,7 +210,13 @@ class SmartReconnectMonitor:
             and normalized_failure_codes.issubset(
                 _TRANSIENT_RECOVERY_FAILURE_CODES
             )
-            and recent_recovery_progress
+            and (
+                bool(
+                    normalized_failure_codes
+                    & _TCP_TRANSIENT_RECOVERY_FAILURE_CODES
+                )
+                or recent_recovery_progress
+            )
         )
         is_full_health = self._is_fully_connected_healthy(result)
         next_connected_high = observed_connected_high
@@ -209,12 +226,14 @@ class SmartReconnectMonitor:
         elif safely_paused_for_rebinding:
             status = SMART_RECONNECT_STATUS_RECONNECTING
             next_progress_at = previous_progress_at
-        elif terminal_failure_codes:
-            status = SMART_RECONNECT_STATUS_FAILED
-            next_progress_at = previous_progress_at
         elif recovery_progress:
             status = SMART_RECONNECT_STATUS_RECONNECTING
             next_progress_at = now
+        elif terminal_failure_codes:
+            # A timeout diagnostic for one isolated owner must not mask a
+            # same-cycle peer restart/click/recovery that is still progressing.
+            status = SMART_RECONNECT_STATUS_FAILED
+            next_progress_at = previous_progress_at
         elif (
             safe_unknown_wait
             or transient_failure_during_recovery
@@ -262,18 +281,11 @@ class SmartReconnectMonitor:
         return True
 
     @staticmethod
-    def _safe_delay(result: OperationResult, fallback: int) -> int:
-        details = result.details
-        value = details.get("next_check_seconds") if details is not None else None
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return fallback
-        return max(1, int(value))
-
-    @staticmethod
     def _signature(result: OperationResult) -> tuple[object, ...]:
         details = result.details or {}
         state_counts = details.get("state_counts", {})
         failure_codes = details.get("failure_codes", [])
+        tcp_observation = details.get("tcp_observation", {})
         return (
             result.code,
             tuple(sorted(state_counts.items()))
@@ -284,6 +296,14 @@ class SmartReconnectMonitor:
             else (),
             details.get("clicked_windows"),
             details.get("restarted_windows"),
+            (
+                tcp_observation.get("query_succeeded"),
+                tcp_observation.get("observed_window_count"),
+                tcp_observation.get("zero_window_count"),
+                tcp_observation.get("confirmed_window_count"),
+            )
+            if isinstance(tcp_observation, Mapping)
+            else (),
         )
 
     @staticmethod
@@ -331,31 +351,11 @@ class SmartReconnectMonitor:
 
     def _recovery_poll_seconds(self) -> float:
         if self.monitor_mode == SMART_RECONNECT_MODE_HIGH_PERFORMANCE:
-            return max(1.0, self.monitor_interval_ms / 1000.0)
+            return min(
+                RECOVERY_POLL_SECONDS,
+                max(1.0, self.monitor_interval_ms / 1000.0),
+            )
         return RECOVERY_POLL_SECONDS
-
-    @staticmethod
-    def _has_open_windows(details: Mapping[str, object]) -> bool:
-        discovered = details.get("discovered_windows")
-        return (
-            isinstance(discovered, int)
-            and not isinstance(discovered, bool)
-            and discovered > 0
-        )
-
-    @staticmethod
-    def _contains_disconnected_windows(details: Mapping[str, object]) -> bool:
-        state_counts = details.get("state_counts")
-        disconnected = (
-            state_counts.get("disconnected")
-            if isinstance(state_counts, Mapping)
-            else 0
-        )
-        return (
-            isinstance(disconnected, int)
-            and not isinstance(disconnected, bool)
-            and disconnected > 0
-        )
 
     @staticmethod
     def _contains_recovery_states(details: Mapping[str, object]) -> bool:
@@ -444,33 +444,7 @@ class SmartReconnectMonitor:
         now = time.monotonic()
         self._set_runtime_status(result, now=now)
 
-        delay = self._safe_delay(result, self._fallback_delay_seconds)
-        is_full_health = self._is_fully_connected_healthy(result)
-        has_open_windows = self._has_open_windows(details)
-        recovery_interval = self._recovery_poll_seconds()
-        if self._contains_disconnected_windows(details):
-            delay = recovery_interval
-            self._fully_connected_stable_from = None
-        elif has_open_windows:
-            if is_full_health:
-                if self._fully_connected_stable_from is None:
-                    self._fully_connected_stable_from = now
-                    delay = recovery_interval
-                elif now - self._fully_connected_stable_from >= FULLY_CONNECTED_STABLE_SECONDS:
-                    if self.monitor_mode == SMART_RECONNECT_MODE_BALANCED:
-                        delay = max(
-                            float(self._fallback_delay_seconds),
-                            delay,
-                        )
-                    else:
-                        delay = recovery_interval
-                else:
-                    delay = recovery_interval
-            else:
-                self._fully_connected_stable_from = None
-                delay = recovery_interval
-        else:
-            self._fully_connected_stable_from = None
+        delay = self._recovery_poll_seconds()
         self._report_stalled_reconnect(result, details, now)
         signature = self._signature(result)
         if self._logger is not None and signature != self._last_signature:
@@ -496,6 +470,19 @@ class SmartReconnectMonitor:
                 if isinstance(state_counts, dict)
                 else ""
             )
+            tcp_observation = details.get("tcp_observation", {})
+            tcp_summary = (
+                "generation={generation}; observed_at_monotonic={observed_at}; "
+                "query_succeeded={succeeded}; observed_window_count={observed}; "
+                "zero_window_count={zero}; confirmed_window_count={confirmed}"
+            ).format(
+                generation=tcp_observation.get("generation"),
+                observed_at=tcp_observation.get("observed_at_monotonic"),
+                succeeded=tcp_observation.get("query_succeeded"),
+                observed=tcp_observation.get("observed_window_count"),
+                zero=tcp_observation.get("zero_window_count"),
+                confirmed=tcp_observation.get("confirmed_window_count"),
+            ) if isinstance(tcp_observation, Mapping) else "tcp_observation=unavailable"
             self._logger.info(
                 "Smart reconnect state changed; "
                 f"code={result.code}; "
@@ -506,7 +493,7 @@ class SmartReconnectMonitor:
                 f"restarted={details.get('restarted_windows', 0)}; "
                 f"unknown={details.get('unknown_windows', 0)}; "
                 f"failure_codes={safe_failure_codes or 'none'}; "
-                f"next_check_seconds={delay}"
+                f"next_check_seconds={delay}; {tcp_summary}"
             )
         self._last_signature = signature
         return result, delay
@@ -516,7 +503,7 @@ class SmartReconnectMonitor:
             try:
                 _result, delay = self.run_once()
             except Exception as exc:
-                delay = self._fallback_delay_seconds
+                delay = RECOVERY_POLL_SECONDS
                 with self._lock:
                     self._runtime_status = SMART_RECONNECT_STATUS_FAILED
                     self._runtime_recovery_progress_at = None

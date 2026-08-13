@@ -29,16 +29,71 @@ from services.sync_scope_service import SyncScope, SyncScopeService
 
 
 @dataclass(frozen=True, slots=True)
+class TargetFailureEvidence:
+    """One immutable, fully attributable target-local failure."""
+
+    entry_id: str
+    fingerprint: str
+    failure_codes: tuple[str, ...]
+    candidate_windows: tuple[WindowInfo, ...] = ()
+
+    def __post_init__(self) -> None:
+        entry_id = self.entry_id.strip() if isinstance(self.entry_id, str) else ""
+        fingerprint = normalize_launch_fingerprint(self.fingerprint)
+        failure_codes = tuple(
+            dict.fromkeys(
+                code.strip()
+                for code in self.failure_codes
+                if isinstance(code, str) and code.strip()
+            )
+        )
+        try:
+            candidates = tuple(self.candidate_windows)
+        except TypeError as error:
+            raise ValueError(
+                "Target failure candidates must be an immutable collection."
+            ) from error
+        identities = []
+        for candidate in candidates:
+            identity = complete_window_instance_identity(candidate)
+            if (
+                identity is None
+                or normalize_launch_fingerprint(candidate.launch_fingerprint)
+                != fingerprint
+            ):
+                raise ValueError(
+                    "Target failure candidates must have complete matching identities."
+                )
+            identities.append(identity)
+        handles = [identity[1] for identity in identities]
+        process_ids = [identity[2] for identity in identities]
+        stable_tokens = [identity[:6] for identity in identities]
+        if (
+            not entry_id
+            or fingerprint is None
+            or not failure_codes
+            or len(handles) != len(set(handles))
+            or len(process_ids) != len(set(process_ids))
+            or len(stable_tokens) != len(set(stable_tokens))
+        ):
+            raise ValueError("Target failure evidence must be fully attributable.")
+        object.__setattr__(self, "entry_id", entry_id)
+        object.__setattr__(self, "fingerprint", fingerprint)
+        object.__setattr__(self, "failure_codes", failure_codes)
+        object.__setattr__(self, "candidate_windows", candidates)
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedTargetWindows:
-    """Safe open windows plus aggregate isolation evidence."""
+    """Safe open windows with immutable local and global failure evidence."""
 
     windows: tuple[WindowInfo, ...]
-    failure_codes: tuple[str, ...] = ()
-    blocked_fingerprints: frozenset[str] = frozenset()
     sync_windows: tuple[WindowInfo, ...] = ()
     sync_entry_ids: tuple[str, ...] = ()
     sync_scope_entry_ids: tuple[str, ...] = ()
     sync_controller_entry_id: str | None = None
+    target_failure_evidence: tuple[TargetFailureEvidence, ...] = ()
+    global_failure_codes: tuple[str, ...] = ()
 
 
 class TargetWindowContractService:
@@ -170,6 +225,11 @@ class TargetWindowContractService:
         *,
         expanded_sync_scope: bool = True,
         _resolved_scope: tuple[tuple[object, ...], SyncScope] | None = None,
+        _window_observation: tuple[
+            tuple[WindowInfo, ...],
+            int | None,
+            bool,
+        ] | None = None,
     ) -> TargetWindowSnapshot:
         if not isinstance(group_name, str) or not group_name.strip():
             return TargetWindowSnapshot(
@@ -219,12 +279,18 @@ class TargetWindowContractService:
             selected_ids = tuple(entry.entry_id for entry in group.entries)
             snapshot_failures = scope.failure_codes
 
-        try:
-            windows = tuple(self._window_backend.list_windows())
-            foreground_handle = self._window_backend.foreground_handle()
-        except Exception:
-            windows = ()
-            foreground_handle = None
+        if _window_observation is None:
+            try:
+                windows = tuple(self._window_backend.list_windows())
+                foreground_handle = self._window_backend.foreground_handle()
+                observation_failed = False
+            except Exception:
+                windows = ()
+                foreground_handle = None
+                observation_failed = True
+        else:
+            windows, foreground_handle, observation_failed = _window_observation
+        if observation_failed:
             snapshot_failures = tuple(
                 dict.fromkeys((*snapshot_failures, "window_enumeration_failed"))
             )
@@ -376,15 +442,33 @@ class TargetWindowContractService:
                 ),
             )
         )
+        try:
+            window_observation = (
+                tuple(self._window_backend.list_windows()),
+                self._window_backend.foreground_handle(),
+                False,
+            )
+        except Exception:
+            window_observation = ((), None, True)
         snapshot = self.snapshot(
             group_name,
             expanded_sync_scope=expanded_sync_scope,
             _resolved_scope=(resolved_scope if normalized_group_name else None),
+            _window_observation=window_observation,
         )
-        failures = list(snapshot.failure_codes)
-        for target in snapshot.targets:
-            failures.extend(target.failure_codes)
         scope = resolved_scope[1]
+        windows_by_fingerprint: dict[str, list[WindowInfo]] = {}
+        for window in window_observation[0]:
+            if not all(
+                keyword in window.title.casefold()
+                for keyword in self._title_keywords
+            ):
+                continue
+            fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
+            if fingerprint is not None:
+                windows_by_fingerprint.setdefault(fingerprint, []).append(window)
+        global_failures = list(snapshot.failure_codes)
+        target_failures: list[TargetFailureEvidence] = []
         safe_pairs: list[tuple[str, WindowInfo, str]] = []
         scoped_resolution = (
             scope.ready
@@ -392,6 +476,30 @@ class TargetWindowContractService:
         )
         if scoped_resolution:
             for entry_id, target in zip(scope.entry_ids, snapshot.targets):
+                failure_codes = tuple(target.failure_codes)
+                fingerprint = normalize_launch_fingerprint(target.fingerprint)
+                if failure_codes:
+                    if fingerprint is None:
+                        # Without a complete normalized fingerprint, this
+                        # cannot be attributed to one target safely.
+                        global_failures.extend(failure_codes)
+                    else:
+                        try:
+                            target_failures.append(
+                                TargetFailureEvidence(
+                                    entry_id,
+                                    fingerprint,
+                                    failure_codes,
+                                    tuple(
+                                        windows_by_fingerprint.get(
+                                            fingerprint,
+                                            (),
+                                        )
+                                    ),
+                                )
+                            )
+                        except ValueError:
+                            global_failures.extend(failure_codes)
                 window = self._safe_window_for_target(target)
                 if window is None:
                     continue
@@ -401,6 +509,88 @@ class TargetWindowContractService:
                 if monitor_fingerprint is None:
                     continue
                 safe_pairs.append((entry_id, window, monitor_fingerprint))
+        else:
+            # A target failure is only local when the same scope proves its
+            # entry binding.  A partial or changed scope is a global denial.
+            for target in snapshot.targets:
+                global_failures.extend(target.failure_codes)
+
+        if scoped_resolution:
+            # A shared launcher is safe only when every raw candidate can be
+            # attributed to exactly one entry.  A confirmed registry mapping
+            # may choose one sibling, but it may not silently discard another.
+            safe_candidate_identities = {
+                identity
+                for _entry_id, window, _monitor_fingerprint in safe_pairs
+                if (
+                    identity := complete_window_instance_identity(window)
+                ) is not None
+            }
+            filtered_failures: list[TargetFailureEvidence] = []
+            for evidence in target_failures:
+                candidates = tuple(
+                    candidate
+                    for candidate in evidence.candidate_windows
+                    if complete_window_instance_identity(candidate)
+                    not in safe_candidate_identities
+                )
+                if evidence.candidate_windows and not candidates:
+                    global_failures.extend(evidence.failure_codes)
+                    global_failures.append("target_failure_unattributed")
+                    continue
+                if candidates == evidence.candidate_windows:
+                    filtered_failures.append(evidence)
+                    continue
+                try:
+                    filtered_failures.append(
+                        TargetFailureEvidence(
+                            evidence.entry_id,
+                            evidence.fingerprint,
+                            evidence.failure_codes,
+                            candidates,
+                        )
+                    )
+                except ValueError:
+                    global_failures.extend(evidence.failure_codes)
+                    global_failures.append("target_failure_unattributed")
+            target_failures = filtered_failures
+            attributed_candidates: dict[
+                tuple[object, ...],
+                set[str],
+            ] = {}
+            for entry_id, window, _monitor_fingerprint in safe_pairs:
+                identity = complete_window_instance_identity(window)
+                if identity is not None:
+                    attributed_candidates.setdefault(identity, set()).add(entry_id)
+            for evidence in target_failures:
+                for window in evidence.candidate_windows:
+                    identity = complete_window_instance_identity(window)
+                    if identity is not None:
+                        attributed_candidates.setdefault(identity, set()).add(
+                            evidence.entry_id
+                        )
+            scoped_fingerprints = {
+                fingerprint
+                for target in snapshot.targets
+                if (
+                    fingerprint := normalize_launch_fingerprint(
+                        target.fingerprint
+                    )
+                ) is not None
+            }
+            for fingerprint, candidates in windows_by_fingerprint.items():
+                if fingerprint not in scoped_fingerprints:
+                    global_failures.append("unattributed_candidate_window")
+                    continue
+                for candidate in candidates:
+                    identity = complete_window_instance_identity(candidate)
+                    owners = (
+                        attributed_candidates.get(identity, set())
+                        if identity is not None
+                        else set()
+                    )
+                    if len(owners) != 1:
+                        global_failures.append("unattributed_candidate_window")
 
         if safe_pairs:
             handles = Counter(window.handle for _entry, window, _id in safe_pairs)
@@ -426,54 +616,34 @@ class TargetWindowContractService:
                 )
             }
             if conflicts:
-                failures.append("window_identity_duplicate")
+                # A collision crosses entry boundaries, so no controller may
+                # infer which target owns either identity.
+                global_failures.append("window_identity_duplicate")
             safe_pairs = [
                 item for item in safe_pairs if item[0] not in conflicts
             ]
 
         if scoped_resolution:
             windows = tuple(window for _entry, window, _id in safe_pairs)
-            controller_is_safe = any(
-                entry_id == scope.controller_entry_id
-                for entry_id, _window, _identity in safe_pairs
+            # Preserve every independently safe entry/window pair for
+            # reconnect.  Basic input sync still rejects this partial list in
+            # resolve_complete_sync_instance_windows when its controller entry
+            # is absent, but one unsafe controller must not erase a safe
+            # follower's TCP identity proof.
+            sync_windows = tuple(
+                replace(window, launch_fingerprint=monitor_fingerprint)
+                for _entry, window, monitor_fingerprint in safe_pairs
             )
-            if controller_is_safe:
-                sync_windows = tuple(
-                    replace(window, launch_fingerprint=monitor_fingerprint)
-                    for _entry, window, monitor_fingerprint in safe_pairs
-                )
-                sync_entry_ids = tuple(
-                    entry_id for entry_id, _window, _id in safe_pairs
-                )
-            else:
-                sync_windows = ()
-                sync_entry_ids = ()
+            sync_entry_ids = tuple(
+                entry_id for entry_id, _window, _id in safe_pairs
+            )
         else:
             windows = self._safe_windows(snapshot)
             sync_windows = ()
             sync_entry_ids = ()
 
-        safe_source_fingerprints = {
-            fingerprint
-            for window in windows
-            if (
-                fingerprint := normalize_launch_fingerprint(
-                    window.launch_fingerprint
-                )
-            ) is not None
-        }
-        blocked_fingerprints = frozenset(
-            target.fingerprint
-            for target in snapshot.targets
-            if target.fingerprint is not None
-            and target.failure_codes
-            and target.failure_codes != ("window_offline",)
-            and target.fingerprint not in safe_source_fingerprints
-        )
         return ResolvedTargetWindows(
             windows=windows,
-            failure_codes=tuple(dict.fromkeys(failures)),
-            blocked_fingerprints=blocked_fingerprints,
             sync_windows=sync_windows,
             sync_entry_ids=sync_entry_ids,
             sync_scope_entry_ids=(
@@ -482,6 +652,8 @@ class TargetWindowContractService:
             sync_controller_entry_id=(
                 scope.controller_entry_id if scope.ready else None
             ),
+            target_failure_evidence=tuple(target_failures),
+            global_failure_codes=tuple(dict.fromkeys(global_failures)),
         )
 
     @staticmethod
