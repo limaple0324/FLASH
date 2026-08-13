@@ -1452,10 +1452,6 @@ def build_services(
         SmartReconnectCaptureSettingsService,
         smart_reconnect_capture_settings_service,
     )
-    AppContext.register(
-        DataContractMigrationService,
-        data_contract_migration_service,
-    )
     AppContext.register(BackgroundImageService, background_image_service)
     AppContext.register(
         FeatureCardLayoutService,
@@ -1474,15 +1470,6 @@ def build_services(
     AppContext.register(WindowRegistryStore, registry_store)
     AppContext.register(WindowRegistry, registry)
     AppContext.register(CharacterStore, character_store)
-    AppContext.register(CharacterGameDataStore, character_game_data_store)
-    AppContext.register(
-        CharacterGameDataUpdateService,
-        character_game_data_update_service,
-    )
-    AppContext.register(
-        CharacterGameDataViewService,
-        character_game_data_view_service,
-    )
     AppContext.register(CharacterViewService, character_view_service)
     AppContext.register(CharacterDetailViewService, character_detail_view_service)
     AppContext.register(CharacterNoteService, character_note_service)
@@ -1512,16 +1499,11 @@ def build_services(
     AppContext.register(RoleIdTemplateService, role_id_template_service)
     AppContext.register(ActivityProgressStore, progress_store)
     AppContext.register(ActivityProgressService, progress_service)
-    AppContext.register(ActivityScheduleCatalog, activity_schedule_catalog)
     AppContext.register(
         ActivityDescriptionService,
         activity_description_service,
     )
     AppContext.register(ActivityScheduleViewService, activity_schedule_view_service)
-    AppContext.register(DecisionService, decision_service)
-    AppContext.register(ActivityOrderHabitStore, activity_order_habit_store)
-    AppContext.register(ActivityOrderHabitService, activity_order_habit_service)
-    AppContext.register(PlayerHabitStore, player_habit_store)
     AppContext.register(PlayerHabitPreferenceService, player_habit_service)
     AppContext.register(WorkspaceService, workspace_service)
     AppContext.register(CardHistoryStore, card_history_store)
@@ -1795,8 +1777,6 @@ def build_services(
             ),
         )
     )
-    AppContext.register(SyncConflictArbiter, sync_conflict_arbiter)
-
     AppContext.register(
         WindowsInputSyncController,
         WindowsInputSyncController.for_real_windows(

@@ -8,8 +8,6 @@ from decision.models import (
 )
 from decision.service import DecisionService
 from domain.character import CharacterImportance
-from main import build_services
-from services.app_context import AppContext
 
 
 def _candidate(candidate_id: str, **changes) -> DecisionCandidate:
@@ -212,9 +210,3 @@ def test_same_layer_sort_is_time_then_character_importance_then_stable_id():
         "reserve-soon",
         "secondary-later",
     ]
-
-
-def test_build_services_registers_decision_service(tmp_path):
-    build_services(root=tmp_path)
-
-    assert isinstance(AppContext.get(DecisionService), DecisionService)

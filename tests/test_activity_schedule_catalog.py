@@ -97,10 +97,8 @@ def test_mystery_examiner_is_one_shared_daily_subject():
 def test_build_services_registers_catalog_and_all_progress_definitions(tmp_path):
     build_services(root=tmp_path)
 
-    catalog = AppContext.get(ActivityScheduleCatalog)
     progress = AppContext.get(ActivityProgressService)
 
-    assert isinstance(catalog, ActivityScheduleCatalog)
     assert progress.definition("mystery-examiner").max_completions == 1
     assert progress.definition("magic-soldiers").name == "魔兵降臨"
 

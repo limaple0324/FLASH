@@ -309,8 +309,6 @@ def test_settings_view_exposes_editable_preference_values(tmp_path) -> None:
 def test_build_services_registers_player_habit_store_and_service(tmp_path) -> None:
     paths, _logger = build_services(root=tmp_path)
 
-    store = AppContext.get(PlayerHabitStore)
     service = AppContext.get(PlayerHabitPreferenceService)
 
-    assert store.path == paths.data_dir() / PLAYER_HABIT_FILENAME
-    assert service.store is store
+    assert service.store.path == paths.data_dir() / PLAYER_HABIT_FILENAME

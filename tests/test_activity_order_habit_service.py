@@ -4,7 +4,6 @@ from habit.models import HabitReviewState
 from habit.service import ActivityOrderHabitService
 from habit.store import ActivityOrderHabitStore
 from main import ACTIVITY_ORDER_HABIT_FILENAME, build_services
-from services.app_context import AppContext
 
 
 def _service(tmp_path) -> ActivityOrderHabitService:
@@ -111,11 +110,21 @@ def test_remove_observation_supports_player_correction(tmp_path):
     assert service.snapshot().observations == ()
 
 
-def test_build_services_registers_managed_habit_store_and_service(tmp_path):
-    paths, _logger = build_services(root=tmp_path)
+def test_build_services_loads_managed_activity_order_habits(
+    tmp_path,
+    monkeypatch,
+):
+    loaded_paths = []
+    original_load = ActivityOrderHabitStore.load
 
-    store = AppContext.get(ActivityOrderHabitStore)
-    service = AppContext.get(ActivityOrderHabitService)
+    def record_load(store):
+        loaded_paths.append(store.path)
+        return original_load(store)
 
-    assert store.path == paths.data_dir() / ACTIVITY_ORDER_HABIT_FILENAME
-    assert service.store is store
+    monkeypatch.setattr(ActivityOrderHabitStore, "load", record_load)
+
+    build_services(root=tmp_path)
+
+    assert loaded_paths == [
+        tmp_path / "data" / ACTIVITY_ORDER_HABIT_FILENAME
+    ]

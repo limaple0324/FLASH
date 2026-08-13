@@ -217,4 +217,4 @@ def test_build_services_registers_coordinator_with_shared_services(tmp_path):
 
     assert coordinator.cards is AppContext.get(CardService)
     assert coordinator.history is AppContext.get(CardHistoryService)
-    assert coordinator.decision_service is AppContext.get(DecisionService)
+    assert isinstance(coordinator.decision_service, DecisionService)
