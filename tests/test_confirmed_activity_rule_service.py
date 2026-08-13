@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -254,7 +255,10 @@ def test_fantasy_training_pauses_only_for_game_close_and_uses_collection_day_cou
         != ConfirmedActivityKind.FANTASY_TRAINING.value
         for card in cards.cards
     )
-    assert service.fantasy_collection_count("role-120", at.date()) == 1
+    saved = json.loads(
+        (tmp_path / "confirmed.json").read_text(encoding="utf-8")
+    )
+    assert saved["fantasy_collections"][f"role-120:{at.date().isoformat()}"] == 1
 
     for index in (2, 3):
         started_at = at + timedelta(minutes=40 + index * 20)
@@ -651,7 +655,10 @@ def test_restart_keeps_timers_daily_results_counts_current_group_and_markers(
     assert dimension.stage == "進行中"
     assert dimension.elapsed_at(at + timedelta(minutes=45)) == timedelta(minutes=45)
     assert reloaded.record("magic-soldiers:role-160:2026-08-03").stage == "已完成"
-    assert reloaded.fantasy_collection_count("role-120", at.date()) == 1
+    saved = json.loads(
+        (tmp_path / "confirmed.json").read_text(encoding="utf-8")
+    )
+    assert saved["fantasy_collections"][f"role-120:{at.date().isoformat()}"] == 1
     assert reloaded.handle_role_status("role-120", ROLE_STATUS_OPEN, at) == ()
     assert reloaded.poll(datetime(2026, 8, 3, 12, tzinfo=TAIPEI_TIMEZONE)) == ()
     assert reloaded_cards.cards == ()
@@ -665,7 +672,8 @@ def test_rejected_or_failed_persistence_keeps_state_events_and_cards_unchanged(
     at = datetime(2026, 8, 3, 9, tzinfo=TAIPEI_TIMEZONE)
     events = []
     event_bus.subscribe(CONFIRMED_ACTIVITY_RULE_CHANGED_EVENT, events.append)
-    before_bytes = service.state_path.read_bytes()
+    state_path = tmp_path / "confirmed.json"
+    before_bytes = state_path.read_bytes()
     rejected = _event(
         ConfirmedActivityKind.DIMENSION_SPACE,
         ConfirmedActivityEventType.DIMENSION_ENTERED,
@@ -676,7 +684,7 @@ def test_rejected_or_failed_persistence_keeps_state_events_and_cards_unchanged(
     )
     assert service.handle(rejected) is False
     assert service.records() == ()
-    assert service.state_path.read_bytes() == before_bytes
+    assert state_path.read_bytes() == before_bytes
     assert events == []
     assert cards.cards == ()
 
@@ -701,7 +709,7 @@ def test_rejected_or_failed_persistence_keeps_state_events_and_cards_unchanged(
     before_prompts = dict(service._artifact_prompts)
     assert service.handle_role_status("role-120", ROLE_STATUS_OPEN, at) == ()
     assert service.records() == ()
-    assert service.state_path.read_bytes() == before_bytes
+    assert state_path.read_bytes() == before_bytes
     assert service._artifact_prompts == before_prompts
     assert events == []
     assert cards.cards == ()
