@@ -4674,59 +4674,38 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         """Prove each required plan entry without comparing fingerprint sets."""
 
         plan = self._group_launch_plan
-        if not isinstance(resolved, ResolvedTargetWindows) or plan is None:
-            return None
-        try:
-            targets = tuple(plan.targets)
-            windows = tuple(resolved.windows)
-            sync_windows = tuple(resolved.sync_windows)
-            evidence_items = tuple(resolved.target_failure_evidence)
-        except TypeError:
-            return None
-        if not targets or resolved.global_failure_codes:
+        if (
+            not isinstance(resolved, ResolvedTargetWindows)
+            or plan is None
+            or not plan.targets
+            or resolved.global_failure_codes
+        ):
             return None
 
-        targets_by_entry: dict[str, GroupLaunchTarget] = {}
+        targets = tuple(plan.targets)
+        targets_by_entry = {}
         for target in targets:
-            entry_id = target.entry_id.strip() if isinstance(
-                target.entry_id,
-                str,
-            ) else ""
-            role_id = target.role_id.strip() if isinstance(
-                target.role_id,
-                str,
-            ) else ""
-            fingerprint = normalize_launch_fingerprint(target.fingerprint)
             if (
-                not entry_id
-                or not role_id
-                or entry_id != target.entry_id
-                or role_id != target.role_id
-                or fingerprint is None
-                or fingerprint != target.fingerprint
-                or entry_id in targets_by_entry
+                not target.entry_id
+                or not target.role_id
+                or target.entry_id in targets_by_entry
             ):
                 return None
-            targets_by_entry[entry_id] = target
+            targets_by_entry[target.entry_id] = target
 
         evidence_by_entry = {}
-        for evidence in evidence_items:
-            entry_id = getattr(evidence, "entry_id", None)
-            fingerprint = normalize_launch_fingerprint(
-                getattr(evidence, "fingerprint", None)
-            )
-            target = targets_by_entry.get(entry_id)
+        for evidence in resolved.target_failure_evidence:
+            target = targets_by_entry.get(evidence.entry_id)
             if (
                 target is None
-                or entry_id in evidence_by_entry
-                or fingerprint is None
-                or fingerprint != evidence.fingerprint
-                or fingerprint != target.fingerprint
+                or evidence.entry_id in evidence_by_entry
                 or evidence.failure_codes != ("window_offline",)
                 or evidence.candidate_windows != ()
+                or normalize_launch_fingerprint(evidence.fingerprint)
+                != target.fingerprint
             ):
                 return None
-            evidence_by_entry[entry_id] = evidence
+            evidence_by_entry[evidence.entry_id] = evidence
 
         plan_entry_ids = tuple(target.entry_id for target in targets)
         required_targets = tuple(
@@ -4740,117 +4719,33 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if (
             tuple(resolved.sync_scope_entry_ids) != plan_entry_ids
             or tuple(resolved.sync_entry_ids) != required_entry_ids
-            or len(windows) != len(required_targets)
-            or len(sync_windows) != len(required_targets)
+            or len(resolved.windows) != len(required_targets)
+            or len(complete_instances) != len(required_targets)
+            or len(source_fingerprints) != len(required_targets)
         ):
             return None
 
-        raw_instances: list[tuple[GroupLaunchTarget, WindowInstanceToken]] = []
-        handles: set[int] = set()
-        process_ids: set[int] = set()
-        lifecycle_tokens: set[int] = set()
-        stable_identities: set[tuple[object, ...]] = set()
-        for target, window, sync_window in zip(
-            required_targets,
-            windows,
-            sync_windows,
-        ):
-            if (
-                not isinstance(window, WindowInfo)
-                or window.visible is not True
-                or not isinstance(sync_window, WindowInfo)
-                or sync_window.visible is not True
-            ):
-                return None
-            source_fingerprint = normalize_launch_fingerprint(
-                window.launch_fingerprint
-            )
-            identity = complete_window_instance_identity(window)
-            instance = WindowInstanceToken.from_window(window)
-            sync_identity = complete_window_instance_identity(sync_window)
-            sync_instance = WindowInstanceToken.from_window(sync_window)
-            sync_source_fingerprint = normalize_launch_fingerprint(
-                sync_window.launch_fingerprint
-            )
-            expected_sync_fingerprint = (
-                monitored_window_instance_fingerprint(window)
-            )
-            stable_identity = (
-                self._activation_instance_key(source_fingerprint, instance)
-                if source_fingerprint is not None and instance is not None
-                else None
-            )
-            if (
-                source_fingerprint is None
-                or source_fingerprint != window.launch_fingerprint
-                or source_fingerprint != target.fingerprint
-                or identity is None
-                or identity[0] != target.fingerprint
-                or instance is None
-                or sync_source_fingerprint is None
-                or sync_source_fingerprint != sync_window.launch_fingerprint
-                or sync_source_fingerprint != expected_sync_fingerprint
-                or sync_identity is None
-                or sync_instance is None
-                or sync_instance != instance
-                or sync_identity[1:] != identity[1:]
-                or stable_identity is None
-                or instance.handle in handles
-                or instance.process_id in process_ids
-                or instance.process_lifecycle_token in lifecycle_tokens
-                or stable_identity in stable_identities
-            ):
-                return None
-            handles.add(instance.handle)
-            process_ids.add(instance.process_id)
-            lifecycle_tokens.add(instance.process_lifecycle_token)
-            stable_identities.add(stable_identity)
-            raw_instances.append((target, instance))
-
-        if (
-            len(complete_instances) != len(required_targets)
-            or len(source_fingerprints) != len(complete_instances)
-            or any(
-                monitor_fingerprint not in source_fingerprints
-                for monitor_fingerprint in complete_instances
-            )
-        ):
-            return None
-
-        verified_instances: dict[
-            str,
-            tuple[WindowInfo, WindowInstanceToken],
-        ] = {}
+        verified_instances = {}
         verified_sources: dict[str, str] = {}
-        for target, raw_instance in raw_instances:
+        for target in required_targets:
             matches = tuple(
-                monitor_fingerprint
-                for monitor_fingerprint, (window, instance)
+                (monitor_fingerprint, candidate)
+                for monitor_fingerprint, candidate
                 in complete_instances.items()
                 if (
-                    normalize_launch_fingerprint(monitor_fingerprint)
-                    == monitor_fingerprint
-                    and source_fingerprints.get(monitor_fingerprint)
+                    source_fingerprints.get(monitor_fingerprint)
                     == target.fingerprint
-                    and instance == raw_instance
-                    and WindowInstanceToken.from_window(window) == raw_instance
-                    and window.launch_fingerprint == monitor_fingerprint
+                    and self._tcp_id(
+                        resolved,
+                        target.fingerprint,
+                        candidate[1],
+                    ) == target.entry_id
                 )
             )
-            if (
-                len(matches) != 1
-                or matches[0] in verified_instances
-                or self._tcp_id(
-                    resolved,
-                    target.fingerprint,
-                    raw_instance,
-                ) != target.entry_id
-            ):
+            if len(matches) != 1 or matches[0][0] in verified_instances:
                 return None
-            monitor_fingerprint = matches[0]
-            verified_instances[monitor_fingerprint] = complete_instances[
-                monitor_fingerprint
-            ]
+            monitor_fingerprint, candidate = matches[0]
+            verified_instances[monitor_fingerprint] = candidate
             verified_sources[monitor_fingerprint] = target.fingerprint
         if len(verified_instances) != len(complete_instances):
             return None
@@ -4876,17 +4771,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 global_failures,
                 target_failures,
             ) = self._candidate_window_set()
-            plan = self._group_launch_plan
-            resolved = self._tcp_v
-            if global_failures and (
-                plan is None
-                or not isinstance(resolved, ResolvedTargetWindows)
-                or resolved.global_failure_codes
-            ):
+            if global_failures:
                 return self._snapshot_failure(
                     "reconnect.snapshot_source_failed",
                     "目前無法安全讀取遊戲視窗，沒有啟用智慧重連。",
                     global_failures[0],
+                )
+            if not candidate_windows:
+                return self._snapshot_failure(
+                    "reconnect.snapshot_empty",
+                    "目前沒有可安全監看的遊戲視窗，沒有啟用智慧重連。",
+                    "snapshot_empty",
                 )
             (
                 complete_instances,
@@ -4895,10 +4790,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             ) = self._activation_snapshot_candidate_instances(
                 candidate_windows
             )
-            contract_isolated_window_count = len(target_failures)
+            if not complete_instances:
+                return self._snapshot_failure(
+                    "reconnect.snapshot_identity_unsafe",
+                    "目前遊戲視窗不完整或身分重複，沒有啟用智慧重連。",
+                    "window_identity_unsafe",
+                )
+            plan = self._group_launch_plan
+            contract_isolated_window_count = 0
             if plan is not None:
                 verified = self._verified_group_activation_snapshot(
-                    resolved,
+                    self._tcp_v,
                     complete_instances,
                     source_fingerprints,
                 )
@@ -4913,24 +4815,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     source_fingerprints,
                     contract_isolated_window_count,
                 ) = verified
-            if global_failures:
-                return self._snapshot_failure(
-                    "reconnect.snapshot_source_failed",
-                    "目前無法安全讀取遊戲視窗，沒有啟用智慧重連。",
-                    global_failures[0],
-                )
-            if not candidate_windows:
-                return self._snapshot_failure(
-                    "reconnect.snapshot_empty",
-                    "目前沒有可安全監看的遊戲視窗，沒有啟用智慧重連。",
-                    "snapshot_empty",
-                )
-            if not complete_instances:
-                return self._snapshot_failure(
-                    "reconnect.snapshot_identity_unsafe",
-                    "目前遊戲視窗不完整或身分重複，沒有啟用智慧重連。",
-                    "window_identity_unsafe",
-                )
             instance_index: dict[
                 tuple[str, int, int, int, str, int], str
             ] = {}

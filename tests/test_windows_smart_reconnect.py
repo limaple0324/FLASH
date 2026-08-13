@@ -33,10 +33,7 @@ from adapters.windows_smart_reconnect import (
     WindowInstanceToken,
     WindowsSmartReconnectController,
 )
-from adapters.windows_window import (
-    WindowInfo,
-    monitored_window_instance_fingerprint,
-)
+from adapters.windows_window import WindowInfo
 from core.reconnect_policy import ReconnectScreenState
 from core.sp1_boundaries import ReconnectState
 from domain.character import CharacterImportance
@@ -5990,15 +5987,6 @@ def test_group_activation_snapshot_excludes_only_unique_empty_offline_entry(
     plan = make_tcp_group_plan(tmp_path, [*active, offline])
     resolved = tcp_resolved_targets(
         active,
-        sync_windows=tuple(
-            replace(
-                window,
-                launch_fingerprint=monitored_window_instance_fingerprint(
-                    window
-                ),
-            )
-            for window in active
-        ),
         entry_ids=("entry-0", "entry-1"),
         scope_entry_ids=("entry-0", "entry-1", "entry-2"),
         target_failures=(
@@ -6099,8 +6087,16 @@ def test_group_activation_snapshot_rejects_non_pure_offline_evidence(
     prepared = fixture.controller.prepare_execution_snapshot()
 
     assert prepared.success is False
-    assert prepared.code == "reconnect.snapshot_identity_unsafe"
-    assert prepared.details["failure_codes"] == ["window_identity_unsafe"]
+    expected_code = (
+        "reconnect.snapshot_source_failed"
+        if unsafe_evidence in {
+            "duplicate-entry",
+            "unknown-entry",
+            "fingerprint-mismatch",
+        }
+        else "reconnect.snapshot_identity_unsafe"
+    )
+    assert prepared.code == expected_code
     assert fixture.controller._activation_snapshot_instances is None
 
 
@@ -6111,16 +6107,16 @@ def test_group_activation_snapshot_rejects_non_pure_offline_evidence(
         "sync-entry-extra",
         "sync-entry-reordered",
         "sync-entry-duplicate",
-        "sync-window-length",
-        "sync-window-hwnd",
-        "sync-window-pid",
-        "sync-window-lifecycle",
-        "sync-window-fingerprint",
-        "raw-fingerprint-mismatch",
-        "incomplete-instance",
-        "duplicate-hwnd",
-        "duplicate-pid",
-        "duplicate-lifecycle",
+        "empty-plan-entry",
+        "duplicate-plan-entry",
+        "scope-entry-missing",
+        "scope-entry-extra",
+        "scope-entry-reordered",
+        "window-count-mismatch",
+        "complete-instance-count-mismatch",
+        "source-map-count-mismatch",
+        "monitor-source-mismatch",
+        "monitor-entry-ambiguous",
         "tcp-entry-mismatch",
     ),
 )
@@ -6129,19 +6125,19 @@ def test_group_activation_snapshot_rejects_unproven_required_entry(
     monkeypatch,
     unsafe_contract,
 ):
+    fingerprints = (
+        ("a" * 64, "a" * 64)
+        if unsafe_contract == "monitor-entry-ambiguous"
+        else ("a" * 64, "b" * 64)
+    )
     planned = [
-        make_window(1, fingerprint="a" * 64),
-        make_window(2, fingerprint="b" * 64),
+        make_window(index, fingerprint=fingerprint)
+        for index, fingerprint in enumerate(fingerprints, start=1)
     ]
     windows = list(planned)
-    sync_windows = [
-        replace(
-            window,
-            launch_fingerprint=monitored_window_instance_fingerprint(window),
-        )
-        for window in planned
-    ]
+    plan = make_tcp_group_plan(tmp_path, planned)
     entry_ids = ("entry-0", "entry-1")
+    scope_entry_ids = ("entry-0", "entry-1")
     if unsafe_contract == "sync-entry-missing":
         entry_ids = ("entry-0",)
     elif unsafe_contract == "sync-entry-extra":
@@ -6150,41 +6146,64 @@ def test_group_activation_snapshot_rejects_unproven_required_entry(
         entry_ids = ("entry-1", "entry-0")
     elif unsafe_contract == "sync-entry-duplicate":
         entry_ids = ("entry-0", "entry-0")
-    elif unsafe_contract == "sync-window-length":
-        sync_windows = sync_windows[:1]
-    elif unsafe_contract == "sync-window-hwnd":
-        sync_windows[0] = replace(sync_windows[0], handle=99)
-    elif unsafe_contract == "sync-window-pid":
-        sync_windows[0] = replace(sync_windows[0], process_id=999)
-    elif unsafe_contract == "sync-window-lifecycle":
-        sync_windows[0] = replace(
-            sync_windows[0],
-            process_lifecycle_token=99999,
+    elif unsafe_contract == "empty-plan-entry":
+        invalid_plans = (
+            replace(
+                plan,
+                targets=(
+                    replace(plan.targets[0], entry_id=""),
+                    plan.targets[1],
+                ),
+            ),
+            replace(
+                plan,
+                targets=(
+                    replace(plan.targets[0], role_id=""),
+                    plan.targets[1],
+                ),
+            ),
         )
-    elif unsafe_contract == "sync-window-fingerprint":
-        sync_windows[0] = replace(
-            sync_windows[0],
-            launch_fingerprint="d" * 64,
+        for invalid_plan in invalid_plans:
+            fixture = make_controller(
+                [1, 1],
+                windows=windows,
+                expected_windows=2,
+                group_launch_plan=invalid_plan,
+                target_windows_provider=lambda: tcp_resolved_targets(
+                    windows,
+                    entry_ids=entry_ids,
+                    scope_entry_ids=scope_entry_ids,
+                ),
+            )
+            fixture.controller.set_execution_enabled(False)
+            prepared = fixture.controller.prepare_execution_snapshot()
+            assert prepared.success is False
+            assert prepared.code == "reconnect.snapshot_identity_unsafe"
+            assert prepared.details["failure_codes"] == [
+                "window_identity_unsafe"
+            ]
+            assert fixture.controller._activation_snapshot_instances is None
+        return
+    elif unsafe_contract == "duplicate-plan-entry":
+        plan = replace(
+            plan,
+            targets=(
+                plan.targets[0],
+                replace(plan.targets[1], entry_id="entry-0"),
+            ),
         )
-    elif unsafe_contract == "raw-fingerprint-mismatch":
-        windows[0] = replace(windows[0], launch_fingerprint="d" * 64)
-    elif unsafe_contract == "incomplete-instance":
-        windows[0] = replace(windows[0], process_id=0)
-    elif unsafe_contract == "duplicate-hwnd":
-        windows[1] = replace(windows[1], handle=windows[0].handle)
-    elif unsafe_contract == "duplicate-pid":
-        windows[1] = replace(windows[1], process_id=windows[0].process_id)
-    elif unsafe_contract == "duplicate-lifecycle":
-        windows[1] = replace(
-            windows[1],
-            process_lifecycle_token=windows[0].process_lifecycle_token,
-        )
-    plan = make_tcp_group_plan(tmp_path, planned)
+    elif unsafe_contract == "scope-entry-missing":
+        scope_entry_ids = ("entry-0",)
+    elif unsafe_contract == "scope-entry-extra":
+        scope_entry_ids = ("entry-0", "entry-1", "entry-extra")
+    elif unsafe_contract == "scope-entry-reordered":
+        scope_entry_ids = ("entry-1", "entry-0")
+    elif unsafe_contract == "window-count-mismatch":
+        windows = windows[:1]
     resolved = tcp_resolved_targets(
         windows,
-        sync_windows=sync_windows,
         entry_ids=entry_ids,
-        scope_entry_ids=("entry-0", "entry-1"),
+        scope_entry_ids=scope_entry_ids,
     )
     fixture = make_controller(
         [1, 1],
@@ -6193,19 +6212,61 @@ def test_group_activation_snapshot_rejects_unproven_required_entry(
         group_launch_plan=plan,
         target_windows_provider=lambda: resolved,
     )
-    if unsafe_contract == "tcp-entry-mismatch":
+    if unsafe_contract in {
+        "complete-instance-count-mismatch",
+        "source-map-count-mismatch",
+        "monitor-source-mismatch",
+    }:
+        complete, sources, isolated = (
+            fixture.controller._activation_snapshot_candidate_instances(
+                windows
+            )
+        )
+        monitor_fingerprint = next(iter(complete))
+        if unsafe_contract == "complete-instance-count-mismatch":
+            complete = {
+                key: value
+                for key, value in complete.items()
+                if key != monitor_fingerprint
+            }
+        elif unsafe_contract == "source-map-count-mismatch":
+            sources = {
+                key: value
+                for key, value in sources.items()
+                if key != monitor_fingerprint
+            }
+        else:
+            sources = {**sources, monitor_fingerprint: "d" * 64}
+        monkeypatch.setattr(
+            fixture.controller,
+            "_activation_snapshot_candidate_instances",
+            lambda _windows: (complete, sources, isolated),
+        )
+    if unsafe_contract in {"monitor-entry-ambiguous", "tcp-entry-mismatch"}:
         monkeypatch.setattr(
             fixture.controller,
             "_tcp_id",
-            lambda *_args: "entry-wrong",
+            lambda *_args: (
+                "entry-0"
+                if unsafe_contract == "monitor-entry-ambiguous"
+                else "entry-wrong"
+            ),
         )
     fixture.controller.set_execution_enabled(False)
 
     prepared = fixture.controller.prepare_execution_snapshot()
 
     assert prepared.success is False
-    assert prepared.code == "reconnect.snapshot_identity_unsafe"
-    assert prepared.details["failure_codes"] == ["window_identity_unsafe"]
+    if unsafe_contract == "window-count-mismatch":
+        assert prepared.code == "reconnect.snapshot_source_failed"
+        assert prepared.details["failure_codes"] == [
+            "target_failure_unattributed"
+        ]
+    else:
+        assert prepared.code == "reconnect.snapshot_identity_unsafe"
+        assert prepared.details["failure_codes"] == [
+            "window_identity_unsafe"
+        ]
     assert fixture.controller._activation_snapshot_instances is None
 
 
