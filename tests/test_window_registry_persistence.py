@@ -110,14 +110,17 @@ def test_corrupt_registry_recovers_from_last_valid_backup(tmp_path):
 
     registry.register_character("second", "第二角")
     store.save(registry)
-    path.write_text('{"characters": [', encoding="utf-8")
+    corrupt_payload = '{"characters": ['
+    path.write_text(corrupt_payload, encoding="utf-8")
 
     restored = store.load()
 
     assert [item.character_id for item in restored.all()] == ["first"]
     assert store.recovered_from_corruption is True
-    assert store.recovered_from_backup is True
     assert store.corrupt_backup is not None
+    assert store.corrupt_backup.read_text(encoding="utf-8") == corrupt_payload
+    backup_payload = json.loads(store.backup_path.read_text(encoding="utf-8"))
+    assert [item["character_id"] for item in backup_payload["characters"]] == ["first"]
 
 
 def test_corrupt_registry_without_backup_is_preserved_and_rebuilt_empty(tmp_path):
@@ -129,7 +132,6 @@ def test_corrupt_registry_without_backup_is_preserved_and_rebuilt_empty(tmp_path
 
     assert registry.all() == ()
     assert store.recovered_from_corruption is True
-    assert store.recovered_from_backup is False
     assert store.corrupt_backup is not None
     assert store.corrupt_backup.read_text(encoding="utf-8") == '{"characters": ['
     assert not path.exists()

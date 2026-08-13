@@ -1,3 +1,5 @@
+import json
+
 from domain.character_game_data import (
     CharacterGameData,
     LifeSoul,
@@ -32,10 +34,15 @@ def _record() -> CharacterGameData:
 
 
 def test_character_game_data_round_trip_and_player_summary(tmp_path) -> None:
-    store = CharacterGameDataStore(tmp_path / "character_game_data.json")
+    path = tmp_path / "character_game_data.json"
+    store = CharacterGameDataStore(path)
     store.save((_record(),))
 
     assert store.load() == (_record(),)
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "schema_version": CharacterGameDataStore.SCHEMA_VERSION,
+        "records": [_record().to_dict()],
+    }
     assert CharacterGameDataViewService(store).get("char-a") == (
         CharacterGameDataView(
             pet_talent="尚未安全讀取",
@@ -66,6 +73,18 @@ def test_unknown_character_does_not_invent_game_data(tmp_path) -> None:
         life_soul="尚未安全讀取",
         artifact="尚未安全讀取",
     )
+
+
+def test_corrupt_character_game_data_is_isolated_as_a_sidecar(tmp_path) -> None:
+    path = tmp_path / "character_game_data.json"
+    corrupt_payload = '{"schema_version": 1, "records": ['
+    path.write_text(corrupt_payload, encoding="utf-8")
+
+    assert CharacterGameDataStore(path).load() == ()
+
+    corrupt_backup = path.with_suffix(".json.corrupt")
+    assert corrupt_backup.read_text(encoding="utf-8") == corrupt_payload
+    assert not path.exists()
 
 
 def _verified_obsidian(

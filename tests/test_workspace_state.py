@@ -18,11 +18,9 @@ def _activity() -> ActivityDefinition:
 def test_workspace_state_can_start_without_a_selection():
     state = WorkspaceState()
 
-    assert state.to_dict() == {
-        "current_group": None,
-        "current_activity": None,
-        "next_step": None,
-    }
+    assert state.current_group is None
+    assert state.current_activity is None
+    assert state.next_step is None
 
 
 def test_workspace_state_reuses_group_and_activity_models_for_presentation():
@@ -37,8 +35,8 @@ def test_workspace_state_reuses_group_and_activity_models_for_presentation():
     assert state.current_group is group
     assert state.current_activity is activity
     assert state.next_step == "完成下一個角色"
-    assert state.to_dict()["current_group"]["name"] == "14支"
-    assert state.to_dict()["current_activity"]["name"] == "守紀"
+    assert state.current_group.name == "14支"
+    assert state.current_activity.name == "守紀"
 
 
 @pytest.mark.parametrize("next_step", ["", "   "])

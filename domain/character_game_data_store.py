@@ -15,12 +15,8 @@ class CharacterGameDataStore:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self.recovered_from_corruption = False
-        self.corrupt_backup: Path | None = None
 
     def load(self) -> tuple[CharacterGameData, ...]:
-        self.recovered_from_corruption = False
-        self.corrupt_backup = None
         if not self.path.exists():
             return ()
         try:
@@ -42,8 +38,7 @@ class CharacterGameDataStore:
             self._validate_unique(records)
             return records
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
-            self.corrupt_backup = self._preserve_corrupt_file()
-            self.recovered_from_corruption = True
+            self._preserve_corrupt_file()
             return ()
 
     def save(self, records: Iterable[CharacterGameData]) -> None:
@@ -75,9 +70,9 @@ class CharacterGameDataStore:
         if len(identities) != len(set(identities)):
             raise ValueError("Duplicate character game data identity.")
 
-    def _preserve_corrupt_file(self) -> Path | None:
+    def _preserve_corrupt_file(self) -> None:
         if not self.path.exists():
-            return None
+            return
         candidate = self.path.with_suffix(self.path.suffix + ".corrupt")
         index = 1
         while candidate.exists():
@@ -87,6 +82,5 @@ class CharacterGameDataStore:
             index += 1
         try:
             self.path.replace(candidate)
-            return candidate
         except OSError:
-            return None
+            pass

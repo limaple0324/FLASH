@@ -30,16 +30,3 @@ class WorkspaceState:
             if not next_step:
                 raise ValueError("next_step must not be empty.")
             object.__setattr__(self, "next_step", next_step)
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "current_group": (
-                self.current_group.to_dict() if self.current_group is not None else None
-            ),
-            "current_activity": (
-                self.current_activity.to_dict()
-                if self.current_activity is not None
-                else None
-            ),
-            "next_step": self.next_step,
-        }
