@@ -123,6 +123,9 @@ class TargetWindowContractService:
             str,
             tuple[tuple[object, ...], SyncScope],
         ] = {}
+        self._configured_scope_cache: tuple[
+            tuple[object, ...], SyncScope
+        ] | None = None
 
     @staticmethod
     def _file_evidence(path: Path) -> tuple[object, ...]:
@@ -218,6 +221,48 @@ class TargetWindowContractService:
             )
         self._scope_cache[group_name] = (resolved_signature, scope)
         return self._scope_cache[group_name]
+
+    def _resolved_configured_scope(
+        self,
+    ) -> tuple[tuple[object, ...], SyncScope]:
+        inputs = self._scope_service.configured_inputs()
+        observed_signature = self._scope_signature(inputs.shortcut_paths)
+        cached = self._configured_scope_cache
+        if (
+            cached is not None
+            and cached[0] == observed_signature
+            and cached[1].entry_ids == inputs.entry_ids
+            and cached[1].shortcut_paths == inputs.shortcut_paths
+        ):
+            return cached
+        scope = self._scope_service.configured_scope()
+        resolved_signature = self._scope_signature(scope.shortcut_paths)
+        if (
+            observed_signature != resolved_signature
+            or scope.entry_ids != inputs.entry_ids
+            or scope.shortcut_paths != inputs.shortcut_paths
+        ):
+            return (
+                resolved_signature,
+                replace(
+                    scope,
+                    failure_codes=tuple(
+                        dict.fromkeys(
+                            (
+                                *scope.failure_codes,
+                                "scope_evidence_changed_during_resolution",
+                            )
+                        )
+                    ),
+                ),
+            )
+        self._configured_scope_cache = (resolved_signature, scope)
+        return self._configured_scope_cache
+
+    def configured_scope(self) -> SyncScope:
+        """Expose the cached configured identity authority without windows."""
+
+        return self._resolved_configured_scope()[1]
 
     def snapshot(
         self,
@@ -424,22 +469,32 @@ class TargetWindowContractService:
         group_name: object,
         *,
         expanded_sync_scope: bool = True,
+        _configured_scope: bool = False,
     ) -> ResolvedTargetWindows:
         """Keep uniquely resolved open roles while isolating unsafe siblings."""
+        groups = self._configuration.groups()
         normalized_group_name = (
-            group_name.strip()
-            if isinstance(group_name, str) and group_name.strip()
-            else ""
+            groups[0].name
+            if _configured_scope and groups
+            else (
+                group_name.strip()
+                if isinstance(group_name, str) and group_name.strip()
+                else ""
+            )
         )
         resolved_scope = (
-            self._resolved_scope(normalized_group_name)
-            if normalized_group_name
+            self._resolved_configured_scope()
+            if _configured_scope
             else (
-                (),
-                SyncScope(
-                    "",
-                    failure_codes=("group_name_invalid",),
-                ),
+                self._resolved_scope(normalized_group_name)
+                if normalized_group_name
+                else (
+                    (),
+                    SyncScope(
+                        "",
+                        failure_codes=("group_name_invalid",),
+                    ),
+                )
             )
         )
         try:
@@ -451,7 +506,7 @@ class TargetWindowContractService:
         except Exception:
             window_observation = ((), None, True)
         snapshot = self.snapshot(
-            group_name,
+            normalized_group_name,
             expanded_sync_scope=expanded_sync_scope,
             _resolved_scope=(resolved_scope if normalized_group_name else None),
             _window_observation=window_observation,
@@ -578,9 +633,38 @@ class TargetWindowContractService:
                     )
                 ) is not None
             }
+            configured_scope = (
+                scope
+                if _configured_scope
+                else self._resolved_configured_scope()[1]
+            )
+            if not configured_scope.ready:
+                global_failures.extend(configured_scope.failure_codes)
+            configured_owners: dict[str, set[str]] = {}
+            if configured_scope.ready:
+                for entry_id, fingerprint in zip(
+                    configured_scope.entry_ids,
+                    configured_scope.entry_fingerprints,
+                ):
+                    if fingerprint is not None:
+                        configured_owners.setdefault(fingerprint, set()).add(
+                            entry_id
+                        )
             for fingerprint, candidates in windows_by_fingerprint.items():
                 if fingerprint not in scoped_fingerprints:
-                    global_failures.append("unattributed_candidate_window")
+                    owners = configured_owners.get(fingerprint, set())
+                    identities = tuple(
+                        complete_window_instance_identity(candidate)
+                        for candidate in candidates
+                    )
+                    if (
+                        len(owners) != 1
+                        or len(candidates) != 1
+                        or identities[0] is None
+                    ):
+                        global_failures.append(
+                            "unattributed_candidate_window"
+                        )
                     continue
                 for candidate in candidates:
                     identity = complete_window_instance_identity(candidate)
@@ -655,6 +739,11 @@ class TargetWindowContractService:
             target_failure_evidence=tuple(target_failures),
             global_failure_codes=tuple(dict.fromkeys(global_failures)),
         )
+
+    def configured_reconnect_targets(self) -> ResolvedTargetWindows:
+        """Resolve every configured group entry as one reconnect authority."""
+
+        return self.reconnect_targets("", _configured_scope=True)
 
     @staticmethod
     def _has_complete_window_instance(window: WindowInfo) -> bool:

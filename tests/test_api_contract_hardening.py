@@ -68,6 +68,16 @@ class _ShortcutContentResolver:
         return resolved
 
 
+class _BatchRecordingResolver(_Resolver):
+    def __init__(self):
+        self.calls = []
+
+    def resolve(self, paths):
+        paths = tuple(paths)
+        self.calls.append(paths)
+        return super().resolve(paths)
+
+
 class _WindowBackend:
     def __init__(
         self,
@@ -1047,6 +1057,181 @@ def test_shared_launcher_incomplete_or_conflicting_instance_isolated(tmp_path):
     assert conflicted.windows == ()
     assert conflicted.sync_windows == ()
     assert "window_identity_duplicate" in conflicted.global_failure_codes
+
+
+def test_configured_reconnect_authority_is_global_cached_and_fail_closed(
+    tmp_path,
+):
+    current_paths = tuple(
+        _shortcut_path
+        for index in range(13)
+        for _shortcut_path in (tmp_path / f"current-{index}.lnk",)
+    )
+    other_paths = tuple(tmp_path / f"other-{index}.lnk" for index in range(11))
+    for path in (*current_paths, *other_paths):
+        path.write_bytes(str(path).encode("utf-8"))
+    legacy = tmp_path / "configured-global.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "current",
+                        "launch_entries": [
+                            {
+                                "path": str(path),
+                                "role_id": f"current-role-{index}",
+                            }
+                            for index, path in enumerate(current_paths)
+                        ],
+                    },
+                    {
+                        "name": "other",
+                        "launch_entries": [
+                            {
+                                "path": str(path),
+                                "role_id": f"other-role-{index}",
+                            }
+                            for index, path in enumerate(other_paths)
+                        ],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    configuration = GroupConfigurationService(
+        tmp_path / "configured-groups.json",
+        legacy_config_path=legacy,
+    )
+    resolver = _BatchRecordingResolver()
+    scope_service = SyncScopeService(configuration, resolver)
+    fingerprints = {
+        path: hashlib.sha256(str(path).encode()).hexdigest()
+        for path in (*current_paths, *other_paths)
+    }
+    live_paths = (*current_paths[:3], *other_paths)
+    windows = tuple(
+        WindowInfo(
+            100 + index,
+            "Adobe Flash Player 11",
+            True,
+            False,
+            (index * 10, 0, index * 10 + 9, 9),
+            1000 + index,
+            "Flash",
+            fingerprints[path],
+            2000 + index,
+            3000 + index,
+        )
+        for index, path in enumerate(live_paths)
+    )
+    backend = _WindowBackend(windows, foreground=100)
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        backend,
+    )
+
+    authority = service.configured_scope()
+    assert authority.ready is True
+    assert len(authority.entry_ids) == 24
+    assert [len(paths) for paths in resolver.calls] == [24]
+    global_targets = service.configured_reconnect_targets()
+    current_targets = service.reconnect_targets("current")
+    assert len(global_targets.windows) == 14
+    assert len(global_targets.sync_scope_entry_ids) == 24
+    assert len(global_targets.target_failure_evidence) == 10
+    assert global_targets.global_failure_codes == ()
+    assert tuple(window.handle for window in current_targets.windows) == (
+        100,
+        101,
+        102,
+    )
+    assert current_targets.global_failure_codes == ()
+    assert sum(len(paths) == 24 for paths in resolver.calls) == 1
+
+    backend.windows += (
+        WindowInfo(
+            999,
+            "Adobe Flash Player 11",
+            True,
+            False,
+            (0, 0, 9, 9),
+            9999,
+            "Flash",
+            "f" * 64,
+            8999,
+            7999,
+        ),
+    )
+    assert service.configured_reconnect_targets().global_failure_codes == (
+        "unattributed_candidate_window",
+    )
+    backend.windows = windows + (replace(windows[3], handle=888, process_id=8888),)
+    duplicate = service.configured_reconnect_targets()
+    assert "window_identity_duplicate" in duplicate.global_failure_codes
+    assert "unattributed_candidate_window" in duplicate.global_failure_codes
+
+
+def test_configured_authority_deduplicates_one_entry_shared_across_groups(
+    tmp_path,
+):
+    shared = tmp_path / "shared.lnk"
+    shared.write_bytes(b"shared")
+    legacy = tmp_path / "shared-configured.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": name,
+                        "launch_entries": [
+                            {"path": str(shared), "role_id": "same-role"}
+                        ],
+                    }
+                    for name in ("first", "second")
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    configuration = GroupConfigurationService(
+        tmp_path / "shared-configured-groups.json",
+        legacy_config_path=legacy,
+    )
+    resolver = _BatchRecordingResolver()
+    scope_service = SyncScopeService(configuration, resolver)
+    fingerprint = hashlib.sha256(str(shared).encode()).hexdigest()
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        _WindowBackend(
+            (
+                WindowInfo(
+                    11,
+                    "Adobe Flash Player 11",
+                    True,
+                    False,
+                    (0, 0, 9, 9),
+                    101,
+                    "Flash",
+                    fingerprint,
+                    1001,
+                    10001,
+                ),
+            ),
+            foreground=11,
+        ),
+    )
+
+    resolved = service.configured_reconnect_targets()
+
+    assert len(resolved.sync_scope_entry_ids) == 1
+    assert len(resolved.windows) == 1
+    assert [len(paths) for paths in resolver.calls] == [1]
 
 
 def test_sync_controller_accepts_only_the_shared_target_provider():

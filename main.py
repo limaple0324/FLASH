@@ -196,6 +196,7 @@ from services.group_launch_service import (
     CONFIRMED_GROUP_ORDERS,
     GroupLaunchPlan,
     GroupLaunchService,
+    GroupLaunchTarget,
 )
 from services.group_role_status_monitor import GroupRoleStatusMonitor
 from services.group_role_status_service import (
@@ -1742,9 +1743,7 @@ def build_services(
         )
 
     def current_reconnect_target_windows() -> ResolvedTargetWindows:
-        return target_window_contract_service.reconnect_targets(
-            current_group_name()
-        )
+        return target_window_contract_service.configured_reconnect_targets()
 
     reconnect_controller = WindowsSmartReconnectController.for_real_windows(
         reference_dir=resource_path(RECONNECT_REFERENCE_DIR),
@@ -3333,6 +3332,80 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             failure_codes=plan.failure_codes,
         )
 
+    def configured_reconnect_plan() -> GroupLaunchPlan | None:
+        if (
+            target_window_contract_service is None
+            or group_configuration_service is None
+        ):
+            return None
+        scope = target_window_contract_service.configured_scope()
+        if not scope.ready:
+            return None
+        entries = {}
+        evidence = {}
+        for group in group_configuration_service.groups():
+            for entry in group.entries:
+                signature = (
+                    str(entry.shortcut_path.resolve(strict=False)).casefold(),
+                    entry.display_name,
+                    entry.role_id,
+                    entry.placement,
+                )
+                if (
+                    entry.entry_id in evidence
+                    and evidence[entry.entry_id] != signature
+                ):
+                    return None
+                entries.setdefault(entry.entry_id, entry)
+                evidence[entry.entry_id] = signature
+        if tuple(entries) != tuple(scope.entry_ids):
+            return None
+
+        profiles = {
+            character.character_id: character
+            for character in (
+                character_store.load()
+                if character_store is not None
+                else ()
+            )
+        }
+        profile_ids = {}
+        if group_selection_service is not None:
+            for choice in group_selection_service.choices():
+                for member in choice.members:
+                    if member.character_id:
+                        profile_ids.setdefault(member.entry_id, set()).add(
+                            member.character_id
+                        )
+        targets = []
+        for order, (entry_id, fingerprint) in enumerate(
+            zip(scope.entry_ids, scope.entry_fingerprints),
+            start=1,
+        ):
+            character_ids = profile_ids.get(entry_id, set())
+            if len(character_ids) > 1:
+                return None
+            profile = profiles.get(
+                next(iter(character_ids), entry_id)
+            )
+            entry = entries[entry_id]
+            if fingerprint is None or not entry.role_id.strip():
+                return None
+            targets.append(
+                GroupLaunchTarget(
+                    order,
+                    entry.display_name,
+                    entry.shortcut_path,
+                    fingerprint,
+                    entry.placement,
+                    entry.entry_id,
+                    entry.role_id,
+                    profile.level if profile is not None else None,
+                    profile.importance if profile is not None else None,
+                )
+            )
+        return GroupLaunchPlan("configured", tuple(targets))
+
     def write_clipboard(value: str) -> bool:
         try:
             window.clipboard_clear()
@@ -3445,8 +3518,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 pointer_sync_controller.set_controller_fingerprint(
                     instance_fingerprints[0]
                 )
-        if smart_reconnect_controller is not None:
-            smart_reconnect_controller.set_group_launch_plan(plan)
         return plan
 
     sync_connected_fingerprints: tuple[str, ...] | None = None
@@ -3574,8 +3645,6 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             input_controller.set_allowed_window_instances(None)
         if pointer_sync_controller is not None:
             pointer_sync_controller.set_allowed_window_instances(None)
-        if smart_reconnect_controller is not None:
-            smart_reconnect_controller.set_group_launch_plan(None)
         sync_connected_fingerprints = None
         sync_connected_instance_signature = None
 
@@ -5156,20 +5225,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "智慧重連服務尚未正確設定，沒有啟用。",
             )
         if enabled:
-            current_group = config.get(CURRENT_GROUP_NAME_KEY, "")
-            published_group = workspace_service.snapshot().current_group
-            published_group_name = (
-                published_group.name if published_group is not None else ""
-            )
-            choice = (
-                group_selection_service.find(current_group)
-                if group_selection_service is not None
-                and isinstance(current_group, str)
-                and current_group.strip()
-                and current_group == published_group_name
-                else None
-            )
-            if choice is None or not close_group_operation_gate():
+            if not close_group_operation_gate():
                 return SmartReconnectToggleViewResult(
                     False,
                     False,
@@ -5181,8 +5237,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "目前組別的安全視窗身分尚未完成，智慧重連未啟用。",
             )
             try:
-                identity_ready = apply_group_identity(choice) is not None
+                plan = configured_reconnect_plan()
+                identity_ready = plan is not None
                 if identity_ready:
+                    smart_reconnect_controller.set_group_launch_plan(plan)
                     transition = apply_smart_reconnect_snapshot_transition(
                         True,
                         smart_reconnect_controller,
@@ -5196,16 +5254,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             except Exception:
                 identity_ready = False
             if not identity_ready or not transition.success:
-                if not restore_group_identity(choice):
-                    try:
-                        clear_group_identity()
-                    except Exception:
-                        pass
-                    return transition
                 try:
+                    smart_reconnect_controller.set_group_launch_plan(None)
                     reopen_group_operation_gate()
                 except Exception:
-                    return transition
+                    pass
                 return transition
             try:
                 reopen_group_operation_gate()
@@ -5221,7 +5274,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                         timeout_seconds=1.0,
                     ),
                 )
-                restore_group_identity(choice)
+                smart_reconnect_controller.set_group_launch_plan(None)
                 return SmartReconnectToggleViewResult(
                     False,
                     False,
@@ -5255,7 +5308,11 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                     )
                 except Exception:
                     pass
-                if gate_closed and restore_group_identity(choice):
+                try:
+                    smart_reconnect_controller.set_group_launch_plan(None)
+                except Exception:
+                    pass
+                if gate_closed:
                     try:
                         reopen_group_operation_gate()
                     except Exception:
