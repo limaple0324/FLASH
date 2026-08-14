@@ -7096,7 +7096,7 @@ def test_recent_line_target_change_requires_two_new_matching_frames():
     assert fixture.mouse.clicks == [(1, (0.5, 0.722))]
 
 
-def test_real_controller_uses_guarded_fresh_background_capture(monkeypatch):
+def test_real_controller_wires_only_non_mutating_capture_routes(monkeypatch):
     tcp_queries = []
 
     def tcp_provider(process_ids):
@@ -7114,14 +7114,8 @@ def test_real_controller_uses_guarded_fresh_background_capture(monkeypatch):
 
     assert isinstance(controller._capture_provider, Win32PrintWindowProvider)
     assert type(controller._capture_provider) is Win32PrintWindowProvider
-    assert isinstance(
-        controller._obscured_capture_provider,
-        Win32TemporarilyRevealedCaptureProvider,
-    )
-    assert isinstance(
-        controller._active_refresh_capture_provider,
-        Win32RecoveringPrintWindowProvider,
-    )
+    assert controller._obscured_capture_provider is None
+    assert controller._active_refresh_capture_provider is None
     assert controller._primary_capture_is_trusted is True
     assert controller._primary_capture_is_fresh_without_visibility is False
     assert controller._tcp_counts is tcp_provider
@@ -7129,7 +7123,7 @@ def test_real_controller_uses_guarded_fresh_background_capture(monkeypatch):
     assert tcp_queries == []
 
 
-def test_real_obscured_provider_is_used_only_by_active_reconnect(
+def test_real_obscured_window_stays_unknown_without_revealing_it(
     monkeypatch,
 ):
     window = make_window(1)
@@ -7139,28 +7133,16 @@ def test_real_obscured_provider_is_used_only_by_active_reconnect(
         window_backend=ObscuredWindowBackend([window]),
     )
     visible = FakeCaptureProvider({window.handle: None})
-    obscured = FakeCaptureProvider({window.handle: 1})
-    guarded_provider = controller._obscured_capture_provider
-    assert isinstance(
-        guarded_provider,
-        Win32TemporarilyRevealedCaptureProvider,
-    )
+    passive = FakeCaptureProvider({window.handle: 1})
     monkeypatch.setattr(
         controller._visible_capture_provider,
         "capture",
         visible.capture,
     )
     monkeypatch.setattr(
-        guarded_provider,
-        "capture",
-        obscured.capture,
-    )
-    monkeypatch.setattr(
         controller._capture_provider,
         "capture",
-        lambda _handle: (_ for _ in ()).throw(
-            AssertionError("stale PrintWindow path is forbidden")
-        ),
+        passive.capture,
     )
     controller._recognizer = FakeRecognizer(
         {1: ReconnectScreenState.CONNECTED}
@@ -7172,25 +7154,57 @@ def test_real_obscured_provider_is_used_only_by_active_reconnect(
     assert observed == {
         window.launch_fingerprint: ReconnectScreenState.UNKNOWN
     }
-    assert obscured.calls == []
+    assert passive.calls == []
 
     controller.set_execution_enabled(True)
     result = controller.reconnect()
 
-    assert result.code == "reconnect.connected"
-    assert obscured.calls == [window.handle]
-    assert result.details["capture_diagnostics"] == [
-        {
-            "window_index": 1,
-            "stage": "scan",
-            "capture_path": "obscured",
-            "width": 2,
-            "height": 2,
-            "sha256": result.details["capture_diagnostics"][0]["sha256"],
-            "recognition_score": 0.0,
-            "rejection_gate": None,
-        }
-    ]
+    assert result.details["connected_windows"] == 0
+    assert result.details["unknown_windows"] == 1
+    assert result.details["clicked_windows"] == 0
+    assert passive.calls == [window.handle]
+    diagnostic = result.details["capture_diagnostics"][0]
+    assert diagnostic["capture_path"] == "obscured"
+    assert diagnostic["rejection_gate"] == "capture_not_fresh"
+
+
+def test_real_minimized_window_stays_unknown_without_restoring_it(
+    monkeypatch,
+):
+    window = make_window(1, minimized=True)
+    tcp_queries = []
+
+    def tcp_provider(process_ids):
+        tcp_queries.append(process_ids)
+        return {window.process_id: 0}
+
+    monkeypatch.setattr(
+        "adapters.windows_smart_reconnect._ipv4_established_counts_by_pid",
+        tcp_provider,
+    )
+    controller = WindowsSmartReconnectController.for_real_windows(
+        reference_dir=Path("assets") / "reconnect_reference",
+        expected_windows=1,
+        window_backend=FakeWindowBackend([window]),
+    )
+    passive = FakeCaptureProvider({window.handle: 1})
+    monkeypatch.setattr(
+        controller._capture_provider,
+        "capture",
+        passive.capture,
+    )
+    controller.set_execution_enabled(True)
+
+    result = controller.reconnect()
+
+    assert result.details["connected_windows"] == 0
+    assert result.details["unknown_windows"] == 1
+    assert result.details["clicked_windows"] == 0
+    assert passive.calls == []
+    assert tcp_queries == [frozenset({window.process_id})]
+    diagnostic = result.details["capture_diagnostics"][0]
+    assert diagnostic["capture_path"] == "minimized"
+    assert diagnostic["rejection_gate"] == "capture_failed"
 
 
 def test_failed_minimized_refresh_never_falls_back_to_passive_pixels():
@@ -9707,7 +9721,7 @@ def test_real_mixed_fourteen_window_shape_only_recovers_confirmed_disconnects():
     ]
 
 
-def test_minimized_active_reconnect_uses_refresh_capture_provider():
+def test_minimized_recognition_never_delivers_background_input():
     windows = [make_window(1, minimized=True), make_window(2)]
     active_refresh = FakeCaptureProvider({1: 2})
     fixture = make_controller(
@@ -9724,9 +9738,9 @@ def test_minimized_active_reconnect_uses_refresh_capture_provider():
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert result.details["clicked_windows"] == 1
+    assert result.details["clicked_windows"] == 0
     assert active_refresh.calls == [1, 1, 1]
-    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
+    assert fixture.mouse.clicks == []
 
 
 def test_disabled_minimized_check_never_captures_clicks_or_reports_online():
@@ -9776,9 +9790,9 @@ def test_minimized_stale_connected_frame_is_refreshed_before_decision():
     second = fixture.controller.reconnect()
 
     assert first.details["clicked_windows"] == 0
-    assert second.details["clicked_windows"] == 1
+    assert second.details["clicked_windows"] == 0
     assert active_refresh.calls == [1, 1, 1]
-    assert fixture.mouse.clicks == [(1, (0.5, 0.5))]
+    assert fixture.mouse.clicks == []
 
 
 def test_minimized_failed_refresh_never_trusts_stale_connected_frame():

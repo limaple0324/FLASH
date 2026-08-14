@@ -2606,16 +2606,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             expected_windows=expected_windows,
             title_keywords=title_keywords,
             window_backend=window_backend,
-            # Passive observation never changes window state. Active reconnect
-            # scans use guarded reversible providers for fresh desktop pixels.
+            # Smart reconnect capture must never change a game window's
+            # minimized state or z-order.  A window that is not already fully
+            # visible therefore remains UNKNOWN while TCP observation keeps
+            # running independently.
             capture_provider=Win32PrintWindowProvider(),
             visible_capture_provider=Win32VisibleRegionCaptureProvider(),
-            obscured_capture_provider=(
-                Win32TemporarilyRevealedCaptureProvider()
-            ),
-            active_refresh_capture_provider=(
-                Win32RecoveringPrintWindowProvider()
-            ),
+            obscured_capture_provider=None,
+            active_refresh_capture_provider=None,
             primary_capture_is_trusted=True,
             primary_capture_is_fresh_without_visibility=False,
             recognizer=ReferenceScreenRecognizer(reference_dir),
@@ -5365,6 +5363,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._auto_battle_evidence[fingerprint] = evidence
 
         def deliver() -> MouseClickResult | None:
+            current_window = self._current_action_window(
+                instance,
+                fingerprint,
+            )
             if (
                 not self.auto_battle_execution_allowed()
                 or attempt_key in self._auto_battle_attempted_actions
@@ -5373,7 +5375,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     fingerprint,
                     instance,
                 )
-                or self._current_action_window(instance, fingerprint) is None
+                or current_window is None
+                or current_window.minimized
             ):
                 return None
 
@@ -10339,6 +10342,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     )
                     if (
                         current_window is None
+                        or current_window.minimized
                         or not self._capture_authority_is_current(
                             capture_settings_revision,
                             current_capture_route,
