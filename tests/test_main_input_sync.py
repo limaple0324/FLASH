@@ -1288,37 +1288,64 @@ def test_only_two_real_launch_results_feed_the_shared_auto_battle_helper():
     assert "apply_auto_battle_after_game_launch" in single_role
 
 
-def test_smart_reconnect_enable_binds_current_group_before_opening_gate():
+def test_smart_reconnect_enable_binds_configured_plan_before_opening_gate():
     source = Path("main.py").read_text(encoding="utf-8")
     function_source = source[
         source.index("    def change_smart_reconnect("):
         source.index("    def change_smart_reconnect_auto_battle(")
     ]
+    configured_source = source[
+        source.index("    def configured_reconnect_plan("):
+        source.index("    def write_clipboard(")
+    ]
+    group_identity_source = source[
+        source.index("    def apply_group_identity("):
+        source.index("    sync_connected_fingerprints:")
+    ]
+    input_sync_source = source[
+        source.index("    def change_keyboard_sync("):
+        source.index("    def change_smart_reconnect(")
+    ]
 
-    current_index = function_source.index(
-        "config.get(CURRENT_GROUP_NAME_KEY"
-    )
-    workspace_index = function_source.index("workspace_service.snapshot()")
-    choice_index = function_source.index("group_selection_service.find(")
     close_index = function_source.index("close_group_operation_gate()")
-    apply_index = function_source.index("apply_group_identity(choice)")
+    plan_index = function_source.index("configured_reconnect_plan()")
+    bind_index = function_source.index(
+        "smart_reconnect_controller.set_group_launch_plan(plan)"
+    )
     transition_index = function_source.index(
         "apply_smart_reconnect_snapshot_transition("
     )
     reopen_index = function_source.index("reopen_group_operation_gate()")
     save_index = function_source.index("config.update_values(")
     assert (
-        current_index
-        < workspace_index
-        < choice_index
-        < close_index
-        < apply_index
+        close_index
+        < plan_index
+        < bind_index
         < transition_index
         < reopen_index
         < save_index
     )
-    assert "restore_group_identity(choice)" in function_source
-    assert "clear_group_identity()" in function_source
+    assert "smart_reconnect_controller.set_group_launch_plan(None)" in (
+        function_source
+    )
+    assert "CURRENT_GROUP_NAME_KEY" not in function_source
+    assert "workspace_service.snapshot()" not in function_source
+    assert "group_selection_service.find(" not in function_source
+    assert "apply_group_identity(choice)" not in function_source
+    assert "CURRENT_GROUP_NAME_KEY" not in configured_source
+    assert "workspace_service.snapshot()" not in configured_source
+    assert "group_selection_service.choices()" in configured_source
+    assert "smart_reconnect_controller.set_group_launch_plan" not in (
+        group_identity_source
+    )
+    assert "input_controller.set_allowed_window_instances" in (
+        group_identity_source
+    )
+    assert "pointer_sync_controller.set_allowed_window_instances" in (
+        group_identity_source
+    )
+    assert "workspace_service.snapshot()" in input_sync_source
+    assert "group_selection_service.find(group_name)" in input_sync_source
 
 
 def test_build_services_registers_input_controller_and_safe_default(tmp_path):

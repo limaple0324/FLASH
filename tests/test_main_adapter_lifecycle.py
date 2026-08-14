@@ -257,8 +257,8 @@ def test_build_services_uses_global_reconnect_and_grouped_sync_targets(
     strict_contract = ResolvedTargetWindows(strict_targets)
     monkeypatch.setattr(
         contract,
-        "reconnect_targets",
-        lambda _group_name: strict_contract,
+        "configured_reconnect_targets",
+        lambda: strict_contract,
     )
 
     assert reconnect._target_windows_provider() is strict_contract
