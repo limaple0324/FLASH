@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 from adapters.windows_window import WindowInfo
@@ -31,8 +32,11 @@ def _window(handle: int, fingerprint: str) -> WindowInfo:
 class FakeShortcutFingerprintResolver:
     def __init__(self, values: dict[Path, str]) -> None:
         self.values = values
+        self.calls: list[tuple[Path, ...]] = []
 
     def resolve(self, paths):
+        paths = tuple(paths)
+        self.calls.append(paths)
         return {
             Path(path).resolve(): self.values[Path(path).resolve()]
             for path in paths
@@ -59,14 +63,15 @@ def test_lists_only_open_unique_windows_outside_all_groups(tmp_path):
     configuration.add_shortcuts("第一組", (grouped,))
     observed: list[tuple[tuple[str, ...], tuple[WindowInfo, ...]]] = []
 
+    resolver = FakeShortcutFingerprintResolver(
+        {
+            grouped: group_fingerprint,
+            ungrouped: free_fingerprint,
+        }
+    )
     service = UngroupedWindowService(
         configuration,
-        FakeShortcutFingerprintResolver(
-            {
-                grouped: group_fingerprint,
-                ungrouped: free_fingerprint,
-            }
-        ),
+        resolver,
         FakeWindowBackend(
             (
                 _window(1, group_fingerprint),
@@ -80,6 +85,11 @@ def test_lists_only_open_unique_windows_outside_all_groups(tmp_path):
         shortcut_roots=(desktop, nested),
     )
 
+    candidates = service.safe_candidates()
+
+    assert candidates == ((free_fingerprint, ungrouped, _window(2, free_fingerprint)),)
+    assert observed == []
+
     snapshot = service.snapshot()
 
     assert [(item.shortcut_name, item.status) for item in snapshot] == [
@@ -87,6 +97,7 @@ def test_lists_only_open_unique_windows_outside_all_groups(tmp_path):
     ]
     assert snapshot[0].fingerprint == free_fingerprint
     assert service.shortcut_for(free_fingerprint) == ungrouped
+    assert len(resolver.calls) == 1
     assert observed[0][0] == (free_fingerprint,)
     assert observed[0][1][0].handle == 2
 
@@ -156,3 +167,50 @@ def test_shortcut_lookup_is_unique_and_does_not_reenter_screen_observation(
     )
     assert service.shortcut_for(fingerprint) is None
     assert screen_calls == []
+
+
+def test_safe_candidates_excludes_duplicate_and_incomplete_live_instances(
+    tmp_path,
+):
+    desktop = tmp_path / "Desktop"
+    duplicate = _shortcut(desktop, "duplicate")
+    incomplete = _shortcut(desktop, "incomplete")
+    duplicate_fingerprint = "f" * 64
+    incomplete_fingerprint = "1" * 64
+    service = UngroupedWindowService(
+        GroupConfigurationService(tmp_path / "groups.json"),
+        FakeShortcutFingerprintResolver(
+            {
+                duplicate: duplicate_fingerprint,
+                incomplete: incomplete_fingerprint,
+            }
+        ),
+        FakeWindowBackend(
+            (
+                _window(1, duplicate_fingerprint),
+                _window(2, duplicate_fingerprint),
+                replace(
+                    _window(3, incomplete_fingerprint),
+                    process_lifecycle_token=None,
+                ),
+            )
+        ),
+        shortcut_roots=(desktop,),
+    )
+
+    assert service.safe_candidates() == ()
+
+
+def test_safe_candidate_without_shortcut_has_detection_identity_only(tmp_path):
+    fingerprint = "2" * 64
+    window = _window(1, fingerprint)
+    service = UngroupedWindowService(
+        GroupConfigurationService(tmp_path / "groups.json"),
+        FakeShortcutFingerprintResolver({}),
+        FakeWindowBackend((window,)),
+        shortcut_roots=(tmp_path / "empty",),
+    )
+
+    assert service.safe_candidates() == ((fingerprint, None, window),)
+    assert service.snapshot() == ()
+    assert service.shortcut_for(fingerprint) is None

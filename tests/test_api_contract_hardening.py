@@ -41,6 +41,7 @@ from services.sync_scope_service import SyncScopeService
 from services.target_window_contract_service import (
     TargetWindowContractService,
 )
+from services.ungrouped_window_service import UngroupedWindowService
 
 
 class _Resolver:
@@ -1177,6 +1178,109 @@ def test_configured_reconnect_authority_is_global_cached_and_fail_closed(
     duplicate = service.configured_reconnect_targets()
     assert "window_identity_duplicate" in duplicate.global_failure_codes
     assert "unattributed_candidate_window" in duplicate.global_failure_codes
+
+
+def test_configured_authority_includes_unique_complete_ungrouped_detection(
+    tmp_path,
+):
+    configured_paths = tuple(
+        tmp_path / f"configured-{index}.lnk" for index in range(12)
+    )
+    ungrouped_paths = tuple(
+        tmp_path / f"ungrouped-{index}.lnk" for index in range(3)
+    )
+    for path in (*configured_paths, *ungrouped_paths):
+        path.write_bytes(str(path).encode("utf-8"))
+    legacy = tmp_path / "configured.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "configured",
+                        "launch_entries": [
+                            {
+                                "path": str(path),
+                                "role_id": f"role-{index}",
+                            }
+                            for index, path in enumerate(configured_paths)
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    configuration = GroupConfigurationService(
+        tmp_path / "groups.json",
+        legacy_config_path=legacy,
+    )
+    resolver = _BatchRecordingResolver()
+    scope_service = SyncScopeService(configuration, resolver)
+    all_paths = (*configured_paths, *ungrouped_paths)
+    windows = tuple(
+        WindowInfo(
+            100 + index,
+            "Adobe Flash Player 11",
+            True,
+            False,
+            (index * 10, 0, index * 10 + 9, 9),
+            1000 + index,
+            "Flash",
+            hashlib.sha256(str(path).encode()).hexdigest(),
+            2000 + index,
+            3000 + index,
+        )
+        for index, path in enumerate(all_paths)
+    )
+    backend = _WindowBackend(windows, foreground=100)
+    ungrouped = UngroupedWindowService(
+        configuration,
+        resolver,
+        backend,
+        shortcut_roots=(tmp_path,),
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        backend,
+        ungrouped,
+    )
+
+    resolved = service.configured_reconnect_targets()
+
+    assert len(resolved.windows) == 12
+    assert resolved.detection_only_windows == windows[12:]
+    assert len((*resolved.windows, *resolved.detection_only_windows)) == 15
+    assert resolved.global_failure_codes == ()
+    assert [len(paths) for paths in resolver.calls] == [12, 15]
+
+    cached = service.configured_reconnect_targets()
+    assert cached.detection_only_windows == windows[12:]
+    assert [len(paths) for paths in resolver.calls] == [12, 15]
+
+    backend.windows = windows + (
+        replace(
+            windows[12],
+            handle=999,
+            process_id=9999,
+            thread_id=8999,
+            process_lifecycle_token=7999,
+        ),
+    )
+    duplicate = service.configured_reconnect_targets()
+    assert windows[12] not in duplicate.detection_only_windows
+    assert "unattributed_candidate_window" in duplicate.global_failure_codes
+
+    backend.windows = (
+        *windows[:12],
+        replace(windows[12], process_lifecycle_token=None),
+        *windows[13:],
+    )
+    incomplete = service.configured_reconnect_targets()
+    assert len(incomplete.detection_only_windows) == 2
+    assert "unattributed_candidate_window" in incomplete.global_failure_codes
 
 
 def test_configured_authority_deduplicates_one_entry_shared_across_groups(

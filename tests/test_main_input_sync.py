@@ -1535,16 +1535,17 @@ def test_formal_deferred_gate_reobserves_connected_before_each_delivery(
         assert pointer.close() is True
 
 
-def test_build_services_wires_registered_roles_without_ungrouped_reconnect_path(
+def test_build_services_wires_ungrouped_detection_into_reconnect_contract(
     tmp_path,
 ):
     build_services(root=tmp_path)
 
     reconnect = AppContext.get(WindowsSmartReconnectController)
     ungrouped = AppContext.get(UngroupedWindowService)
+    contract = AppContext.get(TargetWindowContractService)
 
     assert callable(reconnect._registered_role_provider)
-    assert ungrouped is not None
+    assert contract._ungrouped_window_service is ungrouped
 
 
 def test_build_services_preserves_explicit_saved_auto_battle_off(tmp_path):

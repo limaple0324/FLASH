@@ -1427,6 +1427,17 @@ def build_services(
     synchronized_window_backend = Win32WindowBackend(
         PowerShellLaunchFingerprintResolver()
     )
+    ungrouped_window_service = UngroupedWindowService(
+        group_configuration_service,
+        shortcut_fingerprint_resolver,
+        synchronized_window_backend,
+        screen_states_provider=(
+            lambda fingerprints, windows: reconnect_controller.observe_screen_states(
+                fingerprints,
+                candidate_windows=windows,
+            )
+        ),
+    )
     game_operation_gate = GameOperationGate()
     AppContext.register(GameOperationGate, game_operation_gate)
     target_window_contract_service = TargetWindowContractService(
@@ -1434,6 +1445,7 @@ def build_services(
         sync_scope_service,
         registry,
         synchronized_window_backend,
+        ungrouped_window_service,
     )
     sync_calibration_backend = Win32SyncCalibrationBackend()
     role_id_template_service = RoleIdTemplateService()
@@ -1892,17 +1904,6 @@ def build_services(
             CharacterGameDataCaptureService,
             character_game_data_capture_service,
         )
-    ungrouped_window_service = UngroupedWindowService(
-        group_configuration_service,
-        shortcut_fingerprint_resolver,
-        synchronized_window_backend,
-        screen_states_provider=(
-            lambda fingerprints, windows: reconnect_controller.observe_screen_states(
-                fingerprints,
-                candidate_windows=windows,
-            )
-        ),
-    )
     AppContext.register(UngroupedWindowService, ungrouped_window_service)
     deferred_sync_service = DeferredSyncOperationService(
         state_path=paths.data_dir() / DEFERRED_SYNC_STATE_FILENAME,

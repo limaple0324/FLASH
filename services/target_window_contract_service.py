@@ -26,6 +26,7 @@ from services.group_configuration_service import (
     GroupConfigurationService,
 )
 from services.sync_scope_service import SyncScope, SyncScopeService
+from services.ungrouped_window_service import UngroupedWindowService
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +95,7 @@ class ResolvedTargetWindows:
     sync_controller_entry_id: str | None = None
     target_failure_evidence: tuple[TargetFailureEvidence, ...] = ()
     global_failure_codes: tuple[str, ...] = ()
+    detection_only_windows: tuple[WindowInfo, ...] = ()
 
 
 class TargetWindowContractService:
@@ -105,6 +107,7 @@ class TargetWindowContractService:
         scope_service: SyncScopeService,
         registry: WindowRegistry,
         window_backend: WindowBackend,
+        ungrouped_window_service: UngroupedWindowService | None = None,
         *,
         title_keywords: tuple[str, ...] = ("Adobe Flash Player",),
     ) -> None:
@@ -112,6 +115,7 @@ class TargetWindowContractService:
         self._scope_service = scope_service
         self._registry = registry
         self._window_backend = window_backend
+        self._ungrouped_window_service = ungrouped_window_service
         self._title_keywords = tuple(
             keyword.strip().casefold()
             for keyword in title_keywords
@@ -519,7 +523,24 @@ class TargetWindowContractService:
             fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
             if fingerprint is not None:
                 windows_by_fingerprint.setdefault(fingerprint, []).append(window)
+        detection_candidates: dict[str, WindowInfo] = {}
+        ungrouped_authority_failed = False
+        if _configured_scope and self._ungrouped_window_service is not None:
+            try:
+                detection_candidates = {
+                    fingerprint: window
+                    for fingerprint, _path, window in (
+                        self._ungrouped_window_service.safe_candidates(
+                            window_observation[0]
+                        )
+                    )
+                }
+            except Exception:
+                detection_candidates = {}
+                ungrouped_authority_failed = True
         global_failures = list(snapshot.failure_codes)
+        if ungrouped_authority_failed:
+            global_failures.append("ungrouped_authority_unavailable")
         target_failures: list[TargetFailureEvidence] = []
         safe_pairs: list[tuple[str, WindowInfo, str]] = []
         scoped_resolution = (
@@ -651,9 +672,20 @@ class TargetWindowContractService:
                         configured_owners.setdefault(fingerprint, set()).add(
                             entry_id
                         )
+            detection_only_windows: list[WindowInfo] = []
             for fingerprint, candidates in windows_by_fingerprint.items():
                 if fingerprint not in scoped_fingerprints:
                     owners = configured_owners.get(fingerprint, set())
+                    detection_candidate = detection_candidates.get(fingerprint)
+                    if (
+                        not owners
+                        and len(candidates) == 1
+                        and detection_candidate is not None
+                        and complete_window_instance_identity(candidates[0])
+                        == complete_window_instance_identity(detection_candidate)
+                    ):
+                        detection_only_windows.append(candidates[0])
+                        continue
                     if (
                         len(owners) != 1
                         or len(candidates) != 1
@@ -673,21 +705,42 @@ class TargetWindowContractService:
                     )
                     if len(owners) != 1:
                         global_failures.append("unattributed_candidate_window")
+        else:
+            detection_only_windows = []
 
-        if safe_pairs:
-            handles = Counter(window.handle for _entry, window, _id in safe_pairs)
+        all_safe_pairs = [
+            *safe_pairs,
+            *(
+                (f"observation:{fingerprint}", window, monitor_fingerprint)
+                for window in detection_only_windows
+                if (
+                    (fingerprint := normalize_launch_fingerprint(
+                        window.launch_fingerprint
+                    ))
+                    is not None
+                    and (
+                        monitor_fingerprint := (
+                            monitored_window_instance_fingerprint(window)
+                        )
+                    )
+                    is not None
+                )
+            ),
+        ]
+        if all_safe_pairs:
+            handles = Counter(window.handle for _entry, window, _id in all_safe_pairs)
             stable_instances = Counter(
                 complete_window_instance_identity(window)[:6]
-                for _entry, window, _id in safe_pairs
+                for _entry, window, _id in all_safe_pairs
                 if complete_window_instance_identity(window) is not None
             )
             monitor_ids = Counter(
                 monitor_fingerprint
-                for _entry, _window, monitor_fingerprint in safe_pairs
+                for _entry, _window, monitor_fingerprint in all_safe_pairs
             )
             conflicts = {
                 entry_id
-                for entry_id, window, monitor_fingerprint in safe_pairs
+                for entry_id, window, monitor_fingerprint in all_safe_pairs
                 if (
                     handles[window.handle] != 1
                     or complete_window_instance_identity(window) is None
@@ -703,6 +756,11 @@ class TargetWindowContractService:
                 global_failures.append("window_identity_duplicate")
             safe_pairs = [
                 item for item in safe_pairs if item[0] not in conflicts
+            ]
+            detection_only_windows = [
+                window
+                for window in detection_only_windows
+                if f"observation:{window.launch_fingerprint}" not in conflicts
             ]
 
         if scoped_resolution:
@@ -726,6 +784,7 @@ class TargetWindowContractService:
 
         return ResolvedTargetWindows(
             windows=windows,
+            detection_only_windows=tuple(detection_only_windows),
             sync_windows=sync_windows,
             sync_entry_ids=sync_entry_ids,
             sync_scope_entry_ids=(

@@ -1521,6 +1521,7 @@ class FakeBattleRestarter:
             sync_controller_entry_id=value.sync_controller_entry_id,
             target_failure_evidence=evidence,
             global_failure_codes=value.global_failure_codes,
+            detection_only_windows=value.detection_only_windows,
         )
 
 
@@ -2016,6 +2017,7 @@ def tcp_resolved_targets(
     scope_entry_ids=None,
     target_failures=(),
     global_failure_codes=(),
+    detection_only_windows=(),
 ):
     entry_ids = tuple(entry_ids or (
         f"entry-{index}" for index in range(len(windows))
@@ -2025,9 +2027,10 @@ def tcp_resolved_targets(
         sync_windows=tuple(sync_windows or windows),
         sync_entry_ids=entry_ids,
         sync_scope_entry_ids=tuple(scope_entry_ids or entry_ids),
-        sync_controller_entry_id=entry_ids[0],
+        sync_controller_entry_id=(entry_ids[0] if entry_ids else None),
         target_failure_evidence=tuple(target_failures),
         global_failure_codes=tuple(global_failure_codes),
+        detection_only_windows=tuple(detection_only_windows),
     )
 
 
@@ -2676,13 +2679,17 @@ def tcp_login_fixture(
     extra_states=(1, 1),
     target_importance=CharacterImportance.PRIMARY,
     tcp_observations=None,
+    detection_only=(),
 ):
     old = make_window(1, process_id=101)
     new = replace(old, handle=11, process_id=111, thread_id=211,
                   process_lifecycle_token=311)
     peers = [make_window(i, process_id=100 + i) for i in (2, 3)]
-    initial_windows = [old, *peers]
-    windows = [new, *peers]
+    detection_only = tuple(detection_only)
+    configured_initial = [old, *peers]
+    configured_windows = [new, *peers]
+    initial_windows = [*configured_initial, *detection_only]
+    windows = [*configured_windows, *detection_only]
     plan = GroupLaunchPlan(
         "current",
         (GroupLaunchTarget(1, "AlphaHero", tmp_path / "a.lnk",
@@ -2708,19 +2715,33 @@ def tcp_login_fixture(
             return ScreenRecognition(ReconnectScreenState.CONNECTED, 0.0, None,
                                      "connected")
 
-    resolved = [tcp_resolved_targets(initial_windows)]
+    resolved = [
+        tcp_resolved_targets(
+            configured_initial,
+            detection_only_windows=detection_only,
+        )
+    ]
     now = [0.0]
+    initial_online = {
+        window.process_id: 1 for window in initial_windows
+    }
+    target_zero = {**initial_online, old.process_id: 0}
+    rebound_online = {
+        window.process_id: 1 for window in windows
+    }
     tcp = SequenceTcpCounts(
         tcp_observations
         if tcp_observations is not None
         else (
-            [{101: 1, 102: 1, 103: 1}]
-            + [{101: 0, 102: 1, 103: 1}] * 5
-            + [{111: 1, 102: 1, 103: 1}] * 40
+            [initial_online]
+            + [target_zero] * 5
+            + [rebound_online] * 40
         )
     )
     fixture = make_controller(
-        [1, 1, 1], windows=initial_windows, expected_windows=3,
+        [1] * len(initial_windows),
+        windows=initial_windows,
+        expected_windows=len(initial_windows),
         recognizer=LoginRecognizer(), group_launch_plan=plan,
         target_windows_provider=lambda: resolved[0],
         clock=lambda: now[0],
@@ -2734,12 +2755,17 @@ def tcp_login_fixture(
     now[0] = 9.0
     restarted = fixture.controller.reconnect()
     assert restarted.details["restarted_windows"] == 1
-    resolved[0] = tcp_resolved_targets(windows)
+    resolved[0] = tcp_resolved_targets(
+        configured_windows,
+        detection_only_windows=detection_only,
+    )
     fixture.controller._window_backend.windows = list(windows)
     fixture.capture.states.update(
         {new.handle: 3, **{
             peer.handle: marker
             for peer, marker in zip(peers, extra_states)
+        }, **{
+            peer.handle: 1 for peer in detection_only
         }}
     )
     tick = [9.0]
@@ -2754,6 +2780,57 @@ def tcp_login_fixture(
 
     fixture.controller._monotonic_clock = progress_clock
     return fixture, old, new, peers, frames
+
+
+def test_configured_login_recovery_keeps_detection_only_peers_immutable(
+    tmp_path,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    detection_only = tuple(
+        make_window(index, process_id=100 + index)
+        for index in (4, 5, 6)
+    )
+    fixture, old, new, peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+        detection_only=detection_only,
+    )
+    restarter = fixture.controller._battle_restarter
+
+    fixture.controller.reconnect()
+    login = fixture.controller.reconnect()
+    fixture.capture.states[new.handle] = 5
+    fixture.controller.reconnect()
+    selected = fixture.controller.reconnect()
+    complete_with_fresh_connected_frames(fixture, handle=new.handle)
+
+    assert login.details["clicked_windows"] == 1
+    assert selected.details["clicked_windows"] == 1
+    assert [call[0] for call in restarter.calls] == [old]
+    assert restarter.calls[0][1] == (old, *peers, *detection_only)
+    assert restarter.reopen_calls[0][1] == (*peers, *detection_only)
+    assert fixture.mouse.clicks == [
+        (new.handle, (0.505, 0.856)),
+        (new.handle, CHARACTER_ENTER_CLICK_POINT),
+    ]
+    assert all(
+        handle not in {window.handle for window in detection_only}
+        for handle, _point in fixture.mouse.clicks
+    )
+    fingerprint = old.launch_fingerprint
+    assert fingerprint not in fixture.controller._pending_reopen_fingerprints
+    assert fingerprint not in fixture.controller._pending_reconnect_fingerprints
+    assert fingerprint not in (
+        fixture.controller._login_only_recovery_fingerprints
+    )
 
 
 def tcp_missing_target(
@@ -6021,6 +6098,250 @@ def test_group_activation_snapshot_excludes_only_unique_empty_offline_entry(
         )[0].items()
     )
     assert len(fixture.controller._activation_snapshot_instances) == 2
+
+
+def test_group_activation_snapshot_tracks_detection_only_without_authority(
+    tmp_path,
+):
+    configured = make_window(1, process_id=101, fingerprint="a" * 64)
+    detection_only = tuple(
+        make_window(
+            index,
+            process_id=100 + index,
+            fingerprint=f"{index:064x}",
+        )
+        for index in (2, 3, 4)
+    )
+    windows = (configured, *detection_only)
+    resolved = tcp_resolved_targets(
+        (configured,),
+        detection_only_windows=detection_only,
+    )
+    tcp = SequenceTcpCounts(
+        [
+            {
+                window.process_id: 1
+                for window in windows
+            }
+        ] * 3
+    )
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [1, 3, 5, 2],
+        windows=windows,
+        expected_windows=4,
+        group_launch_plan=make_tcp_group_plan(tmp_path, [configured]),
+        target_windows_provider=lambda: resolved,
+        tcp_connection_count_provider=tcp,
+        battle_restarter=restarter,
+    )
+
+    prepared = activate_current_window_snapshot(fixture)
+    initial_authorizations = set(
+        fixture.controller._initial_login_authorizations
+    )
+    fixture.controller.check_connection()
+    fixture.controller.reconnect()
+
+    assert prepared.success is True
+    assert prepared.details["window_count"] == 4
+    assert fixture.controller._detection_only_fingerprints == frozenset(
+        window.launch_fingerprint for window in detection_only
+    )
+    assert initial_authorizations == {
+        configured.launch_fingerprint
+    }
+    assert tcp.calls == [
+        frozenset(window.process_id for window in windows)
+    ] * 2
+    assert sum(
+        state.entry_id is None
+        for state in fixture.controller._tcp_s.values()
+    ) == 3
+    assert fixture.controller._pending_reopen_fingerprints == set()
+    assert fixture.controller._login_only_recovery_fingerprints == set()
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+    assert fixture.mouse.clicks == []
+
+
+def test_detection_only_tcp_confirmation_never_gains_mutation_authority(
+    tmp_path,
+):
+    configured = make_window(1, process_id=101, fingerprint="a" * 64)
+    detection_only = make_window(2, process_id=102, fingerprint="b" * 64)
+    windows = (configured, detection_only)
+    resolved = tcp_resolved_targets(
+        (configured,),
+        detection_only_windows=(detection_only,),
+    )
+    now = [0.0]
+    tcp = SequenceTcpCounts(
+        [{101: 1, 102: 1}] + [{101: 1, 102: 0}] * 4
+    )
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [255, 1],
+        windows=windows,
+        expected_windows=2,
+        battle_markers=(1,),
+        clock=lambda: now[0],
+        group_launch_plan=make_tcp_group_plan(tmp_path, [configured]),
+        target_windows_provider=lambda: resolved,
+        tcp_connection_count_provider=tcp,
+        battle_restarter=restarter,
+    )
+    auto_calls = []
+    fixture.controller._run_auto_battle_for_connected = (
+        lambda *args, **kwargs: auto_calls.append(args) or True
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    fixture.controller.check_connection()
+    confirmed = None
+    for observed_at in (1.0, 4.0, 8.0):
+        now[0] = observed_at
+        confirmed = fixture.controller.check_connection()
+    now[0] = 9.0
+    attempted = fixture.controller.reconnect()
+
+    assert confirmed is not None
+    assert "tcp_disconnect_confirmed" in confirmed.details["failure_codes"]
+    assert "recovery_identity_unavailable" in (
+        confirmed.details["failure_codes"]
+    )
+    state = next(
+        state
+        for state in fixture.controller._tcp_s.values()
+        if state.instance.process_id == detection_only.process_id
+    )
+    assert state.entry_id is None
+    assert state.zero_count >= 3
+    assert "recovery_identity_unavailable" in (
+        attempted.details["failure_codes"]
+    )
+    assert fixture.controller._pending_reopen_fingerprints == set()
+    assert fixture.controller._login_only_recovery_fingerprints == set()
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+    assert fixture.mouse.clicks == []
+    assert all(
+        args[1] != detection_only.launch_fingerprint
+        for args in auto_calls
+    )
+
+
+def test_configured_owner_recovers_with_detection_only_peers_unchanged(
+    tmp_path,
+):
+    owner = make_window(1, process_id=101, fingerprint="a" * 64)
+    detection_only = tuple(
+        make_window(
+            index,
+            process_id=100 + index,
+            fingerprint=f"{index:064x}",
+        )
+        for index in (2, 3, 4)
+    )
+    windows = (owner, *detection_only)
+    resolved = tcp_resolved_targets(
+        (owner,),
+        detection_only_windows=detection_only,
+    )
+    restarter = FakeBattleRestarter()
+    tcp = SequenceTcpCounts(
+        [
+            {101: 1, 102: 1, 103: 1, 104: 1},
+            *(
+                {101: 0, 102: 1, 103: 1, 104: 1}
+                for _index in range(5)
+            ),
+        ]
+    )
+    fixture = make_controller(
+        [2, 1, 1, 1],
+        windows=windows,
+        expected_windows=4,
+        battle_markers=(2,),
+        group_launch_plan=make_tcp_group_plan(tmp_path, [owner]),
+        target_windows_provider=lambda: resolved,
+        tcp_connection_count_provider=tcp,
+        battle_restarter=restarter,
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    fixture.controller.check_connection()
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    restarted = fixture.controller.reconnect()
+
+    assert restarted.details["restarted_windows"] == 1
+    assert [call[0] for call in restarter.calls] == [owner]
+    assert restarter.calls[0][1] == windows
+    assert len(restarter.reopen_calls) == 1
+    assert restarter.reopen_calls[0][1] == detection_only
+    assert fixture.controller._pending_reopen_fingerprints == {
+        owner.launch_fingerprint
+    }
+    assert fixture.controller._login_only_recovery_fingerprints == {
+        owner.launch_fingerprint
+    }
+    assert fixture.mouse.clicks == []
+
+
+def test_post_close_contract_requires_detection_only_peers_unchanged(
+    tmp_path,
+):
+    owner = make_window(1, process_id=101, fingerprint="a" * 64)
+    detection_only = (
+        make_window(2, process_id=102, fingerprint="b" * 64),
+        make_window(3, process_id=103, fingerprint="c" * 64),
+    )
+    fixture = make_controller(
+        [2, 1, 1],
+        windows=(owner, *detection_only),
+        expected_windows=3,
+        group_launch_plan=make_tcp_group_plan(tmp_path, [owner]),
+    )
+    before = tcp_resolved_targets(
+        (owner,),
+        detection_only_windows=detection_only,
+    )
+    after = tcp_resolved_targets(
+        (),
+        entry_ids=(),
+        scope_entry_ids=("entry-0",),
+        target_failures=(
+            tcp_target_failure(
+                "entry-0",
+                owner.launch_fingerprint,
+                "window_offline",
+            ),
+        ),
+        detection_only_windows=detection_only,
+    )
+
+    assert fixture.controller._post_close_backend_contract(
+        before,
+        after,
+        "entry-0",
+        owner,
+    ) == detection_only
+
+    changed = replace(
+        detection_only[0],
+        process_lifecycle_token=999999,
+    )
+    assert fixture.controller._post_close_backend_contract(
+        before,
+        replace(
+            after,
+            detection_only_windows=(changed, detection_only[1]),
+        ),
+        "entry-0",
+        owner,
+    ) is None
 
 
 @pytest.mark.parametrize(

@@ -2483,6 +2483,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._activation_snapshot_direct_identity_collisions: (
             frozenset[str]
         ) = frozenset()
+        self._detection_only_fingerprints: frozenset[str] = frozenset()
         self._initial_login_authorizations: dict[
             str,
             _InitialLoginAuthorization,
@@ -4212,6 +4213,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     ) -> tuple[
         dict[str, tuple[WindowInfo, WindowInstanceToken]],
         dict[str, str],
+        frozenset[str],
         int,
     ]:
         """Isolate incomplete instances and disambiguate shared executables."""
@@ -4720,8 +4722,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             tuple(resolved.sync_scope_entry_ids) != plan_entry_ids
             or tuple(resolved.sync_entry_ids) != required_entry_ids
             or len(resolved.windows) != len(required_targets)
-            or len(complete_instances) != len(required_targets)
-            or len(source_fingerprints) != len(required_targets)
+            or len(complete_instances)
+            != len(required_targets) + len(resolved.detection_only_windows)
+            or len(source_fingerprints) != len(complete_instances)
         ):
             return None
 
@@ -4747,9 +4750,38 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             monitor_fingerprint, candidate = matches[0]
             verified_instances[monitor_fingerprint] = candidate
             verified_sources[monitor_fingerprint] = target.fingerprint
+        detection_only: set[str] = set()
+        for window in resolved.detection_only_windows:
+            source_fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+            instance = WindowInstanceToken.from_window(window)
+            if source_fingerprint is None or instance is None:
+                return None
+            matches = tuple(
+                (monitor_fingerprint, candidate)
+                for monitor_fingerprint, candidate in complete_instances.items()
+                if (
+                    monitor_fingerprint not in verified_instances
+                    and source_fingerprints.get(monitor_fingerprint)
+                    == source_fingerprint
+                    and candidate[1] == instance
+                )
+            )
+            if len(matches) != 1:
+                return None
+            monitor_fingerprint, candidate = matches[0]
+            detection_only.add(monitor_fingerprint)
+            verified_instances[monitor_fingerprint] = candidate
+            verified_sources[monitor_fingerprint] = source_fingerprint
         if len(verified_instances) != len(complete_instances):
             return None
-        return verified_instances, verified_sources, len(evidence_by_entry)
+        return (
+            verified_instances,
+            verified_sources,
+            frozenset(detection_only),
+            len(evidence_by_entry),
+        )
 
     def prepare_execution_snapshot(self) -> OperationResult:
         """Lock this activation to the complete game windows open right now."""
@@ -4813,8 +4845,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 (
                     complete_instances,
                     source_fingerprints,
+                    detection_only_fingerprints,
                     contract_isolated_window_count,
                 ) = verified
+            else:
+                detection_only_fingerprints = frozenset()
             instance_index: dict[
                 tuple[str, int, int, int, str, int], str
             ] = {}
@@ -4852,6 +4887,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
             self._activation_snapshot_instance_index = instance_index
             self._activation_snapshot_direct_identity_collisions = frozenset()
+            self._detection_only_fingerprints = detection_only_fingerprints
             self._pending_reopen_fingerprints.clear()
             self._reopen_retry_after.clear()
             self._auto_battle_evidence.clear()
@@ -4875,6 +4911,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 )
                 for fingerprint, instance
                 in self._activation_snapshot_instances.items()
+                if fingerprint not in self._detection_only_fingerprints
             }
             self._persist_runtime_state()
             return OperationResult(
@@ -4944,6 +4981,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 raise ValueError("plan must be a ready GroupLaunchPlan.")
             scope_token = self._group_scope_token(plan)
             self._group_launch_plan = plan
+            self._detection_only_fingerprints = frozenset()
             self.set_allowed_fingerprints(plan.fingerprints)
             self._runtime_scope_token = scope_token
             if previous_token != scope_token:
@@ -5087,6 +5125,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._activation_snapshot_source_fingerprints = None
             self._activation_snapshot_instance_index = None
             self._activation_snapshot_direct_identity_collisions = frozenset()
+            self._detection_only_fingerprints = frozenset()
             plan = self._group_launch_plan
             self._allowed_fingerprints = (
                 plan.fingerprints if plan is not None else None
@@ -5875,7 +5914,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if fingerprint is None or token is None:
                 continue
             entry_id = self._tcp_id(self._tcp_v, fingerprint, token)
-            if entry_id is None and self._group_launch_plan is not None:
+            if (
+                entry_id is None
+                and self._group_launch_plan is not None
+                and fingerprint not in self._detection_only_fingerprints
+            ):
                 continue
             # Read-only global monitoring keeps a token-local anonymous key;
             # it is never an entry_id and _ordered_tcp_owner therefore cannot
@@ -6350,7 +6393,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def _contract_entry_candidates(
         self,
         resolved: ResolvedTargetWindows,
-    ) -> dict[str, tuple[WindowInfo, ...]] | None:
+    ) -> tuple[
+        dict[str, tuple[WindowInfo, ...]],
+        tuple[WindowInfo, ...],
+    ] | None:
         """Return the contract's static candidates indexed by real entry id.
 
         This consumes the immutable per-target evidence directly.  The old
@@ -6407,6 +6453,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 return None
             result[target.entry_id] = candidates
             all_candidates.extend(candidates)
+        detection_only = tuple(resolved.detection_only_windows)
+        all_candidates.extend(detection_only)
         identities = self._complete_contract_identities(all_candidates)
         if identities is None:
             return None
@@ -6419,7 +6467,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or len(stable_tokens) != len(set(stable_tokens))
         ):
             return None
-        return result
+        return result, detection_only
 
     def _pre_close_backend_contract(
         self,
@@ -6427,9 +6475,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         entry_id: str,
         expected_instance: WindowInstanceToken,
     ) -> tuple[WindowInfo, tuple[WindowInfo, ...]] | None:
-        candidates_by_entry = self._contract_entry_candidates(resolved)
-        if candidates_by_entry is None:
+        contract = self._contract_entry_candidates(resolved)
+        if contract is None:
             return None
+        candidates_by_entry, detection_only = contract
         owner_candidates = candidates_by_entry.get(entry_id, ())
         owner_matches = tuple(
             window
@@ -6442,7 +6491,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             window
             for candidates in candidates_by_entry.values()
             for window in candidates
-        )
+        ) + detection_only
 
     def _post_close_backend_contract(
         self,
@@ -6451,10 +6500,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         entry_id: str,
         owner_window: WindowInfo,
     ) -> tuple[WindowInfo, ...] | None:
-        before_candidates = self._contract_entry_candidates(before)
-        after_candidates = self._contract_entry_candidates(after)
-        if before_candidates is None or after_candidates is None:
+        before_contract = self._contract_entry_candidates(before)
+        after_contract = self._contract_entry_candidates(after)
+        if before_contract is None or after_contract is None:
             return None
+        before_candidates, before_detection = before_contract
+        after_candidates, after_detection = after_contract
         owner_identity = complete_window_instance_identity(owner_window)
         if owner_identity is None:
             return None
@@ -6464,6 +6515,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             len(old_owner) != 1
             or complete_window_instance_identity(old_owner[0]) != owner_identity
             or new_owner
+            or self._complete_contract_identities(before_detection)
+            != self._complete_contract_identities(after_detection)
         ):
             return None
         owner_evidence = tuple(
@@ -6492,7 +6545,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             for candidate_entry, candidates in after_candidates.items()
             if candidate_entry != entry_id
             for window in candidates
-        )
+        ) + after_detection
 
     def _reopen_backend_contract(
         self,
@@ -6501,8 +6554,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     ) -> tuple[WindowInfo, ...] | None:
         """Return only the exact post-close collection for one missing owner."""
 
-        candidates_by_entry = self._contract_entry_candidates(resolved)
-        if candidates_by_entry is None or candidates_by_entry.get(entry_id) is None:
+        contract = self._contract_entry_candidates(resolved)
+        if contract is None:
+            return None
+        candidates_by_entry, detection_only = contract
+        if candidates_by_entry.get(entry_id) is None:
             return None
         owner_evidence = tuple(
             evidence
@@ -6521,7 +6577,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             for candidate_entry, candidates in candidates_by_entry.items()
             if candidate_entry != entry_id
             for window in candidates
-        )
+        ) + detection_only
 
     def _candidate_window_set(
         self,
@@ -6539,9 +6595,32 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     global_failures, target_failures = (
                         self._contract_failure_evidence(provided)
                     )
+                    provided_windows = (
+                        *provided.windows,
+                        *provided.detection_only_windows,
+                    )
+                    provided_fingerprints = {
+                        fingerprint
+                        for window in provided_windows
+                        if (
+                            fingerprint := normalize_launch_fingerprint(
+                                window.launch_fingerprint
+                            )
+                        )
+                        is not None
+                    }
+                    target_failures.update(
+                        {
+                            fingerprint: ("recovery_identity_unavailable",)
+                            for fingerprint in (
+                                self._detection_only_fingerprints
+                                - provided_fingerprints
+                            )
+                        }
+                    )
                     windows, blocked = (
                         self._bind_activation_snapshot_window_set(
-                            provided.windows,
+                            provided_windows,
                             frozenset(target_failures),
                         )
                     )
@@ -7632,6 +7711,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         expected: WindowInfo | WindowInstanceToken,
         fingerprint: str,
     ) -> WindowInfo | None:
+        if fingerprint in self._detection_only_fingerprints:
+            return None
         candidates, global_failures, target_failures = (
             self._candidate_window_set()
         )
@@ -8802,6 +8883,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             *retry_failures,
             *tcp_failures,
         ]
+        if any(
+            fingerprint in self._detection_only_fingerprints
+            and state.entry_id is None
+            for fingerprint, state in tcp_evidence
+        ):
+            failures.append("recovery_identity_unavailable")
         if tcp_owner_failure:
             failures.append(tcp_owner_failure)
         if blocking_group_failures:
@@ -10703,7 +10790,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
             for window, fingerprint, item in recognized:
                 if (
-                    fingerprint in terminal_completed_fingerprints
+                    fingerprint in self._detection_only_fingerprints
+                    or fingerprint in terminal_completed_fingerprints
                     or fingerprint in self._login_only_recovery_fingerprints
                     or fingerprint in self._tcp_timeout_isolated
                     or WindowInstanceToken.from_window(window)

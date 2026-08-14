@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from adapters.windows_launch_fingerprint import (
     ShortcutFingerprintResolver,
     normalize_launch_fingerprint,
 )
-from adapters.windows_window import WindowBackend, WindowInfo
+from adapters.windows_window import (
+    WindowBackend,
+    WindowInfo,
+    complete_window_instance_identity,
+)
 from services.group_configuration_service import GroupConfigurationService
 
 
@@ -73,6 +78,10 @@ class UngroupedWindowService:
         self._fingerprint_resolver = fingerprint_resolver
         self._window_backend = window_backend
         self._screen_states_provider = screen_states_provider
+        self._fingerprint_cache: tuple[
+            tuple[tuple[Path, str], ...],
+            dict[Path, str],
+        ] | None = None
 
     @staticmethod
     def default_shortcut_roots() -> tuple[Path, Path]:
@@ -112,11 +121,21 @@ class UngroupedWindowService:
         self,
         paths: tuple[Path, ...],
     ) -> dict[Path, str]:
+        evidence: list[tuple[Path, str]] = []
+        try:
+            for path in paths:
+                evidence.append((path, sha256(path.read_bytes()).hexdigest()))
+        except OSError:
+            return {}
+        signature = tuple(evidence)
+        cached = self._fingerprint_cache
+        if cached is not None and cached[0] == signature:
+            return dict(cached[1])
         try:
             resolved = self._fingerprint_resolver.resolve(paths)
         except Exception:
             return {}
-        return {
+        fingerprints = {
             path: fingerprint
             for path in paths
             if (
@@ -126,6 +145,8 @@ class UngroupedWindowService:
             )
             is not None
         }
+        self._fingerprint_cache = (signature, fingerprints)
+        return dict(fingerprints)
 
     @staticmethod
     def _unique_paths_by_fingerprint(
@@ -140,7 +161,12 @@ class UngroupedWindowService:
             if len(paths) == 1
         }
 
-    def snapshot(self) -> tuple[UngroupedWindow, ...]:
+    def safe_candidates(
+        self,
+        windows: Iterable[WindowInfo] | None = None,
+    ) -> tuple[tuple[str, Path | None, WindowInfo], ...]:
+        """Return unique complete live identities without screen observation."""
+
         shortcut_paths = self._candidate_shortcuts()
         group_paths = self._group_shortcuts()
         all_paths = tuple(dict.fromkeys((*shortcut_paths, *group_paths)))
@@ -158,12 +184,20 @@ class UngroupedWindowService:
         paths_by_fingerprint = self._unique_paths_by_fingerprint(
             shortcut_fingerprints
         )
-        try:
-            windows = tuple(self._window_backend.list_windows())
-        except Exception:
-            return ()
+        if windows is None:
+            try:
+                candidates = tuple(self._window_backend.list_windows())
+            except Exception:
+                return ()
+        else:
+            try:
+                candidates = tuple(windows)
+            except TypeError:
+                return ()
         by_fingerprint: dict[str, list[WindowInfo]] = {}
-        for window in windows:
+        for window in candidates:
+            if not isinstance(window, WindowInfo):
+                continue
             if not all(
                 keyword in window.title.casefold()
                 for keyword in self._title_keywords
@@ -174,12 +208,20 @@ class UngroupedWindowService:
             )
             if fingerprint is not None:
                 by_fingerprint.setdefault(fingerprint, []).append(window)
-        resolved = tuple(
-            (fingerprint, path, by_fingerprint[fingerprint][0])
-            for fingerprint, path in paths_by_fingerprint.items()
+        return tuple(
+            (
+                fingerprint,
+                paths_by_fingerprint.get(fingerprint),
+                candidates[0],
+            )
+            for fingerprint, candidates in by_fingerprint.items()
             if fingerprint not in grouped_fingerprints
-            and len(by_fingerprint.get(fingerprint, ())) == 1
+            and len(candidates) == 1
+            and complete_window_instance_identity(candidates[0]) is not None
         )
+
+    def snapshot(self) -> tuple[UngroupedWindow, ...]:
+        resolved = self.safe_candidates()
         states: Mapping[str, object] = {}
         if self._screen_states_provider is not None and resolved:
             fingerprints_to_observe = tuple(
@@ -205,7 +247,10 @@ class UngroupedWindowService:
                 status=self._status_for(states.get(fingerprint)),
             )
             for fingerprint, path, _window in sorted(
-                resolved,
+                (
+                    item for item in resolved
+                    if item[1] is not None
+                ),
                 key=lambda item: item[1].name.casefold(),
             )
         )
@@ -214,42 +259,12 @@ class UngroupedWindowService:
         normalized = normalize_launch_fingerprint(fingerprint)
         if normalized is None:
             return None
-        shortcut_paths = self._candidate_shortcuts()
-        group_paths = self._group_shortcuts()
-        all_paths = tuple(dict.fromkeys((*shortcut_paths, *group_paths)))
-        fingerprints = self._fingerprints_for(all_paths)
-        unique_shortcuts = self._unique_paths_by_fingerprint(
-            {
-                path: value
-                for path, value in fingerprints.items()
-                if path in shortcut_paths
-            }
-        )
-        grouped = {
-            value
-            for path, value in fingerprints.items()
-            if path in group_paths
-        }
-        path = unique_shortcuts.get(normalized)
-        if path is None or normalized in grouped:
-            return None
-        try:
-            windows = tuple(self._window_backend.list_windows())
-        except Exception:
-            return None
         matches = tuple(
-            window
-            for window in windows
-            if all(
-                keyword in window.title.casefold()
-                for keyword in self._title_keywords
-            )
-            and normalize_launch_fingerprint(
-                window.launch_fingerprint
-            )
-            == normalized
+            path
+            for candidate_fingerprint, path, _window in self.safe_candidates()
+            if candidate_fingerprint == normalized and path is not None
         )
-        return path if len(matches) == 1 else None
+        return matches[0] if len(matches) == 1 else None
 
     @classmethod
     def _status_for(cls, state: object) -> str:
