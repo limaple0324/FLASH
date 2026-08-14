@@ -373,39 +373,36 @@ class TargetWindowContractService:
             tuple[GroupConfigurationEntry, str, str | None, bool]
         ] = []
         for entry_id in selected_ids:
+            candidates = entry_candidates.get(entry_id, ())
             root_entry = root_entries.get(entry_id)
             if root_entry is not None:
-                resolved_entries.append(
-                    (
-                        root_entry,
-                        name,
-                        fingerprint_by_id.get(entry_id),
-                        len(entry_candidates.get(entry_id, ())) > 1,
-                    )
-                )
-                continue
-            candidates = entry_candidates.get(entry_id, ())
-            if len(candidates) == 1:
-                candidate_group, candidate_entry = candidates[0]
-                resolved_entries.append(
-                    (
-                        candidate_entry,
-                        candidate_group,
-                        fingerprint_by_id.get(entry_id),
-                        False,
-                    )
-                )
-                continue
-            snapshot_failures = tuple(
-                dict.fromkeys(
-                    (
-                        *snapshot_failures,
+                entry_group, entry = name, root_entry
+            elif len(candidates) == 1 or (
+                scope.ready and scope.group_name == "configured" and candidates
+            ):
+                entry_group, entry = candidates[0]
+            else:
+                snapshot_failures = tuple(
+                    dict.fromkeys(
                         (
-                            "target_entry_group_ambiguous"
-                            if candidates
-                            else "target_entry_unresolved"
-                        ),
+                            *snapshot_failures,
+                            (
+                                "target_entry_group_ambiguous"
+                                if candidates
+                                else "target_entry_unresolved"
+                            ),
+                        )
                     )
+                )
+                continue
+            if scope.group_name == "configured" and len(candidates) > 1:
+                entry_group = scope.group_name
+            resolved_entries.append(
+                (
+                    entry,
+                    entry_group,
+                    fingerprint_by_id.get(entry_id),
+                    len(candidates) > 1,
                 )
             )
 

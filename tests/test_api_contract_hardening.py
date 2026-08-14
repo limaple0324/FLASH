@@ -25,7 +25,11 @@ from services.data_contract_migration_service import (
     DataContractMigrationService,
 )
 from services.event_bus import EventBus
-from services.group_configuration_service import GroupConfigurationService
+from services.group_configuration_service import (
+    GroupConfiguration,
+    GroupConfigurationEntry,
+    GroupConfigurationService,
+)
 from services.game_operation_gate import GameOperationGate
 from services.group_selection_service import GroupSelectionService
 from services.keyboard_sync_monitor import Win32KeyboardStateBackend
@@ -1178,7 +1182,9 @@ def test_configured_reconnect_authority_is_global_cached_and_fail_closed(
 def test_configured_authority_deduplicates_one_entry_shared_across_groups(
     tmp_path,
 ):
+    root = tmp_path / "root.lnk"
     shared = tmp_path / "shared.lnk"
+    root.write_bytes(b"root")
     shared.write_bytes(b"shared")
     legacy = tmp_path / "shared-configured.json"
     legacy.write_text(
@@ -1186,12 +1192,20 @@ def test_configured_authority_deduplicates_one_entry_shared_across_groups(
             {
                 "groups": [
                     {
+                        "name": "root",
+                        "launch_entries": [
+                            {"path": str(root), "role_id": "root-role"}
+                        ],
+                    },
+                    *[
+                    {
                         "name": name,
                         "launch_entries": [
                             {"path": str(shared), "role_id": "same-role"}
                         ],
                     }
                     for name in ("first", "second")
+                    ],
                 ]
             }
         ),
@@ -1204,34 +1218,205 @@ def test_configured_authority_deduplicates_one_entry_shared_across_groups(
     resolver = _BatchRecordingResolver()
     scope_service = SyncScopeService(configuration, resolver)
     fingerprint = hashlib.sha256(str(shared).encode()).hexdigest()
+    backend = _WindowBackend(
+        (
+            WindowInfo(
+                11,
+                "Adobe Flash Player 11",
+                True,
+                False,
+                (0, 0, 9, 9),
+                101,
+                "Flash",
+                fingerprint,
+                1001,
+                10001,
+            ),
+        ),
+        foreground=11,
+    )
     service = TargetWindowContractService(
         configuration,
         scope_service,
         WindowRegistry(),
-        _WindowBackend(
-            (
-                WindowInfo(
-                    11,
-                    "Adobe Flash Player 11",
-                    True,
-                    False,
-                    (0, 0, 9, 9),
-                    101,
-                    "Flash",
-                    fingerprint,
-                    1001,
-                    10001,
-                ),
-            ),
-            foreground=11,
+        backend,
+    )
+
+    resolved = service.configured_reconnect_targets()
+    shared_entry_id = configuration.group("first").entries[0].entry_id
+
+    assert len(resolved.sync_scope_entry_ids) == 2
+    assert resolved.sync_scope_entry_ids.count(shared_entry_id) == 1
+    assert resolved.sync_entry_ids == (shared_entry_id,)
+    assert len(resolved.windows) == 1
+    assert len(resolved.target_failure_evidence) == 1
+    assert resolved.target_failure_evidence[0].failure_codes == (
+        "window_offline",
+    )
+    assert resolved.global_failure_codes == ()
+    assert [len(paths) for paths in resolver.calls] == [2]
+
+    backend.windows += (
+        replace(
+            backend.windows[0],
+            handle=12,
+            process_id=102,
+            thread_id=1002,
+            process_lifecycle_token=10002,
         ),
+    )
+    duplicate = service.configured_reconnect_targets()
+
+    assert duplicate.windows == ()
+    assert "window_identity_duplicate" in duplicate.global_failure_codes
+    assert "target_entry_group_ambiguous" not in duplicate.global_failure_codes
+
+
+def test_configured_authority_rejects_shared_entry_path_conflict(
+    tmp_path,
+    monkeypatch,
+):
+    first = tmp_path / "first.lnk"
+    second = tmp_path / "second.lnk"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    configuration = GroupConfigurationService(tmp_path / "groups.json")
+    entries = (
+        GroupConfigurationEntry(
+            "shared-entry",
+            "共享項目",
+            first,
+            "主窗口",
+            0,
+            role_id="same-role",
+        ),
+        GroupConfigurationEntry(
+            "shared-entry",
+            "共享項目",
+            second,
+            "主窗口",
+            0,
+            role_id="same-role",
+        ),
+    )
+    groups = tuple(
+        GroupConfiguration(f"group-{index}", name, (entry,))
+        for index, (name, entry) in enumerate(
+            zip(("first", "second"), entries),
+            start=1,
+        )
+    )
+    monkeypatch.setattr(configuration, "groups", lambda: groups)
+    monkeypatch.setattr(
+        configuration,
+        "group",
+        lambda name: next((group for group in groups if group.name == name), None),
+    )
+    resolver = _BatchRecordingResolver()
+    service = TargetWindowContractService(
+        configuration,
+        SyncScopeService(configuration, resolver),
+        WindowRegistry(),
+        _WindowBackend(),
     )
 
     resolved = service.configured_reconnect_targets()
 
-    assert len(resolved.sync_scope_entry_ids) == 1
-    assert len(resolved.windows) == 1
-    assert [len(paths) for paths in resolver.calls] == [1]
+    assert resolved.windows == ()
+    assert "configured_identity_path_conflict" in resolved.global_failure_codes
+    assert resolver.calls == []
+
+
+def test_configured_authority_keeps_many_offline_targets_local_with_shared_entry(
+    tmp_path,
+):
+    paths = tuple(tmp_path / f"configured-{index}.lnk" for index in range(103))
+    for path in paths:
+        path.write_bytes(str(path).encode("utf-8"))
+    shared = paths[12]
+    legacy = tmp_path / "many-configured.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "root",
+                        "launch_entries": [
+                            {
+                                "path": str(path),
+                                "role_id": f"role-{index}",
+                            }
+                            for index, path in enumerate(paths[:10])
+                        ],
+                    },
+                    {
+                        "name": "configured",
+                        "launch_entries": [
+                            {
+                                "path": str(path),
+                                "role_id": f"role-{index}",
+                            }
+                            for index, path in enumerate(paths[10:], start=10)
+                        ],
+                    },
+                    {
+                        "name": "shared",
+                        "launch_entries": [
+                            {"path": str(shared), "role_id": "role-12"}
+                        ],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    configuration = GroupConfigurationService(
+        tmp_path / "many-groups.json",
+        legacy_config_path=legacy,
+    )
+    resolver = _BatchRecordingResolver()
+    scope_service = SyncScopeService(configuration, resolver)
+    live_paths = paths[:13]
+    backend = _WindowBackend(
+        tuple(
+            WindowInfo(
+                100 + index,
+                "Adobe Flash Player 11",
+                True,
+                False,
+                (index * 10, 0, index * 10 + 9, 9),
+                1000 + index,
+                "Flash",
+                hashlib.sha256(str(path).encode()).hexdigest(),
+                2000 + index,
+                3000 + index,
+            )
+            for index, path in enumerate(live_paths)
+        ),
+        foreground=100,
+    )
+    service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        backend,
+    )
+
+    resolved = service.configured_reconnect_targets()
+    offline = tuple(
+        evidence
+        for evidence in resolved.target_failure_evidence
+        if evidence.failure_codes == ("window_offline",)
+    )
+    shared_entry_id = configuration.group("shared").entries[0].entry_id
+
+    assert len(resolved.sync_scope_entry_ids) == 103
+    assert resolved.sync_scope_entry_ids.count(shared_entry_id) == 1
+    assert len(resolved.windows) == 13
+    assert len(offline) == 90
+    assert all(evidence.candidate_windows == () for evidence in offline)
+    assert resolved.global_failure_codes == ()
+    assert [len(call) for call in resolver.calls] == [103]
 
 
 def test_sync_controller_accepts_only_the_shared_target_provider():
