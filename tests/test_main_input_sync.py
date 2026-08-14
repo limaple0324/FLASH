@@ -35,6 +35,7 @@ from main import (
     UI_THEME_CLASSIC_GOLD_MIGRATION_KEY,
     UI_THEME_KEY,
     _connected_sync_fingerprints,
+    build_configured_reconnect_plan,
     build_services,
     apply_auto_battle_after_game_launch,
     apply_smart_reconnect_auto_battle_setting,
@@ -1298,6 +1299,10 @@ def test_smart_reconnect_enable_binds_configured_plan_before_opening_gate():
         source.index("    def configured_reconnect_plan("):
         source.index("    def write_clipboard(")
     ]
+    plan_builder_source = source[
+        source.index("def build_configured_reconnect_plan("):
+        source.index("def apply_auto_battle_after_game_launch(")
+    ]
     group_identity_source = source[
         source.index("    def apply_group_identity("):
         source.index("    sync_connected_fingerprints:")
@@ -1335,6 +1340,8 @@ def test_smart_reconnect_enable_binds_configured_plan_before_opening_gate():
     assert "CURRENT_GROUP_NAME_KEY" not in configured_source
     assert "workspace_service.snapshot()" not in configured_source
     assert "group_selection_service.choices()" in configured_source
+    assert "not entry.role_id.strip()" not in plan_builder_source
+    assert "recovery_role_id" in plan_builder_source
     assert "smart_reconnect_controller.set_group_launch_plan" not in (
         group_identity_source
     )
@@ -1346,6 +1353,51 @@ def test_smart_reconnect_enable_binds_configured_plan_before_opening_gate():
     )
     assert "workspace_service.snapshot()" in input_sync_source
     assert "group_selection_service.find(group_name)" in input_sync_source
+
+
+def test_configured_reconnect_plan_keeps_recovery_conflicts_detection_only(
+    tmp_path,
+):
+    shortcut = tmp_path / "same.lnk"
+    scope = SimpleNamespace(
+        ready=True,
+        entry_ids=("shared-entry",),
+        entry_fingerprints=("a" * 64,),
+    )
+
+    def entry(role_id, placement=None):
+        return SimpleNamespace(
+            entry_id="shared-entry",
+            display_name="same",
+            shortcut_path=shortcut,
+            role_id=role_id,
+            placement=placement,
+        )
+
+    def plan_for(first, second):
+        return build_configured_reconnect_plan(
+            scope,
+            (
+                SimpleNamespace(entries=(first,)),
+                SimpleNamespace(entries=(second,)),
+            ),
+            (),
+            (),
+        )
+
+    blank_conflict = plan_for(entry(""), entry("hero"))
+    placement_conflict = plan_for(
+        entry("hero"),
+        entry("hero", SimpleNamespace(x=1)),
+    )
+    recoverable = plan_for(entry("hero"), entry("hero"))
+
+    assert blank_conflict is not None
+    assert blank_conflict.targets[0].role_id == ""
+    assert placement_conflict is not None
+    assert placement_conflict.targets[0].role_id == ""
+    assert recoverable is not None
+    assert recoverable.targets[0].role_id == "hero"
 
 
 def test_build_services_registers_input_controller_and_safe_default(tmp_path):

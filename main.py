@@ -713,6 +713,104 @@ def resolve_registered_reconnect_roles(
     )
 
 
+def build_configured_reconnect_plan(
+    scope: object,
+    groups: object,
+    characters: object,
+    choices: object,
+) -> GroupLaunchPlan | None:
+    """Keep every detected entry while granting recovery per identity."""
+
+    if not bool(getattr(scope, "ready", False)):
+        return None
+    group_items = tuple(groups) if isinstance(groups, (list, tuple)) else ()
+    character_items = (
+        tuple(characters) if isinstance(characters, (list, tuple)) else ()
+    )
+    choice_items = tuple(choices) if isinstance(choices, (list, tuple)) else ()
+    entries = {}
+    shortcut_paths = {}
+    recovery_evidence = {}
+    recovery_conflicts = set()
+    for group in group_items:
+        for entry in tuple(getattr(group, "entries", ())):
+            shortcut_path = str(
+                entry.shortcut_path.resolve(strict=False)
+            ).casefold()
+            if (
+                entry.entry_id in shortcut_paths
+                and shortcut_paths[entry.entry_id] != shortcut_path
+            ):
+                return None
+            entries.setdefault(entry.entry_id, entry)
+            shortcut_paths[entry.entry_id] = shortcut_path
+            evidence = (
+                entry.display_name,
+                entry.role_id.strip(),
+                entry.placement,
+            )
+            if (
+                entry.entry_id in recovery_evidence
+                and recovery_evidence[entry.entry_id] != evidence
+            ):
+                recovery_conflicts.add(entry.entry_id)
+            recovery_evidence.setdefault(entry.entry_id, evidence)
+    entry_ids = tuple(getattr(scope, "entry_ids", ()))
+    entry_fingerprints = tuple(
+        getattr(scope, "entry_fingerprints", ())
+    )
+    if tuple(entries) != entry_ids:
+        return None
+
+    profiles = {
+        character.character_id: character
+        for character in character_items
+    }
+    profile_ids = {}
+    for choice in choice_items:
+        for member in tuple(getattr(choice, "members", ())):
+            if member.character_id:
+                profile_ids.setdefault(member.entry_id, set()).add(
+                    member.character_id
+                )
+    targets = []
+    for order, (entry_id, fingerprint) in enumerate(
+        zip(entry_ids, entry_fingerprints),
+        start=1,
+    ):
+        if fingerprint is None:
+            return None
+        character_ids = profile_ids.get(entry_id, set())
+        recovery_evidence_for_entry = recovery_evidence[entry_id]
+        recovery_role_id = (
+            recovery_evidence_for_entry[1]
+            if entry_id not in recovery_conflicts
+            and recovery_evidence_for_entry[1]
+            and len(character_ids) <= 1
+            else ""
+        )
+        profile = (
+            profiles.get(next(iter(character_ids), entry_id))
+            if recovery_role_id
+            else None
+        )
+        entry = entries[entry_id]
+        targets.append(
+            GroupLaunchTarget(
+                order,
+                entry.display_name,
+                entry.shortcut_path,
+                fingerprint,
+                entry.placement,
+                entry.entry_id,
+                recovery_role_id,
+                profile.level if profile is not None else None,
+                profile.importance if profile is not None else None,
+            )
+        )
+    return GroupLaunchPlan("configured", tuple(targets))
+
+
 def apply_auto_battle_after_game_launch(
     game_was_launched: bool,
     controller: object,
@@ -3340,72 +3438,20 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         ):
             return None
         scope = target_window_contract_service.configured_scope()
-        if not scope.ready:
-            return None
-        entries = {}
-        evidence = {}
-        for group in group_configuration_service.groups():
-            for entry in group.entries:
-                signature = (
-                    str(entry.shortcut_path.resolve(strict=False)).casefold(),
-                    entry.display_name,
-                    entry.role_id,
-                    entry.placement,
-                )
-                if (
-                    entry.entry_id in evidence
-                    and evidence[entry.entry_id] != signature
-                ):
-                    return None
-                entries.setdefault(entry.entry_id, entry)
-                evidence[entry.entry_id] = signature
-        if tuple(entries) != tuple(scope.entry_ids):
-            return None
-
-        profiles = {
-            character.character_id: character
-            for character in (
+        return build_configured_reconnect_plan(
+            scope,
+            group_configuration_service.groups(),
+            (
                 character_store.load()
                 if character_store is not None
                 else ()
-            )
-        }
-        profile_ids = {}
-        if group_selection_service is not None:
-            for choice in group_selection_service.choices():
-                for member in choice.members:
-                    if member.character_id:
-                        profile_ids.setdefault(member.entry_id, set()).add(
-                            member.character_id
-                        )
-        targets = []
-        for order, (entry_id, fingerprint) in enumerate(
-            zip(scope.entry_ids, scope.entry_fingerprints),
-            start=1,
-        ):
-            character_ids = profile_ids.get(entry_id, set())
-            if len(character_ids) > 1:
-                return None
-            profile = profiles.get(
-                next(iter(character_ids), entry_id)
-            )
-            entry = entries[entry_id]
-            if fingerprint is None or not entry.role_id.strip():
-                return None
-            targets.append(
-                GroupLaunchTarget(
-                    order,
-                    entry.display_name,
-                    entry.shortcut_path,
-                    fingerprint,
-                    entry.placement,
-                    entry.entry_id,
-                    entry.role_id,
-                    profile.level if profile is not None else None,
-                    profile.importance if profile is not None else None,
-                )
-            )
-        return GroupLaunchPlan("configured", tuple(targets))
+            ),
+            (
+                group_selection_service.choices()
+                if group_selection_service is not None
+                else ()
+            ),
+        )
 
     def write_clipboard(value: str) -> bool:
         try:

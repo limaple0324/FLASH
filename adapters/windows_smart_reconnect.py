@@ -4689,7 +4689,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         for target in targets:
             if (
                 not target.entry_id
-                or not target.role_id
                 or target.entry_id in targets_by_entry
             ):
                 return None
@@ -4730,6 +4729,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
         verified_instances = {}
         verified_sources: dict[str, str] = {}
+        detection_only: set[str] = set()
         for target in required_targets:
             matches = tuple(
                 (monitor_fingerprint, candidate)
@@ -4750,7 +4750,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             monitor_fingerprint, candidate = matches[0]
             verified_instances[monitor_fingerprint] = candidate
             verified_sources[monitor_fingerprint] = target.fingerprint
-        detection_only: set[str] = set()
+            if not target.role_id:
+                detection_only.add(monitor_fingerprint)
         for window in resolved.detection_only_windows:
             source_fingerprint = normalize_launch_fingerprint(
                 window.launch_fingerprint
@@ -6066,8 +6067,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             target
             for target in plan.targets
             if (
+                target.role_id
+                and target.fingerprint not in self._detection_only_fingerprints
+                and (
                 target.fingerprint in self._login_only_recovery_fingerprints
                 and self._has_reconnect_session(target.fingerprint)
+                )
             )
         )
         if len(sessions) > 1:
@@ -6078,6 +6083,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             fingerprint: state for fingerprint, state in confirmed
         }
         for target in plan.targets:
+            if (
+                not target.role_id
+                or target.fingerprint in self._detection_only_fingerprints
+            ):
+                continue
             state = confirmed_by_fingerprint.get(target.fingerprint)
             if state is None or target.fingerprint in self._tcp_timeout_isolated:
                 continue
@@ -8727,6 +8737,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 or any(
                     not target.entry_id or not target.role_id
                     for target in plan.targets
+                    if target.fingerprint in formal_reopen
                 )
             )
         )
@@ -8885,7 +8896,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         ]
         if any(
             fingerprint in self._detection_only_fingerprints
-            and state.entry_id is None
             for fingerprint, state in tcp_evidence
         ):
             failures.append("recovery_identity_unavailable")
