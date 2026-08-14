@@ -571,9 +571,7 @@ class TargetWindowContractService:
                 global_failures.extend(target.failure_codes)
 
         if scoped_resolution:
-            # A shared launcher is safe only when every raw candidate can be
-            # attributed to exactly one entry.  A confirmed registry mapping
-            # may choose one sibling, but it may not silently discard another.
+            # Every raw candidate must have exactly one entry owner.
             safe_candidate_identities = {
                 identity
                 for _entry_id, window, _monitor_fingerprint in safe_pairs
@@ -618,6 +616,12 @@ class TargetWindowContractService:
                 if identity is not None:
                     attributed_candidates.setdefault(identity, set()).add(entry_id)
             for evidence in target_failures:
+                if _configured_scope and (
+                    evidence.failure_codes != ("window_offline",)
+                    or evidence.candidate_windows
+                ):
+                    global_failures.extend(evidence.failure_codes)
+                    continue
                 for window in evidence.candidate_windows:
                     identity = complete_window_instance_identity(window)
                     if identity is not None:
@@ -653,14 +657,11 @@ class TargetWindowContractService:
             for fingerprint, candidates in windows_by_fingerprint.items():
                 if fingerprint not in scoped_fingerprints:
                     owners = configured_owners.get(fingerprint, set())
-                    identities = tuple(
-                        complete_window_instance_identity(candidate)
-                        for candidate in candidates
-                    )
                     if (
                         len(owners) != 1
                         or len(candidates) != 1
-                        or identities[0] is None
+                        or complete_window_instance_identity(candidates[0])
+                        is None
                     ):
                         global_failures.append(
                             "unattributed_candidate_window"
