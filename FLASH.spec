@@ -1,5 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+from pathlib import Path
+
 from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_dynamic_libs,
@@ -16,6 +19,13 @@ rapidocr_binaries = (
 )
 rapidocr_datas = collect_data_files('rapidocr_onnxruntime')
 rapidocr_hiddenimports = collect_submodules('rapidocr_onnxruntime')
+wgc_helper_path = Path(
+    os.environ.get(
+        'FLASH_WGC_HELPER_DLL',
+        'native/windows_graphics_capture_helper.dll',
+    )
+)
+wgc_helper_binaries = [(str(wgc_helper_path), '.')]
 obsidian_reference_datas = [
     (
         f'assets/game_data_reference/obsidian/page_{page:02d}.png',
@@ -27,7 +37,12 @@ obsidian_reference_datas = [
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=rawpy_binaries + pillow_heif_binaries + rapidocr_binaries,
+    binaries=(
+        rawpy_binaries
+        + pillow_heif_binaries
+        + rapidocr_binaries
+        + wgc_helper_binaries
+    ),
     datas=[
         ('assets/flash_icon.png', 'assets'),
         ('assets/flash_icon.ico', 'assets'),
@@ -83,4 +98,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='assets/flash_icon.ico',
+    manifest='packaging/wgc-validation/FLASH.exe.manifest',
 )

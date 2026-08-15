@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from ctypes import wintypes
+from pathlib import Path
 from typing import Callable, Protocol
 
 
@@ -267,6 +269,331 @@ class CaptureSample:
 class WindowCaptureProvider(Protocol):
     def capture(self, window_handle: int) -> CaptureSample | None:
         """Capture a target window without changing focus or sending input."""
+
+
+class _WgcFrame(ctypes.Structure):
+    _fields_ = [
+        ("size", ctypes.c_uint32),
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("stride", ctypes.c_uint32),
+        ("required_bytes", ctypes.c_uint32),
+        ("timestamp", ctypes.c_uint64),
+    ]
+
+
+class WindowsGraphicsCaptureProvider:
+    """Borderless Windows Graphics Capture for visible or occluded windows.
+
+    Permission is prepared explicitly before monitoring is enabled.  A
+    minimized window, an unavailable package capability, a visible system
+    border, or a frame without a strictly newer system timestamp all fail
+    closed.  The helper exports no window-state or input mutation operation.
+    """
+
+    ACCESS_ALLOWED = 1
+    CAPTURE_OK = 1
+    CAPTURE_BUFFER_TOO_SMALL = 2
+    ABI_VERSION = 1
+    MAX_FRAME_BYTES = 512 * 1024 * 1024
+
+    _ACCESS_NAMES = {
+        1: "allowed",
+        2: "denied",
+        3: "unspecified",
+        -1: "error",
+    }
+
+    def __init__(
+        self,
+        helper_path: Path | None = None,
+        *,
+        timeout_ms: int = 1500,
+        library_loader: Callable[[str], object] | None = None,
+        minimized_provider: Callable[[int], bool] | None = None,
+        window_identity_provider: (
+            Callable[[int], tuple[object, ...] | None] | None
+        ) = None,
+        process_lifecycle_provider: (
+            Callable[[int], int | None] | None
+        ) = None,
+    ) -> None:
+        self._helper_path = Path(helper_path) if helper_path else None
+        self._timeout_ms = max(1, int(timeout_ms))
+        self._library_loader = library_loader
+        self._minimized_provider = minimized_provider
+        self._window_identity_provider = window_identity_provider
+        self._process_lifecycle_provider = (
+            process_lifecycle_provider
+            or _default_process_lifecycle_token
+        )
+        self._library: object | None = None
+        self._access_state: int | None = None
+        self._last_timestamps: dict[int, int] = {}
+        self._lock = threading.RLock()
+        self._last_failure_stage: str | None = None
+
+    def _window_identity(
+        self,
+        window_handle: int,
+    ) -> tuple[object, ...] | None:
+        provider = self._window_identity_provider
+        if provider is not None:
+            try:
+                return provider(window_handle)
+            except Exception:
+                return None
+        if os.name != "nt" or not window_handle:
+            return None
+        try:
+            user32 = ctypes.windll.user32
+            user32.IsWindow.argtypes = (wintypes.HWND,)
+            user32.IsWindow.restype = wintypes.BOOL
+            user32.GetWindowThreadProcessId.argtypes = (
+                wintypes.HWND,
+                ctypes.POINTER(wintypes.DWORD),
+            )
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            user32.GetClassNameW.argtypes = (
+                wintypes.HWND,
+                wintypes.LPWSTR,
+                ctypes.c_int,
+            )
+            user32.GetClassNameW.restype = ctypes.c_int
+            user32.GetWindowRect.argtypes = (
+                wintypes.HWND,
+                ctypes.POINTER(wintypes.RECT),
+            )
+            user32.GetWindowRect.restype = wintypes.BOOL
+            user32.IsIconic.argtypes = (wintypes.HWND,)
+            user32.IsIconic.restype = wintypes.BOOL
+            hwnd = wintypes.HWND(window_handle)
+            credential = _query_window_instance_credential(
+                user32,
+                hwnd,
+                self._process_lifecycle_provider,
+            )
+            rect = wintypes.RECT()
+            if credential is None or not user32.GetWindowRect(
+                hwnd,
+                ctypes.byref(rect),
+            ):
+                return None
+            minimized = bool(user32.IsIconic(hwnd))
+            if not _same_window_instance(
+                user32,
+                hwnd,
+                credential,
+                self._process_lifecycle_provider,
+            ):
+                return None
+            return (
+                credential.handle,
+                credential.process_id,
+                credential.thread_id,
+                credential.window_class,
+                (
+                    int(rect.left),
+                    int(rect.top),
+                    int(rect.right),
+                    int(rect.bottom),
+                ),
+                minimized,
+                credential.process_lifecycle_token,
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _default_helper_path() -> Path:
+        frozen_root = getattr(sys, "_MEIPASS", None)
+        if frozen_root:
+            return Path(frozen_root) / "windows_graphics_capture_helper.dll"
+        return (
+            Path(__file__).resolve().parents[1]
+            / "native"
+            / "windows_graphics_capture_helper.dll"
+        )
+
+    @property
+    def access_status(self) -> str:
+        state = self._access_state
+        return (
+            "unprepared"
+            if state is None
+            else self._ACCESS_NAMES.get(state, "error")
+        )
+
+    @property
+    def last_failure_stage(self) -> str | None:
+        return self._last_failure_stage
+
+    def _load_library(self) -> object | None:
+        if self._library is not None:
+            return self._library
+        if os.name != "nt" and self._library_loader is None:
+            self._last_failure_stage = "platform_unsupported"
+            return None
+        path = self._helper_path or self._default_helper_path()
+        loader = self._library_loader or ctypes.WinDLL
+        try:
+            library = loader(str(path))
+            library.FlashWgcHelperAbiVersion.argtypes = ()
+            library.FlashWgcHelperAbiVersion.restype = ctypes.c_uint32
+            library.FlashWgcPrepareBorderlessAccess.argtypes = ()
+            library.FlashWgcPrepareBorderlessAccess.restype = ctypes.c_int
+            library.FlashWgcCaptureWindow.argtypes = (
+                wintypes.HWND,
+                ctypes.c_uint64,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_ubyte),
+                ctypes.c_uint32,
+                ctypes.POINTER(_WgcFrame),
+            )
+            library.FlashWgcCaptureWindow.restype = ctypes.c_int
+            if library.FlashWgcHelperAbiVersion() != self.ABI_VERSION:
+                self._last_failure_stage = "helper_abi_mismatch"
+                return None
+        except (AttributeError, OSError, TypeError, ValueError):
+            self._last_failure_stage = "helper_load_failed"
+            return None
+        self._library = library
+        return library
+
+    def prepare_borderless_access(self) -> bool:
+        """Request formal borderless access once and retain its exact result."""
+
+        with self._lock:
+            if self._access_state is not None:
+                return self._access_state == self.ACCESS_ALLOWED
+            library = self._load_library()
+            if library is None:
+                self._access_state = -1
+                return False
+            try:
+                state = int(library.FlashWgcPrepareBorderlessAccess())
+            except (OSError, TypeError, ValueError):
+                state = -1
+            self._access_state = state
+            if state != self.ACCESS_ALLOWED:
+                self._last_failure_stage = (
+                    "borderless_access_" + self.access_status
+                )
+                return False
+            self._last_failure_stage = None
+            return True
+
+    def _is_minimized(self, window_handle: int) -> bool:
+        provider = self._minimized_provider
+        if provider is not None:
+            try:
+                return provider(window_handle) is True
+            except Exception:
+                return True
+        if os.name != "nt" or not window_handle:
+            return True
+        try:
+            user32 = ctypes.windll.user32
+            user32.IsIconic.argtypes = (wintypes.HWND,)
+            user32.IsIconic.restype = wintypes.BOOL
+            return bool(user32.IsIconic(wintypes.HWND(window_handle)))
+        except (AttributeError, OSError, TypeError, ValueError):
+            return True
+
+    @staticmethod
+    def _empty_frame() -> _WgcFrame:
+        frame = _WgcFrame()
+        frame.size = ctypes.sizeof(_WgcFrame)
+        return frame
+
+    @classmethod
+    def _valid_frame_shape(cls, frame: _WgcFrame) -> bool:
+        return bool(
+            frame.width > 0
+            and frame.height > 0
+            and frame.stride == frame.width * 4
+            and frame.required_bytes == frame.stride * frame.height
+            and frame.required_bytes <= cls.MAX_FRAME_BYTES
+            and frame.timestamp > 0
+        )
+
+    def capture(self, window_handle: int) -> CaptureSample | None:
+        with self._lock:
+            self._last_failure_stage = None
+            if (
+                self._access_state != self.ACCESS_ALLOWED
+                or self._library is None
+            ):
+                self._last_failure_stage = "borderless_access_unavailable"
+                return None
+            expected_identity = self._window_identity(window_handle)
+            if expected_identity is None:
+                self._last_failure_stage = "window_identity_unavailable"
+                return None
+            if self._is_minimized(window_handle):
+                self._last_failure_stage = "window_minimized"
+                return None
+
+            previous_timestamp = self._last_timestamps.get(window_handle, 0)
+            probe = self._empty_frame()
+            try:
+                result = int(
+                    self._library.FlashWgcCaptureWindow(
+                        wintypes.HWND(window_handle),
+                        ctypes.c_uint64(previous_timestamp),
+                        ctypes.c_uint32(self._timeout_ms),
+                        None,
+                        ctypes.c_uint32(0),
+                        ctypes.byref(probe),
+                    )
+                )
+            except (OSError, TypeError, ValueError):
+                self._last_failure_stage = "capture_call_failed"
+                return None
+            if (
+                result != self.CAPTURE_BUFFER_TOO_SMALL
+                or not self._valid_frame_shape(probe)
+                or probe.timestamp <= previous_timestamp
+                or self._window_identity(window_handle)
+                != expected_identity
+            ):
+                self._last_failure_stage = "fresh_frame_probe_failed"
+                return None
+
+            buffer = (ctypes.c_ubyte * probe.required_bytes)()
+            captured = self._empty_frame()
+            try:
+                result = int(
+                    self._library.FlashWgcCaptureWindow(
+                        wintypes.HWND(window_handle),
+                        ctypes.c_uint64(probe.timestamp),
+                        ctypes.c_uint32(self._timeout_ms),
+                        buffer,
+                        ctypes.c_uint32(probe.required_bytes),
+                        ctypes.byref(captured),
+                    )
+                )
+            except (OSError, TypeError, ValueError):
+                self._last_failure_stage = "capture_call_failed"
+                return None
+            if (
+                result != self.CAPTURE_OK
+                or not self._valid_frame_shape(captured)
+                or captured.timestamp <= probe.timestamp
+                or captured.required_bytes > probe.required_bytes
+                or self._window_identity(window_handle)
+                != expected_identity
+            ):
+                self._last_failure_stage = "fresh_frame_copy_failed"
+                return None
+
+            self._last_timestamps[window_handle] = captured.timestamp
+            return CaptureSample(
+                width=captured.width,
+                height=captured.height,
+                pixels=bytes(buffer[: captured.required_bytes]),
+                api_succeeded=True,
+            )
 
 
 class Win32PrintWindowProvider:

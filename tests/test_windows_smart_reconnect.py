@@ -23,6 +23,7 @@ from adapters.windows_background_capture import (
     Win32PrintWindowProvider,
     Win32RecoveringPrintWindowProvider,
     Win32TemporarilyRevealedCaptureProvider,
+    WindowsGraphicsCaptureProvider,
 )
 from adapters.windows_battle_restart import BattleRestartResult
 from adapters.windows_smart_reconnect import (
@@ -1525,6 +1526,18 @@ class FakeBattleRestarter:
         )
 
 
+class FailFirstReopenRestarter(FakeBattleRestarter):
+    def reopen_missing(self, target, candidate_windows, **kwargs):
+        self.reopen_calls.append((target, tuple(candidate_windows)))
+        self.reopen_kwargs.append(kwargs)
+        succeeded = len(self.reopen_calls) > 1
+        return BattleRestartResult(
+            succeeded,
+            None if succeeded else "battle_shortcut_open_failed",
+            shortcut_open_requested=succeeded,
+        )
+
+
 class SequenceTcpCounts:
     def __init__(self, observations):
         self.observations = list(observations)
@@ -1560,6 +1573,7 @@ def make_controller(
     visible_capture_provider=None,
     obscured_capture_provider=None,
     active_refresh_capture_provider=None,
+    capture_access_preparer=None,
     primary_capture_is_trusted=True,
     operation_gate=None,
     window_backend=None,
@@ -1628,6 +1642,7 @@ def make_controller(
             visible_capture_provider=visible_capture_provider,
             obscured_capture_provider=obscured_capture_provider,
             active_refresh_capture_provider=active_refresh_capture_provider,
+            capture_access_preparer=capture_access_preparer,
             primary_capture_is_trusted=primary_capture_is_trusted,
             recognizer=recognizer,
             mouse_backend=mouse,
@@ -1987,12 +2002,11 @@ def test_multiple_tcp_zero_queues_only_first_plan_owner_for_mutation(
     fixture.controller.check_connection()
     fixture.controller.reconnect()
     fixture.controller.reconnect()
-    # TCP confirmation grants the owner only. Two fresh matching frames still
-    # have to complete before the close/reopen boundary.
-    fixture.controller.reconnect()
     restarted = fixture.controller.reconnect()
+    waiting_for_new_instance = fixture.controller.reconnect()
 
     assert restarted.details["restarted_windows"] == 1
+    assert waiting_for_new_instance.details["restarted_windows"] == 0
     assert [call[0] for call in restarter.calls] == [windows[0]]
     assert len(restarter.reopen_calls) == 1
     assert restarter.reopen_calls[0][0].fingerprint == (
@@ -3140,7 +3154,9 @@ def test_recovered_peer_can_be_revoked_again_in_a_new_source_generation():
     )
 
 
-def test_pending_reopen_ignores_mapped_duplicate_sibling_only(tmp_path):
+def test_pending_tcp_reopen_does_not_repeat_for_mapped_duplicate_sibling(
+    tmp_path,
+):
     target = CharacterSelectionCandidate(
         120,
         None,
@@ -3176,13 +3192,15 @@ def test_pending_reopen_ignores_mapped_duplicate_sibling_only(tmp_path):
         )
     }
     fixture.controller._target_windows_provider = lambda: provider_state["value"]
-    reopen_count_before_retry = len(restarter.reopen_calls)
+    reopen_count_before_wait = len(restarter.reopen_calls)
 
     fixture.controller.reconnect()
 
-    assert len(restarter.reopen_calls) == reopen_count_before_retry + 1
-    assert restarter.reopen_calls[-1][0].fingerprint == old.launch_fingerprint
-    assert restarter.reopen_calls[-1][1] == (peers[1],)
+    assert len(restarter.reopen_calls) == reopen_count_before_wait
+    assert [call[0] for call in restarter.calls] == [old]
+    assert fixture.controller._pending_reopen_fingerprints == {
+        old.launch_fingerprint
+    }
     assert fixture.mouse.clicks == []
 
 
@@ -3469,11 +3487,12 @@ def test_tcp_confirmed_peer_waits_until_first_owner_reaches_terminal(tmp_path):
     assert [call[0] for call in restarter.calls] == [old]
 
     first_peer_scan = fixture.controller.reconnect()
-    assert first_peer_scan.details["restarted_windows"] == 0
     second_peer_scan = fixture.controller.reconnect()
 
-    assert second_peer_scan.details["restarted_windows"] == 1
+    assert first_peer_scan.details["restarted_windows"] == 1
+    assert second_peer_scan.details["restarted_windows"] == 0
     assert [call[0] for call in restarter.calls] == [old, peers[0]]
+    assert len(restarter.reopen_calls) == 2
     assert all(call[0] != peers[1] for call in restarter.calls)
 
 
@@ -6423,11 +6442,13 @@ def test_recovery_owner_ignores_configured_and_ungrouped_detection_only_peers(
     fixture.controller.check_connection()
     fixture.controller.reconnect()
     fixture.controller.reconnect()
-    fixture.controller.reconnect()
     restarted = fixture.controller.reconnect()
+    waiting_for_new_instance = fixture.controller.reconnect()
 
     assert restarted.details["restarted_windows"] == 1
+    assert waiting_for_new_instance.details["restarted_windows"] == 0
     assert [call[0] for call in restarter.calls] == [owner]
+    assert len(restarter.reopen_calls) == 1
     assert restarter.calls[0][1] == (
         owner,
         configured_detection,
@@ -6496,10 +6517,11 @@ def test_configured_owner_recovers_with_detection_only_peers_unchanged(
     fixture.controller.check_connection()
     fixture.controller.reconnect()
     fixture.controller.reconnect()
-    fixture.controller.reconnect()
     restarted = fixture.controller.reconnect()
+    waiting_for_new_instance = fixture.controller.reconnect()
 
     assert restarted.details["restarted_windows"] == 1
+    assert waiting_for_new_instance.details["restarted_windows"] == 0
     assert [call[0] for call in restarter.calls] == [owner]
     assert restarter.calls[0][1] == windows
     assert len(restarter.reopen_calls) == 1
@@ -7114,8 +7136,12 @@ def test_real_controller_wires_only_non_mutating_capture_routes(monkeypatch):
 
     assert isinstance(controller._capture_provider, Win32PrintWindowProvider)
     assert type(controller._capture_provider) is Win32PrintWindowProvider
-    assert controller._obscured_capture_provider is None
+    assert isinstance(
+        controller._obscured_capture_provider,
+        WindowsGraphicsCaptureProvider,
+    )
     assert controller._active_refresh_capture_provider is None
+    assert callable(controller._capture_access_preparer)
     assert controller._primary_capture_is_trusted is True
     assert controller._primary_capture_is_fresh_without_visibility is False
     assert controller._tcp_counts is tcp_provider
@@ -7162,10 +7188,28 @@ def test_real_obscured_window_stays_unknown_without_revealing_it(
     assert result.details["connected_windows"] == 0
     assert result.details["unknown_windows"] == 1
     assert result.details["clicked_windows"] == 0
-    assert passive.calls == [window.handle]
+    assert passive.calls == []
     diagnostic = result.details["capture_diagnostics"][0]
     assert diagnostic["capture_path"] == "obscured"
-    assert diagnostic["rejection_gate"] == "capture_not_fresh"
+    assert diagnostic["rejection_gate"] == "capture_failed"
+
+
+def test_denied_borderless_access_rejects_snapshot_without_opening_execution():
+    calls = []
+    fixture = make_controller(
+        [1],
+        expected_windows=1,
+        capture_access_preparer=lambda: calls.append("prepare") or False,
+    )
+
+    fixture.controller.set_execution_enabled(False)
+    result = fixture.controller.prepare_execution_snapshot()
+
+    assert result.success is False
+    assert result.code == "reconnect.snapshot_capture_access_denied"
+    assert calls == ["prepare"]
+    assert fixture.controller._execution_enabled.is_set() is False
+    assert fixture.controller._activation_snapshot_instances is None
 
 
 def test_real_minimized_window_stays_unknown_without_restoring_it(
@@ -12105,3 +12149,370 @@ def test_reconnect_timeout_records_anonymous_stage_and_keeps_monitoring(tmp_path
     assert ("a" * 64, "disconnect_to_primary_auto") in (
         fixture.controller._reconnect_timing_flows
     )
+
+
+def _run_case_tcp_owner(
+    tmp_path,
+    *,
+    final_observation,
+    windows=None,
+    owner_marker=None,
+    on_final=None,
+    target_windows_provider=None,
+    battle_restarter=None,
+):
+    windows = windows or [
+        make_window(index, process_id=100 + index)
+        for index in (1, 2, 3)
+    ]
+    restarter = battle_restarter or FakeBattleRestarter()
+    now = [0.0]
+    calls = [0]
+    fixture_holder = {}
+    online = {window.process_id: 1 for window in windows}
+    owner_zero = dict(online)
+    owner_zero[windows[0].process_id] = 0
+
+    def tcp(_process_ids):
+        calls[0] += 1
+        if calls[0] == 1:
+            return online
+        if calls[0] == 6:
+            if on_final is not None:
+                on_final(fixture_holder["fixture"])
+            return final_observation
+        return owner_zero
+
+    fixture = make_controller(
+        [owner_marker, *([1] * (len(windows) - 1))],
+        windows=windows,
+        expected_windows=len(windows),
+        clock=lambda: now[0],
+        tcp_connection_count_provider=tcp,
+        target_windows_provider=(
+            target_windows_provider
+            or (lambda: tcp_resolved_targets(windows))
+        ),
+        battle_restarter=restarter,
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
+    )
+    fixture_holder["fixture"] = fixture
+    assert activate_current_window_snapshot(fixture).success is True
+    for observed_at in (0.0, 1.0, 4.0, 8.0):
+        now[0] = observed_at
+        fixture.controller.check_connection()
+    now[0] = 9.0
+    result = fixture.controller.reconnect()
+    return fixture, restarter, result, calls
+
+
+def test_case_01_confirmed_tcp_unknown_unresolved_route_exactly_restarts_owner(
+    tmp_path,
+):
+    final = {101: 0, 102: 1, 103: 1}
+    fixture, restarter, result, calls = _run_case_tcp_owner(
+        tmp_path,
+        final_observation=final,
+    )
+
+    assert calls == [6]
+    assert result.details["restarted_windows"] == 1
+    assert [call[0].handle for call in restarter.calls] == [1]
+    assert fixture.mouse.clicks == []
+    assert result.details["capture_diagnostics"][0]["capture_path"] == (
+        "unresolved"
+    )
+
+
+def test_case_02_final_tcp_nonzero_blocks_exact_close(tmp_path):
+    _fixture, restarter, _result, calls = _run_case_tcp_owner(
+        tmp_path,
+        final_observation={101: 1, 102: 1, 103: 1},
+    )
+
+    assert calls == [6]
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
+def test_case_03_failed_final_tcp_query_blocks_exact_close(tmp_path):
+    fixture, restarter, _result, calls = _run_case_tcp_owner(
+        tmp_path,
+        final_observation=None,
+    )
+
+    assert calls == [6]
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+    assert fixture.controller._battle_restart_attempts == {}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("handle", 901),
+        ("process_id", 902),
+        ("thread_id", 903),
+        ("window_class", "ChangedFlash"),
+        ("process_lifecycle_token", 904),
+        ("rect", (10, 10, 910, 610)),
+        ("minimized", True),
+    ),
+)
+def test_case_04_any_complete_instance_identity_change_blocks_close(
+    tmp_path,
+    field,
+    value,
+):
+    def change_instance(fixture):
+        changed = replace(
+            fixture.controller._window_backend.windows[0],
+            **{field: value},
+        )
+        changed_windows = [
+            changed,
+            *fixture.controller._window_backend.windows[1:],
+        ]
+        fixture.controller._window_backend.windows = changed_windows
+        fixture.controller._target_windows_provider = (
+            lambda: tcp_resolved_targets(changed_windows)
+        )
+
+    _fixture, restarter, _result, _calls = _run_case_tcp_owner(
+        tmp_path,
+        final_observation={101: 0, 102: 1, 103: 1},
+        on_final=change_instance,
+    )
+
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
+def test_case_05_recovery_authority_disappears_before_close(tmp_path):
+    def revoke_plan(fixture):
+        fixture.controller.set_group_launch_plan(None)
+
+    _fixture, restarter, _result, _calls = _run_case_tcp_owner(
+        tmp_path,
+        final_observation={101: 0, 102: 1, 103: 1},
+        on_final=revoke_plan,
+    )
+
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
+def test_case_06_peer_contract_change_before_close_blocks_owner(tmp_path):
+    windows = [
+        make_window(index, process_id=100 + index)
+        for index in (1, 2, 3)
+    ]
+    resolved = {"value": tcp_resolved_targets(windows)}
+
+    def change_peer_contract(_fixture):
+        resolved["value"] = tcp_resolved_targets(
+            [
+                windows[0],
+                replace(windows[1], process_lifecycle_token=999999),
+                windows[2],
+            ]
+        )
+
+    _fixture, restarter, _result, _calls = _run_case_tcp_owner(
+        tmp_path,
+        windows=windows,
+        final_observation={101: 0, 102: 1, 103: 1},
+        on_final=change_peer_contract,
+        target_windows_provider=lambda: resolved["value"],
+    )
+
+    assert restarter.calls == []
+    assert restarter.reopen_calls == []
+
+
+def test_case_07_exact_close_absence_and_exact_shortcut_reopen(tmp_path):
+    final = {101: 0, 102: 1, 103: 1}
+    _fixture, restarter, result, _calls = _run_case_tcp_owner(
+        tmp_path,
+        final_observation=final,
+    )
+
+    assert result.details["restarted_windows"] == 1
+    assert len(restarter.calls) == 1
+    assert len(restarter.reopen_calls) == 1
+    assert restarter.reopen_calls[0][0].entry_id == "entry-0"
+    assert restarter.reopen_calls[0][0].shortcut_path == (
+        tmp_path / "current-1.lnk"
+    )
+    assert [window.handle for window in restarter.reopen_calls[0][1]] == [2, 3]
+
+
+def test_tcp_reopen_retry_success_waits_for_new_instance_without_relaunch(
+    tmp_path,
+):
+    restarter = FailFirstReopenRestarter()
+    fixture, restarter, first_attempt, _calls = _run_case_tcp_owner(
+        tmp_path,
+        final_observation={101: 0, 102: 1, 103: 1},
+        battle_restarter=restarter,
+    )
+    fingerprint = restarter.calls[0][0].launch_fingerprint
+
+    assert first_attempt.details["restarted_windows"] == 0
+    assert len(restarter.calls) == 1
+    assert len(restarter.reopen_calls) == 1
+    assert fixture.controller._pending_reopen_fingerprints == {fingerprint}
+
+    fixture.controller._reopen_retry_after[fingerprint] = 0.0
+    retry_succeeded = fixture.controller.reconnect()
+    owner_deadline = fixture.controller._reconnect_budget_deadline(fingerprint)
+
+    assert retry_succeeded.details["restarted_windows"] == 1
+    assert len(restarter.calls) == 1
+    assert len(restarter.reopen_calls) == 2
+    assert owner_deadline is not None
+    assert fixture.controller._reopen_retry_after[fingerprint] == owner_deadline
+
+    still_waiting = fixture.controller.reconnect()
+
+    assert still_waiting.details["restarted_windows"] == 0
+    assert len(restarter.calls) == 1
+    assert len(restarter.reopen_calls) == 2
+    assert fixture.controller._pending_reopen_fingerprints == {fingerprint}
+    assert fixture.mouse.clicks == []
+
+
+def test_case_08_one_unique_new_instance_rebinds_original_entry(tmp_path):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        False,
+        (0.5, 0.706),
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, old, new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+
+    fixture.controller.reconnect()
+
+    assert fixture.controller._activation_snapshot_instances[
+        old.launch_fingerprint
+    ] == WindowInstanceToken.from_window(new)
+    assert old.launch_fingerprint not in (
+        fixture.controller._pending_reopen_fingerprints
+    )
+    assert fixture.mouse.clicks == []
+
+
+def test_case_10_occluded_login_uses_fresh_provider_before_allowed_click():
+    window = make_window(1)
+    obscured = FakeCaptureProvider({window.handle: 3})
+    fixture = make_controller(
+        [None],
+        windows=[window],
+        expected_windows=1,
+        window_backend=ObscuredWindowBackend([window]),
+        obscured_capture_provider=obscured,
+        primary_capture_is_trusted=False,
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    first = fixture.controller.reconnect()
+    second = fixture.controller.reconnect()
+
+    assert first.details["clicked_windows"] == 0
+    assert second.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(window.handle, (0.505, 0.856))]
+    assert obscured.calls == [window.handle, window.handle, window.handle]
+    assert second.details["capture_diagnostics"][0]["capture_path"] == (
+        "obscured"
+    )
+
+
+def test_case_11_unknown_general_login_and_character_never_send_input():
+    unknown = make_controller([None], expected_windows=1)
+    assert activate_current_window_snapshot(unknown).success is True
+    unknown.controller.reconnect()
+    unknown.controller.reconnect()
+
+    character = make_controller([5], expected_windows=1)
+    assert activate_current_window_snapshot(character).success is True
+    character.controller.reconnect()
+    character.controller.reconnect()
+
+    assert unknown.mouse.clicks == []
+    assert character.mouse.clicks == []
+
+
+def test_case_12_minimized_old_confirmed_tcp_closes_without_restore(tmp_path):
+    windows = [make_window(1, process_id=101, minimized=True)]
+    fixture, restarter, result, calls = _run_case_tcp_owner(
+        tmp_path,
+        windows=windows,
+        final_observation={101: 0},
+    )
+
+    assert calls == [6]
+    assert result.details["restarted_windows"] == 1
+    assert restarter.calls[0][0].minimized is True
+    assert fixture.controller._active_refresh_capture_provider is None
+    assert fixture.mouse.clicks == []
+
+
+def test_case_13_minimized_new_window_has_zero_click_and_zero_restore():
+    window = make_window(1, minimized=True)
+    fixture = make_controller(
+        [3],
+        windows=[window],
+        expected_windows=1,
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+    assert fixture.capture.calls == []
+    assert fixture.controller._active_refresh_capture_provider is None
+
+
+def test_case_14_one_confirmed_owner_leaves_fifteen_healthy_peers_untouched(
+    tmp_path,
+):
+    windows = [
+        make_window(index, process_id=100 + index)
+        for index in range(1, 17)
+    ]
+    final = {window.process_id: 1 for window in windows}
+    final[windows[0].process_id] = 0
+
+    fixture, restarter, result, calls = _run_case_tcp_owner(
+        tmp_path,
+        windows=windows,
+        final_observation=final,
+    )
+
+    peers = windows[1:]
+    peer_handles = {window.handle for window in peers}
+    peer_fingerprints = {window.launch_fingerprint for window in peers}
+    assert calls == [6]
+    assert result.details["restarted_windows"] == 1
+    assert result.details["clicked_windows"] == 0
+    assert [call[0] for call in restarter.calls] == [windows[0]]
+    assert all(
+        call[0].handle not in peer_handles for call in restarter.calls
+    )
+    assert [call[0].fingerprint for call in restarter.reopen_calls] == [
+        windows[0].launch_fingerprint
+    ]
+    assert all(
+        call[0].fingerprint not in peer_fingerprints
+        for call in restarter.reopen_calls
+    )
+    assert restarter.reopen_calls[0][1] == tuple(peers)
+    assert fixture.mouse.clicks == []
