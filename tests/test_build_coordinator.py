@@ -1,4 +1,5 @@
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 
@@ -59,3 +60,89 @@ def test_source_change_during_build_keeps_existing_formal_output(
         BuildCoordinator(tmp_path, executor=executor).build()
 
     assert (output_dir / "FLASH.exe").read_bytes() == b"previous"
+
+
+def test_wgc_native_and_manifest_sources_change_build_identity(
+    tmp_path: Path,
+) -> None:
+    _source(tmp_path)
+    inputs = (
+        tmp_path / "native" / "helper.cpp",
+        tmp_path / "native" / "helper.h",
+        tmp_path / "packaging" / "FLASH.exe.manifest",
+        tmp_path / "packaging" / "Package.appxmanifest",
+    )
+    previous = source_digest(tmp_path)
+    for path in inputs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(path.suffix + "\n", encoding="utf-8")
+        current = source_digest(tmp_path)
+        assert current != previous
+        previous = current
+
+
+def test_wgc_build_uses_isolated_helper_and_matching_package_identity() -> None:
+    coordinator = Path("scripts/build_coordinator.py").read_text(
+        encoding="utf-8"
+    )
+    spec = Path("FLASH.spec").read_text(encoding="utf-8")
+    registration = Path(
+        "scripts/register_wgc_validation_package.ps1"
+    ).read_text(encoding="utf-8")
+    executable_manifest = ElementTree.parse(
+        "packaging/wgc-validation/FLASH.exe.manifest"
+    ).getroot()
+    package_manifest = ElementTree.parse(
+        "packaging/wgc-validation/Package.appxmanifest"
+    ).getroot()
+
+    assert 'work_dir / "windows_graphics_capture_helper.dll"' in coordinator
+    assert 'build_environment["FLASH_WGC_HELPER_DLL"]' in coordinator
+    assert "FLASH_WGC_HELPER_DLL" in spec
+    assert "windows_graphics_capture_helper.dll" in spec
+    assert "packaging/wgc-validation/FLASH.exe.manifest" in spec
+
+    msix = executable_manifest.find(
+        "{urn:schemas-microsoft-com:msix.v1}msix"
+    )
+    assert msix is not None
+    identity = package_manifest.find(
+        "{http://schemas.microsoft.com/appx/manifest/foundation/windows10}Identity"
+    )
+    assert identity is not None
+    application = package_manifest.find(
+        ".//{http://schemas.microsoft.com/appx/manifest/foundation/windows10}Application"
+    )
+    assert application is not None
+    assert msix.attrib == {
+        "publisher": identity.attrib["Publisher"],
+        "packageName": identity.attrib["Name"],
+        "applicationId": application.attrib["Id"],
+    }
+    assert application.attrib[
+        "{http://schemas.microsoft.com/appx/manifest/uap/windows10/10}RuntimeBehavior"
+    ] == "win32App"
+    capability_names = {
+        capability.attrib["Name"]
+        for capability in package_manifest.find(
+            "{http://schemas.microsoft.com/appx/manifest/foundation/windows10}Capabilities"
+        )
+    }
+    assert capability_names == {
+        "runFullTrust",
+        "unvirtualizedResources",
+        "graphicsCaptureWithoutBorder",
+    }
+    assert "MakeAppx pack /d $stageRoot /p $packagePath /o /nv" in (
+        registration
+    )
+    assert "-ValidationOnly" in registration
+    assert '[ValidatePattern("^[0-9A-Fa-f]{64}$")]' in registration
+    assert "[string]$ExpectedSha256" in registration
+    assert "Get-FileHash -LiteralPath $flashExecutable" in registration
+    assert registration.index("Get-FileHash") < registration.index(
+        "Add-AppxPackage"
+    )
+    assert "Add-AppxPackage -Path $packagePath -ExternalLocation" in (
+        registration
+    )

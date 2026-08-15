@@ -1,4 +1,7 @@
 import ctypes
+from pathlib import Path
+
+import pytest
 
 from adapters.windows_background_capture import (
     CaptureSample,
@@ -6,6 +9,7 @@ from adapters.windows_background_capture import (
     Win32RecoveringPrintWindowProvider,
     Win32TemporarilyRevealedCaptureProvider,
     Win32VisibleRegionCaptureProvider,
+    WindowsGraphicsCaptureProvider,
     WindowsBackgroundCaptureBackend,
     _query_window_instance_credential,
 )
@@ -2157,3 +2161,221 @@ def test_revealed_capture_never_demotes_after_final_target_check_reuses_neighbor
         provider.HWND_NOTOPMOST,
     ]
     assert user32.target not in user32.topmost
+
+
+class FakeWgcLibrary:
+    def __init__(self, access_state=1):
+        self.access_state = access_state
+        self.capture_calls = []
+        self.FlashWgcHelperAbiVersion = FakeCallable(lambda: 1)
+        self.FlashWgcPrepareBorderlessAccess = FakeCallable(
+            lambda: self.access_state
+        )
+        self.FlashWgcCaptureWindow = FakeCallable(self._capture)
+
+    @staticmethod
+    def _value(value):
+        return value.value if hasattr(value, "value") else int(value)
+
+    def _capture(
+        self,
+        window_handle,
+        after_timestamp,
+        _timeout_ms,
+        destination,
+        capacity,
+        output,
+    ):
+        handle = self._value(window_handle)
+        after = self._value(after_timestamp)
+        self.capture_calls.append((handle, after, destination is None))
+        frame = output._obj
+        frame.width = 2
+        frame.height = 2
+        frame.stride = 8
+        frame.required_bytes = 16
+        frame.timestamp = after + 1
+        if destination is None:
+            return WindowsGraphicsCaptureProvider.CAPTURE_BUFFER_TOO_SMALL
+        if self._value(capacity) < frame.required_bytes:
+            return -6
+        pixels = bytes([handle & 0xFF, 20, 80, 255] * 4)
+        for index, value in enumerate(pixels):
+            destination[index] = value
+        return WindowsGraphicsCaptureProvider.CAPTURE_OK
+
+
+def wgc_provider(
+    library,
+    *,
+    minimized=False,
+    identity_provider=None,
+):
+    def stable_identity(handle):
+        return (
+            handle,
+            201,
+            301,
+            "ShockwaveFlash",
+            (0, 0, 800, 600),
+            False,
+            401,
+        )
+    provider = WindowsGraphicsCaptureProvider(
+        library_loader=lambda _path: library,
+        minimized_provider=lambda _handle: minimized,
+        window_identity_provider=(
+            identity_provider or stable_identity
+        ),
+    )
+    return provider
+
+
+def test_case_09_wgc_visible_and_occluded_windows_return_fresh_bgra_frames():
+    library = FakeWgcLibrary()
+    provider = wgc_provider(library)
+
+    assert provider.prepare_borderless_access() is True
+    visible = provider.capture(101)
+    occluded = provider.capture(202)
+
+    assert visible == sample([101, 20, 80, 255] * 4)
+    assert occluded == sample([202, 20, 80, 255] * 4)
+    assert library.capture_calls == [
+        (101, 0, True),
+        (101, 1, False),
+        (202, 0, True),
+        (202, 1, False),
+    ]
+
+
+def test_case_13_wgc_minimized_new_window_is_unknown_without_capture():
+    library = FakeWgcLibrary()
+    provider = wgc_provider(library, minimized=True)
+
+    assert provider.prepare_borderless_access() is True
+    assert provider.capture(303) is None
+    assert provider.last_failure_stage == "window_minimized"
+    assert library.capture_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    (
+        (0, 999),
+        (1, 999),
+        (2, 999),
+        (3, "ChangedFlash"),
+        (4, (1, 2, 801, 602)),
+        (5, True),
+        (6, 999),
+    ),
+)
+def test_wgc_rejects_complete_instance_change_during_capture(
+    field,
+    changed_value,
+):
+    library = FakeWgcLibrary()
+    stable = [
+        101,
+        201,
+        301,
+        "ShockwaveFlash",
+        (0, 0, 800, 600),
+        False,
+        401,
+    ]
+    changed = list(stable)
+    changed[field] = changed_value
+    observations = [tuple(stable), tuple(changed)]
+
+    def identity(_handle):
+        return observations.pop(0) if observations else tuple(changed)
+
+    provider = wgc_provider(library, identity_provider=identity)
+    assert provider.prepare_borderless_access() is True
+
+    assert provider.capture(101) is None
+    assert provider.last_failure_stage == "fresh_frame_probe_failed"
+    assert library.capture_calls == [(101, 0, True)]
+
+
+def test_wgc_rejects_complete_instance_change_after_pixel_copy():
+    library = FakeWgcLibrary()
+    stable = (
+        101,
+        201,
+        301,
+        "ShockwaveFlash",
+        (0, 0, 800, 600),
+        False,
+        401,
+    )
+    changed = (*stable[:-1], 999)
+    observations = [stable, stable, changed]
+
+    def identity(_handle):
+        return observations.pop(0) if observations else changed
+
+    provider = wgc_provider(library, identity_provider=identity)
+    assert provider.prepare_borderless_access() is True
+
+    assert provider.capture(101) is None
+    assert provider.last_failure_stage == "fresh_frame_copy_failed"
+    assert library.capture_calls == [
+        (101, 0, True),
+        (101, 1, False),
+    ]
+
+
+def test_case_15_native_wgc_helper_has_no_window_or_input_mutation_api():
+    source = Path("native/windows_graphics_capture_helper.cpp").read_text(
+        encoding="utf-8"
+    )
+
+    for forbidden in (
+        "ShowWindow",
+        "SetWindowPos",
+        "BringWindowToTop",
+        "SetForegroundWindow",
+        "SetFocus",
+        "SetActiveWindow",
+        "GetForegroundWindow",
+        "SetCursorPos",
+        "GetCursorPos",
+        "SendInput",
+        "keybd_event",
+        "mouse_event",
+        "SendMessage",
+        "PostMessage",
+    ):
+        assert forbidden not in source
+
+
+def test_case_16_borderless_grant_requires_and_verifies_zero_border():
+    library = FakeWgcLibrary(access_state=1)
+    provider = wgc_provider(library)
+    source = Path("native/windows_graphics_capture_helper.cpp").read_text(
+        encoding="utf-8"
+    )
+
+    assert provider.prepare_borderless_access() is True
+    assert provider.access_status == "allowed"
+    compact_source = "".join(source.split())
+    assert (
+        "GraphicsCaptureAccess::RequestAccessAsync("
+        "GraphicsCaptureAccessKind::Borderless).get()"
+    ) in compact_source
+    assert "session.IsBorderRequired(false);" in source
+    assert "if (session.IsBorderRequired())" in source
+
+
+def test_case_17_denied_borderless_access_fails_closed_without_capture():
+    library = FakeWgcLibrary(access_state=2)
+    provider = wgc_provider(library)
+
+    assert provider.prepare_borderless_access() is False
+    assert provider.access_status == "denied"
+    assert provider.capture(404) is None
+    assert provider.last_failure_stage == "borderless_access_unavailable"
+    assert library.capture_calls == []

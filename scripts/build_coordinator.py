@@ -33,11 +33,15 @@ _BUILD_INPUT_SUFFIXES = frozenset(
         ".bat",
         ".bmp",
         ".cmd",
+        ".cpp",
         ".gif",
+        ".h",
         ".ico",
         ".jpeg",
         ".jpg",
         ".json",
+        ".manifest",
+        ".appxmanifest",
         ".png",
         ".ps1",
         ".py",
@@ -140,6 +144,21 @@ def source_digest(root: Path) -> str:
 
 
 def _default_executor(root: Path, dist_dir: Path, work_dir: Path) -> None:
+    helper_path = work_dir / "windows_graphics_capture_helper.dll"
+    subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts" / "build_wgc_helper.py"),
+            "--root",
+            str(root),
+            "--output",
+            str(helper_path),
+        ],
+        cwd=root,
+        check=True,
+    )
+    build_environment = os.environ.copy()
+    build_environment["FLASH_WGC_HELPER_DLL"] = str(helper_path)
     subprocess.run(
         [
             sys.executable,
@@ -154,6 +173,7 @@ def _default_executor(root: Path, dist_dir: Path, work_dir: Path) -> None:
             str(root / "FLASH.spec"),
         ],
         cwd=root,
+        env=build_environment,
         check=True,
     )
 

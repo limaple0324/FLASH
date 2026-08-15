@@ -14,6 +14,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, replace
 from ctypes import wintypes
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
@@ -35,6 +36,7 @@ from adapters.windows_background_capture import (
     Win32RecoveringPrintWindowProvider,
     Win32TemporarilyRevealedCaptureProvider,
     Win32VisibleRegionCaptureProvider,
+    WindowsGraphicsCaptureProvider,
     WindowCaptureProvider,
 )
 from adapters.windows_auto_battle import AutoBattleEvidence, AutoBattleRecognizer
@@ -263,6 +265,53 @@ class _TcpObservation:
             ("zero_window_count", self.zero_window_count),
             ("confirmed_window_count", self.confirmed_window_count),
         )
+
+
+class _TcpRecoveryStage(Enum):
+    TCP_CONFIRMED_OWNER = "tcp_confirmed_owner"
+    CLOSE_VERIFIED = "close_verified"
+    REOPEN_PENDING = "reopen_pending"
+    SHORTCUT_REQUESTED = "shortcut_requested"
+    WAITING_NEW_INSTANCE = "waiting_new_instance"
+    NEW_INSTANCE_BOUND = "new_instance_bound"
+    SCREEN_RECOVERY = "screen_recovery"
+    LOGIN = "login"
+    LINE = "line"
+    ROLE = "role"
+    ENTER = "enter"
+    CONNECTED = "connected"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+
+
+@dataclass(slots=True)
+class _TcpRecoveryAuthority:
+    """The only mutable authority for one TCP recovery owner."""
+
+    fingerprint: str
+    entry_id: str
+    stage: _TcpRecoveryStage
+    old_instance: WindowInstanceToken
+    activation_instance: WindowInstanceToken
+    target_fingerprint: str
+    shortcut_path: str
+    plan_signature: tuple[tuple[object, ...], ...]
+    peer_signature: tuple[tuple[object, ...], ...]
+    source_state_generation: int
+    scope_token: str | None
+    deadline: float
+    retry_at: float
+    shortcut_consumed: bool = False
+    new_instance: WindowInstanceToken | None = None
+    restored_tombstone: bool = False
+
+    @property
+    def terminal(self) -> bool:
+        return self.stage in {
+            _TcpRecoveryStage.CONNECTED,
+            _TcpRecoveryStage.CANCELLED,
+            _TcpRecoveryStage.TIMED_OUT,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1953,6 +2002,7 @@ class ReconnectRuntimeState:
     flow_pause_until: dict[str, float]
     scope_token: str | None
     preferred_line_numbers: dict[str, int]
+    tcp_recovery_authority: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -2195,6 +2245,24 @@ class ReconnectRuntimeStateStore:
                 ):
                     raise ValueError("Invalid preferred reconnect line")
                 preferred_line_numbers[fingerprint] = raw_line_number
+            raw_tcp_authority = payload.get("tcp_recovery_authority")
+            if raw_tcp_authority is not None:
+                if (
+                    source_version != self.VERSION
+                    or not isinstance(raw_tcp_authority, dict)
+                    or not isinstance(raw_tcp_authority.get("stage"), str)
+                    or normalize_launch_fingerprint(
+                        raw_tcp_authority.get("fingerprint")
+                    )
+                    is None
+                    or type(
+                        raw_tcp_authority.get("shortcut_consumed")
+                    ) is not bool
+                ):
+                    raise ValueError("Invalid persisted TCP recovery authority")
+                tcp_recovery_authority = dict(raw_tcp_authority)
+            else:
+                tcp_recovery_authority = None
             state = ReconnectRuntimeState(
                 pending,
                 active,
@@ -2206,6 +2274,7 @@ class ReconnectRuntimeStateStore:
                 flow_pauses,
                 scope_token,
                 preferred_line_numbers,
+                tcp_recovery_authority,
             )
             if scope_token is None and (
                 state.pending_fingerprints
@@ -2274,6 +2343,7 @@ class ReconnectRuntimeStateStore:
                 fingerprint: state.preferred_line_numbers[fingerprint]
                 for fingerprint in sorted(state.preferred_line_numbers)
             },
+            "tcp_recovery_authority": state.tcp_recovery_authority,
         }
         temp_path = self.path.with_name(
             f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -2309,6 +2379,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         visible_capture_provider: WindowCaptureProvider | None = None,
         obscured_capture_provider: WindowCaptureProvider | None = None,
         active_refresh_capture_provider: WindowCaptureProvider | None = None,
+        capture_access_preparer: Callable[[], bool] | None = None,
         primary_capture_is_trusted: bool = False,
         primary_capture_is_fresh_without_visibility: bool = False,
         capture_settings: SmartReconnectCaptureSettings | None = None,
@@ -2358,6 +2429,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._visible_capture_provider = visible_capture_provider
         self._obscured_capture_provider = obscured_capture_provider
         self._active_refresh_capture_provider = active_refresh_capture_provider
+        self._capture_access_preparer = capture_access_preparer
         self._primary_capture_is_trusted = bool(primary_capture_is_trusted)
         self._primary_capture_is_fresh_without_visibility = bool(
             primary_capture_is_fresh_without_visibility
@@ -2546,6 +2618,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         # only through login and character selection.  It must not inherit
         # post-login or auto-battle authority from unrelated roles.
         self._login_only_recovery_fingerprints: set[str] = set()
+        self._tcp_recovery_authority = (
+            self._restore_tcp_recovery_tombstone(
+                runtime_state.tcp_recovery_authority
+            )
+        )
         # One delivered timeout confirmation may not be repeated merely
         # because capture routing, settings, or source generation changes.
         # The event is intentionally bound only to immutable window-session
@@ -2602,6 +2679,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 )
             except (OSError, TypeError, ValueError):
                 evidence_initialization_failed = True
+        graphics_capture_provider = WindowsGraphicsCaptureProvider()
         return cls(
             expected_windows=expected_windows,
             title_keywords=title_keywords,
@@ -2612,8 +2690,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             # running independently.
             capture_provider=Win32PrintWindowProvider(),
             visible_capture_provider=Win32VisibleRegionCaptureProvider(),
-            obscured_capture_provider=None,
+            obscured_capture_provider=graphics_capture_provider,
             active_refresh_capture_provider=None,
+            capture_access_preparer=(
+                graphics_capture_provider.prepare_borderless_access
+            ),
             primary_capture_is_trusted=True,
             primary_capture_is_fresh_without_visibility=False,
             recognizer=ReferenceScreenRecognizer(reference_dir),
@@ -4785,6 +4866,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def prepare_execution_snapshot(self) -> OperationResult:
         """Lock this activation to the complete game windows open right now."""
         with self._scan_lock:
+            if self._capture_access_preparer is not None:
+                try:
+                    capture_access_ready = (
+                        self._capture_access_preparer() is True
+                    )
+                except Exception:
+                    capture_access_ready = False
+                if not capture_access_ready:
+                    return self._snapshot_failure(
+                        "reconnect.snapshot_capture_access_denied",
+                        "Windows 無彩框背景擷取權限未允許，智慧重連未啟用。",
+                        "borderless_capture_access_denied",
+                    )
             if not self._evidence_available():
                 return self._snapshot_failure(
                     "reconnect.snapshot_evidence_unavailable",
@@ -4912,7 +5006,20 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 in self._activation_snapshot_instances.items()
                 if fingerprint not in self._detection_only_fingerprints
             }
-            self._persist_runtime_state()
+            retired_tombstone = self._retirable_tcp_recovery_tombstone(
+                complete_instances,
+                source_fingerprints,
+            )
+            if retired_tombstone is not None:
+                self._tcp_recovery_authority = None
+            if (
+                not self._persist_runtime_state()
+                and retired_tombstone is not None
+            ):
+                # Memory must remain at least as restrictive as the durable
+                # consumed-launch tombstone when its retirement cannot be
+                # committed atomically.
+                self._tcp_recovery_authority = retired_tombstone
             return OperationResult(
                 True,
                 "reconnect.snapshot_ready",
@@ -4926,6 +5033,51 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     ),
                 },
             )
+
+    def _retirable_tcp_recovery_tombstone(
+        self,
+        complete_instances: dict[
+            str,
+            tuple[WindowInfo, WindowInstanceToken],
+        ],
+        source_fingerprints: dict[str, str],
+    ) -> _TcpRecoveryAuthority | None:
+        """Prove a consumed reboot tombstone obsolete from one full activation."""
+
+        authority = self._tcp_recovery_authority
+        plan = self._group_launch_plan
+        resolved = self._tcp_v
+        if (
+            authority is None
+            or authority.stage is not _TcpRecoveryStage.CANCELLED
+            or not authority.shortcut_consumed
+            or not authority.restored_tombstone
+            or plan is None
+            or not plan.ready
+            or not isinstance(resolved, ResolvedTargetWindows)
+        ):
+            return None
+        target = self._target_for_entry(authority.entry_id)
+        if target is None:
+            return None
+        matches = tuple(
+            instance
+            for monitor_fingerprint, (_window, instance)
+            in complete_instances.items()
+            if (
+                source_fingerprints.get(monitor_fingerprint)
+                == target.fingerprint
+                and self._tcp_id(
+                    resolved,
+                    target.fingerprint,
+                    instance,
+                )
+                == authority.entry_id
+            )
+        )
+        if len(matches) != 1 or matches[0] == authority.old_instance:
+            return None
+        return authority
 
     def _initial_login_authorization_is_current(
         self,
@@ -6066,6 +6218,20 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         plan = self._group_launch_plan
         if plan is None:
             return None, None, None
+        current_authority = self._tcp_recovery_authority
+        if current_authority is not None and not current_authority.terminal:
+            current_state = next(
+                (
+                    state
+                    for fingerprint, state in confirmed
+                    if fingerprint == current_authority.fingerprint
+                ),
+                None,
+            )
+            # Once selected, one owner retains the queue head through close,
+            # reopen, rebind and screen recovery. Confirmed peers stay queued
+            # and can never cancel or overlap the active owner.
+            return current_authority.fingerprint, current_state, None
         sessions = tuple(
             target
             for target in plan.targets
@@ -6781,6 +6947,23 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 changed_instances[fingerprint] = instance
                 accepted.append(window)
                 continue
+            authority = self._tcp_recovery_authority
+            if (
+                authority is not None
+                and authority.fingerprint == fingerprint
+                and authority.old_instance == expected
+                and authority.shortcut_consumed
+                and authority.stage
+                in {
+                    _TcpRecoveryStage.SHORTCUT_REQUESTED,
+                    _TcpRecoveryStage.WAITING_NEW_INSTANCE,
+                }
+                and instance.handle != expected.handle
+            ):
+                # The state machine, not this generic reconciliation path,
+                # owns the first binding of the requested new instance.
+                accepted.append(window)
+                continue
             if self._has_reconnect_session(fingerprint):
                 changed_instances[fingerprint] = instance
                 self._initial_login_authorizations.pop(
@@ -6893,10 +7076,28 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
 
     def _has_reconnect_session(self, fingerprint: str) -> bool:
-        return fingerprint in (
+        if fingerprint in (
             self._pending_reconnect_fingerprints
             | self._pending_reopen_fingerprints
             | self._active_automation_fingerprints
+        ):
+            return True
+        authority = self._tcp_recovery_authority
+        return bool(
+            authority is not None
+            and authority.fingerprint == fingerprint
+            and not authority.terminal
+            and authority.stage
+            in {
+                _TcpRecoveryStage.SHORTCUT_REQUESTED,
+                _TcpRecoveryStage.WAITING_NEW_INSTANCE,
+                _TcpRecoveryStage.NEW_INSTANCE_BOUND,
+                _TcpRecoveryStage.SCREEN_RECOVERY,
+                _TcpRecoveryStage.LOGIN,
+                _TcpRecoveryStage.LINE,
+                _TcpRecoveryStage.ROLE,
+                _TcpRecoveryStage.ENTER,
+            }
         )
 
     @staticmethod
@@ -8306,7 +8507,141 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 dict(self._flow_pause_until),
                 self._runtime_scope_token,
                 dict(self._preferred_line_numbers),
+                self._persisted_tcp_recovery_authority(),
             )
+
+    @staticmethod
+    def _instance_payload(
+        instance: WindowInstanceToken | None,
+    ) -> dict[str, object] | None:
+        if instance is None:
+            return None
+        return {
+            "handle": instance.handle,
+            "process_id": instance.process_id,
+            "thread_id": instance.thread_id,
+            "window_class": instance.window_class,
+            "rect": list(instance.rect),
+            "minimized": instance.minimized,
+            "process_lifecycle_token": instance.process_lifecycle_token,
+        }
+
+    @staticmethod
+    def _instance_from_payload(
+        payload: object,
+    ) -> WindowInstanceToken | None:
+        if not isinstance(payload, dict):
+            return None
+        try:
+            rect = tuple(payload["rect"])
+            instance = WindowInstanceToken(
+                handle=payload["handle"],
+                process_id=payload["process_id"],
+                thread_id=payload["thread_id"],
+                window_class=payload["window_class"],
+                rect=rect,
+                minimized=payload["minimized"],
+                process_lifecycle_token=payload[
+                    "process_lifecycle_token"
+                ],
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        return (
+            instance
+            if (
+                type(instance.handle) is int
+                and instance.handle > 0
+                and type(instance.process_id) is int
+                and instance.process_id > 0
+                and type(instance.thread_id) is int
+                and instance.thread_id > 0
+                and isinstance(instance.window_class, str)
+                and bool(instance.window_class.strip())
+                and len(instance.rect) == 4
+                and all(type(value) is int for value in instance.rect)
+                and type(instance.minimized) is bool
+                and type(instance.process_lifecycle_token) is int
+                and instance.process_lifecycle_token > 0
+            )
+            else None
+        )
+
+    def _persisted_tcp_recovery_authority(
+        self,
+    ) -> dict[str, object] | None:
+        authority = self._tcp_recovery_authority
+        if authority is None:
+            return None
+        immutable_authority = (
+            authority.fingerprint,
+            authority.entry_id,
+            authority.old_instance,
+            authority.activation_instance,
+            authority.target_fingerprint,
+            authority.shortcut_path,
+            authority.plan_signature,
+            authority.peer_signature,
+            authority.source_state_generation,
+            authority.scope_token,
+        )
+        return {
+            "fingerprint": authority.fingerprint,
+            "entry_id": authority.entry_id,
+            "stage": authority.stage.value,
+            "old_instance": self._instance_payload(authority.old_instance),
+            "new_instance": self._instance_payload(authority.new_instance),
+            "shortcut_consumed": authority.shortcut_consumed,
+            "authority_signature": hashlib.sha256(
+                repr(immutable_authority).encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def _restore_tcp_recovery_tombstone(
+        self,
+        payload: dict[str, object] | None,
+    ) -> _TcpRecoveryAuthority | None:
+        if payload is None:
+            return None
+        fingerprint = normalize_launch_fingerprint(
+            payload.get("fingerprint")
+        )
+        old_instance = self._instance_from_payload(
+            payload.get("old_instance")
+        )
+        entry_id = payload.get("entry_id")
+        if (
+            fingerprint is None
+            or old_instance is None
+            or not isinstance(entry_id, str)
+            or not entry_id.strip()
+            or type(payload.get("shortcut_consumed")) is not bool
+        ):
+            return None
+        # Monotonic deadlines and live source/plan objects cannot survive a
+        # process boundary.  Keep only a non-actionable consumed-launch
+        # tombstone: it blocks a duplicate shortcut request and is cleared
+        # only by a fresh activation authority.
+        return _TcpRecoveryAuthority(
+            fingerprint=fingerprint,
+            entry_id=entry_id.strip(),
+            stage=_TcpRecoveryStage.CANCELLED,
+            old_instance=old_instance,
+            activation_instance=old_instance,
+            target_fingerprint=fingerprint,
+            shortcut_path="",
+            plan_signature=(),
+            peer_signature=(),
+            source_state_generation=-1,
+            scope_token=None,
+            deadline=0.0,
+            retry_at=0.0,
+            shortcut_consumed=bool(payload.get("shortcut_consumed")),
+            new_instance=self._instance_from_payload(
+                payload.get("new_instance")
+            ),
+            restored_tombstone=True,
+        )
 
     def _persist_runtime_state(self) -> bool:
         store = self._runtime_state_store
@@ -8341,7 +8676,719 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 tuple(sorted(self._flow_pause_until.items())),
                 self._runtime_scope_token,
                 tuple(sorted(self._preferred_line_numbers.items())),
+                repr(self._persisted_tcp_recovery_authority()),
             )
+
+    @staticmethod
+    def _launch_plan_signature(
+        plan: GroupLaunchPlan | None,
+    ) -> tuple[tuple[object, ...], ...] | None:
+        if plan is None or not plan.ready:
+            return None
+        signature = tuple(
+            (
+                target.order,
+                target.entry_id,
+                target.fingerprint,
+                target.role_id,
+                str(target.shortcut_path),
+            )
+            for target in plan.targets
+        )
+        if (
+            not signature
+            or any(not item[1] or not item[2] for item in signature)
+            or len({item[1] for item in signature}) != len(signature)
+        ):
+            return None
+        return signature
+
+    def _tcp_peer_signature(
+        self,
+        resolved: ResolvedTargetWindows,
+        owner_entry_id: str,
+    ) -> tuple[tuple[object, ...], ...] | None:
+        contract = self._contract_entry_candidates(resolved)
+        plan = self._group_launch_plan
+        if contract is None or plan is None:
+            return None
+        candidates_by_entry, detection_only = contract
+        signature: list[tuple[object, ...]] = []
+        for target in plan.targets:
+            if target.entry_id == owner_entry_id:
+                continue
+            candidates = candidates_by_entry.get(target.entry_id, ())
+            identities = self._complete_contract_identities(
+                candidates
+            )
+            if identities is None:
+                return None
+            if len(identities) == 1:
+                signature.append((target.entry_id, identities[0]))
+                continue
+            offline_evidence = tuple(
+                evidence
+                for evidence in resolved.target_failure_evidence
+                if evidence.entry_id == target.entry_id
+            )
+            if (
+                candidates
+                or len(offline_evidence) != 1
+                or offline_evidence[0].fingerprint != target.fingerprint
+                or offline_evidence[0].failure_codes != ("window_offline",)
+                or offline_evidence[0].candidate_windows
+            ):
+                return None
+            signature.append(
+                (target.entry_id, "window_offline", target.fingerprint)
+            )
+        detection_identities = self._complete_contract_identities(
+            detection_only
+        )
+        if detection_identities is None:
+            return None
+        signature.extend(
+            ("detection", identity) for identity in detection_identities
+        )
+        return tuple(signature)
+
+    def _tcp_authority_signature(
+        self,
+        authority: _TcpRecoveryAuthority,
+    ) -> str:
+        return hashlib.sha256(
+            repr(
+                (
+                    authority.fingerprint,
+                    authority.entry_id,
+                    authority.old_instance,
+                    authority.activation_instance,
+                    authority.target_fingerprint,
+                    authority.shortcut_path,
+                    authority.plan_signature,
+                    authority.peer_signature,
+                    authority.source_state_generation,
+                    authority.scope_token,
+                    authority.deadline,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _begin_tcp_recovery_evidence(
+        self,
+        authority: _TcpRecoveryAuthority,
+        action: str,
+    ) -> tuple[int | None, str]:
+        """Record owner recovery diagnostics without granting authority."""
+
+        signature = self._tcp_authority_signature(authority)
+        recorder = self._evidence_recorder
+        if recorder is None or self._evidence_recording_failed:
+            return None, signature
+        try:
+            sequence = recorder.record_action_intent(
+                raw_window_key=authority.fingerprint,
+                state=authority.stage.value,
+                action=action,
+                identity_verified=True,
+                input_channel="window_control",
+                authority_signature=signature,
+            )
+        except (OSError, TypeError, ValueError):
+            self._mark_evidence_failure()
+            return None, signature
+        return sequence, signature
+
+    def _finish_tcp_recovery_evidence(
+        self,
+        authority: _TcpRecoveryAuthority,
+        action: str,
+        sequence: int | None,
+        signature: str,
+        result: BattleRestartResult | None,
+        *,
+        allowed: bool,
+    ) -> None:
+        self._finish_evidence_action(
+            fingerprint=authority.fingerprint,
+            item=ScreenRecognition(
+                ReconnectScreenState.RECONNECTING,
+                None,
+                None,
+                authority.stage.value,
+            ),
+            action=action,
+            intent_sequence=sequence,
+            allowed=allowed,
+            performed=bool(
+                result is not None
+                and (result.window_closed or result.shortcut_open_requested)
+            ),
+            clicked=False,
+            identity_verified=True,
+            restoration_verified=None,
+            failure_reason=(
+                result.failure_code
+                if result is not None
+                else ("authorization_revoked" if not allowed else None)
+            ),
+            authority_signature=signature,
+            input_channel="window_control",
+        )
+
+    def _run_tcp_recovery_mutation(
+        self,
+        operation: str,
+        authority: _TcpRecoveryAuthority,
+        callback: Callable[[], object],
+    ) -> tuple[bool, object | None]:
+        """Mutate from owner authority without consulting screen capture."""
+
+        execution_allowed = self._execution_enabled.is_set
+        if not execution_allowed():
+            return False, None
+        gate = self._operation_gate
+        lease = (
+            gate.acquire(
+                operation,
+                execution_guard=execution_allowed,
+                timeout_seconds=0,
+            )
+            if gate is not None
+            else None
+        )
+        if gate is not None and lease is None:
+            return False, None
+        try:
+            with self._source_authority_lock:
+                if (
+                    not execution_allowed()
+                    or self._tcp_recovery_authority is not authority
+                    or self._source_state_generation
+                    != authority.source_state_generation
+                ):
+                    return False, None
+                return True, callback()
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def _cancel_tcp_recovery(
+        self,
+        authority: _TcpRecoveryAuthority,
+        *,
+        timed_out: bool = False,
+    ) -> None:
+        if self._tcp_recovery_authority is not authority:
+            return
+        authority.stage = (
+            _TcpRecoveryStage.TIMED_OUT
+            if timed_out
+            else _TcpRecoveryStage.CANCELLED
+        )
+        if not authority.shortcut_consumed:
+            state = self._tcp_s.get(
+                (authority.entry_id, authority.old_instance)
+            )
+            if state is not None:
+                state.zero_since = None
+                state.zero_count = 0
+        self._persist_runtime_state()
+
+    def _new_tcp_recovery_authority(
+        self,
+        fingerprint: str,
+        state: _TcpState,
+        now: float,
+        source_state_generation: int,
+    ) -> _TcpRecoveryAuthority | None:
+        plan = self._group_launch_plan
+        resolved = self._tcp_v
+        target = self._target_for_entry(state.entry_id or "")
+        snapshot = self._activation_snapshot_instances
+        snapshot_sources = self._activation_snapshot_source_fingerprints
+        plan_signature = self._launch_plan_signature(plan)
+        deadline = self._reconnect_budget_deadline(fingerprint)
+        if (
+            state.entry_id is None
+            or target is None
+            or target.entry_id != state.entry_id
+            or target.fingerprint != fingerprint
+            or not isinstance(resolved, ResolvedTargetWindows)
+            or plan_signature is None
+            or deadline is None
+            or now >= deadline
+            or snapshot is None
+            or snapshot.get(fingerprint) != state.instance
+            or snapshot_sources is None
+            or normalize_launch_fingerprint(
+                snapshot_sources.get(fingerprint)
+            )
+            != target.fingerprint
+            or self._tcp_id(resolved, fingerprint, state.instance)
+            != state.entry_id
+        ):
+            return None
+        peer_signature = self._tcp_peer_signature(
+            resolved,
+            state.entry_id,
+        )
+        if peer_signature is None:
+            return None
+        return _TcpRecoveryAuthority(
+            fingerprint=fingerprint,
+            entry_id=state.entry_id,
+            stage=_TcpRecoveryStage.TCP_CONFIRMED_OWNER,
+            old_instance=state.instance,
+            activation_instance=state.instance,
+            target_fingerprint=target.fingerprint,
+            shortcut_path=str(target.shortcut_path),
+            plan_signature=plan_signature,
+            peer_signature=peer_signature,
+            source_state_generation=source_state_generation,
+            scope_token=self._runtime_scope_token,
+            deadline=deadline,
+            retry_at=now,
+        )
+
+    def _tcp_recovery_authority_is_current(
+        self,
+        authority: _TcpRecoveryAuthority,
+        resolved: ResolvedTargetWindows,
+    ) -> bool:
+        target = self._target_for_entry(authority.entry_id)
+        snapshot = self._activation_snapshot_instances
+        snapshot_sources = self._activation_snapshot_source_fingerprints
+        return bool(
+            self._tcp_recovery_authority is authority
+            and not authority.terminal
+            and self._source_state_generation_snapshot()
+            == authority.source_state_generation
+            and self._runtime_scope_token == authority.scope_token
+            and self._launch_plan_signature(self._group_launch_plan)
+            == authority.plan_signature
+            and target is not None
+            and target.fingerprint == authority.target_fingerprint
+            and str(target.shortcut_path) == authority.shortcut_path
+            and snapshot is not None
+            and snapshot.get(authority.fingerprint)
+            == authority.activation_instance
+            and snapshot_sources is not None
+            and normalize_launch_fingerprint(
+                snapshot_sources.get(authority.fingerprint)
+            )
+            == authority.target_fingerprint
+            and self._tcp_peer_signature(resolved, authority.entry_id)
+            == authority.peer_signature
+        )
+
+    def _bind_tcp_recovery_instance(
+        self,
+        authority: _TcpRecoveryAuthority,
+        resolved: ResolvedTargetWindows,
+    ) -> WindowInstanceToken | None:
+        contract = self._contract_entry_candidates(resolved)
+        if contract is None:
+            return None
+        candidates_by_entry, _detection = contract
+        candidates = candidates_by_entry.get(authority.entry_id, ())
+        if len(candidates) != 1:
+            return None
+        new_instance = WindowInstanceToken.from_window(candidates[0])
+        if (
+            new_instance is None
+            or new_instance == authority.old_instance
+            or new_instance.handle == authority.old_instance.handle
+            or self._tcp_id(
+                resolved,
+                authority.fingerprint,
+                new_instance,
+            )
+            != authority.entry_id
+        ):
+            return None
+        return new_instance
+
+    def _advance_tcp_recovery(
+        self,
+        *,
+        owner: str | None,
+        owner_state: _TcpState | None,
+        execute: bool,
+        now: float,
+        source_state_generation: int,
+    ) -> tuple[int, list[str], int | None]:
+        """Advance exactly one owner through close/reopen without pixels."""
+
+        authority = self._tcp_recovery_authority
+        if authority is not None and not execute:
+            return 0, [], None
+        if authority is not None and authority.terminal:
+            if authority.restored_tombstone and authority.shortcut_consumed:
+                return 0, [], None
+            can_replace = bool(
+                owner is not None
+                and owner_state is not None
+                and (
+                    owner != authority.fingerprint
+                    or not authority.shortcut_consumed
+                    or (
+                        authority.stage is _TcpRecoveryStage.CONNECTED
+                        and owner_state.instance != authority.old_instance
+                    )
+                )
+            )
+            if not can_replace:
+                return 0, [], None
+            self._tcp_recovery_authority = None
+            self._persist_runtime_state()
+            authority = None
+        if authority is None:
+            if owner is None or owner_state is None or not execute:
+                return 0, [], None
+            authority = self._new_tcp_recovery_authority(
+                owner,
+                owner_state,
+                now,
+                source_state_generation,
+            )
+            if authority is None:
+                return 0, ["tcp_recovery_authority_missing"], None
+            self._tcp_recovery_authority = authority
+            self._persist_runtime_state()
+        elif owner not in {None, authority.fingerprint}:
+            self._cancel_tcp_recovery(authority)
+            return 0, ["tcp_recovery_owner_conflict"], None
+
+        fresh_now = self._monotonic_clock()
+        if fresh_now >= authority.deadline:
+            self._cancel_tcp_recovery(authority, timed_out=True)
+            self._tcp_timeout_isolated.add(authority.fingerprint)
+            return 0, ["tcp_reconnect_timeout"], None
+        resolved = self._tcp_v
+        if (
+            not isinstance(resolved, ResolvedTargetWindows)
+            or not self._tcp_recovery_authority_is_current(
+                authority,
+                resolved,
+            )
+        ):
+            self._cancel_tcp_recovery(authority)
+            return 0, ["battle_contract_changed"], None
+
+        if authority.stage is _TcpRecoveryStage.TCP_CONFIRMED_OWNER:
+            states = tuple(self._tcp_s.values())
+            counts, generation, observed_at = self._observe_tcp_counts(
+                states,
+                fresh_now,
+            )
+            target_state = self._tcp_s.get(
+                (authority.entry_id, authority.old_instance)
+            )
+            if (
+                counts is None
+                or generation is None
+                or observed_at is None
+                or observed_at >= authority.deadline
+                or target_state is None
+                or counts.get(authority.old_instance.process_id) != 0
+            ):
+                self._cancel_tcp_recovery(
+                    authority,
+                    timed_out=bool(
+                        observed_at is not None
+                        and observed_at >= authority.deadline
+                    ),
+                )
+                return 0, [
+                    "tcp_reconnect_timeout"
+                    if observed_at is not None
+                    and observed_at >= authority.deadline
+                    else "tcp_final_query_changed"
+                ], None
+            for state in states:
+                if counts.get(state.instance.process_id, 0) > 0:
+                    state.online = True
+                    state.zero_since = None
+                    state.zero_count = 0
+                state.gen = generation
+            self._candidate_window_set()
+            resolved = self._tcp_v
+            staged = (
+                self._pre_close_backend_contract(
+                    resolved,
+                    authority.entry_id,
+                    authority.old_instance,
+                )
+                if isinstance(resolved, ResolvedTargetWindows)
+                and self._tcp_recovery_authority_is_current(
+                    authority,
+                    resolved,
+                )
+                else None
+            )
+            if staged is None or self._battle_restarter is None:
+                self._cancel_tcp_recovery(authority)
+                return 0, ["battle_contract_changed"], None
+            owner_window, pre_candidates = staged
+            sequence, signature = (
+                self._begin_tcp_recovery_evidence(
+                    authority,
+                    "close_window",
+                )
+            )
+            allowed, value = self._run_tcp_recovery_mutation(
+                "smart-reconnect-owner-close",
+                authority,
+                lambda: self._battle_restarter.close_verified(
+                    owner_window,
+                    pre_candidates,
+                    deadline=authority.deadline,
+                ),
+            )
+            result = value if isinstance(value, BattleRestartResult) else None
+            self._finish_tcp_recovery_evidence(
+                authority,
+                "close_window",
+                sequence,
+                signature,
+                result,
+                allowed=allowed,
+            )
+            if (
+                not allowed
+                or result is None
+                or not result.success
+                or not result.window_closed
+            ):
+                self._cancel_tcp_recovery(authority)
+                return 0, [
+                    result.failure_code
+                    if result is not None and result.failure_code
+                    else "battle_window_close_failed"
+                ], None
+            self._candidate_window_set()
+            after = self._tcp_v
+            if (
+                not isinstance(after, ResolvedTargetWindows)
+                or self._post_close_backend_contract(
+                    resolved,
+                    after,
+                    authority.entry_id,
+                    owner_window,
+                )
+                is None
+                or not self._tcp_recovery_authority_is_current(
+                    authority,
+                    after,
+                )
+            ):
+                self._cancel_tcp_recovery(authority)
+                return 0, ["battle_contract_changed"], None
+            authority.stage = _TcpRecoveryStage.CLOSE_VERIFIED
+            authority.stage = _TcpRecoveryStage.REOPEN_PENDING
+            authority.retry_at = self._monotonic_clock()
+            self._persist_runtime_state()
+
+        if authority.stage is _TcpRecoveryStage.REOPEN_PENDING:
+            fresh_now = self._monotonic_clock()
+            if fresh_now < authority.retry_at:
+                return 0, [], max(1, math.ceil(authority.retry_at - fresh_now))
+            self._candidate_window_set()
+            resolved = self._tcp_v
+            target = self._target_for_entry(authority.entry_id)
+            candidates = (
+                self._reopen_backend_contract(
+                    resolved,
+                    authority.entry_id,
+                )
+                if isinstance(resolved, ResolvedTargetWindows)
+                and self._tcp_recovery_authority_is_current(
+                    authority,
+                    resolved,
+                )
+                else None
+            )
+            if (
+                candidates is None
+                or target is None
+                or self._battle_restarter is None
+            ):
+                self._cancel_tcp_recovery(authority)
+                return 0, ["battle_reopen_identity_unsafe"], None
+            sequence, signature = (
+                self._begin_tcp_recovery_evidence(
+                    authority,
+                    "reopen_window",
+                )
+            )
+            # Persist the consumed edge before entering the shortcut backend.
+            # A crash can lose an unperformed retry, never duplicate a launch.
+            authority.stage = _TcpRecoveryStage.SHORTCUT_REQUESTED
+            authority.shortcut_consumed = True
+            if not self._persist_runtime_state():
+                self._cancel_tcp_recovery(authority)
+                return 0, ["reconnect_state_persistence_failed"], None
+            allowed, value = self._run_tcp_recovery_mutation(
+                "smart-reconnect-owner-reopen",
+                authority,
+                lambda: self._battle_restarter.reopen_missing(
+                    target,
+                    candidates,
+                    deadline=authority.deadline,
+                ),
+            )
+            result = value if isinstance(value, BattleRestartResult) else None
+            self._finish_tcp_recovery_evidence(
+                authority,
+                "reopen_window",
+                sequence,
+                signature,
+                result,
+                allowed=allowed,
+            )
+            if (
+                allowed
+                and result is not None
+                and result.shortcut_open_requested
+            ):
+                authority.stage = _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                self._persist_runtime_state()
+                return 1, [], self._policy.progress_interval_seconds
+            if not allowed:
+                self._cancel_tcp_recovery(authority)
+                return 0, ["authorization_revoked"], None
+            authority.stage = _TcpRecoveryStage.REOPEN_PENDING
+            authority.shortcut_consumed = False
+            authority.retry_at = (
+                self._monotonic_clock()
+                + self._policy.progress_interval_seconds
+            )
+            self._persist_runtime_state()
+            return 0, [
+                result.failure_code
+                if result is not None and result.failure_code
+                else "battle_shortcut_open_failed"
+            ], self._policy.progress_interval_seconds
+
+        if authority.stage in {
+            _TcpRecoveryStage.SHORTCUT_REQUESTED,
+            _TcpRecoveryStage.WAITING_NEW_INSTANCE,
+        }:
+            self._candidate_window_set()
+            resolved = self._tcp_v
+            if (
+                not isinstance(resolved, ResolvedTargetWindows)
+                or not self._tcp_recovery_authority_is_current(
+                    authority,
+                    resolved,
+                )
+            ):
+                self._cancel_tcp_recovery(authority)
+                return 0, ["battle_contract_changed"], None
+            new_instance = self._bind_tcp_recovery_instance(
+                authority,
+                resolved,
+            )
+            if new_instance is None:
+                if self._monotonic_clock() >= authority.deadline:
+                    self._cancel_tcp_recovery(authority, timed_out=True)
+                    return 0, ["tcp_reconnect_timeout"], None
+                return 0, [], self._policy.progress_interval_seconds
+            authority.new_instance = new_instance
+            authority.stage = _TcpRecoveryStage.NEW_INSTANCE_BOUND
+            snapshot = self._activation_snapshot_instances
+            sources = self._activation_snapshot_source_fingerprints
+            index = self._activation_snapshot_instance_index
+            source_fingerprint = (
+                sources.get(authority.fingerprint)
+                if sources is not None
+                else None
+            )
+            new_key = self._activation_instance_key(
+                source_fingerprint,
+                new_instance,
+            )
+            old_key = self._activation_instance_key(
+                source_fingerprint,
+                authority.activation_instance,
+            )
+            if (
+                snapshot is None
+                or index is None
+                or new_key is None
+                or old_key is None
+                or (
+                    new_key in index
+                    and index[new_key] != authority.fingerprint
+                )
+            ):
+                self._cancel_tcp_recovery(authority)
+                return 0, ["snapshot_replacement_identity_collision"], None
+            snapshot[authority.fingerprint] = new_instance
+            index.pop(old_key, None)
+            index[new_key] = authority.fingerprint
+            authority.activation_instance = new_instance
+            with self._source_authority_lock:
+                self._source_state_generation += 1
+                authority.source_state_generation = (
+                    self._source_state_generation
+                )
+            authority.stage = _TcpRecoveryStage.SCREEN_RECOVERY
+            self._login_only_recovery_fingerprints.add(
+                authority.fingerprint
+            )
+            self._pending_reconnect_fingerprints.add(
+                authority.fingerprint
+            )
+            self._active_automation_fingerprints.add(
+                authority.fingerprint
+            )
+            self._active_automation_until[authority.fingerprint] = (
+                self._monotonic_clock()
+                + POST_LOGIN_AUTOMATION_GRACE_SECONDS
+            )
+            self._persist_runtime_state()
+        return 0, [], self._policy.progress_interval_seconds
+
+    def _advance_tcp_screen_stage(
+        self,
+        fingerprint: str,
+        recognition: ScreenRecognition,
+    ) -> None:
+        authority = self._tcp_recovery_authority
+        if (
+            authority is None
+            or authority.fingerprint != fingerprint
+            or self._source_state_generation_snapshot()
+            != authority.source_state_generation
+            or authority.stage.value
+            not in {
+                _TcpRecoveryStage.SCREEN_RECOVERY.value,
+                _TcpRecoveryStage.LOGIN.value,
+                _TcpRecoveryStage.LINE.value,
+                _TcpRecoveryStage.ROLE.value,
+                _TcpRecoveryStage.ENTER.value,
+            }
+        ):
+            return
+        state = recognition.state
+        next_stage = {
+            ReconnectScreenState.LOGIN_START: _TcpRecoveryStage.LOGIN,
+            ReconnectScreenState.FORCE_LOGIN_START: _TcpRecoveryStage.LOGIN,
+            ReconnectScreenState.FORCE_LOGIN_TIMEOUT: _TcpRecoveryStage.LOGIN,
+            ReconnectScreenState.LINE_SELECTION: _TcpRecoveryStage.LINE,
+            ReconnectScreenState.CONNECTED: _TcpRecoveryStage.CONNECTED,
+        }.get(state)
+        if state is ReconnectScreenState.CHARACTER_SELECTION:
+            next_stage = (
+                _TcpRecoveryStage.ENTER
+                if recognition.character_slot_selected is True
+                else _TcpRecoveryStage.ROLE
+            )
+        if next_stage is not None and authority.stage is not next_stage:
+            authority.stage = next_stage
+            self._persist_runtime_state()
 
     def _retry_pending_reopens(
         self,
@@ -8722,10 +9769,28 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             target_failures,
         )
         runtime_authority_revoked = False
-        pending_reopen = frozenset(self._pending_reopen_fingerprints)
+        tcp_recovery_authority = self._tcp_recovery_authority
+        machine_pending_reopen = frozenset(
+            (tcp_recovery_authority.fingerprint,)
+            if (
+                tcp_recovery_authority is not None
+                and not tcp_recovery_authority.terminal
+                and tcp_recovery_authority.stage
+                in {
+                    _TcpRecoveryStage.CLOSE_VERIFIED,
+                    _TcpRecoveryStage.REOPEN_PENDING,
+                    _TcpRecoveryStage.SHORTCUT_REQUESTED,
+                    _TcpRecoveryStage.WAITING_NEW_INSTANCE,
+                }
+            )
+            else ()
+        )
+        pending_reopen = frozenset(
+            self._pending_reopen_fingerprints
+        ) | machine_pending_reopen
         formal_reopen = (
             pending_reopen & self._login_only_recovery_fingerprints
-        )
+        ) | machine_pending_reopen
         plan = self._group_launch_plan
         resolved_contract = self._tcp_v
         contract_plan_unsafe = bool(
@@ -8866,25 +9931,51 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             candidate_windows,
             global_failures,
             target_failures,
-            tcp_owner,
+            (
+                tcp_recovery_authority.fingerprint
+                if (
+                    tcp_recovery_authority is not None
+                    and not tcp_recovery_authority.terminal
+                )
+                else tcp_owner
+            ),
         )
-        retried_reopens, retry_failures, pending_reopen_delay = (
-            self._retry_pending_reopens(
-                candidate_windows=candidate_windows,
-                global_failures=global_failures,
-                target_failures=target_failures,
-                execute=mutation_execute,
-                now=now,
-                expected_capture_settings_revision=(
-                    capture_settings_revision
-                ),
-                expected_source_state_generation=(
-                    scan_source_state_generation
-                ),
-                safety_failures=tuple(reopen_safety_failures),
-                owner=tcp_owner,
+        if (
+            self._tcp_recovery_authority is None
+            and tcp_owner is not None
+            and tcp_owner_state is None
+            and tcp_owner in self._pending_reopen_fingerprints
+        ):
+            # Preserve the pre-existing non-TCP visual-battle retry path.
+            # Formal TCP owners always have a private authority record and
+            # therefore continue exclusively through the state machine.
+            retried_reopens, retry_failures, pending_reopen_delay = (
+                self._retry_pending_reopens(
+                    candidate_windows=candidate_windows,
+                    global_failures=global_failures,
+                    target_failures=target_failures,
+                    execute=mutation_execute,
+                    now=now,
+                    expected_capture_settings_revision=(
+                        capture_settings_revision
+                    ),
+                    expected_source_state_generation=(
+                        scan_source_state_generation
+                    ),
+                    safety_failures=tuple(reopen_safety_failures),
+                    owner=tcp_owner,
+                )
             )
-        )
+        else:
+            retried_reopens, retry_failures, pending_reopen_delay = (
+                self._advance_tcp_recovery(
+                    owner=tcp_owner,
+                    owner_state=tcp_owner_state,
+                    execute=mutation_execute,
+                    now=now,
+                    source_state_generation=scan_source_state_generation,
+                )
+            )
         failures = [
             *group_failures,
             *global_failures,
@@ -9235,6 +10326,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         terminal_confirmed
                         and terminal_budget_current
                     ):
+                        self._advance_tcp_screen_stage(
+                            fingerprint,
+                            recognition,
+                        )
                         self._complete_reconnect_timing(
                             fingerprint,
                             "tcp_disconnect_to_connected",
@@ -9301,6 +10396,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 recognition,
                 initial_login_authorized=initial_login_authorized,
             )
+            if recognition.state is not ReconnectScreenState.CONNECTED:
+                self._advance_tcp_screen_stage(
+                    fingerprint,
+                    recognition,
+                )
             if (
                 fingerprint in self._pending_reopen_fingerprints
                 and fingerprint in self._login_only_recovery_fingerprints
@@ -9373,18 +10473,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         now,
                     )
             action = self._policy.decide(recognition.state).action
-            tcp_action = bool(
-                tcp_owner == fingerprint
-                and tcp_owner_state is not None
-                and tcp_owner_state.entry_id is not None
-                and tcp_owner_state.instance == instance
-                and not self._has_reconnect_session(fingerprint)
-                and self._tcp_id(
-                    self._tcp_v,
-                    fingerprint,
-                    tcp_owner_state.instance,
-                ) == tcp_owner_state.entry_id
-            )
+            # Formal TCP recovery is advanced once, before capture, by the
+            # owner-local state machine.  It never enters the legacy visual
+            # battle restart path below.
+            tcp_action = False
             is_action_candidate = (
                 tcp_action
                 or (
@@ -9661,10 +10753,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         # General auto-battle remains independently available to healthy
         # windows.  It is narrowed only while one concrete recovery owner is
         # active; zero evidence without an owner must not freeze the group.
-        active_recovery_owner = tcp_owner
+        recovery_authority = self._tcp_recovery_authority
+        active_recovery_owner = (
+            recovery_authority.fingerprint
+            if (
+                recovery_authority is not None
+                and not recovery_authority.terminal
+            )
+            else tcp_owner
+        )
         operation_scope = (
-            frozenset((tcp_owner,))
-            if tcp_owner is not None
+            frozenset((active_recovery_owner,))
+            if active_recovery_owner is not None
             else (
                 frozenset()
                 if tcp_owner_failure
@@ -9708,7 +10808,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             and (operation_scope is None or fingerprint in operation_scope)
             and (
                 not tcp_managed_scope
-                or fingerprint == tcp_owner
+                or fingerprint == active_recovery_owner
                 or (
                     fingerprint in initial_authorized_action_fingerprints
                     and item.state is not ReconnectScreenState.DISCONNECTED
@@ -9756,17 +10856,24 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if (
                 item.state is ReconnectScreenState.DISCONNECTED
                 and item.battle_context
-                or fingerprint in tcp_action_entries
             )
             and fingerprint in confirmed_action_instances
             and fingerprint not in self._tcp_timeout_isolated
+            and not (
+                recovery_authority is not None
+                and not recovery_authority.terminal
+                and recovery_authority.fingerprint == fingerprint
+            )
             and (operation_scope is None or fingerprint in operation_scope)
-            and (not tcp_managed_scope or fingerprint == tcp_owner)
+            and (
+                not tcp_managed_scope
+                or fingerprint == active_recovery_owner
+            )
         ]
         clicked_windows = 0
         restarted_windows = retried_reopens
         battle_restart_attempted = False
-        tcp_restart_progressed = False
+        tcp_restart_progressed = retried_reopens > 0
         invalid_targets = 0
         unresponsive_targets = 0
         delivery_failures = 0
