@@ -1282,7 +1282,7 @@ def auto_read_missing_role_id_once(
     *,
     refresh: Callable[[], None] | None = None,
 ) -> bool:
-    """Read one blank role ID only from a complete CONNECTED target window."""
+    """Read one blank role ID twice from one complete in-game target window."""
 
     group = group_configuration_service.group(group_name)
     if group is None:
@@ -1299,7 +1299,7 @@ def auto_read_missing_role_id_once(
         group_launch_service,
         target_window_contract_service,
     )
-    if window is None or window.minimized:
+    if window is None or not window.visible or window.minimized:
         return False
     fingerprint = normalize_launch_fingerprint(window.launch_fingerprint)
     instance = WindowInstanceToken.from_window(window)
@@ -1309,7 +1309,10 @@ def auto_read_missing_role_id_once(
         (fingerprint,),
         candidate_windows=(window,),
     ).get(fingerprint)
-    if screen_state is not ReconnectScreenState.CONNECTED:
+    if screen_state not in (
+        ReconnectScreenState.CONNECTED,
+        ReconnectScreenState.UNKNOWN,
+    ):
         return False
     result = role_id_template_service.read_if_missing(
         window.handle,
@@ -1333,6 +1336,7 @@ def auto_read_missing_role_id_once(
     )
     if (
         refreshed_window is None
+        or not refreshed_window.visible
         or refreshed_window.minimized
         or refreshed_fingerprint != fingerprint
         or WindowInstanceToken.from_window(refreshed_window) != instance
@@ -1342,7 +1346,10 @@ def auto_read_missing_role_id_once(
         (fingerprint,),
         candidate_windows=(refreshed_window,),
     ).get(fingerprint)
-    if refreshed_state is not ReconnectScreenState.CONNECTED:
+    if refreshed_state not in (
+        ReconnectScreenState.CONNECTED,
+        ReconnectScreenState.UNKNOWN,
+    ):
         return False
     latest_group = group_configuration_service.group(group_name)
     latest_entries = (
@@ -1356,10 +1363,28 @@ def auto_read_missing_role_id_once(
     )
     if len(latest_entries) != 1 or latest_entries[0].role_id.strip():
         return False
+    confirmed_result = role_id_template_service.read_if_missing(
+        refreshed_window.handle,
+        existing_role_id=latest_entries[0].role_id,
+    )
+    if not confirmed_result.success or confirmed_result.role_id != result.role_id:
+        return False
+    final_group = group_configuration_service.group(group_name)
+    final_entries = (
+        tuple(
+            item
+            for item in final_group.entries
+            if item.entry_id == entry_id
+        )
+        if final_group is not None
+        else ()
+    )
+    if len(final_entries) != 1 or final_entries[0].role_id.strip():
+        return False
     if not group_configuration_service.set_role_id(
         group_name,
         entry_id,
-        result.role_id,
+        confirmed_result.role_id,
     ):
         return False
     if refresh is not None:

@@ -302,6 +302,117 @@ def test_role_id_calibration_uses_only_the_visible_game_text():
     assert "entry_id=entry_id" in function_source
 
 
+class _RoleIdAutoReadFixture:
+    def __init__(
+        self,
+        *,
+        windows=None,
+        states=(
+            ReconnectScreenState.CONNECTED,
+            ReconnectScreenState.CONNECTED,
+        ),
+        role_ids=("原角色", "原角色"),
+        on_read=None,
+    ):
+        self.fingerprint = "f" * 64
+        self.window = WindowInfo(
+            21,
+            "Adobe Flash Player 21",
+            True,
+            False,
+            (0, 0, 900, 600),
+            201,
+            "Flash",
+            self.fingerprint,
+            2001,
+            200001,
+        )
+        self.windows = iter(windows or (self.window, self.window))
+        self.states = iter(states)
+        self.role_ids = iter(role_ids)
+        self.on_read = on_read
+        self.entry = SimpleNamespace(entry_id="entry-a", role_id="")
+        self.set_calls = []
+        self.read_calls = []
+        self.refresh_calls = []
+
+        def set_role_id(group_name, entry_id, role_id):
+            self.set_calls.append((group_name, entry_id, role_id))
+            self.entry.role_id = role_id
+            return True
+
+        self.configuration = SimpleNamespace(
+            group=lambda _group_name: SimpleNamespace(entries=(self.entry,)),
+            set_role_id=set_role_id,
+        )
+        self.launch_service = SimpleNamespace(
+            plan=lambda _group_name: SimpleNamespace(
+                ready=True,
+                targets=(
+                    SimpleNamespace(
+                        entry_id="entry-a",
+                        fingerprint=self.fingerprint,
+                    ),
+                ),
+            )
+        )
+
+        def reconnect_targets(_group_name):
+            window = next(self.windows)
+            return ResolvedTargetWindows(
+                windows=(window,),
+                sync_windows=(
+                    replace(
+                        window,
+                        launch_fingerprint=(
+                            monitored_window_instance_fingerprint(window)
+                        ),
+                    ),
+                ),
+                sync_entry_ids=("entry-a",),
+                sync_scope_entry_ids=("entry-a",),
+                sync_controller_entry_id="entry-a",
+            )
+
+        self.target_service = SimpleNamespace(
+            reconnect_targets=reconnect_targets
+        )
+
+        def read_if_missing(handle, *, existing_role_id):
+            call_index = len(self.read_calls)
+            self.read_calls.append((handle, existing_role_id))
+            if self.on_read is not None:
+                self.on_read(call_index, self.entry)
+            return SimpleNamespace(
+                success=True,
+                role_id=next(self.role_ids),
+            )
+
+        self.role_id_service = SimpleNamespace(
+            read_if_missing=read_if_missing
+        )
+        self.controller = SimpleNamespace(
+            observe_screen_states=(
+                lambda fingerprints, *, candidate_windows: {
+                    fingerprint: next(self.states)
+                    for fingerprint in fingerprints
+                }
+            )
+        )
+
+    def run(self):
+        return auto_read_missing_role_id_once(
+            "測試組",
+            "entry-a",
+            self.configuration,
+            self.launch_service,
+            self.target_service,
+            self.role_id_service,
+            self.controller,
+            refresh=lambda: self.refresh_calls.append(True),
+        )
+
+
 def test_role_id_is_automatically_read_only_for_connected_missing_roles():
     fingerprint = "b" * 64
     window = WindowInfo(
@@ -392,7 +503,10 @@ def test_role_id_is_automatically_read_only_for_connected_missing_roles():
         ((fingerprint,), (window,)),
         ((fingerprint,), (window,)),
     ]
-    assert role_id_service.read_calls == [(window.handle, "")]
+    assert role_id_service.read_calls == [
+        (window.handle, ""),
+        (window.handle, ""),
+    ]
     assert configuration.set_calls == [("測試組", "entry-a", "原角色")]
     assert refreshed == [True]
 
@@ -497,11 +611,6 @@ def test_role_id_auto_read_never_persists_after_contract_identity_changes():
             ("entry-a", "e" * 64),
             ReconnectScreenState.CONNECTED,
         ),
-        "connected": (
-            original,
-            ("entry-a", fingerprint),
-            ReconnectScreenState.UNKNOWN,
-        ),
     }
     for _name, (refreshed, refreshed_target, final_state) in cases.items():
         entry = SimpleNamespace(entry_id="entry-a", role_id="")
@@ -576,6 +685,121 @@ def test_role_id_auto_read_never_persists_after_contract_identity_changes():
         ) is False
         assert reads == [(original.handle, "")]
         assert set_calls == []
+
+
+def test_role_id_auto_read_accepts_unknown_only_with_two_consistent_reads():
+    fixture = _RoleIdAutoReadFixture(
+        states=(ReconnectScreenState.UNKNOWN, ReconnectScreenState.UNKNOWN)
+    )
+
+    assert fixture.run() is True
+    assert fixture.read_calls == [(21, ""), (21, "")]
+    assert fixture.set_calls == [("測試組", "entry-a", "原角色")]
+
+
+def test_role_id_auto_read_rejects_inconsistent_unknown_reads():
+    fixture = _RoleIdAutoReadFixture(
+        states=(ReconnectScreenState.UNKNOWN, ReconnectScreenState.UNKNOWN),
+        role_ids=("原角色", "另一角色"),
+    )
+
+    assert fixture.run() is False
+    assert fixture.read_calls == [(21, ""), (21, "")]
+    assert fixture.set_calls == []
+
+
+def test_role_id_auto_read_rejects_each_live_instance_drift():
+    base = _RoleIdAutoReadFixture().window
+    changed_windows = (
+        replace(base, handle=22),
+        replace(base, process_id=202),
+        replace(base, thread_id=2002),
+        replace(base, process_lifecycle_token=200002),
+    )
+    for changed in changed_windows:
+        fixture = _RoleIdAutoReadFixture(windows=(base, changed))
+
+        assert fixture.run() is False
+        assert fixture.read_calls == [(21, "")]
+        assert fixture.set_calls == []
+
+
+def test_role_id_auto_read_never_overwrites_role_filled_during_either_read():
+    for fill_on_call in (0, 1):
+        def fill_role(call_index, entry, expected=fill_on_call):
+            if call_index == expected:
+                entry.role_id = "已由其他流程保存"
+
+        fixture = _RoleIdAutoReadFixture(on_read=fill_role)
+
+        assert fixture.run() is False
+        assert len(fixture.read_calls) == fill_on_call + 1
+        assert fixture.set_calls == []
+        assert fixture.entry.role_id == "已由其他流程保存"
+
+
+def test_role_id_auto_read_rejects_every_explicit_non_game_state_before_or_after_ocr():
+    allowed = {
+        ReconnectScreenState.CONNECTED,
+        ReconnectScreenState.UNKNOWN,
+    }
+    rejected = tuple(state for state in ReconnectScreenState if state not in allowed)
+
+    for state in rejected:
+        before = _RoleIdAutoReadFixture(
+            states=(state, ReconnectScreenState.CONNECTED)
+        )
+        assert before.run() is False
+        assert before.read_calls == []
+        assert before.set_calls == []
+
+        after = _RoleIdAutoReadFixture(
+            states=(ReconnectScreenState.CONNECTED, state)
+        )
+        assert after.run() is False
+        assert after.read_calls == [(21, "")]
+        assert after.set_calls == []
+
+
+def test_role_id_auto_read_rejects_hidden_or_minimized_without_restoring():
+    base = _RoleIdAutoReadFixture().window
+    for blocked in (
+        replace(base, visible=False),
+        replace(base, minimized=True),
+    ):
+        fixture = _RoleIdAutoReadFixture(windows=(blocked, blocked))
+
+        assert fixture.run() is False
+        assert fixture.read_calls == []
+        assert fixture.set_calls == []
+
+
+def test_role_id_auto_read_rejects_incomplete_fingerprint_or_instance():
+    base = _RoleIdAutoReadFixture().window
+    incomplete_windows = (
+        replace(base, launch_fingerprint=None),
+        replace(base, process_lifecycle_token=None),
+    )
+    for incomplete in incomplete_windows:
+        initial = _RoleIdAutoReadFixture(windows=(incomplete, incomplete))
+        assert initial.run() is False
+        assert initial.read_calls == []
+        assert initial.set_calls == []
+
+        refreshed = _RoleIdAutoReadFixture(windows=(base, incomplete))
+        assert refreshed.run() is False
+        assert refreshed.read_calls == [(21, "")]
+        assert refreshed.set_calls == []
+
+
+def test_role_id_auto_read_does_not_read_or_overwrite_after_saving():
+    fixture = _RoleIdAutoReadFixture()
+
+    assert fixture.run() is True
+    assert fixture.run() is False
+    assert fixture.read_calls == [(21, ""), (21, "")]
+    assert fixture.set_calls == [("測試組", "entry-a", "原角色")]
+    assert fixture.refresh_calls == [True]
 
 
 def test_cancelled_bulk_shortcut_selection_has_no_side_effects():
