@@ -730,8 +730,7 @@ def build_configured_reconnect_plan(
     choice_items = tuple(choices) if isinstance(choices, (list, tuple)) else ()
     entries = {}
     shortcut_paths = {}
-    recovery_evidence = {}
-    recovery_conflicts = set()
+    role_ids = {}
     for group in group_items:
         for entry in tuple(getattr(group, "entries", ())):
             shortcut_path = str(
@@ -744,17 +743,9 @@ def build_configured_reconnect_plan(
                 return None
             entries.setdefault(entry.entry_id, entry)
             shortcut_paths[entry.entry_id] = shortcut_path
-            evidence = (
-                entry.display_name,
-                entry.role_id.strip(),
-                entry.placement,
-            )
-            if (
-                entry.entry_id in recovery_evidence
-                and recovery_evidence[entry.entry_id] != evidence
-            ):
-                recovery_conflicts.add(entry.entry_id)
-            recovery_evidence.setdefault(entry.entry_id, evidence)
+            role_id = entry.role_id.strip()
+            if role_id:
+                role_ids.setdefault(entry.entry_id, set()).add(role_id)
     entry_ids = tuple(getattr(scope, "entry_ids", ()))
     entry_fingerprints = tuple(
         getattr(scope, "entry_fingerprints", ())
@@ -781,11 +772,10 @@ def build_configured_reconnect_plan(
         if fingerprint is None:
             return None
         character_ids = profile_ids.get(entry_id, set())
-        recovery_evidence_for_entry = recovery_evidence[entry_id]
+        entry_role_ids = role_ids.get(entry_id, set())
         recovery_role_id = (
-            recovery_evidence_for_entry[1]
-            if entry_id not in recovery_conflicts
-            and recovery_evidence_for_entry[1]
+            next(iter(entry_role_ids))
+            if len(entry_role_ids) == 1
             and len(character_ids) <= 1
             else ""
         )

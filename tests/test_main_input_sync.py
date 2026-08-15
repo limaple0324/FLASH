@@ -1359,22 +1359,29 @@ def test_configured_reconnect_plan_keeps_recovery_conflicts_detection_only(
     tmp_path,
 ):
     shortcut = tmp_path / "same.lnk"
+    other_shortcut = tmp_path / "other.lnk"
     scope = SimpleNamespace(
         ready=True,
         entry_ids=("shared-entry",),
         entry_fingerprints=("a" * 64,),
     )
 
-    def entry(role_id, placement=None):
+    def entry(
+        role_id,
+        placement=None,
+        *,
+        display_name="same",
+        shortcut_path=shortcut,
+    ):
         return SimpleNamespace(
             entry_id="shared-entry",
-            display_name="same",
-            shortcut_path=shortcut,
+            display_name=display_name,
+            shortcut_path=shortcut_path,
             role_id=role_id,
             placement=placement,
         )
 
-    def plan_for(first, second):
+    def plan_for(first, second, *, choices=()):
         return build_configured_reconnect_plan(
             scope,
             (
@@ -1382,22 +1389,62 @@ def test_configured_reconnect_plan_keeps_recovery_conflicts_detection_only(
                 SimpleNamespace(entries=(second,)),
             ),
             (),
-            (),
+            choices,
         )
 
-    blank_conflict = plan_for(entry(""), entry("hero"))
-    placement_conflict = plan_for(
-        entry("hero"),
-        entry("hero", SimpleNamespace(x=1)),
+    blank_and_a = plan_for(entry("A"), entry(""))
+    same_role = plan_for(entry("A"), entry("A"))
+    conflicting_roles = plan_for(entry("A"), entry("B"))
+    placement_difference = plan_for(
+        entry("A"),
+        entry("A", SimpleNamespace(x=1)),
     )
-    recoverable = plan_for(entry("hero"), entry("hero"))
+    display_difference = plan_for(
+        entry("A"),
+        entry("A", display_name="另一顯示名稱"),
+    )
+    profile_conflict = plan_for(
+        entry("A"),
+        entry("A"),
+        choices=(
+            SimpleNamespace(
+                members=(
+                    SimpleNamespace(
+                        entry_id="shared-entry",
+                        character_id="profile-a",
+                    ),
+                )
+            ),
+            SimpleNamespace(
+                members=(
+                    SimpleNamespace(
+                        entry_id="shared-entry",
+                        character_id="profile-b",
+                    ),
+                )
+            ),
+        ),
+    )
+    path_conflict = plan_for(
+        entry("A"),
+        entry("A", shortcut_path=other_shortcut),
+    )
 
-    assert blank_conflict is not None
-    assert blank_conflict.targets[0].role_id == ""
-    assert placement_conflict is not None
-    assert placement_conflict.targets[0].role_id == ""
-    assert recoverable is not None
-    assert recoverable.targets[0].role_id == "hero"
+    assert blank_and_a is not None
+    assert blank_and_a.targets[0].role_id == "A"
+    assert same_role is not None
+    assert same_role.targets[0].role_id == "A"
+    assert conflicting_roles is not None
+    assert len(conflicting_roles.targets) == 1
+    assert conflicting_roles.targets[0].role_id == ""
+    assert placement_difference is not None
+    assert placement_difference.targets[0].role_id == "A"
+    assert display_difference is not None
+    assert display_difference.targets[0].role_id == "A"
+    assert profile_conflict is not None
+    assert len(profile_conflict.targets) == 1
+    assert profile_conflict.targets[0].role_id == ""
+    assert path_conflict is None
 
 
 def test_build_services_registers_input_controller_and_safe_default(tmp_path):

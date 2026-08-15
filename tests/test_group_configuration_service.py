@@ -650,6 +650,83 @@ def test_import_rejects_reserved_feature_hotkey_without_changing_owned(
     assert service.group("120") is None
 
 
+def _shared_role_entries(tmp_path):
+    shortcut = _shortcut(tmp_path, "共用角色")
+    service = GroupConfigurationService(tmp_path / "groups.json")
+    service.add_shortcuts("第一組", (shortcut,))
+    service.add_shortcuts("第二組", (shortcut,))
+    entry_id = service.group("第一組").entries[0].entry_id
+    raw_entries = tuple(
+        entry
+        for group in service._groups
+        for entry in group["launch_entries"]
+        if entry["entry_id"] == entry_id
+    )
+    assert len(raw_entries) == 2
+    return service, entry_id, raw_entries
+
+
+def test_set_role_id_updates_two_blank_shared_entries_with_one_save(
+    tmp_path,
+    monkeypatch,
+):
+    service, entry_id, raw_entries = _shared_role_entries(tmp_path)
+    save_calls = []
+    monkeypatch.setattr(service, "_save", lambda: save_calls.append(True))
+
+    assert service.set_role_id("第一組", entry_id, "A") is True
+    assert tuple(entry["role_id"] for entry in raw_entries) == ("A", "A")
+    assert save_calls == [True]
+    assert service.set_role_id("第二組", entry_id, "A") is False
+    assert tuple(entry["role_id"] for entry in raw_entries) == ("A", "A")
+    assert save_calls == [True]
+
+
+def test_set_role_id_fills_only_blank_copy_matching_existing_role(
+    tmp_path,
+    monkeypatch,
+):
+    service, entry_id, raw_entries = _shared_role_entries(tmp_path)
+    raw_entries[0]["role_id"] = "A"
+    save_calls = []
+    monkeypatch.setattr(service, "_save", lambda: save_calls.append(True))
+
+    assert service.set_role_id("第二組", entry_id, "A") is True
+    assert tuple(entry["role_id"] for entry in raw_entries) == ("A", "A")
+    assert save_calls == [True]
+
+
+def test_set_role_id_rejects_conflicting_nonempty_shared_roles_atomically(
+    tmp_path,
+    monkeypatch,
+):
+    service, entry_id, raw_entries = _shared_role_entries(tmp_path)
+    raw_entries[0]["role_id"] = "A"
+    raw_entries[1]["role_id"] = "B"
+    before = json.dumps(service._groups, ensure_ascii=False, sort_keys=True)
+    save_calls = []
+    monkeypatch.setattr(service, "_save", lambda: save_calls.append(True))
+
+    assert service.set_role_id("第一組", entry_id, "A") is False
+    assert json.dumps(service._groups, ensure_ascii=False, sort_keys=True) == before
+    assert save_calls == []
+
+
+def test_set_role_id_rejects_shared_entry_path_conflict_atomically(
+    tmp_path,
+    monkeypatch,
+):
+    service, entry_id, raw_entries = _shared_role_entries(tmp_path)
+    raw_entries[1]["path"] = str(_shortcut(tmp_path, "另一捷徑"))
+    before = json.dumps(service._groups, ensure_ascii=False, sort_keys=True)
+    save_calls = []
+    monkeypatch.setattr(service, "_save", lambda: save_calls.append(True))
+
+    assert service.set_role_id("第一組", entry_id, "A") is False
+    assert json.dumps(service._groups, ensure_ascii=False, sort_keys=True) == before
+    assert save_calls == []
+
+
 def test_sync_offset_delay_base_point_and_role_id_survive_reload(tmp_path):
     legacy, _first, _second = _legacy(tmp_path)
     owned = tmp_path / "groups.json"

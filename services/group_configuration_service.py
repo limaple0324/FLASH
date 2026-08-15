@@ -1257,7 +1257,8 @@ class GroupConfigurationService:
             )
         ):
             return False
-        raw_group = next(
+        normalized_entry_id = entry_id.strip()
+        source_group = next(
             (
                 group
                 for group in self._groups
@@ -1265,24 +1266,65 @@ class GroupConfigurationService:
             ),
             None,
         )
-        if raw_group is None:
-            return False
-        entries = raw_group.get("launch_entries")
-        if not isinstance(entries, list):
-            return False
-        raw_entry = next(
-            (
-                entry
-                for entry in entries
-                if entry.get("entry_id") == entry_id.strip()
-            ),
-            None,
+        source_entries = (
+            source_group.get("launch_entries")
+            if source_group is not None
+            else None
         )
-        if raw_entry is None:
+        if (
+            not isinstance(source_entries, list)
+            or not any(
+                entry.get("entry_id") == normalized_entry_id
+                for entry in source_entries
+            )
+        ):
             return False
-        if self._clean_role_id(raw_entry.get("role_id")) == normalized_role_id:
+        matching_entries: list[dict[str, object]] = []
+        shortcut_paths: set[str] = set()
+        for raw_group in self._groups:
+            entries = raw_group.get("launch_entries")
+            if not isinstance(entries, list):
+                return False
+            for raw_entry in entries:
+                if raw_entry.get("entry_id") != normalized_entry_id:
+                    continue
+                raw_path = raw_entry.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    return False
+                path = Path(raw_path).resolve(strict=False)
+                if self._entry_id(path) != normalized_entry_id:
+                    return False
+                matching_entries.append(raw_entry)
+                shortcut_paths.add(os.path.normcase(str(path)))
+        if not matching_entries or len(shortcut_paths) != 1:
             return False
-        raw_entry["role_id"] = normalized_role_id
+        existing_role_ids = {
+            current_role_id
+            for raw_entry in matching_entries
+            if (
+                current_role_id := self._clean_role_id(
+                    raw_entry.get("role_id")
+                )
+            )
+        }
+        if (
+            len(existing_role_ids) > 1
+            or (
+                existing_role_ids
+                and normalized_role_id not in existing_role_ids
+            )
+        ):
+            return False
+        changed_entries = tuple(
+            raw_entry
+            for raw_entry in matching_entries
+            if self._clean_role_id(raw_entry.get("role_id"))
+            != normalized_role_id
+        )
+        if not changed_entries:
+            return False
+        for raw_entry in changed_entries:
+            raw_entry["role_id"] = normalized_role_id
         self._save()
         return True
 
