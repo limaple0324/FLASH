@@ -7094,15 +7094,15 @@ def test_activation_snapshot_authorizes_known_login_only_after_two_frames():
 
 
 @pytest.mark.parametrize(
-    ("marker", "expected_point"),
+    ("marker", "expected_clicks"),
     (
-        (4, (0.5, 0.327)),
-        (6, (0.86, 0.12)),
+        (4, [(1, (0.5, 0.327))]),
+        (6, []),
     ),
 )
 def test_activation_snapshot_authorizes_known_initial_flow_screens(
     marker,
-    expected_point,
+    expected_clicks,
 ):
     fixture = make_controller([marker], expected_windows=1)
     activate_current_window_snapshot(fixture)
@@ -7110,8 +7110,8 @@ def test_activation_snapshot_authorizes_known_initial_flow_screens(
     fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
-    assert result.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(1, expected_point)]
+    assert result.details["clicked_windows"] == len(expected_clicks)
+    assert fixture.mouse.clicks == expected_clicks
 
 
 def test_activation_snapshot_unknown_and_single_login_frame_never_click():
@@ -11123,6 +11123,282 @@ def test_formal_healthy_tcp_keeps_initial_login_authorization_actionable(
 
     assert result.details["clicked_windows"] == 1
     assert fixture.mouse.clicks == [(1, CHARACTER_ENTER_CLICK_POINT)]
+
+
+def test_eleven_healthy_tcp_windows_never_use_initial_login_for_post_login(
+    tmp_path,
+):
+    windows = [
+        make_window(index, process_id=100 + index)
+        for index in range(1, 12)
+    ]
+    fixture = make_controller(
+        [6] * 5 + [1] * 6,
+        windows=windows,
+        expected_windows=11,
+        tcp_connection_count_provider=lambda process_ids: {
+            process_id: 1 for process_id in process_ids
+        },
+        target_windows_provider=lambda: tcp_resolved_targets(windows),
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
+    )
+
+    assert activate_current_window_snapshot(fixture).success is True
+    first_frame = fixture.controller.reconnect()
+    second_frame = fixture.controller.reconnect()
+
+    assert first_frame.details["clicked_windows"] == 0
+    assert second_frame.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+
+
+def test_forming_recovery_owner_revokes_every_non_owner_input_grant(tmp_path):
+    windows = [
+        make_window(1, process_id=101),
+        make_window(2, process_id=102),
+    ]
+    now = [0.0]
+    counts = {101: 1, 102: 1}
+    restarter = FakeBattleRestarter()
+    fixture = make_controller(
+        [1, 3],
+        windows=windows,
+        expected_windows=2,
+        clock=lambda: now[0],
+        tcp_connection_count_provider=lambda process_ids: {
+            process_id: counts[process_id] for process_id in process_ids
+        },
+        target_windows_provider=lambda: tcp_resolved_targets(windows),
+        battle_restarter=restarter,
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.reconnect()
+    peer = windows[1].launch_fingerprint
+    peer_candidate = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        False,
+        (0.5, 0.7),
+        digit_count=3,
+        identity="role-1",
+    )
+    fixture.controller._active_automation_fingerprints.add(peer)
+    fixture.controller._active_automation_until[peer] = 99.0
+    fixture.controller._action_retry_after[peer] = (
+        ReconnectScreenState.FORCE_LOGIN_START,
+        99.0,
+    )
+    fixture.controller._flow_pause_until[peer] = 99.0
+    fixture.controller._character_selection_pending.add(peer)
+    fixture.controller._character_selection_targets[peer] = peer_candidate
+    fixture.controller._pending_reconnect_fingerprints.add(peer)
+    fixture.controller._primary_entry_authorized.add(peer)
+    fixture.controller._primary_connected_fingerprints.add(peer)
+    fixture.controller._reconnect_entry_authorized.add(peer)
+    fixture.controller._start_reconnect_timing(
+        peer,
+        "tcp_disconnect_to_connected",
+        "tcp_owner_confirmed",
+        0.0,
+    )
+    assert peer in fixture.controller._initial_login_authorizations
+    assert peer in fixture.controller._action_confirmations
+
+    counts[101] = 0
+    for observed_at in (1.0, 4.0, 8.0):
+        now[0] = observed_at
+        fixture.controller.check_connection()
+    now[0] = 9.0
+    fixture.controller.reconnect()
+
+    assert fixture.controller._tcp_recovery_authority.fingerprint == (
+        windows[0].launch_fingerprint
+    )
+    assert peer not in fixture.controller._action_confirmations
+    assert peer not in fixture.controller._active_automation_fingerprints
+    assert peer not in fixture.controller._active_automation_until
+    assert peer not in fixture.controller._initial_login_authorizations
+    assert peer not in fixture.controller._action_retry_after
+    assert peer not in fixture.controller._flow_pause_until
+    assert peer not in fixture.controller._character_selection_pending
+    assert peer not in fixture.controller._character_selection_targets
+    assert peer not in fixture.controller._pending_reconnect_fingerprints
+    assert peer not in fixture.controller._primary_entry_authorized
+    assert peer not in fixture.controller._primary_connected_fingerprints
+    assert peer not in fixture.controller._reconnect_entry_authorized
+    assert (
+        peer,
+        "tcp_disconnect_to_connected",
+    ) not in fixture.controller._reconnect_timing_flows
+    assert all(handle != windows[1].handle for handle, _point in fixture.mouse.clicks)
+
+    now[0] = 60.5
+    fixture.controller._check_reconnect_timing_deadlines(now[0])
+    peer_window_id = hashlib.sha256(peer.encode("ascii")).hexdigest()[:12]
+    assert not any(
+        item.status == "timeout" and item.window_id == peer_window_id
+        for item in fixture.controller.anonymous_reconnect_timing_diagnostics()
+    )
+    assert peer not in fixture.controller._tcp_timeout_isolated
+
+
+@pytest.mark.parametrize(
+    "peer_recognition",
+    (
+        ScreenRecognition(
+            ReconnectScreenState.LOGIN_START,
+            0.0,
+            (0.5, 0.8),
+            "login",
+        ),
+        ScreenRecognition(
+            ReconnectScreenState.POST_LOGIN_ACTIVITY,
+            0.0,
+            (0.86, 0.12),
+            "post-login",
+        ),
+        ScreenRecognition(
+            ReconnectScreenState.LINE_SELECTION,
+            0.0,
+            (0.5, 0.327),
+            "line",
+            line_number=1,
+            recent_line_present=False,
+        ),
+        _character_recognition((
+            CharacterSelectionCandidate(
+                120,
+                None,
+                1,
+                False,
+                (0.5, 0.7),
+                digit_count=3,
+                identity="peer-2",
+            ),
+        )),
+        _character_recognition((
+            CharacterSelectionCandidate(
+                120,
+                None,
+                1,
+                True,
+                CHARACTER_ENTER_CLICK_POINT,
+                digit_count=3,
+                identity="peer-2",
+            ),
+        )),
+    ),
+    ids=("login", "post-login", "line", "role", "enter"),
+)
+def test_only_fully_rebound_recovery_owner_can_receive_login_flow_input(
+    tmp_path,
+    peer_recognition,
+):
+    owner_target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, old, new, peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(owner_target,),
+    )
+    peer = peers[0]
+    peer_fingerprint = peer.launch_fingerprint
+    fixture.capture.states[peer.handle] = 50
+    fixture.controller._recognizer = RecognitionByMarker(
+        {
+            1: ScreenRecognition(
+                ReconnectScreenState.CONNECTED,
+                0.0,
+                None,
+                "connected",
+            ),
+            3: ScreenRecognition(
+                ReconnectScreenState.LOGIN_START,
+                0.0,
+                (0.5, 0.8),
+                "login",
+            ),
+            50: peer_recognition,
+        }
+    )
+    fixture.controller.reconnect()
+    authority = fixture.controller._tcp_recovery_authority
+    assert authority is not None
+    assert authority.fingerprint == old.launch_fingerprint
+    assert authority.new_instance == WindowInstanceToken.from_window(new)
+    owner_authorization = next(
+        iter(fixture.controller._initial_login_authorizations.values()),
+        None,
+    )
+    if owner_authorization is not None:
+        fixture.controller._initial_login_authorizations[peer_fingerprint] = (
+            replace(
+                owner_authorization,
+                instance=WindowInstanceToken.from_window(peer),
+                source_state_generation=(
+                    fixture.controller._source_state_generation_snapshot()
+                ),
+                expires_at=999.0,
+            )
+        )
+    fixture.controller._pending_reconnect_fingerprints.add(peer_fingerprint)
+    fixture.controller._active_automation_fingerprints.add(peer_fingerprint)
+    fixture.controller._active_automation_until[peer_fingerprint] = 999.0
+    fixture.controller._login_only_recovery_fingerprints.add(peer_fingerprint)
+
+    for _frame in range(3):
+        fixture.controller.reconnect()
+
+    assert all(handle != peer.handle for handle, _point in fixture.mouse.clicks)
+    assert peer_fingerprint not in fixture.controller._action_confirmations
+
+
+@pytest.mark.parametrize(
+    "unsafe_authority",
+    ("shortcut_not_consumed", "new_instance_missing", "stage_not_ready"),
+)
+def test_recovery_owner_login_fails_closed_until_full_authority(
+    tmp_path,
+    unsafe_authority,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    fixture.controller.reconnect()
+    authority = fixture.controller._tcp_recovery_authority
+    assert authority is not None
+    assert authority.stage.value == "screen_recovery"
+    if unsafe_authority == "shortcut_not_consumed":
+        authority.shortcut_consumed = False
+    elif unsafe_authority == "new_instance_missing":
+        authority.new_instance = None
+    else:
+        authority.stage = type(authority.stage).NEW_INSTANCE_BOUND
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+    assert new.launch_fingerprint not in fixture.controller._action_confirmations
 
 
 def test_formal_tcp_suspected_or_unknown_never_uses_visual_disconnect(

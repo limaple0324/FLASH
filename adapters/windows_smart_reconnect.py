@@ -113,6 +113,7 @@ _SESSION_ONLY_STATES = frozenset(
         ReconnectScreenState.CHARACTER_SELECTION,
     }
 ) | _POST
+_INITIAL_LOGIN_STATES = _SESSION_ONLY_STATES - _POST
 _AUTO_BATTLE_GENERAL_STATES = frozenset(
     {
         ReconnectScreenState.CONNECTED,
@@ -7317,6 +7318,49 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return
         self._action_confirmations.pop(fingerprint, None)
 
+    def _isolate_non_owner_recovery_actions(self, owner: str) -> None:
+        """Revoke every in-flight input grant that does not belong to owner."""
+
+        with self._screen_state_lock:
+            non_owners = (
+                set(self._action_confirmations)
+                | self._active_automation_fingerprints
+                | set(self._initial_login_authorizations)
+                | set(self._action_retry_after)
+                | set(self._action_state_since)
+                | set(self._flow_pause_until)
+                | self._character_selection_pending
+                | set(self._character_selection_targets)
+                | self._pending_reconnect_fingerprints
+                | self._primary_entry_authorized
+                | self._primary_connected_fingerprints
+                | self._reconnect_entry_authorized
+                | {
+                    fingerprint
+                    for fingerprint, _lifecycle in self._reconnect_timing_flows
+                }
+            ) - {owner}
+            self._active_automation_fingerprints.difference_update(non_owners)
+            self._character_selection_pending.difference_update(non_owners)
+            self._pending_reconnect_fingerprints.difference_update(non_owners)
+            self._primary_entry_authorized.difference_update(non_owners)
+            self._primary_connected_fingerprints.difference_update(non_owners)
+            self._reconnect_entry_authorized.difference_update(non_owners)
+            for mapping in (
+                self._action_confirmations,
+                self._active_automation_until,
+                self._initial_login_authorizations,
+                self._action_retry_after,
+                self._action_state_since,
+                self._flow_pause_until,
+                self._character_selection_targets,
+            ):
+                for fingerprint in non_owners:
+                    mapping.pop(fingerprint, None)
+            for key in tuple(self._reconnect_timing_flows):
+                if key[0] in non_owners:
+                    self._reconnect_timing_flows.pop(key, None)
+
     def _clear_reconnect_session(self, fingerprint: str) -> None:
         """Revoke every permission granted by a completed reconnect flow."""
         self._pending_reconnect_fingerprints.discard(fingerprint)
@@ -9328,6 +9372,36 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             == authority.peer_signature
         )
 
+    def _tcp_recovery_screen_action_is_current(
+        self,
+        authority: _TcpRecoveryAuthority,
+        fingerprint: str,
+        instance: WindowInstanceToken | None,
+    ) -> bool:
+        """Authorize input only for the fully rebound instance of one owner."""
+
+        resolved = self._tcp_v
+        return bool(
+            instance is not None
+            and isinstance(resolved, ResolvedTargetWindows)
+            and self._tcp_recovery_authority is authority
+            and authority.fingerprint == fingerprint
+            and authority.shortcut_consumed
+            and authority.new_instance == instance
+            and authority.activation_instance == instance
+            and instance != authority.old_instance
+            and authority.stage
+            in {
+                _TcpRecoveryStage.SCREEN_RECOVERY,
+                _TcpRecoveryStage.LOGIN,
+                _TcpRecoveryStage.LINE,
+                _TcpRecoveryStage.ROLE,
+                _TcpRecoveryStage.ENTER,
+            }
+            and self._tcp_recovery_authority_is_current(authority, resolved)
+            and self._bind_tcp_recovery_instance(authority, resolved) == instance
+        )
+
     def _bind_tcp_recovery_instance(
         self,
         authority: _TcpRecoveryAuthority,
@@ -9404,6 +9478,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if authority is None:
                 return 0, ["tcp_recovery_authority_missing"], None
             self._tcp_recovery_authority = authority
+            self._isolate_non_owner_recovery_actions(authority.fingerprint)
             self._persist_runtime_state()
         elif owner not in {None, authority.fingerprint}:
             self._cancel_tcp_recovery(authority)
@@ -11107,9 +11182,32 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             recognition.state in _SESSION_ONLY_STATES
                             and (
                                 self._has_reconnect_session(fingerprint)
-                                or initial_login_authorized
+                                or (
+                                    initial_login_authorized
+                                    and recognition.state
+                                    in _INITIAL_LOGIN_STATES
+                                )
                             )
                         )
+                    )
+                )
+            )
+            current_recovery_authority = self._tcp_recovery_authority
+            recovery_action_required = bool(
+                tcp_owner_state is not None
+                or (
+                    current_recovery_authority is not None
+                    and not current_recovery_authority.terminal
+                )
+            )
+            recovery_action_authorized = bool(
+                not recovery_action_required
+                or (
+                    current_recovery_authority is not None
+                    and self._tcp_recovery_screen_action_is_current(
+                        current_recovery_authority,
+                        fingerprint,
+                        instance,
                     )
                 )
             )
@@ -11131,6 +11229,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     }
                 )
                 and is_action_candidate
+                and recovery_action_authorized
             )
             if not action_evidence_complete:
                 # A frame with no actionable point, an unknown/disabled
@@ -11379,7 +11478,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 recovery_authority is not None
                 and not recovery_authority.terminal
             )
-            else tcp_owner
+            else (
+                tcp_owner
+                if tcp_owner_state is not None
+                else None
+            )
         )
         operation_scope = (
             frozenset((active_recovery_owner,))
@@ -11425,6 +11528,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             and fingerprint in confirmed_action_instances
             and fingerprint not in self._tcp_timeout_isolated
             and (operation_scope is None or fingerprint in operation_scope)
+            and (
+                active_recovery_owner is None
+                or (
+                    recovery_authority is not None
+                    and self._tcp_recovery_screen_action_is_current(
+                        recovery_authority,
+                        fingerprint,
+                        confirmed_action_instances[fingerprint],
+                    )
+                )
+            )
             and (
                 not tcp_managed_scope
                 or fingerprint == active_recovery_owner
@@ -12088,6 +12202,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         )
                     ):
                         return "changed", False
+                    if (
+                        active_recovery_owner is not None
+                        and (
+                            recovery_authority is None
+                            or not self._tcp_recovery_screen_action_is_current(
+                                recovery_authority,
+                                fingerprint,
+                                confirmed_instance,
+                            )
+                        )
+                    ):
+                        return "changed", False
                     try:
                         permitted, click_result = (
                             self._run_authorized_backend_call(
@@ -12131,9 +12257,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                                     confirmation.source_state_generation
                                 ),
                                 additional_authorization_check=(
-                                    lambda: self._reconnect_budget_current(
-                                        fingerprint,
-                                        self._monotonic_clock(),
+                                    lambda: (
+                                        self._reconnect_budget_current(
+                                            fingerprint,
+                                            self._monotonic_clock(),
+                                        )
+                                        and (
+                                            active_recovery_owner is None
+                                            or (
+                                                recovery_authority is not None
+                                                and self._tcp_recovery_screen_action_is_current(
+                                                    recovery_authority,
+                                                    fingerprint,
+                                                    confirmed_instance,
+                                                )
+                                            )
+                                        )
                                     )
                                 ),
                             )
@@ -12522,7 +12661,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             next_check_seconds = self._policy.retry_interval_seconds
 
         # Auto-battle evidence remains isolated per role.
-        if mutation_execute and self.auto_battle_execution_allowed():
+        if (
+            mutation_execute
+            and not terminal_completed_fingerprints
+            and self.auto_battle_execution_allowed()
+        ):
             tcp_non_operable_instances = frozenset(
                 state.instance
                 for state in self._tcp_s.values()
