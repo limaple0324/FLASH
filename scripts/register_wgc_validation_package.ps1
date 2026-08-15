@@ -136,6 +136,10 @@ Import-Certificate `
     -FilePath $certificatePath `
     -CertStoreLocation Cert:\CurrentUser\TrustedPeople |
     Out-Null
+Import-Certificate `
+    -FilePath $certificatePath `
+    -CertStoreLocation Cert:\CurrentUser\Root |
+    Out-Null
 
 & $sdkTools.SignTool sign `
     /fd SHA256 `

@@ -2597,6 +2597,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._tcp_counts = tcp_connection_count_provider
         self._tcp_gen = 0
         self._tcp_s: dict[tuple[str, WindowInstanceToken], _TcpState] = {}
+        # Keep only the fact that one exact configured process instance was
+        # previously observed online.  A temporary unsafe source snapshot must
+        # break every zero-count sequence, but must not erase that prerequisite
+        # for the same old instance after the source becomes unique again.
+        # Rect/minimized are deliberately excluded because a player may
+        # legitimately minimize the same HWND before its TCP connection drops.
+        self._tcp_online_witnesses: dict[
+            tuple[str, str],
+            tuple[int, int, int, str, int],
+        ] = {}
         self._tcp_observation = _TcpObservation()
         self._tcp_timeout_isolated: set[str] = set()
         self._tcp_v = None
@@ -4966,6 +4976,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
             self._revoke_capture_authority()
             self._tcp_s.clear()
+            self._tcp_online_witnesses.clear()
             self._tcp_timeout_isolated.clear()
             if plan is None:
                 self._runtime_scope_token = None
@@ -5141,6 +5152,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 self._retain_runtime_scope(frozenset())
                 self._initial_login_authorizations.clear()
                 self._tcp_s.clear()
+                self._tcp_online_witnesses.clear()
                 self._tcp_timeout_isolated.clear()
             elif previous_scope != self._allowed_fingerprints:
                 self._retain_runtime_scope(self._allowed_fingerprints)
@@ -5215,6 +5227,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 fingerprints
             )
             self._tcp_timeout_isolated.intersection_update(fingerprints)
+            for key in tuple(self._tcp_online_witnesses):
+                if key[1] not in fingerprints:
+                    self._tcp_online_witnesses.pop(key, None)
             for mapping in (
                 self._active_automation_until,
                 self._action_retry_after,
@@ -5271,6 +5286,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._initial_login_authorizations.clear()
             self._force_login_timeout_attempts.clear()
             self._tcp_s.clear()
+            self._tcp_online_witnesses.clear()
             self._tcp_timeout_isolated.clear()
             self._activation_snapshot_instances = None
             self._activation_snapshot_source_fingerprints = None
@@ -6062,6 +6078,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         ownership is selected later by the ordered launch plan.
         """
 
+        self._retain_tcp_online_witnesses_for_contract(self._tcp_v)
         live: dict[tuple[str, WindowInstanceToken], _TcpState] = {}
         fingerprints: dict[tuple[str, WindowInstanceToken], str] = {}
         for window in windows:
@@ -6083,6 +6100,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             state = self._tcp_s.get(key)
             if state is None:
                 state = _TcpState(token, entry_id)
+                if entry_id is not None:
+                    witness_key = (entry_id, fingerprint)
+                    instance_identity = self._tcp_online_instance_identity(token)
+                    witnessed_identity = self._tcp_online_witnesses.get(
+                        witness_key
+                    )
+                    if witnessed_identity == instance_identity:
+                        state.online = True
+                    elif witnessed_identity is not None:
+                        # A new HWND/process/thread/class/lifecycle is never the
+                        # previously-online old instance, even if a fingerprint
+                        # or entry is reused later.
+                        self._tcp_online_witnesses.pop(witness_key, None)
             live[key] = state
             fingerprints[key] = fingerprint
         self._tcp_s = live
@@ -6110,6 +6140,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             count = counts[state.instance.process_id]
             if count > 0:
                 state.online = True
+                if state.entry_id is not None:
+                    self._tcp_online_witnesses[
+                        (state.entry_id, fingerprint)
+                    ] = self._tcp_online_instance_identity(state.instance)
                 state.zero_since = None
                 state.zero_count = 0
                 state.gen = generation
@@ -6154,6 +6188,98 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             (),
             observed_at,
         )
+
+    @staticmethod
+    def _tcp_online_instance_identity(
+        instance: WindowInstanceToken,
+    ) -> tuple[int, int, int, str, int]:
+        """Return the immutable process/window identity used by TCP baseline."""
+
+        return (
+            instance.handle,
+            instance.process_id,
+            instance.thread_id,
+            instance.window_class,
+            instance.process_lifecycle_token,
+        )
+
+    def _retain_tcp_online_witnesses_for_contract(
+        self,
+        resolved: object,
+    ) -> None:
+        """Retain witnesses only for the same formal entry and core instance."""
+
+        plan = self._group_launch_plan
+        if (
+            not isinstance(resolved, ResolvedTargetWindows)
+            or plan is None
+            or tuple(resolved.sync_scope_entry_ids)
+            != tuple(target.entry_id for target in plan.targets)
+            or len(resolved.windows) != len(resolved.sync_entry_ids)
+        ):
+            self._tcp_online_witnesses.clear()
+            return
+        current: dict[tuple[str, str], tuple[int, int, int, str, int]] = {}
+        for entry_id, window in zip(
+            resolved.sync_entry_ids,
+            resolved.windows,
+        ):
+            fingerprint = normalize_launch_fingerprint(
+                window.launch_fingerprint
+            )
+            token = WindowInstanceToken.from_window(window)
+            if not entry_id or fingerprint is None or token is None:
+                self._tcp_online_witnesses.clear()
+                return
+            key = (entry_id, fingerprint)
+            if key in current:
+                self._tcp_online_witnesses.clear()
+                return
+            current[key] = self._tcp_online_instance_identity(token)
+        for key, witnessed_identity in tuple(
+            self._tcp_online_witnesses.items()
+        ):
+            if current.get(key) == witnessed_identity:
+                continue
+            matching_failures = tuple(
+                evidence
+                for evidence in resolved.target_failure_evidence
+                if (
+                    evidence.entry_id == key[0]
+                    and evidence.fingerprint == key[1]
+                    and evidence.failure_codes
+                    == ("window_identity_duplicate",)
+                )
+            )
+            if len(matching_failures) == 1:
+                candidate_identities: list[
+                    tuple[int, int, int, str, int]
+                ] = []
+                candidates_are_exact_fingerprint = True
+                for candidate in matching_failures[0].candidate_windows:
+                    candidate_token = WindowInstanceToken.from_window(candidate)
+                    if (
+                        normalize_launch_fingerprint(
+                            candidate.launch_fingerprint
+                        )
+                        != key[1]
+                        or candidate_token is None
+                    ):
+                        candidates_are_exact_fingerprint = False
+                        break
+                    candidate_identities.append(
+                        self._tcp_online_instance_identity(candidate_token)
+                    )
+                if (
+                    candidates_are_exact_fingerprint
+                    and len(candidate_identities) >= 2
+                    and candidate_identities.count(witnessed_identity) == 1
+                ):
+                    # The configured old instance is still present among an
+                    # ambiguous duplicate set.  Keep only its prior online fact;
+                    # the unsafe round still clears every zero/confirmation.
+                    continue
+            self._tcp_online_witnesses.pop(key, None)
 
     def _tcp_id(
         self,
@@ -9874,6 +10000,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if code != "group_identity_set_mismatch"
         )
         if source_identity_unsafe or blocking_group_failures:
+            self._retain_tcp_online_witnesses_for_contract(
+                resolved_contract
+            )
             self._tcp_s.clear()
             self._tcp_observation = _TcpObservation(
                 generation=self._tcp_gen,

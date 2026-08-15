@@ -122,6 +122,7 @@ def test_wgc_build_uses_isolated_helper_and_matching_package_identity() -> None:
     assert application.attrib[
         "{http://schemas.microsoft.com/appx/manifest/uap/windows10/10}RuntimeBehavior"
     ] == "win32App"
+    assert "EntryPoint" not in application.attrib
     capability_names = {
         capability.attrib["Name"]
         for capability in package_manifest.find(
@@ -142,6 +143,11 @@ def test_wgc_build_uses_isolated_helper_and_matching_package_identity() -> None:
     assert "Get-FileHash -LiteralPath $flashExecutable" in registration
     assert registration.index("Get-FileHash") < registration.index(
         "Add-AppxPackage"
+    )
+    assert "Cert:\\CurrentUser\\TrustedPeople" in registration
+    assert "Cert:\\CurrentUser\\Root" in registration
+    assert registration.index("Cert:\\CurrentUser\\Root") < (
+        registration.index("Add-AppxPackage")
     )
     assert "Add-AppxPackage -Path $packagePath -ExternalLocation" in (
         registration

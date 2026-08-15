@@ -1875,12 +1875,116 @@ def test_tcp_disconnect_confirmation_is_read_only_and_resets_on_recovery():
     assert fixture.mouse.expected_process_ids == []
 
 
+def test_tcp_online_witness_survives_temporary_duplicate_of_same_old_instance(
+    tmp_path,
+):
+    owner = make_window(1, process_id=101, fingerprint="a" * 64)
+    peer = make_window(2, process_id=102, fingerprint="b" * 64)
+    duplicate = make_window(9, process_id=909, fingerprint="a" * 64)
+    windows = (owner, peer)
+    provider_state = {
+        "resolved": tcp_resolved_targets(windows),
+    }
+    now = [0.0]
+    tcp = SequenceTcpCounts(
+        [
+            {101: 1, 102: 1},
+            {101: 0, 102: 1},
+            {101: 0, 102: 1},
+            {101: 0, 102: 1},
+        ]
+    )
+    fixture = make_controller(
+        [1, 1],
+        windows=windows,
+        expected_windows=2,
+        clock=lambda: now[0],
+        tcp_connection_count_provider=tcp,
+        target_windows_provider=lambda: provider_state["resolved"],
+        group_launch_plan=make_tcp_group_plan(tmp_path, windows),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    fixture.controller.check_connection()
+    provider_state["resolved"] = tcp_resolved_targets(
+        (peer,),
+        entry_ids=("entry-1",),
+        scope_entry_ids=("entry-0", "entry-1"),
+        target_failures=(
+            tcp_target_failure(
+                "entry-0",
+                owner.launch_fingerprint,
+                "window_identity_duplicate",
+                candidate_windows=(owner, duplicate),
+            ),
+        ),
+        global_failure_codes=("unattributed_candidate_window",),
+    )
+    now[0] = 0.5
+    unsafe = fixture.controller.check_connection()
+    provider_state["resolved"] = tcp_resolved_targets(windows)
+    results = []
+    for observed_at in (1.0, 4.0, 8.0):
+        now[0] = observed_at
+        results.append(fixture.controller.check_connection())
+
+    assert "unattributed_candidate_window" in unsafe.details["failure_codes"]
+    assert [result.details["failure_codes"] for result in results] == [
+        ["tcp_disconnect_suspected"],
+        ["tcp_disconnect_suspected"],
+        ["tcp_disconnect_confirmed"],
+    ]
+    assert tcp.calls == [frozenset({101, 102})] * 4
+    assert fixture.mouse.clicks == []
+
+
+def test_tcp_online_witness_allows_same_instance_to_be_minimized_before_zeroes(
+    tmp_path,
+):
+    visible = make_window(1, process_id=101, fingerprint="a" * 64)
+    minimized = replace(
+        visible,
+        rect=(-32000, -32000, -31840, -31972),
+        minimized=True,
+    )
+    provider_state = {"resolved": tcp_resolved_targets((visible,))}
+    now = [0.0]
+    tcp = SequenceTcpCounts(
+        [{101: 1}, {101: 0}, {101: 0}, {101: 0}]
+    )
+    fixture = make_controller(
+        [1],
+        windows=[visible],
+        expected_windows=1,
+        clock=lambda: now[0],
+        tcp_connection_count_provider=tcp,
+        target_windows_provider=lambda: provider_state["resolved"],
+        group_launch_plan=make_tcp_group_plan(tmp_path, (visible,)),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+
+    fixture.controller.check_connection()
+    provider_state["resolved"] = tcp_resolved_targets((minimized,))
+    results = []
+    for observed_at in (1.0, 4.0, 8.0):
+        now[0] = observed_at
+        results.append(fixture.controller.check_connection())
+
+    assert [
+        "tcp_disconnect_suspected" in result.details["failure_codes"]
+        for result in results
+    ] == [True, True, False]
+    assert "tcp_disconnect_confirmed" in results[-1].details["failure_codes"]
+    assert fixture.mouse.clicks == []
+
+
 @pytest.mark.parametrize(
     "change",
     [
         {"handle": 2},
         {"process_id": 202},
         {"thread_id": 303},
+        {"window_class": "ChangedFlash"},
         {"process_lifecycle_token": 404},
     ],
 )
