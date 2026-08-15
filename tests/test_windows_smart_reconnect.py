@@ -25,7 +25,11 @@ from adapters.windows_background_capture import (
     Win32TemporarilyRevealedCaptureProvider,
     WindowsGraphicsCaptureProvider,
 )
-from adapters.windows_battle_restart import BattleRestartResult
+from adapters.windows_battle_restart import (
+    BattleReopenStage,
+    BattleReopenStageEvidence,
+    BattleRestartResult,
+)
 from adapters.windows_smart_reconnect import (
     MouseClickResult,
     ReconnectRuntimeStateStore,
@@ -1451,6 +1455,12 @@ class FakeBattleRestarter:
         self.close_kwargs = []
         self.reopen_kwargs = []
         self._closed_window = None
+        self._bounded_owner = None
+        self.bounded_begin_calls = 0
+        self.bounded_authorize_calls = 0
+        self.bounded_poll_calls = 0
+        self.bounded_complete_calls = 0
+        self.bounded_cancel_calls = 0
 
     def close_verified(self, window, candidate_windows, **kwargs):
         self.calls.append((window, tuple(candidate_windows)))
@@ -1471,6 +1481,70 @@ class FakeBattleRestarter:
             None if self.succeeds else self.failure_code,
             shortcut_open_requested=self.succeeds,
         )
+
+    def begin_bounded_reopen(
+        self,
+        *,
+        owner,
+        entry_id,
+        original_instance,
+        target,
+        candidate_windows,
+        deadline,
+    ):
+        self.bounded_begin_calls += 1
+        if self._bounded_owner not in (None, (owner, entry_id)):
+            return BattleRestartResult(False, "battle_reopen_job_conflict")
+        if self._bounded_owner is None:
+            legacy = self.reopen_missing(
+                target,
+                candidate_windows,
+                deadline=deadline,
+            )
+            if not legacy.success:
+                return replace(legacy, retry_allowed=True)
+            self._bounded_owner = (owner, entry_id)
+        return BattleRestartResult(
+            False,
+            pending=True,
+            stage=BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+
+    def authorize_bounded_reopen(self, *, owner, entry_id):
+        self.bounded_authorize_calls += 1
+        if self._bounded_owner != (owner, entry_id):
+            return BattleRestartResult(False, "battle_reopen_job_missing")
+        return BattleRestartResult(
+            False,
+            pending=True,
+            stage=BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+
+    def poll_bounded_reopen(self, *, owner, entry_id, deadline):
+        self.bounded_poll_calls += 1
+        if self._bounded_owner != (owner, entry_id):
+            return BattleRestartResult(False, "battle_reopen_job_missing")
+        return BattleRestartResult(
+            True,
+            shortcut_open_requested=True,
+            stage=BattleReopenStage.WAITING_NEW_INSTANCE.value,
+            delivery_boundary_crossed=True,
+            wait_new_instance_only=True,
+        )
+
+    def complete_bounded_reopen(self, *, owner, entry_id):
+        self.bounded_complete_calls += 1
+        if self._bounded_owner != (owner, entry_id):
+            return BattleRestartResult(False, "battle_reopen_job_missing")
+        self._bounded_owner = None
+        return BattleRestartResult(True)
+
+    def cancel_bounded_reopen(self, *, owner, entry_id):
+        self.bounded_cancel_calls += 1
+        if self._bounded_owner not in (None, (owner, entry_id)):
+            return False
+        self._bounded_owner = None
+        return True
 
     def post_close_contract(self, value):
         """Model the provider's real post-close owner-offline transition."""
@@ -2118,6 +2192,9 @@ def test_multiple_tcp_zero_queues_only_first_plan_owner_for_mutation(
     assert waiting_for_new_instance.details["restarted_windows"] == 0
     assert [call[0] for call in restarter.calls] == [windows[0]]
     assert len(restarter.reopen_calls) == 1
+    assert restarter.bounded_begin_calls == 1
+    assert restarter.bounded_authorize_calls == 1
+    assert restarter.bounded_poll_calls >= 1
     assert restarter.reopen_calls[0][0].fingerprint == (
         windows[0].launch_fingerprint
     )
@@ -2261,6 +2338,9 @@ def test_tcp_sixty_second_timeout_isolates_owner_and_allows_peer_queue(
         fixture.controller._login_only_recovery_fingerprints
     )
     assert "tcp_reconnect_timeout" in timeout.details["failure_codes"]
+    assert restarter.bounded_authorize_calls == 1
+    assert len(restarter.reopen_calls) == 1
+    assert restarter.bounded_cancel_calls >= 1
 
     peer_confirmation = fixture.controller.reconnect()
     assert peer_confirmation.details["restarted_windows"] == 0
@@ -11198,6 +11278,623 @@ def test_owner_state_factory_recorder_route_none_launches_once(tmp_path):
     assert authority.shortcut_consumed is True
 
 
+def test_owner_state_new_instance_race_persists_boundary_and_enters_screen(
+    tmp_path,
+):
+    old = make_window(1, process_id=101)
+    peer = make_window(2, process_id=102)
+    new = replace(
+        old,
+        handle=11,
+        process_id=111,
+        thread_id=211,
+        process_lifecycle_token=311,
+    )
+    now = [0.0]
+    provider_state = {
+        "windows": [old, peer],
+        "resolved": tcp_resolved_targets((old, peer)),
+        "now": now,
+    }
+
+    class NewInstanceRaceRestarter(FakeBattleRestarter):
+        def __init__(self):
+            super().__init__()
+            self.stage_evidence = ()
+            self.worker_cleaned = False
+
+        def begin_bounded_reopen(self, **kwargs):
+            result = super().begin_bounded_reopen(**kwargs)
+            target = kwargs["target"]
+            self.stage_evidence = (
+                BattleReopenStageEvidence(
+                    owner=kwargs["owner"],
+                    entry_id=kwargs["entry_id"],
+                    fingerprint=target.fingerprint,
+                    original_instance=tuple(kwargs["original_instance"]),
+                    original_shortcut=str(target.shortcut_path),
+                    stage=(
+                        BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+                    ),
+                    stage_started_at=100.0,
+                    stage_ended_at=100.0,
+                    delivery_boundary_crossed=False,
+                    retry_allowed=False,
+                    wait_new_instance_only=False,
+                ),
+            )
+            return replace(result, stage_evidence=self.stage_evidence)
+
+        def authorize_bounded_reopen(self, *, owner, entry_id):
+            result = super().authorize_bounded_reopen(
+                owner=owner,
+                entry_id=entry_id,
+            )
+            return replace(result, stage_evidence=self.stage_evidence)
+
+        def poll_bounded_reopen(self, *, owner, entry_id, deadline):
+            self.bounded_poll_calls += 1
+            assert self._bounded_owner == (owner, entry_id)
+            return BattleRestartResult(
+                False,
+                pending=True,
+                stage=BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+                stage_evidence=self.stage_evidence,
+            )
+
+        def complete_bounded_reopen(self, *, owner, entry_id):
+            self.bounded_complete_calls += 1
+            assert self._bounded_owner == (owner, entry_id)
+            self._bounded_owner = None
+            self.worker_cleaned = True
+            prepared = self.stage_evidence[0]
+            self.stage_evidence += (
+                BattleReopenStageEvidence(
+                    owner=owner,
+                    entry_id=entry_id,
+                    fingerprint=prepared.fingerprint,
+                    original_instance=prepared.original_instance,
+                    original_shortcut=prepared.original_shortcut,
+                    stage=BattleReopenStage.NEW_INSTANCE_APPEARED.value,
+                    stage_started_at=101.0,
+                    stage_ended_at=101.0,
+                    delivery_boundary_crossed=True,
+                    retry_allowed=False,
+                    wait_new_instance_only=True,
+                ),
+            )
+            return BattleRestartResult(
+                True,
+                shortcut_open_requested=True,
+                stage=BattleReopenStage.NEW_INSTANCE_APPEARED.value,
+                delivery_boundary_crossed=True,
+                wait_new_instance_only=True,
+                stage_evidence=self.stage_evidence,
+            )
+
+    restarter = NewInstanceRaceRestarter()
+    controller = _formal_owner_state_controller(
+        tmp_path,
+        tcp_provider=SequenceTcpCounts(
+            [{101: 1, 102: 1}]
+            + [{101: 0, 102: 1}] * 5
+            + [{111: 1, 102: 1}] * 5
+        ),
+        restarter=restarter,
+        provider_state=provider_state,
+        state_name="new-instance-race.json",
+    )
+    delegate = controller._evidence_recorder
+
+    class CountingRecorder:
+        def __init__(self):
+            self.reopen_intents = 0
+            self.reopen_finishes = 0
+
+        def record_action_intent(self, **kwargs):
+            if kwargs.get("action") == "reopen_window":
+                self.reopen_intents += 1
+            return delegate.record_action_intent(**kwargs)
+
+        def record_action(self, **kwargs):
+            if kwargs.get("action") == "reopen_window":
+                self.reopen_finishes += 1
+            return delegate.record_action(**kwargs)
+
+        def __getattr__(self, name):
+            return getattr(delegate, name)
+
+    recorder = CountingRecorder()
+    controller._evidence_recorder = recorder
+    _confirm_formal_owner(controller, now)
+    launched = controller.reconnect()
+    assert launched.details["restarted_windows"] == 1
+    provider_state["resolved"] = tcp_resolved_targets((new, peer))
+    controller._window_backend.windows = [new, peer]
+
+    now[0] = 10.0
+    bound = controller.reconnect()
+
+    authority = controller._tcp_recovery_authority
+    assert bound.details["clicked_windows"] == 0
+    assert authority is not None
+    assert authority.stage.value == "screen_recovery"
+    assert authority.new_instance == WindowInstanceToken.from_window(new)
+    assert authority.reopen_stage_evidence[-1].stage == (
+        BattleReopenStage.NEW_INSTANCE_APPEARED.value
+    )
+    assert authority.reopen_stage_evidence[-1].delivery_boundary_crossed is True
+    assert not any(
+        item.stage == BattleReopenStage.SHORTCUT_LAUNCH_RETURNED.value
+        for item in authority.reopen_stage_evidence
+    )
+    assert restarter.bounded_authorize_calls == 1
+    assert restarter.bounded_complete_calls == 1
+    assert restarter.worker_cleaned is True
+    assert recorder.reopen_intents == 1
+    assert recorder.reopen_finishes == 1
+
+
+@pytest.mark.parametrize("launch_entered", (False, True))
+def test_owner_state_unreaped_worker_never_binds_or_relaunches(
+    tmp_path,
+    launch_entered,
+):
+    old = make_window(1, process_id=101)
+    peer = make_window(2, process_id=102)
+    new = replace(
+        old,
+        handle=11,
+        process_id=111,
+        thread_id=211,
+        process_lifecycle_token=311,
+    )
+    now = [0.0]
+    provider_state = {
+        "windows": [old, peer],
+        "resolved": tcp_resolved_targets((old, peer)),
+        "now": now,
+    }
+
+    class UnreapedCompletionRestarter(FakeBattleRestarter):
+        def poll_bounded_reopen(self, *, owner, entry_id, deadline):
+            if launch_entered:
+                return super().poll_bounded_reopen(
+                    owner=owner,
+                    entry_id=entry_id,
+                    deadline=deadline,
+                )
+            self.bounded_poll_calls += 1
+            assert self._bounded_owner == (owner, entry_id)
+            return BattleRestartResult(
+                False,
+                pending=True,
+                stage=BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+            )
+
+        def complete_bounded_reopen(self, *, owner, entry_id):
+            self.bounded_complete_calls += 1
+            assert self._bounded_owner == (owner, entry_id)
+            return BattleRestartResult(
+                False,
+                "battle_reopen_worker_unreaped",
+                shortcut_open_requested=True,
+                stage=BattleReopenStage.FAILED.value,
+                delivery_boundary_crossed=True,
+                retry_allowed=False,
+                wait_new_instance_only=True,
+            )
+
+    restarter = UnreapedCompletionRestarter()
+    controller = _formal_owner_state_controller(
+        tmp_path,
+        tcp_provider=SequenceTcpCounts(
+            [{101: 1, 102: 1}]
+            + [{101: 0, 102: 1}] * 5
+            + [{111: 1, 102: 1}] * 5
+        ),
+        restarter=restarter,
+        provider_state=provider_state,
+        state_name="unreaped-worker.json",
+    )
+    _confirm_formal_owner(controller, now)
+    controller.reconnect()
+    provider_state["resolved"] = tcp_resolved_targets((new, peer))
+    controller._window_backend.windows = [new, peer]
+
+    now[0] = 10.0
+    failed = controller.reconnect()
+
+    authority = controller._tcp_recovery_authority
+    assert "battle_reopen_worker_unreaped" in failed.details["failure_codes"]
+    assert authority is not None
+    assert authority.stage.value == "waiting_new_instance"
+    assert authority.stage.value != "screen_recovery"
+    assert authority.shortcut_consumed is True
+    assert authority.new_instance is None
+    assert authority.activation_instance == WindowInstanceToken.from_window(old)
+    assert restarter._bounded_owner == (
+        old.launch_fingerprint,
+        "entry-0",
+    )
+    assert restarter.bounded_begin_calls == 1
+    assert restarter.bounded_authorize_calls == 1
+    assert restarter.bounded_complete_calls == 1
+    assert len(restarter.reopen_calls) == 1
+    assert controller._last_trusted_capture_routes == {}
+
+
+@pytest.mark.parametrize(
+    "replacement_kind",
+    ("different_owner", "new_lifecycle", "different_shortcut"),
+)
+def test_owner_state_failed_cancel_blocks_every_replacement_authority(
+    tmp_path,
+    replacement_kind,
+):
+    old = make_window(1, process_id=101)
+    peer = make_window(2, process_id=102)
+    now = [0.0]
+    state_name = f"failed-cancel-{replacement_kind}.json"
+    provider_state = {
+        "windows": [old, peer],
+        "resolved": tcp_resolved_targets((old, peer)),
+        "now": now,
+    }
+
+    class UncancellableRestarter(FakeBattleRestarter):
+        def cancel_bounded_reopen(self, *, owner, entry_id):
+            self.bounded_cancel_calls += 1
+            assert self._bounded_owner == (owner, entry_id)
+            return False
+
+    restarter = UncancellableRestarter()
+    controller = _formal_owner_state_controller(
+        tmp_path,
+        tcp_provider=SequenceTcpCounts(
+            [{101: 1, 102: 1}] + [{101: 0, 102: 1}] * 6
+        ),
+        restarter=restarter,
+        provider_state=provider_state,
+        state_name=state_name,
+    )
+    _confirm_formal_owner(controller, now)
+    controller.reconnect()
+    authority = controller._tcp_recovery_authority
+    assert authority is not None
+    old_identity = (
+        old.launch_fingerprint,
+        old.handle,
+        old.process_id,
+        old.thread_id,
+        old.window_class,
+        old.process_lifecycle_token,
+        old.rect,
+        old.minimized,
+    )
+    old_evidence = BattleReopenStageEvidence(
+        owner=old.launch_fingerprint,
+        entry_id="entry-0",
+        fingerprint=old.launch_fingerprint,
+        original_instance=old_identity,
+        original_shortcut=str(tmp_path / "current-1.lnk"),
+        stage=BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        stage_started_at=100.0,
+        stage_ended_at=100.0,
+        delivery_boundary_crossed=False,
+        retry_allowed=False,
+        wait_new_instance_only=False,
+    )
+    authority.reopen_stage_evidence = (old_evidence,)
+
+    if replacement_kind == "different_owner":
+        next_owner = peer.launch_fingerprint
+        next_state = next(
+            state
+            for (entry_id, _instance), state in controller._tcp_s.items()
+            if entry_id == "entry-1"
+        )
+        next_instance = next_state.instance
+        next_entry = "entry-1"
+    elif replacement_kind == "new_lifecycle":
+        replacement = replace(
+            old,
+            handle=11,
+            process_id=111,
+            thread_id=211,
+            process_lifecycle_token=311,
+        )
+        next_owner = old.launch_fingerprint
+        old_state = next(
+            state
+            for (entry_id, _instance), state in controller._tcp_s.items()
+            if entry_id == "entry-0"
+        )
+        next_instance = WindowInstanceToken.from_window(replacement)
+        assert next_instance is not None
+        next_state = type(old_state)(next_instance, "entry-0", online=True)
+        next_entry = "entry-0"
+    else:
+        next_owner = old.launch_fingerprint
+        next_state = next(
+            state
+            for (entry_id, _instance), state in controller._tcp_s.items()
+            if entry_id == "entry-0"
+        )
+        next_instance = next_state.instance
+        next_entry = "entry-0"
+    invalid_evidence = replace(
+        old_evidence,
+        owner=next_owner,
+        entry_id=next_entry,
+        fingerprint=next_owner,
+        original_instance=(
+            next_owner,
+            next_instance.handle,
+            next_instance.process_id,
+            next_instance.thread_id,
+            next_instance.window_class,
+            next_instance.process_lifecycle_token,
+            next_instance.rect,
+            next_instance.minimized,
+        ),
+        original_shortcut=(
+            str(tmp_path / "different-shortcut.lnk")
+            if replacement_kind == "different_shortcut"
+            else old_evidence.original_shortcut
+        ),
+    )
+    accepted = controller._accept_tcp_reopen_stage_evidence(
+        authority,
+        BattleRestartResult(False, stage_evidence=(invalid_evidence,)),
+    )
+    cancelled = controller._cancel_tcp_recovery(authority)
+    attempted = controller._advance_tcp_recovery(
+        owner=next_owner,
+        owner_state=next_state,
+        execute=True,
+        now=10.0,
+        source_state_generation=controller._source_state_generation,
+    )
+
+    assert accepted is False
+    assert cancelled is False
+    assert attempted == (0, [], None)
+    assert controller._tcp_recovery_authority is authority
+    assert authority.stage.value == "cancelled"
+    assert authority.shortcut_consumed is True
+    assert authority.reopen_worker_unreaped is True
+    assert authority.reopen_stage_evidence == (old_evidence,)
+    assert restarter._bounded_owner == (old.launch_fingerprint, "entry-0")
+    assert restarter.bounded_begin_calls == 1
+    assert restarter.bounded_authorize_calls == 1
+    assert restarter.bounded_cancel_calls == 1
+    assert len(restarter.reopen_calls) == 1
+    persisted = json.loads(
+        (tmp_path / state_name).read_text(encoding="utf-8")
+    )
+    assert {
+        item["owner"]
+        for item in persisted["tcp_recovery_authority"][
+            "reopen_stage_evidence"
+        ]
+    } == {old.launch_fingerprint}
+
+
+def test_owner_state_persists_all_reopen_stages_under_one_intent(tmp_path):
+    windows = [
+        make_window(1, process_id=101),
+        make_window(2, process_id=102),
+    ]
+    now = [0.0]
+    provider_state = {
+        "windows": windows,
+        "resolved": tcp_resolved_targets(windows),
+        "now": now,
+    }
+
+    class StageEvidenceRestarter(FakeBattleRestarter):
+        def __init__(self):
+            super().__init__()
+            self.stage_evidence = ()
+
+        @staticmethod
+        def _record(
+            owner,
+            entry_id,
+            original_instance,
+            target,
+            stage,
+            started_at,
+            ended_at,
+            *,
+            boundary=False,
+        ):
+            return BattleReopenStageEvidence(
+                owner=owner,
+                entry_id=entry_id,
+                fingerprint=target.fingerprint,
+                original_instance=tuple(original_instance),
+                original_shortcut=str(target.shortcut_path),
+                stage=stage,
+                stage_started_at=started_at,
+                stage_ended_at=ended_at,
+                delivery_boundary_crossed=boundary,
+                retry_allowed=False,
+                wait_new_instance_only=boundary,
+            )
+
+        def begin_bounded_reopen(self, **kwargs):
+            result = super().begin_bounded_reopen(**kwargs)
+            owner = kwargs["owner"]
+            entry_id = kwargs["entry_id"]
+            instance = kwargs["original_instance"]
+            target = kwargs["target"]
+            self.stage_evidence = (
+                self._record(
+                    owner,
+                    entry_id,
+                    instance,
+                    target,
+                    BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+                    100.0,
+                    101.0,
+                ),
+                self._record(
+                    owner,
+                    entry_id,
+                    instance,
+                    target,
+                    BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+                    100.0,
+                    101.0,
+                ),
+                self._record(
+                    owner,
+                    entry_id,
+                    instance,
+                    target,
+                    BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+                    101.0,
+                    102.0,
+                ),
+                self._record(
+                    owner,
+                    entry_id,
+                    instance,
+                    target,
+                    BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+                    101.0,
+                    102.0,
+                ),
+                self._record(
+                    owner,
+                    entry_id,
+                    instance,
+                    target,
+                    BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+                    102.0,
+                    103.0,
+                ),
+                self._record(
+                    owner,
+                    entry_id,
+                    instance,
+                    target,
+                    BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+                    102.0,
+                    103.0,
+                ),
+                self._record(
+                    owner,
+                    entry_id,
+                    instance,
+                    target,
+                    BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+                    103.0,
+                    103.0,
+                ),
+            )
+            return replace(result, stage_evidence=self.stage_evidence)
+
+        def poll_bounded_reopen(self, *, owner, entry_id, deadline):
+            result = super().poll_bounded_reopen(
+                owner=owner,
+                entry_id=entry_id,
+                deadline=deadline,
+            )
+            target = self.reopen_calls[0][0]
+            instance = self.stage_evidence[0].original_instance
+            if not any(
+                item.stage == BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value
+                for item in self.stage_evidence
+            ):
+                self.stage_evidence += (
+                    self._record(
+                        owner,
+                        entry_id,
+                        instance,
+                        target,
+                        BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value,
+                        104.0,
+                        105.0,
+                        boundary=True,
+                    ),
+                    self._record(
+                        owner,
+                        entry_id,
+                        instance,
+                        target,
+                        BattleReopenStage.WAITING_NEW_INSTANCE.value,
+                        105.0,
+                        None,
+                        boundary=True,
+                    ),
+                )
+            return replace(result, stage_evidence=self.stage_evidence)
+
+    restarter = StageEvidenceRestarter()
+    state_name = "bounded-stage-evidence.json"
+    controller = _formal_owner_state_controller(
+        tmp_path,
+        tcp_provider=SequenceTcpCounts(
+            [{101: 1, 102: 1}] + [{101: 0, 102: 1}] * 10
+        ),
+        restarter=restarter,
+        provider_state=provider_state,
+        state_name=state_name,
+    )
+    delegate = controller._evidence_recorder
+
+    class CountingRecorder:
+        def __init__(self):
+            self.reopen_intents = 0
+
+        def record_action_intent(self, **kwargs):
+            if kwargs.get("action") == "reopen_window":
+                self.reopen_intents += 1
+            return delegate.record_action_intent(**kwargs)
+
+        def __getattr__(self, name):
+            return getattr(delegate, name)
+
+    recorder = CountingRecorder()
+    controller._evidence_recorder = recorder
+    _confirm_formal_owner(controller, now)
+
+    controller.reconnect()
+    now[0] = 10.0
+    controller.reconnect()
+    now[0] = 11.0
+    controller.reconnect()
+
+    persisted = json.loads((tmp_path / state_name).read_text(encoding="utf-8"))
+    stage_evidence = persisted["tcp_recovery_authority"][
+        "reopen_stage_evidence"
+    ]
+    assert recorder.reopen_intents == 1
+    assert [item["stage"] for item in stage_evidence] == [
+        BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+        BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+        BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+        BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+        BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+        BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+        BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value,
+        BattleReopenStage.WAITING_NEW_INSTANCE.value,
+    ]
+    assert stage_evidence[0]["stage_started_at"] == 100.0
+    assert stage_evidence[0]["stage_ended_at"] == 101.0
+    assert stage_evidence[-1]["delivery_boundary_crossed"] is True
+    assert stage_evidence[-1]["wait_new_instance_only"] is True
+    assert stage_evidence[-1]["stage_ended_at"] is None
+    assert stage_evidence[-1]["owner"] == windows[0].launch_fingerprint
+    assert stage_evidence[-1]["entry_id"] == "entry-0"
+    assert stage_evidence[-1]["fingerprint"] == windows[0].launch_fingerprint
+    assert stage_evidence[-1]["original_shortcut"].endswith("current-1.lnk")
+
+
 @pytest.mark.parametrize("recorder_mode", ("missing", "write_failure"))
 def test_owner_state_tcp_evidence_is_diagnostic_only(
     tmp_path,
@@ -11384,6 +12081,122 @@ def test_owner_state_process_restart_keeps_consumed_launch_tombstone(
     assert second_restarter.reopen_calls == []
     assert second._tcp_recovery_authority.stage.value == "cancelled"
     assert second._tcp_recovery_authority.shortcut_consumed is True
+
+
+@pytest.mark.parametrize(
+    ("persisted_stage", "expected_stages"),
+    (
+        (
+            BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value,
+            (
+                BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+                BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value,
+            ),
+        ),
+        ("untrusted_stage", ()),
+    ),
+)
+def test_owner_state_restart_restores_only_valid_reopen_stage_evidence(
+    tmp_path,
+    persisted_stage,
+    expected_stages,
+):
+    windows = [
+        make_window(1, process_id=101),
+        make_window(2, process_id=102),
+    ]
+    now = [0.0]
+    state_path = tmp_path / "durable-stage-evidence.json"
+    provider_state = {
+        "windows": windows,
+        "resolved": tcp_resolved_targets(windows),
+        "now": now,
+    }
+    first = _formal_owner_state_controller(
+        tmp_path,
+        tcp_provider=SequenceTcpCounts(
+            [{101: 1, 102: 1}] + [{101: 0, 102: 1}] * 6
+        ),
+        restarter=FakeBattleRestarter(),
+        provider_state=provider_state,
+        state_name=state_path.name,
+    )
+    _confirm_formal_owner(first, now)
+    first.reconnect()
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    authority_payload = persisted["tcp_recovery_authority"]
+    original_instance = [
+        windows[0].launch_fingerprint,
+        windows[0].handle,
+        windows[0].process_id,
+        windows[0].thread_id,
+        windows[0].window_class,
+        windows[0].process_lifecycle_token,
+        list(windows[0].rect),
+        windows[0].minimized,
+    ]
+
+    def stage_record(stage, started_at, ended_at, boundary):
+        return {
+            "owner": windows[0].launch_fingerprint,
+            "entry_id": "entry-0",
+            "fingerprint": windows[0].launch_fingerprint,
+            "original_instance": original_instance,
+            "original_shortcut": str(tmp_path / "current-1.lnk"),
+            "stage": stage,
+            "stage_started_at": started_at,
+            "stage_ended_at": ended_at,
+            "delivery_boundary_crossed": boundary,
+            "retry_allowed": False,
+            "wait_new_instance_only": boundary,
+            "failure_reason": None,
+            "hard_timeout": False,
+        }
+
+    authority_payload["reopen_stage_evidence"] = [
+        stage_record(
+            BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+            100.0,
+            100.0,
+            False,
+        ),
+        stage_record(persisted_stage, 101.0, None, True),
+    ]
+    state_path.write_text(
+        json.dumps(persisted, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    provider_state["resolved"] = tcp_missing_target(
+        (windows[1],),
+        blocked=(windows[0].launch_fingerprint,),
+    )
+    second = _formal_owner_state_controller(
+        tmp_path,
+        tcp_provider=lambda process_ids: {
+            process_id: 1 for process_id in process_ids
+        },
+        restarter=FakeBattleRestarter(),
+        provider_state=provider_state,
+        state_name=state_path.name,
+    )
+    restored = second._tcp_recovery_authority
+
+    assert restored is not None
+    assert restored.stage.value == "cancelled"
+    assert restored.shortcut_consumed is True
+    assert tuple(
+        item.stage for item in restored.reopen_stage_evidence
+    ) == expected_stages
+    assert second._persist_runtime_state() is True
+    rewritten = json.loads(state_path.read_text(encoding="utf-8"))
+    assert tuple(
+        item["stage"]
+        for item in rewritten["tcp_recovery_authority"][
+            "reopen_stage_evidence"
+        ]
+    ) == expected_stages
 
 
 def test_owner_state_restart_tombstone_retires_only_after_new_activation(
@@ -11607,6 +12420,9 @@ def test_owner_state_formal_factory_uses_wgc_after_new_instance_bind(
     assert second_frame.details["clicked_windows"] == 1
     assert captures.count(new.handle) == 3
     assert mouse.clicks == [(new.handle, (0.505, 0.856))]
+    assert restarter.bounded_begin_calls == 1
+    assert restarter.bounded_authorize_calls == 1
+    assert restarter.bounded_complete_calls == 1
 
 
 def test_owner_state_formal_factory_minimized_new_instance_is_untouched(
@@ -13082,6 +13898,7 @@ def test_case_08_one_unique_new_instance_rebinds_original_entry(tmp_path):
     assert fixture.controller._activation_snapshot_instances[
         old.launch_fingerprint
     ] == WindowInstanceToken.from_window(new)
+    assert fixture.controller._battle_restarter.bounded_complete_calls == 1
     assert old.launch_fingerprint not in (
         fixture.controller._pending_reopen_fingerprints
     )

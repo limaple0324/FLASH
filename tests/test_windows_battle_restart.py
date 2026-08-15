@@ -1,9 +1,17 @@
+import json
+import os
+import time
+from dataclasses import replace
+
 import pytest
 
 from adapters.windows_battle_restart import (
+    BattleReopenStage,
     BattleRestartResult,
     WindowsBattleWindowRestarter,
     WindowsShortcutOpenBackend,
+    _POWERSHELL_REOPEN_SCRIPT,
+    _PowerShellBattleReopenWorker,
 )
 from adapters.windows_window import WindowInfo
 from services.group_launch_service import GroupLaunchTarget
@@ -450,3 +458,876 @@ def test_final_shortcut_delivery_rechecks_absence_after_identity_resolution(
     assert failure_code == "battle_window_already_exists"
     assert calls == ["absence", "resolve", "absence"]
     assert starts == []
+
+
+class _BoundedWorker:
+    def __init__(self, stages=()):
+        self._events = []
+        self._running = True
+        self.authorize_calls = 0
+        self.terminate_calls = 0
+        self.cleanup_calls = 0
+        self.job_id = "test-job"
+        self.emit(*stages)
+
+    def emit(self, *stages):
+        for stage in stages:
+            self._events.append(
+                {
+                    "stage": stage,
+                    "timestamp_ms": 1_000 + len(self._events),
+                }
+            )
+
+    def poll_events(self):
+        events = tuple(self._events)
+        self._events.clear()
+        return events
+
+    def is_running(self):
+        return self._running
+
+    def authorize_launch(self):
+        self.authorize_calls += 1
+        return self._running and self.authorize_calls == 1
+
+    def terminate_and_wait(self):
+        self.terminate_calls += 1
+        self._running = False
+        return True
+
+    def cleanup(self):
+        self.cleanup_calls += 1
+
+
+def _bounded_restarter(worker_factory, now):
+    return WindowsBattleWindowRestarter(
+        _Windows([]),
+        _Closer(),
+        _Opener(),
+        absence_stability_seconds=0.1,
+        poll_seconds=0.05,
+        reopen_enumeration_timeout_seconds=1.0,
+        reopen_fingerprint_timeout_seconds=1.0,
+        reopen_launch_timeout_seconds=1.0,
+        monotonic_clock=lambda: now[0],
+        wall_clock=lambda: 1_700_000_000.0 + now[0],
+        sleeper=lambda _seconds: None,
+        reopen_worker_factory=worker_factory,
+    )
+
+
+def _begin_bounded(restarter, tmp_path, *, deadline=60.0):
+    target = _target(tmp_path)
+    return restarter.begin_bounded_reopen(
+        owner=target.fingerprint,
+        entry_id=target.entry_id,
+        original_instance=(
+            target.fingerprint,
+            11,
+            101,
+            501,
+            "ShockwaveFlash",
+            1001,
+            (0, 0, 900, 600),
+            False,
+        ),
+        target=target,
+        candidate_windows=(),
+        deadline=deadline,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stages", "expected_stage", "expected_failure"),
+    (
+        (
+            (),
+            BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+            "battle_first_absence_hard_timeout",
+        ),
+        (
+            (
+                BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+                BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+                BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            ),
+            BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            "battle_shortcut_fingerprint_hard_timeout",
+        ),
+        (
+            (
+                BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+                BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+                BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+                BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+                BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            ),
+            BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            "battle_second_absence_hard_timeout",
+        ),
+    ),
+)
+def test_bounded_prelaunch_hard_timeouts_stop_worker_and_allow_safe_retry(
+    tmp_path,
+    stages,
+    expected_stage,
+    expected_failure,
+):
+    now = [0.0]
+    workers = []
+
+    def factory(_payload):
+        worker = _BoundedWorker(stages)
+        workers.append(worker)
+        return worker
+
+    restarter = _bounded_restarter(factory, now)
+    pending = _begin_bounded(restarter, tmp_path)
+    assert pending.pending is True
+    assert pending.stage == expected_stage
+
+    now[0] = 1.1
+    failed = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+
+    assert failed.failure_code == expected_failure
+    assert failed.hard_timeout is True
+    assert failed.retry_allowed is True
+    assert failed.delivery_boundary_crossed is False
+    assert failed.wait_new_instance_only is False
+    assert workers[0].terminate_calls == 1
+    assert workers[0].is_running() is False
+
+    retried = _begin_bounded(restarter, tmp_path)
+    assert retried.pending is True
+    assert len(workers) == 2
+
+
+def test_timeout_evidence_survives_safe_retry_that_reaches_launch_ready(
+    tmp_path,
+):
+    now = [0.0]
+    ready_stages = (
+        BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+        BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+        BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+        BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+        BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+        BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+        BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+    )
+    workers = [_BoundedWorker(), _BoundedWorker(ready_stages)]
+    restarter = _bounded_restarter(lambda _payload: workers.pop(0), now)
+    _begin_bounded(restarter, tmp_path)
+    now[0] = 1.1
+    first = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+    assert first.failure_code == "battle_first_absence_hard_timeout"
+
+    now[0] = 2.0
+    second = _begin_bounded(restarter, tmp_path)
+
+    assert second.stage == BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+    assert any(
+        item.failure_reason == "battle_first_absence_hard_timeout"
+        and item.hard_timeout
+        for item in second.stage_evidence
+    )
+    assert second.stage_evidence[-1].stage == (
+        BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+    )
+
+    authorized = restarter.authorize_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+    first_failure_index = next(
+        index
+        for index, item in enumerate(authorized.stage_evidence)
+        if item.failure_reason == "battle_first_absence_hard_timeout"
+    )
+    second_prepared_index = max(
+        index
+        for index, item in enumerate(authorized.stage_evidence)
+        if item.stage == BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+    )
+    assert first_failure_index < second_prepared_index
+    assert authorized.stage_evidence[first_failure_index].hard_timeout is True
+    assert authorized.stage_evidence == second.stage_evidence
+    assert authorized.stage == BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+    assert workers == []
+
+
+def test_launch_call_hang_is_nonblocking_consumed_and_never_authorized_twice(
+    tmp_path,
+):
+    now = [0.0]
+    worker = _BoundedWorker(
+        (
+            BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+            BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+            BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+    )
+    factory_calls = []
+    restarter = _bounded_restarter(
+        lambda payload: factory_calls.append(payload) or worker,
+        now,
+    )
+    ready = _begin_bounded(restarter, tmp_path)
+    assert ready.pending is True
+    authorized = restarter.authorize_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+    assert authorized.pending is True
+    worker.emit(BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value)
+
+    before = time.perf_counter()
+    entered = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+    elapsed = time.perf_counter() - before
+    assert elapsed < 0.1
+    assert entered.pending is True
+    assert entered.delivery_boundary_crossed is True
+    assert entered.wait_new_instance_only is True
+
+    now[0] = 1.1
+    timed_out = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+    assert timed_out.failure_code == "battle_shortcut_launch_hard_timeout"
+    assert timed_out.hard_timeout is True
+    assert timed_out.retry_allowed is False
+    assert timed_out.wait_new_instance_only is True
+    assert worker.authorize_calls == 1
+    assert len(factory_calls) == 1
+
+
+def test_target_appearing_during_ack_wait_never_enters_or_retries_launch(
+    tmp_path,
+):
+    now = [0.0]
+    worker = _BoundedWorker(
+        (
+            BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+            BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+            BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+    )
+    factory_calls = []
+    restarter = _bounded_restarter(
+        lambda payload: factory_calls.append(payload) or worker,
+        now,
+    )
+    ready = _begin_bounded(restarter, tmp_path)
+    assert ready.stage == BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+    restarter.authorize_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+    worker._events.append(
+        {
+            "stage": BattleReopenStage.FAILED.value,
+            "timestamp_ms": 2_000,
+            "failure_code": "battle_window_already_exists",
+        }
+    )
+
+    failed = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+    repeated = _begin_bounded(restarter, tmp_path)
+
+    ack = _POWERSHELL_REOPEN_SCRIPT.index(
+        "Wait-TokenFile $script:ackPath 65"
+    )
+    final_absence = _POWERSHELL_REOPEN_SCRIPT.index(
+        "$failure = Test-TargetAbsent",
+        ack,
+    )
+    entered = _POWERSHELL_REOPEN_SCRIPT.index(
+        "Emit-Stage 'shortcut_launch_entered'"
+    )
+    shell_execute = _POWERSHELL_REOPEN_SCRIPT.index(
+        "$start.UseShellExecute = $true"
+    )
+    assert ack < final_absence < entered < shell_execute
+    assert failed.failure_code == "battle_window_already_exists"
+    assert failed.delivery_boundary_crossed is False
+    assert failed.shortcut_open_requested is False
+    assert failed.retry_allowed is False
+    assert failed.wait_new_instance_only is True
+    assert repeated.failure_code == "battle_window_already_exists"
+    assert not any(
+        item.stage == BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value
+        for item in failed.stage_evidence
+    )
+    assert worker.authorize_calls == 1
+    assert worker.terminate_calls == 1
+    assert len(factory_calls) == 1
+
+
+def test_final_absence_after_ack_has_dedicated_hard_timeout(tmp_path):
+    now = [0.0]
+    worker = _BoundedWorker(
+        (
+            BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+            BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+            BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+    )
+    restarter = _bounded_restarter(lambda _payload: worker, now)
+    _begin_bounded(restarter, tmp_path)
+    restarter.authorize_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+
+    now[0] = 1.1
+    failed = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+
+    assert failed.failure_code == "battle_final_absence_hard_timeout"
+    assert failed.hard_timeout is True
+    assert failed.retry_allowed is False
+    assert failed.wait_new_instance_only is True
+    assert failed.delivery_boundary_crossed is False
+    assert worker.authorize_calls == 1
+    assert worker.terminate_calls == 1
+
+
+def test_new_instance_race_absorbs_entered_event_and_proves_boundary(
+    tmp_path,
+):
+    now = [0.0]
+    worker = _BoundedWorker(
+        (
+            BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+            BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+            BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+    )
+    factory_calls = []
+    restarter = _bounded_restarter(
+        lambda payload: factory_calls.append(payload) or worker,
+        now,
+    )
+    ready = _begin_bounded(restarter, tmp_path)
+    assert ready.stage == BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+    restarter.authorize_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+    worker.emit(BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value)
+
+    completed = restarter.complete_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+
+    stages = tuple(item.stage for item in completed.stage_evidence)
+    assert completed.success is True
+    assert completed.stage == BattleReopenStage.NEW_INSTANCE_APPEARED.value
+    assert completed.delivery_boundary_crossed is True
+    assert completed.shortcut_open_requested is True
+    assert BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value in stages
+    assert BattleReopenStage.SHORTCUT_LAUNCH_RETURNED.value not in stages
+    assert completed.stage_evidence[-1].delivery_boundary_crossed is True
+    assert completed.stage_evidence[-1].wait_new_instance_only is True
+    assert worker.authorize_calls == 1
+    assert worker.terminate_calls == 1
+    assert worker.cleanup_calls == 1
+    assert len(factory_calls) == 1
+
+
+@pytest.mark.parametrize("launch_entered", (False, True))
+def test_new_instance_completion_keeps_unreaped_worker_active(
+    tmp_path,
+    launch_entered,
+):
+    now = [0.0]
+
+    class UnreapableWorker(_BoundedWorker):
+        def terminate_and_wait(self):
+            self.terminate_calls += 1
+            return False
+
+    worker = UnreapableWorker(
+        (
+            BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+            BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+            BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+    )
+    factory_calls = []
+    restarter = _bounded_restarter(
+        lambda payload: factory_calls.append(payload) or worker,
+        now,
+    )
+    _begin_bounded(restarter, tmp_path)
+    restarter.authorize_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+    if launch_entered:
+        worker.emit(BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value)
+
+    failed = restarter.complete_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+    still_blocked = _begin_bounded(restarter, tmp_path)
+
+    assert failed.failure_code == "battle_reopen_worker_unreaped"
+    assert failed.success is False
+    assert failed.delivery_boundary_crossed is True
+    assert failed.retry_allowed is False
+    assert failed.wait_new_instance_only is True
+    assert failed.stage == BattleReopenStage.FAILED.value
+    assert still_blocked.failure_code == "battle_reopen_worker_unreaped"
+    assert restarter._active_reopen_job is not None
+    assert restarter._reopen_evidence_history == ()
+    assert (
+        any(
+            item.stage == BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value
+            for item in failed.stage_evidence
+        )
+        is launch_entered
+    )
+    assert worker.authorize_calls == 1
+    assert worker.terminate_calls == 1
+    assert worker.cleanup_calls == 0
+    assert len(factory_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("next_owner", "next_handle", "next_shortcut"),
+    (
+        ("b" * 64, 22, None),
+        ("a" * 64, 99, None),
+        ("a" * 64, 11, "different-shortcut.lnk"),
+    ),
+)
+def test_unreaped_active_job_conflicts_by_complete_event_key_without_evidence(
+    tmp_path,
+    next_owner,
+    next_handle,
+    next_shortcut,
+):
+    now = [0.0]
+
+    class UnreapableWorker(_BoundedWorker):
+        def terminate_and_wait(self):
+            self.terminate_calls += 1
+            return False
+
+    worker = UnreapableWorker(
+        (
+            BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+            BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+            BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+    )
+    factory_calls = []
+    restarter = _bounded_restarter(
+        lambda payload: factory_calls.append(payload) or worker,
+        now,
+    )
+    _begin_bounded(restarter, tmp_path)
+    restarter.authorize_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+    failed = restarter.complete_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+    target = _target(tmp_path, fingerprint=next_owner)
+    if next_shortcut is not None:
+        target = replace(
+            target,
+            shortcut_path=tmp_path / next_shortcut,
+        )
+    next_instance = (
+        (
+            "a" * 64,
+            11,
+            101,
+            501,
+            "ShockwaveFlash",
+            1001,
+            (0, 0, 900, 600),
+            False,
+        )
+        if next_shortcut is not None
+        else (
+            next_owner,
+            next_handle,
+            100 + next_handle,
+            500 + next_handle,
+            "ShockwaveFlash",
+            1000 + next_handle,
+            (0, 0, 900, 600),
+            False,
+        )
+    )
+
+    conflict = restarter.begin_bounded_reopen(
+        owner=next_owner,
+        entry_id=target.entry_id,
+        original_instance=next_instance,
+        target=target,
+        candidate_windows=(),
+        deadline=60.0,
+    )
+
+    assert failed.failure_code == "battle_reopen_worker_unreaped"
+    assert conflict.failure_code == "battle_reopen_job_conflict"
+    assert conflict.stage is None
+    assert conflict.delivery_boundary_crossed is False
+    assert conflict.stage_evidence == ()
+    assert restarter._active_reopen_job is not None
+    assert restarter._active_reopen_job.original_instance[1] == 11
+    assert worker.authorize_calls == 1
+    assert len(factory_calls) == 1
+
+
+def test_delayed_launch_return_has_one_authorization_and_then_waits_for_instance(
+    tmp_path,
+):
+    now = [0.0]
+    worker = _BoundedWorker(
+        (
+            BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+            BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+            BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+    )
+    factory_calls = []
+    restarter = _bounded_restarter(
+        lambda payload: factory_calls.append(payload) or worker,
+        now,
+    )
+    _begin_bounded(restarter, tmp_path)
+    restarter.authorize_bounded_reopen(owner="a" * 64, entry_id="entry-a")
+    worker.emit(BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value)
+    entered = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+    assert entered.pending is True
+    now[0] = 0.5
+    still_waiting = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+    assert still_waiting.pending is True
+
+    worker.emit(BattleReopenStage.SHORTCUT_LAUNCH_RETURNED.value)
+    worker._running = False
+    returned = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+
+    assert returned.success is True
+    assert returned.stage == BattleReopenStage.WAITING_NEW_INSTANCE.value
+    assert returned.shortcut_open_requested is True
+    assert worker.authorize_calls == 1
+    assert len(factory_calls) == 1
+    launch_started = next(
+        item
+        for item in returned.stage_evidence
+        if item.stage == BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value
+    )
+    assert launch_started.stage_ended_at is not None
+
+    evidence_count = len(returned.stage_evidence)
+    for observed_at in (0.6, 0.8):
+        now[0] = observed_at
+        stable = restarter.poll_bounded_reopen(
+            owner="a" * 64,
+            entry_id="entry-a",
+            deadline=60.0,
+        )
+        assert stable.pending is True
+        assert stable.stage == BattleReopenStage.WAITING_NEW_INSTANCE.value
+        assert len(stable.stage_evidence) == evidence_count
+    assert worker.authorize_calls == 1
+    assert len(factory_calls) == 1
+
+    now[0] = 60.0
+    deadline_failure = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+    assert deadline_failure.failure_code == "tcp_reconnect_timeout"
+    assert deadline_failure.hard_timeout is True
+    timed_out_evidence_count = len(deadline_failure.stage_evidence)
+    repeated = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+    assert repeated.failure_code == "tcp_reconnect_timeout"
+    assert len(repeated.stage_evidence) == timed_out_evidence_count
+    assert worker.authorize_calls == 1
+    assert len(factory_calls) == 1
+
+
+def test_launch_ack_at_owner_deadline_is_refused_without_shortcut_delivery(
+    tmp_path,
+):
+    now = [0.0]
+    worker = _BoundedWorker(
+        (
+            BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+            BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+            BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+    )
+    restarter = _bounded_restarter(lambda _payload: worker, now)
+    ready = _begin_bounded(restarter, tmp_path, deadline=1.0)
+    assert ready.stage == BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+
+    now[0] = 1.0
+    blocked = restarter.authorize_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+    )
+
+    assert blocked.failure_code == "tcp_reconnect_timeout"
+    assert blocked.hard_timeout is True
+    assert blocked.retry_allowed is False
+    assert blocked.delivery_boundary_crossed is False
+    assert worker.authorize_calls == 0
+    assert worker.terminate_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("next_fingerprint", "next_handle", "next_shortcut"),
+    (
+        ("b" * 64, 11, None),
+        ("a" * 64, 99, None),
+        ("a" * 64, 11, "different-shortcut.lnk"),
+    ),
+)
+def test_reopen_evidence_history_isolated_by_complete_recovery_event(
+    tmp_path,
+    next_fingerprint,
+    next_handle,
+    next_shortcut,
+):
+    now = [0.0]
+    ready_stages = (
+        BattleReopenStage.FIRST_ABSENCE_STARTED.value,
+        BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+        BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+        BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+        BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+        BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+        BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+    )
+    workers = [_BoundedWorker(), _BoundedWorker(ready_stages)]
+    restarter = _bounded_restarter(lambda _payload: workers.pop(0), now)
+    _begin_bounded(restarter, tmp_path)
+    now[0] = 1.1
+    first = restarter.poll_bounded_reopen(
+        owner="a" * 64,
+        entry_id="entry-a",
+        deadline=60.0,
+    )
+    assert first.failure_code == "battle_first_absence_hard_timeout"
+
+    target = _target(tmp_path, fingerprint=next_fingerprint)
+    if next_shortcut is not None:
+        target = replace(
+            target,
+            shortcut_path=tmp_path / next_shortcut,
+        )
+    original_instance = (
+        (
+            "a" * 64,
+            11,
+            101,
+            501,
+            "ShockwaveFlash",
+            1001,
+            (0, 0, 900, 600),
+            False,
+        )
+        if next_shortcut is not None
+        else (
+            next_fingerprint,
+            next_handle,
+            200 + next_handle,
+            500 + next_handle,
+            "ShockwaveFlash",
+            2000 + next_handle,
+            (0, 0, 900, 600),
+            False,
+        )
+    )
+    now[0] = 2.0
+    second = restarter.begin_bounded_reopen(
+        owner=next_fingerprint,
+        entry_id=target.entry_id,
+        original_instance=original_instance,
+        target=target,
+        candidate_windows=(),
+        deadline=60.0,
+    )
+
+    assert second.stage == BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+    assert sum(
+        item.failure_reason == "battle_first_absence_hard_timeout"
+        for item in second.stage_evidence
+    ) == 0
+    assert {
+        (item.owner, item.entry_id, item.original_instance)
+        for item in second.stage_evidence
+    } == {(next_fingerprint, "entry-a", original_instance)}
+
+
+def test_partial_stage_file_cannot_advance_sequence_or_launch_boundary(tmp_path):
+    worker = object.__new__(_PowerShellBattleReopenWorker)
+    worker._event_path = tmp_path / "stages.jsonl"
+    worker._seen_lines = 0
+    worker._next_sequence = 1
+    worker._job_id = "job-a"
+    worker._token = "token-a"
+    event = json.dumps(
+        {
+            "job_id": worker._job_id,
+            "token": worker._token,
+            "sequence": 1,
+            "stage": BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value,
+            "timestamp_ms": 1_000,
+            "failure_code": "",
+        },
+        separators=(",", ":"),
+    )
+    split_at = len(event) // 2
+    worker._event_path.write_text(event[:split_at], encoding="utf-8")
+
+    assert worker.poll_events() == ()
+    assert worker._seen_lines == 0
+    assert worker._next_sequence == 1
+
+    with worker._event_path.open("a", encoding="utf-8") as stream:
+        stream.write(event[split_at:] + "\n")
+    completed = worker.poll_events()
+
+    assert len(completed) == 1
+    assert completed[0]["stage"] == (
+        BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value
+    )
+    assert worker._seen_lines == 1
+    assert worker._next_sequence == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows worker only")
+def test_real_windows_worker_starts_reports_first_stage_and_cleans_up(tmp_path):
+    worker = _PowerShellBattleReopenWorker(
+        {
+            "fingerprint": "a" * 64,
+            "shortcut_path": str(tmp_path / "never-launch.lnk"),
+            "title_keywords": ("Adobe Flash Player",),
+            "absence_stability_seconds": 1.0,
+            "poll_seconds": 0.1,
+            "expected_identity_keys": (),
+        }
+    )
+    temporary_dir = worker._temporary_dir
+    ack_path = worker._ack_path
+    observed = []
+    deadline = time.monotonic() + 10.0
+    try:
+        while time.monotonic() < deadline:
+            observed.extend(worker.poll_events())
+            if any(
+                event["stage"]
+                == BattleReopenStage.FIRST_ABSENCE_STARTED.value
+                for event in observed
+            ):
+                break
+            if not worker.is_running():
+                break
+            time.sleep(0.02)
+        assert any(
+            event["stage"]
+            == BattleReopenStage.FIRST_ABSENCE_STARTED.value
+            for event in observed
+        )
+        assert ack_path.exists() is False
+    finally:
+        assert worker.terminate_and_wait() is True
+        worker.cleanup()
+
+    assert temporary_dir.exists() is False
+
+
+def test_reopen_worker_has_no_foreground_focus_cursor_visibility_or_z_order_mutation():
+    script = _POWERSHELL_REOPEN_SCRIPT.casefold()
+
+    assert "setforegroundwindow" not in script
+    assert "setfocus" not in script
+    assert "setcursorpos" not in script
+    assert "showwindow" not in script
+    assert "setwindowpos" not in script
+    assert "bringwindowtotop" not in script
+    assert "mouse_event" not in script

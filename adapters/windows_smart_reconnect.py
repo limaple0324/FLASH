@@ -41,6 +41,8 @@ from adapters.windows_background_capture import (
 )
 from adapters.windows_auto_battle import AutoBattleEvidence, AutoBattleRecognizer
 from adapters.windows_battle_restart import (
+    BattleReopenStage,
+    BattleReopenStageEvidence,
     BattleRestartResult,
     Win32WindowCloseBackend,
     WindowsBattleWindowRestarter,
@@ -304,6 +306,11 @@ class _TcpRecoveryAuthority:
     shortcut_consumed: bool = False
     new_instance: WindowInstanceToken | None = None
     restored_tombstone: bool = False
+    reopen_stage_evidence: tuple[BattleReopenStageEvidence, ...] = ()
+    reopen_intent_sequence: int | None = None
+    reopen_intent_signature: str | None = None
+    reopen_intent_finished: bool = False
+    reopen_worker_unreaped: bool = False
 
     @property
     def terminal(self) -> bool:
@@ -5063,6 +5070,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or authority.stage is not _TcpRecoveryStage.CANCELLED
             or not authority.shortcut_consumed
             or not authority.restored_tombstone
+            or authority.reopen_worker_unreaped
             or plan is None
             or not plan.ready
             or not isinstance(resolved, ResolvedTargetWindows)
@@ -8693,6 +8701,121 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             else None
         )
 
+    @staticmethod
+    def _reopen_stage_evidence_from_payload(
+        payload: object,
+        *,
+        fingerprint: str,
+        entry_id: str,
+        old_instance: WindowInstanceToken,
+    ) -> tuple[BattleReopenStageEvidence, ...]:
+        if not isinstance(payload, list):
+            return ()
+        expected_instance = (
+            fingerprint,
+            old_instance.handle,
+            old_instance.process_id,
+            old_instance.thread_id,
+            old_instance.window_class,
+            old_instance.process_lifecycle_token,
+            old_instance.rect,
+            old_instance.minimized,
+        )
+        allowed_stages = {stage.value for stage in BattleReopenStage}
+        restored: list[BattleReopenStageEvidence] = []
+        boundary_crossed = False
+        for raw in payload:
+            if not isinstance(raw, dict):
+                return ()
+            raw_instance = raw.get("original_instance")
+            if (
+                not isinstance(raw_instance, (list, tuple))
+                or len(raw_instance) != 8
+                or not isinstance(raw_instance[6], (list, tuple))
+                or len(raw_instance[6]) != 4
+            ):
+                return ()
+            original_instance = (
+                normalize_launch_fingerprint(raw_instance[0]),
+                raw_instance[1],
+                raw_instance[2],
+                raw_instance[3],
+                raw_instance[4],
+                raw_instance[5],
+                tuple(raw_instance[6]),
+                raw_instance[7],
+            )
+            owner = normalize_launch_fingerprint(raw.get("owner"))
+            evidence_fingerprint = normalize_launch_fingerprint(
+                raw.get("fingerprint")
+            )
+            raw_entry_id = raw.get("entry_id")
+            shortcut = raw.get("original_shortcut")
+            stage = raw.get("stage")
+            started_at = raw.get("stage_started_at")
+            ended_at = raw.get("stage_ended_at")
+            delivery_boundary = raw.get("delivery_boundary_crossed")
+            retry_allowed = raw.get("retry_allowed")
+            wait_only = raw.get("wait_new_instance_only")
+            failure_reason = raw.get("failure_reason")
+            hard_timeout = raw.get("hard_timeout")
+            if (
+                owner != fingerprint
+                or evidence_fingerprint != fingerprint
+                or raw_entry_id != entry_id
+                or original_instance != expected_instance
+                or not isinstance(shortcut, str)
+                or not shortcut.strip()
+                or stage not in allowed_stages
+                or not isinstance(started_at, (int, float))
+                or isinstance(started_at, bool)
+                or not math.isfinite(float(started_at))
+                or (
+                    ended_at is not None
+                    and (
+                        not isinstance(ended_at, (int, float))
+                        or isinstance(ended_at, bool)
+                        or not math.isfinite(float(ended_at))
+                        or float(ended_at) < float(started_at)
+                    )
+                )
+                or type(delivery_boundary) is not bool
+                or type(retry_allowed) is not bool
+                or type(wait_only) is not bool
+                or type(hard_timeout) is not bool
+                or (
+                    failure_reason is not None
+                    and (
+                        not isinstance(failure_reason, str)
+                        or not failure_reason.strip()
+                    )
+                )
+                or (boundary_crossed and not delivery_boundary)
+                or (retry_allowed and wait_only)
+            ):
+                return ()
+            boundary_crossed = boundary_crossed or delivery_boundary
+            restored.append(
+                BattleReopenStageEvidence(
+                    owner=owner,
+                    entry_id=raw_entry_id,
+                    fingerprint=evidence_fingerprint,
+                    original_instance=expected_instance,
+                    original_shortcut=shortcut,
+                    stage=stage,
+                    stage_started_at=float(started_at),
+                    stage_ended_at=(
+                        None if ended_at is None else float(ended_at)
+                    ),
+                    delivery_boundary_crossed=delivery_boundary,
+                    retry_allowed=retry_allowed,
+                    wait_new_instance_only=wait_only,
+                    failure_reason=failure_reason,
+                    hard_timeout=hard_timeout,
+                )
+            )
+        return tuple(restored)
+
     def _persisted_tcp_recovery_authority(
         self,
     ) -> dict[str, object] | None:
@@ -8718,6 +8841,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             "old_instance": self._instance_payload(authority.old_instance),
             "new_instance": self._instance_payload(authority.new_instance),
             "shortcut_consumed": authority.shortcut_consumed,
+            "reopen_stage_evidence": [
+                {
+                    "owner": item.owner,
+                    "entry_id": item.entry_id,
+                    "fingerprint": item.fingerprint,
+                    "original_instance": list(item.original_instance),
+                    "original_shortcut": item.original_shortcut,
+                    "stage": item.stage,
+                    "stage_started_at": item.stage_started_at,
+                    "stage_ended_at": item.stage_ended_at,
+                    "delivery_boundary_crossed": (
+                        item.delivery_boundary_crossed
+                    ),
+                    "retry_allowed": item.retry_allowed,
+                    "wait_new_instance_only": item.wait_new_instance_only,
+                    "failure_reason": item.failure_reason,
+                    "hard_timeout": item.hard_timeout,
+                }
+                for item in authority.reopen_stage_evidence
+            ],
             "authority_signature": hashlib.sha256(
                 repr(immutable_authority).encode("utf-8")
             ).hexdigest(),
@@ -8744,6 +8887,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             or type(payload.get("shortcut_consumed")) is not bool
         ):
             return None
+        reopen_stage_evidence = self._reopen_stage_evidence_from_payload(
+            payload.get("reopen_stage_evidence", []),
+            fingerprint=fingerprint,
+            entry_id=entry_id.strip(),
+            old_instance=old_instance,
+        )
         # Monotonic deadlines and live source/plan objects cannot survive a
         # process boundary.  Keep only a non-actionable consumed-launch
         # tombstone: it blocks a duplicate shortcut request and is cleared
@@ -8767,6 +8916,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 payload.get("new_instance")
             ),
             restored_tombstone=True,
+            reopen_stage_evidence=reopen_stage_evidence,
         )
 
     def _persist_runtime_state(self) -> bool:
@@ -8908,6 +9058,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         """Record owner recovery diagnostics without granting authority."""
 
         signature = self._tcp_authority_signature(authority)
+        if (
+            action == "reopen_window"
+            and authority.reopen_intent_signature is not None
+        ):
+            return authority.reopen_intent_sequence, (
+                authority.reopen_intent_signature
+            )
         recorder = self._evidence_recorder
         if recorder is None or self._evidence_recording_failed:
             return None, signature
@@ -8923,6 +9080,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         except (OSError, TypeError, ValueError):
             self._mark_evidence_failure()
             return None, signature
+        if action == "reopen_window":
+            authority.reopen_intent_sequence = sequence
+            authority.reopen_intent_signature = signature
         return sequence, signature
 
     def _finish_tcp_recovery_evidence(
@@ -8935,6 +9095,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         *,
         allowed: bool,
     ) -> None:
+        if action == "reopen_window":
+            if authority.reopen_intent_finished:
+                return
+            if result is not None and (
+                result.pending or result.retry_allowed
+            ) and not result.delivery_boundary_crossed:
+                return
         self._finish_evidence_action(
             fingerprint=authority.fingerprint,
             item=ScreenRecognition(
@@ -8961,6 +9128,41 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             authority_signature=signature,
             input_channel="window_control",
         )
+        if action == "reopen_window":
+            authority.reopen_intent_finished = True
+
+    def _accept_tcp_reopen_stage_evidence(
+        self,
+        authority: _TcpRecoveryAuthority,
+        result: BattleRestartResult | None,
+    ) -> bool:
+        if result is None or not result.stage_evidence:
+            return True
+        expected_instance = (
+            authority.fingerprint,
+            authority.old_instance.handle,
+            authority.old_instance.process_id,
+            authority.old_instance.thread_id,
+            authority.old_instance.window_class,
+            authority.old_instance.process_lifecycle_token,
+            authority.old_instance.rect,
+            authority.old_instance.minimized,
+        )
+        if any(
+            not isinstance(item, BattleReopenStageEvidence)
+            or item.owner != authority.fingerprint
+            or item.entry_id != authority.entry_id
+            or item.fingerprint != authority.target_fingerprint
+            or item.original_instance != expected_instance
+            or item.original_shortcut != authority.shortcut_path
+            for item in result.stage_evidence
+        ):
+            return False
+        if result.stage_evidence == authority.reopen_stage_evidence:
+            return True
+        authority.reopen_stage_evidence = result.stage_evidence
+        self._persist_runtime_state()
+        return True
 
     def _run_tcp_recovery_mutation(
         self,
@@ -9004,9 +9206,26 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         authority: _TcpRecoveryAuthority,
         *,
         timed_out: bool = False,
-    ) -> None:
+    ) -> bool:
         if self._tcp_recovery_authority is not authority:
-            return
+            return False
+        cancel_reopen = getattr(
+            self._battle_restarter,
+            "cancel_bounded_reopen",
+            None,
+        )
+        reopen_cancelled = True
+        if callable(cancel_reopen):
+            reopen_cancelled = bool(cancel_reopen(
+                owner=authority.fingerprint,
+                entry_id=authority.entry_id,
+            ))
+        if not reopen_cancelled:
+            authority.stage = _TcpRecoveryStage.CANCELLED
+            authority.shortcut_consumed = True
+            authority.reopen_worker_unreaped = True
+            self._persist_runtime_state()
+            return False
         authority.stage = (
             _TcpRecoveryStage.TIMED_OUT
             if timed_out
@@ -9020,6 +9239,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 state.zero_since = None
                 state.zero_count = 0
         self._persist_runtime_state()
+        return True
 
     def _new_tcp_recovery_authority(
         self,
@@ -9150,7 +9370,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if authority is not None and not execute:
             return 0, [], None
         if authority is not None and authority.terminal:
-            if authority.restored_tombstone and authority.shortcut_consumed:
+            if authority.shortcut_consumed and (
+                authority.restored_tombstone
+                or authority.reopen_worker_unreaped
+            ):
                 return 0, [], None
             can_replace = bool(
                 owner is not None
@@ -9188,6 +9411,49 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
 
         fresh_now = self._monotonic_clock()
         if fresh_now >= authority.deadline:
+            poll_reopen = getattr(
+                self._battle_restarter,
+                "poll_bounded_reopen",
+                None,
+            )
+            if callable(poll_reopen) and authority.stage in {
+                _TcpRecoveryStage.REOPEN_PENDING,
+                _TcpRecoveryStage.SHORTCUT_REQUESTED,
+                _TcpRecoveryStage.WAITING_NEW_INSTANCE,
+            }:
+                _allowed, timeout_value = self._run_tcp_recovery_mutation(
+                    "smart-reconnect-owner-reopen-timeout",
+                    authority,
+                    lambda: poll_reopen(
+                        owner=authority.fingerprint,
+                        entry_id=authority.entry_id,
+                        deadline=authority.deadline,
+                    ),
+                )
+                timeout_result = (
+                    timeout_value
+                    if isinstance(timeout_value, BattleRestartResult)
+                    else None
+                )
+                timeout_evidence_valid = self._accept_tcp_reopen_stage_evidence(
+                    authority,
+                    timeout_result,
+                )
+                if not timeout_evidence_valid:
+                    timeout_result = BattleRestartResult(
+                        False,
+                        "battle_reopen_stage_evidence_invalid",
+                        wait_new_instance_only=True,
+                    )
+                self._finish_tcp_recovery_evidence(
+                    authority,
+                    "reopen_window",
+                    authority.reopen_intent_sequence,
+                    authority.reopen_intent_signature
+                    or self._tcp_authority_signature(authority),
+                    timeout_result,
+                    allowed=_allowed,
+                )
             self._cancel_tcp_recovery(authority, timed_out=True)
             self._tcp_timeout_isolated.add(authority.fingerprint)
             return 0, ["tcp_reconnect_timeout"], None
@@ -9348,23 +9614,48 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     "reopen_window",
                 )
             )
-            # Persist the consumed edge before entering the shortcut backend.
-            # A crash can lose an unperformed retry, never duplicate a launch.
-            authority.stage = _TcpRecoveryStage.SHORTCUT_REQUESTED
-            authority.shortcut_consumed = True
-            if not self._persist_runtime_state():
-                self._cancel_tcp_recovery(authority)
-                return 0, ["reconnect_state_persistence_failed"], None
             allowed, value = self._run_tcp_recovery_mutation(
                 "smart-reconnect-owner-reopen",
                 authority,
-                lambda: self._battle_restarter.reopen_missing(
-                    target,
-                    candidates,
+                lambda: self._battle_restarter.begin_bounded_reopen(
+                    owner=authority.fingerprint,
+                    entry_id=authority.entry_id,
+                    original_instance=(
+                        authority.fingerprint,
+                        authority.old_instance.handle,
+                        authority.old_instance.process_id,
+                        authority.old_instance.thread_id,
+                        authority.old_instance.window_class,
+                        authority.old_instance.process_lifecycle_token,
+                        authority.old_instance.rect,
+                        authority.old_instance.minimized,
+                    ),
+                    target=target,
+                    candidate_windows=candidates,
                     deadline=authority.deadline,
                 ),
             )
             result = value if isinstance(value, BattleRestartResult) else None
+            evidence_valid = self._accept_tcp_reopen_stage_evidence(
+                authority,
+                result,
+            )
+            if not evidence_valid:
+                invalid_result = BattleRestartResult(
+                    False,
+                    "battle_reopen_stage_evidence_invalid",
+                    wait_new_instance_only=True,
+                )
+                self._finish_tcp_recovery_evidence(
+                    authority,
+                    "reopen_window",
+                    sequence,
+                    signature,
+                    invalid_result,
+                    allowed=allowed,
+                )
+                self._cancel_tcp_recovery(authority)
+                return 0, [invalid_result.failure_code], None
             self._finish_tcp_recovery_evidence(
                 authority,
                 "reopen_window",
@@ -9373,19 +9664,88 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 result,
                 allowed=allowed,
             )
-            if (
-                allowed
-                and result is not None
-                and result.shortcut_open_requested
-            ):
-                authority.stage = _TcpRecoveryStage.WAITING_NEW_INSTANCE
-                self._persist_runtime_state()
-                return 1, [], self._policy.progress_interval_seconds
             if not allowed:
                 self._cancel_tcp_recovery(authority)
                 return 0, ["authorization_revoked"], None
+            if result is None:
+                self._cancel_tcp_recovery(authority)
+                return 0, ["battle_reopen_result_invalid"], None
+            if (
+                result.pending
+                and result.stage
+                == BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+            ):
+                # The worker is stopped at a private ACK gate.  Persist the
+                # consumed edge first; only a durable success may release it
+                # into the Windows shortcut-launch boundary.
+                authority.stage = _TcpRecoveryStage.SHORTCUT_REQUESTED
+                authority.shortcut_consumed = True
+                if not self._persist_runtime_state():
+                    self._battle_restarter.cancel_bounded_reopen(
+                        owner=authority.fingerprint,
+                        entry_id=authority.entry_id,
+                    )
+                    self._cancel_tcp_recovery(authority)
+                    return 0, ["reconnect_state_persistence_failed"], None
+                authorized, authorization_value = (
+                    self._run_tcp_recovery_mutation(
+                        "smart-reconnect-owner-reopen-authorize",
+                        authority,
+                        lambda: (
+                            self._battle_restarter.authorize_bounded_reopen(
+                                owner=authority.fingerprint,
+                                entry_id=authority.entry_id,
+                            )
+                        ),
+                    )
+                )
+                authorization_result = (
+                    authorization_value
+                    if isinstance(
+                        authorization_value,
+                        BattleRestartResult,
+                    )
+                    else None
+                )
+                authorization_evidence_valid = (
+                    self._accept_tcp_reopen_stage_evidence(
+                        authority,
+                        authorization_result,
+                    )
+                )
+                if not authorization_evidence_valid:
+                    authority.stage = _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                    authority.shortcut_consumed = True
+                    self._persist_runtime_state()
+                    return (
+                        0,
+                        ["battle_reopen_stage_evidence_invalid"],
+                        self._policy.progress_interval_seconds,
+                    )
+                if not authorized or authorization_result is None:
+                    authority.stage = _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                    self._persist_runtime_state()
+                    return 0, [], self._policy.progress_interval_seconds
+                if authorization_result.failure_code is not None:
+                    authority.stage = _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                    self._persist_runtime_state()
+                    return 0, [], self._policy.progress_interval_seconds
+                authority.stage = _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                self._persist_runtime_state()
+                return 1, [], self._policy.progress_interval_seconds
+            if result.delivery_boundary_crossed or result.success:
+                authority.stage = _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                self._persist_runtime_state()
+                return 1, [], self._policy.progress_interval_seconds
+            if result.pending:
+                return 0, [], self._policy.progress_interval_seconds
+            if result.wait_new_instance_only:
+                authority.stage = _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                authority.shortcut_consumed = True
+                self._persist_runtime_state()
+                return 0, [], self._policy.progress_interval_seconds
             authority.stage = _TcpRecoveryStage.REOPEN_PENDING
-            authority.shortcut_consumed = False
+            authority.shortcut_consumed = not result.retry_allowed
             authority.retry_at = (
                 self._monotonic_clock()
                 + self._policy.progress_interval_seconds
@@ -9401,6 +9761,75 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             _TcpRecoveryStage.SHORTCUT_REQUESTED,
             _TcpRecoveryStage.WAITING_NEW_INSTANCE,
         }:
+            if self._battle_restarter is not None:
+                poll_reopen = getattr(
+                    self._battle_restarter,
+                    "poll_bounded_reopen",
+                    None,
+                )
+                if callable(poll_reopen):
+                    allowed, poll_value = self._run_tcp_recovery_mutation(
+                        "smart-reconnect-owner-reopen-poll",
+                        authority,
+                        lambda: poll_reopen(
+                            owner=authority.fingerprint,
+                            entry_id=authority.entry_id,
+                            deadline=authority.deadline,
+                        ),
+                    )
+                    poll_result = (
+                        poll_value
+                        if isinstance(poll_value, BattleRestartResult)
+                        else None
+                    )
+                    poll_evidence_valid = (
+                        self._accept_tcp_reopen_stage_evidence(
+                            authority,
+                            poll_result,
+                        )
+                    )
+                    if not poll_evidence_valid:
+                        authority.stage = (
+                            _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                        )
+                        authority.shortcut_consumed = True
+                        self._persist_runtime_state()
+                        return (
+                            0,
+                            ["battle_reopen_stage_evidence_invalid"],
+                            self._policy.progress_interval_seconds,
+                        )
+                    if (
+                        poll_result is not None
+                        and (
+                            poll_result.delivery_boundary_crossed
+                            or poll_result.success
+                            or poll_result.failure_code is not None
+                        )
+                    ):
+                        self._finish_tcp_recovery_evidence(
+                            authority,
+                            "reopen_window",
+                            authority.reopen_intent_sequence,
+                            authority.reopen_intent_signature
+                            or self._tcp_authority_signature(authority),
+                            poll_result,
+                            allowed=allowed,
+                        )
+                    if not allowed or poll_result is None:
+                        authority.stage = (
+                            _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                        )
+                        self._persist_runtime_state()
+                    elif (
+                        poll_result.delivery_boundary_crossed
+                        or poll_result.success
+                        or poll_result.wait_new_instance_only
+                    ):
+                        authority.stage = (
+                            _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                        )
+                        self._persist_runtime_state()
             self._candidate_window_set()
             resolved = self._tcp_v
             if (
@@ -9421,6 +9850,67 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     self._cancel_tcp_recovery(authority, timed_out=True)
                     return 0, ["tcp_reconnect_timeout"], None
                 return 0, [], self._policy.progress_interval_seconds
+            complete_reopen = getattr(
+                self._battle_restarter,
+                "complete_bounded_reopen",
+                None,
+            )
+            completed_result = None
+            if callable(complete_reopen):
+                completed_reopen = complete_reopen(
+                    owner=authority.fingerprint,
+                    entry_id=authority.entry_id,
+                )
+                completed_result = (
+                    completed_reopen
+                    if isinstance(
+                        completed_reopen,
+                        BattleRestartResult,
+                    )
+                    else None
+                )
+                complete_evidence_valid = (
+                    self._accept_tcp_reopen_stage_evidence(
+                        authority,
+                        completed_result,
+                    )
+                )
+                if not complete_evidence_valid:
+                    authority.stage = (
+                        _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                    )
+                    authority.shortcut_consumed = True
+                    self._persist_runtime_state()
+                    return (
+                        0,
+                        ["battle_reopen_stage_evidence_invalid"],
+                        self._policy.progress_interval_seconds,
+                    )
+            if completed_result is None or not completed_result.success:
+                authority.stage = _TcpRecoveryStage.WAITING_NEW_INSTANCE
+                authority.shortcut_consumed = True
+                self._persist_runtime_state()
+                return (
+                    0,
+                    [
+                        completed_result.failure_code
+                        if (
+                            completed_result is not None
+                            and completed_result.failure_code
+                        )
+                        else "battle_reopen_completion_failed"
+                    ],
+                    self._policy.progress_interval_seconds,
+                )
+            self._finish_tcp_recovery_evidence(
+                authority,
+                "reopen_window",
+                authority.reopen_intent_sequence,
+                authority.reopen_intent_signature
+                or self._tcp_authority_signature(authority),
+                completed_result,
+                allowed=True,
+            )
             authority.new_instance = new_instance
             authority.stage = _TcpRecoveryStage.NEW_INSTANCE_BOUND
             snapshot = self._activation_snapshot_instances
