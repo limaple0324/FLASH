@@ -495,12 +495,7 @@ function Get-LiveIdentitySnapshot {
             [string]$row.ProcessId,
             [string]$row.ThreadId,
             $classB64,
-            [string]$row.Lifecycle,
-            [string]$row.Left,
-            [string]$row.Top,
-            [string]$row.Right,
-            [string]$row.Bottom,
-            $(if ($row.Minimized) { '1' } else { '0' })
+            [string]$row.Lifecycle
         ) -join '|'
         $keys += $key
         $fingerprints += [string]$fingerprint
@@ -888,11 +883,10 @@ class _PowerShellBattleReopenWorker:
 
 
 def _reopen_identity_key(identity: WindowInstanceIdentity) -> str:
-    fingerprint, handle, process_id, thread_id, window_class, lifecycle, rect, minimized = identity
+    fingerprint, handle, process_id, thread_id, window_class, lifecycle, _rect, _minimized = identity
     encoded_class = base64.b64encode(
         str(window_class).encode("utf-8")
     ).decode("ascii")
-    left, top, right, bottom = rect
     return "|".join(
         (
             str(fingerprint),
@@ -901,11 +895,6 @@ def _reopen_identity_key(identity: WindowInstanceIdentity) -> str:
             str(thread_id),
             encoded_class,
             str(lifecycle),
-            str(left),
-            str(top),
-            str(right),
-            str(bottom),
-            "1" if minimized else "0",
         )
     )
 

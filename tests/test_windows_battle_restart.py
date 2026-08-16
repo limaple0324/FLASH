@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import time
@@ -25,13 +26,15 @@ def _window(
     thread_id=501,
     process_lifecycle_token=1001,
     window_class="ShockwaveFlash",
+    rect=(0, 0, 900, 600),
+    minimized=False,
 ):
     return WindowInfo(
         handle=handle,
         title="Adobe Flash Player 11",
         visible=True,
-        minimized=False,
-        rect=(0, 0, 900, 600),
+        minimized=minimized,
+        rect=rect,
         process_id=process_id,
         window_class=window_class,
         launch_fingerprint=fingerprint,
@@ -500,6 +503,114 @@ class _BoundedWorker:
         self.cleanup_calls += 1
 
 
+def _snapshot_identity_key(window, component_count):
+    stable = (
+        str(window.launch_fingerprint),
+        str(window.handle),
+        str(window.process_id),
+        str(window.thread_id),
+        base64.b64encode(window.window_class.encode("utf-8")).decode("ascii"),
+        str(window.process_lifecycle_token),
+    )
+    if component_count == len(stable):
+        return "|".join(stable)
+    if component_count == len(stable) + 5:
+        return "|".join(
+            stable
+            + tuple(str(value) for value in window.rect)
+            + ("1" if window.minimized else "0",)
+        )
+    raise AssertionError("unexpected bounded identity schema")
+
+
+class _SnapshotContractWorker(_BoundedWorker):
+    def __init__(self, payload, current_windows):
+        super().__init__()
+        self.emit(BattleReopenStage.FIRST_ABSENCE_STARTED.value)
+        expected = tuple(payload["expected_identity_keys"])
+        if any(
+            window.launch_fingerprint is None
+            or not window.window_class
+            or not window.thread_id
+            or not window.process_lifecycle_token
+            for window in current_windows
+        ):
+            failure_code = "battle_window_existing_state_unknown"
+        else:
+            component_count = len(expected[0].split("|")) if expected else 6
+            actual = tuple(
+                sorted(
+                    _snapshot_identity_key(window, component_count)
+                    for window in current_windows
+                )
+            )
+            failure_code = (
+                None
+                if actual == tuple(sorted(expected))
+                else "battle_contract_identity_changed"
+            )
+            if (
+                failure_code is None
+                and any(
+                    window.launch_fingerprint == payload["fingerprint"]
+                    for window in current_windows
+                )
+            ):
+                failure_code = "battle_window_already_exists"
+        if failure_code is not None:
+            self._events.append(
+                {
+                    "stage": BattleReopenStage.FAILED.value,
+                    "timestamp_ms": 1_000 + len(self._events),
+                    "failure_code": failure_code,
+                }
+            )
+            return
+        self.emit(
+            BattleReopenStage.FIRST_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value,
+            BattleReopenStage.SHORTCUT_FINGERPRINT_COMPLETED.value,
+            BattleReopenStage.SECOND_ABSENCE_STARTED.value,
+            BattleReopenStage.SECOND_ABSENCE_COMPLETED.value,
+            BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value,
+        )
+
+
+def _begin_bounded_with_peer_snapshot(
+    tmp_path,
+    *,
+    original_windows,
+    current_windows,
+):
+    now = [0.0]
+    payloads = []
+
+    def worker_factory(payload):
+        payloads.append(payload)
+        return _SnapshotContractWorker(payload, current_windows)
+
+    restarter = _bounded_restarter(worker_factory, now)
+    target = _target(tmp_path)
+    result = restarter.begin_bounded_reopen(
+        owner=target.fingerprint,
+        entry_id=target.entry_id,
+        original_instance=(
+            target.fingerprint,
+            11,
+            101,
+            501,
+            "ShockwaveFlash",
+            1001,
+            (0, 0, 900, 600),
+            False,
+        ),
+        target=target,
+        candidate_windows=original_windows,
+        deadline=60.0,
+    )
+    return result, payloads
+
+
 def _bounded_restarter(worker_factory, now):
     return WindowsBattleWindowRestarter(
         _Windows([]),
@@ -536,6 +647,243 @@ def _begin_bounded(restarter, tmp_path, *, deadline=60.0):
         candidate_windows=(),
         deadline=deadline,
     )
+
+
+@pytest.mark.parametrize(
+    ("original_peer", "current_peer"),
+    (
+        (
+            _window(fingerprint="b" * 64),
+            _window(fingerprint="b" * 64, rect=(20, 30, 920, 630)),
+        ),
+        (
+            _window(fingerprint="b" * 64),
+            _window(fingerprint="b" * 64, rect=(0, 0, 1024, 768)),
+        ),
+        (
+            _window(fingerprint="b" * 64, minimized=True),
+            _window(fingerprint="b" * 64, minimized=False),
+        ),
+    ),
+    ids=("move", "resize", "minimize-restore"),
+)
+def test_bounded_reopen_peer_layout_change_preserves_stable_contract(
+    tmp_path,
+    original_peer,
+    current_peer,
+):
+    result, _payloads = _begin_bounded_with_peer_snapshot(
+        tmp_path,
+        original_windows=(original_peer,),
+        current_windows=(current_peer,),
+    )
+
+    assert result.pending is True
+    assert result.stage == BattleReopenStage.SHORTCUT_LAUNCH_PREPARED.value
+    assert result.failure_code is None
+
+
+@pytest.mark.parametrize(
+    ("current_peer", "changed_field"),
+    (
+        (
+            _window(
+                handle=13,
+                process_id=102,
+                fingerprint="b" * 64,
+                thread_id=502,
+                process_lifecycle_token=1002,
+            ),
+            "handle",
+        ),
+        (
+            _window(
+                handle=12,
+                process_id=103,
+                fingerprint="b" * 64,
+                thread_id=502,
+                process_lifecycle_token=1002,
+            ),
+            "process-id",
+        ),
+        (
+            _window(
+                handle=12,
+                process_id=102,
+                fingerprint="b" * 64,
+                thread_id=503,
+                process_lifecycle_token=1002,
+            ),
+            "thread-id",
+        ),
+        (
+            _window(
+                handle=12,
+                process_id=102,
+                fingerprint="b" * 64,
+                thread_id=502,
+                process_lifecycle_token=1003,
+            ),
+            "lifecycle",
+        ),
+    ),
+    ids=("handle", "process-id", "thread-id", "lifecycle"),
+)
+def test_bounded_reopen_rejects_single_stable_peer_identity_change(
+    tmp_path,
+    current_peer,
+    changed_field,
+):
+    original_peer = _window(
+        handle=12,
+        process_id=102,
+        fingerprint="b" * 64,
+        thread_id=502,
+        process_lifecycle_token=1002,
+    )
+
+    result, payloads = _begin_bounded_with_peer_snapshot(
+        tmp_path,
+        original_windows=(original_peer,),
+        current_windows=(current_peer,),
+    )
+
+    assert changed_field
+    assert result.failure_code == "battle_contract_identity_changed"
+    assert result.pending is False
+    assert payloads[0]["expected_identity_keys"]
+
+
+@pytest.mark.parametrize(
+    "current_windows",
+    (
+        (
+            _window(
+                handle=12,
+                process_id=102,
+                fingerprint=None,
+                thread_id=502,
+                process_lifecycle_token=1002,
+            ),
+        ),
+        (
+            _window(
+                handle=12,
+                process_id=102,
+                fingerprint="b" * 64,
+                thread_id=502,
+                process_lifecycle_token=1002,
+            ),
+        )
+        * 2,
+    ),
+    ids=("unknown", "duplicate"),
+)
+def test_bounded_reopen_rejects_unknown_or_duplicate_peer_snapshot(
+    tmp_path,
+    current_windows,
+):
+    original_peer = _window(
+        handle=12,
+        process_id=102,
+        fingerprint="b" * 64,
+        thread_id=502,
+        process_lifecycle_token=1002,
+    )
+
+    result, _payloads = _begin_bounded_with_peer_snapshot(
+        tmp_path,
+        original_windows=(original_peer,),
+        current_windows=current_windows,
+    )
+
+    assert result.failure_code in {
+        "battle_window_existing_state_unknown",
+        "battle_contract_identity_changed",
+    }
+    assert result.pending is False
+
+
+def test_bounded_reopen_rejects_missing_healthy_peer(tmp_path):
+    first_peer = _window(
+        handle=12,
+        process_id=102,
+        fingerprint="b" * 64,
+        thread_id=502,
+        process_lifecycle_token=1002,
+    )
+    second_peer = _window(
+        handle=13,
+        process_id=103,
+        fingerprint="c" * 64,
+        thread_id=503,
+        process_lifecycle_token=1003,
+    )
+
+    result, _payloads = _begin_bounded_with_peer_snapshot(
+        tmp_path,
+        original_windows=(first_peer, second_peer),
+        current_windows=(first_peer,),
+    )
+
+    assert result.failure_code == "battle_contract_identity_changed"
+    assert result.pending is False
+
+
+def test_bounded_reopen_rejects_old_owner_reappearing(tmp_path):
+    peer = _window(
+        handle=12,
+        process_id=102,
+        fingerprint="b" * 64,
+        thread_id=502,
+        process_lifecycle_token=1002,
+    )
+    old_owner = _window(
+        handle=11,
+        process_id=101,
+        fingerprint="a" * 64,
+        thread_id=501,
+        process_lifecycle_token=1001,
+    )
+
+    result, payloads = _begin_bounded_with_peer_snapshot(
+        tmp_path,
+        original_windows=(peer,),
+        current_windows=(peer, old_owner),
+    )
+
+    assert result.failure_code == "battle_contract_identity_changed"
+    assert result.pending is False
+    assert payloads[0]["fingerprint"] == old_owner.launch_fingerprint
+
+
+def test_bounded_worker_identity_key_excludes_layout_and_minimized_state():
+    key_block = _POWERSHELL_REOPEN_SCRIPT.split("$key = @(", 1)[1].split(
+        ") -join '|'",
+        1,
+    )[0]
+
+    for stable_field in (
+        "$fingerprint",
+        "$row.Handle",
+        "$row.ProcessId",
+        "$row.ThreadId",
+        "$classB64",
+        "$row.Lifecycle",
+    ):
+        assert stable_field in key_block
+    for layout_field in (
+        "$row.Left",
+        "$row.Top",
+        "$row.Right",
+        "$row.Bottom",
+        "$row.Minimized",
+    ):
+        assert layout_field not in key_block
+    assert "$actual.Count -ne $expected.Count" in _POWERSHELL_REOPEN_SCRIPT
+    assert "Sort-Object" in _POWERSHELL_REOPEN_SCRIPT
+    assert "[StringComparison]::Ordinal" in _POWERSHELL_REOPEN_SCRIPT
+    assert "$snapshot.Fingerprints" in _POWERSHELL_REOPEN_SCRIPT
 
 
 @pytest.mark.parametrize(
