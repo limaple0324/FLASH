@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
+import zlib
 from collections import Counter
 from dataclasses import dataclass, replace
 from ctypes import wintypes
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
+
+from PIL import Image
 
 from adapters.game_screen_recognizer import (
     CharacterSelectionCandidate,
@@ -125,6 +130,11 @@ AUTO_BATTLE_RECHECK_SECONDS = 2
 RECONNECT_TOTAL_BUDGET_SECONDS = 60.0
 START_GAME_BUDGET_SECONDS = 60.0
 TIMING_DIAGNOSTIC_LIMIT = 256
+_POST_LOGIN_DIAGNOSTIC_OFFSETS_SECONDS = (2.5, 5.0, 30.0)
+_DIAGNOSTIC_RECORD_MAX_ATTEMPTS = 2
+_DIAGNOSTIC_RECORD_LIMIT = 64
+_OPERATION_RECORD_DETAIL_LIMIT = 240
+_DIAGNOSTIC_CHUNK_DATA_LENGTH = 80
 _TCP_N = 3
 _TCP_T = 7
 _ISOLATABLE_TARGET_WINDOW_FAILURE_CODES = frozenset(
@@ -323,6 +333,180 @@ class _TcpRecoveryAuthority:
 
 
 @dataclass(frozen=True, slots=True)
+class _PostLoginDiagnosticFrame:
+    target_offset_seconds: float
+    captured_at_monotonic: float
+    width: int
+    height: int
+    pixels: bytes
+    recognition: ScreenRecognition
+
+
+@dataclass(slots=True)
+class _PostLoginDiagnosticEvent:
+    authority: _TcpRecoveryAuthority
+    key: tuple[object, ...]
+    owner: str
+    entry_id: str
+    old_instance: WindowInstanceToken
+    new_instance: WindowInstanceToken
+    scope_token: str | None
+    armed_at_monotonic: float
+    capture_settings_revision: int
+    next_offset_index: int = 0
+    frames: tuple[_PostLoginDiagnosticFrame, ...] = ()
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = (
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ForceLoginMessageWindowState:
+    observed_at_monotonic: float
+    foreground_handle: int
+    target_handle: int
+    target_instance: _WindowInstanceCredential
+    gui_thread_id: int
+    active_handle: int
+    focus_handle: int
+    focus_root_handle: int
+    target_is_foreground: bool
+    target_has_focus: bool
+    cursor: tuple[int, int]
+    target_visible: bool
+    target_minimized: bool
+    target_rect: tuple[int, int, int, int]
+    presentation_state: str
+    target_topmost: bool
+    previous_instance: _WindowInstanceCredential | None
+    next_instance: _WindowInstanceCredential | None
+    expected_visible: bool | None = None
+    expected_minimized: bool | None = None
+    expected_rect: tuple[int, int, int, int] | None = None
+    expected_presentation_state: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ForceLoginMessageEvidence:
+    sequence: int
+    message: int
+    message_name: str
+    before: _ForceLoginMessageWindowState | None
+    after: _ForceLoginMessageWindowState | None
+    attempted: bool
+    confirmed: bool
+    drift_fields: tuple[str, ...]
+    target_drift_fields: tuple[str, ...] = ()
+    external_change_fields: tuple[str, ...] = ()
+    change_kind: str | None = None
+    cause: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ForceLoginFormalPresentation:
+    visible: bool
+    minimized: bool
+    rect: tuple[int, int, int, int]
+    presentation_state: str
+
+
+class _LoginInputTransactionState(Enum):
+    PREPARING = "preparing"
+    AUTHORIZED = "authorized"
+    CONSUMED = "consumed"
+    RESULT_RECORDED = "result_recorded"
+    REJECTED = "rejected"
+    INVALIDATED = "invalidated"
+    EVIDENCE_FAILED = "evidence_failed"
+
+
+@dataclass(slots=True)
+class _LoginInputAuthorizationTransaction:
+    authority: _TcpRecoveryAuthority
+    key: tuple[object, ...]
+    owner: str
+    entry_id: str
+    new_instance: WindowInstanceToken
+    scope_token: str | None
+    context_key: tuple[object, ...] = ()
+    event_sequence: int = 1
+    state: _LoginInputTransactionState = (
+        _LoginInputTransactionState.PREPARING
+    )
+    expected_screen: ReconnectScreenState = (
+        ReconnectScreenState.FORCE_LOGIN_START
+    )
+    expected_action: str = "force_login"
+    expected_point: NormalizedPoint | None = None
+    confirmation_signature: tuple[object, ...] = ()
+    confirmation_frame_digests: tuple[str, ...] = ()
+    confirmation_observation_epochs: tuple[int, ...] = ()
+    formal_presentation: _ForceLoginFormalPresentation | None = None
+    formal_window_state: _ForceLoginMessageWindowState | None = None
+    intent_sequence: int | None = None
+    evidence_authority_signature: str | None = None
+    consumed: bool = False
+    permanent_input_blocked: bool = False
+    terminal_reason: str | None = None
+    departure_signature: tuple[object, ...] | None = None
+    departure_frame_digests: tuple[str, ...] = ()
+    departure_observation_epochs: tuple[int, ...] = ()
+    return_signature: tuple[object, ...] | None = None
+    return_frame_digests: tuple[str, ...] = ()
+    return_observation_epochs: tuple[int, ...] = ()
+    semantic_departure_confirmed: bool = False
+    semantic_event_ready: bool = False
+    evidence: tuple[_ForceLoginMessageEvidence, ...] = ()
+    first_drift: tuple[str, ...] = ()
+    completed: bool = False
+    persistent_record_attempted: bool = False
+    persistent_record_succeeded: bool = False
+    persistent_record_failed: bool = False
+    target_drift: bool = False
+    attempt_sequence: int = 1
+
+
+# Kept as a local compatibility alias while the per-message observer is
+# consumed exclusively by the authorization transaction above.
+_ForceLoginMessageDiagnosticEvent = _LoginInputAuthorizationTransaction
+
+
+@dataclass(slots=True)
+class _LineFallbackSearchEvent:
+    authority: _TcpRecoveryAuthority
+    key: tuple[object, ...]
+    original_line: int
+    phase: str
+    routes: tuple[int, ...] = ()
+    last_page: tuple[int, ...] = ()
+    invalid: bool = False
+    record_sequence: int = 0
+    record_failed: bool = False
+
+
+@dataclass(slots=True)
+class _PendingDiagnosticRecord:
+    role: str
+    details: tuple[str, ...]
+    kind: str
+    event_key_sha256: str
+    attempt_sequence: int | None
+    attempts: int = 1
+    status: str = "pending_retry"
+
+
+@dataclass(frozen=True, slots=True)
 class RegisteredReconnectRole:
     """One saved game ID used only to resolve a same-level role tie."""
 
@@ -372,6 +556,33 @@ class MouseMessageBackend(Protocol):
     ) -> MouseClickResult:
         """Send one client-relative left click to an already validated window."""
 
+    def click_relative_diagnosed(
+        self,
+        handle: int,
+        point: NormalizedPoint,
+        expected_process_id: int,
+        instance_token: WindowInstanceToken,
+        formal_presentation: _ForceLoginFormalPresentation,
+        observed_presentation_reader: Callable[
+            [bool, bool, tuple[int, int, int, int]], str
+        ],
+        diagnostic_recorder: Callable[[_ForceLoginMessageEvidence], None],
+        formal_window_state: _ForceLoginMessageWindowState | None = None,
+    ) -> MouseClickResult:
+        """Send one click while recording each formal login message boundary."""
+
+    def observe_relative_diagnosed(
+        self,
+        handle: int,
+        expected_process_id: int,
+        instance_token: WindowInstanceToken,
+        formal_presentation: _ForceLoginFormalPresentation,
+        observed_presentation_reader: Callable[
+            [bool, bool, tuple[int, int, int, int]], str
+        ],
+    ) -> _ForceLoginMessageWindowState | None:
+        """Read the guarded formal-login state without sending input."""
+
     def scroll_relative(
         self,
         handle: int,
@@ -403,6 +614,7 @@ class Win32MouseMessageBackend:
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     SYNCHRONIZE = 0x00100000
     WAIT_TIMEOUT = 0x00000102
+    GA_ROOT = 2
     _window_state_lock = (
         Win32RecoveringPrintWindowProvider._window_state_lock
     )
@@ -455,6 +667,15 @@ class Win32MouseMessageBackend:
             ctypes.c_int,
         )
         user32.GetClassNameW.restype = ctypes.c_int
+        user32.GetGUIThreadInfo.argtypes = (
+            wintypes.DWORD,
+            ctypes.POINTER(_GUITHREADINFO),
+        )
+        user32.GetGUIThreadInfo.restype = wintypes.BOOL
+        user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+        user32.GetAncestor.restype = wintypes.HWND
+        user32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
+        user32.GetCursorPos.restype = wintypes.BOOL
 
     @staticmethod
     def _configure_kernel32(kernel32) -> None:
@@ -733,6 +954,388 @@ class Win32MouseMessageBackend:
         )
 
     @classmethod
+    def _force_login_message_window_state(
+        cls,
+        user32,
+        kernel32,
+        hwnd,
+        *,
+        token: WindowInstanceToken,
+        formal_presentation: _ForceLoginFormalPresentation,
+        observed_presentation_reader: Callable[
+            [bool, bool, tuple[int, int, int, int]], str
+        ],
+    ) -> _ForceLoginMessageWindowState | None:
+        try:
+            gui = _GUITHREADINFO()
+            gui.cbSize = ctypes.sizeof(_GUITHREADINFO)
+            cursor = wintypes.POINT()
+            target_rect = wintypes.RECT()
+            target_handle = cls._handle_value(hwnd)
+            foreground = cls._handle_value(user32.GetForegroundWindow())
+            foreground_process_id = wintypes.DWORD()
+            foreground_thread_id = (
+                int(
+                    user32.GetWindowThreadProcessId(
+                        wintypes.HWND(foreground),
+                        ctypes.byref(foreground_process_id),
+                    )
+                )
+                if foreground
+                else 0
+            )
+            if (
+                not foreground_thread_id
+                or not user32.GetGUIThreadInfo(
+                    wintypes.DWORD(foreground_thread_id),
+                    ctypes.byref(gui),
+                )
+                or not user32.GetCursorPos(ctypes.byref(cursor))
+            ):
+                return None
+            active = cls._handle_value(gui.hwndActive)
+            focus = cls._handle_value(gui.hwndFocus)
+            focus_root = (
+                cls._handle_value(
+                    user32.GetAncestor(
+                        wintypes.HWND(focus),
+                        cls.GA_ROOT,
+                    )
+                )
+                if focus
+                else 0
+            )
+            target_instance = cls._state_instance_credential(
+                user32,
+                kernel32,
+                target_handle,
+            )
+            previous_handle = cls._handle_value(
+                user32.GetWindow(
+                    hwnd,
+                    Win32TemporarilyRevealedCaptureProvider.GW_HWNDPREV,
+                )
+            )
+            next_handle = cls._handle_value(
+                user32.GetWindow(
+                    hwnd,
+                    Win32TemporarilyRevealedCaptureProvider.GW_HWNDNEXT,
+                )
+            )
+            previous_instance = (
+                cls._state_instance_credential(
+                    user32,
+                    kernel32,
+                    previous_handle,
+                )
+                if previous_handle
+                else None
+            )
+            next_instance = (
+                cls._state_instance_credential(
+                    user32,
+                    kernel32,
+                    next_handle,
+                )
+                if next_handle
+                else None
+            )
+            target_visible = bool(user32.IsWindowVisible(hwnd))
+            target_minimized = bool(user32.IsIconic(hwnd))
+            if (
+                target_instance is None
+                or (previous_handle and previous_instance is None)
+                or (next_handle and next_instance is None)
+                or not user32.GetWindowRect(
+                    hwnd,
+                    ctypes.byref(target_rect),
+                )
+            ):
+                return None
+            observed_rect = (
+                int(target_rect.left),
+                int(target_rect.top),
+                int(target_rect.right),
+                int(target_rect.bottom),
+            )
+            observed_presentation = observed_presentation_reader(
+                target_visible,
+                target_minimized,
+                observed_rect,
+            )
+            if not isinstance(observed_presentation, str):
+                return None
+            return _ForceLoginMessageWindowState(
+                observed_at_monotonic=time.monotonic(),
+                foreground_handle=foreground,
+                target_handle=target_handle,
+                target_instance=target_instance,
+                gui_thread_id=foreground_thread_id,
+                active_handle=active,
+                focus_handle=focus,
+                focus_root_handle=focus_root,
+                target_is_foreground=foreground == target_handle,
+                target_has_focus=bool(
+                    focus == target_handle or focus_root == target_handle
+                ),
+                cursor=(int(cursor.x), int(cursor.y)),
+                target_visible=target_visible,
+                target_minimized=target_minimized,
+                target_rect=observed_rect,
+                presentation_state=observed_presentation,
+                target_topmost=(
+                    Win32TemporarilyRevealedCaptureProvider._is_topmost(
+                        user32,
+                        hwnd,
+                    )
+                ),
+                previous_instance=previous_instance,
+                next_instance=next_instance,
+                expected_visible=formal_presentation.visible,
+                expected_minimized=formal_presentation.minimized,
+                expected_rect=formal_presentation.rect,
+                expected_presentation_state=(
+                    formal_presentation.presentation_state
+                ),
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _force_login_message_changes(
+        baseline: _ForceLoginMessageWindowState | None,
+        current: _ForceLoginMessageWindowState | None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        if baseline is None or current is None:
+            unavailable = ("diagnostic_state_unavailable",)
+            return unavailable, unavailable, ()
+        fields: list[str] = []
+        for name in (
+            "foreground_handle",
+            "target_handle",
+            "target_instance",
+            "gui_thread_id",
+            "active_handle",
+            "focus_handle",
+            "focus_root_handle",
+            "target_is_foreground",
+            "target_has_focus",
+            "cursor",
+            "target_visible",
+            "target_minimized",
+            "target_rect",
+            "presentation_state",
+            "target_topmost",
+            "previous_instance",
+            "next_instance",
+        ):
+            if getattr(baseline, name) != getattr(current, name):
+                fields.append(name)
+        target_fields = [
+            name
+            for name in fields
+            if name
+            in {
+                "target_handle",
+                "target_instance",
+                "target_visible",
+                "target_minimized",
+                "target_rect",
+                "presentation_state",
+                "target_topmost",
+                "previous_instance",
+                "next_instance",
+            }
+        ]
+        if (
+            not baseline.target_is_foreground
+            and current.target_is_foreground
+        ):
+            target_fields.append("target_became_foreground")
+        if (
+            baseline.focus_root_handle != baseline.target_handle
+            and current.focus_root_handle == current.target_handle
+        ):
+            target_fields.append("target_gained_global_focus")
+        target = tuple(dict.fromkeys(target_fields))
+        external = tuple(name for name in fields if name not in target_fields)
+        return tuple(fields), target, external
+
+    @staticmethod
+    def _force_login_formal_state_matches(
+        state: _ForceLoginMessageWindowState | None,
+        token: WindowInstanceToken,
+        formal: _ForceLoginFormalPresentation,
+    ) -> bool:
+        if state is None:
+            return False
+        identity = state.target_instance
+        return bool(
+            state.target_handle == token.handle
+            and identity.handle == token.handle
+            and identity.process_id == token.process_id
+            and identity.thread_id == token.thread_id
+            and identity.window_class == token.window_class
+            and identity.process_lifecycle_token
+            == token.process_lifecycle_token
+            and state.target_visible is formal.visible
+            and state.target_minimized is formal.minimized
+            and state.target_rect == formal.rect
+            and state.presentation_state == formal.presentation_state
+        )
+
+    @staticmethod
+    def _force_login_transaction_baseline_changes(
+        expected: _ForceLoginMessageWindowState | None,
+        current: _ForceLoginMessageWindowState | None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        if expected is None or current is None:
+            unavailable = ("diagnostic_state_unavailable",)
+            return unavailable, unavailable, ()
+        target_fields: list[str] = []
+        if expected.target_is_foreground is not current.target_is_foreground:
+            target_fields.append("target_is_foreground")
+        expected_global_focus = (
+            expected.focus_root_handle == expected.target_handle
+        )
+        current_global_focus = (
+            current.focus_root_handle == current.target_handle
+        )
+        if expected_global_focus is not current_global_focus:
+            target_fields.append("target_global_focus_root")
+        for name in (
+            "target_topmost",
+            "previous_instance",
+            "next_instance",
+        ):
+            if getattr(expected, name) != getattr(current, name):
+                target_fields.append(name)
+        external_fields = [
+            name
+            for name in (
+                "foreground_handle",
+                "gui_thread_id",
+                "active_handle",
+                "focus_handle",
+                "focus_root_handle",
+                "cursor",
+            )
+            if getattr(expected, name) != getattr(current, name)
+        ]
+        drift = tuple(dict.fromkeys(target_fields + external_fields))
+        return drift, tuple(target_fields), tuple(external_fields)
+
+    @classmethod
+    def _diagnosed_message_attempt(
+        cls,
+        user32,
+        kernel32,
+        hwnd,
+        *,
+        token: WindowInstanceToken,
+        process_handle,
+        message: int,
+        wparam: int,
+        lparam: int,
+        baseline: _ForceLoginMessageWindowState | None,
+        formal_presentation: _ForceLoginFormalPresentation,
+        observed_presentation_reader: Callable[
+            [bool, bool, tuple[int, int, int, int]], str
+        ],
+        sequence: int,
+        allow_despite_pre_drift: bool,
+        action_state_is_current: Callable[[], bool],
+        diagnostic_recorder: Callable[[_ForceLoginMessageEvidence], None],
+    ) -> tuple[_MessageAttempt, tuple[str, ...], bool]:
+        before = cls._force_login_message_window_state(
+            user32,
+            kernel32,
+            hwnd,
+            token=token,
+            formal_presentation=formal_presentation,
+            observed_presentation_reader=observed_presentation_reader,
+        )
+        pre_changes, pre_target_drift, pre_external = (
+            cls._force_login_message_changes(baseline, before)
+        )
+        if pre_target_drift and not allow_despite_pre_drift:
+            attempt = _MessageAttempt(False, False)
+            after = before
+        else:
+            attempt = cls._send_confirmed(
+                user32,
+                kernel32,
+                hwnd,
+                token=token,
+                process_handle=process_handle,
+                message=message,
+                wparam=wparam,
+                lparam=lparam,
+            )
+            after = cls._force_login_message_window_state(
+                user32,
+                kernel32,
+                hwnd,
+                token=token,
+                formal_presentation=formal_presentation,
+                observed_presentation_reader=observed_presentation_reader,
+            )
+        after_changes, after_target_drift, after_external = (
+            cls._force_login_message_changes(baseline, after)
+        )
+        changes = tuple(
+            dict.fromkeys(
+                pre_changes + after_changes
+            )
+        )
+        target_drift = tuple(
+            dict.fromkeys(pre_target_drift + after_target_drift)
+        )
+        external_changes = tuple(
+            dict.fromkeys(pre_external + after_external)
+        )
+        guard_current = action_state_is_current()
+        if not guard_current:
+            guard_field = "target_identity_or_presentation_guard_changed"
+            changes = tuple(dict.fromkeys((*changes, guard_field)))
+            target_drift = tuple(
+                dict.fromkeys((*target_drift, guard_field))
+            )
+        diagnostic_recorder(
+            _ForceLoginMessageEvidence(
+                sequence=sequence,
+                message=message,
+                message_name={
+                    cls.WM_MOUSEMOVE: "WM_MOUSEMOVE",
+                    cls.WM_LBUTTONDOWN: "WM_LBUTTONDOWN",
+                    cls.WM_LBUTTONUP: "WM_LBUTTONUP",
+                }.get(message, str(message)),
+                before=before,
+                after=after,
+                attempted=attempt.attempted,
+                confirmed=attempt.confirmed,
+                drift_fields=changes,
+                target_drift_fields=target_drift,
+                external_change_fields=external_changes,
+                change_kind=(
+                    "target_change"
+                    if target_drift
+                    else "external_change"
+                    if external_changes
+                    else None
+                ),
+                cause=(
+                    "target_state_changed"
+                    if target_drift
+                    else "cause_unknown"
+                    if external_changes
+                    else None
+                ),
+            )
+        )
+        return attempt, target_drift, guard_current
+
+    @classmethod
     def _release_after_down_attempt(
         cls,
         user32,
@@ -850,6 +1453,235 @@ class Win32MouseMessageBackend:
         if (
             not state_after_down_is_current
             or not action_state_is_current()
+        ):
+            return MouseClickResult(
+                False,
+                True,
+                True,
+                "input_window_state_changed_during_click",
+            )
+        return MouseClickResult(True, True, False, None)
+
+    @classmethod
+    def _deliver_click_messages_diagnosed(
+        cls,
+        user32,
+        kernel32,
+        hwnd,
+        *,
+        token: WindowInstanceToken,
+        process_handle,
+        lparam: int,
+        action_state_is_current: Callable[[], bool],
+        formal_presentation: _ForceLoginFormalPresentation,
+        observed_presentation_reader: Callable[
+            [bool, bool, tuple[int, int, int, int]], str
+        ],
+        diagnostic_recorder: Callable[[_ForceLoginMessageEvidence], None],
+        formal_window_state: _ForceLoginMessageWindowState | None = None,
+    ) -> MouseClickResult:
+        if not action_state_is_current():
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                "input_instance_changed_before_move",
+            )
+        baseline = cls._force_login_message_window_state(
+            user32,
+            kernel32,
+            hwnd,
+            token=token,
+            formal_presentation=formal_presentation,
+            observed_presentation_reader=observed_presentation_reader,
+        )
+        if not cls._force_login_formal_state_matches(
+            baseline,
+            token,
+            formal_presentation,
+        ):
+            diagnostic_recorder(
+                _ForceLoginMessageEvidence(
+                    sequence=1,
+                    message=cls.WM_MOUSEMOVE,
+                    message_name="WM_MOUSEMOVE",
+                    before=baseline,
+                    after=baseline,
+                    attempted=False,
+                    confirmed=False,
+                    drift_fields=("formal_presentation_mismatch",),
+                    target_drift_fields=(
+                        "formal_presentation_mismatch",
+                    ),
+                    change_kind="target_change",
+                    cause="target_state_changed",
+                )
+            )
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                "force_login_message_state_changed",
+            )
+        if formal_window_state is not None:
+            drift, target_drift, external_change = (
+                cls._force_login_transaction_baseline_changes(
+                    formal_window_state,
+                    baseline,
+                )
+            )
+            if drift:
+                diagnostic_recorder(
+                    _ForceLoginMessageEvidence(
+                        sequence=0,
+                        message=0,
+                        message_name="PRE_SEND_BASELINE",
+                        before=formal_window_state,
+                        after=baseline,
+                        attempted=False,
+                        confirmed=not target_drift,
+                        drift_fields=drift,
+                        target_drift_fields=target_drift,
+                        external_change_fields=external_change,
+                        change_kind=(
+                            "target_change"
+                            if target_drift
+                            else "external_change"
+                        ),
+                        cause=(
+                            "target_state_changed"
+                            if target_drift
+                            else "cause_unknown"
+                        ),
+                    )
+                )
+            if target_drift:
+                return MouseClickResult(
+                    False,
+                    True,
+                    False,
+                    "force_login_message_state_changed",
+                )
+        moved, move_drift, move_guard_current = (
+            cls._diagnosed_message_attempt(
+            user32,
+            kernel32,
+            hwnd,
+            token=token,
+            process_handle=process_handle,
+            message=cls.WM_MOUSEMOVE,
+            wparam=0,
+            lparam=lparam,
+            baseline=baseline,
+            formal_presentation=formal_presentation,
+            observed_presentation_reader=observed_presentation_reader,
+            sequence=1,
+            allow_despite_pre_drift=False,
+            action_state_is_current=action_state_is_current,
+            diagnostic_recorder=diagnostic_recorder,
+            )
+        )
+        if move_drift:
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                "force_login_message_state_changed",
+            )
+        if not moved.confirmed:
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                (
+                    "input_instance_changed_before_move"
+                    if not moved.attempted
+                    else "mouse_move_delivery_failed"
+                ),
+            )
+        if not move_guard_current:
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                "input_instance_changed_before_down",
+            )
+        pressed, down_drift, down_guard_current = (
+            cls._diagnosed_message_attempt(
+            user32,
+            kernel32,
+            hwnd,
+            token=token,
+            process_handle=process_handle,
+            message=cls.WM_LBUTTONDOWN,
+            wparam=cls.MK_LBUTTON,
+            lparam=lparam,
+            baseline=baseline,
+            formal_presentation=formal_presentation,
+            observed_presentation_reader=observed_presentation_reader,
+            sequence=2,
+            allow_despite_pre_drift=False,
+            action_state_is_current=action_state_is_current,
+            diagnostic_recorder=diagnostic_recorder,
+            )
+        )
+        if not pressed.attempted:
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                (
+                    "force_login_message_state_changed"
+                    if down_drift
+                    else "input_instance_changed_before_down"
+                ),
+            )
+        state_after_down_is_current = down_guard_current
+        up_attempt, up_drift, up_guard_current = (
+            cls._diagnosed_message_attempt(
+            user32,
+            kernel32,
+            hwnd,
+            token=token,
+            process_handle=process_handle,
+            message=cls.WM_LBUTTONUP,
+            wparam=0,
+            lparam=lparam,
+            baseline=baseline,
+            formal_presentation=formal_presentation,
+            observed_presentation_reader=observed_presentation_reader,
+            sequence=3,
+            allow_despite_pre_drift=True,
+            action_state_is_current=action_state_is_current,
+            diagnostic_recorder=diagnostic_recorder,
+            )
+        )
+        released = up_attempt.confirmed
+        any_drift = tuple(dict.fromkeys(down_drift + up_drift))
+        if any_drift:
+            return MouseClickResult(
+                False,
+                True,
+                True,
+                "force_login_message_state_changed",
+            )
+        if not pressed.confirmed:
+            return MouseClickResult(
+                False,
+                True,
+                True,
+                "mouse_down_delivery_uncertain",
+            )
+        if not released:
+            return MouseClickResult(
+                False,
+                True,
+                True,
+                "mouse_up_delivery_uncertain",
+            )
+        if (
+            not state_after_down_is_current
+            or not up_guard_current
         ):
             return MouseClickResult(
                 False,
@@ -1289,6 +2121,151 @@ class Win32MouseMessageBackend:
             except OSError:
                 pass
 
+    def click_relative_diagnosed(
+        self,
+        handle: int,
+        point: NormalizedPoint,
+        expected_process_id: int,
+        instance_token: WindowInstanceToken,
+        formal_presentation: _ForceLoginFormalPresentation,
+        observed_presentation_reader: Callable[
+            [bool, bool, tuple[int, int, int, int]], str
+        ],
+        diagnostic_recorder: Callable[[_ForceLoginMessageEvidence], None],
+        formal_window_state: _ForceLoginMessageWindowState | None = None,
+    ) -> MouseClickResult:
+        if (
+            not callable(observed_presentation_reader)
+            or not callable(diagnostic_recorder)
+        ):
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                "force_login_message_diagnostic_unavailable",
+            )
+        user32 = self._user32()
+        kernel32 = self._kernel32()
+        if (
+            user32 is None
+            or kernel32 is None
+            or not isinstance(expected_process_id, int)
+            or isinstance(expected_process_id, bool)
+            or expected_process_id <= 0
+            or not isinstance(instance_token, WindowInstanceToken)
+            or not isinstance(
+                formal_presentation,
+                _ForceLoginFormalPresentation,
+            )
+            or instance_token.handle != handle
+            or instance_token.process_id != expected_process_id
+        ):
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                "input_instance_token_invalid",
+            )
+        self._configure(user32)
+        self._configure_kernel32(kernel32)
+        hwnd = wintypes.HWND(handle)
+        process_handle = self._open_expected_process(
+            kernel32,
+            instance_token,
+        )
+        if not process_handle:
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                "input_process_lifecycle_mismatch",
+            )
+        try:
+            with self._window_state_lock:
+                return self._click_relative_locked(
+                    user32,
+                    kernel32,
+                    hwnd,
+                    point=point,
+                    token=instance_token,
+                    process_handle=process_handle,
+                    wheel_delta=None,
+                    formal_presentation=formal_presentation,
+                    observed_presentation_reader=(
+                        observed_presentation_reader
+                    ),
+                    diagnostic_recorder=diagnostic_recorder,
+                    formal_window_state=formal_window_state,
+                )
+        finally:
+            try:
+                kernel32.CloseHandle(process_handle)
+            except OSError:
+                pass
+
+    def observe_relative_diagnosed(
+        self,
+        handle: int,
+        expected_process_id: int,
+        instance_token: WindowInstanceToken,
+        formal_presentation: _ForceLoginFormalPresentation,
+        observed_presentation_reader: Callable[
+            [bool, bool, tuple[int, int, int, int]], str
+        ],
+    ) -> _ForceLoginMessageWindowState | None:
+        if (
+            not callable(observed_presentation_reader)
+            or not isinstance(expected_process_id, int)
+            or isinstance(expected_process_id, bool)
+            or expected_process_id <= 0
+            or not isinstance(instance_token, WindowInstanceToken)
+            or not isinstance(
+                formal_presentation,
+                _ForceLoginFormalPresentation,
+            )
+            or instance_token.handle != handle
+            or instance_token.process_id != expected_process_id
+        ):
+            return None
+        user32 = self._user32()
+        kernel32 = self._kernel32()
+        if user32 is None or kernel32 is None:
+            return None
+        self._configure(user32)
+        self._configure_kernel32(kernel32)
+        hwnd = wintypes.HWND(handle)
+        process_handle = self._open_expected_process(
+            kernel32,
+            instance_token,
+        )
+        if not process_handle:
+            return None
+        try:
+            with self._window_state_lock:
+                if not self._static_instance_is_current(
+                    user32,
+                    kernel32,
+                    hwnd,
+                    token=instance_token,
+                    process_handle=process_handle,
+                ):
+                    return None
+                return self._force_login_message_window_state(
+                    user32,
+                    kernel32,
+                    hwnd,
+                    token=instance_token,
+                    formal_presentation=formal_presentation,
+                    observed_presentation_reader=(
+                        observed_presentation_reader
+                    ),
+                )
+        finally:
+            try:
+                kernel32.CloseHandle(process_handle)
+            except OSError:
+                pass
+
     def scroll_relative(
         self,
         handle: int,
@@ -1368,6 +2345,14 @@ class Win32MouseMessageBackend:
         token: WindowInstanceToken,
         process_handle,
         wheel_delta: int | None,
+        formal_presentation: _ForceLoginFormalPresentation | None = None,
+        observed_presentation_reader: (
+            Callable[[bool, bool, tuple[int, int, int, int]], str] | None
+        ) = None,
+        diagnostic_recorder: (
+            Callable[[_ForceLoginMessageEvidence], None] | None
+        ) = None,
+        formal_window_state: _ForceLoginMessageWindowState | None = None,
     ) -> MouseClickResult:
         state = Win32TemporarilyRevealedCaptureProvider
         recovery = Win32RecoveringPrintWindowProvider
@@ -1797,6 +2782,32 @@ class Win32MouseMessageBackend:
                         delta=wheel_delta,
                         action_state_is_current=action_state_is_current,
                     )
+                if diagnostic_recorder is not None:
+                    if (
+                        formal_presentation is None
+                        or not callable(observed_presentation_reader)
+                    ):
+                        return MouseClickResult(
+                            False,
+                            not temporarily_restored,
+                            False,
+                            "force_login_message_diagnostic_unavailable",
+                        )
+                    return self._deliver_click_messages_diagnosed(
+                        user32,
+                        kernel32,
+                        hwnd,
+                        token=token,
+                        process_handle=process_handle,
+                        lparam=lparam,
+                        action_state_is_current=action_state_is_current,
+                        formal_presentation=formal_presentation,
+                        observed_presentation_reader=(
+                            observed_presentation_reader
+                        ),
+                        diagnostic_recorder=diagnostic_recorder,
+                        formal_window_state=formal_window_state,
+                    )
                 return self._deliver_click_messages(
                     user32,
                     kernel32,
@@ -2031,6 +3042,8 @@ class _ActionConfirmation:
     source_state_generation: int
     signature: tuple[object, ...]
     consecutive_frames: int
+    frame_digests: tuple[str, ...] = ()
+    observation_epochs: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2065,6 +3078,7 @@ class _InitialLoginAuthorization:
     capture_settings_revision: int
     source_state_generation: int
     expires_at: float
+    continuation_state: ReconnectScreenState | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2568,6 +3582,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             str,
             _InitialLoginAuthorization,
         ] = {}
+        self._line_input_consumed_fingerprints: set[str] = set()
         self._failure_status_service = failure_status_service
         self._failure_record_callback = failure_record_callback
         self._target_windows_provider = target_windows_provider
@@ -2641,6 +3656,24 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 runtime_state.tcp_recovery_authority
             )
         )
+        self._post_login_diagnostic_event: (
+            _PostLoginDiagnosticEvent | None
+        ) = None
+        self._post_login_diagnostic_output_dir: Path | None = None
+        self._post_login_diagnostic_complete = False
+        self._post_login_diagnostic_export_attempted = False
+        self._post_login_diagnostic_temp_root = Path(tempfile.gettempdir())
+        self._login_input_transaction: (
+            _LoginInputAuthorizationTransaction | None
+        ) = None
+        self._force_login_message_diagnostic_event: (
+            _LoginInputAuthorizationTransaction | None
+        ) = None
+        self._screen_observation_epoch = 0
+        self._line_fallback_search_event: _LineFallbackSearchEvent | None = None
+        self._pending_diagnostic_records: list[
+            _PendingDiagnosticRecord
+        ] = []
         # One delivered timeout confirmation may not be repeated merely
         # because capture routing, settings, or source generation changes.
         # The event is intentionally bound only to immutable window-session
@@ -3398,10 +4431,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         capture_route: str | None,
         rejection_gate: str | None,
         expected_source_state_generation: int | None,
-    ) -> None:
+    ) -> str | None:
         recorder = self._evidence_recorder
         if recorder is None or self._evidence_recording_failed:
-            return
+            return None
         pixels = (
             sample.pixels
             if isinstance(sample, CaptureSample) and sample.api_succeeded
@@ -3426,6 +4459,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
         with self._capture_diagnostic_lock:
             foreground_handle = self._capture_diagnostic_foreground_handle
+        presentation_state = self._evidence_presentation_state(
+            window,
+            capture_route,
+        )
         try:
             recorder.record_observation(
                 raw_window_key=fingerprint,
@@ -3445,10 +4482,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     in {CAPTURE_ROUTE_OBSCURED, CAPTURE_ROUTE_MINIMIZED}
                 ),
                 fallback_recognition_used=False,
-                presentation_state=self._evidence_presentation_state(
-                    window,
-                    capture_route,
-                ),
+                presentation_state=presentation_state,
                 scene_context=(
                     "battle"
                     if recognition.battle_context
@@ -3475,6 +4509,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
         except (OSError, TypeError, ValueError):
             self._mark_evidence_failure()
+        return presentation_state
 
     def _record_evidence_decision(
         self,
@@ -3688,6 +4723,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         fingerprint: str,
         item: ScreenRecognition,
     ) -> bool | None:
+        if type(item.original_line_verified) is bool:
+            return item.original_line_verified
         if item.state is not ReconnectScreenState.LINE_SELECTION:
             return None
         if item.line_scroll_delta:
@@ -3738,10 +4775,12 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         auto_battle_panel_verified: bool | None = None,
         authority_signature: str | None = None,
         input_channel: str = "window_message",
-    ) -> None:
+    ) -> bool:
         recorder = self._evidence_recorder
-        if recorder is None or self._evidence_recording_failed:
-            return
+        if recorder is None:
+            return not self._evidence_required
+        if self._evidence_recording_failed:
+            return False
         try:
             recorder.record_action(
                 raw_window_key=fingerprint,
@@ -3772,6 +4811,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
         except (OSError, TypeError, ValueError):
             self._mark_evidence_failure()
+            return False
+        return True
 
     def _record_auto_battle_panel_verification(
         self,
@@ -3816,13 +4857,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         fresh_capture: bool,
         capture_route: str | None,
         expected_source_state_generation: int | None,
-    ) -> None:
+    ) -> str | None:
         with self._capture_diagnostic_lock:
             window_index = self._capture_diagnostic_window_indices.get(
                 fingerprint
             )
         if window_index is None:
-            return
+            return None
 
         width: int | None = None
         height: int | None = None
@@ -3882,7 +4923,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 *self._capture_diagnostics[-63:],
                 diagnostic,
             )
-        self._record_evidence_observation(
+        return self._record_evidence_observation(
             window=window,
             fingerprint=fingerprint,
             sample=sample,
@@ -3901,6 +4942,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         execute: bool = False,
         expected_source_state_generation: int | None = None,
         diagnostic_stage: str = "scan",
+        presentation_states: dict[
+            tuple[str, WindowInstanceToken], str
+        ] | None = None,
     ) -> tuple[
         object | None,
         ScreenRecognition,
@@ -3916,7 +4960,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             ),
         )
         sample, recognition, fresh_capture, capture_route = result
-        self._record_capture_diagnostic(
+        presentation_state = self._record_capture_diagnostic(
             window=window,
             fingerprint=fingerprint,
             stage=diagnostic_stage,
@@ -3928,6 +4972,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 expected_source_state_generation
             ),
         )
+        instance = WindowInstanceToken.from_window(window)
+        if (
+            presentation_states is not None
+            and instance is not None
+            and isinstance(presentation_state, str)
+        ):
+            presentation_states[(fingerprint, instance)] = (
+                presentation_state
+            )
         return result
 
     def _capture_and_recognize_unobserved(
@@ -5014,6 +6067,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 self._monotonic_clock()
                 + INITIAL_LOGIN_AUTHORIZATION_SECONDS
             )
+            self._line_input_consumed_fingerprints.clear()
             self._initial_login_authorizations = {
                 fingerprint: _InitialLoginAuthorization(
                     instance,
@@ -5106,6 +6160,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         capture_settings_revision: int,
         source_state_generation: int,
         now: float | None = None,
+        *,
+        action_state: ReconnectScreenState | None = None,
     ) -> bool:
         authorization = self._initial_login_authorizations.get(fingerprint)
         if authorization is None or instance is None:
@@ -5122,6 +6178,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             == capture_settings_revision
             and authorization.source_state_generation
             == source_state_generation
+            and (
+                authorization.continuation_state is None
+                or action_state is authorization.continuation_state
+            )
             and self._source_authority_is_current(
                 authorization.source_state_generation
             )
@@ -5269,6 +6329,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def set_execution_enabled(self, enabled: bool) -> None:
         """Allow an active scan to stop before its next game-changing click."""
         if enabled:
+            if not self._cleanup_post_login_diagnostic_output():
+                self._execution_enabled.clear()
+                return
             if not self._record_evidence_monitoring_state(True):
                 self._execution_enabled.clear()
                 return
@@ -5280,6 +6343,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._execution_enabled.clear()
         self._record_evidence_monitoring_state(False)
         with self._scan_lock:
+            self._retry_pending_diagnostic_records()
+            self._export_stopped_timed_out_post_login_diagnostic()
             # A later enable is a new session, never permission to resume an
             # old click, reopen, flow pause, terminal, or capture-route grant.
             self._revoke_capture_authority()
@@ -5309,6 +6374,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             with self._source_authority_lock:
                 self._source_state_generation += 1
                 self._source_revoked_fingerprints.clear()
+            if self._post_login_diagnostic_event is not None:
+                self._post_login_diagnostic_event = None
+                self._post_login_diagnostic_complete = False
 
     @property
     def auto_battle_enabled(self) -> bool:
@@ -7192,12 +8260,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         None,
                     )
                     continue
+                if (
+                    authorization.continuation_state is not None
+                    and not self._same_live_instance_identity(
+                        authorization.instance,
+                        instance,
+                    )
+                ):
+                    self._initial_login_authorizations.pop(
+                        fingerprint,
+                        None,
+                    )
+                    continue
                 self._initial_login_authorizations[fingerprint] = (
                     _InitialLoginAuthorization(
                         instance,
                         authorization.capture_settings_revision,
                         source_state_generation,
                         authorization.expires_at,
+                        authorization.continuation_state,
                     )
                 )
         return tuple(accepted), scoped_target_failures, tuple(failures)
@@ -7245,6 +8326,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             item.recent_line_present,
             item.recent_login_role,
             item.line_scroll_delta,
+            item.line_visible_routes,
+            item.line_list_page_complete,
+            item.line_list_top_verified,
+            item.line_list_bottom_verified,
+            item.line_one_click_point,
+            item.line_fallback_used,
+            item.original_line_verified,
             item.character_level,
             item.character_importance,
             item.character_slot_index,
@@ -7311,6 +8399,489 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         ):
             return replace(item, click_point=None, line_scroll_delta=0)
         return item
+
+    @staticmethod
+    def _merge_trusted_line_pages(
+        existing: tuple[int, ...],
+        page: tuple[int, ...],
+    ) -> tuple[int, ...] | None:
+        if not existing:
+            return page
+        if page == existing or page == existing[-len(page):]:
+            return existing
+        overlaps = tuple(
+            length
+            for length in range(1, min(len(existing), len(page)) + 1)
+            if existing[-length:] == page[:length]
+        )
+        if len(overlaps) != 1:
+            return None
+        merged = existing + page[overlaps[0]:]
+        if (
+            len(merged) != len(set(merged))
+            or tuple(sorted(merged)) != merged
+            or merged
+            != tuple(range(merged[0], merged[-1] + 1))
+        ):
+            return None
+        return merged
+
+    @staticmethod
+    def _diagnostic_record_detail(
+        payload: dict[str, object],
+    ) -> str:
+        return json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @classmethod
+    def _diagnostic_persistence_details(
+        cls,
+        payload: dict[str, object],
+    ) -> tuple[str, ...]:
+        detail = cls._diagnostic_record_detail(payload)
+        if len(detail) <= _OPERATION_RECORD_DETAIL_LIMIT:
+            return (detail,)
+        raw = detail.encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        compressed = zlib.compress(raw, level=9)
+        encoded = base64.b64encode(compressed).decode("ascii")
+        chunks = tuple(
+            encoded[offset : offset + _DIAGNOSTIC_CHUNK_DATA_LENGTH]
+            for offset in range(
+                0,
+                len(encoded),
+                _DIAGNOSTIC_CHUNK_DATA_LENGTH,
+            )
+        )
+        total = len(chunks)
+        persisted = tuple(
+            cls._diagnostic_record_detail(
+                {
+                    "version": 1,
+                    "type": "chunk",
+                    "payload_sha256": digest,
+                    "index": index,
+                    "total": total,
+                    "chunk": chunk,
+                }
+            )
+            for index, chunk in enumerate(chunks)
+        ) + (
+            cls._diagnostic_record_detail(
+                {
+                    "version": 1,
+                    "type": "complete",
+                    "encoding": "zlib+base64",
+                    "payload_sha256": digest,
+                    "total": total,
+                    "raw_bytes": len(raw),
+                    "compressed_bytes": len(compressed),
+                }
+            ),
+        )
+        if any(
+            len(item) > _OPERATION_RECORD_DETAIL_LIMIT
+            for item in persisted
+        ):
+            raise ValueError("diagnostic evidence segment is too long")
+        return persisted
+
+    def _record_diagnostic_payload(
+        self,
+        role: str,
+        payload: dict[str, object],
+        *,
+        attempt_sequence: int | None = None,
+    ) -> bool:
+        callback = self._failure_record_callback
+        if callback is None:
+            return True
+        details = self._diagnostic_persistence_details(payload)
+        try:
+            for detail in details:
+                callback(role, detail)
+            return True
+        except Exception:
+            pending_payload = dict(payload)
+            pending_payload["record_status"] = (
+                "record_failed_retry_pending"
+            )
+            pending_details = self._diagnostic_persistence_details(
+                pending_payload
+            )
+            pending = _PendingDiagnosticRecord(
+                role=role,
+                details=pending_details,
+                kind=str(payload.get("kind") or "unknown"),
+                event_key_sha256=str(
+                    payload.get("event_key_sha256") or ""
+                ),
+                attempt_sequence=attempt_sequence,
+            )
+            if not any(
+                item.role == pending.role
+                and item.details == pending.details
+                for item in self._pending_diagnostic_records
+            ):
+                if (
+                    len(self._pending_diagnostic_records)
+                    < _DIAGNOSTIC_RECORD_LIMIT
+                ):
+                    self._pending_diagnostic_records.append(pending)
+            return False
+
+    def _retry_pending_diagnostic_records(self) -> None:
+        callback = self._failure_record_callback
+        if callback is None:
+            return
+        for pending in tuple(
+            self._pending_diagnostic_records[:_DIAGNOSTIC_RECORD_LIMIT]
+        ):
+            if pending.attempts >= _DIAGNOSTIC_RECORD_MAX_ATTEMPTS:
+                pending.status = "record_failed"
+                continue
+            pending.attempts += 1
+            try:
+                for detail in pending.details:
+                    callback(pending.role, detail)
+            except Exception:
+                pending.status = "record_failed"
+                continue
+            try:
+                self._pending_diagnostic_records.remove(pending)
+            except ValueError:
+                continue
+            if pending.kind == "force_login_message_diagnostic":
+                event = self._force_login_message_diagnostic_event
+                if (
+                    event is not None
+                    and hashlib.sha256(
+                        repr(event.key).encode("utf-8")
+                    ).hexdigest()
+                    == pending.event_key_sha256
+                    and event.attempt_sequence
+                    == pending.attempt_sequence
+                ):
+                    event.persistent_record_succeeded = True
+                    event.persistent_record_failed = False
+
+    def _persist_line_fallback_diagnostic(
+        self,
+        event: _LineFallbackSearchEvent,
+        item: ScreenRecognition,
+        *,
+        overlap: int | None,
+        selected_line: int | None,
+        reason: str,
+    ) -> bool:
+        event.record_sequence += 1
+        callback = self._failure_record_callback
+        if callback is None:
+            return True
+        authority = event.authority
+        payload = {
+            "kind": "line_fallback_search",
+            "event_key_sha256": hashlib.sha256(
+                repr(event.key).encode("utf-8")
+            ).hexdigest(),
+            "sequence": event.record_sequence,
+            "owner": authority.fingerprint,
+            "entry_id": authority.entry_id,
+            "new_instance": self._post_login_diagnostic_instance_payload(
+                event.key[1]
+            ),
+            "scope_token": authority.scope_token,
+            "deadline": authority.deadline,
+            "original_line": event.original_line,
+            "original_line_verified": selected_line == event.original_line,
+            "selected_line": selected_line,
+            "reason": reason,
+            "routes": list(item.line_visible_routes),
+            "top_verified": item.line_list_top_verified,
+            "bottom_verified": item.line_list_bottom_verified,
+            "unique_overlap": overlap,
+            "cumulative_routes": list(event.routes),
+            "phase": event.phase,
+            "fallback_used": selected_line == 1,
+        }
+        recorded = self._record_diagnostic_payload(
+            "smart-reconnect-diagnostic",
+            payload,
+        )
+        if not recorded:
+            event.record_failed = True
+            event.invalid = True
+            event.phase = "record_failed"
+        return recorded
+
+    def _line_fallback_event_key(
+        self,
+        authority: _TcpRecoveryAuthority,
+        instance: WindowInstanceToken,
+        original_line: int,
+    ) -> tuple[object, ...]:
+        return (
+            self._force_login_message_diagnostic_key(authority),
+            instance,
+            original_line,
+            self._runtime_scope_token,
+        )
+
+    def _recognition_for_tcp_line_fallback(
+        self,
+        fingerprint: str,
+        instance: WindowInstanceToken | None,
+        item: ScreenRecognition,
+        now: float,
+        *,
+        fresh_capture: bool = True,
+    ) -> ScreenRecognition:
+        active_event = self._line_fallback_search_event
+        if (
+            active_event is not None
+            and active_event.authority.fingerprint == fingerprint
+            and (
+                not fresh_capture
+                or item.state is not ReconnectScreenState.LINE_SELECTION
+            )
+        ):
+            self._line_fallback_search_event = None
+        if (
+            not fresh_capture
+            or item.state is not ReconnectScreenState.LINE_SELECTION
+        ):
+            return item
+        authority = self._tcp_recovery_authority
+        preferred = self._preferred_line_numbers.get(fingerprint)
+        original_line = (
+            preferred
+            if preferred in LINE_ROUTE_CLICK_POINTS
+            else (
+                item.line_number
+                if item.recent_line_present is True
+                and item.line_number in LINE_ROUTE_CLICK_POINTS
+                else None
+            )
+        )
+        if (
+            authority is None
+            or instance is None
+            or original_line not in LINE_ROUTE_CLICK_POINTS
+            or original_line == 1
+            or now >= authority.deadline
+            or item.recent_line_present is not True
+            or item.line_number != original_line
+            or not self._tcp_recovery_screen_action_is_current(
+                authority,
+                fingerprint,
+                instance,
+            )
+        ):
+            self._line_fallback_search_event = None
+            return item
+        page = item.line_visible_routes
+        key = self._line_fallback_event_key(
+            authority,
+            instance,
+            original_line,
+        )
+        event = self._line_fallback_search_event
+        if event is None or event.authority is not authority or event.key != key:
+            event = _LineFallbackSearchEvent(
+                authority=authority,
+                key=key,
+                original_line=original_line,
+                phase="seeking_top",
+            )
+            self._line_fallback_search_event = event
+        if event.invalid:
+            return replace(item, click_point=None, line_scroll_delta=0)
+        page_is_consecutive = bool(
+            page
+            and len(page) == len(set(page))
+            and tuple(sorted(page)) == page
+            and page == tuple(range(page[0], page[-1] + 1))
+        )
+        if not item.line_list_page_complete or not page_is_consecutive:
+            event.invalid = True
+            event.phase = "invalid"
+            self._persist_line_fallback_diagnostic(
+                event,
+                item,
+                overlap=None,
+                selected_line=None,
+                reason="page_untrusted_or_nonconsecutive",
+            )
+            return replace(item, click_point=None, line_scroll_delta=0)
+        if (
+            original_line in page
+            and item.click_point is not None
+            and item.line_scroll_delta == 0
+            and item.click_point != LINE_LIST_SCROLL_POINT
+        ):
+            event.routes = page
+            event.phase = "original_available"
+            if not self._persist_line_fallback_diagnostic(
+                event,
+                item,
+                overlap=None,
+                selected_line=original_line,
+                reason="original_line_visible",
+            ):
+                return replace(
+                    item,
+                    click_point=None,
+                    line_scroll_delta=0,
+                )
+            self._line_fallback_search_event = None
+            return replace(item, original_line_verified=True)
+
+        overlap: int | None = None
+        if event.phase == "seeking_top":
+            if not item.line_list_top_verified or page[:2] != (1, 2):
+                if not self._persist_line_fallback_diagnostic(
+                    event,
+                    item,
+                    overlap=None,
+                    selected_line=None,
+                    reason="seeking_verified_top",
+                ):
+                    return replace(
+                        item,
+                        click_point=None,
+                        line_scroll_delta=0,
+                    )
+                return replace(
+                    item,
+                    click_point=LINE_LIST_SCROLL_POINT,
+                    line_scroll_delta=120,
+                )
+            event.phase = "traversing"
+            event.routes = page
+            event.last_page = page
+        elif event.phase == "traversing" and page != event.last_page:
+            overlaps = tuple(
+                length
+                for length in range(
+                    1,
+                    min(len(event.routes), len(page)) + 1,
+                )
+                if event.routes[-length:] == page[:length]
+            )
+            overlap = overlaps[0] if len(overlaps) == 1 else None
+            merged = self._merge_trusted_line_pages(event.routes, page)
+            if merged is None:
+                event.invalid = True
+                event.phase = "invalid"
+                self._persist_line_fallback_diagnostic(
+                    event,
+                    item,
+                    overlap=overlap,
+                    selected_line=None,
+                    reason="page_chain_invalid",
+                )
+                return replace(item, click_point=None, line_scroll_delta=0)
+            event.routes = merged
+            event.last_page = page
+
+        if event.phase == "traversing":
+            if item.line_list_bottom_verified:
+                if (
+                    page[-2:] != (7, 8)
+                    or event.routes != tuple(range(1, 9))
+                ):
+                    event.invalid = True
+                    event.phase = "invalid"
+                    self._persist_line_fallback_diagnostic(
+                        event,
+                        item,
+                        overlap=overlap,
+                        selected_line=None,
+                        reason="bottom_without_complete_one_to_eight",
+                    )
+                    return replace(
+                        item,
+                        click_point=None,
+                        line_scroll_delta=0,
+                    )
+                event.phase = "returning_top"
+            else:
+                if not self._persist_line_fallback_diagnostic(
+                    event,
+                    item,
+                    overlap=overlap,
+                    selected_line=None,
+                    reason="traversing_down",
+                ):
+                    return replace(
+                        item,
+                        click_point=None,
+                        line_scroll_delta=0,
+                    )
+                return replace(
+                    item,
+                    click_point=LINE_LIST_SCROLL_POINT,
+                    line_scroll_delta=-120,
+                )
+
+        if not item.line_list_top_verified:
+            if not self._persist_line_fallback_diagnostic(
+                event,
+                item,
+                overlap=overlap,
+                selected_line=None,
+                reason="returning_verified_top",
+            ):
+                return replace(
+                    item,
+                    click_point=None,
+                    line_scroll_delta=0,
+                )
+            return replace(
+                item,
+                click_point=LINE_LIST_SCROLL_POINT,
+                line_scroll_delta=120,
+            )
+        if (
+            item.line_one_click_point is None
+            or page.count(1) != 1
+            or page[:2] != (1, 2)
+        ):
+            event.invalid = True
+            event.phase = "invalid"
+            self._persist_line_fallback_diagnostic(
+                event,
+                item,
+                overlap=overlap,
+                selected_line=None,
+                reason="line_one_not_unique_at_top",
+            )
+            return replace(item, click_point=None, line_scroll_delta=0)
+        event.phase = "fallback_ready"
+        if not self._persist_line_fallback_diagnostic(
+            event,
+            item,
+            overlap=overlap,
+            selected_line=1,
+            reason="original_absent_complete_search_line_one_unique",
+        ):
+            return replace(
+                item,
+                click_point=None,
+                line_scroll_delta=0,
+            )
+        return replace(
+            item,
+            line_number=1,
+            click_point=item.line_one_click_point,
+            line_scroll_delta=0,
+            line_fallback_used=True,
+            original_line_verified=False,
+        )
 
     def _clear_action_confirmation(self, fingerprint: str | None = None) -> None:
         if fingerprint is None:
@@ -7393,6 +8964,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         capture_settings_revision: int,
         source_state_generation: int,
         confirmation_signature: tuple[object, ...] | None = None,
+        frame_digest: str | None = None,
+        observation_epoch: int | None = None,
+        require_independent_frames: bool = False,
     ) -> bool:
         if instance is None or capture_route is None:
             self._clear_action_confirmation(fingerprint)
@@ -7429,6 +9003,25 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             )
             with self._screen_state_lock:
                 previous = self._action_confirmations.get(fingerprint)
+                independent_frame = bool(
+                    not require_independent_frames
+                    or (
+                        isinstance(frame_digest, str)
+                        and frame_digest
+                        and isinstance(observation_epoch, int)
+                        and not isinstance(observation_epoch, bool)
+                        and (
+                            previous is None
+                            or not previous.frame_digests
+                            or (
+                                previous.frame_digests[-1]
+                                != frame_digest
+                                and previous.observation_epochs[-1]
+                                != observation_epoch
+                            )
+                        )
+                    )
+                )
                 count = (
                     previous.consecutive_frames + 1
                     if (
@@ -7440,8 +9033,35 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         and previous.source_state_generation
                         == source_state_generation
                         and previous.signature == signature
+                        and independent_frame
                     )
                     else 1
+                )
+                frame_digests = (
+                    (
+                        previous.frame_digests
+                        + ((frame_digest,) if frame_digest else ())
+                    )[-ACTION_CONFIRMATION_FRAMES:]
+                    if previous is not None
+                    and count > 1
+                    else ((frame_digest,) if frame_digest else ())
+                )
+                observation_epochs = (
+                    (
+                        previous.observation_epochs
+                        + (
+                            (observation_epoch,)
+                            if isinstance(observation_epoch, int)
+                            else ()
+                        )
+                    )[-ACTION_CONFIRMATION_FRAMES:]
+                    if previous is not None
+                    and count > 1
+                    else (
+                        (observation_epoch,)
+                        if isinstance(observation_epoch, int)
+                        else ()
+                    )
                 )
                 self._action_confirmations[fingerprint] = (
                     _ActionConfirmation(
@@ -7455,6 +9075,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         ),
                         signature=signature,
                         consecutive_frames=count,
+                        frame_digests=frame_digests,
+                        observation_epochs=observation_epochs,
                     )
                 )
                 return count >= ACTION_CONFIRMATION_FRAMES
@@ -8235,6 +9857,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 expected_instance,
                 expected_capture_settings_revision,
                 expected_source_state_generation,
+                action_state=recognition.state,
             )
         )
         if (
@@ -8255,6 +9878,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             fingerprint,
             current,
         )
+        if current.state is ReconnectScreenState.LINE_SELECTION:
+            current = self._recognition_for_tcp_line_fallback(
+                fingerprint,
+                expected_instance,
+                current,
+                self._monotonic_clock(),
+            )
         if (
             require_recognition_match
             and self._action_signature(current)
@@ -9245,6 +10875,1105 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if lease is not None:
                 lease.release()
 
+    def _post_login_diagnostic_key(
+        self,
+        authority: _TcpRecoveryAuthority,
+        capture_settings_revision: int,
+    ) -> tuple[object, ...]:
+        return (
+            authority.fingerprint,
+            authority.entry_id,
+            authority.old_instance,
+            authority.activation_instance,
+            authority.new_instance,
+            authority.target_fingerprint,
+            authority.shortcut_path,
+            authority.plan_signature,
+            authority.peer_signature,
+            authority.source_state_generation,
+            self._source_state_generation_snapshot(),
+            authority.scope_token,
+            self._runtime_scope_token,
+            authority.deadline,
+            authority.reopen_intent_sequence,
+            authority.reopen_intent_signature,
+            capture_settings_revision,
+            self._capture_settings_revision,
+        )
+
+    @staticmethod
+    def _login_input_instance_key(
+        instance: WindowInstanceToken | None,
+    ) -> tuple[object, ...] | None:
+        if instance is None:
+            return None
+        return (
+            instance.handle,
+            instance.process_id,
+            instance.thread_id,
+            instance.window_class,
+            instance.process_lifecycle_token,
+        )
+
+    @classmethod
+    def _login_input_transaction_context_key(
+        cls,
+        authority: _TcpRecoveryAuthority,
+    ) -> tuple[object, ...]:
+        return (
+            authority.fingerprint,
+            authority.entry_id,
+            cls._login_input_instance_key(authority.old_instance),
+            cls._login_input_instance_key(authority.activation_instance),
+            cls._login_input_instance_key(authority.new_instance),
+            authority.target_fingerprint,
+            authority.shortcut_path,
+            authority.plan_signature,
+            authority.peer_signature,
+            authority.scope_token,
+            authority.deadline,
+            authority.reopen_intent_sequence,
+            authority.reopen_intent_signature,
+            _TcpRecoveryStage.LOGIN.value,
+            ReconnectScreenState.FORCE_LOGIN_START.value,
+            "force_login",
+        )
+
+    @classmethod
+    def _force_login_message_diagnostic_key(
+        cls,
+        authority: _TcpRecoveryAuthority,
+    ) -> tuple[object, ...]:
+        return cls._login_input_transaction_context_key(authority)
+
+    @staticmethod
+    def _force_login_message_instance_payload(
+        instance: _WindowInstanceCredential | None,
+    ) -> dict[str, object] | None:
+        if instance is None:
+            return None
+        return {
+            "handle": instance.handle,
+            "process_id": instance.process_id,
+            "thread_id": instance.thread_id,
+            "window_class": instance.window_class,
+            "process_lifecycle_token": instance.process_lifecycle_token,
+        }
+
+    @classmethod
+    def _force_login_message_state_payload(
+        cls,
+        state: _ForceLoginMessageWindowState | None,
+    ) -> dict[str, object] | None:
+        if state is None:
+            return None
+        return {
+            "observed_at_monotonic": state.observed_at_monotonic,
+            "foreground_handle": state.foreground_handle,
+            "target_handle": state.target_handle,
+            "target_instance": cls._force_login_message_instance_payload(
+                state.target_instance
+            ),
+            "gui_thread_id": state.gui_thread_id,
+            "active_handle": state.active_handle,
+            "focus_handle": state.focus_handle,
+            "focus_root_handle": state.focus_root_handle,
+            "target_is_foreground": state.target_is_foreground,
+            "target_has_focus": state.target_has_focus,
+            "cursor": list(state.cursor),
+            "target_visible": state.target_visible,
+            "target_minimized": state.target_minimized,
+            "target_rect": list(state.target_rect),
+            "presentation_state": state.presentation_state,
+            "expected_visible": state.expected_visible,
+            "expected_minimized": state.expected_minimized,
+            "expected_rect": (
+                list(state.expected_rect)
+                if state.expected_rect is not None
+                else None
+            ),
+            "expected_presentation_state": (
+                state.expected_presentation_state
+            ),
+            "target_topmost": state.target_topmost,
+            "previous_instance": cls._force_login_message_instance_payload(
+                state.previous_instance
+            ),
+            "next_instance": cls._force_login_message_instance_payload(
+                state.next_instance
+            ),
+        }
+
+    def _append_force_login_message_evidence(
+        self,
+        event: _LoginInputAuthorizationTransaction,
+        evidence: _ForceLoginMessageEvidence,
+    ) -> None:
+        if (
+            self._login_input_transaction is not event
+            or self._force_login_message_diagnostic_event is not event
+            or event.completed
+        ):
+            return
+        event.evidence = event.evidence + (evidence,)
+        if not event.first_drift and evidence.drift_fields:
+            event.first_drift = evidence.drift_fields
+        if evidence.target_drift_fields:
+            event.target_drift = True
+
+    def _force_login_message_diagnostic_payload(
+        self,
+        event: _LoginInputAuthorizationTransaction,
+    ) -> dict[str, object]:
+        return {
+            "kind": "force_login_message_diagnostic",
+            "event_key_sha256": hashlib.sha256(
+                repr(event.key).encode("utf-8")
+            ).hexdigest(),
+            "owner": event.owner,
+            "entry_id": event.entry_id,
+            "scope_token": event.scope_token,
+            "deadline": event.authority.deadline,
+            "source_state_generation": (
+                event.authority.source_state_generation
+            ),
+            "reopen_intent_sequence": (
+                event.authority.reopen_intent_sequence
+            ),
+            "reopen_intent_signature": (
+                event.authority.reopen_intent_signature
+            ),
+            "attempt_sequence": event.attempt_sequence,
+            "event_sequence": event.event_sequence,
+            "transaction_state": (
+                _LoginInputTransactionState.CONSUMED.value
+                if event.consumed
+                else event.state.value
+            ),
+            "consumed": event.consumed,
+            "new_instance": self._post_login_diagnostic_instance_payload(
+                event.new_instance
+            ),
+            "first_drift": list(event.first_drift),
+            "messages": [
+                {
+                    "sequence": item.sequence,
+                    "message": item.message_name,
+                    "attempted": item.attempted,
+                    "confirmed": item.confirmed,
+                    "drift_fields": list(item.drift_fields),
+                    "target_drift_fields": list(
+                        item.target_drift_fields
+                    ),
+                    "external_change_fields": list(
+                        item.external_change_fields
+                    ),
+                    "change_kind": item.change_kind,
+                    "cause": item.cause,
+                    "before": self._force_login_message_state_payload(
+                        item.before
+                    ),
+                    "after": self._force_login_message_state_payload(
+                        item.after
+                    ),
+                }
+                for item in event.evidence
+            ],
+        }
+
+    def _persist_force_login_message_diagnostic(
+        self,
+        event: _LoginInputAuthorizationTransaction,
+    ) -> bool:
+        if event.persistent_record_attempted:
+            return event.persistent_record_succeeded
+        event.persistent_record_attempted = True
+        if self._failure_record_callback is None:
+            event.persistent_record_succeeded = True
+            return True
+        payload = self._force_login_message_diagnostic_payload(event)
+        event.persistent_record_succeeded = self._record_diagnostic_payload(
+            "smart-reconnect-diagnostic",
+            payload,
+            attempt_sequence=event.attempt_sequence,
+        )
+        event.persistent_record_failed = not (
+            event.persistent_record_succeeded
+        )
+        return event.persistent_record_succeeded
+
+    @staticmethod
+    def _login_input_observation_matches(
+        observed: _ForceLoginMessageWindowState | None,
+        instance: WindowInstanceToken,
+        formal: _ForceLoginFormalPresentation,
+    ) -> bool:
+        if observed is None:
+            return False
+        identity = observed.target_instance
+        return bool(
+            identity.handle == instance.handle
+            and identity.process_id == instance.process_id
+            and identity.thread_id == instance.thread_id
+            and identity.window_class == instance.window_class
+            and identity.process_lifecycle_token
+            == instance.process_lifecycle_token
+            and observed.target_handle == instance.handle
+            and observed.target_visible is formal.visible
+            and observed.target_minimized is formal.minimized
+            and observed.target_rect == formal.rect
+            and observed.presentation_state == formal.presentation_state
+            and observed.expected_visible is formal.visible
+            and observed.expected_minimized is formal.minimized
+            and observed.expected_rect == formal.rect
+            and observed.expected_presentation_state
+            == formal.presentation_state
+        )
+
+    def _login_input_pre_authorization_payload(
+        self,
+        event: _LoginInputAuthorizationTransaction,
+    ) -> dict[str, object]:
+        return {
+            "kind": "login_input_pre_authorization",
+            "event_key_sha256": hashlib.sha256(
+                repr(event.key).encode("utf-8")
+            ).hexdigest(),
+            "owner": event.owner,
+            "entry_id": event.entry_id,
+            "new_instance": self._post_login_diagnostic_instance_payload(
+                event.new_instance
+            ),
+            "scope_token": event.scope_token,
+            "deadline": event.authority.deadline,
+            "event_sequence": event.event_sequence,
+            "screen": event.expected_screen.value,
+            "action": event.expected_action,
+            "confirmation_frame_digests": list(
+                event.confirmation_frame_digests
+            ),
+            "confirmation_observation_epochs": list(
+                event.confirmation_observation_epochs
+            ),
+            "consumed": False,
+        }
+
+    def _reject_login_input_transaction(
+        self,
+        event: _LoginInputAuthorizationTransaction,
+        reason: str,
+    ) -> None:
+        if event.consumed:
+            return
+        event.state = _LoginInputTransactionState.REJECTED
+        event.terminal_reason = reason
+        event.completed = True
+
+    def _prepare_login_input_transaction(
+        self,
+        *,
+        authority: _TcpRecoveryAuthority,
+        fingerprint: str,
+        instance: WindowInstanceToken,
+        window: WindowInfo,
+        item: ScreenRecognition,
+        confirmation: _ActionConfirmation,
+        presentation_state: str,
+        capture_settings_revision: int,
+    ) -> _LoginInputAuthorizationTransaction | None:
+        if (
+            self._tcp_recovery_authority is not authority
+            or authority.terminal
+            or authority.stage is not _TcpRecoveryStage.LOGIN
+            or fingerprint != authority.fingerprint
+            or fingerprint != authority.target_fingerprint
+            or not authority.shortcut_consumed
+            or authority.new_instance != instance
+            or authority.activation_instance != instance
+            or WindowInstanceToken.from_window(window) != instance
+            or item.state is not ReconnectScreenState.FORCE_LOGIN_START
+            or item.click_point is None
+            or self._monotonic_clock() >= authority.deadline
+            or not self._tcp_recovery_screen_action_is_current(
+                authority,
+                fingerprint,
+                instance,
+            )
+            or confirmation.instance != instance
+            or confirmation.consecutive_frames < ACTION_CONFIRMATION_FRAMES
+            or len(confirmation.frame_digests)
+            < ACTION_CONFIRMATION_FRAMES
+            or len(set(confirmation.frame_digests))
+            < ACTION_CONFIRMATION_FRAMES
+            or len(confirmation.observation_epochs)
+            < ACTION_CONFIRMATION_FRAMES
+            or len(set(confirmation.observation_epochs))
+            < ACTION_CONFIRMATION_FRAMES
+            or confirmation.signature != self._action_signature(item)
+            or not isinstance(presentation_state, str)
+        ):
+            return None
+        context_key = self._login_input_transaction_context_key(authority)
+        previous = self._login_input_transaction
+        event_sequence = 1
+        if previous is not None:
+            if (
+                previous.authority is authority
+                and previous.context_key == context_key
+            ):
+                if (
+                    previous.permanent_input_blocked
+                    or previous.target_drift
+                    or not previous.semantic_event_ready
+                ):
+                    return None
+                event_sequence = previous.event_sequence + 1
+            else:
+                if previous.state not in {
+                    _LoginInputTransactionState.RESULT_RECORDED,
+                    _LoginInputTransactionState.REJECTED,
+                    _LoginInputTransactionState.INVALIDATED,
+                    _LoginInputTransactionState.EVIDENCE_FAILED,
+                }:
+                    previous.state = (
+                        _LoginInputTransactionState.INVALIDATED
+                    )
+                    previous.terminal_reason = (
+                        "login_input_authority_changed"
+                    )
+                    previous.completed = True
+                event_sequence = previous.event_sequence + 1
+        formal = _ForceLoginFormalPresentation(
+            visible=window.visible,
+            minimized=window.minimized,
+            rect=window.rect,
+            presentation_state=presentation_state,
+        )
+        key = (
+            context_key,
+            event_sequence,
+            confirmation.signature,
+            tuple(confirmation.frame_digests),
+            tuple(confirmation.observation_epochs),
+        )
+        event = _LoginInputAuthorizationTransaction(
+            authority=authority,
+            key=key,
+            context_key=context_key,
+            owner=fingerprint,
+            entry_id=authority.entry_id,
+            new_instance=instance,
+            scope_token=authority.scope_token,
+            event_sequence=event_sequence,
+            attempt_sequence=event_sequence,
+            expected_point=item.click_point,
+            confirmation_signature=confirmation.signature,
+            confirmation_frame_digests=tuple(
+                confirmation.frame_digests
+            ),
+            confirmation_observation_epochs=tuple(
+                confirmation.observation_epochs
+            ),
+            formal_presentation=formal,
+        )
+        self._login_input_transaction = event
+        self._force_login_message_diagnostic_event = event
+        observe = getattr(
+            self._mouse_backend,
+            "observe_relative_diagnosed",
+            None,
+        )
+        if not callable(observe):
+            self._reject_login_input_transaction(
+                event,
+                "login_input_pre_observation_unavailable",
+            )
+            return None
+
+        def observed_presentation_reader(
+            visible: bool,
+            minimized: bool,
+            rect: tuple[int, int, int, int],
+        ) -> str:
+            return self._evidence_presentation_state(
+                replace(
+                    window,
+                    visible=visible,
+                    minimized=minimized,
+                    rect=rect,
+                ),
+                confirmation.capture_route,
+            )
+
+        try:
+            observed = observe(
+                instance.handle,
+                instance.process_id,
+                instance,
+                formal,
+                observed_presentation_reader,
+            )
+        except OSError:
+            observed = None
+        if not self._login_input_observation_matches(
+            observed,
+            instance,
+            formal,
+        ):
+            self._reject_login_input_transaction(
+                event,
+                "login_input_observed_state_mismatch",
+            )
+            return None
+        event.formal_window_state = observed
+        ready, intent, evidence_authority = self._begin_evidence_action(
+            fingerprint=fingerprint,
+            item=item,
+            action=event.expected_action,
+            instance=instance,
+            capture_route=confirmation.capture_route,
+            capture_settings_revision=capture_settings_revision,
+            source_state_generation=confirmation.source_state_generation,
+        )
+        event.intent_sequence = intent
+        event.evidence_authority_signature = evidence_authority
+        if not ready:
+            self._reject_login_input_transaction(
+                event,
+                "login_input_pre_evidence_unavailable",
+            )
+            return None
+        if not self._record_diagnostic_payload(
+            "smart-reconnect-diagnostic",
+            self._login_input_pre_authorization_payload(event),
+            attempt_sequence=event.event_sequence,
+        ):
+            self._reject_login_input_transaction(
+                event,
+                "login_input_pre_evidence_callback_failed",
+            )
+            self._finish_evidence_action(
+                fingerprint=fingerprint,
+                item=item,
+                action=event.expected_action,
+                intent_sequence=intent,
+                allowed=False,
+                performed=False,
+                clicked=False,
+                identity_verified=True,
+                restoration_verified=None,
+                failure_reason=event.terminal_reason,
+                authority_signature=evidence_authority,
+            )
+            return None
+        event.state = _LoginInputTransactionState.AUTHORIZED
+        return event
+
+    def _observe_force_login_message_screen(
+        self,
+        authority: _TcpRecoveryAuthority | None,
+        fingerprint: str,
+        instance: WindowInstanceToken | None,
+        recognition: ScreenRecognition,
+        *,
+        fresh_capture: bool,
+        capture_route: str | None,
+        source_state_generation: int,
+        frame_digest: str | None = None,
+        observation_epoch: int | None = None,
+    ) -> None:
+        self._retry_pending_diagnostic_records()
+        event = self._login_input_transaction
+        if (
+            event is not None
+            and authority is event.authority
+            and event.owner == fingerprint
+            and self._login_input_instance_key(event.new_instance)
+            != self._login_input_instance_key(instance)
+            and event.state
+            not in {
+                _LoginInputTransactionState.INVALIDATED,
+                _LoginInputTransactionState.EVIDENCE_FAILED,
+            }
+        ):
+            event.state = _LoginInputTransactionState.INVALIDATED
+            event.terminal_reason = "login_input_instance_changed"
+            event.completed = True
+            return
+        if (
+            event is None
+            or authority is None
+            or event.authority is not authority
+            or event.context_key
+            != self._login_input_transaction_context_key(authority)
+            or event.owner != fingerprint
+            or self._login_input_instance_key(event.new_instance)
+            != self._login_input_instance_key(instance)
+            or event.state is not (
+                _LoginInputTransactionState.RESULT_RECORDED
+            )
+            or event.target_drift
+            or event.permanent_input_blocked
+        ):
+            return
+        if (
+            self._monotonic_clock() >= authority.deadline
+            or not fresh_capture
+            or not isinstance(frame_digest, str)
+            or not frame_digest
+            or not isinstance(observation_epoch, int)
+            or isinstance(observation_epoch, bool)
+            or authority.stage is not _TcpRecoveryStage.LOGIN
+            or source_state_generation
+            != authority.source_state_generation
+        ):
+            if not event.semantic_departure_confirmed:
+                event.departure_signature = None
+                event.departure_frame_digests = ()
+                event.departure_observation_epochs = ()
+            else:
+                event.return_signature = None
+                event.return_frame_digests = ()
+                event.return_observation_epochs = ()
+            return
+        signature = self._action_signature(recognition)
+        if recognition.state is ReconnectScreenState.FORCE_LOGIN_TIMEOUT:
+            if event.semantic_departure_confirmed:
+                return
+            if event.departure_signature != signature:
+                event.departure_signature = signature
+                event.departure_frame_digests = ()
+                event.departure_observation_epochs = ()
+            if (
+                frame_digest not in event.departure_frame_digests
+                and observation_epoch
+                not in event.departure_observation_epochs
+            ):
+                event.departure_frame_digests += (frame_digest,)
+                event.departure_observation_epochs += (
+                    observation_epoch,
+                )
+            if (
+                len(event.departure_frame_digests)
+                >= ACTION_CONFIRMATION_FRAMES
+            ):
+                event.semantic_departure_confirmed = True
+            return
+        if (
+            recognition.state is ReconnectScreenState.FORCE_LOGIN_START
+            and event.semantic_departure_confirmed
+            and recognition.click_point == event.expected_point
+            and signature == event.confirmation_signature
+        ):
+            if event.return_signature != signature:
+                event.return_signature = signature
+                event.return_frame_digests = ()
+                event.return_observation_epochs = ()
+            if (
+                frame_digest not in event.return_frame_digests
+                and observation_epoch not in event.return_observation_epochs
+            ):
+                event.return_frame_digests += (frame_digest,)
+                event.return_observation_epochs += (observation_epoch,)
+            if (
+                len(event.return_frame_digests)
+                >= ACTION_CONFIRMATION_FRAMES
+            ):
+                event.semantic_event_ready = True
+        else:
+            if not event.semantic_departure_confirmed:
+                event.departure_signature = None
+                event.departure_frame_digests = ()
+                event.departure_observation_epochs = ()
+            event.return_signature = None
+            event.return_frame_digests = ()
+            event.return_observation_epochs = ()
+
+    def _deliver_formal_force_login_click(
+        self,
+        authority: _TcpRecoveryAuthority,
+        instance: WindowInstanceToken,
+        window: WindowInfo,
+        presentation_state: str,
+        point: NormalizedPoint,
+        *,
+        capture_route: str | None = CAPTURE_ROUTE_OBSCURED,
+        transaction: _LoginInputAuthorizationTransaction | None = None,
+    ) -> MouseClickResult:
+        event = (
+            transaction
+            if transaction is not None
+            else self._login_input_transaction
+        )
+        if (
+            event is None
+            or self._login_input_transaction is not event
+            or event.authority is not authority
+            or event.state is not _LoginInputTransactionState.AUTHORIZED
+            or event.consumed
+            or authority.terminal
+            or authority.fingerprint != authority.target_fingerprint
+            or not authority.shortcut_consumed
+            or authority.new_instance != instance
+            or authority.activation_instance != instance
+            or WindowInstanceToken.from_window(window) != instance
+            or not isinstance(presentation_state, str)
+            or not self._tcp_recovery_screen_action_is_current(
+                authority,
+                authority.fingerprint,
+                instance,
+            )
+        ):
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                "force_login_message_diagnostic_not_authorized",
+            )
+        diagnosed_click = getattr(
+            self._mouse_backend,
+            "click_relative_diagnosed",
+            None,
+        )
+        if not callable(diagnosed_click):
+            event.consumed = True
+            event.state = _LoginInputTransactionState.CONSUMED
+            event.completed = True
+            return MouseClickResult(
+                False,
+                True,
+                False,
+                "force_login_message_diagnostic_unavailable",
+            )
+
+        def observed_presentation_reader(
+            visible: bool,
+            minimized: bool,
+            rect: tuple[int, int, int, int],
+        ) -> str:
+            return self._evidence_presentation_state(
+                replace(
+                    window,
+                    visible=visible,
+                    minimized=minimized,
+                    rect=rect,
+                ),
+                capture_route,
+            )
+
+        event.consumed = True
+        event.state = _LoginInputTransactionState.CONSUMED
+        try:
+            result = diagnosed_click(
+                instance.handle,
+                point,
+                instance.process_id,
+                instance,
+                _ForceLoginFormalPresentation(
+                    visible=window.visible,
+                    minimized=window.minimized,
+                    rect=window.rect,
+                    presentation_state=presentation_state,
+                ),
+                observed_presentation_reader,
+                lambda evidence: self._append_force_login_message_evidence(
+                    event,
+                    evidence,
+                ),
+                formal_window_state=event.formal_window_state,
+            )
+        except OSError:
+            result = MouseClickResult(
+                False,
+                True,
+                True,
+                "input_delivery_os_error",
+            )
+        finally:
+            event.completed = True
+        if event.target_drift:
+            return MouseClickResult(
+                False,
+                result.restored,
+                bool(
+                    result.delivery_uncertain
+                    or any(
+                        item.message == Win32MouseMessageBackend.WM_LBUTTONDOWN
+                        and item.attempted
+                        for item in event.evidence
+                    )
+                ),
+                "force_login_message_state_changed",
+            )
+        return result
+
+    def _finish_login_input_transaction(
+        self,
+        event: _LoginInputAuthorizationTransaction,
+        item: ScreenRecognition,
+        *,
+        allowed: bool,
+        delivery_state: str | None,
+        click_result: MouseClickResult | None,
+    ) -> None:
+        if self._login_input_transaction is not event:
+            return
+        if not event.consumed:
+            self._reject_login_input_transaction(
+                event,
+                (
+                    delivery_state
+                    if isinstance(delivery_state, str)
+                    else "login_input_authorization_revoked"
+                ),
+            )
+        evidence_ok = self._finish_evidence_action(
+            fingerprint=event.owner,
+            item=item,
+            action=event.expected_action,
+            intent_sequence=event.intent_sequence,
+            allowed=allowed,
+            performed=bool(
+                event.consumed
+                and click_result is not None
+                and (
+                    click_result.delivered
+                    or click_result.delivery_uncertain
+                )
+            ),
+            clicked=bool(
+                click_result is not None and click_result.delivered
+            ),
+            identity_verified=True,
+            restoration_verified=(
+                click_result.restored
+                if click_result is not None
+                else None
+            ),
+            failure_reason=(
+                click_result.failure_code
+                if click_result is not None
+                and click_result.failure_code is not None
+                else (
+                    delivery_state
+                    if isinstance(delivery_state, str)
+                    and delivery_state != "delivered"
+                    else event.terminal_reason
+                )
+            ),
+            authority_signature=event.evidence_authority_signature,
+        )
+        diagnostic_ok = (
+            self._persist_force_login_message_diagnostic(event)
+            if event.consumed
+            else True
+        )
+        if event.consumed and (not evidence_ok or not diagnostic_ok):
+            event.state = _LoginInputTransactionState.EVIDENCE_FAILED
+            event.permanent_input_blocked = True
+            event.terminal_reason = "login_input_result_evidence_failed"
+        elif event.consumed:
+            event.state = _LoginInputTransactionState.RESULT_RECORDED
+        event.completed = True
+
+    def _arm_post_login_diagnostic(
+        self,
+        authority: _TcpRecoveryAuthority,
+        instance: WindowInstanceToken,
+        now: float,
+        capture_settings_revision: int,
+    ) -> bool:
+        if self._post_login_diagnostic_complete:
+            return False
+        if (
+            self._tcp_recovery_authority is not authority
+            or authority.terminal
+            or authority.fingerprint != authority.target_fingerprint
+            or not authority.shortcut_consumed
+            or authority.new_instance != instance
+            or authority.activation_instance != instance
+            or not self._tcp_recovery_screen_action_is_current(
+                authority,
+                authority.fingerprint,
+                instance,
+            )
+        ):
+            return False
+        key = self._post_login_diagnostic_key(
+            authority,
+            capture_settings_revision,
+        )
+        current = self._post_login_diagnostic_event
+        if current is not None:
+            if current.authority is authority and current.key == key:
+                return False
+            self._post_login_diagnostic_event = None
+        self._post_login_diagnostic_event = _PostLoginDiagnosticEvent(
+            authority=authority,
+            key=key,
+            owner=authority.fingerprint,
+            entry_id=authority.entry_id,
+            old_instance=authority.old_instance,
+            new_instance=instance,
+            scope_token=authority.scope_token,
+            armed_at_monotonic=now,
+            capture_settings_revision=capture_settings_revision,
+        )
+        return True
+
+    @staticmethod
+    def _post_login_diagnostic_instance_payload(
+        instance: WindowInstanceToken,
+    ) -> dict[str, object]:
+        return {
+            "handle": instance.handle,
+            "process_id": instance.process_id,
+            "thread_id": instance.thread_id,
+            "window_class": instance.window_class,
+            "rect": list(instance.rect),
+            "minimized": instance.minimized,
+            "process_lifecycle_token": instance.process_lifecycle_token,
+        }
+
+    def _finish_terminal_post_login_diagnostic(
+        self,
+        authority: _TcpRecoveryAuthority,
+    ) -> None:
+        event = self._post_login_diagnostic_event
+        if (
+            event is None
+            or event.authority is not authority
+            or not authority.terminal
+            or event.key
+            != self._post_login_diagnostic_key(
+                authority,
+                event.capture_settings_revision,
+            )
+        ):
+            return
+        self._post_login_diagnostic_complete = True
+        if authority.stage is not _TcpRecoveryStage.TIMED_OUT:
+            self._post_login_diagnostic_event = None
+
+    def _export_stopped_timed_out_post_login_diagnostic(self) -> bool:
+        event = self._post_login_diagnostic_event
+        authority = self._tcp_recovery_authority
+        if (
+            event is None
+            or authority is None
+            or event.authority is not authority
+            or authority.stage is not _TcpRecoveryStage.TIMED_OUT
+            or not self._post_login_diagnostic_complete
+            or self._post_login_diagnostic_export_attempted
+            or event.key
+            != self._post_login_diagnostic_key(
+                authority,
+                event.capture_settings_revision,
+            )
+        ):
+            return False
+        self._post_login_diagnostic_export_attempted = True
+        succeeded = False
+        try:
+            output_dir = Path(tempfile.mkdtemp(
+                prefix="flash-post-login-diagnostic-",
+                dir=str(self._post_login_diagnostic_temp_root),
+            ))
+            self._post_login_diagnostic_output_dir = output_dir
+            manifest_frames = []
+            for index, frame in enumerate(event.frames, start=1):
+                frame_name = f"frame-{index:02d}.png"
+                frame_path = output_dir / frame_name
+                Image.frombytes(
+                    "RGBA",
+                    (frame.width, frame.height),
+                    frame.pixels,
+                    "raw",
+                    "BGRA",
+                ).convert("RGB").save(frame_path, format="PNG")
+                manifest_frames.append(
+                    {
+                        "file": frame_name,
+                        "target_offset_seconds": (
+                            frame.target_offset_seconds
+                        ),
+                        "captured_at_monotonic": (
+                            frame.captured_at_monotonic
+                        ),
+                        "width": frame.width,
+                        "height": frame.height,
+                        "recognition": {
+                            "state": frame.recognition.state.value,
+                            "score": frame.recognition.score,
+                            "reference": frame.recognition.reference_name,
+                            "line_number": frame.recognition.line_number,
+                            "recent_line_present": (
+                                frame.recognition.recent_line_present
+                            ),
+                            "line_scroll_delta": (
+                                frame.recognition.line_scroll_delta
+                            ),
+                        },
+                    }
+                )
+            manifest_path = output_dir / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "event_key_sha256": hashlib.sha256(
+                            repr(event.key).encode("utf-8")
+                        ).hexdigest(),
+                        "owner": event.owner,
+                        "entry_id": event.entry_id,
+                        "scope_token": event.scope_token,
+                        "old_instance": (
+                            self._post_login_diagnostic_instance_payload(
+                                event.old_instance
+                            )
+                        ),
+                        "new_instance": (
+                            self._post_login_diagnostic_instance_payload(
+                                event.new_instance
+                            )
+                        ),
+                        "armed_at_monotonic": event.armed_at_monotonic,
+                        "terminal_stage": authority.stage.value,
+                        "frames": manifest_frames,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            succeeded = True
+        except Exception:
+            succeeded = False
+        finally:
+            # A stop-triggered export is exactly once.  Keep a partial exact
+            # directory for explicit cleanup, but never retain image bytes for
+            # a later automatic rewrite.
+            self._post_login_diagnostic_event = None
+        return succeeded
+
+    def _cleanup_post_login_diagnostic_output(self) -> bool:
+        output_dir = self._post_login_diagnostic_output_dir
+        if output_dir is None:
+            if self._post_login_diagnostic_event is None:
+                self._post_login_diagnostic_complete = False
+                self._post_login_diagnostic_export_attempted = False
+            return True
+        try:
+            temp_root = self._post_login_diagnostic_temp_root.resolve(
+                strict=False
+            )
+            exact_output = output_dir.resolve(strict=False)
+            if (
+                exact_output.parent != temp_root
+                or not exact_output.name.startswith(
+                    "flash-post-login-diagnostic-"
+                )
+            ):
+                return False
+            if exact_output.exists():
+                shutil.rmtree(exact_output)
+        except (OSError, RuntimeError):
+            return False
+        self._post_login_diagnostic_output_dir = None
+        self._post_login_diagnostic_complete = False
+        self._post_login_diagnostic_export_attempted = False
+        return True
+
+    def _synchronize_post_login_diagnostic(self) -> None:
+        event = self._post_login_diagnostic_event
+        if event is None:
+            return
+        authority = self._tcp_recovery_authority
+        if (
+            authority is not event.authority
+            or event.key
+            != self._post_login_diagnostic_key(
+                event.authority,
+                event.capture_settings_revision,
+            )
+        ):
+            self._post_login_diagnostic_event = None
+            return
+        if authority.terminal:
+            self._finish_terminal_post_login_diagnostic(authority)
+            return
+        resolved = self._tcp_v
+        if (
+            not isinstance(resolved, ResolvedTargetWindows)
+            or not self._tcp_recovery_authority_is_current(
+                authority,
+                resolved,
+            )
+        ):
+            self._post_login_diagnostic_event = None
+
+    def _buffer_post_login_diagnostic(
+        self,
+        *,
+        authority: _TcpRecoveryAuthority | None,
+        fingerprint: str,
+        instance: WindowInstanceToken | None,
+        sample: object | None,
+        recognition: ScreenRecognition,
+        fresh_capture: bool,
+        capture_route: str | None,
+        presentation_state: str | None,
+        capture_settings_revision: int,
+        now: float,
+    ) -> bool:
+        self._synchronize_post_login_diagnostic()
+        event = self._post_login_diagnostic_event
+        if (
+            event is None
+            or authority is None
+            or event.authority is not authority
+            or event.owner != fingerprint
+            or event.new_instance != instance
+            or event.capture_settings_revision != capture_settings_revision
+            or not fresh_capture
+            or capture_route != CAPTURE_ROUTE_OBSCURED
+            or presentation_state != "fully_obscured"
+            or not isinstance(sample, CaptureSample)
+            or not sample.api_succeeded
+            or sample.width <= 0
+            or sample.height <= 0
+            or len(sample.pixels) != sample.width * sample.height * 4
+            or not self._tcp_recovery_screen_action_is_current(
+                authority,
+                fingerprint,
+                instance,
+            )
+        ):
+            return False
+        elapsed = now - event.armed_at_monotonic
+        offset_index = event.next_offset_index
+        if (
+            offset_index >= len(_POST_LOGIN_DIAGNOSTIC_OFFSETS_SECONDS)
+            or elapsed
+            < _POST_LOGIN_DIAGNOSTIC_OFFSETS_SECONDS[offset_index]
+        ):
+            return False
+        event.next_offset_index = offset_index + 1
+        event.frames = (
+            *event.frames,
+            _PostLoginDiagnosticFrame(
+                target_offset_seconds=(
+                    _POST_LOGIN_DIAGNOSTIC_OFFSETS_SECONDS[offset_index]
+                ),
+                captured_at_monotonic=now,
+                width=sample.width,
+                height=sample.height,
+                pixels=memoryview(sample.pixels).tobytes(),
+                recognition=recognition,
+            ),
+        )
+        return True
+
     def _cancel_tcp_recovery(
         self,
         authority: _TcpRecoveryAuthority,
@@ -9269,6 +11998,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             authority.shortcut_consumed = True
             authority.reopen_worker_unreaped = True
             self._persist_runtime_state()
+            self._finish_terminal_post_login_diagnostic(authority)
             return False
         authority.stage = (
             _TcpRecoveryStage.TIMED_OUT
@@ -9283,6 +12013,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 state.zero_since = None
                 state.zero_count = 0
         self._persist_runtime_state()
+        self._finish_terminal_post_login_diagnostic(authority)
         return True
 
     def _new_tcp_recovery_authority(
@@ -9398,6 +12129,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 _TcpRecoveryStage.ROLE,
                 _TcpRecoveryStage.ENTER,
             }
+            and not (
+                self._login_input_transaction is not None
+                and self._login_input_transaction.authority is authority
+                and self._login_input_transaction.owner == fingerprint
+                and self._login_input_instance_key(
+                    self._login_input_transaction.new_instance
+                )
+                == self._login_input_instance_key(instance)
+                and self._login_input_transaction.permanent_input_blocked
+            )
             and self._tcp_recovery_authority_is_current(authority, resolved)
             and self._bind_tcp_recovery_instance(authority, resolved) == instance
         )
@@ -10080,6 +12821,8 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         if next_stage is not None and authority.stage is not next_stage:
             authority.stage = next_stage
             self._persist_runtime_state()
+            if authority.terminal:
+                self._finish_terminal_post_login_diagnostic(authority)
 
     def _retry_pending_reopens(
         self,
@@ -10446,6 +13189,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 )
             )
         )
+        line_event = self._line_fallback_search_event
+        if (
+            line_event is not None
+            and line_event.authority.fingerprint
+            not in {
+                normalize_launch_fingerprint(window.launch_fingerprint)
+                for window in windows
+            }
+        ):
+            self._line_fallback_search_event = None
         self._begin_capture_diagnostics(windows)
         source_failure_affected_fingerprints = (
             self._source_failure_affected_fingerprints(
@@ -10546,6 +13299,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
         state_before = self._runtime_state_signature()
         now = self._monotonic_clock()
+        self._synchronize_post_login_diagnostic()
         group_failures = self._group_failures(
             windows,
             locally_isolated_fingerprints=frozenset(target_failures),
@@ -10829,6 +13583,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         current_initial_login_authorizations: set[str] = set()
         pending_confirmation_delays: list[int] = []
         pending_action_wait_delays: list[int] = []
+        presentation_states: dict[
+            tuple[str, WindowInstanceToken], str
+        ] = {}
         captured_windows = 0
         for window in windows:
             fingerprint = normalize_launch_fingerprint(
@@ -10850,6 +13607,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     scan_source_state_generation
                 ),
                 diagnostic_stage="scan",
+                presentation_states=presentation_states,
+            )
+            self._screen_observation_epoch += 1
+            observation_epoch = self._screen_observation_epoch
+            frame_digest = (
+                hashlib.sha256(sample.pixels).hexdigest()
+                if (
+                    fresh_capture
+                    and isinstance(sample, CaptureSample)
+                    and sample.api_succeeded
+                    and isinstance(sample.pixels, bytes)
+                )
+                else None
             )
             capture_routes[fingerprint] = capture_route
             _, current_capture_settings_revision = (
@@ -10867,6 +13637,35 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 )
                 fresh_capture = False
             instance = WindowInstanceToken.from_window(window)
+            diagnostic_authority = self._tcp_recovery_authority
+            diagnostic_event = self._post_login_diagnostic_event
+            if (
+                diagnostic_event is not None
+                and diagnostic_authority is diagnostic_event.authority
+                and not diagnostic_authority.terminal
+                and diagnostic_event.owner == fingerprint
+                and diagnostic_event.new_instance == instance
+            ):
+                try:
+                    diagnostic_now = self._monotonic_clock()
+                    self._buffer_post_login_diagnostic(
+                        authority=diagnostic_authority,
+                        fingerprint=fingerprint,
+                        instance=instance,
+                        sample=sample,
+                        recognition=recognition,
+                        fresh_capture=fresh_capture,
+                        capture_route=capture_route,
+                        presentation_state=presentation_states.get(
+                            (fingerprint, instance)
+                        ),
+                        capture_settings_revision=(
+                            current_capture_settings_revision
+                        ),
+                        now=diagnostic_now,
+                    )
+                except Exception:
+                    self._post_login_diagnostic_event = None
             initial_login_authorized = (
                 self._initial_login_authorization_is_current(
                     fingerprint,
@@ -10874,7 +13673,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     capture_settings_revision,
                     scan_source_state_generation,
                     now,
+                    action_state=recognition.state,
                 )
+            )
+            initial_login_authorization = (
+                self._initial_login_authorizations.get(fingerprint)
+            )
+            initial_login_continuation = bool(
+                initial_login_authorized
+                and initial_login_authorization is not None
+                and initial_login_authorization.continuation_state
+                is recognition.state
             )
             if initial_login_authorized:
                 current_initial_login_authorizations.add(fingerprint)
@@ -11090,6 +13899,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 recognition,
                 initial_login_authorized=initial_login_authorized,
             )
+            self._observe_force_login_message_screen(
+                self._tcp_recovery_authority,
+                fingerprint,
+                instance,
+                recognition,
+                fresh_capture=fresh_capture,
+                capture_route=capture_route,
+                source_state_generation=scan_source_state_generation,
+                frame_digest=frame_digest,
+                observation_epoch=observation_epoch,
+            )
             if recognition.state is not ReconnectScreenState.CONNECTED:
                 self._advance_tcp_screen_stage(
                     fingerprint,
@@ -11111,6 +13931,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             recognition = self._recognition_for_preferred_line(
                 fingerprint,
                 recognition,
+            )
+            recognition = self._recognition_for_tcp_line_fallback(
+                fingerprint,
+                instance,
+                recognition,
+                now,
+                fresh_capture=fresh_capture,
             )
             if (
                 recognition.state is ReconnectScreenState.FORCE_LOGIN_TIMEOUT
@@ -11269,6 +14096,19 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         if tcp_action and tcp_owner_state is not None
                         else None
                     ),
+                    frame_digest=frame_digest,
+                    observation_epoch=observation_epoch,
+                    require_independent_frames=bool(
+                        recognition.state
+                        is ReconnectScreenState.FORCE_LOGIN_START
+                        and self._tcp_recovery_authority is not None
+                        and self._tcp_recovery_authority.fingerprint
+                        == fingerprint
+                        and self._login_input_instance_key(
+                            self._tcp_recovery_authority.new_instance
+                        )
+                        == self._login_input_instance_key(instance)
+                    ),
                 )
             ):
                 confirmed_action_instances[fingerprint] = instance
@@ -11296,7 +14136,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 if (
                     initial_login_authorized
                     and recognition.state in _SESSION_ONLY_STATES
-                    and not self._has_reconnect_session(fingerprint)
+                    and (
+                        not self._has_reconnect_session(fingerprint)
+                        or initial_login_continuation
+                    )
                 ):
                     initial_authorized_action_fingerprints.add(
                         fingerprint
@@ -11527,6 +14370,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             and item.click_point is not None
             and fingerprint in confirmed_action_instances
             and fingerprint not in self._tcp_timeout_isolated
+            and not (
+                item.state is ReconnectScreenState.LINE_SELECTION
+                and item.line_scroll_delta not in {-120, 120}
+                and fingerprint in self._line_input_consumed_fingerprints
+            )
             and (operation_scope is None or fingerprint in operation_scope)
             and (
                 active_recovery_owner is None
@@ -12095,6 +14943,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         confirmed_instance,
                         capture_settings_revision,
                         scan_source_state_generation,
+                        action_state=item.state,
                     )
                 ):
                     self._clear_action_confirmation(fingerprint)
@@ -12137,6 +14986,56 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     item.state is ReconnectScreenState.LINE_SELECTION
                     and item.line_scroll_delta in {-120, 120}
                 )
+                is_line_direct_input = bool(
+                    item.state is ReconnectScreenState.LINE_SELECTION
+                    and not is_line_scroll
+                )
+                formal_login_transaction = bool(
+                    item.state
+                    is ReconnectScreenState.FORCE_LOGIN_START
+                    and recovery_authority is not None
+                    and active_recovery_owner == fingerprint
+                    and self._tcp_recovery_screen_action_is_current(
+                        recovery_authority,
+                        fingerprint,
+                        confirmed_instance,
+                    )
+                )
+                login_transaction = None
+                if formal_login_transaction:
+                    transaction_window = self._current_action_window(
+                        confirmed_instance,
+                        fingerprint,
+                    )
+                    if transaction_window is not None:
+                        login_transaction = (
+                            self._prepare_login_input_transaction(
+                                authority=recovery_authority,
+                                fingerprint=fingerprint,
+                                instance=confirmed_instance,
+                                window=transaction_window,
+                                item=item,
+                                confirmation=confirmation,
+                                presentation_state=(
+                                    presentation_states.get(
+                                        (
+                                            fingerprint,
+                                            confirmed_instance,
+                                        ),
+                                        "unknown",
+                                    )
+                                ),
+                                capture_settings_revision=(
+                                    capture_settings_revision
+                                ),
+                            )
+                        )
+                    if login_transaction is None:
+                        failures.append(
+                            "login_input_transaction_not_authorized"
+                        )
+                        self._clear_action_confirmation(fingerprint)
+                        continue
 
                 def deliver_click():
                     current_window = self._current_action_window(
@@ -12199,6 +15098,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             confirmed_instance,
                             capture_settings_revision,
                             confirmation.source_state_generation,
+                            action_state=item.state,
                         )
                     ):
                         return "changed", False
@@ -12214,41 +15114,62 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         )
                     ):
                         return "changed", False
+
+                    def perform_authorized_input():
+                        if is_line_scroll:
+                            scroll_relative = getattr(
+                                self._mouse_backend,
+                                "scroll_relative",
+                                None,
+                            )
+                            if not callable(scroll_relative):
+                                return MouseClickResult(
+                                    False,
+                                    True,
+                                    False,
+                                    "input_wheel_backend_unavailable",
+                                )
+                            return scroll_relative(
+                                confirmed_instance.handle,
+                                item.click_point,
+                                item.line_scroll_delta,
+                                confirmed_instance.process_id,
+                                confirmed_instance,
+                            )
+                        if (
+                            item.state
+                            is ReconnectScreenState.FORCE_LOGIN_START
+                            and recovery_authority is not None
+                            and active_recovery_owner == fingerprint
+                            and self._tcp_recovery_screen_action_is_current(
+                                recovery_authority,
+                                fingerprint,
+                                confirmed_instance,
+                            )
+                        ):
+                            return self._deliver_formal_force_login_click(
+                                recovery_authority,
+                                confirmed_instance,
+                                current_window,
+                                presentation_states.get(
+                                    (fingerprint, confirmed_instance),
+                                    "unknown",
+                                ),
+                                item.click_point,
+                                capture_route=current_capture_route,
+                                transaction=login_transaction,
+                            )
+                        return self._mouse_backend.click_relative(
+                            confirmed_instance.handle,
+                            item.click_point,
+                            confirmed_instance.process_id,
+                            confirmed_instance,
+                        )
+
                     try:
                         permitted, click_result = (
                             self._run_authorized_backend_call(
-                                lambda: (
-                                    self._mouse_backend.scroll_relative(
-                                        confirmed_instance.handle,
-                                        item.click_point,
-                                        item.line_scroll_delta,
-                                        confirmed_instance.process_id,
-                                        confirmed_instance,
-                                    )
-                                    if is_line_scroll
-                                    and callable(
-                                        getattr(
-                                            self._mouse_backend,
-                                            "scroll_relative",
-                                            None,
-                                        )
-                                    )
-                                    else (
-                                        MouseClickResult(
-                                            False,
-                                            True,
-                                            False,
-                                            "input_wheel_backend_unavailable",
-                                        )
-                                        if is_line_scroll
-                                        else self._mouse_backend.click_relative(
-                                            confirmed_instance.handle,
-                                            item.click_point,
-                                            confirmed_instance.process_id,
-                                            confirmed_instance,
-                                        )
-                                    )
-                                ),
+                                perform_authorized_input,
                                 expected_capture_settings_revision=(
                                     capture_settings_revision
                                 ),
@@ -12303,7 +15224,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     evidence_intent,
                     evidence_authority,
                 ) = (
-                    self._begin_evidence_action(
+                    (
+                        True,
+                        login_transaction.intent_sequence,
+                        login_transaction.evidence_authority_signature,
+                    )
+                    if login_transaction is not None
+                    else self._begin_evidence_action(
                         fingerprint=fingerprint,
                         item=item,
                         action=evidence_action,
@@ -12321,6 +15248,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     failures.append("evidence_recording_unavailable")
                     self._clear_action_confirmation(fingerprint)
                     continue
+                if is_line_direct_input:
+                    if fingerprint in self._line_input_consumed_fingerprints:
+                        self._clear_action_confirmation(fingerprint)
+                        continue
+                    # Crossing into the mutation boundary consumes this
+                    # activation's only direct line input before any final
+                    # authorization or backend outcome can become uncertain.
+                    self._line_input_consumed_fingerprints.add(fingerprint)
                 permitted, mutation_result = self._run_game_mutation(
                     "smart-reconnect-click",
                     deliver_click,
@@ -12345,47 +15280,60 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     and isinstance(mutation_result[1], MouseClickResult)
                     else None
                 )
-                self._finish_evidence_action(
-                    fingerprint=fingerprint,
-                    item=item,
-                    action=evidence_action,
-                    intent_sequence=evidence_intent,
-                    allowed=permitted,
-                    performed=(
-                        permitted
-                        and evidence_click_result is not None
-                        and (
-                            evidence_click_result.delivered
-                            or evidence_click_result.delivery_uncertain
-                        )
-                    ),
-                    clicked=bool(
-                        evidence_click_result is not None
-                        and evidence_click_result.delivered
-                    ),
-                    identity_verified=True,
-                    restoration_verified=(
-                        evidence_click_result.restored
-                        if evidence_click_result is not None
-                        else None
-                    ),
-                    failure_reason=(
-                        evidence_click_result.failure_code
-                        if evidence_click_result is not None
-                        and evidence_click_result.failure_code is not None
-                        else (
+                if login_transaction is not None:
+                    self._finish_login_input_transaction(
+                        login_transaction,
+                        item,
+                        allowed=permitted,
+                        delivery_state=(
                             str(evidence_delivery_state)
                             if evidence_delivery_state is not None
-                            and evidence_delivery_state != "delivered"
-                            else (
-                                "authorization_revoked"
-                                if not permitted
-                                else None
+                            else None
+                        ),
+                        click_result=evidence_click_result,
+                    )
+                else:
+                    self._finish_evidence_action(
+                        fingerprint=fingerprint,
+                        item=item,
+                        action=evidence_action,
+                        intent_sequence=evidence_intent,
+                        allowed=permitted,
+                        performed=(
+                            permitted
+                            and evidence_click_result is not None
+                            and (
+                                evidence_click_result.delivered
+                                or evidence_click_result.delivery_uncertain
                             )
-                        )
-                    ),
-                    authority_signature=evidence_authority,
-                )
+                        ),
+                        clicked=bool(
+                            evidence_click_result is not None
+                            and evidence_click_result.delivered
+                        ),
+                        identity_verified=True,
+                        restoration_verified=(
+                            evidence_click_result.restored
+                            if evidence_click_result is not None
+                            else None
+                        ),
+                        failure_reason=(
+                            evidence_click_result.failure_code
+                            if evidence_click_result is not None
+                            and evidence_click_result.failure_code is not None
+                            else (
+                                str(evidence_delivery_state)
+                                if evidence_delivery_state is not None
+                                and evidence_delivery_state != "delivered"
+                                else (
+                                    "authorization_revoked"
+                                    if not permitted
+                                    else None
+                                )
+                            )
+                        ),
+                        authority_signature=evidence_authority,
+                    )
                 if not permitted or not isinstance(mutation_result, tuple):
                     self._clear_action_confirmation(fingerprint)
                     if self._capture_authority_is_current(
@@ -12445,10 +15393,40 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 if click_result.delivered:
                     clicked_windows += 1
                     self._action_confirmations.pop(fingerprint, None)
-                    self._initial_login_authorizations.pop(
-                        fingerprint,
-                        None,
+                    authorization = self._initial_login_authorizations.get(
+                        fingerprint
                     )
+                    if (
+                        item.state
+                        is ReconnectScreenState.FORCE_LOGIN_START
+                        and uses_initial_login_authorization
+                        and authority_is_current
+                        and authorization is not None
+                        and self._initial_login_authorization_is_current(
+                            fingerprint,
+                            confirmed_instance,
+                            capture_settings_revision,
+                            confirmation.source_state_generation,
+                            action_state=item.state,
+                        )
+                    ):
+                        # The delivered start-game message consumes the broad
+                        # activation grant.  Keep only one continuation for
+                        # the same live instance's immediately following line
+                        # screen; every other state remains fail-closed.
+                        self._initial_login_authorizations[fingerprint] = (
+                            replace(
+                                authorization,
+                                continuation_state=(
+                                    ReconnectScreenState.LINE_SELECTION
+                                ),
+                            )
+                        )
+                    else:
+                        self._initial_login_authorizations.pop(
+                            fingerprint,
+                            None,
+                        )
                     self._pending_reconnect_fingerprints.add(fingerprint)
                     if item.state is ReconnectScreenState.DISCONNECTED:
                         self._flow_pause_until[fingerprint] = (
@@ -12477,6 +15455,13 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                         item.state is ReconnectScreenState.LINE_SELECTION
                         and not is_line_scroll
                     ):
+                        line_event = self._line_fallback_search_event
+                        if (
+                            line_event is not None
+                            and line_event.authority.fingerprint
+                            == fingerprint
+                        ):
+                            self._line_fallback_search_event = None
                         self._flow_pause_until[fingerprint] = (
                             mutation_completed_at
                             + self._policy.line_transition_wait_seconds
@@ -12496,8 +15481,28 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     continue
                 if click_result.delivered:
                     if (
+                        item.state is ReconnectScreenState.FORCE_LOGIN_START
+                        and recovery_authority is not None
+                        and active_recovery_owner == fingerprint
+                        and self._tcp_recovery_screen_action_is_current(
+                            recovery_authority,
+                            fingerprint,
+                            confirmed_instance,
+                        )
+                    ):
+                        try:
+                            self._arm_post_login_diagnostic(
+                                recovery_authority,
+                                confirmed_instance,
+                                mutation_completed_at,
+                                capture_settings_revision,
+                            )
+                        except Exception:
+                            self._post_login_diagnostic_event = None
+                    if (
                         item.state is ReconnectScreenState.LINE_SELECTION
                         and not is_line_scroll
+                        and not item.line_fallback_used
                         and item.line_number in LINE_ROUTE_CLICK_POINTS
                     ):
                         self._preferred_line_numbers[fingerprint] = (

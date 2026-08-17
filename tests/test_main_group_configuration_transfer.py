@@ -52,3 +52,15 @@ def test_group_configuration_transfer_is_wired_to_current_group_page() -> None:
         "on_group_launch_hotkey_change=change_group_launch_hotkey"
         in source
     )
+
+
+def test_group_window_launch_service_receives_registry_for_existing_window_claim() -> None:
+    source = Path("main.py").read_text(encoding="utf-8")
+    start = source.index("    group_window_launch_service = (")
+    end = source.index("    window_size_adjustment_service = (", start)
+    wiring = source[start:end]
+
+    assert "GroupWindowLaunchService(" in wiring
+    assert "window_registry=registry" in wiring
+    assert "window_registry_store=registry_store" in wiring
+    assert "ManagedGameProcessService(" in wiring

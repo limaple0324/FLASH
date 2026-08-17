@@ -2757,6 +2757,8 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                     else None
                 ),
             ),
+            window_registry=registry,
+            window_registry_store=registry_store,
         )
         if group_launch_service is not None
         else None

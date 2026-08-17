@@ -1,8 +1,11 @@
+import base64
 import ctypes
 import hashlib
 import json
+import shutil
 import threading
 import time
+import zlib
 from dataclasses import dataclass, replace
 from ctypes import wintypes
 from pathlib import Path
@@ -13,6 +16,8 @@ from PIL import Image
 from adapters.game_screen_recognizer import (
     CHARACTER_ENTER_CLICK_POINT,
     CharacterSelectionCandidate,
+    LINE_LIST_SCROLL_POINT,
+    LINE_ROUTE_CLICK_POINTS,
     POST_DISCONNECT_WAITING_REFERENCE_FILE,
     ReferenceScreenRecognizer,
     ScreenRecognition,
@@ -20,6 +25,7 @@ from adapters.game_screen_recognizer import (
 from adapters.windows_auto_battle import AutoBattleEvidence
 from adapters.windows_background_capture import (
     CaptureSample,
+    _WindowInstanceCredential,
     Win32PrintWindowProvider,
     Win32RecoveringPrintWindowProvider,
     Win32TemporarilyRevealedCaptureProvider,
@@ -31,6 +37,9 @@ from adapters.windows_battle_restart import (
     BattleRestartResult,
 )
 from adapters.windows_smart_reconnect import (
+    _ForceLoginFormalPresentation,
+    _ForceLoginMessageEvidence,
+    _ForceLoginMessageWindowState,
     MouseClickResult,
     ReconnectRuntimeStateStore,
     RegisteredReconnectRole,
@@ -50,10 +59,53 @@ from services.reconnect_failure_status_service import (
 from services.smart_reconnect_capture_settings_service import (
     SmartReconnectCaptureSettings,
 )
+from services.sync_operation_record_store import SyncOperationRecordStore
 from services.target_window_contract_service import (
     ResolvedTargetWindows,
     TargetFailureEvidence,
 )
+
+
+def _reconstruct_bounded_diagnostic_details(records):
+    chunks = {}
+    completions = []
+    short_details = []
+    for record in records:
+        detail = (
+            record.detail
+            if hasattr(record, "detail")
+            else record[1]
+        )
+        envelope = json.loads(detail)
+        record_type = envelope.get("type")
+        if record_type == "chunk":
+            digest = envelope["payload_sha256"]
+            chunks.setdefault(digest, {})[envelope["index"]] = envelope[
+                "chunk"
+            ]
+        elif record_type == "complete":
+            completions.append(envelope)
+        else:
+            short_details.append(detail)
+    reconstructed = list(short_details)
+    for completion in completions:
+        digest = completion["payload_sha256"]
+        indexed = chunks.get(digest, {})
+        assert sorted(indexed) == list(range(completion["total"]))
+        encoded = "".join(
+            indexed[index] for index in range(completion["total"])
+        )
+        compressed = base64.b64decode(
+            encoded.encode("ascii"),
+            validate=True,
+        )
+        assert completion["encoding"] == "zlib+base64"
+        assert len(compressed) == completion["compressed_bytes"]
+        raw = zlib.decompress(compressed)
+        assert len(raw) == completion["raw_bytes"]
+        assert hashlib.sha256(raw).hexdigest() == digest
+        reconstructed.append(raw.decode("utf-8"))
+    return reconstructed
 
 
 def make_window(
@@ -115,16 +167,21 @@ class FakeCaptureProvider:
     def __init__(self, states):
         self.states = dict(states)
         self.calls = []
+        self.vary_frames = set()
+        self._frame_sequences = {}
 
     def capture(self, handle):
         self.calls.append(handle)
         marker = self.states.get(handle, 255)
         if marker is None:
             return None
+        sequence = self._frame_sequences.get(handle, 0) + 1
+        self._frame_sequences[handle] = sequence
+        nonce = sequence % 256 if handle in self.vary_frames else 0
         return CaptureSample(
             width=2,
             height=2,
-            pixels=bytes([marker, 0, 0, 255] * 4),
+            pixels=bytes([marker, nonce, 0, 255] * 4),
             api_succeeded=True,
         )
 
@@ -186,6 +243,11 @@ class FakeMouseBackend:
         self.expected_process_ids = []
         self.instance_tokens = []
         self.click_results = list(click_results)
+        self.diagnosed_clicks = []
+        self.diagnostic_evidence = []
+        self.diagnosed_observation = None
+        self.diagnosed_final_observation = None
+        self.on_diagnosed_delivery = None
 
     def is_window(self, handle):
         return handle not in self.invalid
@@ -213,6 +275,130 @@ class FakeMouseBackend:
                 "mouse_click_failed",
             )
         return MouseClickResult(True, True, False, None)
+
+    def click_relative_diagnosed(
+        self,
+        handle,
+        point,
+        expected_process_id,
+        instance_token,
+        formal_presentation,
+        observed_presentation_reader,
+        diagnostic_recorder,
+        formal_window_state=None,
+    ):
+        assert callable(observed_presentation_reader)
+        if callable(self.on_diagnosed_delivery):
+            self.on_diagnosed_delivery()
+        if (
+            self.diagnosed_final_observation is not None
+            and formal_window_state is not None
+        ):
+            current = (
+                self.diagnosed_final_observation(formal_window_state)
+                if callable(self.diagnosed_final_observation)
+                else self.diagnosed_final_observation
+            )
+            drift, target_drift, external_change = (
+                Win32MouseMessageBackend.
+                _force_login_transaction_baseline_changes(
+                    formal_window_state,
+                    current,
+                )
+            )
+            if drift:
+                diagnostic_recorder(
+                    _ForceLoginMessageEvidence(
+                        sequence=0,
+                        message=0,
+                        message_name="PRE_SEND_BASELINE",
+                        before=formal_window_state,
+                        after=current,
+                        attempted=False,
+                        confirmed=not target_drift,
+                        drift_fields=drift,
+                        target_drift_fields=target_drift,
+                        external_change_fields=external_change,
+                        change_kind=(
+                            "target_change"
+                            if target_drift
+                            else "external_change"
+                        ),
+                        cause=(
+                            "target_state_changed"
+                            if target_drift
+                            else "cause_unknown"
+                        ),
+                    )
+                )
+            if target_drift:
+                return MouseClickResult(
+                    False,
+                    True,
+                    False,
+                    "force_login_message_state_changed",
+                )
+        self.diagnosed_clicks.append((handle, point))
+        for evidence in self.diagnostic_evidence:
+            diagnostic_recorder(evidence)
+        return self.click_relative(
+            handle,
+            point,
+            expected_process_id,
+            instance_token,
+        )
+
+    def observe_relative_diagnosed(
+        self,
+        handle,
+        expected_process_id,
+        instance_token,
+        formal_presentation,
+        observed_presentation_reader,
+    ):
+        if callable(self.diagnosed_observation):
+            return self.diagnosed_observation(
+                handle,
+                expected_process_id,
+                instance_token,
+                formal_presentation,
+                observed_presentation_reader,
+            )
+        if self.diagnosed_observation is not None:
+            return self.diagnosed_observation
+        credential = _WindowInstanceCredential(
+            instance_token.handle,
+            instance_token.process_id,
+            instance_token.thread_id,
+            instance_token.window_class,
+            instance_token.process_lifecycle_token,
+        )
+        return _ForceLoginMessageWindowState(
+            observed_at_monotonic=1.0,
+            foreground_handle=700,
+            target_handle=handle,
+            target_instance=credential,
+            gui_thread_id=1700,
+            active_handle=700,
+            focus_handle=700,
+            focus_root_handle=700,
+            target_is_foreground=False,
+            target_has_focus=False,
+            cursor=(321, 654),
+            target_visible=formal_presentation.visible,
+            target_minimized=formal_presentation.minimized,
+            target_rect=formal_presentation.rect,
+            presentation_state=formal_presentation.presentation_state,
+            target_topmost=False,
+            previous_instance=None,
+            next_instance=None,
+            expected_visible=formal_presentation.visible,
+            expected_minimized=formal_presentation.minimized,
+            expected_rect=formal_presentation.rect,
+            expected_presentation_state=(
+                formal_presentation.presentation_state
+            ),
+        )
 
     def scroll_relative(
         self,
@@ -288,6 +474,9 @@ class FakeWin32MouseApi:
         self.normal_rect = (10, 20, 910, 620)
         self.client_rect = (0, 0, 900, 600)
         self.foreground = 700
+        self.gui_active = 700
+        self.gui_focus = 700
+        self.cursor = (321, 654)
         self.z_order = [700, 300, self.target, 400]
         self.topmost = set()
         self.restore_succeeds = restore_succeeds
@@ -334,6 +523,11 @@ class FakeWin32MouseApi:
         self.GetForegroundWindow = FakeWin32Function(
             lambda: self.foreground
         )
+        self.GetGUIThreadInfo = FakeWin32Function(
+            self._get_gui_thread_info
+        )
+        self.GetAncestor = FakeWin32Function(self._get_ancestor)
+        self.GetCursorPos = FakeWin32Function(self._get_cursor_pos)
         self.GetWindowThreadProcessId = FakeWin32Function(
             self._get_window_thread_process_id
         )
@@ -351,6 +545,8 @@ class FakeWin32MouseApi:
         self.SendMessageTimeoutW = FakeWin32Function(
             self._send_message_timeout
         )
+        self.gui_thread_queries = []
+        self.ancestor_calls = []
 
     def _get_window_rect(self, handle, pointer):
         rect = self.rects.get(win32_handle_value(handle))
@@ -410,6 +606,24 @@ class FakeWin32MouseApi:
         process_id = self.process_ids.get(value, 0)
         process_pointer._obj.value = process_id
         return self.thread_ids.get(value, 0) if process_id else 0
+
+    def _get_gui_thread_info(self, thread_id, pointer):
+        queried = win32_handle_value(thread_id)
+        self.gui_thread_queries.append(queried)
+        if queried not in self.thread_ids.values():
+            return False
+        info = pointer._obj
+        info.hwndActive = self.gui_active
+        info.hwndFocus = self.gui_focus
+        return True
+
+    def _get_ancestor(self, handle, _flags):
+        self.ancestor_calls.append(win32_handle_value(handle))
+        return win32_handle_value(handle)
+
+    def _get_cursor_pos(self, pointer):
+        pointer._obj.x, pointer._obj.y = self.cursor
+        return True
 
     def _get_class_name(self, handle, buffer, capacity):
         value = self.window_classes.get(win32_handle_value(handle), "")
@@ -639,6 +853,28 @@ def message_numbers(api):
     return [call[1] for call in api.message_calls]
 
 
+def force_login_presentation(api):
+    return _ForceLoginFormalPresentation(
+        visible=api.visible[api.target],
+        minimized=api.minimized[api.target],
+        rect=api.rects[api.target],
+        presentation_state="fully_obscured",
+    )
+
+
+def force_login_observed_presentation(api):
+    api.observed_presentation_state = "fully_obscured"
+    api.observed_presentation_reads = []
+
+    def read(visible, minimized, rect):
+        api.observed_presentation_reads.append(
+            (visible, minimized, rect)
+        )
+        return api.observed_presentation_state
+
+    return read
+
+
 def test_win32_mouse_uses_confirmed_synchronous_messages_for_normal_window(
     monkeypatch,
 ):
@@ -673,6 +909,367 @@ def test_win32_mouse_uses_confirmed_synchronous_messages_for_normal_window(
             | backend.SMTO_ERRORONEXIT
         )
         assert timeout == backend.MESSAGE_TIMEOUT_MS
+
+
+def test_formal_force_login_diagnostic_records_each_message_without_mutation(
+    monkeypatch,
+):
+    api = FakeWin32MouseApi(minimized=False)
+    backend = win32_mouse_backend(api, monkeypatch)
+    original_foreground = api.foreground
+    original_focus = api.gui_focus
+    original_cursor = api.cursor
+    original_order = list(api.z_order)
+    evidence = []
+
+    result = backend.click_relative_diagnosed(
+        api.target,
+        (0.5, 0.5),
+        api.expected_process_id,
+        api.instance_token(),
+        force_login_presentation(api),
+        force_login_observed_presentation(api),
+        evidence.append,
+    )
+
+    assert result == MouseClickResult(True, True, False, None)
+    assert [item.message_name for item in evidence] == [
+        "WM_MOUSEMOVE",
+        "WM_LBUTTONDOWN",
+        "WM_LBUTTONUP",
+    ]
+    assert all(item.before is not None and item.after is not None
+               for item in evidence)
+    assert all(item.attempted and item.confirmed for item in evidence)
+    assert all(item.drift_fields == () for item in evidence)
+    assert all(item.before.gui_thread_id == api.thread_ids[api.foreground]
+               for item in evidence)
+    assert all(item.before.previous_instance.handle == 300
+               and item.before.next_instance.handle == 400
+               for item in evidence)
+    assert api.foreground == original_foreground
+    assert api.gui_focus == original_focus
+    assert api.cursor == original_cursor
+    assert api.z_order == original_order
+    assert api.foreground_calls == []
+    assert api.position_calls == []
+    assert api.show_calls == []
+    assert len(api.observed_presentation_reads) == 7
+
+
+def test_formal_force_login_rechecks_formal_state_before_first_message(
+    monkeypatch,
+):
+    api = FakeWin32MouseApi(minimized=False)
+    backend = win32_mouse_backend(api, monkeypatch)
+    formal = force_login_presentation(api)
+    observed_presentation = force_login_observed_presentation(api)
+    api.observed_presentation_state = "unexpected"
+    evidence = []
+
+    result = backend.click_relative_diagnosed(
+        api.target,
+        (0.5, 0.5),
+        api.expected_process_id,
+        api.instance_token(),
+        formal,
+        observed_presentation,
+        evidence.append,
+    )
+
+    assert result.failure_code == "force_login_message_state_changed"
+    assert message_numbers(api) == []
+    assert len(evidence) == 1
+    assert evidence[0].attempted is False
+    assert evidence[0].target_drift_fields == (
+        "formal_presentation_mismatch",
+    )
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "before_value", "after_value"),
+    (
+        ("target_visible", True, False),
+        ("target_minimized", False, True),
+        ("target_rect", (10, 20, 910, 620), (11, 20, 911, 620)),
+        ("presentation_state", "fully_obscured", "partially_obscured"),
+    ),
+)
+def test_formal_force_login_message_snapshots_fresh_observed_presentation(
+    monkeypatch,
+    changed_field,
+    before_value,
+    after_value,
+):
+    api = FakeWin32MouseApi(minimized=False)
+    backend = win32_mouse_backend(api, monkeypatch)
+    evidence = []
+    observed_presentation = force_login_observed_presentation(api)
+
+    def change_one_observed_value(fake, message):
+        if message != backend.WM_MOUSEMOVE:
+            return
+        if changed_field == "target_visible":
+            fake.visible[fake.target] = False
+        elif changed_field == "target_minimized":
+            fake.minimized[fake.target] = True
+        elif changed_field == "target_rect":
+            fake.rects[fake.target] = after_value
+        else:
+            fake.observed_presentation_state = after_value
+
+    api.after_message = change_one_observed_value
+    formal = force_login_presentation(api)
+    result = backend.click_relative_diagnosed(
+        api.target,
+        (0.5, 0.5),
+        api.expected_process_id,
+        api.instance_token(),
+        formal,
+        observed_presentation,
+        evidence.append,
+    )
+
+    assert result.delivered is False
+    assert message_numbers(api) == [backend.WM_MOUSEMOVE]
+    assert len(evidence) == 1
+    assert getattr(evidence[0].before, changed_field) == before_value
+    assert getattr(evidence[0].after, changed_field) == after_value
+    assert changed_field in evidence[0].target_drift_fields
+    assert evidence[0].before.expected_visible is formal.visible
+    assert evidence[0].before.expected_minimized is formal.minimized
+    assert evidence[0].before.expected_rect == formal.rect
+    assert (
+        evidence[0].before.expected_presentation_state
+        == formal.presentation_state
+    )
+    assert len(api.observed_presentation_reads) == 3
+
+
+def test_formal_force_login_diagnostic_stops_before_down_on_first_move_drift(
+    monkeypatch,
+):
+    api = FakeWin32MouseApi(minimized=False)
+    backend = win32_mouse_backend(api, monkeypatch)
+    evidence = []
+
+    def activate_target_after_move(fake, message):
+        if message == backend.WM_MOUSEMOVE:
+            fake.foreground = fake.target
+            fake.gui_active = fake.target
+            fake.gui_focus = fake.target
+
+    api.after_message = activate_target_after_move
+    result = backend.click_relative_diagnosed(
+        api.target,
+        (0.5, 0.5),
+        api.expected_process_id,
+        api.instance_token(),
+        force_login_presentation(api),
+        force_login_observed_presentation(api),
+        evidence.append,
+    )
+
+    assert result.delivered is False
+    assert result.delivery_uncertain is False
+    assert result.failure_code == "force_login_message_state_changed"
+    assert message_numbers(api) == [backend.WM_MOUSEMOVE]
+    assert [item.message_name for item in evidence] == ["WM_MOUSEMOVE"]
+    assert "foreground_handle" in evidence[0].drift_fields
+    assert "focus_handle" in evidence[0].drift_fields
+    assert "target_became_foreground" in (
+        evidence[0].target_drift_fields
+    )
+    assert evidence[0].change_kind == "target_change"
+
+
+@pytest.mark.parametrize(
+    ("drift_kind", "expected_field"),
+    (
+        ("identity", "target_instance"),
+        (
+            "presentation",
+            "target_identity_or_presentation_guard_changed",
+        ),
+        ("z_order", "previous_instance"),
+    ),
+)
+def test_formal_force_login_target_identity_presentation_and_z_drift_stop(
+    monkeypatch,
+    drift_kind,
+    expected_field,
+):
+    api = FakeWin32MouseApi(minimized=False)
+    backend = win32_mouse_backend(api, monkeypatch)
+    evidence = []
+
+    def change_target_state_after_move(fake, message):
+        if message != backend.WM_MOUSEMOVE:
+            return
+        if drift_kind == "identity":
+            fake.window_classes[fake.target] = "ChangedFlashClass"
+        elif drift_kind == "presentation":
+            fake.rects[fake.target] = (11, 20, 911, 620)
+        else:
+            fake.z_order = [700, fake.target, 300, 400]
+
+    api.after_message = change_target_state_after_move
+    result = backend.click_relative_diagnosed(
+        api.target,
+        (0.5, 0.5),
+        api.expected_process_id,
+        api.instance_token(),
+        force_login_presentation(api),
+        force_login_observed_presentation(api),
+        evidence.append,
+    )
+
+    assert result.delivered is False
+    assert result.delivery_uncertain is False
+    assert result.failure_code == "force_login_message_state_changed"
+    assert message_numbers(api) == [backend.WM_MOUSEMOVE]
+    assert len(evidence) == 1
+    assert expected_field in evidence[0].target_drift_fields
+    assert evidence[0].change_kind == "target_change"
+
+
+def test_formal_force_login_diagnostic_finishes_up_after_down_drift_then_stops(
+    monkeypatch,
+):
+    api = FakeWin32MouseApi(minimized=False)
+    backend = win32_mouse_backend(api, monkeypatch)
+    evidence = []
+
+    def activate_target_after_down(fake, message):
+        if message == backend.WM_LBUTTONDOWN:
+            fake.foreground = fake.target
+            fake.gui_active = fake.target
+            fake.gui_focus = fake.target
+
+    api.after_message = activate_target_after_down
+    result = backend.click_relative_diagnosed(
+        api.target,
+        (0.5, 0.5),
+        api.expected_process_id,
+        api.instance_token(),
+        force_login_presentation(api),
+        force_login_observed_presentation(api),
+        evidence.append,
+    )
+
+    assert result.delivered is False
+    assert result.delivery_uncertain is True
+    assert result.failure_code == "force_login_message_state_changed"
+    assert message_numbers(api) == [
+        backend.WM_MOUSEMOVE,
+        backend.WM_LBUTTONDOWN,
+        backend.WM_LBUTTONUP,
+    ]
+    assert evidence[1].message_name == "WM_LBUTTONDOWN"
+    assert "foreground_handle" in evidence[1].drift_fields
+    assert "target_became_foreground" in (
+        evidence[1].target_drift_fields
+    )
+    assert evidence[2].message_name == "WM_LBUTTONUP"
+    assert evidence[2].attempted is True
+    assert evidence[2].target_drift_fields
+    assert message_numbers(api).count(backend.WM_LBUTTONUP) == 1
+
+
+def test_formal_force_login_external_focus_and_cursor_change_do_not_stop(
+    monkeypatch,
+):
+    api = FakeWin32MouseApi(minimized=False)
+    backend = win32_mouse_backend(api, monkeypatch)
+    evidence = []
+
+    def change_external_state(fake, message):
+        if message == backend.WM_MOUSEMOVE:
+            fake.foreground = 888
+            fake.gui_active = 888
+            fake.gui_focus = 888
+            fake.cursor = (999, 111)
+
+    api.after_message = change_external_state
+    result = backend.click_relative_diagnosed(
+        api.target,
+        (0.5, 0.5),
+        api.expected_process_id,
+        api.instance_token(),
+        force_login_presentation(api),
+        force_login_observed_presentation(api),
+        evidence.append,
+    )
+
+    assert result == MouseClickResult(True, True, False, None)
+    assert message_numbers(api) == [
+        backend.WM_MOUSEMOVE,
+        backend.WM_LBUTTONDOWN,
+        backend.WM_LBUTTONUP,
+    ]
+    assert "foreground_handle" in evidence[0].drift_fields
+    assert "cursor" in evidence[0].drift_fields
+    assert evidence[0].target_drift_fields == ()
+    assert evidence[0].change_kind == "external_change"
+    assert evidence[0].cause == "cause_unknown"
+
+
+def test_formal_force_login_diagnostic_queries_foreground_thread_and_keeps_zero_focus(
+    monkeypatch,
+):
+    api = FakeWin32MouseApi(minimized=False)
+    api.gui_focus = 0
+    backend = win32_mouse_backend(api, monkeypatch)
+    evidence = []
+
+    result = backend.click_relative_diagnosed(
+        api.target,
+        (0.5, 0.5),
+        api.expected_process_id,
+        api.instance_token(),
+        force_login_presentation(api),
+        force_login_observed_presentation(api),
+        evidence.append,
+    )
+
+    assert result == MouseClickResult(True, True, False, None)
+    assert set(api.gui_thread_queries) == {api.thread_ids[api.foreground]}
+    assert api.ancestor_calls == []
+    assert all(item.before.focus_handle == 0 for item in evidence)
+    assert all(item.before.focus_root_handle == 0 for item in evidence)
+
+
+def test_formal_force_login_down_drift_sends_exactly_one_up_even_when_up_fails(
+    monkeypatch,
+):
+    api = FakeWin32MouseApi(
+        minimized=False,
+        message_results={Win32MouseMessageBackend.WM_LBUTTONUP: [False]},
+    )
+    backend = win32_mouse_backend(api, monkeypatch)
+    evidence = []
+
+    def activate_target_after_down(fake, message):
+        if message == backend.WM_LBUTTONDOWN:
+            fake.foreground = fake.target
+            fake.gui_active = fake.target
+            fake.gui_focus = fake.target
+
+    api.after_message = activate_target_after_down
+    result = backend.click_relative_diagnosed(
+        api.target,
+        (0.5, 0.5),
+        api.expected_process_id,
+        api.instance_token(),
+        force_login_presentation(api),
+        force_login_observed_presentation(api),
+        evidence.append,
+    )
+
+    assert result.delivered is False
+    assert result.delivery_uncertain is True
+    assert message_numbers(api).count(backend.WM_LBUTTONUP) == 1
+    assert [item.message_name for item in evidence].count("WM_LBUTTONUP") == 1
 
 
 @pytest.mark.parametrize("expected_process_id", [0, -1, 999])
@@ -2973,6 +3570,7 @@ def tcp_login_fixture(
             peer.handle: 1 for peer in detection_only
         }}
     )
+    fixture.capture.vary_frames.add(new.handle)
     tick = [9.0]
 
     def progress_clock():
@@ -2985,6 +3583,2583 @@ def tcp_login_fixture(
 
     fixture.controller._monotonic_clock = progress_clock
     return fixture, old, new, peers, frames
+
+
+def _delivered_login_transaction_fixture(
+    tmp_path,
+    *,
+    click_results=(),
+    extra_states=(1, 1),
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, old, new, peers, frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+        extra_states=extra_states,
+    )
+    fixture.mouse.click_results = list(click_results)
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    delivered = fixture.controller.reconnect()
+    return fixture, old, new, peers, frames, delivered
+
+
+def test_login_input_transaction_success_is_consumed_once(tmp_path):
+    fixture, _old, _new, _peers, _frames, delivered = (
+        _delivered_login_transaction_fixture(tmp_path)
+    )
+
+    transaction = fixture.controller._login_input_transaction
+    assert delivered.details["clicked_windows"] == 1
+    assert transaction.state.value == "result_recorded"
+    assert transaction.consumed is True
+    assert transaction.event_sequence == 1
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+    assert fixture.controller._login_input_transaction is transaction
+
+
+def test_login_input_transaction_uncertain_delivery_is_never_reused(tmp_path):
+    uncertain = MouseClickResult(
+        False,
+        True,
+        True,
+        "mouse_down_delivery_uncertain",
+    )
+    fixture, _old, _new, _peers, _frames, _delivered = (
+        _delivered_login_transaction_fixture(
+            tmp_path,
+            click_results=(uncertain,),
+        )
+    )
+
+    transaction = fixture.controller._login_input_transaction
+    assert transaction.consumed is True
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+    for _scan in range(4):
+        fixture.controller.reconnect()
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+    assert fixture.controller._login_input_transaction is transaction
+
+
+def test_login_input_transaction_source_change_does_not_create_event(tmp_path):
+    fixture, _old, _new, _peers, _frames, _delivered = (
+        _delivered_login_transaction_fixture(tmp_path)
+    )
+    transaction = fixture.controller._login_input_transaction
+    fixture.controller._source_state_generation += 1
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert fixture.controller._login_input_transaction is transaction
+    assert transaction.event_sequence == 1
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+
+def test_login_input_transaction_geometry_change_does_not_create_event(tmp_path):
+    fixture, _old, new, _peers, _frames, _delivered = (
+        _delivered_login_transaction_fixture(tmp_path)
+    )
+    transaction = fixture.controller._login_input_transaction
+    fixture.controller._window_backend.windows[0] = replace(
+        new,
+        rect=(10, 10, 910, 610),
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert fixture.controller._login_input_transaction is transaction
+    assert transaction.event_sequence == 1
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+
+def test_login_input_transaction_repeated_login_frames_never_rearm(tmp_path):
+    fixture, _old, _new, _peers, _frames, _delivered = (
+        _delivered_login_transaction_fixture(tmp_path)
+    )
+    transaction = fixture.controller._login_input_transaction
+
+    for _scan in range(8):
+        fixture.controller.reconnect()
+
+    assert fixture.controller._login_input_transaction is transaction
+    assert transaction.event_sequence == 1
+    assert transaction.semantic_event_ready is False
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+
+def test_login_input_transaction_peer_login_is_never_authorized(tmp_path):
+    fixture, _old, new, peers, _frames, _delivered = (
+        _delivered_login_transaction_fixture(
+            tmp_path,
+            extra_states=(3, 3),
+        )
+    )
+    transaction = fixture.controller._login_input_transaction
+
+    assert transaction.owner == new.launch_fingerprint
+    assert [item for item in fixture.mouse.diagnosed_clicks] == [
+        (new.handle, (0.505, 0.856))
+    ]
+    assert not any(
+        handle in {peer.handle for peer in peers}
+        for handle, _point in fixture.mouse.clicks
+    )
+
+
+@pytest.mark.parametrize("delivery_kind", ("success", "uncertain"))
+@pytest.mark.parametrize("failure_kind", ("result_callback", "recorder"))
+def test_login_input_transaction_result_evidence_failure_is_terminal(
+    tmp_path,
+    delivery_kind,
+    failure_kind,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, _new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    if delivery_kind == "uncertain":
+        fixture.mouse.click_results = [
+            MouseClickResult(
+                False,
+                True,
+                True,
+                "mouse_down_delivery_uncertain",
+            )
+        ]
+    if failure_kind == "result_callback":
+        completed_payloads = [0]
+
+        def fail_result_callback(_role, detail):
+            envelope = json.loads(detail)
+            if envelope.get("type") == "complete":
+                completed_payloads[0] += 1
+            elif (
+                completed_payloads[0] == 1
+                and envelope.get("type") == "chunk"
+            ):
+                raise OSError("result evidence unavailable")
+
+        fixture.controller._failure_record_callback = fail_result_callback
+    else:
+        class FailResultRecorder:
+            def record_action_intent(self, **_kwargs):
+                return 1
+
+            def record_decision_evidence(self, **_kwargs):
+                return None
+
+            def record_action(self, **kwargs):
+                if kwargs.get("action") == "force_login":
+                    raise OSError("result evidence unavailable")
+                return None
+
+            def __getattr__(self, name):
+                return lambda **_kwargs: None
+
+        fixture.controller._evidence_recorder = FailResultRecorder()
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    transaction = fixture.controller._login_input_transaction
+
+    assert transaction.state.value == "evidence_failed"
+    assert transaction.permanent_input_blocked is True
+    assert transaction.consumed is True
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+    for _scan in range(4):
+        fixture.controller.reconnect()
+    assert fixture.controller._login_input_transaction is transaction
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+
+def test_login_input_transaction_pre_evidence_callback_failure_sends_zero_input(
+    tmp_path,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, _new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+
+    def fail_pre_authorization(_role, detail):
+        if json.loads(detail).get("type") == "chunk":
+            raise OSError("pre evidence unavailable")
+
+    fixture.controller._failure_record_callback = fail_pre_authorization
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+    transaction = fixture.controller._login_input_transaction
+
+    assert result.details["clicked_windows"] == 0
+    assert transaction.state.value == "rejected"
+    assert transaction.consumed is False
+    assert transaction.terminal_reason == (
+        "login_input_pre_evidence_callback_failed"
+    )
+    assert fixture.mouse.diagnosed_clicks == []
+    assert fixture.mouse.clicks == []
+
+
+def test_login_input_transaction_long_evidence_fits_real_record_contract(
+    tmp_path,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, _new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    store = SyncOperationRecordStore(
+        tmp_path / "operation_records.json",
+        tmp_path / "operation_record_archive",
+    )
+    fixture.controller._failure_record_callback = (
+        lambda role, detail: store.append(
+            "智慧重連",
+            role,
+            detail,
+        )
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+    transaction = fixture.controller._login_input_transaction
+
+    assert transaction is not None
+    full_pre_authorization_detail = (
+        fixture.controller._diagnostic_record_detail(
+            fixture.controller._login_input_pre_authorization_payload(
+                transaction
+            )
+        )
+    )
+    assert len(full_pre_authorization_detail) > 240
+    assert result.details["clicked_windows"] == 1
+    assert transaction.state.value == "result_recorded"
+    assert transaction.consumed is True
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+    diagnostic_records = [
+        record
+        for record in store.records()
+        if record.role_name == "smart-reconnect-diagnostic"
+    ]
+    assert len(diagnostic_records) > 2
+    assert all(len(record.detail) <= 240 for record in diagnostic_records)
+    reconstructed = _reconstruct_bounded_diagnostic_details(
+        diagnostic_records
+    )
+    payloads = [json.loads(detail) for detail in reconstructed]
+    assert {payload["kind"] for payload in payloads} == {
+        "login_input_pre_authorization",
+        "force_login_message_diagnostic",
+    }
+    pre_authorization = next(
+        payload
+        for payload in payloads
+        if payload["kind"] == "login_input_pre_authorization"
+    )
+    assert pre_authorization["consumed"] is False
+    assert fixture.controller._diagnostic_record_detail(
+        pre_authorization
+    ) == full_pre_authorization_detail
+    result_payload = next(
+        payload
+        for payload in payloads
+        if payload["kind"] == "force_login_message_diagnostic"
+    )
+    assert fixture.controller._diagnostic_record_detail(
+        result_payload
+    ) == fixture.controller._diagnostic_record_detail(
+        fixture.controller._force_login_message_diagnostic_payload(
+            transaction
+        )
+    )
+
+
+def test_short_diagnostic_record_keeps_existing_callback_detail():
+    fixture = make_controller([1])
+    records = []
+    fixture.controller._failure_record_callback = (
+        lambda role, detail: records.append((role, detail))
+    )
+    payload = {"kind": "short", "status": "kept"}
+
+    assert fixture.controller._record_diagnostic_payload(
+        "smart-reconnect-diagnostic",
+        payload,
+    ) is True
+    assert records == [
+        (
+            "smart-reconnect-diagnostic",
+            fixture.controller._diagnostic_record_detail(payload),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "login_input_pre_authorization",
+        "force_login_message_diagnostic",
+        "line_fallback_search",
+    ),
+)
+def test_long_diagnostic_payload_round_trips_real_record_contract(
+    tmp_path,
+    kind,
+):
+    fixture = make_controller([1])
+    store = SyncOperationRecordStore(
+        tmp_path / "operation_records.json",
+        tmp_path / "operation_record_archive",
+    )
+    sent_details = []
+
+    def persist(role, detail):
+        sent_details.append(detail)
+        return store.append(
+            "智慧重連",
+            role,
+            detail,
+        )
+
+    fixture.controller._failure_record_callback = persist
+    payload = {
+        "kind": kind,
+        "event_key_sha256": hashlib.sha256(
+            f"event:{kind}".encode("utf-8")
+        ).hexdigest(),
+        "messages": [
+            {
+                "sequence": index,
+                "state": "formal",
+                "detail": "x" * 96,
+            }
+            for index in range(6)
+        ],
+    }
+    canonical = fixture.controller._diagnostic_record_detail(payload)
+    assert len(canonical) > 240
+
+    assert fixture.controller._record_diagnostic_payload(
+        "smart-reconnect-diagnostic",
+        payload,
+    ) is True
+    records = [
+        record
+        for record in store.records()
+        if record.role_name == "smart-reconnect-diagnostic"
+    ]
+    assert records
+    assert all(len(record.detail) <= 240 for record in records)
+    assert json.loads(sent_details[-1])["type"] == "complete"
+    assert all(
+        json.loads(detail)["type"] == "chunk"
+        for detail in sent_details[:-1]
+    )
+    assert _reconstruct_bounded_diagnostic_details(records) == [canonical]
+
+
+@pytest.mark.parametrize("failure_point", ("middle", "complete"))
+def test_bounded_diagnostic_failure_retries_only_complete_evidence(
+    tmp_path,
+    failure_point,
+):
+    fixture = make_controller([1])
+    store = SyncOperationRecordStore(
+        tmp_path / "operation_records.json",
+        tmp_path / "operation_record_archive",
+    )
+    failed = [False]
+
+    def fail_once(role, detail):
+        envelope = json.loads(detail)
+        should_fail = (
+            failure_point == "middle"
+            and envelope.get("type") == "chunk"
+            and envelope.get("index") == 1
+        ) or (
+            failure_point == "complete"
+            and envelope.get("type") == "complete"
+        )
+        if should_fail and not failed[0]:
+            failed[0] = True
+            raise OSError("bounded diagnostic write failed")
+        store.append("智慧重連", role, detail)
+
+    fixture.controller._failure_record_callback = fail_once
+    payload = {
+        "kind": "line_fallback_search",
+        "event_key_sha256": "a" * 64,
+        "messages": ["evidence" * 20 for _index in range(8)],
+    }
+
+    assert fixture.controller._record_diagnostic_payload(
+        "smart-reconnect-diagnostic",
+        payload,
+    ) is False
+    assert failed[0] is True
+    assert len(fixture.controller._pending_diagnostic_records) == 1
+    assert _reconstruct_bounded_diagnostic_details(store.records()) == []
+    assert fixture.mouse.clicks == []
+
+    fixture.controller._retry_pending_diagnostic_records()
+
+    assert fixture.controller._pending_diagnostic_records == []
+    reconstructed = _reconstruct_bounded_diagnostic_details(
+        store.records()
+    )
+    assert len(reconstructed) == 1
+    retry_payload = json.loads(reconstructed[0])
+    assert retry_payload["kind"] == "line_fallback_search"
+    assert retry_payload["record_status"] == (
+        "record_failed_retry_pending"
+    )
+    assert fixture.mouse.clicks == []
+
+
+def test_login_input_transaction_result_evidence_failure_blocks_later_login_input(
+    tmp_path,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, new, peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+
+    completed_payloads = [0]
+
+    def fail_result(_role, detail):
+        envelope = json.loads(detail)
+        if envelope.get("type") == "complete":
+            completed_payloads[0] += 1
+        elif (
+            completed_payloads[0] == 1
+            and envelope.get("type") == "chunk"
+        ):
+            raise OSError("result evidence unavailable")
+
+    fixture.controller._failure_record_callback = fail_result
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    transaction = fixture.controller._login_input_transaction
+    assert transaction.state.value == "evidence_failed"
+    assert len(fixture.mouse.clicks) == 1
+
+    fixture.capture.states[new.handle] = 40
+    fixture.controller._recognizer = RecognitionByMarker(
+        {
+            1: ScreenRecognition(
+                ReconnectScreenState.CONNECTED,
+                0.0,
+                None,
+                "connected",
+            ),
+            40: ScreenRecognition(
+                ReconnectScreenState.LINE_SELECTION,
+                0.0,
+                (0.5, 0.327),
+                "03_line_selection_dialog.png",
+                line_number=1,
+                recent_line_present=True,
+                line_visible_routes=(1, 2, 3),
+                line_list_page_complete=True,
+                line_list_top_verified=True,
+                line_one_click_point=(0.5, 0.327),
+            ),
+        }
+    )
+    for peer in peers:
+        fixture.capture.states[peer.handle] = 1
+    fixture.controller._flow_pause_until.pop(
+        transaction.owner,
+        None,
+    )
+    fixture.controller._action_retry_after.pop(
+        transaction.owner,
+        None,
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert transaction.permanent_input_blocked is True
+    assert len(fixture.mouse.clicks) == 1
+    assert fixture.mouse.scrolls == []
+
+
+def test_login_input_transaction_observed_presentation_mismatch_is_terminal(
+    tmp_path,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, _new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+
+    def mismatched_observation(*args):
+        callback = fixture.mouse.diagnosed_observation
+        fixture.mouse.diagnosed_observation = None
+        try:
+            observed = fixture.mouse.observe_relative_diagnosed(*args)
+        finally:
+            fixture.mouse.diagnosed_observation = callback
+        return replace(observed, presentation_state="unexpected")
+
+    fixture.mouse.diagnosed_observation = mismatched_observation
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+    transaction = fixture.controller._login_input_transaction
+
+    assert result.details["clicked_windows"] == 0
+    assert transaction.state.value == "rejected"
+    assert transaction.terminal_reason == (
+        "login_input_observed_state_mismatch"
+    )
+    assert transaction.consumed is False
+    assert fixture.mouse.diagnosed_clicks == []
+
+
+def _formal_login_observation_with_neighbors(fixture):
+    previous = _WindowInstanceCredential(
+        801,
+        1801,
+        2801,
+        "PeerBefore",
+        3801,
+    )
+    following = _WindowInstanceCredential(
+        802,
+        1802,
+        2802,
+        "PeerAfter",
+        3802,
+    )
+
+    def observe(*args):
+        callback = fixture.mouse.diagnosed_observation
+        fixture.mouse.diagnosed_observation = None
+        try:
+            state = fixture.mouse.observe_relative_diagnosed(*args)
+        finally:
+            fixture.mouse.diagnosed_observation = callback
+        return replace(
+            state,
+            previous_instance=previous,
+            next_instance=following,
+        )
+
+    fixture.mouse.diagnosed_observation = observe
+    return previous, following
+
+
+@pytest.mark.parametrize(
+    ("drift_kind", "expected_field"),
+    (
+        ("target_foreground", "target_is_foreground"),
+        ("target_focus", "target_global_focus_root"),
+        ("topmost", "target_topmost"),
+        ("previous", "previous_instance"),
+        ("next", "next_instance"),
+    ),
+)
+def test_login_input_transaction_final_formal_baseline_drift_sends_zero_input(
+    tmp_path,
+    drift_kind,
+    expected_field,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, _new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    previous, following = _formal_login_observation_with_neighbors(fixture)
+
+    def final_observation(state):
+        if drift_kind == "target_foreground":
+            return replace(
+                state,
+                foreground_handle=state.target_handle,
+                target_is_foreground=True,
+            )
+        if drift_kind == "target_focus":
+            return replace(
+                state,
+                focus_handle=state.target_handle,
+                focus_root_handle=state.target_handle,
+                target_has_focus=True,
+            )
+        if drift_kind == "topmost":
+            return replace(state, target_topmost=True)
+        if drift_kind == "previous":
+            return replace(
+                state,
+                previous_instance=replace(
+                    previous,
+                    process_lifecycle_token=3803,
+                ),
+            )
+        return replace(
+            state,
+            next_instance=replace(
+                following,
+                process_lifecycle_token=3804,
+            ),
+        )
+
+    fixture.mouse.diagnosed_final_observation = final_observation
+    authorized_calls = []
+    run_authorized = fixture.controller._run_authorized_backend_call
+
+    def record_authorized_call(*args, **kwargs):
+        authorized_calls.append(True)
+        return run_authorized(*args, **kwargs)
+
+    fixture.controller._run_authorized_backend_call = record_authorized_call
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+    transaction = fixture.controller._login_input_transaction
+
+    assert authorized_calls
+    assert result.details["clicked_windows"] == 0
+    assert transaction.formal_window_state is not None
+    assert transaction.consumed is True
+    assert transaction.completed is True
+    assert transaction.target_drift is True
+    assert transaction.semantic_event_ready is False
+    assert transaction.evidence[0].attempted is False
+    assert expected_field in transaction.evidence[0].target_drift_fields
+    assert fixture.mouse.diagnosed_clicks == []
+    assert fixture.mouse.clicks == []
+    for _scan in range(4):
+        fixture.controller.reconnect()
+    assert fixture.controller._login_input_transaction is transaction
+    assert transaction.semantic_event_ready is False
+    assert fixture.mouse.diagnosed_clicks == []
+    assert fixture.mouse.clicks == []
+
+
+def test_login_input_transaction_external_baseline_change_still_sends_once(
+    tmp_path,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, _new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    _formal_login_observation_with_neighbors(fixture)
+    fixture.mouse.diagnosed_final_observation = lambda state: replace(
+        state,
+        foreground_handle=701,
+        gui_thread_id=1701,
+        active_handle=701,
+        focus_handle=701,
+        focus_root_handle=701,
+        cursor=(322, 655),
+        target_is_foreground=False,
+        target_has_focus=False,
+    )
+    authorized_calls = []
+    run_authorized = fixture.controller._run_authorized_backend_call
+
+    def record_authorized_call(*args, **kwargs):
+        authorized_calls.append(True)
+        return run_authorized(*args, **kwargs)
+
+    fixture.controller._run_authorized_backend_call = record_authorized_call
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+    transaction = fixture.controller._login_input_transaction
+
+    assert authorized_calls
+    assert result.details["clicked_windows"] == 1
+    assert transaction.formal_window_state is not None
+    assert transaction.consumed is True
+    assert transaction.target_drift is False
+    assert transaction.evidence[0].change_kind == "external_change"
+    assert set(transaction.evidence[0].external_change_fields) >= {
+        "foreground_handle",
+        "focus_root_handle",
+        "cursor",
+    }
+    assert fixture.mouse.diagnosed_clicks == [
+        (transaction.new_instance.handle, (0.505, 0.856))
+    ]
+    assert len(fixture.mouse.clicks) == 1
+
+
+def test_login_input_transaction_is_consumed_before_first_message(tmp_path):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, _new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    observed = []
+    fixture.mouse.on_diagnosed_delivery = lambda: observed.append(
+        (
+            fixture.controller._login_input_transaction.state.value,
+            fixture.controller._login_input_transaction.consumed,
+            len(fixture.mouse.diagnosed_clicks),
+        )
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert observed == [("consumed", True, 0)]
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+
+def _observe_login_transaction_semantic_frame(
+    fixture,
+    authority,
+    instance,
+    state,
+    digest,
+    epoch,
+):
+    fixture.controller._observe_force_login_message_screen(
+        authority,
+        authority.fingerprint,
+        instance,
+        ScreenRecognition(
+            state,
+            0.0,
+            (0.505, 0.856)
+            if state is ReconnectScreenState.FORCE_LOGIN_START
+            else None,
+            state.value,
+        ),
+        fresh_capture=True,
+        capture_route="obscured",
+        source_state_generation=authority.source_state_generation,
+        frame_digest=digest,
+        observation_epoch=epoch,
+    )
+
+
+def test_login_input_transaction_requires_two_departure_and_return_frames(
+    tmp_path,
+):
+    fixture, _old, new, _peers, _frames, _delivered = (
+        _delivered_login_transaction_fixture(tmp_path)
+    )
+    transaction = fixture.controller._login_input_transaction
+    authority = fixture.controller._tcp_recovery_authority
+    instance = WindowInstanceToken.from_window(new)
+    for index, state in enumerate(
+        (
+            ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+            ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+            ReconnectScreenState.FORCE_LOGIN_START,
+        ),
+        start=100,
+    ):
+        _observe_login_transaction_semantic_frame(
+            fixture,
+            authority,
+            instance,
+            state,
+            f"digest-{index}",
+            index,
+        )
+    assert transaction.semantic_departure_confirmed is True
+    assert transaction.semantic_event_ready is False
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+    _observe_login_transaction_semantic_frame(
+        fixture,
+        authority,
+        instance,
+        ReconnectScreenState.FORCE_LOGIN_START,
+        "digest-103",
+        103,
+    )
+    fixture.controller._flow_pause_until.pop(authority.fingerprint, None)
+    fixture.controller._action_retry_after.pop(authority.fingerprint, None)
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert fixture.controller._login_input_transaction.event_sequence == 2
+    assert len(fixture.mouse.diagnosed_clicks) == 2
+
+
+def test_login_input_transaction_same_frame_digest_never_confirms(tmp_path):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    fixture.capture.vary_frames.discard(new.handle)
+
+    for _scan in range(6):
+        fixture.controller.reconnect()
+
+    assert fixture.controller._login_input_transaction is None
+    assert fixture.mouse.diagnosed_clicks == []
+
+
+def test_login_input_transaction_fixed_identity_change_invalidates_event(
+    tmp_path,
+):
+    fixture, _old, new, _peers, _frames, _delivered = (
+        _delivered_login_transaction_fixture(tmp_path)
+    )
+    transaction = fixture.controller._login_input_transaction
+    authority = fixture.controller._tcp_recovery_authority
+    changed = replace(
+        WindowInstanceToken.from_window(new),
+        process_id=new.process_id + 1,
+    )
+    fixture.controller._observe_force_login_message_screen(
+        authority,
+        authority.fingerprint,
+        changed,
+        ScreenRecognition(
+            ReconnectScreenState.FORCE_LOGIN_START,
+            0.0,
+            (0.505, 0.856),
+            "login",
+        ),
+        fresh_capture=True,
+        capture_route="obscured",
+        source_state_generation=authority.source_state_generation,
+        frame_digest="identity-change",
+        observation_epoch=500,
+    )
+
+    assert transaction.state.value == "invalidated"
+    assert transaction.terminal_reason == "login_input_instance_changed"
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+
+def test_login_input_transaction_new_bound_instance_creates_new_event(tmp_path):
+    fixture, _old, new, peers, _frames, _delivered = (
+        _delivered_login_transaction_fixture(tmp_path)
+    )
+    first = fixture.controller._login_input_transaction
+    authority = fixture.controller._tcp_recovery_authority
+    newer = replace(
+        new,
+        handle=12,
+        process_id=112,
+        thread_id=212,
+        process_lifecycle_token=312,
+    )
+    newer_instance = WindowInstanceToken.from_window(newer)
+    authority.new_instance = newer_instance
+    authority.activation_instance = newer_instance
+    authority.stage = type(authority.stage).LOGIN
+    fixture.controller._activation_snapshot_instances[
+        authority.fingerprint
+    ] = newer_instance
+    fixture.controller._window_backend.windows = [newer, *peers]
+    fixture.controller._tcp_v = tcp_resolved_targets((newer, *peers))
+    fixture.controller._target_windows_provider = lambda: (
+        tcp_resolved_targets((newer, *peers))
+    )
+    authority.peer_signature = fixture.controller._tcp_peer_signature(
+        fixture.controller._tcp_v,
+        authority.entry_id,
+    )
+    fixture.capture.states[newer.handle] = 3
+    fixture.capture.vary_frames.add(newer.handle)
+    fixture.controller._flow_pause_until.pop(authority.fingerprint, None)
+    fixture.controller._action_retry_after.pop(authority.fingerprint, None)
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    second = fixture.controller._login_input_transaction
+    assert second is not first
+    assert first.state.value == "invalidated"
+    assert second.event_sequence == 2
+    assert second.new_instance == newer_instance
+    assert len(fixture.mouse.diagnosed_clicks) == 2
+
+
+def test_login_input_transaction_new_formal_owner_creates_new_event(tmp_path):
+    fixture, _old, new, peers, _frames, _delivered = (
+        _delivered_login_transaction_fixture(tmp_path)
+    )
+    first = fixture.controller._login_input_transaction
+    old_authority = fixture.controller._tcp_recovery_authority
+    peer = peers[0]
+    peer_target = fixture.controller._target_for_fingerprint(
+        peer.launch_fingerprint
+    )
+    peer_new = replace(
+        peer,
+        handle=22,
+        process_id=222,
+        thread_id=322,
+        process_lifecycle_token=422,
+    )
+    peer_old_instance = WindowInstanceToken.from_window(peer)
+    peer_new_instance = WindowInstanceToken.from_window(peer_new)
+    resolved = tcp_resolved_targets((new, peer_new, peers[1]))
+    new_authority = replace(
+        old_authority,
+        fingerprint=peer.launch_fingerprint,
+        entry_id=peer_target.entry_id,
+        stage=type(old_authority.stage).LOGIN,
+        old_instance=peer_old_instance,
+        activation_instance=peer_new_instance,
+        target_fingerprint=peer_target.fingerprint,
+        shortcut_path=str(peer_target.shortcut_path),
+        source_state_generation=(
+            fixture.controller._source_state_generation
+        ),
+        scope_token=fixture.controller._runtime_scope_token,
+        shortcut_consumed=True,
+        new_instance=peer_new_instance,
+        reopen_intent_sequence=None,
+        reopen_intent_signature=None,
+        reopen_intent_finished=True,
+    )
+    fixture.controller._tcp_recovery_authority = new_authority
+    fixture.controller._activation_snapshot_instances[
+        peer.launch_fingerprint
+    ] = peer_new_instance
+    fixture.controller._activation_snapshot_source_fingerprints[
+        peer.launch_fingerprint
+    ] = peer_target.fingerprint
+    fixture.controller._window_backend.windows = [new, peer_new, peers[1]]
+    fixture.controller._tcp_v = resolved
+    fixture.controller._target_windows_provider = lambda: resolved
+    new_authority.peer_signature = (
+        fixture.controller._tcp_peer_signature(
+            resolved,
+            new_authority.entry_id,
+        )
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        peer.launch_fingerprint
+    )
+    fixture.controller._login_only_recovery_fingerprints.add(
+        peer.launch_fingerprint
+    )
+    fixture.capture.states[peer_new.handle] = 3
+    fixture.capture.vary_frames.add(peer_new.handle)
+    fixture.controller._flow_pause_until.pop(
+        peer.launch_fingerprint,
+        None,
+    )
+    fixture.controller._action_retry_after.pop(
+        peer.launch_fingerprint,
+        None,
+    )
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    second = fixture.controller._login_input_transaction
+    assert second is not first
+    assert second.owner == peer.launch_fingerprint
+    assert second.event_sequence == 2
+    assert second.new_instance == peer_new_instance
+    assert fixture.mouse.diagnosed_clicks[-1] == (
+        peer_new.handle,
+        (0.505, 0.856),
+    )
+    assert len(fixture.mouse.diagnosed_clicks) == 2
+
+
+def test_login_input_transaction_evidence_failure_survives_semantic_cycles(
+    tmp_path,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+
+    completed_payloads = [0]
+
+    def fail_result(_role, detail):
+        envelope = json.loads(detail)
+        if envelope.get("type") == "complete":
+            completed_payloads[0] += 1
+        elif (
+            completed_payloads[0] == 1
+            and envelope.get("type") == "chunk"
+        ):
+            raise OSError("result evidence unavailable")
+
+    fixture.controller._failure_record_callback = fail_result
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    transaction = fixture.controller._login_input_transaction
+    authority = fixture.controller._tcp_recovery_authority
+    instance = WindowInstanceToken.from_window(new)
+    for cycle in range(2):
+        for index, state in enumerate(
+            (
+                ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+                ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+                ReconnectScreenState.FORCE_LOGIN_START,
+                ReconnectScreenState.FORCE_LOGIN_START,
+            )
+        ):
+            epoch = 600 + cycle * 10 + index
+            _observe_login_transaction_semantic_frame(
+                fixture,
+                authority,
+                instance,
+                state,
+                f"cycle-{cycle}-{index}",
+                epoch,
+            )
+        fixture.controller._flow_pause_until.pop(
+            authority.fingerprint,
+            None,
+        )
+        fixture.controller._action_retry_after.pop(
+            authority.fingerprint,
+            None,
+        )
+        fixture.controller.reconnect()
+        fixture.controller.reconnect()
+
+    assert fixture.controller._login_input_transaction is transaction
+    assert transaction.state.value == "evidence_failed"
+    assert transaction.event_sequence == 1
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+
+def _armed_post_login_diagnostic_fixture(tmp_path):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, old, new, peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+        extra_states=(3, 3),
+    )
+    bound = fixture.controller.reconnect()
+    first_login_frame = fixture.controller.reconnect()
+    login = fixture.controller.reconnect()
+    assert bound.details["clicked_windows"] == 0
+    assert first_login_frame.details["clicked_windows"] == 0
+    assert login.details["clicked_windows"] == 1
+    return fixture, old, new, peers
+
+
+def _formal_line_fallback_fixture(tmp_path, original_line=4):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, old, new, peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    fixture.controller.reconnect()
+    authority = fixture.controller._tcp_recovery_authority
+    instance = WindowInstanceToken.from_window(new)
+    assert authority is not None
+    assert instance is not None
+    fixture.controller._preferred_line_numbers[
+        authority.fingerprint
+    ] = original_line
+    return fixture, authority, instance, old, new, peers
+
+
+def _trusted_line_recognition(
+    original_line,
+    routes,
+    *,
+    top=False,
+    bottom=False,
+    page_complete=True,
+    click_point=None,
+):
+    return ScreenRecognition(
+        ReconnectScreenState.LINE_SELECTION,
+        0.0,
+        click_point,
+        "03_line_selection_dialog.png",
+        line_number=original_line,
+        recent_line_present=True,
+        line_visible_routes=tuple(routes),
+        line_list_page_complete=page_complete,
+        line_list_top_verified=top,
+        line_list_bottom_verified=bottom,
+        line_one_click_point=(0.5, 0.327) if 1 in routes else None,
+    )
+
+
+def test_formal_line_fallback_rejects_overlapping_chain_with_missing_route(
+    tmp_path,
+):
+    fixture, authority, instance, _old, _new, _peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    controller = fixture.controller
+    owner = authority.fingerprint
+
+    top = controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        _trusted_line_recognition(4, (1, 2, 3), top=True),
+        authority.deadline - 5.0,
+    )
+    middle = controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        _trusted_line_recognition(4, (3, 5, 6)),
+        authority.deadline - 4.0,
+    )
+    bottom = controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        _trusted_line_recognition(4, (6, 7, 8), bottom=True),
+        authority.deadline - 3.0,
+    )
+    returned = controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        _trusted_line_recognition(4, (1, 2, 3), top=True),
+        authority.deadline - 2.0,
+    )
+
+    assert (top.click_point, top.line_scroll_delta) == (
+        LINE_LIST_SCROLL_POINT,
+        -120,
+    )
+    assert (middle.click_point, middle.line_scroll_delta) == (None, 0)
+    assert (bottom.click_point, bottom.line_scroll_delta) == (None, 0)
+    assert returned.click_point is None
+    assert returned.line_fallback_used is False
+    event = controller._line_fallback_search_event
+    assert event is not None
+    assert event.routes == (1, 2, 3)
+    assert controller._preferred_line_numbers[owner] == 4
+
+
+def test_formal_line_fallback_requires_complete_consecutive_one_to_eight_chain(
+    tmp_path,
+):
+    fixture, authority, instance, _old, _new, _peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    controller = fixture.controller
+    owner = authority.fingerprint
+
+    for routes, top, bottom, remaining in (
+        ((1, 2, 3), True, False, 4.0),
+        ((3, 4, 5, 6), False, False, 3.0),
+        ((6, 7, 8), False, True, 2.0),
+    ):
+        result = controller._recognition_for_tcp_line_fallback(
+            owner,
+            instance,
+            _trusted_line_recognition(4, routes, top=top, bottom=bottom),
+            authority.deadline - remaining,
+        )
+    returned = controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        _trusted_line_recognition(4, (1, 2, 3), top=True),
+        authority.deadline - 1.0,
+    )
+
+    assert result.line_scroll_delta == 120
+    assert returned.line_number == 1
+    assert returned.click_point == (0.5, 0.327)
+    assert returned.line_fallback_used is True
+    assert returned.original_line_verified is False
+    assert controller._line_fallback_search_event.routes == tuple(range(1, 9))
+
+
+def test_formal_line_fallback_record_action_keeps_explicit_false_and_preference(
+    tmp_path,
+):
+    fixture, authority, instance, _old, _new, _peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    controller = fixture.controller
+    for routes, top, bottom, remaining in (
+        ((1, 2, 3), True, False, 4.0),
+        ((3, 4, 5, 6), False, False, 3.0),
+        ((6, 7, 8), False, True, 2.0),
+        ((1, 2, 3), True, False, 1.0),
+    ):
+        fallback = controller._recognition_for_tcp_line_fallback(
+            authority.fingerprint,
+            instance,
+            _trusted_line_recognition(4, routes, top=top, bottom=bottom),
+            authority.deadline - remaining,
+        )
+
+    class ActionRecorder:
+        def __init__(self):
+            self.actions = []
+
+        def record_action(self, **kwargs):
+            self.actions.append(kwargs)
+
+    recorder = ActionRecorder()
+    controller._evidence_recorder = recorder
+    controller._finish_evidence_action(
+        fingerprint=authority.fingerprint,
+        item=fallback,
+        action="click",
+        intent_sequence=1,
+        allowed=True,
+        performed=True,
+        clicked=True,
+        identity_verified=True,
+        restoration_verified=True,
+        failure_reason=None,
+        authority_signature="formal-line-fallback",
+    )
+
+    assert fallback.line_fallback_used is True
+    assert fallback.original_line_verified is False
+    assert recorder.actions[0]["original_line_verified"] is False
+    assert controller._preferred_line_numbers[authority.fingerprint] == 4
+
+
+def test_formal_line_fallback_persists_sanitized_page_chain_and_decision(
+    tmp_path,
+):
+    fixture, authority, instance, _old, _new, _peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    records = []
+    fixture.controller._failure_record_callback = (
+        lambda role, detail: records.append((role, detail))
+    )
+    controller = fixture.controller
+    for routes, top, bottom, remaining in (
+        ((1, 2, 3), True, False, 4.0),
+        ((3, 4, 5, 6), False, False, 3.0),
+        ((6, 7, 8), False, True, 2.0),
+        ((1, 2, 3), True, False, 1.0),
+    ):
+        result = controller._recognition_for_tcp_line_fallback(
+            authority.fingerprint,
+            instance,
+            _trusted_line_recognition(4, routes, top=top, bottom=bottom),
+            authority.deadline - remaining,
+        )
+
+    payloads = [
+        json.loads(detail)
+        for detail in _reconstruct_bounded_diagnostic_details(
+            [
+                record
+                for record in records
+                if record[0] == "smart-reconnect-diagnostic"
+            ]
+        )
+        if json.loads(detail).get("kind") == "line_fallback_search"
+    ]
+    assert len(payloads) == 4
+    assert len({item["event_key_sha256"] for item in payloads}) == 1
+    assert [item["routes"] for item in payloads] == [
+        [1, 2, 3],
+        [3, 4, 5, 6],
+        [6, 7, 8],
+        [1, 2, 3],
+    ]
+    assert payloads[1]["unique_overlap"] == 1
+    assert payloads[2]["cumulative_routes"] == list(range(1, 9))
+    assert payloads[-1]["original_line"] == 4
+    assert payloads[-1]["original_line_verified"] is False
+    assert payloads[-1]["selected_line"] == 1
+    assert payloads[-1]["fallback_used"] is True
+    assert payloads[-1]["reason"] == (
+        "original_absent_complete_search_line_one_unique"
+    )
+    assert payloads[-1]["owner"] == authority.fingerprint
+    assert payloads[-1]["entry_id"] == authority.entry_id
+    assert payloads[-1]["scope_token"] == authority.scope_token
+    assert payloads[-1]["deadline"] == authority.deadline
+    assert result.original_line_verified is False
+    assert "AlphaHero" not in "".join(detail for _role, detail in records)
+
+
+def test_formal_line_fallback_record_failure_freezes_input_and_retries_only_record(
+    tmp_path,
+):
+    fixture, authority, instance, _old, _new, _peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    callback_attempts = []
+    recorded = []
+    failed = [False]
+
+    def fail_once(role, detail):
+        envelope = json.loads(detail)
+        callback_attempts.append((role, detail))
+        if (
+            not failed[0]
+            and envelope.get("type") == "chunk"
+            and envelope.get("index") == 1
+        ):
+            failed[0] = True
+            raise OSError("first line diagnostic write failed")
+        recorded.append((role, detail))
+
+    controller = fixture.controller
+    controller._failure_record_callback = fail_once
+    first = controller._recognition_for_tcp_line_fallback(
+        authority.fingerprint,
+        instance,
+        _trusted_line_recognition(4, (1, 2, 3), top=True),
+        authority.deadline - 3.0,
+    )
+    event = controller._line_fallback_search_event
+
+    assert first.click_point is None
+    assert first.line_scroll_delta == 0
+    assert event is not None
+    assert event.invalid is True
+    assert event.record_failed is True
+    assert event.phase == "record_failed"
+    assert len(controller._pending_diagnostic_records) == 1
+
+    controller._observe_force_login_message_screen(
+        authority,
+        authority.fingerprint,
+        instance,
+        ScreenRecognition(ReconnectScreenState.UNKNOWN, None, None, None),
+        fresh_capture=False,
+        capture_route=None,
+        source_state_generation=authority.source_state_generation,
+    )
+    repeated = controller._recognition_for_tcp_line_fallback(
+        authority.fingerprint,
+        instance,
+        _trusted_line_recognition(4, (1, 2, 3), top=True),
+        authority.deadline - 2.0,
+    )
+
+    assert failed[0] is True
+    reconstructed = _reconstruct_bounded_diagnostic_details(recorded)
+    assert len(reconstructed) == 1
+    assert json.loads(reconstructed[0])["record_status"] == (
+        "record_failed_retry_pending"
+    )
+    assert controller._pending_diagnostic_records == []
+    assert repeated.click_point is None
+    assert repeated.line_scroll_delta == 0
+    assert fixture.mouse.clicks == []
+
+
+def test_formal_line_fallback_uses_two_fresh_top_frames_without_rewriting_line(
+    tmp_path,
+):
+    fixture, authority, instance, _old, new, peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    controller = fixture.controller
+    owner = authority.fingerprint
+    for recognition, observed_at in (
+        (_trusted_line_recognition(4, (1, 2, 3), top=True), 1.0),
+        (_trusted_line_recognition(4, (3, 4, 5, 6)), 2.0),
+        (_trusted_line_recognition(4, (6, 7, 8), bottom=True), 3.0),
+    ):
+        controller._recognition_for_tcp_line_fallback(
+            owner,
+            instance,
+            recognition,
+            authority.deadline - observed_at,
+        )
+    fixture.capture.states[new.handle] = 50
+    for peer in peers:
+        fixture.capture.states[peer.handle] = 1
+    fixture.controller._recognizer = RecognitionByMarker(
+        {
+            1: ScreenRecognition(
+                ReconnectScreenState.CONNECTED,
+                0.0,
+                None,
+                "connected",
+            ),
+            50: _trusted_line_recognition(4, (1, 2, 3), top=True),
+        }
+    )
+
+    first = controller.reconnect()
+    second = controller.reconnect()
+
+    assert first.details["clicked_windows"] == 0
+    assert second.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks[-1] == (new.handle, (0.5, 0.327))
+    assert controller._preferred_line_numbers[owner] == 4
+    assert controller._line_fallback_search_event is None
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    ("timeout", "unknown", "capture_gap"),
+)
+def test_formal_line_fallback_interruption_requires_new_full_search(
+    tmp_path,
+    interruption,
+):
+    fixture, authority, instance, _old, _new, _peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    controller = fixture.controller
+    owner = authority.fingerprint
+    for routes, top in (((1, 2, 3), True), ((3, 4, 5, 6), False)):
+        controller._recognition_for_tcp_line_fallback(
+            owner,
+            instance,
+            _trusted_line_recognition(4, routes, top=top),
+            authority.deadline - 4.0,
+            fresh_capture=True,
+        )
+    assert controller._line_fallback_search_event.routes == (
+        1, 2, 3, 4, 5, 6,
+    )
+
+    interrupted = (
+        _trusted_line_recognition(4, (3, 4, 5, 6))
+        if interruption == "capture_gap"
+        else ScreenRecognition(
+            (
+                ReconnectScreenState.FORCE_LOGIN_TIMEOUT
+                if interruption == "timeout"
+                else ReconnectScreenState.UNKNOWN
+            ),
+            0.0,
+            None,
+            "interrupted.png",
+        )
+    )
+    controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        interrupted,
+        authority.deadline - 3.0,
+        fresh_capture=interruption != "capture_gap",
+    )
+    assert controller._line_fallback_search_event is None
+
+    reentered = controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        _trusted_line_recognition(4, (6, 7, 8), bottom=True),
+        authority.deadline - 2.0,
+        fresh_capture=True,
+    )
+    assert reentered.click_point == LINE_LIST_SCROLL_POINT
+    assert reentered.line_scroll_delta == 120
+    assert controller._line_fallback_search_event.phase == "seeking_top"
+    assert controller._line_fallback_search_event.routes == ()
+
+
+@pytest.mark.parametrize(
+    "pages",
+    (
+        ((1, 2, 3), (5, 6, 7)),
+        ((1, 2, 3), (3, 3, 7, 8)),
+    ),
+    ids=("no-overlap", "duplicate"),
+)
+def test_formal_line_fallback_ambiguous_page_chain_is_zero_input(
+    tmp_path,
+    pages,
+):
+    fixture, authority, instance, _old, _new, _peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    controller = fixture.controller
+    owner = authority.fingerprint
+    controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        _trusted_line_recognition(4, pages[0], top=True),
+        authority.deadline - 2.0,
+    )
+    rejected = controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        _trusted_line_recognition(4, pages[1], bottom=True),
+        authority.deadline - 1.0,
+    )
+
+    assert rejected.click_point is None
+    assert rejected.line_scroll_delta == 0
+    assert rejected.line_fallback_used is False
+    assert fixture.mouse.clicks == []
+
+
+def test_formal_line_fallback_incomplete_page_and_expired_event_are_zero_input(
+    tmp_path,
+):
+    fixture, authority, instance, _old, _new, _peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    controller = fixture.controller
+    owner = authority.fingerprint
+    incomplete = controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        _trusted_line_recognition(
+            4,
+            (1, 2, 3),
+            top=True,
+            page_complete=False,
+        ),
+        authority.deadline - 1.0,
+    )
+    expired_source = _trusted_line_recognition(4, (1, 2, 3), top=True)
+    expired = controller._recognition_for_tcp_line_fallback(
+        owner,
+        instance,
+        expired_source,
+        authority.deadline,
+    )
+
+    assert incomplete.click_point is None
+    assert incomplete.line_scroll_delta == 0
+    assert expired.click_point is None
+    assert expired.line_fallback_used is False
+    assert fixture.mouse.clicks == []
+
+
+def test_formal_line_fallback_immediately_prefers_original_when_it_is_visible(
+    tmp_path,
+):
+    fixture, authority, instance, _old, _new, _peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    original = _trusted_line_recognition(
+        4,
+        (1, 2, 3, 4, 5, 6, 7, 8),
+        top=True,
+        bottom=True,
+        click_point=(0.5, 0.497),
+    )
+
+    result = fixture.controller._recognition_for_tcp_line_fallback(
+        authority.fingerprint,
+        instance,
+        original,
+        authority.deadline - 1.0,
+    )
+
+    assert result.line_number == 4
+    assert result.click_point == (0.5, 0.497)
+    assert result.line_fallback_used is False
+    assert result.original_line_verified is True
+    assert fixture.controller._line_fallback_search_event is None
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("non-owner", "wrong-instance", "scope-changed", "deadline"),
+)
+def test_line_one_fallback_never_crosses_formal_event_boundary(
+    tmp_path,
+    boundary,
+):
+    fixture, authority, instance, _old, _new, peers = (
+        _formal_line_fallback_fixture(tmp_path, original_line=4)
+    )
+    controller = fixture.controller
+    records = []
+    controller._failure_record_callback = (
+        lambda role, detail: records.append((role, detail))
+    )
+    controller._recognition_for_tcp_line_fallback(
+        authority.fingerprint,
+        instance,
+        _trusted_line_recognition(4, (1, 2, 3), top=True),
+        authority.deadline - 2.0,
+    )
+    before_boundary = tuple(records)
+    fingerprint = authority.fingerprint
+    checked_instance = instance
+    checked_at = authority.deadline - 1.0
+    if boundary == "non-owner":
+        fingerprint = peers[0].launch_fingerprint
+        checked_instance = WindowInstanceToken.from_window(peers[0])
+    elif boundary == "wrong-instance":
+        checked_instance = WindowInstanceToken.from_window(peers[0])
+    elif boundary == "scope-changed":
+        controller._runtime_scope_token = "different-scope"
+    else:
+        checked_at = authority.deadline
+
+    result = controller._recognition_for_tcp_line_fallback(
+        fingerprint,
+        checked_instance,
+        _trusted_line_recognition(4, (1, 2, 3), top=True),
+        checked_at,
+    )
+
+    assert result.line_fallback_used is False
+    assert result.click_point is None
+    assert fixture.mouse.clicks == []
+    assert controller._line_fallback_search_event is None
+    assert tuple(records) == before_boundary
+
+
+def _buffer_one_post_login_diagnostic_frame(fixture, new):
+    controller = fixture.controller
+    authority = controller._tcp_recovery_authority
+    event = controller._post_login_diagnostic_event
+    assert authority is not None
+    assert event is not None
+    sample = CaptureSample(
+        width=2,
+        height=2,
+        pixels=bytes([4, 3, 2, 255] * 4),
+        api_succeeded=True,
+    )
+    recognition = ScreenRecognition(
+        ReconnectScreenState.LINE_SELECTION,
+        7.25,
+        (0.5, 0.327),
+        "03_line_selection_dialog.png",
+        line_number=1,
+        recent_line_present=False,
+    )
+    assert controller._buffer_post_login_diagnostic(
+        authority=authority,
+        fingerprint=authority.fingerprint,
+        instance=WindowInstanceToken.from_window(new),
+        sample=sample,
+        recognition=recognition,
+        fresh_capture=True,
+        capture_route="obscured",
+        presentation_state="fully_obscured",
+        capture_settings_revision=controller._capture_settings_revision,
+        now=event.armed_at_monotonic + 2.5,
+    ) is True
+    return authority, event
+
+
+def test_post_login_diagnostic_arms_only_after_formal_owner_login_click(
+    tmp_path,
+):
+    normal = make_controller([3, 1])
+    assert activate_current_window_snapshot(normal).success is True
+    normal.controller.reconnect()
+    normal_login = normal.controller.reconnect()
+    assert normal_login.details["clicked_windows"] == 1
+    assert normal.controller._post_login_diagnostic_event is None
+    assert normal.mouse.diagnosed_clicks == []
+
+    fixture, old, new, peers = _armed_post_login_diagnostic_fixture(tmp_path)
+    event = fixture.controller._post_login_diagnostic_event
+
+    assert event is not None
+    assert event.owner == old.launch_fingerprint
+    assert event.new_instance == WindowInstanceToken.from_window(new)
+    assert event.scope_token == fixture.controller._runtime_scope_token
+    assert event.frames == ()
+    assert fixture.controller._post_login_diagnostic_output_dir is None
+    assert fixture.mouse.clicks == [(new.handle, (0.505, 0.856))]
+    assert fixture.mouse.diagnosed_clicks == [
+        (new.handle, (0.505, 0.856))
+    ]
+    assert all(
+        handle not in {peer.handle for peer in peers}
+        for handle, _point in fixture.mouse.clicks
+    )
+
+
+def test_formal_force_login_first_drift_persists_once_and_forbids_retry(
+    tmp_path,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    records = []
+    fixture.controller._failure_record_callback = (
+        lambda role, detail: records.append((role, detail))
+    )
+    fixture.mouse.diagnostic_evidence = [
+        _ForceLoginMessageEvidence(
+            sequence=1,
+            message=Win32MouseMessageBackend.WM_MOUSEMOVE,
+            message_name="WM_MOUSEMOVE",
+            before=None,
+            after=None,
+            attempted=True,
+            confirmed=True,
+            drift_fields=("foreground_handle",),
+            target_drift_fields=("target_became_foreground",),
+            change_kind="target_change",
+            cause="target_state_changed",
+        )
+    ]
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+    authority = fixture.controller._tcp_recovery_authority
+    instance = WindowInstanceToken.from_window(new)
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.diagnosed_clicks == [
+        (new.handle, (0.505, 0.856))
+    ]
+    assert authority is not None
+    assert instance is not None
+    second = fixture.controller._deliver_formal_force_login_click(
+        authority,
+        instance,
+        new,
+        "fully_obscured",
+        (0.505, 0.856),
+    )
+    assert second.delivered is False
+    assert second.failure_code == (
+        "force_login_message_diagnostic_not_authorized"
+    )
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+    timeout_recognition = ScreenRecognition(
+        ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+        0.0,
+        (0.5, 0.57),
+        "14_force_login_timeout.png",
+    )
+    for _frame in range(2):
+        fixture.controller._observe_force_login_message_screen(
+            authority,
+            authority.fingerprint,
+            instance,
+            timeout_recognition,
+            fresh_capture=True,
+            capture_route="obscured",
+            source_state_generation=authority.source_state_generation,
+        )
+    after_departure = fixture.controller._deliver_formal_force_login_click(
+        authority,
+        instance,
+        new,
+        "fully_obscured",
+        (0.505, 0.856),
+    )
+    assert after_departure.failure_code == (
+        "force_login_message_diagnostic_not_authorized"
+    )
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+    diagnostic_records = [
+        detail
+        for detail in _reconstruct_bounded_diagnostic_details(
+            [
+                record
+                for record in records
+                if record[0] == "smart-reconnect-diagnostic"
+            ]
+        )
+        if json.loads(detail).get("kind")
+        == "force_login_message_diagnostic"
+    ]
+    assert len(diagnostic_records) == 1
+    payload = json.loads(diagnostic_records[0])
+    assert payload == (
+        fixture.controller._force_login_message_diagnostic_payload(
+            fixture.controller._login_input_transaction
+        )
+    )
+    assert payload["first_drift"] == ["foreground_handle"]
+    assert [item["message"] for item in payload["messages"]] == [
+        "WM_MOUSEMOVE"
+    ]
+
+
+@pytest.mark.parametrize("mismatch", ("route", "source_generation"))
+def test_formal_force_login_route_or_source_change_cannot_rearm_transaction(
+    tmp_path,
+    mismatch,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    records = []
+    fixture.controller._failure_record_callback = (
+        lambda role, detail: records.append((role, detail))
+    )
+    instance = WindowInstanceToken.from_window(new)
+    assert instance is not None
+    target_credential = _WindowInstanceCredential(
+        instance.handle,
+        instance.process_id,
+        instance.thread_id,
+        instance.window_class,
+        instance.process_lifecycle_token,
+    )
+    state = _ForceLoginMessageWindowState(
+        observed_at_monotonic=10.0,
+        foreground_handle=700,
+        target_handle=instance.handle,
+        target_instance=target_credential,
+        gui_thread_id=1700,
+        active_handle=700,
+        focus_handle=700,
+        focus_root_handle=700,
+        target_is_foreground=False,
+        target_has_focus=False,
+        cursor=(321, 654),
+        target_visible=True,
+        target_minimized=False,
+        target_rect=instance.rect,
+        presentation_state="fully_obscured",
+        target_topmost=False,
+        previous_instance=None,
+        next_instance=None,
+    )
+    fixture.mouse.diagnostic_evidence = [
+        _ForceLoginMessageEvidence(
+            sequence=sequence,
+            message=message,
+            message_name=name,
+            before=state,
+            after=state,
+            attempted=True,
+            confirmed=True,
+            drift_fields=(),
+        )
+        for sequence, message, name in (
+            (1, Win32MouseMessageBackend.WM_MOUSEMOVE, "WM_MOUSEMOVE"),
+            (2, Win32MouseMessageBackend.WM_LBUTTONDOWN, "WM_LBUTTONDOWN"),
+            (3, Win32MouseMessageBackend.WM_LBUTTONUP, "WM_LBUTTONUP"),
+        )
+    ]
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    first = fixture.controller.reconnect()
+    authority = fixture.controller._tcp_recovery_authority
+    event = fixture.controller._force_login_message_diagnostic_event
+
+    assert first.details["clicked_windows"] == 1
+    assert authority is not None
+    assert event is not None
+    assert event.attempt_sequence == 1
+    same_screen = fixture.controller._deliver_formal_force_login_click(
+        authority,
+        instance,
+        new,
+        "fully_obscured",
+        (0.505, 0.856),
+    )
+    assert same_screen.failure_code == (
+        "force_login_message_diagnostic_not_authorized"
+    )
+
+    timeout_recognition = ScreenRecognition(
+        ReconnectScreenState.FORCE_LOGIN_TIMEOUT,
+        0.0,
+        (0.5, 0.57),
+        "14_force_login_timeout.png",
+    )
+    fixture.controller._observe_force_login_message_screen(
+        authority,
+        authority.fingerprint,
+        instance,
+        timeout_recognition,
+        fresh_capture=True,
+        capture_route="obscured",
+        source_state_generation=authority.source_state_generation,
+    )
+    after_one = fixture.controller._deliver_formal_force_login_click(
+        authority,
+        instance,
+        new,
+        "fully_obscured",
+        (0.505, 0.856),
+    )
+    assert after_one.failure_code == (
+        "force_login_message_diagnostic_not_authorized"
+    )
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+    fixture.controller._observe_force_login_message_screen(
+        authority,
+        authority.fingerprint,
+        instance,
+        timeout_recognition,
+        fresh_capture=True,
+        capture_route=("visible" if mismatch == "route" else "obscured"),
+        source_state_generation=(
+            authority.source_state_generation + 1
+            if mismatch == "source_generation"
+            else authority.source_state_generation
+        ),
+    )
+    after_mismatch = fixture.controller._deliver_formal_force_login_click(
+        authority,
+        instance,
+        new,
+        "fully_obscured",
+        (0.505, 0.856),
+    )
+    assert after_mismatch.failure_code == (
+        "force_login_message_diagnostic_not_authorized"
+    )
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+    for expected_count in (1, 2):
+        fixture.controller._observe_force_login_message_screen(
+            authority,
+            authority.fingerprint,
+            instance,
+            timeout_recognition,
+            fresh_capture=True,
+            capture_route="obscured",
+            source_state_generation=authority.source_state_generation,
+        )
+        if expected_count == 1:
+            still_blocked = (
+                fixture.controller._deliver_formal_force_login_click(
+                    authority,
+                    instance,
+                    new,
+                    "fully_obscured",
+                    (0.505, 0.856),
+                )
+            )
+            assert still_blocked.failure_code == (
+                "force_login_message_diagnostic_not_authorized"
+            )
+            assert len(fixture.mouse.diagnosed_clicks) == 1
+
+    second = fixture.controller._deliver_formal_force_login_click(
+        authority,
+        instance,
+        new,
+        "fully_obscured",
+        (0.505, 0.856),
+    )
+    second_event = fixture.controller._force_login_message_diagnostic_event
+
+    assert second.delivered is False
+    assert second.failure_code == (
+        "force_login_message_diagnostic_not_authorized"
+    )
+    assert second_event is not None
+    assert second_event is event
+    assert second_event.attempt_sequence == 1
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+    payloads = [
+        json.loads(detail)
+        for detail in _reconstruct_bounded_diagnostic_details(
+            [
+                record
+                for record in records
+                if record[0] == "smart-reconnect-diagnostic"
+            ]
+        )
+        if json.loads(detail).get("kind")
+        == "force_login_message_diagnostic"
+    ]
+    assert len(payloads) == 1
+    payload = fixture.controller._force_login_message_diagnostic_payload(
+        event
+    )
+    assert payloads[0] == payload
+    assert payload["attempt_sequence"] == 1
+    assert payload["deadline"] == authority.deadline
+    assert (
+        payload["source_state_generation"]
+        == authority.source_state_generation
+    )
+    assert (
+        payload["reopen_intent_sequence"]
+        == authority.reopen_intent_sequence
+    )
+    assert len(payload["messages"]) == 3
+    assert all(
+        message["before"]["target_instance"]["handle"] == new.handle
+        and message["before"]["presentation_state"]
+        == "fully_obscured"
+        for message in payload["messages"]
+    )
+
+
+def test_force_login_diagnostic_callback_failure_never_repeats_input_and_retries_record(
+    tmp_path,
+):
+    target = CharacterSelectionCandidate(
+        120,
+        CharacterImportance.PRIMARY,
+        1,
+        True,
+        CHARACTER_ENTER_CLICK_POINT,
+        digit_count=3,
+        identity="AlphaHero",
+    )
+    fixture, _old, new, _peers, _frames = tcp_login_fixture(
+        tmp_path,
+        candidates=(target,),
+    )
+    callback_attempts = []
+    recorded = []
+    completed_payloads = [0]
+    failed = [False]
+
+    def fail_once(role, detail):
+        try:
+            envelope = json.loads(detail)
+        except (TypeError, ValueError):
+            return
+        callback_attempts.append((role, detail))
+        if envelope.get("type") == "complete":
+            completed_payloads[0] += 1
+        elif (
+            not failed[0]
+            and completed_payloads[0] == 1
+            and envelope.get("type") == "chunk"
+            and envelope.get("index") == 1
+        ):
+            failed[0] = True
+            raise OSError("first diagnostic write failed")
+        recorded.append((role, detail))
+
+    fixture.controller._failure_record_callback = fail_once
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    first = fixture.controller.reconnect()
+    authority = fixture.controller._tcp_recovery_authority
+    instance = WindowInstanceToken.from_window(new)
+    event = fixture.controller._force_login_message_diagnostic_event
+
+    assert first.details["clicked_windows"] == 1
+    assert authority is not None
+    assert instance is not None
+    assert event is not None
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+    assert event.persistent_record_succeeded is False
+    assert event.persistent_record_failed is True
+    assert len(fixture.controller._pending_diagnostic_records) == 1
+
+    repeated = fixture.controller._deliver_formal_force_login_click(
+        authority,
+        instance,
+        new,
+        "fully_obscured",
+        (0.505, 0.856),
+    )
+    assert repeated.failure_code == (
+        "force_login_message_diagnostic_not_authorized"
+    )
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+    fixture.controller._observe_force_login_message_screen(
+        authority,
+        authority.fingerprint,
+        instance,
+        ScreenRecognition(
+            ReconnectScreenState.UNKNOWN,
+            None,
+            None,
+            None,
+        ),
+        fresh_capture=False,
+        capture_route=None,
+        source_state_generation=authority.source_state_generation,
+    )
+
+    assert failed[0] is True
+    result_payloads = [
+        json.loads(detail)
+        for detail in _reconstruct_bounded_diagnostic_details(recorded)
+        if json.loads(detail).get("kind")
+        == "force_login_message_diagnostic"
+    ]
+    assert len(result_payloads) == 1
+    assert result_payloads[0]["record_status"] == (
+        "record_failed_retry_pending"
+    )
+    assert fixture.controller._pending_diagnostic_records == []
+    assert event.persistent_record_succeeded is True
+    assert event.persistent_record_failed is False
+    assert len(fixture.mouse.diagnosed_clicks) == 1
+
+
+def test_post_login_diagnostic_freezes_timeout_then_exports_only_on_stop(
+    tmp_path,
+):
+    fixture, _old, new, peers = _armed_post_login_diagnostic_fixture(tmp_path)
+    controller = fixture.controller
+    controller._post_login_diagnostic_temp_root = tmp_path
+    authority = controller._tcp_recovery_authority
+    event = controller._post_login_diagnostic_event
+    assert authority is not None
+    assert event is not None
+    sample = CaptureSample(
+        width=2,
+        height=2,
+        pixels=bytes([4, 3, 2, 255] * 4),
+        api_succeeded=True,
+    )
+    recognition = ScreenRecognition(
+        ReconnectScreenState.LINE_SELECTION,
+        7.25,
+        (0.5, 0.327),
+        "03_line_selection_dialog.png",
+        line_number=1,
+        recent_line_present=False,
+    )
+    instance = WindowInstanceToken.from_window(new)
+    revision = controller._capture_settings_revision
+    armed_at = event.armed_at_monotonic
+
+    def buffer(
+        *,
+        elapsed,
+        fresh=True,
+        route="obscured",
+        presentation="fully_obscured",
+    ):
+        return controller._buffer_post_login_diagnostic(
+            authority=authority,
+            fingerprint=authority.fingerprint,
+            instance=instance,
+            sample=sample,
+            recognition=recognition,
+            fresh_capture=fresh,
+            capture_route=route,
+            presentation_state=presentation,
+            capture_settings_revision=revision,
+            now=armed_at + elapsed,
+        )
+
+    controller._evidence_presentation_state = lambda *_args: pytest.fail(
+        "diagnostic buffer must reuse formal observation presentation"
+    )
+    assert buffer(elapsed=2.499) is False
+    assert buffer(elapsed=2.5, fresh=False) is False
+    assert buffer(elapsed=2.5, route="visible") is False
+    assert buffer(elapsed=2.5, presentation="visible") is False
+    assert buffer(elapsed=5.1) is True
+    assert buffer(elapsed=5.2) is True
+    assert buffer(elapsed=30.0) is True
+    assert buffer(elapsed=31.0) is False
+
+    event = controller._post_login_diagnostic_event
+    assert event is not None
+    assert tuple(
+        frame.target_offset_seconds for frame in event.frames
+    ) == (2.5, 5.0, 30.0)
+    assert tuple(
+        frame.captured_at_monotonic - armed_at for frame in event.frames
+    ) == pytest.approx((5.1, 5.2, 30.0))
+    assert all(frame.pixels == sample.pixels for frame in event.frames)
+    assert all(frame.recognition == recognition for frame in event.frames)
+    assert list(tmp_path.iterdir()) == []
+
+    assert controller._cancel_tcp_recovery(authority, timed_out=True) is True
+    assert controller._post_login_diagnostic_event is event
+    assert controller._post_login_diagnostic_complete is True
+    assert controller._post_login_diagnostic_export_attempted is False
+    assert controller._post_login_diagnostic_output_dir is None
+    assert list(tmp_path.iterdir()) == []
+
+    controller.set_execution_enabled(False)
+    output_dir = controller._post_login_diagnostic_output_dir
+    assert output_dir is not None
+    assert output_dir.parent == tmp_path
+    assert output_dir.name.startswith("flash-post-login-diagnostic-")
+    assert len(tuple(output_dir.glob("*.png"))) == 3
+    manifest = json.loads(
+        (output_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["owner"] == authority.fingerprint
+    assert manifest["entry_id"] == authority.entry_id
+    assert manifest["scope_token"] == authority.scope_token
+    assert manifest["terminal_stage"] == "timed_out"
+    assert [
+        frame["target_offset_seconds"] for frame in manifest["frames"]
+    ] == [2.5, 5.0, 30.0]
+    assert all(
+        frame["recognition"]["state"] == "line_selection"
+        for frame in manifest["frames"]
+    )
+    assert recognition.state is ReconnectScreenState.LINE_SELECTION
+    assert controller._post_login_diagnostic_export_attempted is True
+    assert controller._post_login_diagnostic_event is None
+
+    exported_names = tuple(sorted(path.name for path in output_dir.iterdir()))
+    controller.set_execution_enabled(False)
+    assert controller._post_login_diagnostic_output_dir == output_dir
+    assert tuple(sorted(path.name for path in output_dir.iterdir())) == (
+        exported_names
+    )
+
+    assert controller._cleanup_post_login_diagnostic_output() is True
+    assert output_dir.exists() is False
+    assert tuple(tmp_path.rglob("*.png")) == ()
+    assert tuple(tmp_path.rglob("manifest.json")) == ()
+
+
+@pytest.mark.parametrize("terminal", ("connected", "cancelled"))
+def test_post_login_diagnostic_non_timeout_terminal_discards_without_files(
+    tmp_path,
+    terminal,
+):
+    fixture, _old, new, _peers = _armed_post_login_diagnostic_fixture(
+        tmp_path
+    )
+    controller = fixture.controller
+    controller._post_login_diagnostic_temp_root = tmp_path
+    authority, _event = _buffer_one_post_login_diagnostic_frame(
+        fixture,
+        new,
+    )
+
+    if terminal == "connected":
+        controller._advance_tcp_screen_stage(
+            authority.fingerprint,
+            ScreenRecognition(
+                ReconnectScreenState.CONNECTED,
+                8.0,
+                None,
+                "anonymous_live_structure/general_hud.png",
+            ),
+        )
+    else:
+        assert controller._cancel_tcp_recovery(
+            authority,
+            timed_out=False,
+        ) is True
+
+    assert authority.stage.value == terminal
+    assert controller._post_login_diagnostic_event is None
+    assert controller._post_login_diagnostic_output_dir is None
+    assert list(tmp_path.iterdir()) == []
+    controller.set_execution_enabled(False)
+    assert controller._post_login_diagnostic_output_dir is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_post_login_diagnostic_partial_export_is_once_and_cleanup_retries(
+    tmp_path,
+    monkeypatch,
+):
+    fixture, _old, new, _peers = _armed_post_login_diagnostic_fixture(
+        tmp_path
+    )
+    controller = fixture.controller
+    controller._post_login_diagnostic_temp_root = tmp_path
+    authority, _event = _buffer_one_post_login_diagnostic_frame(
+        fixture,
+        new,
+    )
+    assert controller._cancel_tcp_recovery(authority, timed_out=True) is True
+    original_write_text = Path.write_text
+
+    def fail_manifest(path, *args, **kwargs):
+        if path.name == "manifest.json":
+            raise OSError("manifest write failed")
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_manifest)
+    controller.set_execution_enabled(False)
+    output_dir = controller._post_login_diagnostic_output_dir
+    assert output_dir is not None
+    assert output_dir.exists()
+    assert tuple(output_dir.glob("*.png"))
+    assert (output_dir / "manifest.json").exists() is False
+    before = tuple(sorted(path.name for path in output_dir.iterdir()))
+
+    controller.set_execution_enabled(False)
+    assert controller._post_login_diagnostic_output_dir == output_dir
+    assert tuple(sorted(path.name for path in output_dir.iterdir())) == before
+    assert len(tuple(tmp_path.glob("flash-post-login-diagnostic-*"))) == 1
+
+    real_rmtree = shutil.rmtree
+    cleanup_calls = []
+
+    def fail_first_cleanup(path):
+        cleanup_calls.append(Path(path))
+        if len(cleanup_calls) == 1:
+            raise OSError("cleanup failed")
+        real_rmtree(path)
+
+    monkeypatch.setattr(
+        "adapters.windows_smart_reconnect.shutil.rmtree",
+        fail_first_cleanup,
+    )
+    controller.set_execution_enabled(True)
+    assert controller._post_login_diagnostic_output_dir == output_dir
+    assert output_dir.exists()
+    assert controller._post_login_diagnostic_export_attempted is True
+    assert controller._execution_enabled.is_set() is False
+
+    controller.set_execution_enabled(True)
+    assert cleanup_calls == [output_dir.resolve(), output_dir.resolve()]
+    assert controller._post_login_diagnostic_output_dir is None
+    assert output_dir.exists() is False
+    assert controller._execution_enabled.is_set() is True
+    assert tuple(tmp_path.rglob("*.png")) == ()
+    assert tuple(tmp_path.rglob("manifest.json")) == ()
+
+
+def test_post_login_diagnostic_uses_owner_post_capture_time_after_slow_peers(
+    tmp_path,
+    monkeypatch,
+):
+    fixture, _old, new, peers = _armed_post_login_diagnostic_fixture(
+        tmp_path
+    )
+    controller = fixture.controller
+    event = controller._post_login_diagnostic_event
+    assert event is not None
+    event.next_offset_index = 2
+    controller._window_backend.windows = [*peers, new]
+    resolved = controller._target_windows_provider()
+    by_handle = {
+        window.handle: (window, entry_id)
+        for window, entry_id in zip(
+            resolved.sync_windows,
+            resolved.sync_entry_ids,
+        )
+    }
+    ordered = tuple(by_handle[window.handle] for window in (*peers, new))
+    controller._target_windows_provider = lambda: replace(
+        resolved,
+        windows=tuple(window for window, _entry_id in ordered),
+        sync_windows=tuple(window for window, _entry_id in ordered),
+        sync_entry_ids=tuple(entry_id for _window, entry_id in ordered),
+    )
+    clock = [event.armed_at_monotonic]
+    controller._monotonic_clock = lambda: clock[0]
+    original_capture = controller._capture_and_recognize
+    peer_handles = {peer.handle for peer in peers}
+
+    def slow_front_capture(window, fingerprint, **kwargs):
+        result = original_capture(window, fingerprint, **kwargs)
+        if window.handle in peer_handles:
+            clock[0] += 16.0
+        if window.handle == new.handle:
+            instance = WindowInstanceToken.from_window(window)
+            kwargs["presentation_states"][(fingerprint, instance)] = (
+                "fully_obscured"
+            )
+            return result[0], result[1], result[2], "obscured"
+        return result
+
+    monkeypatch.setattr(
+        controller,
+        "_capture_and_recognize",
+        slow_front_capture,
+    )
+    controller.check_connection()
+
+    assert len(event.frames) == 1
+    assert event.frames[0].target_offset_seconds == 30.0
+    assert event.frames[0].captured_at_monotonic == pytest.approx(
+        event.armed_at_monotonic + 32.0
+    )
+
+
+def test_post_login_diagnostic_manual_stop_discards_active_memory_without_files(
+    tmp_path,
+):
+    fixture, _old, new, _peers = _armed_post_login_diagnostic_fixture(
+        tmp_path
+    )
+    controller = fixture.controller
+    controller._post_login_diagnostic_temp_root = tmp_path
+    authority, event = _buffer_one_post_login_diagnostic_frame(
+        fixture,
+        new,
+    )
+    buffered_pixels = event.frames[0].pixels
+    assert authority.terminal is False
+    assert controller._post_login_diagnostic_output_dir is None
+    assert list(tmp_path.iterdir()) == []
+
+    controller.set_execution_enabled(False)
+
+    assert controller._execution_enabled.is_set() is False
+    assert controller._post_login_diagnostic_event is None
+    assert controller._post_login_diagnostic_output_dir is None
+    assert controller._post_login_diagnostic_complete is False
+    assert all(
+        value is not event and value is not buffered_pixels
+        for value in vars(controller).values()
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("handoff", ("owner", "scope"))
+def test_post_login_diagnostic_discards_buffer_on_event_handoff(
+    tmp_path,
+    handoff,
+):
+    fixture, _old, new, peers = _armed_post_login_diagnostic_fixture(tmp_path)
+    controller = fixture.controller
+    controller._post_login_diagnostic_temp_root = tmp_path
+    authority = controller._tcp_recovery_authority
+    event = controller._post_login_diagnostic_event
+    assert authority is not None
+    assert event is not None
+    controller._window_backend = ObscuredWindowBackend([new, *peers])
+    sample = fixture.capture.capture(new.handle)
+    recognition = controller._recognizer.recognize_capture(sample)
+    assert controller._buffer_post_login_diagnostic(
+        authority=authority,
+        fingerprint=authority.fingerprint,
+        instance=WindowInstanceToken.from_window(new),
+        sample=sample,
+        recognition=recognition,
+        fresh_capture=True,
+        capture_route="obscured",
+        presentation_state="fully_obscured",
+        capture_settings_revision=controller._capture_settings_revision,
+        now=event.armed_at_monotonic + 2.5,
+    ) is True
+
+    if handoff == "owner":
+        controller._tcp_recovery_authority = replace(
+            authority,
+            fingerprint=peers[0].launch_fingerprint,
+        )
+    else:
+        controller._runtime_scope_token = "f" * 64
+    controller._synchronize_post_login_diagnostic()
+
+    assert controller._post_login_diagnostic_event is None
+    assert controller._post_login_diagnostic_output_dir is None
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_configured_login_recovery_keeps_detection_only_peers_immutable(
@@ -11077,6 +14252,655 @@ def test_initial_login_authorization_enters_one_already_selected_character():
     assert fixture.mouse.clicks == [(1, CHARACTER_ENTER_CLICK_POINT)]
 
 
+def test_initial_login_force_login_keeps_one_same_instance_line_continuation(
+    tmp_path,
+):
+    window = make_window(1, process_id=101)
+    now = [0.0]
+    line_point = (0.500, 0.385)
+    recognizer = RecognitionByMarker(
+        {
+            1: ScreenRecognition(
+                ReconnectScreenState.CONNECTED,
+                0.0,
+                None,
+                "connected",
+            ),
+            3: ScreenRecognition(
+                ReconnectScreenState.LOGIN_START,
+                0.0,
+                (0.500, 0.786),
+                "login",
+            ),
+            4: ScreenRecognition(
+                ReconnectScreenState.LINE_SELECTION,
+                0.0,
+                line_point,
+                "line",
+                line_number=2,
+                recent_line_present=True,
+                line_visible_routes=tuple(range(1, 9)),
+                line_list_page_complete=True,
+                line_list_top_verified=True,
+                line_list_bottom_verified=True,
+                line_one_click_point=(0.500, 0.327),
+            ),
+        }
+    )
+    fixture = make_controller(
+        [3],
+        windows=[window],
+        expected_windows=1,
+        recognizer=recognizer,
+        tcp_connection_count_provider=lambda process_ids: {
+            process_id: 1 for process_id in process_ids
+        },
+        target_windows_provider=lambda: tcp_resolved_targets([window]),
+        group_launch_plan=make_tcp_group_plan(tmp_path, [window]),
+        clock=lambda: now[0],
+    )
+    fingerprint = window.launch_fingerprint
+
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.reconnect()
+    login_result = fixture.controller.reconnect()
+
+    assert fixture.controller._tcp_counts is not None
+    assert fixture.controller._group_launch_plan is not None
+    assert isinstance(fixture.controller._tcp_v, ResolvedTargetWindows)
+    assert login_result.details["clicked_windows"] == 1
+    assert len(fixture.mouse.clicks) == 1
+    assert fixture.mouse.clicks[0][0] == window.handle
+    assert fingerprint in fixture.controller._initial_login_authorizations
+    continuation = fixture.controller._initial_login_authorizations[
+        fingerprint
+    ]
+    assert continuation.instance == WindowInstanceToken.from_window(window)
+    assert (
+        continuation.continuation_state
+        is ReconnectScreenState.LINE_SELECTION
+    )
+    assert fixture.controller._initial_login_authorization_is_current(
+        fingerprint,
+        WindowInstanceToken.from_window(window),
+        continuation.capture_settings_revision,
+        continuation.source_state_generation,
+        now=continuation.expires_at - 1.0,
+        action_state=ReconnectScreenState.LINE_SELECTION,
+    ) is True
+    assert fixture.controller._initial_login_authorization_is_current(
+        fingerprint,
+        WindowInstanceToken.from_window(window),
+        continuation.capture_settings_revision,
+        continuation.source_state_generation,
+        now=continuation.expires_at - 1.0,
+        action_state=ReconnectScreenState.CHARACTER_SELECTION,
+    ) is False
+    login_point = fixture.mouse.clicks[0][1]
+
+    now[0] = 11.0
+    fixture.capture.states[window.handle] = 4
+    fixture.controller.reconnect()
+    line_result = fixture.controller.reconnect()
+
+    assert line_result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [
+        (window.handle, login_point),
+        (window.handle, line_point),
+    ]
+    assert fingerprint in fixture.controller._line_input_consumed_fingerprints
+    assert fingerprint not in fixture.controller._initial_login_authorizations
+
+    fixture.capture.states[window.handle] = 1
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert len(fixture.mouse.clicks) == 2
+    assert fingerprint not in fixture.controller._initial_login_authorizations
+    assert fingerprint in fixture.controller._line_input_consumed_fingerprints
+
+
+@pytest.mark.parametrize(
+    (
+        "recognized_route",
+        "expected_line",
+        "expected_line_clicks",
+        "fallback_used",
+    ),
+    ((8, 8, 1, False), (None, None, 0, False)),
+    ids=("known-recent-eight", "unknown-recent-stops-safely"),
+)
+def test_formal_initial_login_line_chain_selects_original_or_stops_unknown_recent(
+    monkeypatch,
+    tmp_path,
+    recognized_route,
+    expected_line,
+    expected_line_clicks,
+    fallback_used,
+):
+    product_recognizer = ReferenceScreenRecognizer(
+        Path("assets/reconnect_reference")
+    )
+    monkeypatch.setattr(
+        product_recognizer,
+        "_recognize_route_number",
+        lambda _candidate: (
+            recognized_route,
+            0.0 if recognized_route is not None else None,
+        ),
+    )
+    monkeypatch.setattr(
+        product_recognizer,
+        "_recent_login_information_present",
+        lambda _candidate: True,
+    )
+    monkeypatch.setattr(
+        product_recognizer,
+        "_trusted_line_page",
+        lambda _candidate: (
+            tuple(range(1, 9)),
+            tuple(LINE_ROUTE_CLICK_POINTS.items()),
+            True,
+            True,
+            True,
+        ),
+    )
+    with Image.open(
+        Path("assets/reconnect_reference") / "03_line_selection_dialog.png"
+    ) as source:
+        line_recognition = product_recognizer.recognize_image(
+            source.convert("RGB")
+        )
+
+    expected_point = (
+        LINE_ROUTE_CLICK_POINTS[expected_line]
+        if expected_line is not None
+        else None
+    )
+    assert line_recognition.line_number == expected_line
+    assert line_recognition.click_point == expected_point
+    assert line_recognition.line_scroll_delta == 0
+    assert line_recognition.line_fallback_used is fallback_used
+    assert line_recognition.original_line_verified is None
+
+    window = make_window(1, process_id=101)
+    now = [0.0]
+    fixture = make_controller(
+        [3],
+        windows=[window],
+        expected_windows=1,
+        recognizer=RecognitionByMarker(
+            {
+                1: ScreenRecognition(
+                    ReconnectScreenState.CONNECTED,
+                    0.0,
+                    None,
+                    "connected",
+                ),
+                3: ScreenRecognition(
+                    ReconnectScreenState.LOGIN_START,
+                    0.0,
+                    (0.500, 0.786),
+                    "login",
+                ),
+                4: line_recognition,
+            }
+        ),
+        tcp_connection_count_provider=lambda process_ids: {
+            process_id: 1 for process_id in process_ids
+        },
+        target_windows_provider=lambda: tcp_resolved_targets([window]),
+        group_launch_plan=make_tcp_group_plan(tmp_path, [window]),
+        clock=lambda: now[0],
+    )
+    fingerprint = window.launch_fingerprint
+
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.reconnect()
+    assert fixture.controller.reconnect().details["clicked_windows"] == 1
+    fixture.controller._preferred_line_numbers[fingerprint] = 8
+    login_click_count = len(fixture.mouse.clicks)
+
+    now[0] = 11.0
+    fixture.capture.states[window.handle] = 4
+    fixture.controller.reconnect()
+    line_result = fixture.controller.reconnect()
+
+    assert line_result.details["clicked_windows"] == expected_line_clicks
+    if expected_line_clicks:
+        assert fixture.mouse.clicks[-1] == (window.handle, expected_point)
+    else:
+        assert len(fixture.mouse.clicks) == login_click_count
+    assert fixture.mouse.scrolls == []
+    assert fixture.controller._preferred_line_numbers[fingerprint] == 8
+
+    fixture.capture.states[window.handle] = 1
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    if expected_line_clicks:
+        assert fixture.mouse.clicks.count((window.handle, expected_point)) == 1
+    else:
+        assert len(fixture.mouse.clicks) == login_click_count
+
+
+def test_initial_login_line_continuation_is_never_reused_after_retry_window():
+    window = make_window(1, process_id=101)
+    now = [0.0]
+    line_point = (0.500, 0.385)
+    fixture = make_controller(
+        [3],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        recognizer=RecognitionByMarker(
+            {
+                3: ScreenRecognition(
+                    ReconnectScreenState.LOGIN_START,
+                    0.0,
+                    (0.500, 0.786),
+                    "login",
+                ),
+                4: ScreenRecognition(
+                    ReconnectScreenState.LINE_SELECTION,
+                    0.0,
+                    line_point,
+                    "line",
+                    line_number=2,
+                    recent_line_present=True,
+                    line_visible_routes=tuple(range(1, 9)),
+                    line_list_page_complete=True,
+                    line_list_top_verified=True,
+                    line_list_bottom_verified=True,
+                    line_one_click_point=(0.500, 0.327),
+                ),
+            }
+        ),
+    )
+
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.reconnect()
+    assert fixture.controller.reconnect().details["clicked_windows"] == 1
+
+    now[0] = 11.0
+    fixture.capture.states[window.handle] = 4
+    fixture.controller.reconnect()
+    assert fixture.controller.reconnect().details["clicked_windows"] == 1
+    assert len(fixture.mouse.clicks) == 2
+    assert (
+        window.launch_fingerprint
+        in fixture.controller._line_input_consumed_fingerprints
+    )
+
+    repeated = {}
+    for elapsed_after_line in (59.0, 60.0, 61.0):
+        now[0] = 11.0 + elapsed_after_line
+        repeated[elapsed_after_line] = tuple(
+            fixture.controller.reconnect().details["clicked_windows"]
+            for _frame in range(2)
+        )
+
+    assert repeated == {
+        59.0: (0, 0),
+        60.0: (0, 0),
+        61.0: (0, 0),
+    }
+    assert len(fixture.mouse.clicks) == 2
+
+
+def _delivered_initial_login_line_fixture(
+    *,
+    line_number=2,
+    line_point=(0.500, 0.385),
+    mouse=None,
+    before_line=None,
+):
+    window = make_window(1, process_id=101)
+    now = [0.0]
+    fixture = make_controller(
+        [3],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        mouse=mouse,
+        recognizer=RecognitionByMarker(
+            {
+                1: ScreenRecognition(
+                    ReconnectScreenState.CONNECTED,
+                    0.0,
+                    None,
+                    "connected",
+                ),
+                3: ScreenRecognition(
+                    ReconnectScreenState.LOGIN_START,
+                    0.0,
+                    (0.500, 0.786),
+                    "login",
+                ),
+                4: ScreenRecognition(
+                    ReconnectScreenState.LINE_SELECTION,
+                    0.0,
+                    line_point,
+                    "line",
+                    line_number=line_number,
+                    recent_line_present=True,
+                    line_visible_routes=tuple(range(1, 9)),
+                    line_list_page_complete=True,
+                    line_list_top_verified=True,
+                    line_list_bottom_verified=True,
+                    line_one_click_point=(0.500, 0.327),
+                ),
+                255: ScreenRecognition(
+                    ReconnectScreenState.UNKNOWN,
+                    None,
+                    None,
+                    None,
+                ),
+            }
+        ),
+    )
+    if mouse is not None:
+        mouse.controller_under_test = fixture.controller
+        mouse.consumed_fingerprint = window.launch_fingerprint
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.reconnect()
+    assert fixture.controller.reconnect().details["clicked_windows"] == 1
+    if callable(before_line):
+        before_line(fixture, window)
+    now[0] = 11.0
+    fixture.capture.states[window.handle] = 4
+    fixture.controller.reconnect()
+    line_result = fixture.controller.reconnect()
+    return fixture, window, now, line_result
+
+
+def test_line_consumption_survives_one_connected_frame_and_state_round_trip():
+    fixture, window, now, line_result = (
+        _delivered_initial_login_line_fixture()
+    )
+    assert line_result.details["clicked_windows"] == 1
+    assert len(fixture.mouse.clicks) == 2
+
+    fixture.capture.states[window.handle] = 1
+    fixture.controller.reconnect()
+    assert (
+        window.launch_fingerprint
+        in fixture.controller._line_input_consumed_fingerprints
+    )
+    fixture.capture.states[window.handle] = 255
+    fixture.controller.reconnect()
+    assert (
+        window.launch_fingerprint
+        in fixture.controller._line_input_consumed_fingerprints
+    )
+    fixture.capture.states[window.handle] = 4
+    now[0] = 72.0
+    repeated = [
+        fixture.controller.reconnect().details["clicked_windows"]
+        for _frame in range(3)
+    ]
+
+    assert repeated == [0, 0, 0]
+    assert len(fixture.mouse.clicks) == 2
+
+
+@pytest.mark.parametrize(
+    "line_delivery",
+    (
+        MouseClickResult(
+            False,
+            True,
+            True,
+            "mouse_down_delivery_uncertain",
+        ),
+        MouseClickResult(
+            False,
+            True,
+            False,
+            "mouse_click_failed",
+        ),
+    ),
+    ids=("uncertain", "failed"),
+)
+def test_line_consumption_precedes_delivery_result_and_never_retries(
+    line_delivery,
+):
+    delivered = MouseClickResult(True, True, False, None)
+    mouse = FakeMouseBackend(click_results=(delivered, line_delivery))
+    observed_consumed = []
+    original_click = mouse.click_relative
+
+    def inspecting_click(handle, point, expected_process_id, instance_token):
+        if point == (0.500, 0.385):
+            observed_consumed.append(
+                mouse.consumed_fingerprint
+                in getattr(
+                    mouse.controller_under_test,
+                    "_line_input_consumed_fingerprints",
+                )
+            )
+        return original_click(
+            handle,
+            point,
+            expected_process_id,
+            instance_token,
+        )
+
+    mouse.click_relative = inspecting_click
+    fixture, _window, now, line_result = (
+        _delivered_initial_login_line_fixture(mouse=mouse)
+    )
+
+    assert line_result.details["clicked_windows"] == 0
+    assert observed_consumed == [True]
+    assert len(mouse.clicks) == 2
+    now[0] = 72.0
+    for _frame in range(4):
+        fixture.controller.reconnect()
+    assert len(mouse.clicks) == 2
+
+
+def test_line_consumption_survives_final_authorization_change(monkeypatch):
+    observed_consumed = []
+    original_mutation = []
+    clicks_before_line = []
+
+    def revoke_at_boundary(fixture, window):
+        original_mutation.append(fixture.controller._run_game_mutation)
+        clicks_before_line.append(tuple(fixture.mouse.clicks))
+
+        def changed(_operation, _callback, **_kwargs):
+            observed_consumed.append(
+                window.launch_fingerprint
+                in fixture.controller._line_input_consumed_fingerprints
+            )
+            return False, None
+
+        monkeypatch.setattr(
+            fixture.controller,
+            "_run_game_mutation",
+            changed,
+        )
+
+    fixture, window, now, line_result = (
+        _delivered_initial_login_line_fixture(
+            before_line=revoke_at_boundary,
+        )
+    )
+    monkeypatch.setattr(
+        fixture.controller,
+        "_run_game_mutation",
+        original_mutation[0],
+    )
+
+    assert line_result.details["clicked_windows"] == 0
+    assert observed_consumed == [True]
+    assert tuple(fixture.mouse.clicks) == clicks_before_line[0]
+    now[0] = 72.0
+    for _frame in range(4):
+        fixture.controller.reconnect()
+    assert tuple(fixture.mouse.clicks) == clicks_before_line[0]
+
+
+def test_line_consumption_survives_capture_and_source_authority_changes():
+    fixture, window, _now, line_result = (
+        _delivered_initial_login_line_fixture()
+    )
+    fingerprint = window.launch_fingerprint
+    assert line_result.details["clicked_windows"] == 1
+    assert fingerprint in fixture.controller._line_input_consumed_fingerprints
+
+    fixture.controller.set_capture_settings(
+        SmartReconnectCaptureSettings(
+            visible=True,
+            obscured=False,
+            minimized=True,
+        )
+    )
+    with fixture.controller._source_authority_lock:
+        fixture.controller._source_state_generation += 1
+
+    assert fingerprint in fixture.controller._line_input_consumed_fingerprints
+    for _frame in range(3):
+        fixture.controller.reconnect()
+    assert len(fixture.mouse.clicks) == 2
+
+
+def test_line_scroll_does_not_consume_the_direct_line_input():
+    window = make_window(1, process_id=101)
+    now = [0.0]
+    direct_point = (0.500, 0.385)
+    fixture = make_controller(
+        [4],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        recognizer=RecognitionByMarker(
+            {
+                4: ScreenRecognition(
+                    ReconnectScreenState.LINE_SELECTION,
+                    0.0,
+                    (0.500, 0.500),
+                    "line-scroll",
+                    line_number=2,
+                    recent_line_present=True,
+                    line_scroll_delta=-120,
+                ),
+                5: ScreenRecognition(
+                    ReconnectScreenState.LINE_SELECTION,
+                    0.0,
+                    direct_point,
+                    "line-direct",
+                    line_number=2,
+                    recent_line_present=True,
+                    line_visible_routes=tuple(range(1, 9)),
+                    line_list_page_complete=True,
+                    line_list_top_verified=True,
+                    line_list_bottom_verified=True,
+                    line_one_click_point=(0.500, 0.327),
+                ),
+            }
+        ),
+    )
+    fingerprint = window.launch_fingerprint
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.reconnect()
+    scroll_result = fixture.controller.reconnect()
+
+    assert scroll_result.details["clicked_windows"] == 1
+    assert fixture.mouse.scrolls == [
+        (window.handle, (0.500, 0.500), -120)
+    ]
+    assert fingerprint not in fixture.controller._line_input_consumed_fingerprints
+
+    now[0] = 3.0
+    fixture.capture.states[window.handle] = 5
+    fixture.controller.reconnect()
+    direct_result = fixture.controller.reconnect()
+
+    assert direct_result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(window.handle, direct_point)]
+    assert fingerprint in fixture.controller._line_input_consumed_fingerprints
+
+
+@pytest.mark.parametrize(
+    ("line_number", "line_point"),
+    (
+        (2, (0.500, 0.385)),
+        (8, (0.500, 0.733)),
+    ),
+)
+def test_line_consumption_preserves_direct_special_line_points(
+    line_number,
+    line_point,
+):
+    fixture, window, _now, line_result = (
+        _delivered_initial_login_line_fixture(
+            line_number=line_number,
+            line_point=line_point,
+        )
+    )
+
+    assert line_result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks[-1] == (window.handle, line_point)
+
+
+def test_line_consumption_isolated_per_window_and_reset_by_new_activation():
+    windows = [
+        make_window(1, process_id=101),
+        make_window(2, process_id=102),
+    ]
+    line_points = {4: (0.500, 0.385), 5: (0.500, 0.733)}
+    fixture = make_controller(
+        [4, 5],
+        windows=windows,
+        expected_windows=2,
+        recognizer=RecognitionByMarker(
+            {
+                marker: ScreenRecognition(
+                    ReconnectScreenState.LINE_SELECTION,
+                    0.0,
+                    point,
+                    "line",
+                    line_number=line_number,
+                    recent_line_present=True,
+                    line_visible_routes=tuple(range(1, 9)),
+                    line_list_page_complete=True,
+                    line_list_top_verified=True,
+                    line_list_bottom_verified=True,
+                    line_one_click_point=(0.500, 0.327),
+                )
+                for marker, point, line_number in (
+                    (4, line_points[4], 2),
+                    (5, line_points[5], 8),
+                )
+            }
+        ),
+    )
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 2
+    assert fixture.mouse.clicks == [
+        (windows[0].handle, line_points[4]),
+        (windows[1].handle, line_points[5]),
+    ]
+    consumed = {window.launch_fingerprint for window in windows}
+    assert fixture.controller._line_input_consumed_fingerprints == consumed
+
+    fixture.controller.set_execution_enabled(False)
+    assert fixture.controller._line_input_consumed_fingerprints == consumed
+    assert fixture.controller.prepare_execution_snapshot().success is True
+    assert fixture.controller._line_input_consumed_fingerprints == set()
+    fixture.controller.set_execution_enabled(True)
+    fixture.controller.reconnect()
+    second_activation = fixture.controller.reconnect()
+
+    assert second_activation.details["clicked_windows"] == 2
+    assert len(fixture.mouse.clicks) == 4
+
+
 def test_formal_healthy_tcp_keeps_initial_login_authorization_actionable(
     tmp_path,
 ):
@@ -12624,10 +16448,11 @@ def test_owner_state_formal_factory_uses_wgc_after_new_instance_bind(
 
     def capture(_provider, handle):
         captures.append(handle)
+        nonce = len(captures) % 256
         return CaptureSample(
             width=2,
             height=2,
-            pixels=bytes([3, 0, 0, 255] * 4),
+            pixels=bytes([3, nonce, 0, 255] * 4),
             api_succeeded=True,
         )
 
@@ -13274,11 +17099,26 @@ def test_fifteen_shared_executable_windows_scroll_two_line_eights_independently(
                     "connected",
                 )
             handle = {41: 1, 42: 2}[marker]
-            product_recognizer._visible_line_buttons = (
+            product_recognizer._trusted_line_page = (
                 lambda _candidate: (
-                    ((8, (0.5, 0.722)),)
+                    (
+                        (7, 8),
+                        ((7, (0.5, 0.665)), (8, (0.5, 0.722))),
+                        True,
+                        False,
+                        True,
+                    )
                     if handle in mouse.scrolled_handles
-                    else ()
+                    else (
+                        (1, 2, 3, 4, 5, 6, 7),
+                        tuple(
+                            (route, (0.5, 0.265 + route * 0.057))
+                            for route in range(1, 8)
+                        ),
+                        True,
+                        True,
+                        False,
+                    )
                 )
             )
             return product_recognizer.recognize_image(

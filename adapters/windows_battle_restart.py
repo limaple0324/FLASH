@@ -357,6 +357,28 @@ public static class FlashReopenNative {
     private struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)]
     private struct FILETIME { public uint Low, High; }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    private struct SHELLEXECUTEINFOW {
+        public int cbSize;
+        public uint fMask;
+        public IntPtr hwnd;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpVerb;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpFile;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpParameters;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpDirectory;
+        public int nShow;
+        public IntPtr hInstApp;
+        public IntPtr lpIDList;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpClass;
+        public IntPtr hkeyClass;
+        public uint dwHotKey;
+        public IntPtr hIconOrMonitor;
+        public IntPtr hProcess;
+    }
+
+    private const uint SEE_MASK_FLAG_NO_UI = 0x00000400;
+    private const uint SEE_MASK_NOASYNC = 0x00000100;
+    private const int SW_SHOWNOACTIVATE = 4;
 
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumProc callback, IntPtr value);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
@@ -369,6 +391,27 @@ public static class FlashReopenNative {
     [DllImport("kernel32.dll")] private static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
     [DllImport("kernel32.dll")] private static extern bool GetProcessTimes(IntPtr process, out FILETIME created, out FILETIME exited, out FILETIME kernel, out FILETIME user);
     [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("shell32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShellExecuteExW(ref SHELLEXECUTEINFOW info);
+
+    public static void LaunchWithoutActivation(string path) {
+        if (String.IsNullOrWhiteSpace(path)) {
+            throw new ArgumentException("Shortcut path is required", "path");
+        }
+        var info = new SHELLEXECUTEINFOW {
+            cbSize = Marshal.SizeOf(typeof(SHELLEXECUTEINFOW)),
+            fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
+            lpVerb = "open",
+            lpFile = path,
+            nShow = SW_SHOWNOACTIVATE
+        };
+        if (!ShellExecuteExW(ref info)) {
+            throw new System.ComponentModel.Win32Exception(
+                Marshal.GetLastWin32Error()
+            );
+        }
+    }
 
     private static ulong Lifecycle(uint processId) {
         IntPtr process = OpenProcess(0x1000, false, processId);
@@ -602,10 +645,9 @@ $failure = Test-TargetAbsent
 if (-not [string]::IsNullOrWhiteSpace($failure)) { Fail-Reopen $failure }
 Emit-Stage 'shortcut_launch_entered'
 try {
-    $start = New-Object Diagnostics.ProcessStartInfo
-    $start.FileName = [string]$payload.shortcut_path
-    $start.UseShellExecute = $true
-    [Diagnostics.Process]::Start($start) | Out-Null
+    [FlashReopenNative]::LaunchWithoutActivation(
+        [string]$payload.shortcut_path
+    )
 } catch {
     Fail-Reopen 'battle_shortcut_open_failed'
 }

@@ -46,9 +46,18 @@ ROUTE_DIGIT_TEMPLATES = {
     7: "10_route_digit_7.png",
     8: "11_route_digit_8.png",
 }
+ROUTE_DIGIT_TEMPLATE_MAXIMUM_SCORE = 12.0
+ROUTE_DIGIT_TEMPLATE_MINIMUM_MARGIN = 8.0
 RECENT_LOGIN_ROUTE_PATTERN = re.compile(
     r"(?:線路|线路|路線|路线)[:：]?([1-8])"
 )
+SPECIAL_LINE_ROUTE_NAMES: dict[str, int] = {
+    "公會專線": 2,
+    "郵寄拍賣專線": 8,
+}
+LINE_ROUTE_NETWORK_ABNORMAL_PATTERN = re.compile(r"(?:網路異常|网络异常)")
+DIRECT_LINE_ROUTE_NUMBERS = frozenset((1, 3, 4, 5, 6, 7))
+INFERRED_SPECIAL_LINE_ROUTE_NUMBERS = frozenset((2, 8))
 LINE_ROUTE_CLICK_POINTS: dict[int, NormalizedPoint] = {
     1: (0.500, 0.327),
     2: (0.500, 0.385),
@@ -82,6 +91,14 @@ LINE_BUTTON_ROW_REGIONS: tuple[NormalizedRect, ...] = tuple(
 LINE_LIST_SCROLL_POINT: NormalizedPoint = (0.500, 0.530)
 LINE_SCROLL_DOWN_DELTA = -120
 LINE_SCROLL_UP_DELTA = 120
+LINE_LIST_REFERENCE_SIZE = (1350, 938)
+LINE_ROUTE_TEMPLATE_MAXIMUM_SCORE = 8.0
+LINE_ROUTE_TEMPLATE_MINIMUM_MARGIN = 0.5
+LINE_ROW_FRAME_EDGE_MINIMUM_FRACTION = 0.65
+LINE_ROW_CONTENT_EDGE_MINIMUM_FRACTION = 0.18
+LINE_ROW_BUTTON_IDENTITY_MAXIMUM_SCORE = 0.065
+LINE_ROW_BUTTON_FILL_MAXIMUM_SCORE = 12.0
+LINE_SELECTION_ANONYMIZED_CAPTURE_SIZE = (902, 622)
 POPUP_TITLE_REGIONS: dict[ReconnectScreenState, NormalizedRect] = {
     ReconnectScreenState.POST_LOGIN_ACTIVITY: (0.400, 0.130, 0.600, 0.190),
     ReconnectScreenState.POST_LOGIN_RECOMMENDATION: (
@@ -238,6 +255,11 @@ LINE_SELECTION_FRAME_REGIONS: tuple[NormalizedRect, ...] = (
 )
 LINE_SELECTION_FRAME_MAXIMUM_SCORE = 28.0
 LINE_SELECTION_FRAME_MAXIMUM_EDGE_SCORE = 50.0
+FLASH_CLIENT_DARK_ROW_MAXIMUM_MEAN = 18.0
+FLASH_CLIENT_DARK_RUN_MINIMUM_PIXELS = 8
+FLASH_CLIENT_TOP_PREFIX_MINIMUM_MEAN = 80.0
+FLASH_CLIENT_TOP_SEARCH_MAXIMUM_RATIO = 0.18
+LINE_SELECTION_CONTENT_ASPECT_MAXIMUM_DELTA = 0.08
 LOGIN_START_LIVE_REFERENCE_FILE = "17_login_start_live_capture.png"
 LOGIN_START_LIVE_MAXIMUM_WIDTH_DELTA = 0
 LOGIN_START_LIVE_MAXIMUM_HEIGHT_DELTA = 2
@@ -597,6 +619,13 @@ class ScreenRecognition:
     recent_line_present: bool | None = None
     recent_login_role: str | None = None
     line_scroll_delta: int = 0
+    line_visible_routes: tuple[int, ...] = ()
+    line_list_page_complete: bool = False
+    line_list_top_verified: bool = False
+    line_list_bottom_verified: bool = False
+    line_one_click_point: NormalizedPoint | None = None
+    line_fallback_used: bool = False
+    original_line_verified: bool | None = None
 
 class ReferenceScreenRecognizer:
     """Classify one capture against the confirmed screen references."""
@@ -623,6 +652,14 @@ class ReferenceScreenRecognizer:
             ScreenRecognition,
         ] = OrderedDict()
         self._full_reference_signatures: dict[int, Image.Image] = {}
+        self._line_signature_cache: OrderedDict[
+            tuple[int, int],
+            tuple[
+                tuple[Image.Image, ...],
+                tuple[tuple[float, ...], ...],
+                tuple[tuple[float, float, float], ...],
+            ],
+        ] = OrderedDict()
         self._disconnect_overlay_reference: (
             tuple[
                 Image.Image,
@@ -899,13 +936,35 @@ class ReferenceScreenRecognizer:
             }
             if len(route_values) == 1:
                 return next(iter(route_values)), 0.0
-            if re.search(r"(?:線路|线路|路線|路线)", recent_text):
+            if len(route_values) > 1 or re.search(
+                r"(?:線路|线路|路線|路线)", recent_text
+            ):
                 # A visible route label that is ambiguous or contradictory is
                 # never allowed to fall through to a different visual digit.
                 return None, 255.0
         digit_crop = self._route_digit_crop(candidate)
         if digit_crop is None:
             return None, None
+        digit_readings = (
+            self._read_line_button_text(digit_crop),
+            self._read_line_button_text(
+                self._binary_text(digit_crop).convert("RGB")
+            ),
+        )
+        read_values = tuple(
+            int(match.group(1))
+            for text in digit_readings
+            if (match := re.fullmatch(r"\s*([1-8])\s*", text or ""))
+            is not None
+        )
+        if len(read_values) == len(digit_readings):
+            if len(set(read_values)) == 1:
+                return read_values[0], 0.0
+            return None, 255.0
+        if read_values:
+            # A single OCR preparation seeing a digit is not sufficient, but
+            # it also proves this crop is not safely a 7/8 template fallback.
+            return None, 255.0
         candidate_signature = self._digit_signature(digit_crop)
         if candidate_signature is None:
             return None, None
@@ -928,9 +987,36 @@ class ReferenceScreenRecognizer:
         scores.sort()
         score, route_number = scores[0]
         runner_up = scores[1][0] if len(scores) > 1 else 255.0
-        if score > 65.0 or runner_up - score < 8.0:
+        if (
+            score > ROUTE_DIGIT_TEMPLATE_MAXIMUM_SCORE
+            or runner_up - score < ROUTE_DIGIT_TEMPLATE_MINIMUM_MARGIN
+        ):
             return None, round(score, 3)
         return route_number, round(score, 3)
+
+    @staticmethod
+    def _special_line_route_number(
+        text: str,
+    ) -> tuple[int | None, bool]:
+        """Resolve only exact special route names; partials fail closed."""
+
+        compact = re.sub(r"\s+", "", text or "")
+        matches: list[int] = []
+        remainder = compact
+        for route_name, route_number in SPECIAL_LINE_ROUTE_NAMES.items():
+            count = compact.count(route_name)
+            matches.extend([route_number] * count)
+            remainder = remainder.replace(route_name, "")
+        has_mixed_route = bool(matches) and bool(
+            RECENT_LOGIN_ROUTE_PATTERN.search(remainder)
+            or re.search(r"(?<!\d)[1-8](?:線|线)", remainder)
+            or re.search(r"(?:角色|最近(?:一次)?登入)", remainder)
+        )
+        if len(matches) > 1 or has_mixed_route:
+            return None, True
+        if len(matches) == 1:
+            return matches[0], False
+        return None, False
 
     def _recent_login_information_present(
         self,
@@ -1016,6 +1102,428 @@ class ReferenceScreenRecognizer:
         # a unique target or a reason to scroll the list.
         return tuple(sorted(matches))
 
+    @staticmethod
+    def _line_row_signature(row: Image.Image) -> Image.Image:
+        """Keep stable route glyph edges and exclude fill/status colours."""
+
+        gray = ImageOps.grayscale(
+            row.resize((212, 40), Image.Resampling.BILINEAR).crop(
+                (24, 6, 132, 34)
+            )
+        )
+        return gray.resize(
+            (108, 28),
+            Image.Resampling.BILINEAR,
+        ).point(
+            lambda value: 255 if value < 90 else 0
+        )
+
+    @staticmethod
+    def _line_row_has_complete_frame(row: Image.Image) -> bool:
+        """Require all four inner button edges without matching fill colour."""
+
+        edges = ImageOps.grayscale(
+            row.resize((212, 40), Image.Resampling.BILINEAR)
+        ).filter(ImageFilter.FIND_EDGES)
+
+        def horizontal_fraction(y: int) -> float:
+            values = edges.crop((0, y, 212, y + 1)).tobytes()
+            return sum(value >= 50 for value in values) / len(values)
+
+        def vertical_fraction(x: int) -> float:
+            values = edges.crop((x, 0, x + 1, 40)).tobytes()
+            return sum(value >= 50 for value in values) / len(values)
+
+        top_inner = max(horizontal_fraction(y) for y in range(1, 5))
+        top_outer = horizontal_fraction(0)
+        top_false_inner = max(horizontal_fraction(y) for y in range(5, 9))
+        top_matched = bool(
+            top_inner >= LINE_ROW_FRAME_EDGE_MINIMUM_FRACTION
+            or (
+                top_outer >= LINE_ROW_FRAME_EDGE_MINIMUM_FRACTION
+                and top_false_inner < LINE_ROW_FRAME_EDGE_MINIMUM_FRACTION
+            )
+        )
+        return bool(
+            top_matched
+            and max(horizontal_fraction(y) for y in range(30, 40))
+            >= LINE_ROW_FRAME_EDGE_MINIMUM_FRACTION
+            and max(vertical_fraction(x) for x in range(0, 9))
+            >= LINE_ROW_FRAME_EDGE_MINIMUM_FRACTION
+            and max(vertical_fraction(x) for x in range(202, 212))
+            >= LINE_ROW_FRAME_EDGE_MINIMUM_FRACTION
+        )
+
+    @staticmethod
+    def _line_row_has_button_content(row: Image.Image) -> bool:
+        edges = (
+            ImageOps.grayscale(
+                row.resize((212, 40), Image.Resampling.BILINEAR)
+            )
+            .filter(ImageFilter.FIND_EDGES)
+            .crop((8, 8, 204, 30))
+        )
+        values = edges.tobytes()
+        return (
+            sum(value >= 50 for value in values) / len(values)
+            >= LINE_ROW_CONTENT_EDGE_MINIMUM_FRACTION
+        )
+
+    @staticmethod
+    def _line_row_button_identity_signature(
+        row: Image.Image,
+    ) -> tuple[float, ...]:
+        """Describe stable route glyph and row structure without fill colour."""
+
+        edges = (
+            ImageOps.grayscale(
+                row.resize((212, 40), Image.Resampling.BILINEAR)
+            )
+            .filter(ImageFilter.FIND_EDGES)
+            .crop((10, 6, 202, 34))
+        )
+        values = edges.tobytes()
+        column_bins = tuple(
+            sum(
+                values[(y * 192) + x] >= 50
+                for y in range(28)
+                for x in range(bin_index * 8, (bin_index + 1) * 8)
+            )
+            / (28 * 8)
+            for bin_index in range(24)
+        )
+        row_bins = tuple(
+            sum(
+                values[(y * 192) + x] >= 50
+                for y in range(bin_index * 4, (bin_index + 1) * 4)
+                for x in range(192)
+            )
+            / (4 * 192)
+            for bin_index in range(7)
+        )
+        return column_bins + row_bins
+
+    @staticmethod
+    def _line_row_button_identity_score(
+        first: tuple[float, ...],
+        second: tuple[float, ...],
+    ) -> float:
+        return sum(
+            abs(first_value - second_value)
+            for first_value, second_value in zip(first, second, strict=True)
+        ) / len(first)
+
+    @staticmethod
+    def _line_row_button_fill_signature(
+        row: Image.Image,
+    ) -> tuple[float, float, float]:
+        return tuple(
+            ImageStat.Stat(
+                row.resize((212, 40), Image.Resampling.BILINEAR)
+                .crop((6, 6, 206, 34))
+                .convert("RGB")
+            ).mean
+        )
+
+    @staticmethod
+    def _line_row_button_fill_score(
+        first: tuple[float, float, float],
+        second: tuple[float, float, float],
+    ) -> float:
+        return sum(
+            abs(first_value - second_value)
+            for first_value, second_value in zip(first, second, strict=True)
+        ) / len(first)
+
+    @staticmethod
+    def _direct_line_route_number(
+        text: str,
+    ) -> tuple[int | None, bool]:
+        """Read one ordinary route digit; special 2/8 remain inference-only."""
+
+        values = tuple(
+            int(value)
+            for value in re.findall(r"(?<!\d)([1-8])(?!\d)", text or "")
+        )
+        if not values:
+            return None, False
+        if len(values) != 1 or values[0] not in DIRECT_LINE_ROUTE_NUMBERS:
+            return None, True
+        return values[0], False
+
+    @staticmethod
+    def _normalized_line_image(candidate: Image.Image) -> Image.Image:
+        if candidate.size == LINE_LIST_REFERENCE_SIZE:
+            return candidate.convert("RGB")
+        return candidate.convert("RGB").resize(
+            LINE_LIST_REFERENCE_SIZE,
+            Image.Resampling.BILINEAR,
+        )
+
+    def _line_signatures_for_source_size(
+        self,
+        source_size: tuple[int, int],
+    ) -> tuple[
+        tuple[Image.Image, ...],
+        tuple[tuple[float, ...], ...],
+        tuple[tuple[float, float, float], ...],
+    ]:
+        cached = self._line_signature_cache.get(source_size)
+        if cached is not None:
+            self._line_signature_cache.move_to_end(source_size)
+            return cached
+        reference = self._reference("03_line_selection_dialog.png")
+        if reference.size != source_size:
+            reference = reference.resize(
+                source_size,
+                Image.Resampling.LANCZOS,
+            )
+        reference = self._normalized_line_image(reference)
+        # Build both signatures through the same source-size normalization.
+        # A fresh WGC frame may differ by a few decoration pixels from the
+        # reference canvas; comparing one normalized side with an unscaled
+        # reference made a genuine row fail its button-identity gate.
+        identity_reference = reference
+        reference_rows = tuple(
+            self._crop(reference, region)
+            for region in LINE_BUTTON_ROW_REGIONS
+        )
+        cached = (
+            tuple(self._line_row_signature(row) for row in reference_rows),
+            tuple(
+                self._line_row_button_identity_signature(
+                    self._crop(identity_reference, region)
+                )
+                for region in LINE_BUTTON_ROW_REGIONS
+            ),
+            tuple(
+                self._line_row_button_fill_signature(
+                    self._crop(identity_reference, region)
+                )
+                for region in LINE_BUTTON_ROW_REGIONS
+            ),
+        )
+        self._line_signature_cache[source_size] = cached
+        while len(self._line_signature_cache) > 8:
+            self._line_signature_cache.popitem(last=False)
+        return cached
+
+    @staticmethod
+    def _signature_score(first: Image.Image, second: Image.Image) -> float:
+        return float(
+            ImageStat.Stat(ImageChops.difference(first, second)).mean[0]
+        )
+
+    @staticmethod
+    def _infer_line_page_routes(
+        known_routes: tuple[int | None, ...],
+    ) -> tuple[int, ...] | None:
+        """Infer only special 2/8 rows from one consecutive 1..8 solution."""
+
+        if not known_routes or len(known_routes) > 8:
+            return None
+        direct_routes = tuple(
+            route for route in known_routes if route is not None
+        )
+        if (
+            any(route not in DIRECT_LINE_ROUTE_NUMBERS for route in direct_routes)
+            or len(direct_routes) != len(set(direct_routes))
+        ):
+            return None
+        starts = {
+            route - index
+            for index, route in enumerate(known_routes)
+            if route is not None
+        }
+        if len(starts) > 1:
+            return None
+        if starts:
+            start = next(iter(starts))
+        else:
+            possible_starts = tuple(range(1, 10 - len(known_routes)))
+            if len(possible_starts) != 1:
+                return None
+            start = possible_starts[0]
+        resolved = tuple(range(start, start + len(known_routes)))
+        if not resolved or resolved[0] < 1 or resolved[-1] > 8:
+            return None
+        for known, inferred in zip(known_routes, resolved, strict=True):
+            if known is not None and known != inferred:
+                return None
+            if (
+                known is None
+                and inferred not in INFERRED_SPECIAL_LINE_ROUTE_NUMBERS
+            ):
+                return None
+        return resolved
+
+    def _trusted_line_page(
+        self,
+        candidate: Image.Image,
+    ) -> tuple[
+        tuple[int, ...],
+        tuple[tuple[int, NormalizedPoint], ...],
+        bool,
+        bool,
+        bool,
+    ]:
+        """Publish one page only when every visible row is uniquely trusted."""
+
+        source_size = candidate.size
+        (
+            route_signatures,
+            button_identity_signatures,
+            button_fill_signatures,
+        ) = (
+            self._line_signatures_for_source_size(source_size)
+        )
+        candidate = self._normalized_line_image(candidate)
+        client_height = candidate.height * (
+            1.0 - LINE_SELECTION_CLIENT_TOP_RATIO
+        )
+        if client_height <= 1:
+            return (), (), False, False, False
+
+        slots: list[
+            tuple[
+                int | None,
+                NormalizedPoint | None,
+                int | None,
+            ]
+            | None
+        ] = []
+        for region in LINE_BUTTON_ROW_REGIONS:
+            row = self._crop(candidate, region)
+            row_text = self._read_line_button_text(row)
+            signature = self._line_row_signature(row)
+            scores = sorted(
+                (
+                    self._signature_score(signature, route_signature),
+                    route_number,
+                )
+                for route_number, route_signature in enumerate(
+                    route_signatures,
+                    start=1,
+                )
+                if route_number in DIRECT_LINE_ROUTE_NUMBERS
+            )
+            best_score, route_number = scores[0]
+            margin = scores[1][0] - best_score
+            route_glyph_matched = bool(
+                best_score <= LINE_ROUTE_TEMPLATE_MAXIMUM_SCORE
+                and margin >= LINE_ROUTE_TEMPLATE_MINIMUM_MARGIN
+            )
+            direct_route, direct_ambiguous = self._direct_line_route_number(
+                row_text
+            )
+            special_route, special_ambiguous = (
+                self._special_line_route_number(row_text)
+            )
+            if direct_ambiguous or special_ambiguous:
+                return (), (), False, False, False
+            if (
+                route_glyph_matched
+                and direct_route is not None
+                and route_number != direct_route
+            ):
+                return (), (), False, False, False
+            known_route = direct_route
+            if known_route is None and route_glyph_matched:
+                known_route = route_number
+            button_identity_signature = (
+                self._line_row_button_identity_signature(row)
+            )
+            button_identity_score = min(
+                self._line_row_button_identity_score(
+                    button_identity_signature,
+                    reference_identity_signature,
+                )
+                for reference_identity_signature
+                in button_identity_signatures
+            )
+            button_fill_signature = self._line_row_button_fill_signature(row)
+            button_fill_score = min(
+                self._line_row_button_fill_score(
+                    button_fill_signature,
+                    reference_fill_signature,
+                )
+                for reference_fill_signature in button_fill_signatures
+            )
+            row_has_complete_frame = self._line_row_has_complete_frame(row)
+            row_has_button_content = self._line_row_has_button_content(row)
+            frame_matched = bool(
+                row_has_complete_frame
+                and (
+                    button_identity_score
+                    <= LINE_ROW_BUTTON_IDENTITY_MAXIMUM_SCORE
+                    or (
+                        button_fill_score
+                        <= LINE_ROW_BUTTON_FILL_MAXIMUM_SCORE
+                        and row_has_button_content
+                    )
+                    or (
+                        direct_route is not None
+                        and row_has_button_content
+                    )
+                )
+            )
+            if frame_matched:
+                centre_y = candidate.height * ((region[1] + region[3]) / 2)
+                client_y = (
+                    centre_y
+                    - candidate.height * LINE_SELECTION_CLIENT_TOP_RATIO
+                ) / client_height
+                slots.append(
+                    (
+                        known_route,
+                        (
+                            None
+                            if LINE_ROUTE_NETWORK_ABNORMAL_PATTERN.search(
+                                row_text
+                            )
+                            else (0.500, max(0.0, min(1.0, client_y)))
+                        ),
+                        special_route,
+                    )
+                )
+                continue
+
+            if known_route is not None or special_route is not None or row_text:
+                # A row outline with unknown or ambiguous route glyphs is not
+                # an empty slot and invalidates the whole page.
+                return (), (), False, False, False
+            slots.append(None)
+
+        occupied_indices = tuple(
+            index for index, slot in enumerate(slots) if slot is not None
+        )
+        if not occupied_indices or occupied_indices != tuple(
+            range(occupied_indices[0], occupied_indices[-1] + 1)
+        ):
+            return (), (), False, False, False
+        occupied = tuple(
+            slot
+            for slot in slots[occupied_indices[0] : occupied_indices[-1] + 1]
+            if slot is not None
+        )
+        known_routes = tuple(slot[0] for slot in occupied)
+        routes = self._infer_line_page_routes(known_routes)
+        if routes is None:
+            return (), (), False, False, False
+        matches: list[tuple[int, NormalizedPoint]] = []
+        for route_number, slot in zip(routes, occupied, strict=True):
+            _known_route, point, exact_special_route = slot
+            if (
+                exact_special_route is not None
+                and exact_special_route != route_number
+            ):
+                return (), (), False, False, False
+            if point is not None:
+                matches.append((route_number, point))
+        top_verified = tuple(routes[:2]) == (1, 2)
+        bottom_verified = tuple(routes[-2:]) == (7, 8)
+        return routes, tuple(matches), True, top_verified, bottom_verified
+
     def _recent_login_role(self, candidate: Image.Image) -> str | None:
         text = self._recent_login_text(candidate)
         match = re.search(
@@ -1030,22 +1538,46 @@ class ReferenceScreenRecognizer:
     def _line_selection_target(
         self,
         candidate: Image.Image,
+        trusted_page: tuple[
+            tuple[int, ...],
+            tuple[tuple[int, NormalizedPoint], ...],
+            bool,
+            bool,
+            bool,
+        ] | None = None,
     ) -> tuple[
         int | None,
         NormalizedPoint | None,
         bool,
         str | None,
         int,
+        bool,
     ]:
         route_number, route_score = self._recognize_route_number(candidate)
         recent_present = self._recent_login_information_present(candidate)
-        if route_number is None:
-            if recent_present:
-                # Existing but ambiguous text is never treated as absence.
-                return None, None, True, self._recent_login_role(candidate), 0
+        if route_number is None and not recent_present:
             route_number = 1
 
-        visible = self._visible_line_buttons(candidate)
+        (
+            visible_routes,
+            visible,
+            page_complete,
+            _top_verified,
+            _bottom_verified,
+        ) = (
+            trusted_page
+            if trusted_page is not None
+            else self._trusted_line_page(candidate)
+        )
+        if not page_complete:
+            return (
+                route_number,
+                None,
+                recent_present,
+                self._recent_login_role(candidate),
+                0,
+                False,
+            )
         if any(
             sum(1 for value, _point in visible if value == number) != 1
             for number, _point in visible
@@ -1059,6 +1591,16 @@ class ReferenceScreenRecognizer:
                 recent_present,
                 self._recent_login_role(candidate),
                 0,
+                False,
+            )
+        if route_number is None:
+            return (
+                None,
+                None,
+                recent_present,
+                self._recent_login_role(candidate),
+                0,
+                False,
             )
         target_points = tuple(
             point for number, point in visible if number == route_number
@@ -1068,17 +1610,40 @@ class ReferenceScreenRecognizer:
                 route_number,
                 target_points[0],
                 recent_present,
+                (
+                    self._recent_login_role(candidate)
+                    if recent_present
+                    else None
+                ),
+                0,
+                False,
+            )
+        if route_number in visible_routes:
+            # The target row is present but deliberately non-clickable, for
+            # example because it reports a network abnormal condition.  Keep
+            # the LINE state and do not turn that condition into a scroll.
+            return (
+                route_number,
+                None,
+                recent_present,
                 self._recent_login_role(candidate),
                 0,
+                False,
             )
         if not recent_present and route_number == 1:
             # The explicit absence fallback is the only fixed-line rule.
+            first_line_points = tuple(
+                point for number, point in visible if number == 1
+            )
+            if len(first_line_points) != 1:
+                return (1, None, False, None, 0, False)
             return (
                 1,
-                LINE_ROUTE_CLICK_POINTS[1],
+                first_line_points[0],
                 False,
                 None,
                 0,
+                False,
             )
 
         visible_numbers = tuple(number for number, _point in visible)
@@ -1099,6 +1664,7 @@ class ReferenceScreenRecognizer:
             recent_present,
             self._recent_login_role(candidate),
             scroll_delta,
+            False,
         )
 
     @staticmethod
@@ -1750,6 +2316,52 @@ class ReferenceScreenRecognizer:
         )
         return matched, max((*scores, *edge_scores))
 
+    def _line_selection_fixed_frame_score(
+        self,
+        candidate: Image.Image,
+    ) -> tuple[bool, float]:
+        return self._fixed_full_window_structure_score(
+            candidate,
+            reference_filename="03_line_selection_dialog.png",
+            regions=LINE_SELECTION_FRAME_REGIONS,
+            maximum_score=LINE_SELECTION_FRAME_MAXIMUM_SCORE,
+            maximum_edge_score=LINE_SELECTION_FRAME_MAXIMUM_EDGE_SCORE,
+        )
+
+    def _line_selection_frame_has_matching_structure(
+        self,
+        candidate: Image.Image,
+    ) -> bool:
+        reference = self._reference("03_line_selection_dialog.png")
+        return all(
+            self._region_has_matching_structure(
+                candidate,
+                reference,
+                region,
+                LINE_SELECTION_FRAME_MAXIMUM_SCORE,
+            )
+            for region in LINE_SELECTION_FRAME_REGIONS
+        )
+
+    def _line_selection_has_button_row_structure(
+        self,
+        candidate: Image.Image,
+    ) -> bool:
+        candidate = self._normalized_line_image(candidate)
+        rows = tuple(
+            self._crop(candidate, region)
+            for region in LINE_BUTTON_ROW_REGIONS
+        )
+        return bool(
+            all(self._line_row_has_complete_frame(row) for row in rows)
+            and sum(
+                1
+                for row in rows
+                if self._line_row_has_button_content(row)
+            )
+            >= 6
+        )
+
     @classmethod
     def _anonymous_structure_atlas(
         cls,
@@ -1866,6 +2478,119 @@ class ReferenceScreenRecognizer:
             ):
                 return True, score
         return False, best_score
+
+    @staticmethod
+    def _flash_client_dark_run_start(image: Image.Image) -> int | None:
+        gray = ImageOps.grayscale(image)
+        search_limit = min(
+            image.height - FLASH_CLIENT_DARK_RUN_MINIMUM_PIXELS,
+            max(
+                FLASH_CLIENT_DARK_RUN_MINIMUM_PIXELS + 1,
+                round(image.height * FLASH_CLIENT_TOP_SEARCH_MAXIMUM_RATIO),
+            ),
+        )
+        if search_limit <= FLASH_CLIENT_DARK_RUN_MINIMUM_PIXELS:
+            return None
+        row_means = tuple(
+            ImageStat.Stat(gray.crop((0, y, image.width, y + 1))).mean[0]
+            for y in range(search_limit + FLASH_CLIENT_DARK_RUN_MINIMUM_PIXELS)
+        )
+        for y in range(4, search_limit + 1):
+            if (
+                max(
+                    row_means[
+                        y : y + FLASH_CLIENT_DARK_RUN_MINIMUM_PIXELS
+                    ]
+                )
+                > FLASH_CLIENT_DARK_ROW_MAXIMUM_MEAN
+            ):
+                continue
+            prefix = row_means[max(0, y - 18) : y]
+            if prefix and max(prefix) >= FLASH_CLIENT_TOP_PREFIX_MINIMUM_MEAN:
+                return y
+        return None
+
+    @staticmethod
+    def _flash_dark_run_has_window_caption_prefix(
+        image: Image.Image,
+        dark_top: int,
+    ) -> bool:
+        start = max(0, dark_top - 5)
+        stop = max(0, dark_top - 1)
+        for y in range(start, stop + 1):
+            mean = ImageStat.Stat(
+                image.crop((0, y, image.width, y + 1)).convert("RGB")
+            ).mean
+            if min(mean) >= 200.0 and (max(mean) - min(mean)) <= 1.5:
+                return True
+        return False
+
+    def _line_selection_candidate_variants(
+        self,
+        candidate: Image.Image,
+    ) -> tuple[Image.Image, ...]:
+        """Normalize one complete Flash content area to line-reference space."""
+
+        reference = self._reference("03_line_selection_dialog.png")
+        if candidate.size == reference.size:
+            return (candidate.convert("RGB"),)
+        reference_top = round(reference.height * LINE_SELECTION_CLIENT_TOP_RATIO)
+        reference_client_height = reference.height - reference_top
+        if reference_client_height <= 1:
+            return ()
+        variants: list[Image.Image] = []
+        full_aspect = candidate.width / candidate.height
+        reference_aspect = reference.width / reference.height
+        if (
+            abs(full_aspect - reference_aspect)
+            <= LINE_SELECTION_CONTENT_ASPECT_MAXIMUM_DELTA
+        ):
+            variants.append(candidate.convert("RGB"))
+
+        reference_dark_top = self._flash_client_dark_run_start(reference)
+        dark_to_client_offset = (
+            max(0, reference_dark_top - reference_top)
+            if reference_dark_top is not None
+            else 0
+        )
+        candidate_dark_top = self._flash_client_dark_run_start(candidate)
+        if candidate_dark_top is None:
+            return tuple(variants)
+        if not self._flash_dark_run_has_window_caption_prefix(
+            candidate,
+            candidate_dark_top,
+        ):
+            return tuple(variants)
+        client_top = max(0, candidate_dark_top - dark_to_client_offset)
+
+        client_height = candidate.height - client_top
+        if client_height <= 1:
+            return tuple(variants)
+        reference_client_aspect = reference.width / reference_client_height
+        client_aspect = candidate.width / client_height
+        if (
+            abs(client_aspect - reference_client_aspect)
+            > LINE_SELECTION_CONTENT_ASPECT_MAXIMUM_DELTA
+        ):
+            return tuple(variants)
+
+        top_reference = reference.crop(
+            (0, 0, reference.width, reference_top)
+        )
+        client = candidate.crop(
+            (0, client_top, candidate.width, candidate.height)
+        )
+        canvas = Image.new("RGB", reference.size)
+        canvas.paste(top_reference, (0, 0))
+        canvas.paste(
+            client.resize(
+                (reference.width, reference_client_height),
+                Image.Resampling.BICUBIC,
+            ),
+            (0, reference_top),
+        )
+        variants.append(canvas)
+        return tuple(variants)
 
     def _region_is_closer_to_confirmed_references(
         self,
@@ -2898,29 +3623,118 @@ class ReferenceScreenRecognizer:
         live_window_dimensions = self._matches_live_window_dimensions(
             candidate
         )
-        if live_window_dimensions and not any(
+        trusted_line_page_for_fallback = None
+        line_selection_target_candidate = candidate
+        line_state_scored = any(
+            item[1].state is ReconnectScreenState.LINE_SELECTION
+            for item in valid_scored
+        )
+        if line_state_scored:
+            trusted_line_page = self._trusted_line_page(candidate)
+            if trusted_line_page[2]:
+                trusted_line_page_for_fallback = trusted_line_page
+            else:
+                for line_candidate in self._line_selection_candidate_variants(
+                    candidate
+                ):
+                    line_frame_matches, _line_frame_score = (
+                        self._line_selection_fixed_frame_score(
+                            line_candidate
+                        )
+                    )
+                    line_row_structure_matches = (
+                        self._line_selection_has_button_row_structure(
+                            line_candidate
+                        )
+                    )
+                    if (
+                        not line_frame_matches
+                        and not line_row_structure_matches
+                    ):
+                        continue
+                    trusted_line_page = self._trusted_line_page(line_candidate)
+                    if (
+                        not trusted_line_page[2]
+                        and not self._line_selection_frame_has_matching_structure(
+                            line_candidate
+                        )
+                        and not line_row_structure_matches
+                    ):
+                        continue
+                    if (
+                        trusted_line_page[2]
+                        and trusted_line_page[3]
+                        and trusted_line_page[4]
+                    ):
+                        trusted_line_page_for_fallback = trusted_line_page
+                        line_selection_target_candidate = line_candidate
+                        break
+        else:
+            for line_candidate in self._line_selection_candidate_variants(
+                candidate
+            ):
+                line_frame_matches, line_frame_score = (
+                    self._line_selection_fixed_frame_score(line_candidate)
+                )
+                line_row_structure_matches = (
+                    self._line_selection_has_button_row_structure(
+                        line_candidate
+                    )
+                )
+                if (
+                    not line_frame_matches
+                    and not line_row_structure_matches
+                ):
+                    continue
+                trusted_line_page = self._trusted_line_page(line_candidate)
+                if (
+                    not trusted_line_page[2]
+                    and not self._line_selection_frame_has_matching_structure(
+                        line_candidate
+                    )
+                    and not line_row_structure_matches
+                ):
+                    continue
+                if (
+                    trusted_line_page[2]
+                    and trusted_line_page[3]
+                    and trusted_line_page[4]
+                ):
+                    trusted_line_page_for_fallback = trusted_line_page
+                    line_selection_target_candidate = line_candidate
+                    valid_scored.append(
+                        (
+                            line_frame_score,
+                            line_definition,
+                            tuple(
+                                0.0
+                                for _region in line_definition.regions
+                            ),
+                        )
+                    )
+                    break
+
+        if any(
             item[1].state is ReconnectScreenState.LINE_SELECTION
             for item in valid_scored
         ):
-            line_frame_matches, line_frame_score = (
-                self._fixed_full_window_structure_score(
-                    candidate,
-                    reference_filename=line_definition.filename,
-                    regions=LINE_SELECTION_FRAME_REGIONS,
-                    maximum_score=LINE_SELECTION_FRAME_MAXIMUM_SCORE,
-                    maximum_edge_score=(
-                        LINE_SELECTION_FRAME_MAXIMUM_EDGE_SCORE
-                    ),
-                )
+            line_page_check = (
+                trusted_line_page_for_fallback
+                if trusted_line_page_for_fallback is not None
+                else self._trusted_line_page(line_selection_target_candidate)
             )
-            if line_frame_matches:
-                valid_scored.append(
-                    (
-                        line_frame_score,
-                        line_definition,
-                        tuple(0.0 for _region in line_definition.regions),
-                    )
-                )
+            if not (
+                line_page_check[2]
+                and line_page_check[3]
+                and line_page_check[4]
+            ):
+                valid_scored = [
+                    item
+                    for item in valid_scored
+                    if item[1].state is not ReconnectScreenState.LINE_SELECTION
+                ]
+            else:
+                trusted_line_page_for_fallback = line_page_check
 
         character_definition = next(
             definition
@@ -3249,16 +4063,48 @@ class ReferenceScreenRecognizer:
         recent_line_present = None
         recent_login_role = None
         line_scroll_delta = 0
+        line_visible_routes: tuple[int, ...] = ()
+        line_list_page_complete = False
+        line_list_top_verified = False
+        line_list_bottom_verified = False
+        line_one_click_point = None
+        line_fallback_used = False
+        original_line_verified = None
         click_point = definition.click_point
         if definition.state is ReconnectScreenState.LINE_SELECTION:
+            line_candidate = line_selection_target_candidate
+            trusted_line_page = (
+                trusted_line_page_for_fallback
+                if trusted_line_page_for_fallback is not None
+                else self._trusted_line_page(line_candidate)
+            )
             (
                 line_number,
                 click_point,
                 recent_line_present,
                 recent_login_role,
                 line_scroll_delta,
+                line_fallback_used,
             ) = self._line_selection_target(
-                candidate,
+                line_candidate,
+                trusted_line_page,
+            )
+            if line_fallback_used:
+                original_line_verified = False
+            (
+                line_visible_routes,
+                trusted_line_buttons,
+                line_list_page_complete,
+                line_list_top_verified,
+                line_list_bottom_verified,
+            ) = trusted_line_page
+            line_one_points = tuple(
+                point
+                for number, point in trusted_line_buttons
+                if number == 1
+            )
+            line_one_click_point = (
+                line_one_points[0] if len(line_one_points) == 1 else None
             )
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
             character_candidates = self._character_selection_candidates(
@@ -3289,6 +4135,13 @@ class ReferenceScreenRecognizer:
             recent_line_present=recent_line_present,
             recent_login_role=recent_login_role,
             line_scroll_delta=line_scroll_delta,
+            line_visible_routes=line_visible_routes,
+            line_list_page_complete=line_list_page_complete,
+            line_list_top_verified=line_list_top_verified,
+            line_list_bottom_verified=line_list_bottom_verified,
+            line_one_click_point=line_one_click_point,
+            line_fallback_used=line_fallback_used,
+            original_line_verified=original_line_verified,
         )
 
     def recognize_capture(self, sample: CaptureSample | None) -> ScreenRecognition:

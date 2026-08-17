@@ -1120,7 +1120,7 @@ def test_target_appearing_during_ack_wait_never_enters_or_retries_launch(
         "Emit-Stage 'shortcut_launch_entered'"
     )
     shell_execute = _POWERSHELL_REOPEN_SCRIPT.index(
-        "$start.UseShellExecute = $true"
+        "[FlashReopenNative]::LaunchWithoutActivation("
     )
     assert ack < final_absence < entered < shell_execute
     assert failed.failure_code == "battle_window_already_exists"
@@ -1634,7 +1634,9 @@ def test_real_windows_worker_starts_reports_first_stage_and_cleans_up(tmp_path):
         {
             "fingerprint": "a" * 64,
             "shortcut_path": str(tmp_path / "never-launch.lnk"),
-            "title_keywords": ("Adobe Flash Player",),
+            "title_keywords": (
+                "Codex bounded reopen worker test no matching window",
+            ),
             "absence_stability_seconds": 1.0,
             "poll_seconds": 0.1,
             "expected_identity_keys": (),
@@ -1649,16 +1651,33 @@ def test_real_windows_worker_starts_reports_first_stage_and_cleans_up(tmp_path):
             observed.extend(worker.poll_events())
             if any(
                 event["stage"]
-                == BattleReopenStage.FIRST_ABSENCE_STARTED.value
+                == BattleReopenStage.FAILED.value
                 for event in observed
             ):
                 break
             if not worker.is_running():
+                observed.extend(worker.poll_events())
                 break
             time.sleep(0.02)
         assert any(
             event["stage"]
             == BattleReopenStage.FIRST_ABSENCE_STARTED.value
+            for event in observed
+        )
+        assert any(
+            event["stage"]
+            == BattleReopenStage.SHORTCUT_FINGERPRINT_STARTED.value
+            for event in observed
+        )
+        assert any(
+            event["stage"] == BattleReopenStage.FAILED.value
+            and event["failure_code"]
+            == "battle_shortcut_identity_unresolved"
+            for event in observed
+        )
+        assert not any(
+            event["stage"]
+            == BattleReopenStage.SHORTCUT_LAUNCH_ENTERED.value
             for event in observed
         )
         assert ack_path.exists() is False
@@ -1679,3 +1698,25 @@ def test_reopen_worker_has_no_foreground_focus_cursor_visibility_or_z_order_muta
     assert "setwindowpos" not in script
     assert "bringwindowtotop" not in script
     assert "mouse_event" not in script
+
+
+def test_formal_reopen_worker_launches_shortcut_once_without_activation():
+    script = _POWERSHELL_REOPEN_SCRIPT
+    launch_block = script.split(
+        "Emit-Stage 'shortcut_launch_entered'",
+        1,
+    )[1].split("Emit-Stage 'shortcut_launch_returned'", 1)[0]
+
+    assert "ShellExecuteExW" in script
+    assert "SW_SHOWNOACTIVATE" in script
+    assert "SEE_MASK_NOASYNC = 0x00000100" in script
+    assert (
+        "fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC"
+        in script
+    )
+    assert "if (!ShellExecuteExW(ref info))" in script
+    assert "Win32Exception" in script
+    assert launch_block.count("LaunchWithoutActivation") == 1
+    assert "Fail-Reopen 'battle_shortcut_open_failed'" in launch_block
+    assert "ProcessStartInfo" not in launch_block
+    assert "UseShellExecute" not in launch_block

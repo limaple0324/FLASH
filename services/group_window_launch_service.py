@@ -13,12 +13,19 @@ from adapters.windows_battle_restart import (
     WindowsShortcutOpenBackend,
 )
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
-from adapters.windows_window import WindowBackend, WindowInfo
+from adapters.windows_window import (
+    WindowBackend,
+    WindowInfo,
+    complete_window_instance_identity,
+)
+from core.window_registry import WindowHealth, WindowRegistry
+from core.window_registry_store import WindowRegistryStore
 from adapters.windows_window_placement import (
     WindowPlacementBackend,
     Win32WindowPlacementBackend,
 )
 from services.group_launch_service import (
+    GroupLaunchPlan,
     GroupLaunchService,
     GroupLaunchTarget,
     SavedWindowPlacement,
@@ -91,8 +98,20 @@ class GroupWindowLaunchResult:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class GroupWindowClaimResult:
+    success: bool
+    group_name: str
+    entry_id: str
+    role_name: str | None = None
+    window: WindowInfo | None = None
+    failure_code: str | None = None
+
+
 class GroupWindowLaunchService:
     """Run a non-blocking exact group launch with legacy-compatible layout."""
+
+    _PLACEMENT_EDGE_TOLERANCE_PX = 12
 
     def __init__(
         self,
@@ -116,6 +135,8 @@ class GroupWindowLaunchService:
             | None
         ) = None,
         managed_process_service: ManagedGameProcessService | None = None,
+        window_registry: WindowRegistry | None = None,
+        window_registry_store: WindowRegistryStore | None = None,
     ) -> None:
         if launch_timeout_seconds <= 0 or poll_seconds <= 0:
             raise ValueError("launch timing values must be positive.")
@@ -140,6 +161,8 @@ class GroupWindowLaunchService:
         self._record_callback = record_callback
         self._placement_update_callback = placement_update_callback
         self._managed_process_service = managed_process_service
+        self._window_registry = window_registry
+        self._window_registry_store = window_registry_store
         self._lock = threading.RLock()
         self._running = False
         self._stop_event = threading.Event()
@@ -182,18 +205,62 @@ class GroupWindowLaunchService:
                 result.setdefault(fingerprint, []).append(window)
         return result
 
+    @classmethod
+    def _matches_saved_placement(
+        cls,
+        target: GroupLaunchTarget,
+        window: WindowInfo,
+    ) -> bool:
+        placement = target.placement
+        if placement is None:
+            return False
+        expected = (
+            placement.x,
+            placement.y,
+            placement.x + placement.width,
+            placement.y + placement.height,
+        )
+        return all(
+            abs(actual - saved) <= cls._PLACEMENT_EDGE_TOLERANCE_PX
+            for actual, saved in zip(window.rect, expected)
+        )
+
+    def _resolve_target_window(
+        self,
+        target: GroupLaunchTarget,
+        by_fingerprint: dict[str, list[WindowInfo]],
+    ) -> tuple[WindowInfo | None, str | None]:
+        matches = tuple(by_fingerprint.get(target.fingerprint, ()))
+        if not matches:
+            return None, None
+        complete = tuple(
+            window
+            for window in matches
+            if complete_window_instance_identity(window) is not None
+        )
+        if len(matches) == 1:
+            if len(complete) == 1:
+                return complete[0], None
+            return None, "group_existing_window_unknown"
+        converged = tuple(
+            window
+            for window in complete
+            if self._matches_saved_placement(target, window)
+        )
+        if len(converged) == 1:
+            return converged[0], None
+        return None, "group_existing_window_duplicate"
+
     def _safe_windows(
         self,
     ) -> tuple[dict[str, list[WindowInfo]] | None, str | None]:
         windows = self._candidate_windows()
         if any(
             normalize_launch_fingerprint(window.launch_fingerprint) is None
-            for window in windows
+                for window in windows
         ):
             return None, "group_existing_window_unknown"
         by_fingerprint = self._windows_by_fingerprint(windows)
-        if any(len(matches) > 1 for matches in by_fingerprint.values()):
-            return None, "group_existing_window_duplicate"
         return by_fingerprint, None
 
     def _wait_for_window(
@@ -207,9 +274,14 @@ class GroupWindowLaunchService:
             by_fingerprint, failure_code = self._safe_windows()
             if failure_code is not None or by_fingerprint is None:
                 return None, failure_code
-            matches = by_fingerprint.get(target.fingerprint, ())
-            if len(matches) == 1:
-                return matches[0], None
+            window, target_failure = self._resolve_target_window(
+                target,
+                by_fingerprint,
+            )
+            if target_failure is not None:
+                return None, target_failure
+            if window is not None:
+                return window, None
             self._sleeper(self._poll_seconds)
         return None, "group_window_wait_timeout"
 
@@ -245,6 +317,134 @@ class GroupWindowLaunchService:
             self._record(group_name, "受管程序身分保存失敗")
         return saved
 
+    def _target_by_entry_id(
+        self,
+        group_name: str,
+        entry_id: str,
+    ) -> tuple[GroupLaunchTarget | None, GroupLaunchPlan | None, str | None]:
+        plan = self._launch_service.plan(group_name)
+        if not plan.ready:
+            return None, plan, "group_launch_plan_unavailable"
+        cleaned = entry_id.strip() if isinstance(entry_id, str) else ""
+        if not cleaned:
+            return None, plan, "group_window_claim_target_unavailable"
+        matches = tuple(
+            target for target in plan.targets if target.entry_id == cleaned
+        )
+        if len(matches) != 1:
+            return None, plan, "group_window_claim_target_unavailable"
+        return matches[0], plan, None
+
+    def _claim_window(
+        self,
+        group_name: str,
+        target: GroupLaunchTarget,
+        window: WindowInfo,
+    ) -> str | None:
+        if (
+            self._window_registry is None
+            or self._window_registry_store is None
+            or self._managed_process_service is None
+        ):
+            return "group_window_claim_unavailable"
+        identity = complete_window_instance_identity(window)
+        if identity is None:
+            return "group_existing_window_unknown"
+
+        original_registry = WindowRegistry.from_dict(
+            self._window_registry.to_dict()
+        )
+        candidate = WindowRegistry.from_dict(
+            self._window_registry.to_dict()
+        )
+        try:
+            candidate.confirm_window(
+                target.entry_id,
+                handle=window.handle,
+                process_id=window.process_id,
+                window_class=window.window_class,
+                rect=window.rect,
+                health=WindowHealth.READY,
+            )
+            self._window_registry_store.save(candidate)
+        except Exception:
+            return "group_window_claim_registry_failed"
+
+        if not self._managed_process_service.remember_group_windows(
+            group_name,
+            ((target, window),),
+        ):
+            try:
+                self._window_registry_store.save(original_registry)
+            except Exception:
+                return "group_window_claim_registry_rollback_failed"
+            return "group_process_ownership_unavailable"
+
+        self._window_registry.confirm_window(
+            target.entry_id,
+            handle=window.handle,
+            process_id=window.process_id,
+            window_class=window.window_class,
+            rect=window.rect,
+            health=WindowHealth.READY,
+        )
+        return None
+
+    def claim_existing_window(
+        self,
+        group_name: str,
+        entry_id: str,
+    ) -> GroupWindowClaimResult:
+        target, plan, target_failure = self._target_by_entry_id(
+            group_name,
+            entry_id,
+        )
+        if target_failure is not None or target is None:
+            return GroupWindowClaimResult(
+                False,
+                group_name,
+                entry_id,
+                failure_code=target_failure,
+            )
+        by_fingerprint, failure_code = self._safe_windows()
+        if failure_code is not None or by_fingerprint is None:
+            return GroupWindowClaimResult(
+                False,
+                plan.group_name if plan is not None else group_name,
+                entry_id,
+                role_name=target.display_name,
+                failure_code=failure_code,
+            )
+        window, target_failure = self._resolve_target_window(
+            target,
+            by_fingerprint,
+        )
+        if target_failure is not None or window is None:
+            return GroupWindowClaimResult(
+                False,
+                plan.group_name,
+                entry_id,
+                role_name=target.display_name,
+                failure_code=target_failure or "group_window_missing",
+            )
+        claim_failure = self._claim_window(plan.group_name, target, window)
+        if claim_failure is not None:
+            return GroupWindowClaimResult(
+                False,
+                plan.group_name,
+                entry_id,
+                role_name=target.display_name,
+                window=window,
+                failure_code=claim_failure,
+            )
+        return GroupWindowClaimResult(
+            True,
+            plan.group_name,
+            entry_id,
+            role_name=target.display_name,
+            window=window,
+        )
+
     def _run(self, group_name: str) -> GroupWindowLaunchResult:
         plan = self._launch_service.plan(group_name)
         if not plan.ready:
@@ -270,8 +470,13 @@ class GroupWindowLaunchService:
             if self._stop_event.is_set():
                 first_failure = first_failure or "group_launch_cancelled"
                 break
-            matches = by_fingerprint.get(target.fingerprint, ())
-            window = matches[0] if len(matches) == 1 else None
+            window, target_failure = self._resolve_target_window(
+                target,
+                by_fingerprint,
+            )
+            if target_failure is not None:
+                first_failure = first_failure or target_failure
+                break
             if window is None:
                 if not self._shortcut_open_backend.open_shortcut(target):
                     self._record(target.display_name, "捷徑啟動失敗")
@@ -337,10 +542,15 @@ class GroupWindowLaunchService:
             return plan.targets, {}, failure_code
         matched: dict[str, WindowInfo] = {}
         for target in plan.targets:
-            matches = by_fingerprint.get(target.fingerprint, ())
-            if len(matches) != 1:
+            window, target_failure = self._resolve_target_window(
+                target,
+                by_fingerprint,
+            )
+            if target_failure is not None:
+                return plan.targets, {}, target_failure
+            if window is None:
                 return plan.targets, {}, "group_window_missing"
-            matched[target.fingerprint] = matches[0]
+            matched[target.fingerprint] = window
         return plan.targets, matched, None
 
     def _run_restore(
