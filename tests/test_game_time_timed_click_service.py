@@ -221,6 +221,42 @@ def test_timed_click_fails_without_sending_when_reconnect_owns_gate():
     active.release()
 
 
+def test_one_timed_press_reports_fourteen_synchronized_windows():
+    scheduler = Scheduler()
+    synchronized_handles = tuple(range(1, 15))
+
+    class FourteenWindowBackend(Backend):
+        def press(self, target, allowed):
+            if target.fingerprint not in allowed:
+                return None
+            receipt = TimedClickPressReceipt(
+                synchronized_handles[0],
+                target.x_ratio,
+                target.y_ratio,
+                synchronized_handles,
+            )
+            self.presses.append(receipt)
+            return receipt
+
+    group_backend = FourteenWindowBackend()
+    service = GameTimeTimedClickService(
+        group_backend,
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+        allowed_fingerprints_provider=lambda: (FINGERPRINT,),
+        wall_clock_ns=lambda: 0,
+        localtime=time.gmtime,
+    )
+
+    service._press_once(group_backend.target)
+
+    assert len(group_backend.presses) == 1
+    assert group_backend.presses[0].handles == synchronized_handles
+    assert service.snapshot().status == (
+        "定時按下：已連點 1 次（同步 14 個視窗）"
+    )
+
+
 def test_server_clock_source_never_falls_back_to_system_time_or_manual_offset():
     scheduler = Scheduler()
     backend = Backend()

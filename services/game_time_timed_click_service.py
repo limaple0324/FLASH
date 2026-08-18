@@ -1,4 +1,4 @@
-"""Legacy-compatible game clock and one-window timed click coordination."""
+"""Legacy-compatible game clock and identity-safe timed click coordination."""
 
 from __future__ import annotations
 
@@ -61,6 +61,11 @@ class TimedClickPressReceipt:
     handle: int
     x_ratio: float
     y_ratio: float
+    synchronized_handles: tuple[int, ...] = ()
+
+    @property
+    def handles(self) -> tuple[int, ...]:
+        return self.synchronized_handles or (self.handle,)
 
 
 class TimedClickBackend(Protocol):
@@ -661,7 +666,15 @@ class GameTimeTimedClickService:
             TIMED_CLICK_PRESS_MS,
             lambda receipt=receipt: self._release_once(receipt),
         )
-        self._status = f"定時按下：已連點 {self._sent_count} 次"
+        synchronized_count = len(receipt.handles)
+        synchronized_detail = (
+            f"（同步 {synchronized_count} 個視窗）"
+            if synchronized_count > 1
+            else ""
+        )
+        self._status = (
+            f"定時按下：已連點 {self._sent_count} 次{synchronized_detail}"
+        )
         self._result(True, "press", self._status)
 
     def _release_once(self, receipt: TimedClickPressReceipt) -> None:

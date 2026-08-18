@@ -65,6 +65,13 @@ def test_main_window_uses_home_view():
     assert "bool(config.get(GAME_TIME_AUTO_UPDATE_KEY, True))" in source
     assert "game_time_snapshot_provider=(" in source
     assert "game_time_timed_click_service.snapshot" in source
+    assert "legacy_timed_click_sync_status.active_group_names()" in source
+    assert (
+        "synchronized_windows_provider=current_sync_target_windows"
+        in source
+    )
+    assert "synchronization_active_provider=(" in source
+    assert "timed_click_synchronization_active" in source
     assert "on_game_time_settings_change=change_game_time_settings" in source
     assert "FeatureCardLayoutService(config)" in source
     assert "feature_card_layout_service.preference" in source

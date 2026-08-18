@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import ctypes
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
+from pathlib import Path
 from typing import Protocol
 
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
 from adapters.windows_pointer_sync import PointerMessageBackend
-from adapters.windows_window import WindowBackend, WindowInfo
+from adapters.windows_window import (
+    Win32WindowBackend,
+    WindowBackend,
+    WindowInfo,
+    complete_window_instance_identity,
+)
 from services.game_time_timed_click_service import (
     TimedClickPressReceipt,
     TimedClickTarget,
@@ -90,6 +97,97 @@ class Win32CursorClientPointReader:
         )
 
 
+def legacy_sync_group_from_title(title: object) -> str | None:
+    """Read the running legacy group from its public top-level window title."""
+
+    if not isinstance(title, str):
+        return None
+    prefix = "輔V0.2 - "
+    suffix = " - 同步中"
+    if not title.startswith(prefix) or not title.endswith(suffix):
+        return None
+    group_name = title[len(prefix) : -len(suffix)].strip()
+    return group_name or None
+
+
+class Win32LegacySyncStatusProvider:
+    """Observe an active legacy sync session without controlling that process."""
+
+    def __init__(
+        self,
+        window_backend: WindowBackend | None = None,
+        process_path_provider: Callable[[int], str | None] | None = None,
+    ) -> None:
+        self._window_backend = window_backend or Win32WindowBackend()
+        self._process_path_provider = (
+            process_path_provider or self._process_path
+        )
+
+    @staticmethod
+    def _process_path(process_id: int) -> str | None:
+        if os.name != "nt" or process_id <= 0:
+            return None
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        process = kernel32.OpenProcess(0x1000, False, int(process_id))
+        if not process:
+            return None
+        try:
+            path_buffer = ctypes.create_unicode_buffer(32768)
+            path_length = wintypes.DWORD(len(path_buffer))
+            if not kernel32.QueryFullProcessImageNameW(
+                process,
+                0,
+                path_buffer,
+                ctypes.byref(path_length),
+            ):
+                return None
+            return path_buffer.value
+        finally:
+            kernel32.CloseHandle(process)
+
+    def active_group_names(self) -> tuple[str, ...]:
+        try:
+            windows = tuple(self._window_backend.list_windows())
+        except Exception:
+            return ()
+        groups = []
+        for window in windows:
+            group_name = legacy_sync_group_from_title(window.title)
+            if (
+                group_name is None
+                or window.window_class != "TkTopLevel"
+                or not isinstance(window.process_id, int)
+                or window.process_id <= 0
+            ):
+                continue
+            try:
+                executable_path = self._process_path_provider(window.process_id)
+            except Exception:
+                continue
+            if (
+                isinstance(executable_path, str)
+                and Path(executable_path).name.casefold()
+                == "輔v0.2.exe".casefold()
+            ):
+                groups.append(group_name)
+        return tuple(dict.fromkeys(groups))
+
+
 class WindowsTimedClickBackend:
     """Resolve a configured fingerprint on every operation and never guess."""
 
@@ -99,10 +197,18 @@ class WindowsTimedClickBackend:
         message_backend: PointerMessageBackend,
         *,
         point_reader: CursorClientPointReader | None = None,
+        synchronized_windows_provider: (
+            Callable[[], Iterable[WindowInfo]] | None
+        ) = None,
+        synchronization_active_provider: (
+            Callable[[], bool | None] | None
+        ) = None,
     ) -> None:
         self._window_backend = window_backend
         self._message_backend = message_backend
         self._point_reader = point_reader or Win32CursorClientPointReader()
+        self._synchronized_windows_provider = synchronized_windows_provider
+        self._synchronization_active_provider = synchronization_active_provider
 
     @staticmethod
     def _allowed(values: Iterable[str]) -> tuple[str, ...]:
@@ -146,6 +252,116 @@ class WindowsTimedClickBackend:
             return ()
         return windows
 
+    def _synchronization_active(self) -> bool | None:
+        if self._synchronization_active_provider is None:
+            return None
+        try:
+            active = self._synchronization_active_provider()
+        except Exception:
+            return False
+        return active if active is None or type(active) is bool else False
+
+    def _synchronized_windows(
+        self,
+        target: TimedClickTarget,
+        allowed_fingerprints: tuple[str, ...],
+    ) -> tuple[WindowInfo, ...]:
+        if self._synchronized_windows_provider is None:
+            return ()
+        try:
+            windows = tuple(self._synchronized_windows_provider())
+        except Exception:
+            return ()
+        identities = tuple(
+            complete_window_instance_identity(window) for window in windows
+        )
+        if len(windows) < 2 or any(identity is None for identity in identities):
+            return ()
+        complete_identities = tuple(
+            identity for identity in identities if identity is not None
+        )
+        fingerprints = tuple(identity[0] for identity in complete_identities)
+        handles = tuple(identity[1] for identity in complete_identities)
+        process_ids = tuple(identity[2] for identity in complete_identities)
+        allowed_order = {
+            fingerprint: index
+            for index, fingerprint in enumerate(allowed_fingerprints)
+        }
+        positions = tuple(
+            allowed_order.get(fingerprint, -1) for fingerprint in fingerprints
+        )
+        if (
+            target.fingerprint != allowed_fingerprints[0]
+            or fingerprints[0] != target.fingerprint
+            or any(position < 0 for position in positions)
+            or positions != tuple(sorted(positions))
+            or len(fingerprints) != len(set(fingerprints))
+            or len(handles) != len(set(handles))
+            or len(process_ids) != len(set(process_ids))
+            or len(complete_identities) != len(set(complete_identities))
+        ):
+            return ()
+        return windows
+
+    def _ready(self, window: WindowInfo) -> bool:
+        return bool(
+            self._message_backend.is_window(window.handle)
+            and self._message_backend.probe_responsive(window.handle, 1_000)
+        )
+
+    def _send_press(
+        self,
+        handle: int,
+        target: TimedClickTarget,
+    ) -> bool:
+        down = self._message_backend.send_pointer(
+            handle,
+            target.x_ratio,
+            target.y_ratio,
+            "left_down",
+        )
+        move = bool(
+            down
+            and self._message_backend.send_pointer(
+                handle,
+                target.x_ratio,
+                target.y_ratio,
+                "move",
+            )
+        )
+        if down and not move:
+            self._message_backend.send_pointer(
+                handle,
+                target.x_ratio,
+                target.y_ratio,
+                "left_up",
+            )
+        return bool(down and move)
+
+    def _release_handles(
+        self,
+        handles: tuple[int, ...],
+        x_ratio: float,
+        y_ratio: float,
+    ) -> bool:
+        def release(handle: int) -> bool:
+            return bool(
+                self._message_backend.is_window(handle)
+                and self._message_backend.send_pointer(
+                    handle,
+                    x_ratio,
+                    y_ratio,
+                    "left_up",
+                )
+            )
+
+        with ThreadPoolExecutor(
+            max_workers=min(14, len(handles)),
+            thread_name_prefix="timed-click-release",
+        ) as executor:
+            released = tuple(executor.map(release, handles))
+        return all(released)
+
     def capture_target(
         self,
         allowed_fingerprints: Iterable[str],
@@ -184,6 +400,50 @@ class WindowsTimedClickBackend:
         allowed = self._allowed(allowed_fingerprints)
         if target.fingerprint not in allowed:
             return None
+        synchronization_active = self._synchronization_active()
+        if synchronization_active is False:
+            return None
+        if synchronization_active is True:
+            windows = self._synchronized_windows(target, allowed)
+            if not windows:
+                return None
+            with ThreadPoolExecutor(
+                max_workers=min(14, len(windows)),
+                thread_name_prefix="timed-click-preflight",
+            ) as executor:
+                ready = tuple(executor.map(self._ready, windows))
+            if not all(ready):
+                return None
+            handles = tuple(window.handle for window in windows)
+            with ThreadPoolExecutor(
+                max_workers=min(14, len(handles)),
+                thread_name_prefix="timed-click-press",
+            ) as executor:
+                pressed = tuple(
+                    executor.map(
+                        lambda handle: self._send_press(handle, target),
+                        handles,
+                    )
+                )
+            successful_handles = tuple(
+                handle
+                for handle, delivered in zip(handles, pressed)
+                if delivered
+            )
+            if not all(pressed):
+                if successful_handles:
+                    self._release_handles(
+                        successful_handles,
+                        target.x_ratio,
+                        target.y_ratio,
+                    )
+                return None
+            return TimedClickPressReceipt(
+                handles[0],
+                target.x_ratio,
+                target.y_ratio,
+                handles,
+            )
         windows = self._configured_windows(allowed)
         matches = tuple(
             window
@@ -202,26 +462,7 @@ class WindowsTimedClickBackend:
             )
         ):
             return None
-        down = self._message_backend.send_pointer(
-            handle,
-            target.x_ratio,
-            target.y_ratio,
-            "left_down",
-        )
-        move = self._message_backend.send_pointer(
-            handle,
-            target.x_ratio,
-            target.y_ratio,
-            "move",
-        )
-        if not down or not move:
-            if down:
-                self._message_backend.send_pointer(
-                    handle,
-                    target.x_ratio,
-                    target.y_ratio,
-                    "left_up",
-                )
+        if not self._send_press(handle, target):
             return None
         return TimedClickPressReceipt(
             handle,
@@ -230,6 +471,12 @@ class WindowsTimedClickBackend:
         )
 
     def release(self, receipt: TimedClickPressReceipt) -> bool:
+        if len(receipt.handles) > 1:
+            return self._release_handles(
+                receipt.handles,
+                receipt.x_ratio,
+                receipt.y_ratio,
+            )
         return bool(
             self._message_backend.is_window(receipt.handle)
             and self._message_backend.send_pointer(

@@ -45,7 +45,10 @@ from adapters.windows_pointer_sync import (
     Win32PointerMessageBackend,
     WindowsPointerSyncController,
 )
-from adapters.windows_timed_click import WindowsTimedClickBackend
+from adapters.windows_timed_click import (
+    Win32LegacySyncStatusProvider,
+    WindowsTimedClickBackend,
+)
 from adapters.windows_sync_calibration import Win32SyncCalibrationBackend
 from adapters.windows_target_desktop_verifier import TargetDesktopVerifier
 from adapters.windows_window import (
@@ -2997,6 +3000,24 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         scope = sync_scope_service.scope(group_name)
         return scope.fingerprints if scope.ready else ()
 
+    legacy_timed_click_sync_status = Win32LegacySyncStatusProvider()
+
+    def timed_click_synchronization_active() -> bool | None:
+        """Select one proven sync owner; reject mismatched simultaneous groups."""
+
+        group_name = current_workspace_group_name()
+        legacy_groups = legacy_timed_click_sync_status.active_group_names()
+        new_sync_active = bool(sync_session_state["enabled"])
+        if not legacy_groups:
+            return True if new_sync_active else None
+        if (
+            group_name is None
+            or len(legacy_groups) != 1
+            or legacy_groups[0] != group_name
+        ):
+            return False
+        return True
+
     def current_operation_role_name() -> str:
         if workspace_service is None:
             return "目前組別"
@@ -3030,6 +3051,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             WindowsTimedClickBackend(
                 group_window_backend,
                 Win32PointerMessageBackend(),
+                synchronized_windows_provider=current_sync_target_windows,
+                synchronization_active_provider=(
+                    timed_click_synchronization_active
+                ),
             ),
             schedule=window.after,
             cancel=window.after_cancel,
