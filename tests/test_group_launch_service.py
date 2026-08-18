@@ -165,6 +165,7 @@ def test_plan_preserves_registered_entry_and_role_identity(tmp_path):
         {
             "entry_id": "entry-120-ancient",
             "role_id": "role-120-ancient",
+            "role_name_prefix": "敖",
         }
     )
     path.write_text(
@@ -177,6 +178,7 @@ def test_plan_preserves_registered_entry_and_role_identity(tmp_path):
     assert plan.ready is True
     assert plan.targets[0].entry_id == "entry-120-ancient"
     assert plan.targets[0].role_id == "role-120-ancient"
+    assert plan.targets[0].role_name_prefix == "敖"
 
 
 def test_changed_14_registration_fails_closed_instead_of_guessing(tmp_path):

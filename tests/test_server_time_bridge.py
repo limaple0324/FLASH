@@ -214,7 +214,11 @@ def test_loopback_server_serves_only_static_flash_policy():
         server.stop()
 
 
-def process_memory_candidate(now_ms=1_800_000_000_000.0):
+def process_memory_candidate(
+    now_ms=1_800_000_000_000.0,
+    *,
+    sample_monotonic_ns=10_000_000_000,
+):
     return ProcessMemoryServerTimeCandidate(
         server_time_address=0x1000,
         core_address=0x2000,
@@ -222,6 +226,7 @@ def process_memory_candidate(now_ms=1_800_000_000_000.0):
         start_time_ms=now_ms,
         server_time_offset_ms=-28_800_000.0,
         time_lag_ms=1_668.0,
+        sample_monotonic_ns=sample_monotonic_ns,
     )
 
 
@@ -279,6 +284,7 @@ def test_memory_reader_rejects_multiple_exact_candidates():
             start_time_ms=1_800_000_000_000.0,
             server_time_offset_ms=-28_800_000.0,
             time_lag_ms=1_668.0,
+            sample_monotonic_ns=10_000_000_000,
         ),
     )
     assert reader._try_window(window) is False
@@ -319,11 +325,59 @@ def test_memory_reader_waits_for_game_opened_after_fu_and_calibrates_automatical
         reader.stop()
 
 
+def test_memory_reader_processing_delay_does_not_become_permanent_offset():
+    for delay_ms in (50, 200):
+        sample_tick = 10_000_000_000
+        tick = [sample_tick]
+        wall = [1_900_000_000_000_000_000]
+        clock = ServerClock(
+            monotonic_ns=lambda: tick[0],
+            source_validator=lambda _: True,
+        )
+        bridge = ServerTimeBridge(clock, source_validator=lambda _: True)
+        window = SimpleNamespace(
+            handle=IDENTITY.handle,
+            process_id=IDENTITY.process_id,
+            thread_id=IDENTITY.thread_id,
+            process_lifecycle_token=IDENTITY.lifecycle,
+            launch_fingerprint=IDENTITY.fingerprint,
+        )
+        reader = ProcessMemoryServerTimeReader(
+            lambda: (window,),
+            bridge,
+            wall_clock_ns=lambda: wall[0],
+            monotonic_ns=lambda: tick[0],
+            local_flash_offset_ms=lambda: (_ for _ in ()).throw(
+                AssertionError("Windows offset must not be calibration truth")
+            ),
+        )
+
+        def scan(_pid, _now):
+            candidate = process_memory_candidate(
+                sample_monotonic_ns=sample_tick
+            )
+            tick[0] += delay_ms * 1_000_000
+            return (candidate,)
+
+        reader._scan_process = scan
+        assert reader._try_window(window) is True
+        assert clock.snapshot().server_base_ms == 1_800_000_001_668
+        assert clock.snapshot().local_base_monotonic_ns == sample_tick
+        assert clock.now_ms() == 1_800_000_001_668 + delay_ms
+        wall[0] += 86_400_000_000_000
+        tick[0] += 1_000_000_000
+        assert clock.now_ms() == 1_800_000_002_668 + delay_ms
+
+
 def test_memory_reader_vector_gate_finds_only_adjacent_current_epoch_pair():
-    reader = ProcessMemoryServerTimeReader(lambda: (), ServerTimeBridge(
-        ServerClock(source_validator=lambda _: True),
-        source_validator=lambda _: True,
-    ))
+    reader = ProcessMemoryServerTimeReader(
+        lambda: (),
+        ServerTimeBridge(
+            ServerClock(source_validator=lambda _: True),
+            source_validator=lambda _: True,
+        ),
+        monotonic_ns=lambda: 123_000_000,
+    )
     now_ms = 1_800_000_000_000.0
     data = struct.pack(
         "<dddddd",
@@ -343,10 +397,14 @@ def test_memory_reader_vector_gate_finds_only_adjacent_current_epoch_pair():
 
 
 def test_memory_reader_requires_exact_minimap_and_core_object_chain():
-    reader = ProcessMemoryServerTimeReader(lambda: (), ServerTimeBridge(
-        ServerClock(source_validator=lambda _: True),
-        source_validator=lambda _: True,
-    ))
+    reader = ProcessMemoryServerTimeReader(
+        lambda: (),
+        ServerTimeBridge(
+            ServerClock(source_validator=lambda _: True),
+            source_validator=lambda _: True,
+        ),
+        monotonic_ns=lambda: 123_000_000,
+    )
     field = 0x5000
     object_address = field - reader._SERVER_TIME_FIELD_OFFSET
     core_address = 0x7000
@@ -376,6 +434,7 @@ def test_memory_reader_requires_exact_minimap_and_core_object_chain():
         start_time_ms=1_800_000_000_000.0,
         server_time_offset_ms=-28_800_000.0,
         time_lag_ms=1_668.0,
+        sample_monotonic_ns=123_000_000,
     )
     classes.remove((core_address, "Core"))
     assert reader._candidate_from_field(

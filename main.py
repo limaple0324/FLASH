@@ -744,6 +744,7 @@ def build_configured_reconnect_plan(
     entries = {}
     shortcut_paths = {}
     role_ids = {}
+    role_name_prefixes = {}
     for group in group_items:
         for entry in tuple(getattr(group, "entries", ())):
             shortcut_path = str(
@@ -759,6 +760,13 @@ def build_configured_reconnect_plan(
             role_id = entry.role_id.strip()
             if role_id:
                 role_ids.setdefault(entry.entry_id, set()).add(role_id)
+            role_name_prefix = str(
+                getattr(entry, "role_name_prefix", "") or ""
+            ).strip()
+            if role_name_prefix:
+                role_name_prefixes.setdefault(entry.entry_id, set()).add(
+                    role_name_prefix
+                )
     entry_ids = tuple(getattr(scope, "entry_ids", ()))
     entry_fingerprints = tuple(
         getattr(scope, "entry_fingerprints", ())
@@ -786,6 +794,7 @@ def build_configured_reconnect_plan(
             return None
         character_ids = profile_ids.get(entry_id, set())
         entry_role_ids = role_ids.get(entry_id, set())
+        entry_role_name_prefixes = role_name_prefixes.get(entry_id, set())
         recovery_role_id = (
             next(iter(entry_role_ids))
             if len(entry_role_ids) == 1
@@ -800,15 +809,24 @@ def build_configured_reconnect_plan(
         entry = entries[entry_id]
         targets.append(
             GroupLaunchTarget(
-                order,
-                entry.display_name,
-                entry.shortcut_path,
-                fingerprint,
-                entry.placement,
-                entry.entry_id,
-                recovery_role_id,
-                profile.level if profile is not None else None,
-                profile.importance if profile is not None else None,
+                order=order,
+                display_name=entry.display_name,
+                shortcut_path=entry.shortcut_path,
+                fingerprint=fingerprint,
+                placement=entry.placement,
+                entry_id=entry.entry_id,
+                role_id=recovery_role_id,
+                registered_level=(
+                    profile.level if profile is not None else None
+                ),
+                importance=(
+                    profile.importance if profile is not None else None
+                ),
+                role_name_prefix=(
+                    next(iter(entry_role_name_prefixes))
+                    if len(entry_role_name_prefixes) == 1
+                    else ""
+                ),
             )
         )
     return GroupLaunchPlan("configured", tuple(targets))

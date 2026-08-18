@@ -71,6 +71,7 @@ class GroupLaunchTarget:
     role_id: str = ""
     registered_level: int | None = None
     importance: CharacterImportance | None = None
+    role_name_prefix: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -93,10 +94,20 @@ class GroupLaunchTarget:
         object.__setattr__(self, "fingerprint", fingerprint)
         entry_id = self.entry_id.strip()
         role_id = self.role_id.strip()
-        if len(entry_id) > 160 or len(role_id) > 160:
+        role_name_prefix = "".join(
+            character
+            for character in self.role_name_prefix.strip()
+            if not character.isspace() and ord(character) >= 32
+        )
+        if (
+            len(entry_id) > 160
+            or len(role_id) > 160
+            or len(role_name_prefix) > 24
+        ):
             raise ValueError("registered role identity is too long.")
         object.__setattr__(self, "entry_id", entry_id)
         object.__setattr__(self, "role_id", role_id)
+        object.__setattr__(self, "role_name_prefix", role_name_prefix)
         if (
             self.registered_level is not None
             and (
@@ -340,7 +351,7 @@ class GroupLaunchService:
             return plan
 
         entries: list[tuple[str, Path]] = []
-        metadata_by_path: dict[str, tuple[str, str]] = {}
+        metadata_by_path: dict[str, tuple[str, str, str]] = {}
         failures: list[str] = []
         for raw_entry in raw_entries:
             if not isinstance(raw_entry, Mapping):
@@ -369,6 +380,11 @@ class GroupLaunchService:
                 (
                     raw_entry.get("role_id", "").strip()
                     if isinstance(raw_entry.get("role_id"), str)
+                    else ""
+                ),
+                (
+                    raw_entry.get("role_name_prefix", "").strip()
+                    if isinstance(raw_entry.get("role_name_prefix"), str)
                     else ""
                 ),
             )
@@ -463,12 +479,16 @@ class GroupLaunchService:
                 ),
                 entry_id=metadata_by_path.get(
                     str(path.resolve(strict=False)).casefold(),
-                    ("", ""),
+                    ("", "", ""),
                 )[0],
                 role_id=metadata_by_path.get(
                     str(path.resolve(strict=False)).casefold(),
-                    ("", ""),
+                    ("", "", ""),
                 )[1],
+                role_name_prefix=metadata_by_path.get(
+                    str(path.resolve(strict=False)).casefold(),
+                    ("", "", ""),
+                )[2],
             )
             for index, (display_name, path, fingerprint) in enumerate(
                 zip(ordered_names, ordered_paths, fingerprints),

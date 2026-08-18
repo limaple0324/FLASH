@@ -3627,7 +3627,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return False
         return bool(
             item.character_target_key.strip().casefold()
-            == target.role_id.strip().casefold()
+            == self._target_character_key(target)
         )
 
     def _finish_evidence_action(
@@ -7151,13 +7151,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
     def _identity_values(target) -> frozenset[str]:
         return frozenset(
             value.strip().casefold()
-            for value in (
-                target.role_id,
-                target.display_name,
-                target.shortcut_path.stem,
-            )
+            for value in (target.role_id,)
             if isinstance(value, str) and value.strip()
         )
+
+    @staticmethod
+    def _target_character_key(target: GroupLaunchTarget) -> str:
+        role_id = target.role_id.strip().casefold()
+        if role_id:
+            return role_id
+        prefix = target.role_name_prefix.strip().casefold()
+        return f"prefix:{prefix}" if prefix else ""
 
     @classmethod
     def _candidate_matches_target_identity(
@@ -7173,10 +7177,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return False
         if observed in cls._identity_values(target):
             return True
-        if not isinstance(target.role_id, str):
-            return False
         target_role = target.role_id.strip().casefold()
-        return bool(target_role) and observed[:1] == target_role[:1]
+        abbreviated = observed.endswith(("…", "..."))
+        observed_prefix = observed.rstrip(".…").strip()
+        if (
+            abbreviated
+            and len(observed_prefix) >= 2
+            and target_role.startswith(observed_prefix)
+        ):
+            return True
+        saved_prefix = target.role_name_prefix.strip().casefold()
+        return bool(saved_prefix) and observed_prefix.startswith(saved_prefix)
 
     @classmethod
     def _candidate_exactly_matches_target_identity(
@@ -7277,7 +7288,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         observed = identity.strip().casefold()
         abbreviated = observed.endswith(("…", "..."))
         observed = observed.rstrip(".…").strip()
-        if len(observed) < 1:
+        if len(observed) < 1 or (abbreviated and len(observed) < 2):
             return None
         try:
             available = tuple(provider())
@@ -7293,16 +7304,6 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 else role.role_id.casefold().startswith(observed)
             )
         )
-        if not matches:
-            first = observed[:1]
-            matches = tuple(
-                role
-                for role in available
-                if (
-                    isinstance(role, RegisteredReconnectRole)
-                    and role.role_id.casefold().startswith(first)
-                )
-            )
         unique = {
             (role.role_id.casefold(), role.importance): role
             for role in matches
@@ -7473,7 +7474,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     else selected.importance
                 ),
                 (
-                    target.role_id.casefold()
+                    self._target_character_key(target)
                     if target is not None
                     else None
                 ),
@@ -7533,7 +7534,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     else selected.importance
                 ),
                 (
-                    target.role_id.casefold()
+                    self._target_character_key(target)
                     if target is not None
                     else None
                 ),
@@ -7582,7 +7583,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 return None
             return replace(
                 item,
-                character_target_key=target.role_id.casefold(),
+                character_target_key=self._target_character_key(target),
             )
 
         if not candidates:
@@ -7617,7 +7618,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 item,
                 selected,
                 target.importance,
-                target.role_id.casefold(),
+                self._target_character_key(target),
             )
 
         # A full candidate list without a uniquely matched role name is not
@@ -10665,7 +10666,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                                     str,
                                 )
                                 and item.character_target_key.strip().casefold()
-                                == reconnect_target.role_id.strip().casefold()
+                                == self._target_character_key(
+                                    reconnect_target
+                                )
                             ):
                                 self._reconnect_entry_authorized.add(
                                     fingerprint

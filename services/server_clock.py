@@ -115,14 +115,29 @@ class ServerClock:
                 return False
         return True
 
-    def calibrate_once(self, sample: ServerTimeSample) -> bool:
+    def calibrate_once(
+        self,
+        sample: ServerTimeSample,
+        *,
+        sample_monotonic_ns: int | None = None,
+    ) -> bool:
         if not self._valid_sample(sample):
+            return False
+        if sample_monotonic_ns is not None and (
+            isinstance(sample_monotonic_ns, bool)
+            or not isinstance(sample_monotonic_ns, int)
+            or sample_monotonic_ns < 0
+        ):
             return False
         with self._lock:
             if self._state != self.UNCALIBRATED:
                 return False
             self._server_base_ms = int(round(float(sample.server_now_ms)))
-            self._local_base_monotonic_ns = int(self._monotonic_ns())
+            self._local_base_monotonic_ns = (
+                int(self._monotonic_ns())
+                if sample_monotonic_ns is None
+                else sample_monotonic_ns
+            )
             self._calibration_count = 1
             self._state = self.CALIBRATED
             return True
@@ -139,4 +154,3 @@ class ServerClock:
                 int(self._monotonic_ns()) - self._local_base_monotonic_ns
             ) // 1_000_000
             return self._server_base_ms + elapsed_ms
-

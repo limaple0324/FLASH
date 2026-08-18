@@ -54,4 +54,24 @@ def test_group_selection_and_ungrouped_join_use_explicit_view_results() -> None:
     assert "_show_group_selection_message" in select_source
     assert "_refresh_group_selection_controls()" in select_source
     assert 'text="目前使用" if current else "選擇"' in home_source
+
+
+def test_joining_an_existing_window_only_changes_membership_and_keeps_sync_off():
+    main_source = Path("main.py").read_text(encoding="utf-8")
+    join_source = main_source[
+        main_source.index("    def add_ungrouped_window_to_group("):
+        main_source.index("    def remove_group_shortcut(")
+    ]
+
+    stop_index = join_source.index(
+        "stop_group_automation_for_configuration_change()"
+    )
+    add_index = join_source.index(
+        "group_configuration_service.add_shortcuts("
+    )
+    assert stop_index < add_index
+    assert "start_service(" not in join_source
+    assert "set_keyboard_sync_enabled(True)" not in join_source
+    assert "set_mouse_sync_enabled(True)" not in join_source
+    assert ".arm(" not in join_source
 from pathlib import Path

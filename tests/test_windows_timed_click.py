@@ -1,4 +1,5 @@
 from collections import Counter
+from dataclasses import replace
 
 from adapters.windows_timed_click import (
     Win32LegacySyncStatusProvider,
@@ -50,19 +51,25 @@ class Points:
 
 
 class Messages:
-    def __init__(self):
+    def __init__(self, *, after_probe=None, after_send=None):
         self.sent = []
         self.responsiveness_timeouts = []
+        self.after_probe = after_probe
+        self.after_send = after_send
 
     def is_window(self, _handle):
         return True
 
     def probe_responsive(self, _handle, timeout):
         self.responsiveness_timeouts.append(timeout)
+        if self.after_probe is not None:
+            self.after_probe()
         return True
 
     def send_pointer(self, handle, x_ratio, y_ratio, event):
         self.sent.append((handle, x_ratio, y_ratio, event))
+        if self.after_send is not None:
+            self.after_send(event)
         return True
 
 
@@ -107,6 +114,120 @@ def test_duplicate_or_changed_identity_never_receives_input():
     assert messages.sent == []
 
 
+def test_preflight_then_reused_handle_never_receives_input():
+    windows = Windows([make_window()])
+    messages = Messages(
+        after_probe=lambda: windows.windows.__setitem__(
+            0,
+            make_window(10, "b" * 64),
+        )
+    )
+    backend = WindowsTimedClickBackend(windows, messages)
+
+    assert backend.press(
+        TimedClickTarget(FINGERPRINT, 0.5, 0.5),
+        (FINGERPRINT,),
+    ) is None
+    assert messages.sent == []
+
+
+def test_preflight_then_process_id_change_never_receives_input():
+    original = make_window()
+    windows = Windows([original])
+    messages = Messages(
+        after_probe=lambda: windows.windows.__setitem__(
+            0,
+            replace(original, process_id=original.process_id + 1),
+        )
+    )
+    backend = WindowsTimedClickBackend(windows, messages)
+
+    assert backend.press(
+        TimedClickTarget(FINGERPRINT, 0.5, 0.5),
+        (FINGERPRINT,),
+    ) is None
+    assert messages.sent == []
+
+
+def test_preflight_then_thread_id_change_never_receives_input():
+    original = make_window()
+    windows = Windows([original])
+    messages = Messages(
+        after_probe=lambda: windows.windows.__setitem__(
+            0,
+            replace(original, thread_id=original.thread_id + 1),
+        )
+    )
+    backend = WindowsTimedClickBackend(windows, messages)
+
+    assert backend.press(
+        TimedClickTarget(FINGERPRINT, 0.5, 0.5),
+        (FINGERPRINT,),
+    ) is None
+    assert messages.sent == []
+
+
+def test_preflight_then_lifecycle_change_never_receives_input():
+    original = make_window()
+    windows = Windows([original])
+    messages = Messages(
+        after_probe=lambda: windows.windows.__setitem__(
+            0,
+            replace(
+                original,
+                process_lifecycle_token=(
+                    original.process_lifecycle_token + 1
+                ),
+            ),
+        )
+    )
+    backend = WindowsTimedClickBackend(windows, messages)
+
+    assert backend.press(
+        TimedClickTarget(FINGERPRINT, 0.5, 0.5),
+        (FINGERPRINT,),
+    ) is None
+    assert messages.sent == []
+
+
+def test_instance_change_after_down_never_moves_or_releases_new_instance():
+    original = make_window()
+    windows = Windows([original])
+
+    def replace_after_down(event):
+        if event == "left_down":
+            windows.windows[0] = replace(
+                original,
+                process_id=original.process_id + 1,
+            )
+
+    messages = Messages(after_send=replace_after_down)
+    backend = WindowsTimedClickBackend(windows, messages)
+
+    assert backend.press(
+        TimedClickTarget(FINGERPRINT, 0.5, 0.5),
+        (FINGERPRINT,),
+    ) is None
+    assert [item[3] for item in messages.sent] == ["left_down"]
+
+
+def test_release_rechecks_original_complete_instance():
+    original = make_window()
+    windows = Windows([original])
+    messages = Messages()
+    backend = WindowsTimedClickBackend(windows, messages)
+    target = TimedClickTarget(FINGERPRINT, 0.5, 0.5)
+
+    receipt = backend.press(target, (FINGERPRINT,))
+    windows.windows[0] = replace(
+        original,
+        process_lifecycle_token=original.process_lifecycle_token + 1,
+    )
+
+    assert backend.release(receipt) is False
+    assert [item[3] for item in messages.sent] == ["left_down", "move"]
+
+
 def test_active_sync_sends_each_timed_press_to_fourteen_windows_once():
     fingerprints = tuple(f"{index:064x}" for index in range(1, 15))
     windows = tuple(
@@ -115,7 +236,7 @@ def test_active_sync_sends_each_timed_press_to_fourteen_windows_once():
     )
     messages = Messages()
     backend = WindowsTimedClickBackend(
-        Windows([windows[0]]),
+        Windows(windows),
         messages,
         point_reader=Points(),
         synchronized_windows_provider=lambda: windows,

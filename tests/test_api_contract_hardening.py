@@ -572,6 +572,91 @@ def test_controller_shortcut_loss_stops_keyboard_and_pointer_target_providers(
         assert pointer.close() is True
 
 
+def test_saved_cross_group_relation_grants_no_keyboard_or_pointer_input(
+    tmp_path,
+):
+    first = tmp_path / "甲主.lnk"
+    second = tmp_path / "甲副.lnk"
+    foreign = tmp_path / "乙組.lnk"
+    for path in (first, second, foreign):
+        path.write_bytes(path.stem.encode("utf-8"))
+    configuration = GroupConfigurationService(tmp_path / "groups.json")
+    configuration.add_shortcuts("甲組", (first, second))
+    configuration.add_shortcuts("乙組", (foreign,))
+    current = configuration.group("甲組")
+    foreign_entry = configuration.group("乙組").main_entry
+    configuration.add_sync_relation(
+        current.main_entry.entry_id,
+        foreign_entry.entry_id,
+    )
+    scope_service = SyncScopeService(configuration, _Resolver())
+    configured = scope_service.configured_scope()
+    windows = _complete_windows_for_scope(configured)
+    backend = _WindowBackend(windows, foreground=windows[0].handle)
+    target_service = TargetWindowContractService(
+        configuration,
+        scope_service,
+        WindowRegistry(),
+        backend,
+    )
+    resolved = target_service.reconnect_targets("甲組")
+    messages = _MessageBackend()
+    provider = lambda: resolved.sync_windows
+    keyboard = WindowsInputSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        target_windows_provider=provider,
+        require_expected_window_count=False,
+    )
+    pointer = WindowsPointerSyncController(
+        expected_windows=2,
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        message_backend=messages,
+        target_windows_provider=provider,
+        require_expected_window_count=False,
+    )
+    for controller in (keyboard, pointer):
+        controller.set_allowed_window_instances(resolved.sync_windows)
+        controller.set_controller_fingerprint(
+            resolved.sync_windows[0].launch_fingerprint
+        )
+    foreign_fingerprint = scope_service.scope("乙組").fingerprints[0]
+    foreign_handle = next(
+        window.handle
+        for window in windows
+        if window.launch_fingerprint == foreign_fingerprint
+    )
+
+    try:
+        keyboard.send_approved_key(
+            "B",
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            source_handle=resolved.sync_windows[0].handle,
+        )
+        pointer.send_click(
+            source_handle=resolved.sync_windows[0].handle,
+            x_ratio=0.5,
+            y_ratio=0.5,
+            policy=WindowInputPolicy.ALL,
+            execute=True,
+            include_source=True,
+        )
+
+        assert foreign_handle not in {
+            handle for handle, _key in messages.sent
+        }
+        assert foreign_handle not in {
+            handle for handle, *_rest in messages.pointers
+        }
+    finally:
+        assert keyboard.close() is True
+        assert pointer.close() is True
+
+
 def test_target_window_enumeration_failure_fails_closed(tmp_path):
     configuration, scope_service, _scope = _configured_group(tmp_path)
     service = TargetWindowContractService(

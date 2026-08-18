@@ -309,57 +309,85 @@ class WindowsTimedClickBackend:
             and self._message_backend.probe_responsive(window.handle, 1_000)
         )
 
-    def _send_press(
+    @staticmethod
+    def _dispatch_identity(
+        window: WindowInfo,
+    ) -> tuple[str, int, int, int, str, int] | None:
+        identity = complete_window_instance_identity(window)
+        return None if identity is None else identity[:6]
+
+    def _instance_is_current(
         self,
-        handle: int,
-        target: TimedClickTarget,
+        expected: tuple[str, int, int, int, str, int],
     ) -> bool:
-        down = self._message_backend.send_pointer(
-            handle,
-            target.x_ratio,
-            target.y_ratio,
-            "left_down",
+        try:
+            matches = tuple(
+                window
+                for window in self._window_backend.list_windows()
+                if window.handle == expected[1]
+            )
+        except Exception:
+            return False
+        return bool(
+            len(matches) == 1
+            and self._dispatch_identity(matches[0]) == expected
         )
-        move = bool(
-            down
+
+    def _send_if_current(
+        self,
+        expected: tuple[str, int, int, int, str, int],
+        target: TimedClickTarget,
+        event: str,
+    ) -> bool:
+        handle = expected[1]
+        return bool(
+            self._instance_is_current(expected)
+            and self._message_backend.is_window(handle)
             and self._message_backend.send_pointer(
                 handle,
                 target.x_ratio,
                 target.y_ratio,
-                "move",
+                event,
             )
         )
+
+    def _send_press(
+        self,
+        expected: tuple[str, int, int, int, str, int],
+        target: TimedClickTarget,
+    ) -> bool:
+        down = self._send_if_current(expected, target, "left_down")
+        move = bool(down and self._send_if_current(expected, target, "move"))
         if down and not move:
-            self._message_backend.send_pointer(
-                handle,
-                target.x_ratio,
-                target.y_ratio,
-                "left_up",
-            )
+            self._send_if_current(expected, target, "left_up")
         return bool(down and move)
 
-    def _release_handles(
+    def _release_instances(
         self,
-        handles: tuple[int, ...],
+        identities: tuple[tuple[str, int, int, int, str, int], ...],
         x_ratio: float,
         y_ratio: float,
     ) -> bool:
-        def release(handle: int) -> bool:
-            return bool(
-                self._message_backend.is_window(handle)
-                and self._message_backend.send_pointer(
-                    handle,
-                    x_ratio,
-                    y_ratio,
-                    "left_up",
-                )
+        target = TimedClickTarget(
+            identities[0][0],
+            x_ratio,
+            y_ratio,
+        )
+
+        def release(
+            identity: tuple[str, int, int, int, str, int],
+        ) -> bool:
+            return self._send_if_current(
+                identity,
+                target,
+                "left_up",
             )
 
         with ThreadPoolExecutor(
-            max_workers=min(14, len(handles)),
+            max_workers=min(14, len(identities)),
             thread_name_prefix="timed-click-release",
         ) as executor:
-            released = tuple(executor.map(release, handles))
+            released = tuple(executor.map(release, identities))
         return all(released)
 
     def capture_target(
@@ -407,6 +435,14 @@ class WindowsTimedClickBackend:
             windows = self._synchronized_windows(target, allowed)
             if not windows:
                 return None
+            identities = tuple(
+                self._dispatch_identity(window) for window in windows
+            )
+            if any(identity is None for identity in identities):
+                return None
+            complete_identities = tuple(
+                identity for identity in identities if identity is not None
+            )
             with ThreadPoolExecutor(
                 max_workers=min(14, len(windows)),
                 thread_name_prefix="timed-click-preflight",
@@ -416,24 +452,24 @@ class WindowsTimedClickBackend:
                 return None
             handles = tuple(window.handle for window in windows)
             with ThreadPoolExecutor(
-                max_workers=min(14, len(handles)),
+                max_workers=min(14, len(complete_identities)),
                 thread_name_prefix="timed-click-press",
             ) as executor:
                 pressed = tuple(
                     executor.map(
-                        lambda handle: self._send_press(handle, target),
-                        handles,
+                        lambda identity: self._send_press(identity, target),
+                        complete_identities,
                     )
                 )
-            successful_handles = tuple(
-                handle
-                for handle, delivered in zip(handles, pressed)
+            successful_identities = tuple(
+                identity
+                for identity, delivered in zip(complete_identities, pressed)
                 if delivered
             )
             if not all(pressed):
-                if successful_handles:
-                    self._release_handles(
-                        successful_handles,
+                if successful_identities:
+                    self._release_instances(
+                        successful_identities,
                         target.x_ratio,
                         target.y_ratio,
                     )
@@ -443,6 +479,7 @@ class WindowsTimedClickBackend:
                 target.x_ratio,
                 target.y_ratio,
                 handles,
+                complete_identities,
             )
         windows = self._configured_windows(allowed)
         matches = tuple(
@@ -453,7 +490,10 @@ class WindowsTimedClickBackend:
         )
         if len(matches) != 1:
             return None
-        handle = matches[0].handle
+        identity = self._dispatch_identity(matches[0])
+        if identity is None:
+            return None
+        handle = identity[1]
         if (
             not self._message_backend.is_window(handle)
             or not self._message_backend.probe_responsive(
@@ -462,27 +502,20 @@ class WindowsTimedClickBackend:
             )
         ):
             return None
-        if not self._send_press(handle, target):
+        if not self._send_press(identity, target):
             return None
         return TimedClickPressReceipt(
             handle,
             target.x_ratio,
             target.y_ratio,
+            instance_identities=(identity,),
         )
 
     def release(self, receipt: TimedClickPressReceipt) -> bool:
-        if len(receipt.handles) > 1:
-            return self._release_handles(
-                receipt.handles,
-                receipt.x_ratio,
-                receipt.y_ratio,
-            )
-        return bool(
-            self._message_backend.is_window(receipt.handle)
-            and self._message_backend.send_pointer(
-                receipt.handle,
-                receipt.x_ratio,
-                receipt.y_ratio,
-                "left_up",
-            )
+        if not receipt.instance_identities:
+            return False
+        return self._release_instances(
+            receipt.instance_identities,
+            receipt.x_ratio,
+            receipt.y_ratio,
         )

@@ -1372,12 +1372,14 @@ def test_configured_reconnect_plan_keeps_recovery_conflicts_detection_only(
         *,
         display_name="same",
         shortcut_path=shortcut,
+        role_name_prefix="",
     ):
         return SimpleNamespace(
             entry_id="shared-entry",
             display_name=display_name,
             shortcut_path=shortcut_path,
             role_id=role_id,
+            role_name_prefix=role_name_prefix,
             placement=placement,
         )
 
@@ -1395,6 +1397,14 @@ def test_configured_reconnect_plan_keeps_recovery_conflicts_detection_only(
     blank_and_a = plan_for(entry("A"), entry(""))
     same_role = plan_for(entry("A"), entry("A"))
     conflicting_roles = plan_for(entry("A"), entry("B"))
+    saved_prefix = plan_for(
+        entry("A", role_name_prefix="敖"),
+        entry("", role_name_prefix=""),
+    )
+    conflicting_prefixes = plan_for(
+        entry("A", role_name_prefix="敖"),
+        entry("A", role_name_prefix="嘻"),
+    )
     placement_difference = plan_for(
         entry("A"),
         entry("A", SimpleNamespace(x=1)),
@@ -1437,6 +1447,10 @@ def test_configured_reconnect_plan_keeps_recovery_conflicts_detection_only(
     assert conflicting_roles is not None
     assert len(conflicting_roles.targets) == 1
     assert conflicting_roles.targets[0].role_id == ""
+    assert saved_prefix is not None
+    assert saved_prefix.targets[0].role_name_prefix == "敖"
+    assert conflicting_prefixes is not None
+    assert conflicting_prefixes.targets[0].role_name_prefix == ""
     assert placement_difference is not None
     assert placement_difference.targets[0].role_id == "A"
     assert display_difference is not None
@@ -2003,6 +2017,23 @@ def test_group_change_stops_all_automation_before_publishing_new_group():
         < workspace_index
         < reopen_index
     )
+
+
+def test_group_switch_revokes_old_keyboard_mouse_and_timed_authority_first():
+    source = Path("main.py").read_text(encoding="utf-8")
+    stop_source = source[
+        source.index(
+            "    def stop_group_automation_for_configuration_change("
+        ):
+        source.index("    def finish_group_management(")
+    ]
+
+    assert 'sync_session_state["enabled"] = False' in stop_source
+    assert "input_controller.invalidate_scheduled()" in stop_source
+    assert "pointer_sync_controller.invalidate_scheduled()" in stop_source
+    assert "game_time_timed_click_service.clear_target(" in stop_source
+    assert "stop_service(keyboard_sync_monitor)" in stop_source
+    assert "stop_service(mouse_sync_monitor)" in stop_source
 
 
 def test_group_change_allows_selection_but_clears_identity_when_unresolved():

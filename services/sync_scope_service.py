@@ -1,4 +1,4 @@
-"""Resolve recursive cross-group synchronization into one deduplicated scope."""
+"""Resolve synchronization authority from the selected group only."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ class SyncScopeInputs:
 
 
 class SyncScopeService:
-    """Use saved acyclic relations and unique shortcut identities."""
+    """Use the selected group's members and unique shortcut identities."""
 
     def __init__(
         self,
@@ -86,25 +86,15 @@ class SyncScopeService:
                 failure_codes=("group_controller_unavailable",),
             )
         controller = selected.main_entry.entry_id
-        member_ids = self._configuration.expanded_sync_members(controller)
+        member_ids = tuple(
+            entry.entry_id
+            for entry in selected.entries
+            if entry.entry_id != controller
+        )
         ordered_ids = (controller, *member_ids)
-        entry_by_id = {}
-        for group in self._configuration.groups():
-            for entry in group.entries:
-                current = entry_by_id.get(entry.entry_id)
-                if (
-                    current is not None
-                    and current.shortcut_path != entry.shortcut_path
-                ):
-                    return SyncScopeInputs(
-                        name,
-                        controller,
-                        entry_ids=ordered_ids,
-                        failure_codes=(
-                            "sync_identity_path_conflict",
-                        ),
-                    )
-                entry_by_id[entry.entry_id] = entry
+        entry_by_id = {
+            entry.entry_id: entry for entry in selected.entries
+        }
         if any(entry_id not in entry_by_id for entry_id in ordered_ids):
             return SyncScopeInputs(
                 name,

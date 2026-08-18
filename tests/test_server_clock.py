@@ -65,3 +65,18 @@ def test_bridge_disconnect_does_not_clear_calibration():
     tick[0] += 3_000_000_000
     assert clock.now_ms() == 8_000
 
+
+def test_explicit_sample_monotonic_anchor_survives_processing_delay():
+    tick = [10_200_000_000]
+    clock = ServerClock(
+        monotonic_ns=lambda: tick[0],
+        source_validator=lambda _: True,
+    )
+
+    assert clock.calibrate_once(
+        sample(5_000),
+        sample_monotonic_ns=10_000_000_000,
+    ) is True
+
+    assert clock.snapshot().local_base_monotonic_ns == 10_000_000_000
+    assert clock.now_ms() == 5_200

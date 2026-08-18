@@ -24,7 +24,7 @@ def _shortcut(tmp_path, name):
     return path
 
 
-def test_scope_recursively_expands_cross_group_and_deduplicates(tmp_path):
+def test_current_group_scope_ignores_saved_cross_group_relations(tmp_path):
     a, b, c, d, e, f = [
         _shortcut(tmp_path, name)
         for name in ("甲", "乙", "丙", "丁", "戊", "己")
@@ -59,15 +59,35 @@ def test_scope_recursively_expands_cross_group_and_deduplicates(tmp_path):
         legacy_config_path=legacy,
     )
     scope = SyncScopeService(configuration, Resolver()).scope("第一組")
-    controller = configuration.group("第一組").main_entry.entry_id
+    current_group = configuration.group("第一組")
+    controller = current_group.main_entry.entry_id
 
     assert scope.ready is True
     assert scope.entry_ids == (
         controller,
-        *configuration.expanded_sync_members(controller),
+        *(
+            entry.entry_id
+            for entry in current_group.entries
+            if entry.entry_id != controller
+        ),
     )
-    assert len(scope.fingerprints) == 6
-    assert len(scope.fingerprints) == len(set(scope.fingerprints))
+    assert len(scope.fingerprints) == 4
+    assert len(configuration.expanded_sync_members(controller)) == 5
+
+
+def test_configured_scope_still_keeps_every_group_for_reconnect(tmp_path):
+    first = _shortcut(tmp_path, "甲")
+    second = _shortcut(tmp_path, "乙")
+    configuration = GroupConfigurationService(tmp_path / "groups.json")
+    configuration.add_shortcuts("甲組", (first,))
+    configuration.add_shortcuts("乙組", (second,))
+    first_id = configuration.group("甲組").main_entry.entry_id
+    second_id = configuration.group("乙組").main_entry.entry_id
+    configuration.add_sync_relation(first_id, second_id)
+    service = SyncScopeService(configuration, Resolver())
+
+    assert service.scope("甲組").entry_ids == (first_id,)
+    assert service.configured_scope().entry_ids == (first_id, second_id)
 
 
 def test_scope_keeps_shared_launcher_digests_until_live_instance_binding(

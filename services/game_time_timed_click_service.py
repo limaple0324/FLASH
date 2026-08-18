@@ -62,9 +62,14 @@ class TimedClickPressReceipt:
     x_ratio: float
     y_ratio: float
     synchronized_handles: tuple[int, ...] = ()
+    instance_identities: tuple[
+        tuple[str, int, int, int, str, int], ...
+    ] = ()
 
     @property
     def handles(self) -> tuple[int, ...]:
+        if self.instance_identities:
+            return tuple(identity[1] for identity in self.instance_identities)
         return self.synchronized_handles or (self.handle,)
 
 

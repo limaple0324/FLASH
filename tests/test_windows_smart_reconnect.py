@@ -5898,12 +5898,14 @@ def test_character_selection_confirms_exact_role_before_entering_game(tmp_path):
                     "160主",
                     tmp_path / "160.lnk",
                     windows[0].launch_fingerprint,
+                    role_id="160主",
                 ),
                 GroupLaunchTarget(
                     2,
                     "160副",
                     tmp_path / "160-2.lnk",
                     windows[1].launch_fingerprint,
+                    role_id="160副",
                 ),
             ),
         )
@@ -8190,12 +8192,14 @@ def test_saved_role_name_selects_matching_character_instead_of_leftmost(
                     "120古",
                     tmp_path / "120古.lnk",
                     windows[0].launch_fingerprint,
+                    role_id="120古",
                 ),
                 GroupLaunchTarget(
                     2,
                     "160靈",
                     tmp_path / "160靈.lnk",
                     windows[1].launch_fingerprint,
+                    role_id="160靈",
                 ),
             ),
         )
@@ -11162,7 +11166,7 @@ def test_registered_character_ocr_variation_keeps_canonical_target():
     assert fixture.mouse.clicks == [(1, CHARACTER_ENTER_CLICK_POINT)]
 
 
-def test_character_name_first_character_selects_saved_main_role(tmp_path):
+def test_explicit_saved_character_prefix_selects_unique_matching_role(tmp_path):
     candidates = (
         CharacterSelectionCandidate(
             120,
@@ -11205,6 +11209,7 @@ def test_character_name_first_character_selects_saved_main_role(tmp_path):
                     tmp_path / "main.lnk",
                     window.launch_fingerprint,
                     role_id="嘻の百級古武",
+                    role_name_prefix="嘻",
                 ),
             ),
         )
@@ -11218,9 +11223,52 @@ def test_character_name_first_character_selects_saved_main_role(tmp_path):
 
     assert result.details["clicked_windows"] == 1
     assert fixture.mouse.clicks == [(1, (0.651, 0.706))]
+    assert fixture.mouse.instance_tokens == [
+        WindowInstanceToken.from_window(window)
+    ]
 
 
-def test_character_name_first_character_collision_stays_zero_click(tmp_path):
+def test_same_first_character_without_saved_prefix_stays_zero_click(tmp_path):
+    candidates = (
+        CharacterSelectionCandidate(
+            120,
+            None,
+            2,
+            False,
+            (0.651, 0.706),
+            digit_count=3,
+            identity="嘻月…",
+        ),
+    )
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(lambda _call: candidates)
+    )
+    fixture.controller.set_group_launch_plan(
+        GroupLaunchPlan(
+            "無前綴",
+            targets=(
+                GroupLaunchTarget(
+                    1,
+                    "主號",
+                    tmp_path / "main.lnk",
+                    window.launch_fingerprint,
+                    role_id="嘻の百級古武",
+                ),
+            ),
+        )
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+
+
+def test_explicit_character_prefix_collision_stays_zero_click(tmp_path):
     candidates = (
         CharacterSelectionCandidate(
             120,
@@ -11254,6 +11302,7 @@ def test_character_name_first_character_collision_stays_zero_click(tmp_path):
                     tmp_path / "main.lnk",
                     window.launch_fingerprint,
                     role_id="嘻の百級古武",
+                    role_name_prefix="嘻",
                 ),
             ),
         )
@@ -11267,6 +11316,68 @@ def test_character_name_first_character_collision_stays_zero_click(tmp_path):
 
     assert result.details["clicked_windows"] == 0
     assert fixture.mouse.clicks == []
+
+
+def test_dimension_group_120_blessing_uses_saved_ao_prefix(tmp_path):
+    candidates = (
+        CharacterSelectionCandidate(
+            120,
+            None,
+            0,
+            False,
+            (0.355, 0.706),
+            digit_count=3,
+            identity="執云一…",
+        ),
+        CharacterSelectionCandidate(
+            91,
+            None,
+            1,
+            False,
+            (0.500, 0.706),
+            digit_count=2,
+            identity="心誠…",
+        ),
+        CharacterSelectionCandidate(
+            120,
+            None,
+            2,
+            False,
+            (0.651, 0.706),
+            digit_count=3,
+            identity="敖の百級福音",
+        ),
+    )
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(lambda _call: candidates)
+    )
+    fixture.controller.set_group_launch_plan(
+        GroupLaunchPlan(
+            "魔心次元組",
+            targets=(
+                GroupLaunchTarget(
+                    1,
+                    "120福",
+                    tmp_path / "120福.lnk",
+                    window.launch_fingerprint,
+                    role_id="120福",
+                    role_name_prefix="敖",
+                ),
+            ),
+        )
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(1, (0.651, 0.706))]
+    assert fixture.mouse.instance_tokens == [
+        WindowInstanceToken.from_window(window)
+    ]
 
 
 def test_canonical_character_target_change_cancels_click():

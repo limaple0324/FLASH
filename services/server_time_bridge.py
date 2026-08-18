@@ -58,6 +58,7 @@ class ServerTimeBridge:
         payload: object,
         *,
         transport_process_id: int | None = None,
+        sample_monotonic_ns: int | None = None,
     ) -> bool:
         data = self._mapping(payload)
         if data is None:
@@ -92,7 +93,10 @@ class ServerTimeBridge:
         previous = self._last_sequence_by_source.get(identity)
         if previous is not None and sample.sample_sequence <= previous:
             return False
-        accepted = self._clock.calibrate_once(sample)
+        accepted = self._clock.calibrate_once(
+            sample,
+            sample_monotonic_ns=sample_monotonic_ns,
+        )
         if accepted:
             self._last_sequence_by_source[identity] = sample.sample_sequence
         return accepted
@@ -453,6 +457,7 @@ class ProcessMemoryServerTimeCandidate:
     start_time_ms: float
     server_time_offset_ms: float
     time_lag_ms: float
+    sample_monotonic_ns: int
 
 
 class ProcessMemoryServerTimeReader:
@@ -809,6 +814,7 @@ class ProcessMemoryServerTimeReader:
             start_time_ms=start_time_ms,
             server_time_offset_ms=server_time_offset_ms,
             time_lag_ms=time_lag_ms,
+            sample_monotonic_ns=int(self._monotonic_ns()),
         )
 
     def _scan_process(
@@ -918,14 +924,7 @@ class ProcessMemoryServerTimeReader:
         if len(candidates) != 1:
             return False
         candidate = candidates[0]
-        sample_wall_ms = self._wall_clock_ns() / 1_000_000.0
-        local_flash_offset_ms = float(self._local_flash_offset_ms())
-        server_now_ms = (
-            sample_wall_ms
-            + candidate.time_lag_ms
-            + local_flash_offset_ms
-            - candidate.server_time_offset_ms
-        )
+        server_now_ms = candidate.server_time_ms
         if not math.isfinite(server_now_ms) or server_now_ms < 0:
             return False
         sample = ServerTimeSample(
@@ -935,7 +934,10 @@ class ProcessMemoryServerTimeReader:
             sample_local_flash_timer=candidate.start_time_ms,
             sample_sequence=1,
         )
-        return self._bridge.ingest(ServerTimeBridge.encode(sample))
+        return self._bridge.ingest(
+            ServerTimeBridge.encode(sample),
+            sample_monotonic_ns=candidate.sample_monotonic_ns,
+        )
 
     def _run(self) -> None:
         while not self._stop_event.is_set():

@@ -34,6 +34,7 @@ class GroupConfigurationEntry:
     placement: SavedWindowPlacement | None = None
     sync_settings: SyncTargetSettings = SyncTargetSettings()
     role_id: str = ""
+    role_name_prefix: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +106,7 @@ class GroupConfigurationService:
             "sync_offset_y",
             "sync_delay_ms",
             "role_id",
+            "role_name_prefix",
         }
     )
     _SENSITIVE_FIELDS = frozenset(
@@ -236,6 +238,17 @@ class GroupConfigurationService:
         return cleaned[:24]
 
     @staticmethod
+    def _clean_role_name_prefix(value: object) -> str:
+        if not isinstance(value, str):
+            return ""
+        cleaned = "".join(
+            character
+            for character in value.strip()
+            if not character.isspace() and ord(character) >= 32
+        )
+        return cleaned[:24]
+
+    @staticmethod
     def _clean_sync_base_point(
         value: Mapping[str, object],
     ) -> tuple[int, int] | None:
@@ -310,6 +323,9 @@ class GroupConfigurationService:
                 "sync_offset_y": sync_settings.offset_y,
                 "sync_delay_ms": sync_settings.delay_ms,
                 "role_id": cls._clean_role_id(value.get("role_id")),
+                "role_name_prefix": cls._clean_role_name_prefix(
+                    value.get("role_name_prefix")
+                ),
             }
         )
         return entry
@@ -795,6 +811,9 @@ class GroupConfigurationService:
                     ),
                     role_id=self._clean_role_id(
                         raw_entry.get("role_id")
+                    ),
+                    role_name_prefix=self._clean_role_name_prefix(
+                        raw_entry.get("role_name_prefix")
                     ),
                 )
                 for index, raw_entry in enumerate(
@@ -1325,6 +1344,76 @@ class GroupConfigurationService:
             return False
         for raw_entry in changed_entries:
             raw_entry["role_id"] = normalized_role_id
+        self._save()
+        return True
+
+    def set_role_name_prefix(
+        self,
+        group_name: object,
+        entry_id: object,
+        role_name_prefix: object,
+    ) -> bool:
+        """Persist one explicit character prefix on one group entry only."""
+
+        cleaned_group = self._clean_name(group_name)
+        normalized_prefix = self._clean_role_name_prefix(role_name_prefix)
+        if (
+            cleaned_group is None
+            or not isinstance(entry_id, str)
+            or not entry_id.strip()
+            or (
+                isinstance(role_name_prefix, str)
+                and role_name_prefix.strip()
+                and not normalized_prefix
+            )
+        ):
+            return False
+        raw_group = next(
+            (
+                group
+                for group in self._groups
+                if group.get("name") == cleaned_group
+            ),
+            None,
+        )
+        entries = (
+            raw_group.get("launch_entries")
+            if isinstance(raw_group, Mapping)
+            else None
+        )
+        if not isinstance(entries, list):
+            return False
+        normalized_entry_id = entry_id.strip()
+        matches = tuple(
+            entry
+            for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("entry_id") == normalized_entry_id
+        )
+        if len(matches) != 1:
+            return False
+        raw_entry = matches[0]
+        raw_path = raw_entry.get("path")
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path.strip()
+            or self._entry_id(Path(raw_path).resolve(strict=False))
+            != normalized_entry_id
+        ):
+            return False
+        saved_role = self._clean_role_id(raw_entry.get("role_id"))
+        effective_prefix = (
+            ""
+            if normalized_prefix
+            and saved_role.casefold().startswith(normalized_prefix.casefold())
+            else normalized_prefix
+        )
+        if (
+            self._clean_role_name_prefix(raw_entry.get("role_name_prefix"))
+            == effective_prefix
+        ):
+            return False
+        raw_entry["role_name_prefix"] = effective_prefix
         self._save()
         return True
 

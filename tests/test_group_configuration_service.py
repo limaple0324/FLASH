@@ -727,6 +727,27 @@ def test_set_role_id_rejects_shared_entry_path_conflict_atomically(
     assert save_calls == []
 
 
+def test_role_name_prefix_is_saved_only_on_the_named_group_entry(tmp_path):
+    service, entry_id, raw_entries = _shared_role_entries(tmp_path)
+
+    assert service.set_role_name_prefix("第一組", entry_id, " 敖 ") is True
+
+    assert raw_entries[0]["role_name_prefix"] == "敖"
+    assert raw_entries[1].get("role_name_prefix", "") == ""
+    assert service.group("第一組").entries[0].role_name_prefix == "敖"
+    assert service.group("第二組").entries[0].role_name_prefix == ""
+
+
+def test_saved_full_role_name_does_not_duplicate_its_prefix(tmp_path):
+    service, entry_id, raw_entries = _shared_role_entries(tmp_path)
+    assert service.set_role_id("第一組", entry_id, "敖の百級福音") is True
+
+    assert service.set_role_name_prefix("第一組", entry_id, "敖") is False
+
+    assert raw_entries[0].get("role_name_prefix", "") == ""
+    assert service.group("第一組").entries[0].role_id == "敖の百級福音"
+
+
 def test_sync_offset_delay_base_point_and_role_id_survive_reload(tmp_path):
     legacy, _first, _second = _legacy(tmp_path)
     owned = tmp_path / "groups.json"
@@ -750,6 +771,11 @@ def test_sync_offset_delay_base_point_and_role_id_survive_reload(tmp_path):
         entry.entry_id,
         "  001|角色_甲 ",
     ) is True
+    assert service.set_role_name_prefix(
+        "14支",
+        entry.entry_id,
+        "角",
+    ) is True
 
     restored = GroupConfigurationService(owned).group("14支")
     restored_entry = restored.entries[1]
@@ -759,6 +785,7 @@ def test_sync_offset_delay_base_point_and_role_id_survive_reload(tmp_path):
     assert restored_entry.sync_settings.offset_y == 12
     assert restored_entry.sync_settings.delay_ms == 450
     assert restored_entry.role_id == "001|角色_甲"
+    assert restored_entry.role_name_prefix == "角"
 
 
 def test_legacy_launch_delay_seeds_sync_delay_and_clear_resets_only_sync(
