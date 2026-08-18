@@ -47,6 +47,7 @@ from adapters.windows_pointer_sync import (
 )
 from adapters.windows_timed_click import (
     Win32LegacySyncStatusProvider,
+    Win32FocusMarkerBackend,
     WindowsTimedClickBackend,
 )
 from adapters.windows_sync_calibration import Win32SyncCalibrationBackend
@@ -3064,16 +3065,20 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if home_view is not None:
             home_view.set_timed_click_result(result)
 
+    timed_click_backend = (
+        WindowsTimedClickBackend(
+            group_window_backend,
+            Win32PointerMessageBackend(),
+            marker_backend=Win32FocusMarkerBackend(),
+            synchronized_windows_provider=current_sync_target_windows,
+            synchronization_active_provider=timed_click_synchronization_active,
+        )
+        if group_window_backend is not None
+        else None
+    )
     game_time_timed_click_service = (
         GameTimeTimedClickService(
-            WindowsTimedClickBackend(
-                group_window_backend,
-                Win32PointerMessageBackend(),
-                synchronized_windows_provider=current_sync_target_windows,
-                synchronization_active_provider=(
-                    timed_click_synchronization_active
-                ),
-            ),
+            timed_click_backend,
             schedule=window.after,
             cancel=window.after_cancel,
             allowed_fingerprints_provider=current_timed_click_fingerprints,
@@ -5836,7 +5841,29 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 "定時按下服務尚未準備完成。",
                 "timed_click_unavailable",
             )
-        return game_time_timed_click_service.capture_target()
+        result = game_time_timed_click_service.capture_target()
+        target = (
+            result.snapshot.target
+            if result.success and result.snapshot is not None
+            else None
+        )
+        if target is None or timed_click_backend is None:
+            return result
+        if timed_click_backend.show_target_markers(
+            target,
+            current_timed_click_fingerprints(),
+        ):
+            return result
+        game_time_timed_click_service.clear_target(notify=False)
+        failed = GameTimeTimedClickResult(
+            False,
+            "capture",
+            "定位標記未能完整顯示，按鈕位置保持不變。",
+            "target_marker_failed",
+            game_time_timed_click_service.snapshot(),
+        )
+        complete_timed_click_result(failed)
+        return failed
 
     def change_timed_click(
         enabled: bool,

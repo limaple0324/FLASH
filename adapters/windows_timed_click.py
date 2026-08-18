@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 from pathlib import Path
+from threading import Timer
 from typing import Protocol
 
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
@@ -32,6 +33,118 @@ class CursorClientPointReader(Protocol):
         handle: int,
         screen_position: tuple[int, int] | None = None,
     ) -> tuple[float, float] | None: ...
+
+
+class TargetMarkerBackend(Protocol):
+    """Draw and erase a native marker without sending window input."""
+
+    def draw(
+        self,
+        window: WindowInfo,
+        target: TimedClickTarget,
+    ) -> object | None: ...
+
+    def erase(self, token: object) -> bool: ...
+
+
+class Win32FocusMarkerBackend:
+    """Use the native reversible focus frame on an existing client surface."""
+
+    _MARKER_HALF_SIZE = 6
+
+    @staticmethod
+    def _user32():
+        return ctypes.windll.user32 if os.name == "nt" else None
+
+    @staticmethod
+    def _configure(user32) -> None:
+        user32.GetClientRect.argtypes = (
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.RECT),
+        )
+        user32.GetClientRect.restype = wintypes.BOOL
+        user32.GetDC.argtypes = (wintypes.HWND,)
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.ReleaseDC.argtypes = (wintypes.HWND, ctypes.c_void_p)
+        user32.ReleaseDC.restype = ctypes.c_int
+        user32.DrawFocusRect.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.RECT),
+        )
+        user32.DrawFocusRect.restype = wintypes.BOOL
+
+    @classmethod
+    def _marker_rect(
+        cls,
+        client: wintypes.RECT,
+        target: TimedClickTarget,
+    ) -> wintypes.RECT | None:
+        width = int(client.right - client.left)
+        height = int(client.bottom - client.top)
+        if width <= 2 * cls._MARKER_HALF_SIZE or height <= 2 * cls._MARKER_HALF_SIZE:
+            return None
+        x = round(target.x_ratio * (width - 1))
+        y = round(target.y_ratio * (height - 1))
+        left = max(0, min(width - 2 * cls._MARKER_HALF_SIZE, x - cls._MARKER_HALF_SIZE))
+        top = max(0, min(height - 2 * cls._MARKER_HALF_SIZE, y - cls._MARKER_HALF_SIZE))
+        return wintypes.RECT(
+            left,
+            top,
+            left + 2 * cls._MARKER_HALF_SIZE,
+            top + 2 * cls._MARKER_HALF_SIZE,
+        )
+
+    def draw(
+        self,
+        window: WindowInfo,
+        target: TimedClickTarget,
+    ) -> object | None:
+        user32 = self._user32()
+        if user32 is None or not isinstance(window.handle, int):
+            return None
+        self._configure(user32)
+        hwnd = wintypes.HWND(window.handle)
+        client = wintypes.RECT()
+        if not user32.GetClientRect(hwnd, ctypes.byref(client)):
+            return None
+        marker = self._marker_rect(client, target)
+        if marker is None:
+            return None
+        device_context = user32.GetDC(hwnd)
+        if not device_context:
+            return None
+        try:
+            if not user32.DrawFocusRect(
+                device_context,
+                ctypes.byref(marker),
+            ):
+                return None
+        finally:
+            user32.ReleaseDC(hwnd, device_context)
+        return (window.handle, tuple(int(value) for value in marker))
+
+    def erase(self, token: object) -> bool:
+        if (
+            not isinstance(token, tuple)
+            or len(token) != 2
+            or not isinstance(token[0], int)
+            or not isinstance(token[1], tuple)
+            or len(token[1]) != 4
+        ):
+            return False
+        user32 = self._user32()
+        if user32 is None:
+            return False
+        self._configure(user32)
+        hwnd = wintypes.HWND(token[0])
+        marker = wintypes.RECT(*token[1])
+        device_context = user32.GetDC(hwnd)
+        if not device_context:
+            return False
+        try:
+            return bool(user32.DrawFocusRect(device_context, ctypes.byref(marker)))
+        finally:
+            user32.ReleaseDC(hwnd, device_context)
 
 
 class Win32CursorClientPointReader:
@@ -197,6 +310,7 @@ class WindowsTimedClickBackend:
         message_backend: PointerMessageBackend,
         *,
         point_reader: CursorClientPointReader | None = None,
+        marker_backend: TargetMarkerBackend | None = None,
         synchronized_windows_provider: (
             Callable[[], Iterable[WindowInfo]] | None
         ) = None,
@@ -207,6 +321,7 @@ class WindowsTimedClickBackend:
         self._window_backend = window_backend
         self._message_backend = message_backend
         self._point_reader = point_reader or Win32CursorClientPointReader()
+        self._marker_backend = marker_backend
         self._synchronized_windows_provider = synchronized_windows_provider
         self._synchronization_active_provider = synchronization_active_provider
 
@@ -302,6 +417,100 @@ class WindowsTimedClickBackend:
         ):
             return ()
         return windows
+
+    def _marker_windows(
+        self,
+        target: TimedClickTarget,
+        allowed_fingerprints: tuple[str, ...],
+    ) -> tuple[WindowInfo, ...]:
+        if self._synchronized_windows_provider is None:
+            return ()
+        if not allowed_fingerprints or target.fingerprint != allowed_fingerprints[0]:
+            return ()
+        try:
+            windows = tuple(self._synchronized_windows_provider())
+        except Exception:
+            return ()
+        if not 1 <= len(windows) <= 14 or len(windows) != len(allowed_fingerprints):
+            return ()
+        identities = tuple(
+            complete_window_instance_identity(window) for window in windows
+        )
+        if any(identity is None for identity in identities):
+            return ()
+        fingerprints = tuple(identity[0] for identity in identities if identity is not None)
+        if fingerprints != allowed_fingerprints or len(set(fingerprints)) != len(fingerprints):
+            return ()
+        return windows
+
+    def show_target_markers(
+        self,
+        target: TimedClickTarget,
+        allowed_fingerprints: Iterable[str],
+        *,
+        duration_seconds: float = 3.0,
+    ) -> bool:
+        """Show one native marker per current sync target, then erase them."""
+        marker_backend = self._marker_backend
+        if marker_backend is None:
+            return False
+        allowed = self._allowed(allowed_fingerprints)
+        windows = self._marker_windows(target, allowed)
+        if not windows:
+            return False
+        identities = tuple(self._dispatch_identity(window) for window in windows)
+        if any(identity is None for identity in identities):
+            return False
+        complete_identities = tuple(
+            identity for identity in identities if identity is not None
+        )
+        drawn: list[tuple[tuple[str, int, int, int, str, int], object]] = []
+
+        def draw(
+            item: tuple[
+                WindowInfo,
+                tuple[str, int, int, int, str, int] | None,
+            ],
+        ) -> tuple[tuple[str, int, int, int, str, int], object] | None:
+            window, identity = item
+            if identity is None or not self._instance_is_current(identity):
+                return None
+            token = marker_backend.draw(window, target)
+            return None if token is None else (identity, token)
+
+        with ThreadPoolExecutor(
+            max_workers=min(14, len(windows)),
+            thread_name_prefix="timed-click-marker",
+        ) as executor:
+            results = tuple(executor.map(draw, zip(windows, identities)))
+        if any(result is None for result in results):
+            for result in results:
+                if result is not None:
+                    marker_backend.erase(result[1])
+            return False
+        drawn = [result for result in results if result is not None]
+
+        def erase() -> None:
+            def erase_one(
+                item: tuple[
+                    tuple[str, int, int, int, str, int],
+                    object,
+                ],
+            ) -> None:
+                identity, token = item
+                if self._instance_is_current(identity):
+                    marker_backend.erase(token)
+
+            with ThreadPoolExecutor(
+                max_workers=min(14, len(drawn)),
+                thread_name_prefix="timed-click-marker-erase",
+            ) as executor:
+                tuple(executor.map(erase_one, tuple(drawn)))
+
+        timer = Timer(max(0.0, float(duration_seconds)), erase)
+        timer.daemon = True
+        timer.start()
+        return True
 
     def _ready(self, window: WindowInfo) -> bool:
         return bool(

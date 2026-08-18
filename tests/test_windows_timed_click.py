@@ -1,5 +1,7 @@
 from collections import Counter
 from dataclasses import replace
+from pathlib import Path
+from time import sleep
 
 from adapters.windows_timed_click import (
     Win32LegacySyncStatusProvider,
@@ -70,6 +72,23 @@ class Messages:
         self.sent.append((handle, x_ratio, y_ratio, event))
         if self.after_send is not None:
             self.after_send(event)
+        return True
+
+
+class Markers:
+    def __init__(self, *, fail_handles=()):
+        self.fail_handles = set(fail_handles)
+        self.shown = []
+        self.erased = []
+
+    def draw(self, window, target):
+        self.shown.append((window.handle, target.x_ratio, target.y_ratio))
+        if window.handle in self.fail_handles:
+            return None
+        return window.handle
+
+    def erase(self, token):
+        self.erased.append(token)
         return True
 
 
@@ -256,6 +275,110 @@ def test_active_sync_sends_each_timed_press_to_fourteen_windows_once():
         assert delivered[(window.handle, "left_up")] == 1
     assert len(messages.sent) == 14 * 3
     assert messages.responsiveness_timeouts == [1_000] * 14
+
+
+def test_marker_requests_all_fourteen_sync_windows_without_pointer_input():
+    fingerprints = tuple(f"{index:064x}" for index in range(1, 15))
+    windows = tuple(
+        make_window(10 + index, fingerprint)
+        for index, fingerprint in enumerate(fingerprints)
+    )
+    messages = Messages()
+    markers = Markers()
+    backend = WindowsTimedClickBackend(
+        Windows(windows),
+        messages,
+        marker_backend=markers,
+        synchronized_windows_provider=lambda: windows,
+    )
+    target = TimedClickTarget(fingerprints[0], 0.25, 0.75)
+
+    assert backend.show_target_markers(target, fingerprints) is True
+    assert markers.shown == [
+        (window.handle, 0.25, 0.75) for window in windows
+    ]
+    assert messages.sent == []
+
+
+def test_marker_identity_incomplete_fails_closed_without_pointer_input():
+    windows = list(make_window(10 + index, f"{index + 1:064x}") for index in range(3))
+    windows[1] = replace(windows[1], thread_id=None)
+    messages = Messages()
+    markers = Markers()
+    backend = WindowsTimedClickBackend(
+        Windows(windows),
+        messages,
+        marker_backend=markers,
+        synchronized_windows_provider=lambda: tuple(windows),
+    )
+    fingerprints = tuple(window.launch_fingerprint for window in windows)
+
+    assert backend.show_target_markers(
+        TimedClickTarget(fingerprints[0], 0.5, 0.5),
+        fingerprints,
+    ) is False
+    assert markers.shown == []
+    assert messages.sent == []
+
+
+def test_any_initial_marker_failure_erases_partial_markers_and_fails_closed():
+    fingerprints = tuple(f"{index:064x}" for index in range(1, 5))
+    windows = tuple(
+        make_window(10 + index, fingerprint)
+        for index, fingerprint in enumerate(fingerprints)
+    )
+    messages = Messages()
+    markers = Markers(fail_handles={12})
+    backend = WindowsTimedClickBackend(
+        Windows(windows),
+        messages,
+        marker_backend=markers,
+        synchronized_windows_provider=lambda: windows,
+    )
+
+    assert backend.show_target_markers(
+        TimedClickTarget(fingerprints[0], 0.5, 0.5),
+        fingerprints,
+    ) is False
+    assert set(markers.erased) == {10, 11, 13}
+    assert messages.sent == []
+
+
+def test_marker_cleanup_does_not_touch_a_reused_handle():
+    original = make_window(10, FINGERPRINT)
+    replacement = replace(original, process_id=original.process_id + 1)
+    live_windows = Windows([original])
+
+    class ReusingMarkers(Markers):
+        def draw(self, window, target):
+            token = super().draw(window, target)
+            live_windows.windows[0] = replacement
+            return token
+
+    markers = ReusingMarkers()
+    backend = WindowsTimedClickBackend(
+        live_windows,
+        Messages(),
+        marker_backend=markers,
+        synchronized_windows_provider=lambda: tuple(live_windows.windows),
+    )
+
+    assert backend.show_target_markers(
+        TimedClickTarget(FINGERPRINT, 0.5, 0.5),
+        (FINGERPRINT,),
+        duration_seconds=0.01,
+    ) is True
+    sleep(0.05)
+    assert markers.erased == []
+
+
+def test_main_wires_native_marker_and_marker_failure_gate():
+    source = (Path(__file__).parents[1] / "main.py").read_text(
+        encoding="utf-8"
+    )
+    assert "marker_backend=Win32FocusMarkerBackend()" in source
+    assert "show_target_markers(" in source
+    assert '"target_marker_failed"' in source
 
 
 def test_inactive_sync_preserves_single_window_timed_click():
