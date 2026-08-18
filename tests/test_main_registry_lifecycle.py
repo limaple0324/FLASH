@@ -2,6 +2,7 @@ import json
 
 from core.window_registry import WindowRegistry
 from core.window_registry_store import WindowRegistryStore
+import main
 from main import build_services, registry_status, save_registry
 from services.app_context import AppContext
 
@@ -45,3 +46,39 @@ def test_corrupt_registry_is_rebuilt_and_reported(tmp_path):
     assert status["recovered"] is True
     assert status["count"] == 0
     assert list(path.parent.glob("window_registry.json.corrupt*"))
+
+
+def test_create_main_window_assembles_group_window_launch_with_registry(
+    tmp_path, monkeypatch
+):
+    class _NoopTrayController:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            return False
+
+        def mark_operations_running(self):
+            pass
+
+        def mark_operations_stopped(self):
+            pass
+
+        def handle_unmap(self, *_args):
+            pass
+
+        def close(self):
+            return True
+
+    monkeypatch.setattr(main, "SystemTrayController", _NoopTrayController)
+    paths, _logger = build_services(root=tmp_path)
+
+    window = None
+    try:
+        window = main.create_main_window(registry_status(), paths)
+    finally:
+        if window is not None:
+            window.destroy()
+
+    assert AppContext.get(WindowRegistry) is not None
+    assert AppContext.get(WindowRegistryStore) is not None
