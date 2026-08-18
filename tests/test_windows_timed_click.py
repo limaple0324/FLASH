@@ -1,3 +1,4 @@
+import ast
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -379,6 +380,28 @@ def test_main_wires_native_marker_and_marker_failure_gate():
     assert "marker_backend=Win32FocusMarkerBackend()" in source
     assert "show_target_markers(" in source
     assert '"target_marker_failed"' in source
+
+
+def test_marker_preview_failure_does_not_clear_captured_target():
+    source = (Path(__file__).parents[1] / "main.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    capture = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "capture_timed_click_target"
+    )
+    clear_calls = [
+        node
+        for node in ast.walk(capture)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "clear_target"
+    ]
+    assert clear_calls == []
+    assert '"按鈕位置已設定，但定位預覽未能完整顯示。"' in source
 
 
 def test_inactive_sync_preserves_single_window_timed_click():

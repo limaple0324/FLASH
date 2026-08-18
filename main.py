@@ -568,6 +568,9 @@ def apply_window_icon(window: Tk) -> None:
 
 def card_display_scale(window: Tk) -> float:
     """Return the display scale relative to the 96-DPI card baseline."""
+    fixed_tk_scaling = getattr(window, "_fu_fixed_tk_scaling", None)
+    if isinstance(fixed_tk_scaling, (int, float)) and fixed_tk_scaling > 0:
+        return max(1.0, float(fixed_tk_scaling) * 0.75)
     try:
         pixels_per_inch = float(window.winfo_fpixels("1i"))
     except (AttributeError, TclError, TypeError, ValueError):
@@ -575,6 +578,35 @@ def card_display_scale(window: Tk) -> float:
     if pixels_per_inch <= 0:
         return 1.0
     return max(1.0, pixels_per_inch / 96.0)
+
+
+def configure_fixed_tk_ui_scaling(window: Tk) -> float:
+    """Keep only the Tk interface scale fixed when moving between monitors."""
+    try:
+        fixed = float(window.tk.call("tk", "scaling"))
+    except (AttributeError, TclError, TypeError, ValueError):
+        fixed = 4.0 / 3.0
+    if fixed <= 0:
+        fixed = 4.0 / 3.0
+    try:
+        window.tk.call("tk", "scaling", fixed)
+    except (AttributeError, TclError, TypeError, ValueError):
+        pass
+
+    def restore(_event=None) -> None:
+        try:
+            current = float(window.tk.call("tk", "scaling"))
+            if abs(current - fixed) > 0.0001:
+                window.tk.call("tk", "scaling", fixed)
+        except (AttributeError, TclError, TypeError, ValueError):
+            return
+
+    try:
+        window.bind("<Configure>", restore, add="+")
+    except (AttributeError, TclError):
+        pass
+    setattr(window, "_fu_fixed_tk_scaling", fixed)
+    return fixed
 
 
 def taskbar_icon_resource() -> str:
@@ -2797,6 +2829,7 @@ def format_start_status(status: dict[str, object], paths: PathManager) -> str:
 def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     window = Tk()
     window.withdraw()
+    configure_fixed_tk_ui_scaling(window)
     window.title(APP_TITLE)
     apply_window_icon(window)
     window.geometry("1040x720")
@@ -3071,7 +3104,9 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             Win32PointerMessageBackend(),
             marker_backend=Win32FocusMarkerBackend(),
             synchronized_windows_provider=current_sync_target_windows,
-            synchronization_active_provider=timed_click_synchronization_active,
+            synchronization_active_provider=(
+                timed_click_synchronization_active
+            ),
         )
         if group_window_backend is not None
         else None
@@ -5854,11 +5889,10 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             current_timed_click_fingerprints(),
         ):
             return result
-        game_time_timed_click_service.clear_target(notify=False)
         failed = GameTimeTimedClickResult(
             False,
             "capture",
-            "定位標記未能完整顯示，按鈕位置保持不變。",
+            "按鈕位置已設定，但定位預覽未能完整顯示。",
             "target_marker_failed",
             game_time_timed_click_service.snapshot(),
         )
