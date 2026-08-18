@@ -244,6 +244,11 @@ def test_home_removes_redundant_heading_and_reserves_card_controls() -> None:
     assert "設定按鈕位置" in source
     assert "啟用定時" in source
     assert "來源：系統時間" in source
+    assert 'DEFAULT_TIMED_CLICK_TARGET_TIME = "08:00:00.000"' in Path(
+        "services/game_time_timed_click_service.py"
+    ).read_text(encoding="utf-8")
+    assert '("校正ms", "_timed_click_lead_entry"' in source
+    assert "每日執行一次；校正正值提前、負值延後。" in source
 
 
 def test_sync_key_section_has_saved_collapsed_summary_and_full_catalog() -> None:

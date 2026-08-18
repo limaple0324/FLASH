@@ -12,6 +12,7 @@ from PIL import Image
 
 from adapters.game_screen_recognizer import (
     CHARACTER_ENTER_CLICK_POINT,
+    LINE_ROUTE_CLICK_POINTS,
     CharacterSelectionCandidate,
     POST_DISCONNECT_WAITING_REFERENCE_FILE,
     ReferenceScreenRecognizer,
@@ -3398,12 +3399,17 @@ def test_tcp_login_final_role_change_cancels_click(tmp_path):
 
 
 @pytest.mark.parametrize("unknown_competitor", [False, True])
-def test_tcp_login_level_fallback_requires_one_complete_candidate(
+def test_tcp_login_requires_saved_role_name(
     tmp_path, unknown_competitor,
 ):
     target = CharacterSelectionCandidate(120, None, 1, True,
                                          CHARACTER_ENTER_CLICK_POINT,
-                                         digit_count=3)
+                                         digit_count=3,
+                                         identity=(
+                                             None
+                                             if unknown_competitor
+                                             else "AlphaHero"
+                                         ))
     candidates = (target,) + ((replace(target, level=None, slot_index=2),)
                               if unknown_competitor else ())
     fixture, _old, new, _peers, _frames = tcp_login_fixture(
@@ -7306,6 +7312,30 @@ def test_saved_line_history_never_overrides_current_recent_line(
     assert saved.preferred_line_numbers == {fingerprint: 8}
 
 
+def test_current_recent_line_five_is_clicked_once_even_with_saved_line_eight():
+    point = LINE_ROUTE_CLICK_POINTS[5]
+    recognition = _recent_line_recognition(
+        line_number=5,
+        point=point,
+        present=True,
+    )
+    fixture = make_controller(
+        [4],
+        windows=[make_window(1)],
+        expected_windows=1,
+        recognizer=RecognitionByMarker({4: recognition}),
+    )
+    fingerprint = make_window(1).launch_fingerprint
+    fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
+    fixture.controller._preferred_line_numbers[fingerprint] = 8
+
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+    fixture.controller.reconnect()
+
+    assert fixture.mouse.clicks == [(1, point)]
+
+
 def test_fresh_visible_capture_wins_without_running_stale_primary_capture():
     windows = [make_window(1), make_window(2)]
     primary = FakeCaptureProvider({1: 2, 2: 1})
@@ -8095,7 +8125,7 @@ def test_same_level_without_unique_role_identity_never_selects_character(
     assert mouse.clicks == []
 
 
-def test_known_shortcut_role_selects_its_unique_level_instead_of_leftmost(
+def test_saved_role_name_selects_matching_character_instead_of_leftmost(
     tmp_path,
 ):
     windows = [make_window(1), make_window(2)]
@@ -8106,15 +8136,17 @@ def test_known_shortcut_role_selects_its_unique_level_instead_of_leftmost(
             160,
             CharacterImportance.PRIMARY,
             2,
-            False,
-            (0.651, 0.706),
+                False,
+                (0.651, 0.706),
+                identity="160靈",
         ),
         CharacterSelectionCandidate(
             120,
             CharacterImportance.PRIMARY,
             1,
-            False,
-            (0.500, 0.706),
+                False,
+                (0.500, 0.706),
+                identity="120古",
         ),
     )
 
@@ -8225,19 +8257,21 @@ def test_user_reported_selection_requires_registered_role_and_retains_match(
             GroupLaunchPlan(
                 "120",
                 targets=(
-                    GroupLaunchTarget(
-                        1,
-                        "120古",
-                        tmp_path / "120古.lnk",
-                        windows[0].launch_fingerprint,
-                        registered_level=120,
-                    ),
+                        GroupLaunchTarget(
+                            1,
+                            "120古",
+                            tmp_path / "120古.lnk",
+                            windows[0].launch_fingerprint,
+                            role_id="120古",
+                            registered_level=120,
+                        ),
                     GroupLaunchTarget(
                         2,
-                        "120靈",
-                        tmp_path / "120靈.lnk",
-                        windows[1].launch_fingerprint,
-                        registered_level=120,
+                            "120靈",
+                            tmp_path / "120靈.lnk",
+                            windows[1].launch_fingerprint,
+                            role_id="120靈",
+                            registered_level=120,
                     ),
                 ),
             )
@@ -8286,25 +8320,28 @@ def test_user_reported_selection_requires_registered_role_and_retains_match(
             level=120,
             importance=None,
             slot_index=0,
-            selected=False,
-            click_point=(0.355, 0.706),
-            digit_count=3,
+                selected=False,
+                click_point=(0.355, 0.706),
+                digit_count=3,
+                identity="120副",
         ),
         CharacterSelectionCandidate(
             level=None,
             importance=None,
             slot_index=1,
-            selected=False,
-            click_point=(0.500, 0.706),
-            digit_count=2,
+                selected=False,
+                click_point=(0.500, 0.706),
+                digit_count=2,
+                identity="120副二",
         ),
         CharacterSelectionCandidate(
             level=120,
             importance=None,
             slot_index=2,
-            selected=True,
-            click_point=(0.353, 0.854),
-            digit_count=3,
+                selected=True,
+                click_point=(0.353, 0.854),
+                digit_count=3,
+                identity="120古",
         ),
     )
     right, right_mouse = controller_for(right_candidates)
@@ -11125,6 +11162,113 @@ def test_registered_character_ocr_variation_keeps_canonical_target():
     assert fixture.mouse.clicks == [(1, CHARACTER_ENTER_CLICK_POINT)]
 
 
+def test_character_name_first_character_selects_saved_main_role(tmp_path):
+    candidates = (
+        CharacterSelectionCandidate(
+            120,
+            None,
+            0,
+            False,
+            (0.355, 0.706),
+            digit_count=3,
+            identity="執云一…",
+        ),
+        CharacterSelectionCandidate(
+            91,
+            None,
+            1,
+            False,
+            (0.500, 0.706),
+            digit_count=2,
+            identity="心誠…",
+        ),
+        CharacterSelectionCandidate(
+            120,
+            None,
+            2,
+            False,
+            (0.651, 0.706),
+            digit_count=3,
+            identity="嘻の…",
+        ),
+    )
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(lambda _call: candidates)
+    )
+    fixture.controller.set_group_launch_plan(
+        GroupLaunchPlan(
+            "主號驗收",
+            targets=(
+                GroupLaunchTarget(
+                    1,
+                    "主號",
+                    tmp_path / "main.lnk",
+                    window.launch_fingerprint,
+                    role_id="嘻の百級古武",
+                ),
+            ),
+        )
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [(1, (0.651, 0.706))]
+
+
+def test_character_name_first_character_collision_stays_zero_click(tmp_path):
+    candidates = (
+        CharacterSelectionCandidate(
+            120,
+            None,
+            0,
+            False,
+            (0.355, 0.706),
+            digit_count=3,
+            identity="嘻の…",
+        ),
+        CharacterSelectionCandidate(
+            120,
+            None,
+            2,
+            False,
+            (0.651, 0.706),
+            digit_count=3,
+            identity="嘻月…",
+        ),
+    )
+    fixture, window = _single_window_character_fixture(
+        _CharacterSequenceRecognizer(lambda _call: candidates)
+    )
+    fixture.controller.set_group_launch_plan(
+        GroupLaunchPlan(
+            "主號碰撞",
+            targets=(
+                GroupLaunchTarget(
+                    1,
+                    "主號",
+                    tmp_path / "main.lnk",
+                    window.launch_fingerprint,
+                    role_id="嘻の百級古武",
+                ),
+            ),
+        )
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+
+
 def test_canonical_character_target_change_cancels_click():
     recognizer = _CharacterSequenceRecognizer(
         lambda call: (
@@ -11411,7 +11555,7 @@ def _registered_roles():
     )
 
 
-def test_fifteen_shared_executable_windows_scroll_two_line_eights_independently():
+def test_fifteen_shared_executable_windows_click_two_line_eights_independently():
     now = [0.0]
     shared_fingerprint = "f" * 64
     windows = [
@@ -11500,24 +11644,23 @@ def test_fifteen_shared_executable_windows_scroll_two_line_eights_independently(
     assert shared_fingerprint not in monitor_fingerprints
 
     fixture.controller.reconnect()
-    scrolled = fixture.controller.reconnect()
+    clicked = fixture.controller.reconnect()
 
-    assert fixture.mouse.scrolls == [
-        (1, (0.5, 0.530), -120),
-        (2, (0.5, 0.530), -120),
+    assert fixture.mouse.scrolls == []
+    assert fixture.mouse.clicks == [
+        (1, (0.5, 0.722)),
+        (2, (0.5, 0.722)),
     ]
-    assert fixture.mouse.clicks == []
-    assert scrolled.details["clicked_windows"] == 2
+    assert clicked.details["clicked_windows"] == 2
 
     now[0] = 2.0
-    fixture.controller.reconnect()
     result = fixture.controller.reconnect()
 
     assert fixture.mouse.clicks == [
         (1, (0.5, 0.722)),
         (2, (0.5, 0.722)),
     ]
-    assert result.details["clicked_windows"] == 2
+    assert result.details["clicked_windows"] == 0
     assert now[0] < 60.0
     assert all(point != (0.5, 0.327) for _handle, point in fixture.mouse.clicks)
     assert all(handle in {1, 2} for handle, _point in fixture.mouse.clicks)
@@ -11553,7 +11696,7 @@ def test_recent_line_absence_alone_falls_back_to_line_one():
     assert fixture.mouse.scrolls == []
 
 
-def test_ambiguous_recent_line_never_scrolls_or_clicks():
+def test_ambiguous_recent_line_stays_zero_click_in_execution_chain():
     fixture = make_controller(
         [4],
         windows=[make_window(1)],

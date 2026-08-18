@@ -6983,9 +6983,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         fingerprint: str,
         item: ScreenRecognition,
     ) -> ScreenRecognition:
-        """Authorize only the line shown by the current game frame."""
+        """Authorize only the current frame's line, defaulting to line 1."""
         if item.state is not ReconnectScreenState.LINE_SELECTION:
             return item
+        if item.line_number is None:
+            # The recognizer supplies line 1 for a frame with no route label.
+            # A still-ambiguous current frame must remain fail-closed here;
+            # this stage must never invent a route or use persisted history.
+            return replace(item, click_point=None, line_scroll_delta=0)
         if (
             item.line_scroll_delta in {-120, 120}
             and item.recent_line_present is True
@@ -7155,6 +7160,37 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
 
     @classmethod
+    def _candidate_matches_target_identity(
+        cls,
+        candidate: CharacterSelectionCandidate,
+        target: GroupLaunchTarget,
+    ) -> bool:
+        """Match a visible role name to the saved target, never by level."""
+        if not isinstance(candidate.identity, str):
+            return False
+        observed = candidate.identity.strip().casefold()
+        if not observed:
+            return False
+        if observed in cls._identity_values(target):
+            return True
+        if not isinstance(target.role_id, str):
+            return False
+        target_role = target.role_id.strip().casefold()
+        return bool(target_role) and observed[:1] == target_role[:1]
+
+    @classmethod
+    def _candidate_exactly_matches_target_identity(
+        cls,
+        candidate: CharacterSelectionCandidate,
+        target: GroupLaunchTarget,
+    ) -> bool:
+        return (
+            isinstance(candidate.identity, str)
+            and candidate.identity.strip().casefold()
+            in cls._identity_values(target)
+        )
+
+    @classmethod
     def _candidate_plan_target(
         cls,
         candidate: CharacterSelectionCandidate,
@@ -7241,7 +7277,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         observed = identity.strip().casefold()
         abbreviated = observed.endswith(("…", "..."))
         observed = observed.rstrip(".…").strip()
-        if len(observed) < 3:
+        if len(observed) < 1:
             return None
         try:
             available = tuple(provider())
@@ -7257,6 +7293,16 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 else role.role_id.casefold().startswith(observed)
             )
         )
+        if not matches:
+            first = observed[:1]
+            matches = tuple(
+                role
+                for role in available
+                if (
+                    isinstance(role, RegisteredReconnectRole)
+                    and role.role_id.casefold().startswith(first)
+                )
+            )
         unique = {
             (role.role_id.casefold(), role.importance): role
             for role in matches
@@ -7338,25 +7384,22 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             exact = tuple(
                 candidate
                 for candidate in candidates
-                if isinstance(candidate.identity, str)
-                and candidate.identity.strip().casefold()
-                in self._identity_values(target)
+                if self._candidate_exactly_matches_target_identity(
+                    candidate,
+                    target,
+                )
             )
-            if len(exact) != 1:
-                if any(candidate.identity for candidate in candidates):
-                    return None
-                level = target.registered_level
+            if not exact:
                 exact = tuple(
                     candidate
                     for candidate in candidates
-                    if candidate.level == level
+                    if self._candidate_matches_target_identity(
+                        candidate,
+                        target,
+                    )
                 )
-                if (
-                    level is None
-                    or len(exact) != 1
-                    or any(candidate.level is None for candidate in candidates)
-                ):
-                    return None
+            if len(exact) != 1:
+                return None
             candidates = exact
             item = replace(item, character_candidates=candidates)
         if pending_target is not None:
@@ -7476,15 +7519,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             if plan is not None:
                 if target is None:
                     return None
-                expected_level = self._target_level(target)
-                identity_matches = bool(
-                    isinstance(selected.identity, str)
-                    and selected.identity.strip().casefold()
-                    in self._identity_values(target)
-                )
-                if not identity_matches and (
-                    expected_level is None
-                    or selected.level != expected_level
+                if not self._candidate_matches_target_identity(
+                    selected,
+                    target,
                 ):
                     return None
             return self._candidate_result(
@@ -7554,12 +7591,20 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         exact_identity = tuple(
             candidate
             for candidate in candidates
-            if (
-                isinstance(candidate.identity, str)
-                and candidate.identity.strip().casefold()
-                in self._identity_values(target)
+            if self._candidate_exactly_matches_target_identity(
+                candidate,
+                target,
             )
         )
+        if not exact_identity:
+            exact_identity = tuple(
+                candidate
+                for candidate in candidates
+                if self._candidate_matches_target_identity(
+                    candidate,
+                    target,
+                )
+            )
         if len(exact_identity) == 1:
             selected = exact_identity[0]
             if (
@@ -7575,127 +7620,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 target.role_id.casefold(),
             )
 
-        selected_candidates = tuple(
-            candidate for candidate in candidates if candidate.selected
-        )
-        if (
-            len(selected_candidates) == 1
-            and expected_level is not None
-            and selected_candidates[0].level == expected_level
-        ):
-            return self._candidate_result(
-                item,
-                selected_candidates[0],
-                target.importance,
-                target.role_id.casefold(),
-            )
-
-        expected_level_candidates = tuple(
-            candidate
-            for candidate in candidates
-            if (
-                expected_level is not None
-                and candidate.level == expected_level
-            )
-        )
-        unknown_competitor = any(
-            candidate.level is None
-            and (
-                candidate.digit_count is None
-                or (
-                    expected_level is not None
-                    and candidate.digit_count
-                    >= len(str(expected_level))
-                )
-            )
-            for candidate in candidates
-        )
-        if len(expected_level_candidates) == 1 and not unknown_competitor:
-            return self._candidate_result(
-                item,
-                expected_level_candidates[0],
-                target.importance,
-                target.role_id.casefold(),
-            )
-        if expected_level is not None:
-            # A registered original-role level is authoritative. If the
-            # current frame cannot prove that role, fail closed instead of
-            # silently choosing a different, merely highest visible role.
-            return None
-
-        known_levels = tuple(
-            candidate
-            for candidate in candidates
-            if candidate.level is not None
-        )
-        if not known_levels:
-            return None
-        highest_level = max(
-            candidate.level
-            for candidate in known_levels
-            if candidate.level is not None
-        )
-        highest_digit_count = len(str(highest_level))
-        if any(
-            candidate.level is None
-            and (
-                candidate.digit_count is None
-                or candidate.digit_count >= highest_digit_count
-            )
-            for candidate in candidates
-        ):
-            return None
-        highest = tuple(
-            candidate
-            for candidate in known_levels
-            if candidate.level == highest_level
-        )
-        if len(highest) == 1:
-            selected = highest[0]
-            resolved = self._candidate_plan_target(selected, plan)
-            return self._candidate_result(
-                item,
-                selected,
-                (
-                    resolved.importance
-                    if resolved is not None
-                    else selected.importance
-                ),
-                (
-                    resolved.role_id.casefold()
-                    if resolved is not None
-                    else target.role_id.casefold()
-                ),
-            )
-
-        ranked: list[
-            tuple[int, int, CharacterSelectionCandidate, object]
-        ] = []
-        for candidate in highest:
-            resolved = self._candidate_plan_target(candidate, plan)
-            if resolved is None or resolved.importance is None:
-                return None
-            ranked.append(
-                (
-                    character_importance_rank(resolved.importance),
-                    resolved.order,
-                    candidate,
-                    resolved,
-                )
-            )
-        ranked.sort(key=lambda value: (value[0], value[1]))
-        if len(ranked) < 1 or (
-            len(ranked) > 1
-            and ranked[0][:2] == ranked[1][:2]
-        ):
-            return None
-        _importance_rank, _order, selected, resolved = ranked[0]
-        return self._candidate_result(
-            item,
-            selected,
-            resolved.importance,
-            resolved.role_id.casefold(),
-        )
+        # A full candidate list without a uniquely matched role name is not
+        # actionable.  Level, selected state, slot order, and importance are
+        # never substitutes for the saved character identity.
+        return None
 
     def _recognition_for_session_action(
         self,

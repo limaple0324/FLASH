@@ -223,9 +223,19 @@ from services.window_size_adjustment_service import (
     WindowSizeAdjustmentService,
 )
 from services.game_time_timed_click_service import (
+    DEFAULT_TIMED_CLICK_INTERVAL_MS,
+    DEFAULT_TIMED_CLICK_LEAD_MS,
+    DEFAULT_TIMED_CLICK_REPEAT_COUNT,
+    DEFAULT_TIMED_CLICK_TARGET_TIME,
     GameTimeTimedClickResult,
     GameTimeTimedClickService,
     clamp_time_offset_ms,
+)
+from services.server_clock import ServerClock, ServerTimeSourceIdentity
+from services.server_time_bridge import (
+    ProcessMemoryServerTimeReader,
+    ServerTimeBridge,
+    ServerTimeBridgeServer,
 )
 from services.keyboard_sync_monitor import (
     KeyboardSyncMonitor,
@@ -1468,10 +1478,10 @@ def build_services(
             GAME_TIME_OFFSET_MS_KEY: 0,
             GAME_TIME_AUTO_UPDATE_KEY: True,
             TIMED_CLICK_SETTINGS_KEY: {
-                "target_time": "",
-                "lead_ms": 120,
-                "repeat_count": 2,
-                "repeat_interval_ms": 250,
+                "target_time": DEFAULT_TIMED_CLICK_TARGET_TIME,
+                "lead_ms": DEFAULT_TIMED_CLICK_LEAD_MS,
+                "repeat_count": DEFAULT_TIMED_CLICK_REPEAT_COUNT,
+                "repeat_interval_ms": DEFAULT_TIMED_CLICK_INTERVAL_MS,
             },
         }
     )
@@ -2211,6 +2221,192 @@ def build_services(
     return paths, logger
 
 
+def register_server_time_services(
+    group_window_backend,
+    registry: WindowRegistry,
+    *,
+    managed_process_service=None,
+    group_configuration_service=None,
+    group_launch_service=None,
+    start_listener: bool = True,
+    start_memory_reader: bool = True,
+    listener_port: int = 37842,
+) -> tuple[ServerClock, ServerTimeBridge]:
+    """接上唯讀遊戲時間服務，不建立任何遊戲操作能力。"""
+
+    def revalidated_source(identity: ServerTimeSourceIdentity) -> bool:
+        """只接受可由既有組別與角色資料唯一重建的現行視窗。"""
+        if (
+            group_configuration_service is None
+            or group_launch_service is None
+            or managed_process_service is None
+        ):
+            return False
+        records = getattr(managed_process_service, "_records", None)
+        if not isinstance(records, dict):
+            return False
+        try:
+            groups = tuple(group_configuration_service.groups())
+        except Exception:
+            return False
+        candidates: dict[tuple[str, str], tuple[set[str], GroupLaunchTarget]] = {}
+        for group in groups:
+            try:
+                plan = group_launch_service.plan(group.name)
+            except Exception:
+                return False
+            if not plan.ready:
+                continue
+            target = plan.target_for_fingerprint(identity.fingerprint)
+            if target is None or not target.entry_id:
+                continue
+            key = (target.entry_id, target.fingerprint)
+            if key not in candidates:
+                candidates[key] = (set(), target)
+            candidates[key][0].add(group.name)
+        if len(candidates) != 1:
+            return False
+        group_names, target = next(iter(candidates.values()))
+        try:
+            registered = registry.get(target.entry_id)
+        except KeyError:
+            return False
+        if registered.display_name != target.display_name:
+            return False
+        managed_matches = tuple(
+            record
+            for record in records.values()
+            if getattr(record, "launch_fingerprint", None)
+            == identity.fingerprint
+            and getattr(record, "group_name", None) in group_names
+            and getattr(record, "role_name", None) == target.display_name
+        )
+        return len(managed_matches) == 1
+
+    def valid_source(identity: ServerTimeSourceIdentity) -> bool:
+        if group_window_backend is None:
+            return False
+        try:
+            windows = tuple(group_window_backend.list_windows())
+        except Exception:
+            return False
+        matches = tuple(
+            window
+            for window in windows
+            if window.handle == identity.handle
+            and window.process_id == identity.process_id
+            and window.thread_id == identity.thread_id
+            and window.process_lifecycle_token == identity.lifecycle
+            and window.launch_fingerprint == identity.fingerprint
+        )
+        if len(matches) != 1:
+            return False
+        registry_match = any(
+            record.confirmed
+            and record.handle == identity.handle
+            and record.process_id == identity.process_id
+            for record in registry.all()
+        )
+        records = getattr(managed_process_service, "_records", None)
+        if isinstance(records, dict) and registry_match:
+            managed_matches = tuple(
+                record
+                for record in records.values()
+                if getattr(record, "window_handle", None) == identity.handle
+                and getattr(record, "process_id", None) == identity.process_id
+                and getattr(record, "launch_fingerprint", None)
+                == identity.fingerprint
+            )
+            if len(managed_matches) == 1:
+                return True
+        return revalidated_source(identity)
+
+    def resolve_transport_source(process_id: int) -> ServerTimeSourceIdentity | None:
+        if isinstance(process_id, bool) or not isinstance(process_id, int) or process_id <= 0:
+            return None
+        if group_window_backend is None:
+            return None
+        try:
+            windows = tuple(group_window_backend.list_windows())
+        except Exception:
+            return None
+        identities: list[ServerTimeSourceIdentity] = []
+        for window in windows:
+            if getattr(window, "process_id", None) != process_id:
+                continue
+            try:
+                identity = ServerTimeSourceIdentity(
+                    handle=window.handle,
+                    process_id=window.process_id,
+                    thread_id=window.thread_id,
+                    lifecycle=window.process_lifecycle_token,
+                    fingerprint=window.launch_fingerprint,
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if valid_source(identity):
+                identities.append(identity)
+        return identities[0] if len(identities) == 1 else None
+
+    def current_server_time_windows() -> tuple[object, ...]:
+        """每輪只交出當下可由正式身分鏈唯一確認的遊戲視窗。"""
+        if group_window_backend is None:
+            return ()
+        try:
+            windows = tuple(group_window_backend.list_windows())
+        except Exception:
+            return ()
+        accepted: list[object] = []
+        for window in windows:
+            try:
+                identity = ServerTimeSourceIdentity(
+                    handle=window.handle,
+                    process_id=window.process_id,
+                    thread_id=window.thread_id,
+                    lifecycle=window.process_lifecycle_token,
+                    fingerprint=window.launch_fingerprint,
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if valid_source(identity):
+                accepted.append(window)
+        return tuple(accepted)
+
+    server_clock = ServerClock(source_validator=valid_source)
+    server_time_bridge = ServerTimeBridge(
+        server_clock,
+        source_validator=valid_source,
+        transport_identity_resolver=resolve_transport_source,
+    )
+    AppContext.register(ServerClock, server_clock)
+    AppContext.register(ServerTimeBridge, server_time_bridge)
+    bridge_server = ServerTimeBridgeServer(
+        server_time_bridge,
+        port=listener_port,
+    )
+    if start_listener:
+        bridge_server.start()
+    AppContext.register(ServerTimeBridgeServer, bridge_server)
+    memory_reader = ProcessMemoryServerTimeReader(
+        current_server_time_windows,
+        server_time_bridge,
+    )
+    if start_memory_reader:
+        memory_reader.start()
+    AppContext.register(ProcessMemoryServerTimeReader, memory_reader)
+    return server_clock, server_time_bridge
+
+
+def shutdown_server_time_services() -> None:
+    """停止唯讀時間橋接接收器，不觸碰任何遊戲視窗。"""
+    memory_reader = AppContext.get(ProcessMemoryServerTimeReader)
+    if memory_reader is not None:
+        memory_reader.stop()
+    bridge_server = AppContext.get(ServerTimeBridgeServer)
+    if bridge_server is not None:
+        bridge_server.stop()
+
+
 def save_registry(logger: LoggerService | None = None) -> None:
     """Persist the current registry without trusting stale handles on next load."""
     store = AppContext.get(WindowRegistryStore)
@@ -2733,6 +2929,19 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
         if group_launch_service is not None
         else None
     )
+    managed_process_service = (
+        ManagedGameProcessService(
+            paths.data_dir() / MANAGED_GAME_PROCESS_FILENAME,
+            group_window_backend,
+            record_callback=(
+                operation_record_store.append
+                if operation_record_store is not None
+                else None
+            ),
+        )
+        if group_window_backend is not None
+        else None
+    )
     group_window_launch_service = (
         GroupWindowLaunchService(
             group_launch_service,
@@ -2748,18 +2957,18 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
                 if group_configuration_service is not None
                 else None
             ),
-            managed_process_service=ManagedGameProcessService(
-                paths.data_dir() / MANAGED_GAME_PROCESS_FILENAME,
-                group_window_backend,
-                record_callback=(
-                    operation_record_store.append
-                    if operation_record_store is not None
-                    else None
-                ),
-            ),
+            managed_process_service=managed_process_service,
         )
         if group_launch_service is not None
         else None
+    )
+
+    register_server_time_services(
+        group_window_backend,
+        registry,
+        managed_process_service=managed_process_service,
+        group_configuration_service=group_configuration_service,
+        group_launch_service=group_launch_service,
     )
     window_size_adjustment_service = (
         WindowSizeAdjustmentService(
@@ -2825,6 +3034,7 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
             allowed_fingerprints_provider=current_timed_click_fingerprints,
             result_callback=complete_timed_click_result,
             operation_gate=game_operation_gate,
+            server_clock=AppContext.get(ServerClock),
         )
         if group_window_backend is not None
         else None
@@ -5512,10 +5722,14 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
     )
     if not isinstance(raw_timed_click_settings, dict):
         raw_timed_click_settings = {}
-    configured_timed_click_target = (
+    raw_configured_timed_click_target = (
         raw_timed_click_settings.get("target_time", "")
         if isinstance(raw_timed_click_settings.get("target_time", ""), str)
         else ""
+    )
+    configured_timed_click_target = (
+        raw_configured_timed_click_target.strip()
+        or DEFAULT_TIMED_CLICK_TARGET_TIME
     )
 
     def bounded_timed_setting(
@@ -5532,20 +5746,20 @@ def create_main_window(status: dict[str, object], paths: PathManager) -> Tk:
 
     configured_timed_click_lead = bounded_timed_setting(
         "lead_ms",
-        120,
-        0,
+        DEFAULT_TIMED_CLICK_LEAD_MS,
+        -5_000,
         5_000,
     )
     configured_timed_click_repeat = bounded_timed_setting(
         "repeat_count",
-        2,
+        DEFAULT_TIMED_CLICK_REPEAT_COUNT,
         1,
         10,
     )
     configured_timed_click_interval = bounded_timed_setting(
         "repeat_interval_ms",
-        250,
-        50,
+        DEFAULT_TIMED_CLICK_INTERVAL_MS,
+        0,
         3_000,
     )
 
@@ -6838,6 +7052,14 @@ def _run_application(
             print(details, file=sys.stderr)
         return 1
     finally:
+        try:
+            shutdown_server_time_services()
+        except Exception:
+            if logger is not None:
+                logger.error(
+                    "Server time bridge shutdown failed:\n"
+                    f"{traceback.format_exc()}"
+                )
         try:
             shutdown_smart_reconnect_monitor(logger)
         except Exception:

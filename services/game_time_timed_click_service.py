@@ -6,6 +6,7 @@ import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import date
 from typing import Protocol
 
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
@@ -13,20 +14,25 @@ from services.game_operation_gate import (
     GameOperationGate,
     GameOperationLease,
 )
+from services.server_clock import ServerClock
 
 
 DAY_MS = 86_400_000
-HALF_DAY_MS = DAY_MS // 2
 MIN_TIME_OFFSET_MS = -60_000
 MAX_TIME_OFFSET_MS = 60_000
-MIN_TIMED_CLICK_LEAD_MS = 0
+MIN_TIMED_CLICK_LEAD_MS = -5_000
 MAX_TIMED_CLICK_LEAD_MS = 5_000
 MIN_TIMED_CLICK_REPEAT_COUNT = 1
 MAX_TIMED_CLICK_REPEAT_COUNT = 10
-MIN_TIMED_CLICK_INTERVAL_MS = 50
+MIN_TIMED_CLICK_INTERVAL_MS = 0
 MAX_TIMED_CLICK_INTERVAL_MS = 3_000
+DEFAULT_TIMED_CLICK_TARGET_TIME = "08:00:00.000"
+DEFAULT_TIMED_CLICK_LEAD_MS = 0
+DEFAULT_TIMED_CLICK_REPEAT_COUNT = 3
+DEFAULT_TIMED_CLICK_INTERVAL_MS = 0
 TIMED_CLICK_POLL_MS = 5
 TIMED_CLICK_TRIGGER_WINDOW_MS = 8
+TIMED_CLICK_LATE_WINDOW_MS = 1_000
 TIMED_CLICK_PRESS_MS = 35
 
 
@@ -75,7 +81,7 @@ class TimedClickBackend(Protocol):
 class GameTimeTimedClickSnapshot:
     offset_ms: int
     auto_update: bool
-    current_time_ms: int
+    current_time_ms: int | None
     current_time_text: str
     target: TimedClickTarget | None
     enabled: bool
@@ -85,6 +91,7 @@ class GameTimeTimedClickSnapshot:
     repeat_interval_ms: int
     sent_count: int
     status: str
+    source: str = "系統時間"
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +173,7 @@ class GameTimeTimedClickService:
         wall_clock_ns: Callable[[], int] = time.time_ns,
         localtime: Callable[[float | None], time.struct_time] = time.localtime,
         operation_gate: GameOperationGate | None = None,
+        server_clock: ServerClock | None = None,
     ) -> None:
         self._backend = backend
         self._schedule = schedule
@@ -175,17 +183,20 @@ class GameTimeTimedClickService:
         self._wall_clock_ns = wall_clock_ns
         self._localtime = localtime
         self._operation_gate = operation_gate
+        self._server_clock = server_clock
         self._offset_ms = 0
         self._auto_update = True
         self._target: TimedClickTarget | None = None
         self._enabled = False
         self._target_time_ms: int | None = None
-        self._lead_ms = 120
-        self._repeat_count = 2
-        self._repeat_interval_ms = 250
+        self._lead_ms = DEFAULT_TIMED_CLICK_LEAD_MS
+        self._repeat_count = DEFAULT_TIMED_CLICK_REPEAT_COUNT
+        self._repeat_interval_ms = DEFAULT_TIMED_CLICK_INTERVAL_MS
         self._sent_count = 0
         self._status = "定時按下：未啟用"
         self._poll_handle: object | None = None
+        self._next_trigger_ms: int | None = None
+        self._firing = False
         self._scheduled_handles: list[object] = []
         self._active_receipts: list[TimedClickPressReceipt] = []
         self._active_operation_leases: dict[int, GameOperationLease] = {}
@@ -196,11 +207,15 @@ class GameTimeTimedClickService:
         offset_ms: object,
         auto_update: object,
     ) -> GameTimeTimedClickSnapshot:
-        self._offset_ms = clamp_time_offset_ms(offset_ms)
+        self._offset_ms = (
+            0 if self._server_clock is not None else clamp_time_offset_ms(offset_ms)
+        )
         self._auto_update = bool(auto_update)
         return self.snapshot()
 
-    def current_time_ms(self) -> int:
+    def _absolute_time_ms(self) -> int | None:
+        if self._server_clock is not None:
+            return self._server_clock.now_ms()
         now_ns = int(self._wall_clock_ns())
         now_seconds = now_ns // 1_000_000_000
         local = self._localtime(float(now_seconds))
@@ -208,7 +223,12 @@ class GameTimeTimedClickService:
             ((local.tm_hour * 60 + local.tm_min) * 60 + local.tm_sec) * 1000
             + (now_ns // 1_000_000) % 1000
         )
-        return (total_ms + self._offset_ms) % DAY_MS
+        day_number = date(local.tm_year, local.tm_mon, local.tm_mday).toordinal()
+        return day_number * DAY_MS + total_ms + self._offset_ms
+
+    def current_time_ms(self) -> int | None:
+        absolute = self._absolute_time_ms()
+        return None if absolute is None else absolute % DAY_MS
 
     def snapshot(self) -> GameTimeTimedClickSnapshot:
         current = self.current_time_ms()
@@ -216,7 +236,11 @@ class GameTimeTimedClickService:
             offset_ms=self._offset_ms,
             auto_update=self._auto_update,
             current_time_ms=current,
-            current_time_text=game_time_ms_to_text(current),
+            current_time_text=(
+                game_time_ms_to_text(current)
+                if current is not None
+                else "尚未校正"
+            ),
             target=self._target,
             enabled=self._enabled,
             target_time_ms=self._target_time_ms,
@@ -225,6 +249,11 @@ class GameTimeTimedClickService:
             repeat_interval_ms=self._repeat_interval_ms,
             sent_count=self._sent_count,
             status=self._status,
+            source=(
+                "遊戲伺服器時間"
+                if self._server_clock is not None
+                else "系統時間"
+            ),
         )
 
     def _result(
@@ -313,9 +342,9 @@ class GameTimeTimedClickService:
         self,
         target_time: object,
         *,
-        lead_ms: object = 120,
-        repeat_count: object = 2,
-        repeat_interval_ms: object = 250,
+        lead_ms: object = DEFAULT_TIMED_CLICK_LEAD_MS,
+        repeat_count: object = DEFAULT_TIMED_CLICK_REPEAT_COUNT,
+        repeat_interval_ms: object = DEFAULT_TIMED_CLICK_INTERVAL_MS,
     ) -> GameTimeTimedClickResult:
         target_ms = parse_target_time_ms(target_time)
         lead = self._bounded_integer(
@@ -344,7 +373,7 @@ class GameTimeTimedClickService:
             return self._result(
                 False,
                 "arm",
-                "提前毫秒必須介於 0 到 5000。",
+                "時間校正必須介於 -5000 到 5000 毫秒。",
                 "lead_ms_invalid",
             )
         if repeats is None:
@@ -358,7 +387,7 @@ class GameTimeTimedClickService:
             return self._result(
                 False,
                 "arm",
-                "連點間隔必須介於 50 到 3000 毫秒。",
+                "連點間隔必須介於 0 到 3000 毫秒。",
                 "repeat_interval_invalid",
             )
         if self._target is None:
@@ -367,6 +396,14 @@ class GameTimeTimedClickService:
                 "arm",
                 "請先設定要按下的按鈕位置。",
                 "target_unavailable",
+            )
+        now_ms = self._absolute_time_ms()
+        if now_ms is None:
+            return self._result(
+                False,
+                "arm",
+                "尚未取得遊戲伺服器時間，沒有啟用定時按下。",
+                "server_time_uncalibrated",
             )
         allowed = self._allowed_fingerprints()
         if self._target.fingerprint not in allowed:
@@ -382,9 +419,16 @@ class GameTimeTimedClickService:
         self._repeat_count = repeats
         self._repeat_interval_ms = interval
         self._sent_count = 0
+        trigger_time_ms = target_ms - lead
+        day_start_ms = (now_ms // DAY_MS) * DAY_MS
+        next_trigger_ms = day_start_ms + trigger_time_ms
+        if next_trigger_ms < now_ms - TIMED_CLICK_TRIGGER_WINDOW_MS:
+            next_trigger_ms += DAY_MS
+        self._next_trigger_ms = next_trigger_ms
+        self._firing = False
         self._enabled = True
         self._auto_update = True
-        self._status = "定時按下已啟用。"
+        self._status = "每日定時按下已啟用。"
         result = self._result(True, "arm", self._status)
         self._schedule_poll()
         return result
@@ -422,6 +466,8 @@ class GameTimeTimedClickService:
         message: str = "定時按下：未啟用",
     ) -> GameTimeTimedClickResult:
         self._enabled = False
+        self._firing = False
+        self._next_trigger_ms = None
         self._cancel_handle(self._poll_handle)
         self._poll_handle = None
         for handle in tuple(self._scheduled_handles):
@@ -448,17 +494,37 @@ class GameTimeTimedClickService:
         self.cancel(notify=False)
         self._target = None
 
+    @staticmethod
+    def _poll_delay_ms(remaining_ms: int) -> int:
+        if remaining_ms > 60_000:
+            return min(1_000, remaining_ms - 60_000)
+        if remaining_ms > 1_000:
+            return min(100, remaining_ms - 1_000)
+        if remaining_ms > 50:
+            return max(1, remaining_ms - TIMED_CLICK_TRIGGER_WINDOW_MS)
+        return 1
+
     def _schedule_poll(self) -> None:
         if not self._enabled or self._poll_handle is not None:
             return
+        now_ms = self._absolute_time_ms()
+        remaining_ms = (
+            TIMED_CLICK_POLL_MS
+            if now_ms is None or self._next_trigger_ms is None
+            else max(1, self._next_trigger_ms - now_ms)
+        )
         self._poll_handle = self._schedule(
-            TIMED_CLICK_POLL_MS,
+            self._poll_delay_ms(remaining_ms),
             self.poll,
         )
 
     def poll(self) -> GameTimeTimedClickResult:
         self._poll_handle = None
-        if not self._enabled or self._target_time_ms is None:
+        if (
+            not self._enabled
+            or self._target_time_ms is None
+            or self._next_trigger_ms is None
+        ):
             return self._result(
                 False,
                 "poll",
@@ -466,18 +532,25 @@ class GameTimeTimedClickService:
                 "timed_click_disabled",
                 notify=False,
             )
-        now_ms = self.current_time_ms()
-        click_ms = (self._target_time_ms - self._lead_ms) % DAY_MS
-        remaining = (click_ms - now_ms + DAY_MS) % DAY_MS
-        if remaining > HALF_DAY_MS:
+        now_ms = self._absolute_time_ms()
+        if now_ms is None:
             self._enabled = False
-            self._status = "定時按下：目標已過"
+            self._status = "定時按下：遊戲伺服器時間尚未校正。"
             return self._result(
                 False,
                 "poll",
                 self._status,
-                "target_time_passed",
+                "server_time_uncalibrated",
             )
+        remaining = self._next_trigger_ms - now_ms
+        if remaining < -TIMED_CLICK_LATE_WINDOW_MS:
+            missed_days = ((-remaining) // DAY_MS) + 1
+            self._next_trigger_ms += missed_days * DAY_MS
+            remaining = self._next_trigger_ms - now_ms
+            self._status = "定時按下：今日時點已錯過，等待下一次。"
+            result = self._result(True, "poll", self._status)
+            self._schedule_poll()
+            return result
         if remaining <= TIMED_CLICK_TRIGGER_WINDOW_MS:
             return self._fire(now_ms)
         self._status = f"定時按下：剩 {remaining} ms"
@@ -493,7 +566,8 @@ class GameTimeTimedClickService:
     def _fire(self, now_ms: int) -> GameTimeTimedClickResult:
         target = self._target
         target_ms = self._target_time_ms
-        if target is None or target_ms is None:
+        scheduled_trigger_ms = self._next_trigger_ms
+        if target is None or target_ms is None or scheduled_trigger_ms is None:
             self._enabled = False
             self._status = "定時按下失敗：按鈕位置不存在。"
             return self._result(
@@ -512,14 +586,12 @@ class GameTimeTimedClickService:
                 self._status,
                 "target_not_in_current_group",
             )
-        self._enabled = False
         self._poll_handle = None
-        for index in range(self._repeat_count):
-            self._schedule_tracked(
-                index * self._repeat_interval_ms,
-                lambda target=target: self._press_once(target),
-            )
-        delta = now_ms - target_ms
+        self._firing = True
+        self._sent_count = 0
+        self._next_trigger_ms = scheduled_trigger_ms + DAY_MS
+        self._schedule_tracked(0, lambda target=target: self._press_once(target))
+        delta = now_ms - scheduled_trigger_ms
         self._status = (
             f"定時按下：準備連點 {self._repeat_count} 次；"
             f"目前差值 {delta} ms。"
@@ -536,6 +608,9 @@ class GameTimeTimedClickService:
             else None
         )
         if self._operation_gate is not None and lease is None:
+            self._enabled = False
+            self._firing = False
+            self._next_trigger_ms = None
             self._status = "定時按下失敗：目前有其他遊戲操作。"
             self._result(
                 False,
@@ -556,6 +631,9 @@ class GameTimeTimedClickService:
                 lease.release()
             raise
         if receipt is None:
+            self._enabled = False
+            self._firing = False
+            self._next_trigger_ms = None
             if lease is not None:
                 lease.release()
             for handle in tuple(self._scheduled_handles):
@@ -592,6 +670,9 @@ class GameTimeTimedClickService:
         if receipt in self._active_receipts:
             self._active_receipts.remove(receipt)
         if not released:
+            self._enabled = False
+            self._firing = False
+            self._next_trigger_ms = None
             self._status = "定時按下失敗：滑鼠放開訊息未送達。"
             self._result(
                 False,
@@ -599,10 +680,28 @@ class GameTimeTimedClickService:
                 self._status,
                 "target_release_failed",
             )
-        elif (
-            self._sent_count >= self._repeat_count
-            and not self._active_receipts
-            and not self._scheduled_handles
-        ):
-            self._status = f"定時按下：已完成 {self._sent_count} 次"
+        elif self._sent_count < self._repeat_count:
+            target = self._target
+            if target is None:
+                self._enabled = False
+                self._firing = False
+                self._next_trigger_ms = None
+                self._status = "定時按下失敗：按鈕位置不存在。"
+                self._result(
+                    False,
+                    "press",
+                    self._status,
+                    "target_unavailable",
+                )
+                return
+            self._schedule_tracked(
+                self._repeat_interval_ms,
+                lambda target=target: self._press_once(target),
+            )
+        elif not self._active_receipts and not self._scheduled_handles:
+            self._firing = False
+            self._status = (
+                f"定時按下：今日已完成 {self._sent_count} 次，等待明日。"
+            )
             self._result(True, "complete", self._status)
+            self._schedule_poll()

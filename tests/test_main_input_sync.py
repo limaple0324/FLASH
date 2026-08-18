@@ -1477,10 +1477,10 @@ def test_build_services_registers_input_controller_and_safe_default(tmp_path):
     assert config.get(UI_THEME_KEY) == "classic_gold"
     assert config.get(UI_THEME_CLASSIC_GOLD_MIGRATION_KEY) is True
     assert config.get(TIMED_CLICK_SETTINGS_KEY) == {
-        "target_time": "",
-        "lead_ms": 120,
-        "repeat_count": 2,
-        "repeat_interval_ms": 250,
+        "target_time": "08:00:00.000",
+        "lead_ms": 0,
+        "repeat_count": 3,
+        "repeat_interval_ms": 0,
     }
     assert isinstance(controller, WindowsInputSyncController)
     assert isinstance(pointer, WindowsPointerSyncController)

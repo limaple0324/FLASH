@@ -1040,9 +1040,21 @@ class ReferenceScreenRecognizer:
         route_number, route_score = self._recognize_route_number(candidate)
         recent_present = self._recent_login_information_present(candidate)
         if route_number is None:
-            if recent_present:
-                # Existing but ambiguous text is never treated as absence.
-                return None, None, True, self._recent_login_role(candidate), 0
+            if route_score == 255.0:
+                # A visible but contradictory route label is not the same as
+                # missing route information; keep the safety stop for that
+                # frame instead of inventing line 1.
+                return (
+                    None,
+                    None,
+                    recent_present,
+                    self._recent_login_role(candidate),
+                    0,
+                )
+            # The current frame is the only line-selection source.  When the
+            # frame does not expose a readable ``線路：N`` value, the product
+            # rule is the explicit line-1 default; a partially readable
+            # recent-login block must not turn that default into a no-op.
             route_number = 1
 
         visible = self._visible_line_buttons(candidate)
@@ -1071,13 +1083,30 @@ class ReferenceScreenRecognizer:
                 self._recent_login_role(candidate),
                 0,
             )
-        if not recent_present and route_number == 1:
-            # The explicit absence fallback is the only fixed-line rule.
+        if route_number in LINE_ROUTE_CLICK_POINTS:
+            # The recent-login route is the current frame's authoritative
+            # selection. If row OCR misses that row while the line-selection
+            # structure is already trusted, use its calibrated point instead
+            # of converting a readable route into a scroll-only action.
+            return (
+                route_number,
+                LINE_ROUTE_CLICK_POINTS[route_number],
+                recent_present,
+                self._recent_login_role(candidate),
+                0,
+            )
+        if route_number == 1 and route_score != 255.0:
+            # The explicit line-1 point is also used when the current frame
+            # has no uniquely readable row for the default route.
             return (
                 1,
                 LINE_ROUTE_CLICK_POINTS[1],
-                False,
-                None,
+                recent_present,
+                (
+                    self._recent_login_role(candidate)
+                    if recent_present
+                    else None
+                ),
                 0,
             )
 

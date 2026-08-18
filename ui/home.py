@@ -96,6 +96,10 @@ from services.window_size_adjustment_service import (
     WindowSizeAdjustmentResult,
 )
 from services.game_time_timed_click_service import (
+    DEFAULT_TIMED_CLICK_INTERVAL_MS,
+    DEFAULT_TIMED_CLICK_LEAD_MS,
+    DEFAULT_TIMED_CLICK_REPEAT_COUNT,
+    DEFAULT_TIMED_CLICK_TARGET_TIME,
     GameTimeTimedClickResult,
     GameTimeTimedClickSnapshot,
     MAX_TIME_OFFSET_MS,
@@ -720,10 +724,10 @@ class HomeView:
         ) = None,
         game_time_offset_ms: int = 0,
         game_time_auto_update: bool = True,
-        timed_click_target_time: str = "",
-        timed_click_lead_ms: int = 120,
-        timed_click_repeat_count: int = 2,
-        timed_click_repeat_interval_ms: int = 250,
+        timed_click_target_time: str = DEFAULT_TIMED_CLICK_TARGET_TIME,
+        timed_click_lead_ms: int = DEFAULT_TIMED_CLICK_LEAD_MS,
+        timed_click_repeat_count: int = DEFAULT_TIMED_CLICK_REPEAT_COUNT,
+        timed_click_repeat_interval_ms: int = DEFAULT_TIMED_CLICK_INTERVAL_MS,
         game_time_snapshot_provider: (
             Callable[[], GameTimeTimedClickSnapshot] | None
         ) = None,
@@ -1058,25 +1062,26 @@ class HomeView:
         self.timed_click_target_time = (
             timed_click_target_time.strip()
             if isinstance(timed_click_target_time, str)
-            else ""
+            and timed_click_target_time.strip()
+            else DEFAULT_TIMED_CLICK_TARGET_TIME
         )
         self.timed_click_lead_ms = (
             timed_click_lead_ms
             if isinstance(timed_click_lead_ms, int)
-            and 0 <= timed_click_lead_ms <= 5_000
-            else 120
+            and -5_000 <= timed_click_lead_ms <= 5_000
+            else DEFAULT_TIMED_CLICK_LEAD_MS
         )
         self.timed_click_repeat_count = (
             timed_click_repeat_count
             if isinstance(timed_click_repeat_count, int)
             and 1 <= timed_click_repeat_count <= 10
-            else 2
+            else DEFAULT_TIMED_CLICK_REPEAT_COUNT
         )
         self.timed_click_repeat_interval_ms = (
             timed_click_repeat_interval_ms
             if isinstance(timed_click_repeat_interval_ms, int)
-            and 50 <= timed_click_repeat_interval_ms <= 3_000
-            else 250
+            and 0 <= timed_click_repeat_interval_ms <= 3_000
+            else DEFAULT_TIMED_CLICK_INTERVAL_MS
         )
         self.game_time_snapshot_provider = game_time_snapshot_provider
         self.on_game_time_settings_change = on_game_time_settings_change
@@ -1420,6 +1425,7 @@ class HomeView:
         self._game_time_offset_entry: Entry | None = None
         self._game_time_auto_variable: IntVar | None = None
         self._game_time_title_label: Label | None = None
+        self._game_time_source_label: Label | None = None
         self._game_time_value_label: Label | None = None
         self._game_time_after_id: str | None = None
         self._timed_click_target_entry: Entry | None = None
@@ -5309,14 +5315,15 @@ class HomeView:
             title="遊戲時間設定",
         )
         card.pack(fill=X, pady=(10, 0))
-        Label(
+        self._game_time_source_label = Label(
             card,
             text="來源：系統時間",
             font=("Microsoft JhengHei UI", 10),
             bg=SURFACE,
             fg=MUTED,
             anchor="w",
-        ).pack(fill=X)
+        )
+        self._game_time_source_label.pack(fill=X)
         row = Frame(card, bg=SURFACE)
         row.pack(fill=X, pady=(8, 0))
         Label(
@@ -5406,7 +5413,7 @@ class HomeView:
             ipady=5,
         )
         for label_text, attribute, initial, width in (
-            ("提前ms", "_timed_click_lead_entry", self.timed_click_lead_ms, 7),
+            ("校正ms", "_timed_click_lead_entry", self.timed_click_lead_ms, 7),
             ("連點", "_timed_click_repeat_entry", self.timed_click_repeat_count, 5),
             (
                 "間隔ms",
@@ -5477,8 +5484,8 @@ class HomeView:
         self._hint_label(
             card,
             text=(
-                "設定位置後才可啟用；只操作該唯一角色視窗，"
-                "不切換、不啟用、不移動其他視窗。"
+                "每日執行一次；校正正值提前、負值延後。"
+                "每次都是完整按下與放開，連點間隔 0 代表不中斷接續。"
             ),
             font=("Microsoft JhengHei UI", 9),
             bg=SURFACE,
@@ -6067,6 +6074,10 @@ class HomeView:
                 text=snapshot.current_time_text,
                 fg="#FFFFFF",
             )
+            if self._game_time_source_label is not None:
+                self._game_time_source_label.configure(
+                    text=f"來源：{snapshot.source}",
+                )
         self._schedule_game_time_tick()
 
     def _apply_game_time_settings(self) -> None:

@@ -870,8 +870,8 @@ def test_each_confirmed_reference_classifies_to_its_declared_state():
         if definition.state is ReconnectScreenState.LINE_SELECTION:
             assert result.line_number == 8
             assert result.recent_line_present is True
-            assert result.click_point is None
-            assert result.line_scroll_delta == -120
+            assert result.click_point == LINE_ROUTE_CLICK_POINTS[8]
+            assert result.line_scroll_delta == 0
         elif definition.state is ReconnectScreenState.CHARACTER_SELECTION:
             assert result.character_level == 100
             assert result.character_importance is None
@@ -937,8 +937,8 @@ def test_live_line_dialog_requires_three_fixed_regions_and_keeps_recent_line():
     assert result.state is ReconnectScreenState.LINE_SELECTION
     assert result.line_number != 1
     assert result.recent_line_present is True
-    assert result.click_point is None
-    assert result.line_scroll_delta in {0, -120}
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[result.line_number]
+    assert result.line_scroll_delta == 0
 
 
 def test_live_connected_hud_is_zero_input_connected_evidence():
@@ -2192,7 +2192,7 @@ def test_line_selection_does_not_replace_recent_line_with_first_line():
     assert result.state is ReconnectScreenState.LINE_SELECTION
     assert result.line_number == 7
     assert result.recent_line_present is True
-    assert result.click_point is None
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[7]
     assert result.line_scroll_delta == 0
 
 
@@ -2318,7 +2318,7 @@ def test_public_line_selection_conflicting_recent_routes_are_zero_input(
     assert result.line_scroll_delta == 0
 
 
-def test_public_line_selection_scrolls_without_clicking_another_visible_row(
+def test_public_line_selection_uses_exact_route_point_when_other_rows_are_visible(
     monkeypatch,
 ):
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
@@ -2346,8 +2346,32 @@ def test_public_line_selection_scrolls_without_clicking_another_visible_row(
 
     assert result.state is ReconnectScreenState.LINE_SELECTION
     assert result.line_number == 8
-    assert result.click_point is None
-    assert result.line_scroll_delta == -120
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[8]
+    assert result.line_scroll_delta == 0
+
+
+def test_public_line_selection_uses_exact_route_point_when_rows_are_unreadable(
+    monkeypatch,
+):
+    recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    monkeypatch.setattr(
+        recognizer,
+        "_recent_login_text",
+        lambda _candidate: "最近一次登入資訊 線路:8",
+    )
+    monkeypatch.setattr(
+        recognizer,
+        "_recent_login_information_present",
+        lambda _candidate: True,
+    )
+    monkeypatch.setattr(recognizer, "_visible_line_buttons", lambda _candidate: ())
+    with Image.open(REFERENCE_DIR / "03_line_selection_dialog.png") as source:
+        result = recognizer.recognize_image(source.convert("RGB"))
+
+    assert result.state is ReconnectScreenState.LINE_SELECTION
+    assert result.line_number == 8
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[8]
+    assert result.line_scroll_delta == 0
 
 
 def test_public_line_selection_duplicate_candidates_never_scroll_or_click(
@@ -2381,7 +2405,7 @@ def test_public_line_selection_duplicate_candidates_never_scroll_or_click(
     assert result.line_scroll_delta == 0
 
 
-def test_line_selection_ambiguous_recent_text_never_defaults_to_line_one(
+def test_line_selection_without_readable_route_defaults_to_line_one(
     monkeypatch,
 ):
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
@@ -2394,16 +2418,17 @@ def test_line_selection_ambiguous_recent_text_never_defaults_to_line_one(
         result = recognizer.recognize_image(source.convert("RGB"))
 
     assert result.state is ReconnectScreenState.LINE_SELECTION
-    assert result.line_number is None
+    assert result.line_number == 1
     assert result.recent_line_present is True
-    assert result.click_point is None
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[1]
     assert result.line_scroll_delta == 0
 
 
-def test_line_selection_complete_recent_absence_is_the_only_line_one_fallback(
+def test_line_selection_complete_recent_absence_defaults_to_line_one(
     monkeypatch,
 ):
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
+    monkeypatch.setattr(recognizer, "_recent_login_text", lambda _candidate: "")
     monkeypatch.setattr(
         recognizer,
         "_recognize_route_number",
@@ -2427,7 +2452,7 @@ def test_line_selection_complete_recent_absence_is_the_only_line_one_fallback(
     assert target == (1, LINE_ROUTE_CLICK_POINTS[1], False, None, 0)
 
 
-def test_line_selection_recent_eight_scrolls_until_exact_button_is_visible(
+def test_line_selection_recent_eight_uses_exact_point_without_scrolling(
     monkeypatch,
 ):
     recognizer = ReferenceScreenRecognizer(REFERENCE_DIR)
@@ -2461,7 +2486,7 @@ def test_line_selection_recent_eight_scrolls_until_exact_button_is_visible(
             source.convert("RGB"),
         )
 
-    assert first == (8, None, True, "120福", -120)
+    assert first == (8, LINE_ROUTE_CLICK_POINTS[8], True, "120福", 0)
     assert second == (8, (0.5, 0.722), True, "120福", 0)
 
 
@@ -2517,8 +2542,8 @@ def test_line_selection_modal_takes_priority_over_login_background(monkeypatch):
     assert result.state is ReconnectScreenState.LINE_SELECTION
     assert result.line_number == 8
     assert result.recent_line_present is True
-    assert result.click_point is None
-    assert result.line_scroll_delta == -120
+    assert result.click_point == LINE_ROUTE_CLICK_POINTS[8]
+    assert result.line_scroll_delta == 0
 
 
 def test_invalid_lower_score_does_not_mask_valid_connected_match(monkeypatch):

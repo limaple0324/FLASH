@@ -1,0 +1,41 @@
+{
+  "batch_id": "FU-20260818-001",
+  "source": "本視窗使用者最新明確命令：把遊戲真正伺服器時間唯讀送入輔",
+  "baseline": "5bddfe8",
+  "branch": "work/fu-shared-review-20260813",
+  "scope": "只讀伺服器時間橋接與輔端單次校正時鐘",
+  "allowed": [
+    "services/server_clock.py",
+    "services/server_time_bridge.py",
+    "tests/test_server_clock.py",
+    "tests/test_server_time_bridge.py",
+    "main.py（只接線）",
+    "tests/test_main_server_clock.py（只測接線）",
+    "C:\\Users\\USER\\AppData\\Local\\Temp\\FLASH-server-time-bridge-20260817-2315\\main_game.decompressed.swf（隔離副本）"
+  ],
+  "forbidden": [
+    "智慧重連、登入、選線、角色、自動戰鬥、同步組、遊戲控制",
+    "目前使用中的遊戲檔",
+    "目前100古與其他遊戲視窗",
+    "桌面輔、正式發布、合併main、推送"
+  ],
+  "acceptance": [
+    "輸出已證明的serverTime毫秒值",
+    "來源必須以既有正式身分核對程序、生命週期、指紋與視窗",
+    "每個輔程序生命週期只校正一次",
+    "後續只用單調時鐘推算",
+    "橋接中斷、斷線、重新登入不清除校正",
+    "非法數值、錯誤身分、不唯一來源拒絕",
+    "智慧重連區域零行為變更"
+  ],
+  "tests": [
+    "直接ServerClock與橋接測試",
+    "main接線測試",
+    "既有時間服務必要回歸",
+    "智慧重連差異核對"
+  ],
+  "build_required": false,
+  "windows_product_validation": false,
+  "status": "施工中",
+  "next": "整合主管安排需求稽核與施工"
+}
