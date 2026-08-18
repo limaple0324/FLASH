@@ -18,6 +18,7 @@ from services.server_clock import ServerClock
 
 
 DAY_MS = 86_400_000
+TAIPEI_UTC_OFFSET_MS = 8 * 60 * 60 * 1_000
 MIN_TIME_OFFSET_MS = -60_000
 MAX_TIME_OFFSET_MS = 60_000
 MIN_TIMED_CLICK_LEAD_MS = -5_000
@@ -215,7 +216,12 @@ class GameTimeTimedClickService:
 
     def _absolute_time_ms(self) -> int | None:
         if self._server_clock is not None:
-            return self._server_clock.now_ms()
+            server_now_ms = self._server_clock.now_ms()
+            return (
+                None
+                if server_now_ms is None
+                else server_now_ms + TAIPEI_UTC_OFFSET_MS
+            )
         now_ns = int(self._wall_clock_ns())
         now_seconds = now_ns // 1_000_000_000
         local = self._localtime(float(now_seconds))

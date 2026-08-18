@@ -6,6 +6,7 @@ from services.game_time_timed_click_service import (
     DEFAULT_TIMED_CLICK_LEAD_MS,
     DEFAULT_TIMED_CLICK_REPEAT_COUNT,
     GameTimeTimedClickService,
+    TAIPEI_UTC_OFFSET_MS,
     TimedClickPressReceipt,
     TimedClickTarget,
     parse_target_time_ms,
@@ -250,11 +251,13 @@ def test_server_clock_source_never_falls_back_to_system_time_or_manual_offset():
         ServerTimeSample(1, identity, 86_401_234, 7, 1)
     ) is True
     assert service.snapshot().offset_ms == 0
-    assert service.snapshot().current_time_ms == 1_234
+    assert service.snapshot().current_time_ms == TAIPEI_UTC_OFFSET_MS + 1_234
+    assert service.snapshot().current_time_text == "08:00:01.234"
     monotonic[0] += 1_000_000_000
-    assert service.snapshot().current_time_ms == 2_234
+    assert service.snapshot().current_time_ms == TAIPEI_UTC_OFFSET_MS + 2_234
+    assert service.snapshot().current_time_text == "08:00:02.234"
 
-    armed = service.arm("00:00:03.234")
+    armed = service.arm("08:00:03.234")
     assert armed.success is True
     monotonic[0] += 1_000_000_000
     assert scheduler.fire_next().action == "fire"
@@ -264,3 +267,31 @@ def test_server_clock_source_never_falls_back_to_system_time_or_manual_offset():
     assert len(backend.presses) == 3
     assert backend.releases == backend.presses
     assert service.snapshot().enabled is True
+
+
+def test_server_clock_taipei_conversion_crosses_midnight_without_recalibration():
+    scheduler = Scheduler()
+    backend = Backend()
+    monotonic = [10_000_000_000]
+    identity = ServerTimeSourceIdentity(1, 2, 3, 4, FINGERPRINT)
+    server_clock = ServerClock(
+        monotonic_ns=lambda: monotonic[0],
+        source_validator=lambda value: value == identity,
+    )
+    service = GameTimeTimedClickService(
+        backend,
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+        allowed_fingerprints_provider=lambda: (FINGERPRINT,),
+        server_clock=server_clock,
+    )
+
+    assert server_clock.calibrate_once(
+        ServerTimeSample(1, identity, 57_599_999, 7, 1)
+    ) is True
+    assert service.snapshot().current_time_text == "23:59:59.999"
+
+    monotonic[0] += 1_000_000
+
+    assert service.snapshot().current_time_text == "00:00:00.000"
+    assert server_clock.calibration_count == 1
