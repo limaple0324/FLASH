@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 
 import adapters.windows_smart_reconnect_base as frozen_base
 from adapters.game_screen_recognizer import ScreenRecognition
@@ -63,14 +64,19 @@ class _Mouse:
         return MouseClickResult(True, True, False, None)
 
 
-def _window(handle: int, fingerprint: str) -> WindowInfo:
+def _window(
+    handle: int,
+    fingerprint: str,
+    *,
+    process_id: int | None = None,
+) -> WindowInfo:
     return WindowInfo(
         handle=handle,
         title="Adobe Flash Player 11",
         visible=True,
         minimized=False,
         rect=(0, 0, 900, 600),
-        process_id=100 + handle,
+        process_id=(100 + handle if process_id is None else process_id),
         window_class="ShockwaveFlash",
         launch_fingerprint=fingerprint,
         thread_id=1000 + handle,
@@ -108,11 +114,20 @@ def _controller(windows, *, target_windows_provider=None, tcp_provider=None):
     )
 
 
-def test_mixed_manual_window_does_not_disable_configured_tcp_provider(monkeypatch):
+def test_mixed_manual_window_does_not_disable_configured_tcp_provider(
+    tmp_path,
+    monkeypatch,
+):
     configured = _window(1, "a" * 64)
     manual = _window(2, "b" * 64)
     tcp_provider = lambda _ids: {}
     controller = _controller((configured, manual), tcp_provider=tcp_provider)
+    controller.set_group_launch_plan(
+        GroupLaunchPlan(
+            "configured",
+            (_target(tmp_path, 1, "entry-configured", configured.launch_fingerprint),),
+        )
+    )
     controller._step_scoped_activation_ready = True
     controller._manual_live_fingerprints = frozenset((manual.launch_fingerprint,))
     observed = []
@@ -132,12 +147,60 @@ def test_mixed_manual_window_does_not_disable_configured_tcp_provider(monkeypatc
     assert controller._tcp_counts is tcp_provider
 
 
-def test_global_identity_collision_is_never_demoted_by_same_local_code():
+def test_manual_only_scope_keeps_existing_visual_recovery_behavior(monkeypatch):
+    manual = _window(1, "a" * 64)
+    tcp_provider = lambda _ids: {}
+    controller = _controller((manual,), tcp_provider=tcp_provider)
+    controller._step_scoped_activation_ready = True
+    controller._manual_live_fingerprints = frozenset((manual.launch_fingerprint,))
+    observed = []
+
+    def fake_scan(instance, *, execute):
+        observed.append((instance._tcp_counts, execute))
+        return "sentinel"
+
+    monkeypatch.setattr(
+        frozen_base.WindowsSmartReconnectController,
+        "_scan_locked",
+        fake_scan,
+    )
+
+    assert controller._scan_locked(execute=True) == "sentinel"
+    assert observed == [(None, True)]
+    assert controller._tcp_counts is tcp_provider
+
+
+def test_local_identity_duplicate_mirror_is_demoted_when_no_cross_window_collision():
     source = "a" * 64
     failed = _window(2, source)
     controller = _controller((failed,))
     resolved = ResolvedTargetWindows(
         windows=(),
+        target_failure_evidence=(
+            TargetFailureEvidence(
+                "entry-failed",
+                source,
+                ("window_identity_duplicate",),
+                (failed,),
+            ),
+        ),
+        global_failure_codes=("window_identity_duplicate",),
+    )
+
+    global_failures, local_failures = controller._contract_failure_evidence(resolved)
+
+    assert global_failures == ()
+    assert local_failures[source] == ("window_identity_duplicate",)
+
+
+def test_real_global_identity_collision_is_never_demoted_by_same_local_code():
+    source = "a" * 64
+    failed = _window(2, source)
+    safe_a = _window(10, "b" * 64, process_id=777)
+    safe_b = _window(11, "c" * 64, process_id=777)
+    controller = _controller((safe_a, safe_b))
+    resolved = ResolvedTargetWindows(
+        windows=(safe_a, safe_b),
         target_failure_evidence=(
             TargetFailureEvidence(
                 "entry-failed",
@@ -194,7 +257,7 @@ def test_shared_source_failure_uses_entry_local_key_not_healthy_source(tmp_path)
     assert source not in local_failures
 
 
-def test_shared_source_activation_and_tcp_binding_keep_healthy_entry(tmp_path):
+def test_shared_source_activation_tcp_and_target_binding_keep_healthy_entry(tmp_path):
     source = "d" * 64
     healthy = _window(1, source)
     healthy_target = _target(tmp_path, 1, "entry-healthy", source)
@@ -222,7 +285,7 @@ def test_shared_source_activation_and_tcp_binding_keep_healthy_entry(tmp_path):
     monitor = monitored_window_instance_fingerprint(healthy)
     token = WindowInstanceToken.from_window(healthy)
     assert monitor is not None and token is not None
-    complete_instances = {monitor: (healthy, token)}
+    complete_instances = {monitor: (replace(healthy, launch_fingerprint=monitor), token)}
     sources = {monitor: source}
 
     verified = controller._verified_group_activation_snapshot(
@@ -240,7 +303,9 @@ def test_shared_source_activation_and_tcp_binding_keep_healthy_entry(tmp_path):
 
     controller._activation_snapshot_instances = {monitor: token}
     controller._activation_snapshot_source_fingerprints = {monitor: source}
+    controller._tcp_v = resolved
     assert controller._tcp_id(resolved, monitor, token) == "entry-healthy"
+    assert controller._target_for_fingerprint(monitor) == healthy_target
 
 
 def test_manual_confirmed_tcp_owner_is_eligible_after_formal_queue_is_empty(tmp_path):

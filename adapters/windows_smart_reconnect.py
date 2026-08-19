@@ -14,7 +14,6 @@ _LOCAL_FAILURE_NAMESPACE = b"fu-smart-reconnect-local-failure-v1\0"
 _NEVER_DEMOTE_GLOBAL_FAILURE_CODES = frozenset(
     {
         "window_offline",
-        "window_identity_duplicate",
         "unattributed_candidate_window",
         "target_failure_unattributed",
         "target_window_provider_failed",
@@ -28,11 +27,6 @@ _NEVER_DEMOTE_GLOBAL_FAILURE_CODES = frozenset(
 
 class WindowsSmartReconnectController(_step.WindowsSmartReconnectController):
     """Keep global failures global and isolate only one proven entry/instance."""
-
-    @classmethod
-    def _install_product_scope_message_normalization(cls) -> None:
-        """UI result types now own wording; adapters must not monkeypatch UI classes."""
-        return None
 
     @staticmethod
     def _formal_plan(controller):
@@ -65,6 +59,29 @@ class WindowsSmartReconnectController(_step.WindowsSmartReconnectController):
             + fingerprint.encode("ascii", errors="strict")
         )
         return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _resolved_global_identity_collision(resolved) -> bool:
+        """Re-prove cross-window collisions instead of trusting a mirrored code."""
+        identities = []
+        for window in (
+            *tuple(resolved.windows),
+            *tuple(resolved.detection_only_windows),
+        ):
+            identity = complete_window_instance_identity(window)
+            if identity is None:
+                return True
+            identities.append(identity)
+        if not identities:
+            return False
+        handles = [identity[1] for identity in identities]
+        process_ids = [identity[2] for identity in identities]
+        stable_tokens = [identity[:6] for identity in identities]
+        return bool(
+            len(handles) != len(set(handles))
+            or len(process_ids) != len(set(process_ids))
+            or len(stable_tokens) != len(set(stable_tokens))
+        )
 
     def _contract_failure_evidence(self, resolved):
         if not self._step_scoped_live_reconnect:
@@ -142,6 +159,15 @@ class WindowsSmartReconnectController(_step.WindowsSmartReconnectController):
                 if code not in _NEVER_DEMOTE_GLOBAL_FAILURE_CODES
             )
 
+        # TargetWindowContractService historically mirrors attributable target
+        # failures into its aggregate global code list. Remove only mirrors
+        # that can be independently re-proven as non-global. Never remove an
+        # unattributed error or a real cross-window collision.
+        if (
+            "window_identity_duplicate" in demotable_mirrors
+            and self._resolved_global_identity_collision(resolved)
+        ):
+            demotable_mirrors.discard("window_identity_duplicate")
         if "target_failure_unattributed" not in global_failures:
             global_failures = [
                 code
@@ -334,6 +360,28 @@ class WindowsSmartReconnectController(_step.WindowsSmartReconnectController):
             return None
         return entry_id
 
+    def _target_for_fingerprint(self, fingerprint: object):
+        formal = _step._base.WindowsSmartReconnectController._target_for_fingerprint(
+            self,
+            fingerprint,
+        )
+        if formal is not None:
+            return formal
+        normalized = normalize_launch_fingerprint(fingerprint)
+        if normalized is None:
+            return None
+
+        snapshot = self._activation_snapshot_instances or {}
+        instance = snapshot.get(normalized)
+        if instance is not None:
+            entry_id = self._tcp_id(self._tcp_v, normalized, instance)
+            if entry_id is not None:
+                target = self._target_for_entry(entry_id)
+                if target is not None:
+                    return target
+
+        return self._manual_reopen_targets.get(normalized)
+
     def _ordered_tcp_owner(self, confirmed):
         if not self._step_scoped_live_reconnect:
             return super()._ordered_tcp_owner(confirmed)
@@ -408,10 +456,23 @@ class WindowsSmartReconnectController(_step.WindowsSmartReconnectController):
         return None, None, None
 
     def _scan_locked(self, *, execute: bool):
-        return _step._base.WindowsSmartReconnectController._scan_locked(
-            self,
-            execute=execute,
-        )
+        formal_plan = self._formal_plan(self)
+        if (
+            self._step_scoped_live_reconnect
+            and self._step_scoped_activation_ready
+            and self._manual_live_fingerprints
+            and formal_plan is not None
+            and formal_plan.targets
+            and self._tcp_counts is not None
+        ):
+            # In a mixed configured+manual set, retain configured TCP evidence.
+            # Manual windows remain anonymous (entry_id=None) and therefore do
+            # not inherit configured close/reopen authority.
+            return _step._base.WindowsSmartReconnectController._scan_locked(
+                self,
+                execute=execute,
+            )
+        return super()._scan_locked(execute=execute)
 
 
 globals()["WindowsSmartReconnectController"] = WindowsSmartReconnectController
