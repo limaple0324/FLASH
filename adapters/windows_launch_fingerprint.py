@@ -42,7 +42,8 @@ class PowerShellLaunchFingerprintResolver:
 
     The script keeps shortcut arguments and command lines inside its own
     process. Its only output is a JSON mapping of numeric PIDs to SHA-256
-    digests.
+    digests. A live process may therefore be identified even when it was
+    opened outside 輔, as long as its command-line argument tail is complete.
     """
 
     _SCRIPT = r"""
@@ -65,6 +66,59 @@ try {
     if ($requested.Count -eq 0) {
         Write-Output '{}'
         exit 0
+    }
+
+    function Get-DirectArgumentTail {
+        param(
+            [string]$CommandLine,
+            [string]$ExecutablePath
+        )
+
+        if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+            return $null
+        }
+
+        $line = $CommandLine.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {
+            $quotedExecutable = '"' + $ExecutablePath + '"'
+            if ($line.StartsWith(
+                $quotedExecutable,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                $tail = $line.Substring($quotedExecutable.Length).TrimStart()
+                if (-not [string]::IsNullOrWhiteSpace($tail)) {
+                    return $tail
+                }
+            }
+
+            if ($line.StartsWith(
+                $ExecutablePath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                $tail = $line.Substring($ExecutablePath.Length)
+                if (
+                    $tail.Length -eq 0 -or
+                    [char]::IsWhiteSpace($tail[0])
+                ) {
+                    $tail = $tail.TrimStart()
+                    if (-not [string]::IsNullOrWhiteSpace($tail)) {
+                        return $tail
+                    }
+                }
+            }
+        }
+
+        if ($line.StartsWith('"')) {
+            $closingQuote = $line.IndexOf('"', 1)
+            if ($closingQuote -gt 0) {
+                $tail = $line.Substring($closingQuote + 1).TrimStart()
+                if (-not [string]::IsNullOrWhiteSpace($tail)) {
+                    return $tail
+                }
+            }
+        }
+
+        return $null
     }
 
     $shortcutShell = New-Object -ComObject WScript.Shell
@@ -129,13 +183,22 @@ try {
             } | Select-Object -ExpandProperty Arguments -Unique
         )
 
-        if ($candidateArguments.Count -ne 1) {
+        $identityArguments = $null
+        if ($candidateArguments.Count -eq 1) {
+            $identityArguments = [string]$candidateArguments[0]
+        } else {
+            # Launch origin is not identity authority. When the live process
+            # is not represented by exactly one desktop shortcut, derive the
+            # same anonymous identity directly from its current argument tail.
+            $identityArguments = Get-DirectArgumentTail $commandLine $executablePath
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$identityArguments)) {
             continue
         }
 
         $sha256 = [Security.Cryptography.SHA256]::Create()
         try {
-            $bytes = [Text.Encoding]::UTF8.GetBytes([string]$candidateArguments[0])
+            $bytes = [Text.Encoding]::UTF8.GetBytes([string]$identityArguments)
             $digest = $sha256.ComputeHash($bytes)
             $resolved[[string]$processId] = (
                 [BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant()
