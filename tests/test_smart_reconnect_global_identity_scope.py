@@ -1,11 +1,23 @@
 import hashlib
 
+from adapters.game_screen_recognizer import ScreenRecognition
+from adapters.windows_background_capture import CaptureSample
+from adapters.windows_smart_reconnect import (
+    MouseClickResult,
+    WindowsSmartReconnectController,
+)
 from adapters.windows_window import WindowInfo
+from core.reconnect_policy import ReconnectScreenState
 from core.window_registry import WindowRegistry
 from main import build_configured_reconnect_plan
 from services.group_configuration_service import GroupConfigurationService
+from services.group_launch_service import GroupLaunchPlan, GroupLaunchTarget
 from services.sync_scope_service import SyncScopeService
-from services.target_window_contract_service import TargetWindowContractService
+from services.target_window_contract_service import (
+    ResolvedTargetWindows,
+    TargetFailureEvidence,
+    TargetWindowContractService,
+)
 
 
 class PartialResolver:
@@ -21,9 +33,10 @@ class PartialResolver:
 
 
 class WindowBackend:
-    def __init__(self, windows=(), foreground=None):
+    def __init__(self, windows=(), foreground=None, obscured=False):
         self.windows = tuple(windows)
         self.foreground = foreground
+        self.obscured = obscured
 
     def list_windows(self):
         return self.windows
@@ -31,11 +44,140 @@ class WindowBackend:
     def foreground_handle(self):
         return self.foreground
 
+    def top_window_at(self, _x, _y):
+        if self.obscured:
+            return 999999
+        return self.windows[0].handle if self.windows else None
+
+
+class MarkerCapture:
+    def __init__(self, markers):
+        self.markers = dict(markers)
+        self.calls = []
+
+    def capture(self, handle):
+        self.calls.append(handle)
+        marker = self.markers.get(handle)
+        if marker is None:
+            return None
+        return CaptureSample(
+            width=2,
+            height=2,
+            pixels=bytes([marker, 0, 0, 255] * 4),
+            api_succeeded=True,
+        )
+
+
+class MarkerRecognizer:
+    def recognize_capture(self, sample):
+        marker = sample.pixels[0]
+        if marker == 3:
+            return ScreenRecognition(
+                ReconnectScreenState.LOGIN_START,
+                0.0,
+                (0.5, 0.8),
+                "login_start",
+            )
+        if marker == 2:
+            return ScreenRecognition(
+                ReconnectScreenState.DISCONNECTED,
+                0.0,
+                (0.5, 0.5),
+                "disconnected",
+            )
+        return ScreenRecognition(
+            ReconnectScreenState.CONNECTED,
+            0.0,
+            None,
+            "connected",
+        )
+
+
+class MouseBackend:
+    def __init__(self):
+        self.clicks = []
+
+    def is_window(self, _handle):
+        return True
+
+    def probe_responsive(self, _handle, _timeout_ms):
+        return True
+
+    def click_relative(
+        self,
+        handle,
+        point,
+        _expected_process_id,
+        _instance_token,
+    ):
+        self.clicks.append((handle, point))
+        return MouseClickResult(True, True, False, None)
+
+    def scroll_relative(
+        self,
+        handle,
+        point,
+        _delta,
+        _expected_process_id,
+        _instance_token,
+    ):
+        self.clicks.append((handle, point))
+        return MouseClickResult(True, True, False, None)
+
 
 def _shortcut(tmp_path, name):
     path = tmp_path / f"{name}.lnk"
     path.write_bytes(b"shortcut")
     return path
+
+
+def _window(handle, fingerprint, *, minimized=False):
+    return WindowInfo(
+        handle=handle,
+        title="Adobe Flash Player 11",
+        visible=True,
+        minimized=minimized,
+        rect=(0, 0, 900, 600),
+        process_id=100 + handle,
+        window_class="ShockwaveFlash",
+        launch_fingerprint=fingerprint,
+        thread_id=1000 + handle,
+        process_lifecycle_token=10000 + handle,
+    )
+
+
+def _controller(
+    windows,
+    markers,
+    *,
+    target_windows_provider=None,
+    capture_access_preparer=None,
+    minimized_refresh_capture_provider=None,
+):
+    backend = WindowBackend(
+        windows,
+        foreground=(windows[0].handle if windows else None),
+    )
+    capture = MarkerCapture(markers)
+    mouse = MouseBackend()
+    controller = WindowsSmartReconnectController(
+        expected_windows=max(1, len(windows)),
+        title_keywords=("Adobe Flash Player",),
+        window_backend=backend,
+        capture_provider=capture,
+        primary_capture_is_trusted=True,
+        recognizer=MarkerRecognizer(),
+        mouse_backend=mouse,
+        execution_enabled=False,
+        require_expected_window_count=False,
+        target_windows_provider=target_windows_provider,
+        capture_access_preparer=capture_access_preparer,
+        step_scoped_live_reconnect=True,
+        minimized_refresh_capture_provider=(
+            minimized_refresh_capture_provider
+        ),
+    )
+    return controller, backend, capture, mouse
 
 
 def test_global_reconnect_plan_survives_one_unresolved_saved_shortcut(tmp_path):
@@ -82,18 +224,7 @@ def test_one_bad_saved_shortcut_does_not_remove_a_live_manual_flash_target(
     resolver = PartialResolver((broken,))
     scope_service = SyncScopeService(configuration, resolver)
     usable_fingerprint = hashlib.sha256(str(usable).encode()).hexdigest()
-    manual_window = WindowInfo(
-        handle=11,
-        title="Adobe Flash Player 11",
-        visible=True,
-        minimized=False,
-        rect=(0, 0, 900, 600),
-        process_id=101,
-        window_class="ShockwaveFlash",
-        launch_fingerprint=usable_fingerprint,
-        thread_id=1001,
-        process_lifecycle_token=100001,
-    )
+    manual_window = _window(11, usable_fingerprint)
     contract = TargetWindowContractService(
         configuration,
         scope_service,
@@ -117,3 +248,153 @@ def test_one_bad_saved_shortcut_does_not_remove_a_live_manual_flash_target(
     assert resolved.target_failure_evidence[0].failure_codes == ("window_offline",)
     assert plan is not None
     assert plan.ready is True
+
+
+def test_empty_configured_scope_is_not_a_global_identity_failure(tmp_path):
+    configuration = GroupConfigurationService(tmp_path / "groups.json")
+    service = SyncScopeService(configuration, PartialResolver())
+
+    inputs = service.configured_inputs()
+    scope = service.configured_scope()
+
+    assert inputs.group_name == "configured"
+    assert inputs.entry_ids == ()
+    assert inputs.failure_codes == ()
+    assert scope.group_name == "configured"
+    assert scope.entry_ids == ()
+    assert scope.failure_codes == ()
+    assert scope.ready is False
+
+
+def test_manual_flash_snapshot_falls_back_to_live_instance_without_role_plan():
+    fingerprint = "a" * 64
+    window = _window(1, fingerprint)
+    permission_calls = []
+    controller, _backend, _capture, mouse = _controller(
+        (window,),
+        {window.handle: 3},
+        target_windows_provider=lambda: ResolvedTargetWindows(
+            (),
+            global_failure_codes=("group_name_invalid",),
+        ),
+        capture_access_preparer=lambda: permission_calls.append(True) or False,
+    )
+
+    prepared = controller.prepare_execution_snapshot()
+    controller.set_execution_enabled(True)
+    first = controller.reconnect()
+    second = controller.reconnect()
+
+    assert prepared.success is True
+    assert prepared.details["window_count"] == 1
+    assert permission_calls == []
+    assert first.details["clicked_windows"] == 0
+    assert second.details["clicked_windows"] == 1
+    assert [handle for handle, _point in mouse.clicks] == [window.handle]
+
+
+def test_detection_only_manual_flash_can_advance_login_but_not_gain_reopen_owner(
+    tmp_path,
+):
+    configured = _window(1, "a" * 64)
+    manual = _window(2, "b" * 64)
+    plan = GroupLaunchPlan(
+        "configured",
+        (
+            GroupLaunchTarget(
+                1,
+                "configured-role",
+                tmp_path / "configured.lnk",
+                configured.launch_fingerprint,
+                entry_id="entry-configured",
+                role_id="configured-role",
+            ),
+        ),
+    )
+    resolved = ResolvedTargetWindows(
+        windows=(configured,),
+        sync_windows=(configured,),
+        sync_entry_ids=("entry-configured",),
+        sync_scope_entry_ids=("entry-configured",),
+        sync_controller_entry_id="entry-configured",
+        detection_only_windows=(manual,),
+    )
+    controller, _backend, _capture, mouse = _controller(
+        (configured, manual),
+        {
+            configured.handle: 1,
+            manual.handle: 3,
+        },
+        target_windows_provider=lambda: resolved,
+    )
+    controller.set_group_launch_plan(plan)
+
+    prepared = controller.prepare_execution_snapshot()
+    controller.set_execution_enabled(True)
+    controller.reconnect()
+    result = controller.reconnect()
+
+    assert prepared.success is True
+    assert manual.launch_fingerprint in controller._detection_only_fingerprints
+    assert manual.launch_fingerprint in controller._initial_login_authorizations or (
+        manual.launch_fingerprint in controller._pending_reconnect_fingerprints
+    )
+    assert result.details["clicked_windows"] == 1
+    assert [handle for handle, _point in mouse.clicks] == [manual.handle]
+    assert manual.launch_fingerprint not in controller._pending_reopen_fingerprints
+    assert manual.launch_fingerprint not in (
+        controller._login_only_recovery_fingerprints
+    )
+
+
+def test_attributable_unknown_target_failure_stays_local():
+    healthy = _window(1, "a" * 64)
+    failed = _window(2, "b" * 64)
+    controller, _backend, _capture, _mouse = _controller(
+        (healthy, failed),
+        {healthy.handle: 1, failed.handle: 1},
+    )
+    resolved = ResolvedTargetWindows(
+        windows=(healthy,),
+        target_failure_evidence=(
+            TargetFailureEvidence(
+                "entry-failed",
+                failed.launch_fingerprint,
+                ("new_target_local_failure",),
+                (failed,),
+            ),
+        ),
+    )
+
+    global_failures, local_failures = (
+        controller._contract_failure_evidence(resolved)
+    )
+
+    assert global_failures == ()
+    assert local_failures == {
+        failed.launch_fingerprint: ("new_target_local_failure",)
+    }
+
+
+def test_minimized_activation_uses_dedicated_refresh_provider_without_wgc_access():
+    fingerprint = "c" * 64
+    window = _window(3, fingerprint, minimized=True)
+    refresh = MarkerCapture({window.handle: 1})
+    permission_calls = []
+    controller, _backend, primary, mouse = _controller(
+        (window,),
+        {window.handle: 1},
+        capture_access_preparer=lambda: permission_calls.append(True) or False,
+        minimized_refresh_capture_provider=refresh,
+    )
+
+    prepared = controller.prepare_execution_snapshot()
+    controller.set_execution_enabled(True)
+    result = controller.reconnect()
+
+    assert prepared.success is True
+    assert permission_calls == []
+    assert refresh.calls == [window.handle]
+    assert primary.calls == []
+    assert result.details["connected_windows"] == 1
+    assert mouse.clicks == []

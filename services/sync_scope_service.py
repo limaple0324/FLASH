@@ -139,7 +139,13 @@ class SyncScopeService:
         )
 
     def configured_inputs(self) -> SyncScopeInputs:
-        """Return every configured entry once, without resolving shortcuts."""
+        """Return every configured entry once, without resolving shortcuts.
+
+        An empty configuration is not a global identity failure for smart
+        reconnect.  It simply means there is no configured reopen authority;
+        the live-instance controller may still monitor manually opened FLASH
+        windows and will fail closed only for steps that need a saved source.
+        """
 
         entries = {}
         for group in self._configuration.groups():
@@ -157,10 +163,7 @@ class SyncScopeService:
         entry_ids = tuple(entries)
         paths = tuple(entries[entry_id].shortcut_path for entry_id in entry_ids)
         if not entry_ids:
-            return SyncScopeInputs(
-                "configured",
-                failure_codes=("configured_entries_unavailable",),
-            )
+            return SyncScopeInputs("configured")
         return SyncScopeInputs(
             "configured",
             entry_ids[0],
