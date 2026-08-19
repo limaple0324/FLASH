@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from adapters.windows_launch_fingerprint import (
@@ -59,6 +60,8 @@ class SyncScopeInputs:
 class SyncScopeService:
     """Use the selected group's members and unique shortcut identities."""
 
+    _ISOLATED_FINGERPRINT_NAMESPACE = b"fu-configured-reconnect-isolated-v1\0"
+
     def __init__(
         self,
         configuration: GroupConfigurationService,
@@ -66,6 +69,31 @@ class SyncScopeService:
     ) -> None:
         self._configuration = configuration
         self._fingerprint_resolver = fingerprint_resolver
+
+    @classmethod
+    def _isolated_configured_fingerprint(
+        cls,
+        entry_id: str,
+        shortcut_path: Path,
+    ) -> str:
+        """Return an anonymous sentinel for one unavailable configured shortcut.
+
+        Global smart reconnect must not be disabled merely because one unrelated
+        saved shortcut cannot currently be resolved.  The sentinel keeps that
+        entry structurally present in the configured authority while ensuring it
+        cannot inherit another live window's launcher fingerprint.
+        """
+
+        payload = (
+            cls._ISOLATED_FINGERPRINT_NAMESPACE
+            + entry_id.strip().encode("utf-8", errors="strict")
+            + b"\0"
+            + str(Path(shortcut_path).resolve(strict=False)).casefold().encode(
+                "utf-8",
+                errors="strict",
+            )
+        )
+        return sha256(payload).hexdigest()
 
     def inputs(self, group_name: object) -> SyncScopeInputs:
         if not isinstance(group_name, str) or not group_name.strip():
@@ -141,7 +169,15 @@ class SyncScopeService:
         )
 
     def configured_scope(self) -> SyncScope:
-        """Resolve all configured shortcut identities in one batch call."""
+        """Resolve configured reconnect identities while isolating bad siblings.
+
+        This authority is intentionally more tolerant than ``scope()``.  Input
+        synchronization still fails closed for a selected group, but smart
+        reconnect is global and must continue monitoring every independently
+        proven FLASH instance even when one saved shortcut is missing, stale or
+        unreadable.  Unresolved configured entries receive anonymous isolated
+        sentinels; they stay offline and cannot steal another window's identity.
+        """
 
         inputs = self.configured_inputs()
         if not inputs.ready:
@@ -152,33 +188,32 @@ class SyncScopeService:
                 entry_ids=inputs.entry_ids,
                 shortcut_paths=inputs.shortcut_paths,
             )
-        resolved = self._fingerprint_resolver.resolve(inputs.shortcut_paths)
-        entry_fingerprints = tuple(
+        try:
+            resolved = self._fingerprint_resolver.resolve(inputs.shortcut_paths)
+        except Exception:
+            resolved = {}
+        raw_entry_fingerprints = tuple(
             normalize_launch_fingerprint(resolved.get(path))
             for path in inputs.shortcut_paths
         )
-        if any(fingerprint is None for fingerprint in entry_fingerprints):
-            return SyncScope(
-                inputs.group_name,
-                inputs.controller_entry_id,
-                tuple(
-                    fingerprint
-                    for fingerprint in entry_fingerprints
-                    if fingerprint is not None
-                ),
-                failure_codes=("shortcut_identity_unresolved",),
-                entry_ids=inputs.entry_ids,
-                shortcut_paths=inputs.shortcut_paths,
-                entry_fingerprints=entry_fingerprints,
-                isolated_entry_ids=tuple(
-                    entry_id
-                    for entry_id, fingerprint in zip(
-                        inputs.entry_ids,
-                        entry_fingerprints,
-                    )
-                    if fingerprint is None
-                ),
+        isolated_entry_ids = tuple(
+            entry_id
+            for entry_id, fingerprint in zip(
+                inputs.entry_ids,
+                raw_entry_fingerprints,
             )
+            if fingerprint is None
+        )
+        entry_fingerprints = tuple(
+            fingerprint
+            if fingerprint is not None
+            else self._isolated_configured_fingerprint(entry_id, path)
+            for entry_id, path, fingerprint in zip(
+                inputs.entry_ids,
+                inputs.shortcut_paths,
+                raw_entry_fingerprints,
+            )
+        )
         return SyncScope(
             inputs.group_name,
             inputs.controller_entry_id,
@@ -186,6 +221,7 @@ class SyncScopeService:
             entry_ids=inputs.entry_ids,
             shortcut_paths=inputs.shortcut_paths,
             entry_fingerprints=entry_fingerprints,
+            isolated_entry_ids=isolated_entry_ids,
         )
 
     def scope(self, group_name: object) -> SyncScope:
