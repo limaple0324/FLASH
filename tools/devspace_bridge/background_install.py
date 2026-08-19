@@ -43,14 +43,14 @@ def _startup_vbs(repo: Path, pythonw: Path) -> tuple[Path, str]:
 
 
 def _launch_background(repo: Path, pythonw: Path) -> int:
-    runner = repo / "tools" / "devspace_bridge" / "bridge_runner.py"
-    if not runner.is_file():
-        raise RuntimeError(f"找不到橋接程式：{runner}")
+    bootstrap = repo / "tools" / "devspace_bridge" / "background_bootstrap.py"
+    if not bootstrap.is_file():
+        raise RuntimeError(f"找不到背景橋接入口：{bootstrap}")
     creationflags = 0
     for name in ("CREATE_NO_WINDOW", "DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
         creationflags |= int(getattr(subprocess, name, 0))
     process = subprocess.Popen(
-        [str(pythonw), str(runner), "--repo", str(repo)],
+        [str(pythonw), str(bootstrap), "--repo", str(repo)],
         cwd=str(repo),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
