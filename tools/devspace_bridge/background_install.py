@@ -8,7 +8,6 @@ import sys
 import time
 from pathlib import Path
 
-
 WAIT_TIMEOUT = 0x00000102
 SYNCHRONIZE = 0x00100000
 
@@ -45,8 +44,8 @@ def _startup_vbs(repo: Path, pythonw: Path) -> tuple[Path, str]:
     )
     startup.mkdir(parents=True, exist_ok=True)
     target = startup / "DevspaceBridge.vbs"
-    bootstrap = repo / "tools" / "devspace_bridge" / "background_bootstrap.py"
-    command = f'"{pythonw}" "{bootstrap}" --repo "{repo}"'
+    runner = repo / "tools" / "devspace_bridge" / "bridge_runner.py"
+    command = f'"{pythonw}" "{runner}" --repo "{repo}"'
     script = (
         'Set sh = CreateObject("WScript.Shell")\r\n'
         f'sh.Run "{_quote_vbs(command)}", 0, False\r\n'
@@ -90,7 +89,11 @@ def _pid_alive(pid: int) -> bool:
 
 def _stop_existing_bridge(state_root: Path) -> None:
     pid_files = (state_root / "bridge.pid", state_root / "background.pid")
-    pids = tuple(dict.fromkeys(pid for path in pid_files if (pid := _read_pid(path)) is not None))
+    pids = tuple(
+        dict.fromkeys(
+            pid for path in pid_files if (pid := _read_pid(path)) is not None
+        )
+    )
     stop_request = state_root / "stop.request"
     if pids:
         stop_request.write_text("stop\n", encoding="ascii")
@@ -107,51 +110,38 @@ def _stop_existing_bridge(state_root: Path) -> None:
             path.unlink(missing_ok=True)
         except OSError:
             pass
-    time.sleep(0.6)
+    time.sleep(0.5)
 
 
 def _launch_background(repo: Path, pythonw: Path, state_root: Path) -> int:
-    bootstrap = repo / "tools" / "devspace_bridge" / "background_bootstrap.py"
-    if not bootstrap.is_file():
-        raise RuntimeError(f"找不到背景橋接入口：{bootstrap}")
+    runner = repo / "tools" / "devspace_bridge" / "bridge_runner.py"
+    if not runner.is_file():
+        raise RuntimeError(f"找不到橋接主程序：{runner}")
     creationflags = 0
     for name in ("CREATE_NO_WINDOW", "DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
         creationflags |= int(getattr(subprocess, name, 0))
-
-    last_code: int | None = None
-    for attempt in range(3):
-        process = subprocess.Popen(
-            [str(pythonw), str(bootstrap), "--repo", str(repo)],
-            cwd=str(repo),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            creationflags=creationflags,
-        )
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            current_pid = _read_pid(state_root / "bridge.pid")
-            if current_pid == process.pid and _pid_alive(process.pid):
-                (state_root / "background.pid").write_text(
-                    str(process.pid) + "\n", encoding="ascii"
-                )
-                return int(process.pid)
-            code = process.poll()
-            if code is not None:
-                last_code = int(code)
-                break
-            time.sleep(0.1)
-        if process.poll() is None:
-            current_pid = _read_pid(state_root / "bridge.pid")
-            if current_pid == process.pid:
-                (state_root / "background.pid").write_text(
-                    str(process.pid) + "\n", encoding="ascii"
-                )
-                return int(process.pid)
-        time.sleep(0.8)
-
-    raise RuntimeError(f"背景橋接未能建立唯一常駐實例；最後退出代碼：{last_code}")
+    process = subprocess.Popen(
+        [str(pythonw), str(runner), "--repo", str(repo)],
+        cwd=str(repo),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=creationflags,
+    )
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        current_pid = _read_pid(state_root / "bridge.pid")
+        if current_pid is not None and _pid_alive(current_pid):
+            (state_root / "background.pid").write_text(
+                str(current_pid) + "\n", encoding="ascii"
+            )
+            return current_pid
+        code = process.poll()
+        if code is not None and code != 0:
+            raise RuntimeError(f"背景橋接啟動失敗：{code}")
+        time.sleep(0.1)
+    raise RuntimeError("背景橋接沒有建立在線 PID")
 
 
 def main() -> int:
