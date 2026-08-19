@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-smart-reconnect-direct-20260820-0607",
+  "action": "run_tests",
+  "bridge_pid": 18460,
+  "started_at_unix": 1787178174.2119339,
+  "ok": true,
+  "finished_at_unix": 1787178178.567044,
+  "result": {
+    "commit": "9513953382c0d0644d8295cc9f47d387c1ad9bbf",
+    "returncode": 4,
+    "passed": false,
+    "stdout": "\nno tests ran in 0.00s\n",
+    "stderr": "ERROR: file or directory not found: tests/test_target_window_contract_service.py\n\n"
+  }
+}
