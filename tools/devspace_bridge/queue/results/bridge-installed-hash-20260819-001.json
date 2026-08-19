@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "task_id": "bridge-installed-hash-20260819-001",
+  "action": "installed_fu_hash",
+  "bridge_pid": 24736,
+  "started_at_unix": 1787134218.1952662,
+  "ok": true,
+  "finished_at_unix": 1787134218.38108,
+  "result": {
+    "path": "C:\\Users\\USER\\AppData\\Local\\Programs\\輔\\完整累積版\\FLASH.exe",
+    "sha256": "BF058102DF047A0B57D1C1792377FB58C7BCA2C65F4C9496C276F3CE804DA809",
+    "size": 194036480
+  }
+}
