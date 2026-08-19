@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import queue
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -211,6 +213,15 @@ class GameTimeTimedClickService:
         self._scheduled_handles: list[object] = []
         self._active_receipts: list[TimedClickPressReceipt] = []
         self._active_operation_leases: dict[int, GameOperationLease] = {}
+        self._work_queue: queue.Queue[tuple[object, ...]] = queue.Queue()
+        self._work_lock = threading.RLock()
+        self._work_generation = 0
+        self._work_worker: threading.Thread | None = None
+        self._work_inflight = 0
+        self._work_pending = 0
+        self._result_queue: queue.Queue[Callable[[], object]] = queue.Queue()
+        self._result_pump_handle: object | None = None
+        self._pending_release_ids: set[int] = set()
 
     def configure_game_time(
         self,
@@ -449,6 +460,255 @@ class GameTimeTimedClickService:
         self._schedule_poll()
         return result
 
+    def _ensure_work_worker(self) -> bool:
+        with self._work_lock:
+            worker = self._work_worker
+            if worker is not None and worker.is_alive():
+                return True
+            worker = threading.Thread(
+                target=self._work_worker_loop,
+                name="FLASH-TimedClickIO",
+                daemon=True,
+            )
+            self._work_worker = worker
+            worker.start()
+            return True
+
+    def _ensure_result_pump(self) -> None:
+        if self._result_pump_handle is not None:
+            return
+        try:
+            self._result_pump_handle = self._schedule(
+                0,
+                self._drain_worker_results,
+            )
+        except Exception:
+            self._result_pump_handle = None
+
+    def _drain_worker_results(self) -> None:
+        self._result_pump_handle = None
+        for _ in range(64):
+            try:
+                callback = self._result_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            finally:
+                with self._work_lock:
+                    self._work_pending = max(0, self._work_pending - 1)
+        with self._work_lock:
+            worker_active = self._work_inflight > 0
+            work_pending = self._work_pending
+        if worker_active or work_pending or not self._result_queue.empty():
+            try:
+                self._result_pump_handle = self._schedule(
+                    5,
+                    self._drain_worker_results,
+                )
+            except Exception:
+                self._result_pump_handle = None
+
+    def _work_worker_loop(self) -> None:
+        while True:
+            item = self._work_queue.get()
+            with self._work_lock:
+                self._work_inflight += 1
+                current_generation = self._work_generation
+            try:
+                kind, generation, payload, lease = item
+                if kind == "press":
+                    if generation != current_generation:
+                        self._result_queue.put(
+                            lambda generation=generation, payload=payload, lease=lease: self._complete_press(
+                                generation,
+                                payload,
+                                None,
+                                lease,
+                            )
+                        )
+                        continue
+                    try:
+                        receipt = self._backend.press(
+                            payload,
+                            self._allowed_fingerprints(),
+                        )
+                    except Exception:
+                        receipt = None
+                    self._result_queue.put(
+                        lambda generation=generation, payload=payload, receipt=receipt, lease=lease: self._complete_press(
+                            generation,
+                            payload,
+                            receipt,
+                            lease,
+                        )
+                    )
+                elif kind == "release":
+                    try:
+                        released = bool(self._backend.release(payload))
+                    except Exception:
+                        released = False
+                    self._result_queue.put(
+                        lambda generation=generation, payload=payload, released=released, lease=lease: self._complete_release(
+                            generation,
+                            payload,
+                            released,
+                            lease,
+                        )
+                    )
+            finally:
+                with self._work_lock:
+                    self._work_inflight -= 1
+                self._work_queue.task_done()
+
+    def _queue_press(
+        self,
+        generation: int,
+        target: TimedClickTarget,
+        lease: GameOperationLease | None,
+    ) -> bool:
+        if not self._ensure_work_worker():
+            if lease is not None:
+                lease.release()
+            return False
+        with self._work_lock:
+            self._work_pending += 1
+            self._work_queue.put(("press", generation, target, lease))
+        self._ensure_result_pump()
+        return True
+
+    def _queue_release(
+        self,
+        generation: int,
+        receipt: TimedClickPressReceipt,
+        lease: GameOperationLease | None = None,
+    ) -> bool:
+        receipt_id = id(receipt)
+        if receipt_id in self._pending_release_ids:
+            return True
+        self._pending_release_ids.add(receipt_id)
+        if not self._ensure_work_worker():
+            self._pending_release_ids.discard(receipt_id)
+            if lease is not None:
+                lease.release()
+            return False
+        with self._work_lock:
+            self._work_pending += 1
+            self._work_queue.put(("release", generation, receipt, lease))
+        self._ensure_result_pump()
+        return True
+
+    def _complete_press(
+        self,
+        generation: int,
+        target: TimedClickTarget,
+        receipt: TimedClickPressReceipt | None,
+        lease: GameOperationLease | None,
+    ) -> None:
+        with self._work_lock:
+            current_generation = self._work_generation
+        if (
+            receipt is not None
+            and generation == current_generation
+            and self._enabled
+        ):
+            self._active_receipts.append(receipt)
+            if lease is not None:
+                self._active_operation_leases[id(receipt)] = lease
+            self._sent_count += 1
+            self._schedule_tracked(
+                TIMED_CLICK_PRESS_MS,
+                lambda receipt=receipt: self._release_once(receipt),
+            )
+            synchronized_count = len(receipt.handles)
+            synchronized_detail = (
+                f"（同步 {synchronized_count} 個視窗）"
+                if synchronized_count > 1
+                else ""
+            )
+            self._status = (
+                f"定時按下：已連點 {self._sent_count} 次{synchronized_detail}"
+            )
+            self._result(True, "press", self._status)
+            return
+        if receipt is not None:
+            self._queue_release(generation, receipt, lease)
+            return
+        if lease is not None:
+            lease.release()
+        if generation != current_generation or not self._enabled:
+            return
+        self._enabled = False
+        self._firing = False
+        self._next_trigger_ms = None
+        for handle in tuple(self._scheduled_handles):
+            self._cancel_handle(handle)
+        self._scheduled_handles.clear()
+        self._status = "定時按下失敗：目標視窗無法唯一確認。"
+        self._result(
+            False,
+            "press",
+            self._status,
+            "target_delivery_failed",
+        )
+
+    def _complete_release(
+        self,
+        generation: int,
+        receipt: TimedClickPressReceipt,
+        released: bool,
+        lease: GameOperationLease | None,
+    ) -> None:
+        self._pending_release_ids.discard(id(receipt))
+        if receipt in self._active_receipts:
+            self._active_receipts.remove(receipt)
+        tracked_lease = self._active_operation_leases.pop(id(receipt), None)
+        if tracked_lease is not None:
+            tracked_lease.release()
+        if lease is not None:
+            lease.release()
+        with self._work_lock:
+            current_generation = self._work_generation
+        if generation != current_generation or not self._enabled:
+            return
+        if not released:
+            self._enabled = False
+            self._firing = False
+            self._next_trigger_ms = None
+            self._status = "定時按下失敗：滑鼠放開訊息未送達。"
+            self._result(
+                False,
+                "release",
+                self._status,
+                "target_release_failed",
+            )
+            return
+        if self._sent_count < self._repeat_count:
+            target = self._target
+            if target is None:
+                self._enabled = False
+                self._firing = False
+                self._next_trigger_ms = None
+                self._status = "定時按下失敗：按鈕位置不存在。"
+                self._result(
+                    False,
+                    "press",
+                    self._status,
+                    "target_unavailable",
+                )
+                return
+            self._schedule_tracked(
+                self._repeat_interval_ms,
+                lambda target=target: self._press_once(target),
+            )
+        elif not self._active_receipts and not self._scheduled_handles:
+            self._firing = False
+            self._status = (
+                f"定時按下：今日已完成 {self._sent_count} 次，等待明日。"
+            )
+            self._result(True, "complete", self._status)
+            self._schedule_poll()
+
     def _cancel_handle(self, handle: object | None) -> None:
         if handle is None:
             return
@@ -481,6 +741,9 @@ class GameTimeTimedClickService:
         notify: bool = True,
         message: str = "定時按下：未啟用",
     ) -> GameTimeTimedClickResult:
+        with self._work_lock:
+            self._work_generation += 1
+            generation = self._work_generation
         self._enabled = False
         self._firing = False
         self._next_trigger_ms = None
@@ -490,14 +753,21 @@ class GameTimeTimedClickService:
             self._cancel_handle(handle)
         self._scheduled_handles.clear()
         for receipt in tuple(self._active_receipts):
-            try:
-                self._backend.release(receipt)
-            except OSError:
-                pass
-            lease = self._active_operation_leases.pop(id(receipt), None)
-            if lease is not None:
-                lease.release()
+            if not self._queue_release(generation, receipt):
+                lease = self._active_operation_leases.pop(id(receipt), None)
+                if lease is not None:
+                    lease.release()
         self._active_receipts.clear()
+        self._cancel_handle(self._result_pump_handle)
+        self._result_pump_handle = None
+        with self._work_lock:
+            needs_pump = bool(
+                self._work_pending
+                or self._work_inflight
+                or not self._result_queue.empty()
+            )
+        if needs_pump:
+            self._ensure_result_pump()
         self._status = message
         return self._result(
             True,
@@ -635,97 +905,36 @@ class GameTimeTimedClickService:
                 "operation_gate_closed",
             )
             return
-        try:
-            receipt = self._backend.press(
-                target,
-                self._allowed_fingerprints(),
-            )
-        except OSError:
-            receipt = None
-        except Exception:
-            if lease is not None:
-                lease.release()
-            raise
-        if receipt is None:
-            self._enabled = False
-            self._firing = False
-            self._next_trigger_ms = None
-            if lease is not None:
-                lease.release()
-            for handle in tuple(self._scheduled_handles):
-                self._cancel_handle(handle)
-            self._scheduled_handles.clear()
-            self._status = "定時按下失敗：目標視窗無法唯一確認。"
-            self._result(
-                False,
-                "press",
-                self._status,
-                "target_delivery_failed",
-            )
+        with self._work_lock:
+            generation = self._work_generation
+        if self._queue_press(generation, target, lease):
             return
-        self._active_receipts.append(receipt)
         if lease is not None:
-            self._active_operation_leases[id(receipt)] = lease
-        self._sent_count += 1
-        self._schedule_tracked(
-            TIMED_CLICK_PRESS_MS,
-            lambda receipt=receipt: self._release_once(receipt),
+            lease.release()
+        if not self._enabled:
+            return
+        self._enabled = False
+        self._firing = False
+        self._next_trigger_ms = None
+        for handle in tuple(self._scheduled_handles):
+            self._cancel_handle(handle)
+        self._scheduled_handles.clear()
+        self._status = "定時按下失敗：目標視窗無法唯一確認。"
+        self._result(
+            False,
+            "press",
+            self._status,
+            "target_delivery_failed",
         )
-        synchronized_count = len(receipt.handles)
-        synchronized_detail = (
-            f"（同步 {synchronized_count} 個視窗）"
-            if synchronized_count > 1
-            else ""
-        )
-        self._status = (
-            f"定時按下：已連點 {self._sent_count} 次{synchronized_detail}"
-        )
-        self._result(True, "press", self._status)
 
     def _release_once(self, receipt: TimedClickPressReceipt) -> None:
-        try:
-            released = self._backend.release(receipt)
-        except OSError:
-            released = False
-        finally:
-            lease = self._active_operation_leases.pop(id(receipt), None)
-            if lease is not None:
-                lease.release()
-        if receipt in self._active_receipts:
-            self._active_receipts.remove(receipt)
-        if not released:
-            self._enabled = False
-            self._firing = False
-            self._next_trigger_ms = None
-            self._status = "定時按下失敗：滑鼠放開訊息未送達。"
-            self._result(
-                False,
-                "release",
-                self._status,
-                "target_release_failed",
-            )
-        elif self._sent_count < self._repeat_count:
-            target = self._target
-            if target is None:
-                self._enabled = False
-                self._firing = False
-                self._next_trigger_ms = None
-                self._status = "定時按下失敗：按鈕位置不存在。"
-                self._result(
-                    False,
-                    "press",
-                    self._status,
-                    "target_unavailable",
-                )
-                return
-            self._schedule_tracked(
-                self._repeat_interval_ms,
-                lambda target=target: self._press_once(target),
-            )
-        elif not self._active_receipts and not self._scheduled_handles:
-            self._firing = False
-            self._status = (
-                f"定時按下：今日已完成 {self._sent_count} 次，等待明日。"
-            )
-            self._result(True, "complete", self._status)
-            self._schedule_poll()
+        if (
+            receipt not in self._active_receipts
+            or id(receipt) in self._pending_release_ids
+        ):
+            return
+        with self._work_lock:
+            generation = self._work_generation
+        if self._queue_release(generation, receipt):
+            return
+        self._complete_release(generation, receipt, False, None)

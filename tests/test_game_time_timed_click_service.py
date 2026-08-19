@@ -1,3 +1,6 @@
+import queue
+import queue
+import threading
 import time
 
 from services.game_time_timed_click_service import (
@@ -43,6 +46,18 @@ class Scheduler:
         return token[1]()
 
 
+def wait_until(scheduler, predicate, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        if scheduler.calls:
+            scheduler.fire_next()
+        else:
+            time.sleep(0.001)
+    assert predicate()
+
+
 class Clock:
     def __init__(self):
         self.nanoseconds = 0
@@ -74,6 +89,38 @@ class Backend:
     def release(self, receipt):
         self.releases.append(receipt)
         return True
+
+
+class EventLoopScheduler:
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def schedule(self, delay, callback):
+        timer = threading.Timer(
+            max(0, delay) / 1000,
+            lambda: self.queue.put(callback),
+        )
+        timer.daemon = True
+        timer.start()
+        return timer
+
+    def cancel(self, token):
+        token.cancel()
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            try:
+                callback = self.queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            callback()
+
+    def close(self):
+        self.stop_event.set()
+        self.thread.join(1)
 
 
 def make_service():
@@ -115,12 +162,14 @@ def test_timed_click_uses_one_captured_role_and_repeats_daily_with_new_defaults(
     assert scheduler.fire_next().action == "fire"
     assert len(backend.presses) == 0
     scheduler.fire_next()
-    assert len(backend.presses) == 1
+    wait_until(scheduler, lambda: len(backend.presses) == 1)
     assert backend.releases == []
-    scheduler.fire_next()
-    assert backend.releases == backend.presses
-    for _ in range(4):
-        scheduler.fire_next()
+    wait_until(scheduler, lambda: len(backend.releases) == 1)
+    wait_until(scheduler, lambda: len(backend.presses) == 2)
+    wait_until(scheduler, lambda: len(backend.releases) == 2)
+    wait_until(scheduler, lambda: len(backend.presses) == 3)
+    wait_until(scheduler, lambda: len(backend.releases) == 3)
+    wait_until(scheduler, lambda: "今日已完成 3 次" in service.snapshot().status)
 
     assert len(backend.presses) == 3
     assert backend.releases == backend.presses
@@ -130,8 +179,8 @@ def test_timed_click_uses_one_captured_role_and_repeats_daily_with_new_defaults(
 
     clock.nanoseconds += DAY_MS * 1_000_000
     assert scheduler.fire_next().action == "fire"
-    for _ in range(6):
-        scheduler.fire_next()
+    wait_until(scheduler, lambda: len(backend.presses) == 6)
+    wait_until(scheduler, lambda: len(backend.releases) == 6)
 
     assert len(backend.presses) == 6
     assert backend.releases == backend.presses
@@ -158,8 +207,8 @@ def test_signed_timing_correction_can_advance_or_delay_the_daily_click():
         assert armed.snapshot.lead_ms == correction_ms
         assert scheduler.fire_next().action == "fire"
         scheduler.fire_next()
-        scheduler.fire_next()
-        assert len(backend.presses) == 1
+        wait_until(scheduler, lambda: len(backend.presses) == 1)
+        wait_until(scheduler, lambda: len(backend.releases) == 1)
         assert backend.releases == backend.presses
 
 
@@ -248,13 +297,180 @@ def test_one_timed_press_reports_fourteen_synchronized_windows():
         localtime=time.gmtime,
     )
 
+    service._enabled = True
+    service._firing = True
+    service._repeat_count = 1
     service._press_once(group_backend.target)
+
+    wait_until(
+        scheduler,
+        lambda: "14 個視窗" in service.snapshot().status,
+    )
 
     assert len(group_backend.presses) == 1
     assert group_backend.presses[0].handles == synchronized_handles
     assert service.snapshot().status == (
         "定時按下：已連點 1 次（同步 14 個視窗）"
     )
+
+
+def test_slow_release_does_not_block_schedule_thread_and_completes_three_presses():
+    scheduler = EventLoopScheduler()
+    release_started = threading.Event()
+    release_gate = threading.Event()
+    sequence = []
+
+    class SlowReleaseBackend(Backend):
+        def press(self, target, allowed):
+            receipt = super().press(target, allowed)
+            if receipt is not None:
+                sequence.append(("down", len(self.presses)))
+            return receipt
+
+        def release(self, receipt):
+            self.releases.append(receipt)
+            sequence.append(("up", len(self.releases)))
+            if len(self.releases) == 1:
+                release_started.set()
+                release_gate.wait(1)
+            return True
+
+    backend = SlowReleaseBackend()
+    service = GameTimeTimedClickService(
+        backend,
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+        allowed_fingerprints_provider=lambda: (FINGERPRINT,),
+    )
+    service._target = backend.target
+    service._enabled = True
+    service._firing = True
+    service._repeat_count = 3
+    service._repeat_interval_ms = 250
+    finished = threading.Event()
+
+    def mark_finished():
+        if len(backend.releases) == 3:
+            finished.set()
+
+    original_release = backend.release
+
+    def release_and_mark(receipt):
+        result = original_release(receipt)
+        mark_finished()
+        return result
+
+    backend.release = release_and_mark
+    scheduler.schedule(0, lambda: service._press_once(backend.target))
+    probe = threading.Event()
+    try:
+        assert release_started.wait(1)
+        scheduler.schedule(0, probe.set)
+        assert probe.wait(0.1)
+    finally:
+        release_gate.set()
+        assert finished.wait(3)
+        scheduler.close()
+
+    assert sequence == [
+        ("down", 1),
+        ("up", 1),
+        ("down", 2),
+        ("up", 2),
+        ("down", 3),
+        ("up", 3),
+    ]
+
+
+def test_result_pump_survives_running_before_worker_starts():
+    scheduler = Scheduler()
+    worker_started = threading.Event()
+    worker_gate = threading.Event()
+    backend = Backend()
+    service = GameTimeTimedClickService(
+        backend,
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+        allowed_fingerprints_provider=lambda: (FINGERPRINT,),
+        wall_clock_ns=lambda: 0,
+        localtime=time.gmtime,
+    )
+    service._target = backend.target
+    service._enabled = True
+    service._firing = True
+    original_loop = service._work_worker_loop
+
+    def delayed_loop():
+        worker_started.set()
+        worker_gate.wait(1)
+        original_loop()
+
+    service._work_worker_loop = delayed_loop
+    service._press_once(backend.target)
+    assert worker_started.wait(1)
+    scheduler.fire_next()
+    assert scheduler.calls
+    worker_gate.set()
+    wait_until(scheduler, lambda: len(backend.presses) == 1)
+
+
+def test_cancel_releases_inflight_receipt_without_sending_another_press():
+    scheduler = Scheduler()
+    backend = Backend()
+    service = GameTimeTimedClickService(
+        backend,
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+        allowed_fingerprints_provider=lambda: (FINGERPRINT,),
+        wall_clock_ns=lambda: 0,
+        localtime=time.gmtime,
+    )
+    service._target = backend.target
+    service._enabled = True
+    service._firing = True
+    service._repeat_count = 3
+    service._press_once(backend.target)
+    wait_until(scheduler, lambda: "已連點 1 次" in service.snapshot().status)
+
+    service.cancel(notify=False)
+    wait_until(scheduler, lambda: len(backend.releases) == 1)
+    wait_until(scheduler, lambda: not service._active_receipts)
+
+    assert len(backend.presses) == 1
+    assert backend.releases == backend.presses
+    assert service.snapshot().enabled is False
+
+
+def test_release_failure_stops_sequence_without_a_followup_press():
+    scheduler = Scheduler()
+
+    class FailedReleaseBackend(Backend):
+        def release(self, receipt):
+            self.releases.append(receipt)
+            return False
+
+    backend = FailedReleaseBackend()
+    service = GameTimeTimedClickService(
+        backend,
+        schedule=scheduler.schedule,
+        cancel=scheduler.cancel,
+        allowed_fingerprints_provider=lambda: (FINGERPRINT,),
+        wall_clock_ns=lambda: 0,
+        localtime=time.gmtime,
+    )
+    service._target = backend.target
+    service._enabled = True
+    service._firing = True
+    service._repeat_count = 3
+    service._press_once(backend.target)
+    wait_until(
+        scheduler,
+        lambda: "放開訊息未送達" in service.snapshot().status,
+    )
+
+    assert len(backend.presses) == 1
+    assert len(backend.releases) == 1
+    assert service.snapshot().enabled is False
 
 
 def test_server_clock_source_never_falls_back_to_system_time_or_manual_offset():
@@ -297,8 +513,8 @@ def test_server_clock_source_never_falls_back_to_system_time_or_manual_offset():
     assert armed.success is True
     monotonic[0] += 1_000_000_000
     assert scheduler.fire_next().action == "fire"
-    for _ in range(6):
-        scheduler.fire_next()
+    wait_until(scheduler, lambda: len(backend.presses) == 3)
+    wait_until(scheduler, lambda: len(backend.releases) == 3)
 
     assert len(backend.presses) == 3
     assert backend.releases == backend.presses

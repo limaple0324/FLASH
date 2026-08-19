@@ -8,7 +8,8 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 from pathlib import Path
-from threading import Timer
+from threading import Thread
+from time import monotonic, sleep
 from typing import Protocol
 
 from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
@@ -431,7 +432,7 @@ class WindowsTimedClickBackend:
             windows = tuple(self._synchronized_windows_provider())
         except Exception:
             return ()
-        if not 1 <= len(windows) <= 14 or len(windows) != len(allowed_fingerprints):
+        if not 1 <= len(windows) <= 14:
             return ()
         identities = tuple(
             complete_window_instance_identity(window) for window in windows
@@ -439,7 +440,28 @@ class WindowsTimedClickBackend:
         if any(identity is None for identity in identities):
             return ()
         fingerprints = tuple(identity[0] for identity in identities if identity is not None)
-        if fingerprints != allowed_fingerprints or len(set(fingerprints)) != len(fingerprints):
+        allowed_order = {
+            fingerprint: index
+            for index, fingerprint in enumerate(allowed_fingerprints)
+        }
+        positions = tuple(allowed_order.get(fingerprint, -1) for fingerprint in fingerprints)
+        complete_identities = tuple(
+            identity for identity in identities if identity is not None
+        )
+        handles = tuple(identity[1] for identity in complete_identities)
+        process_ids = tuple(identity[2] for identity in complete_identities)
+        thread_ids = tuple(identity[3] for identity in complete_identities)
+        lifecycles = tuple(identity[5] for identity in complete_identities)
+        if (
+            any(position < 0 for position in positions)
+            or positions != tuple(sorted(positions))
+            or len(set(fingerprints)) != len(fingerprints)
+            or len(set(handles)) != len(handles)
+            or len(set(process_ids)) != len(process_ids)
+            or len(set(thread_ids)) != len(thread_ids)
+            or len(set(lifecycles)) != len(lifecycles)
+            or len(set(complete_identities)) != len(complete_identities)
+        ):
             return ()
         return windows
 
@@ -461,36 +483,12 @@ class WindowsTimedClickBackend:
         identities = tuple(self._dispatch_identity(window) for window in windows)
         if any(identity is None for identity in identities):
             return False
-        complete_identities = tuple(
-            identity for identity in identities if identity is not None
-        )
-        drawn: list[tuple[tuple[str, int, int, int, str, int], object]] = []
 
-        def draw(
-            item: tuple[
-                WindowInfo,
-                tuple[str, int, int, int, str, int] | None,
+        def erase_markers(
+            markers: Iterable[
+                tuple[tuple[str, int, int, int, str, int], object]
             ],
-        ) -> tuple[tuple[str, int, int, int, str, int], object] | None:
-            window, identity = item
-            if identity is None or not self._instance_is_current(identity):
-                return None
-            token = marker_backend.draw(window, target)
-            return None if token is None else (identity, token)
-
-        with ThreadPoolExecutor(
-            max_workers=min(14, len(windows)),
-            thread_name_prefix="timed-click-marker",
-        ) as executor:
-            results = tuple(executor.map(draw, zip(windows, identities)))
-        if any(result is None for result in results):
-            for result in results:
-                if result is not None:
-                    marker_backend.erase(result[1])
-            return False
-        drawn = [result for result in results if result is not None]
-
-        def erase() -> None:
+        ) -> None:
             def erase_one(
                 item: tuple[
                     tuple[str, int, int, int, str, int],
@@ -501,15 +499,69 @@ class WindowsTimedClickBackend:
                 if self._instance_is_current(identity):
                     marker_backend.erase(token)
 
+            markers = tuple(markers)
+            if not markers:
+                return
             with ThreadPoolExecutor(
-                max_workers=min(14, len(drawn)),
+                max_workers=min(14, len(markers)),
                 thread_name_prefix="timed-click-marker-erase",
             ) as executor:
-                tuple(executor.map(erase_one, tuple(drawn)))
+                tuple(executor.map(erase_one, markers))
 
-        timer = Timer(max(0.0, float(duration_seconds)), erase)
-        timer.daemon = True
-        timer.start()
+        def draw_markers() -> list[
+            tuple[tuple[str, int, int, int, str, int], object]
+        ] | None:
+            def draw(
+                item: tuple[
+                    WindowInfo,
+                    tuple[str, int, int, int, str, int] | None,
+                ],
+            ) -> tuple[tuple[str, int, int, int, str, int], object] | None:
+                window, identity = item
+                if identity is None or not self._instance_is_current(identity):
+                    return None
+                token = marker_backend.draw(window, target)
+                return None if token is None else (identity, token)
+
+            with ThreadPoolExecutor(
+                max_workers=min(14, len(windows)),
+                thread_name_prefix="timed-click-marker",
+            ) as executor:
+                results = tuple(executor.map(draw, zip(windows, identities)))
+            if any(result is None for result in results):
+                erase_markers(result for result in results if result is not None)
+                return None
+            return [result for result in results if result is not None]
+
+        drawn = draw_markers()
+        if drawn is None:
+            return False
+
+        def blink() -> None:
+            visible = drawn
+            deadline = monotonic() + max(0.0, float(duration_seconds))
+            interval = min(
+                0.5,
+                max(0.05, max(0.0, float(duration_seconds)) / 6.0),
+            )
+            try:
+                while monotonic() < deadline:
+                    sleep(min(interval, max(0.0, deadline - monotonic())))
+                    if monotonic() >= deadline:
+                        break
+                    if visible:
+                        erase_markers(visible)
+                        visible = []
+                    else:
+                        redrawn = draw_markers()
+                        if redrawn is None:
+                            return
+                        visible = redrawn
+            finally:
+                erase_markers(visible)
+
+        preview = Thread(target=blink, name="timed-click-marker-blink", daemon=True)
+        preview.start()
         return True
 
     def _ready(self, window: WindowInfo) -> bool:

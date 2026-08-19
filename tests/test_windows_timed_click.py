@@ -81,14 +81,17 @@ class Markers:
         self.fail_handles = set(fail_handles)
         self.shown = []
         self.erased = []
+        self.events = []
 
     def draw(self, window, target):
+        self.events.append("draw")
         self.shown.append((window.handle, target.x_ratio, target.y_ratio))
         if window.handle in self.fail_handles:
             return None
         return window.handle
 
     def erase(self, token):
+        self.events.append("erase")
         self.erased.append(token)
         return True
 
@@ -294,10 +297,144 @@ def test_marker_requests_all_fourteen_sync_windows_without_pointer_input():
     )
     target = TimedClickTarget(fingerprints[0], 0.25, 0.75)
 
-    assert backend.show_target_markers(target, fingerprints) is True
+    assert backend.show_target_markers(
+        target,
+        fingerprints,
+        duration_seconds=0.01,
+    ) is True
+    sleep(0.05)
     assert markers.shown == [
         (window.handle, 0.25, 0.75) for window in windows
     ]
+    assert messages.sent == []
+
+
+def test_marker_accepts_connected_ordered_subset_of_allowed_group():
+    allowed = tuple(f"{index:064x}" for index in range(1, 17))
+    windows = tuple(
+        make_window(10 + index, fingerprint)
+        for index, fingerprint in enumerate(allowed[:10])
+    )
+    messages = Messages()
+    markers = Markers()
+    backend = WindowsTimedClickBackend(
+        Windows(windows),
+        messages,
+        marker_backend=markers,
+        synchronized_windows_provider=lambda: windows,
+    )
+
+    assert backend.show_target_markers(
+        TimedClickTarget(allowed[0], 0.25, 0.75),
+        allowed,
+        duration_seconds=0.01,
+    ) is True
+    sleep(0.05)
+    assert [handle for handle, _x, _y in markers.shown[:10]] == [
+        window.handle for window in windows
+    ]
+    assert messages.sent == []
+
+
+def test_marker_rejects_more_than_fourteen_connected_windows():
+    allowed = tuple(f"{index:064x}" for index in range(1, 17))
+    windows = tuple(
+        make_window(10 + index, fingerprint)
+        for index, fingerprint in enumerate(allowed[:15])
+    )
+    markers = Markers()
+    backend = WindowsTimedClickBackend(
+        Windows(windows),
+        Messages(),
+        marker_backend=markers,
+        synchronized_windows_provider=lambda: windows,
+    )
+
+    assert backend.show_target_markers(
+        TimedClickTarget(allowed[0], 0.25, 0.75),
+        allowed,
+    ) is False
+    assert markers.shown == []
+
+
+def test_marker_rejects_nonmember_duplicate_and_out_of_order_windows():
+    allowed = tuple(f"{index:064x}" for index in range(1, 5))
+    cases = (
+        (allowed[0], "f" * 64),
+        (allowed[0], allowed[0]),
+        (allowed[1], allowed[0]),
+    )
+
+    for fingerprints in cases:
+        windows = tuple(
+            make_window(10 + index, fingerprint)
+            for index, fingerprint in enumerate(fingerprints)
+        )
+        markers = Markers()
+        backend = WindowsTimedClickBackend(
+            Windows(windows),
+            Messages(),
+            marker_backend=markers,
+            synchronized_windows_provider=lambda windows=windows: windows,
+        )
+
+        assert backend.show_target_markers(
+            TimedClickTarget(allowed[0], 0.25, 0.75),
+            allowed,
+        ) is False
+        assert markers.shown == []
+
+
+def test_marker_rejects_duplicate_instance_fields():
+    allowed = tuple(f"{index:064x}" for index in range(1, 3))
+    original = (
+        make_window(10, allowed[0]),
+        make_window(11, allowed[1]),
+    )
+
+    for field in ("handle", "process_id", "thread_id", "process_lifecycle_token"):
+        windows = (
+            original[0],
+            replace(original[1], **{field: getattr(original[0], field)}),
+        )
+        markers = Markers()
+        backend = WindowsTimedClickBackend(
+            Windows(windows),
+            Messages(),
+            marker_backend=markers,
+            synchronized_windows_provider=lambda windows=windows: windows,
+        )
+
+        assert backend.show_target_markers(
+            TimedClickTarget(allowed[0], 0.25, 0.75),
+            allowed,
+        ) is False
+        assert markers.shown == []
+
+
+def test_marker_blinks_for_multiple_draw_and_erase_rounds():
+    allowed = tuple(f"{index + 1:064x}" for index in range(2))
+    windows = tuple(
+        make_window(10 + index, fingerprint)
+        for index, fingerprint in enumerate(allowed)
+    )
+    markers = Markers()
+    messages = Messages()
+    backend = WindowsTimedClickBackend(
+        Windows(windows),
+        messages,
+        marker_backend=markers,
+        synchronized_windows_provider=lambda: windows,
+    )
+
+    assert backend.show_target_markers(
+        TimedClickTarget(allowed[0], 0.5, 0.5),
+        allowed,
+        duration_seconds=0.2,
+    ) is True
+    sleep(0.35)
+    assert markers.events.count("draw") >= 2
+    assert markers.events.count("erase") >= 2
     assert messages.sent == []
 
 
@@ -367,9 +504,10 @@ def test_marker_cleanup_does_not_touch_a_reused_handle():
     assert backend.show_target_markers(
         TimedClickTarget(FINGERPRINT, 0.5, 0.5),
         (FINGERPRINT,),
-        duration_seconds=0.01,
+        duration_seconds=0.2,
     ) is True
-    sleep(0.05)
+    sleep(0.35)
+    assert len(markers.shown) == 1
     assert markers.erased == []
 
 
