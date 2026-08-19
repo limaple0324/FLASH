@@ -1,10 +1,15 @@
-"""Run the Devspace bridge with explicit queue refresh and hidden Windows children."""
+"""Run the Devspace bridge as one hidden Windows singleton."""
 from __future__ import annotations
 
+import ctypes
+import os
 import subprocess
 import sys
 
 import bridge as core
+
+MUTEX_NAME = r"Local\Limaple.DevspaceBridge.Runner"
+ERROR_ALREADY_EXISTS = 183
 
 
 def _hidden_run(
@@ -15,9 +20,11 @@ def _hidden_run(
     check: bool = True,
     env: dict[str, str] | None = None,
 ):
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    creationflags = (
+        int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if sys.platform == "win32"
+        else 0
+    )
     try:
         result = subprocess.run(
             args,
@@ -59,13 +66,40 @@ def _fixed_fetch(self: core.QueueClient) -> None:
     )
 
 
+def _acquire_mutex():
+    if os.name != "nt":
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+    create_mutex.restype = ctypes.c_void_p
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_bool
+    ctypes.set_last_error(0)
+    handle = create_mutex(None, False, MUTEX_NAME)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "Devspace mutex failed")
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        close_handle(handle)
+        return False
+    return handle
+
+
 def main() -> int:
-    core._run = _hidden_run
-    core.QueueClient.fetch = _fixed_fetch
-    print("DEVSPACE BRIDGE ONLINE", flush=True)
-    print("QUEUE REFRESH FIX ACTIVE", flush=True)
-    print("NO WINDOW CHILD PROCESS ACTIVE", flush=True)
-    return core.main()
+    mutex = _acquire_mutex()
+    if mutex is False:
+        return 0
+    try:
+        core._run = _hidden_run
+        core.QueueClient.fetch = _fixed_fetch
+        return core.main()
+    finally:
+        if os.name == "nt" and mutex not in (None, False):
+            try:
+                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(mutex)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
