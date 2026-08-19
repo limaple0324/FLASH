@@ -18,6 +18,16 @@ def test_normalize_launch_fingerprint_is_strict_and_case_insensitive():
     assert normalize_launch_fingerprint(None) is None
 
 
+def test_process_resolver_keeps_manual_launch_fallback_secret_safe():
+    script = PowerShellLaunchFingerprintResolver._SCRIPT
+
+    assert "function Get-DirectArgumentTail" in script
+    assert "$identityArguments = Get-DirectArgumentTail $commandLine $executablePath" in script
+    assert "Launch origin is not identity authority" in script
+    assert "Write-Output $commandLine" not in script
+    assert "Write-Output $identityArguments" not in script
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Resolver intentionally runs only on Windows")
 def test_resolver_returns_only_requested_valid_fingerprints(monkeypatch):
     observed = {}
