@@ -26,6 +26,15 @@ class SyncScope:
 
     @property
     def ready(self) -> bool:
+        if self.group_name == "configured" and not self.entry_ids:
+            return (
+                self.controller_entry_id is None
+                and not self.fingerprints
+                and not self.shortcut_paths
+                and not self.entry_fingerprints
+                and not self.isolated_entry_ids
+                and not self.failure_codes
+            )
         return (
             self.controller_entry_id is not None
             and bool(self.fingerprints)
@@ -48,6 +57,12 @@ class SyncScopeInputs:
 
     @property
     def ready(self) -> bool:
+        if self.group_name == "configured" and not self.entry_ids:
+            return (
+                self.controller_entry_id is None
+                and not self.shortcut_paths
+                and not self.failure_codes
+            )
         return (
             self.controller_entry_id is not None
             and bool(self.entry_ids)
@@ -79,7 +94,7 @@ class SyncScopeService:
         """Return an anonymous sentinel for one unavailable configured shortcut.
 
         Global smart reconnect must not be disabled merely because one unrelated
-        saved shortcut cannot currently be resolved.  The sentinel keeps that
+        saved shortcut cannot currently be resolved. The sentinel keeps that
         entry structurally present in the configured authority while ensuring it
         cannot inherit another live window's launcher fingerprint.
         """
@@ -142,7 +157,7 @@ class SyncScopeService:
         """Return every configured entry once, without resolving shortcuts.
 
         An empty configuration is not a global identity failure for smart
-        reconnect.  It simply means there is no configured reopen authority;
+        reconnect. It simply means there is no configured reopen authority;
         the live-instance controller may still monitor manually opened FLASH
         windows and will fail closed only for steps that need a saved source.
         """
@@ -174,11 +189,11 @@ class SyncScopeService:
     def configured_scope(self) -> SyncScope:
         """Resolve configured reconnect identities while isolating bad siblings.
 
-        This authority is intentionally more tolerant than ``scope()``.  Input
+        This authority is intentionally more tolerant than ``scope()``. Input
         synchronization still fails closed for a selected group, but smart
         reconnect is global and must continue monitoring every independently
         proven FLASH instance even when one saved shortcut is missing, stale or
-        unreadable.  Unresolved configured entries receive anonymous isolated
+        unreadable. Unresolved configured entries receive anonymous isolated
         sentinels; they stay offline and cannot steal another window's identity.
         """
 
@@ -267,11 +282,6 @@ class SyncScopeService:
                 entry_fingerprints=entry_fingerprints,
                 isolated_entry_ids=isolated_entry_ids,
             )
-        # A launch digest identifies the executable image, not one live
-        # top-level game window.  Keep ordered duplicate digests here; the
-        # target-window contract later binds each configured entry to exactly
-        # one player-confirmed complete window instance before any controller
-        # receives an allowed identity.
         return SyncScope(
             inputs.group_name,
             inputs.controller_entry_id,

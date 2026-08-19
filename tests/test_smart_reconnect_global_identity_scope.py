@@ -1,5 +1,8 @@
 import hashlib
 
+import pytest
+
+import adapters.windows_smart_reconnect_base as smart_reconnect_base
 from adapters.game_screen_recognizer import ScreenRecognition
 from adapters.windows_background_capture import CaptureSample
 from adapters.windows_smart_reconnect import (
@@ -18,6 +21,7 @@ from services.target_window_contract_service import (
     TargetFailureEvidence,
     TargetWindowContractService,
 )
+from ui.home import HomeView, SmartReconnectToggleViewResult
 
 
 class PartialResolver:
@@ -153,6 +157,8 @@ def _controller(
     target_windows_provider=None,
     capture_access_preparer=None,
     minimized_refresh_capture_provider=None,
+    manual_shortcut_resolver=None,
+    tcp_connection_count_provider=None,
 ):
     backend = WindowBackend(
         windows,
@@ -176,6 +182,8 @@ def _controller(
         minimized_refresh_capture_provider=(
             minimized_refresh_capture_provider
         ),
+        manual_shortcut_resolver=manual_shortcut_resolver,
+        tcp_connection_count_provider=tcp_connection_count_provider,
     )
     return controller, backend, capture, mouse
 
@@ -250,20 +258,31 @@ def test_one_bad_saved_shortcut_does_not_remove_a_live_manual_flash_target(
     assert plan.ready is True
 
 
-def test_empty_configured_scope_is_not_a_global_identity_failure(tmp_path):
+def test_empty_configured_scope_builds_a_clean_empty_enable_plan(tmp_path):
     configuration = GroupConfigurationService(tmp_path / "groups.json")
     service = SyncScopeService(configuration, PartialResolver())
 
     inputs = service.configured_inputs()
     scope = service.configured_scope()
+    plan = build_configured_reconnect_plan(
+        scope,
+        configuration.groups(),
+        (),
+        (),
+    )
 
     assert inputs.group_name == "configured"
     assert inputs.entry_ids == ()
     assert inputs.failure_codes == ()
+    assert inputs.ready is True
     assert scope.group_name == "configured"
     assert scope.entry_ids == ()
     assert scope.failure_codes == ()
-    assert scope.ready is False
+    assert scope.ready is True
+    assert plan is not None
+    assert plan.group_name == "configured"
+    assert plan.targets == ()
+    assert plan.failure_codes == ()
 
 
 def test_manual_flash_snapshot_falls_back_to_live_instance_without_role_plan():
@@ -279,12 +298,14 @@ def test_manual_flash_snapshot_falls_back_to_live_instance_without_role_plan():
         ),
         capture_access_preparer=lambda: permission_calls.append(True) or False,
     )
+    controller.set_group_launch_plan(GroupLaunchPlan("configured", ()))
 
     prepared = controller.prepare_execution_snapshot()
     controller.set_execution_enabled(True)
     first = controller.reconnect()
     second = controller.reconnect()
 
+    assert controller._manual_empty_plan_requested is True
     assert prepared.success is True
     assert prepared.details["window_count"] == 1
     assert permission_calls == []
@@ -293,9 +314,62 @@ def test_manual_flash_snapshot_falls_back_to_live_instance_without_role_plan():
     assert [handle for handle, _point in mouse.clicks] == [window.handle]
 
 
-def test_detection_only_manual_flash_can_advance_login_but_not_gain_reopen_owner(
+def test_manual_unique_shortcut_grants_only_reopen_source(tmp_path):
+    fingerprint = "d" * 64
+    window = _window(4, fingerprint)
+    shortcut = _shortcut(tmp_path, "手動角色")
+    controller, _backend, _capture, _mouse = _controller(
+        (window,),
+        {window.handle: 1},
+        target_windows_provider=lambda: ResolvedTargetWindows(
+            (),
+            global_failure_codes=("group_name_invalid",),
+        ),
+        manual_shortcut_resolver=(
+            lambda requested: shortcut if requested == fingerprint else None
+        ),
+    )
+    controller.set_group_launch_plan(GroupLaunchPlan("configured", ()))
+
+    prepared = controller.prepare_execution_snapshot()
+
+    assert prepared.success is True
+    assert controller._manual_live_fingerprints == frozenset((fingerprint,))
+    target = controller._manual_reopen_targets[fingerprint]
+    assert target.shortcut_path == shortcut
+    assert target.fingerprint == fingerprint
+    assert target.entry_id == ""
+    assert target.role_id == ""
+    assert controller._group_launch_plan is not None
+    assert controller._manual_runtime_plan_installed is True
+
+
+def test_manual_without_unique_shortcut_keeps_live_actions_but_no_reopen_target():
+    fingerprint = "e" * 64
+    window = _window(5, fingerprint)
+    controller, _backend, _capture, _mouse = _controller(
+        (window,),
+        {window.handle: 1},
+        target_windows_provider=lambda: ResolvedTargetWindows(
+            (),
+            global_failure_codes=("group_name_invalid",),
+        ),
+        manual_shortcut_resolver=lambda _requested: None,
+    )
+    controller.set_group_launch_plan(GroupLaunchPlan("configured", ()))
+
+    prepared = controller.prepare_execution_snapshot()
+
+    assert prepared.success is True
+    assert controller._manual_live_fingerprints == frozenset((fingerprint,))
+    assert controller._manual_reopen_targets == {}
+    assert controller._group_launch_plan is None
+
+
+def test_detection_only_manual_flash_can_advance_login_without_formal_role(
     tmp_path,
 ):
+    configured_shortcut = _shortcut(tmp_path, "configured")
     configured = _window(1, "a" * 64)
     manual = _window(2, "b" * 64)
     plan = GroupLaunchPlan(
@@ -304,7 +378,7 @@ def test_detection_only_manual_flash_can_advance_login_but_not_gain_reopen_owner
             GroupLaunchTarget(
                 1,
                 "configured-role",
-                tmp_path / "configured.lnk",
+                configured_shortcut,
                 configured.launch_fingerprint,
                 entry_id="entry-configured",
                 role_id="configured-role",
@@ -336,18 +410,16 @@ def test_detection_only_manual_flash_can_advance_login_but_not_gain_reopen_owner
 
     assert prepared.success is True
     assert manual.launch_fingerprint in controller._detection_only_fingerprints
+    assert manual.launch_fingerprint in controller._manual_live_fingerprints
     assert manual.launch_fingerprint in controller._initial_login_authorizations or (
         manual.launch_fingerprint in controller._pending_reconnect_fingerprints
     )
     assert result.details["clicked_windows"] == 1
     assert [handle for handle, _point in mouse.clicks] == [manual.handle]
-    assert manual.launch_fingerprint not in controller._pending_reopen_fingerprints
-    assert manual.launch_fingerprint not in (
-        controller._login_only_recovery_fingerprints
-    )
+    assert manual.launch_fingerprint not in controller._login_only_recovery_fingerprints
 
 
-def test_attributable_unknown_target_failure_stays_local():
+def test_attributable_unknown_target_failure_stays_local_even_if_source_mirrors_it():
     healthy = _window(1, "a" * 64)
     failed = _window(2, "b" * 64)
     controller, _backend, _capture, _mouse = _controller(
@@ -364,6 +436,7 @@ def test_attributable_unknown_target_failure_stays_local():
                 (failed,),
             ),
         ),
+        global_failure_codes=("new_target_local_failure",),
     )
 
     global_failures, local_failures = (
@@ -376,9 +449,124 @@ def test_attributable_unknown_target_failure_stays_local():
     }
 
 
-def test_minimized_activation_uses_dedicated_refresh_provider_without_wgc_access():
+def test_activation_isolates_one_attributable_bad_configured_window(tmp_path):
+    healthy_shortcut = _shortcut(tmp_path, "healthy")
+    failed_shortcut = _shortcut(tmp_path, "failed")
+    healthy = _window(1, "a" * 64)
+    failed = _window(2, "b" * 64)
+    plan = GroupLaunchPlan(
+        "configured",
+        (
+            GroupLaunchTarget(
+                1,
+                "healthy",
+                healthy_shortcut,
+                healthy.launch_fingerprint,
+                entry_id="entry-healthy",
+                role_id="healthy",
+            ),
+            GroupLaunchTarget(
+                2,
+                "failed",
+                failed_shortcut,
+                failed.launch_fingerprint,
+                entry_id="entry-failed",
+                role_id="failed",
+            ),
+        ),
+    )
+    resolved = ResolvedTargetWindows(
+        windows=(healthy,),
+        sync_windows=(healthy,),
+        sync_entry_ids=("entry-healthy",),
+        sync_scope_entry_ids=("entry-healthy", "entry-failed"),
+        sync_controller_entry_id="entry-healthy",
+        target_failure_evidence=(
+            TargetFailureEvidence(
+                "entry-failed",
+                failed.launch_fingerprint,
+                ("new_target_local_failure",),
+                (failed,),
+            ),
+        ),
+        global_failure_codes=("new_target_local_failure",),
+    )
+    controller, _backend, _capture, _mouse = _controller(
+        (healthy, failed),
+        {healthy.handle: 1, failed.handle: 1},
+        target_windows_provider=lambda: resolved,
+    )
+    controller.set_group_launch_plan(plan)
+
+    prepared = controller.prepare_execution_snapshot()
+
+    assert prepared.success is True
+    assert prepared.details["window_count"] == 1
+    assert prepared.details["isolated_window_count"] >= 1
+    assert tuple(controller._activation_snapshot_instances) == (
+        healthy.launch_fingerprint,
+    )
+
+
+def test_mixed_manual_scope_temporarily_uses_visual_recovery_without_losing_tcp_provider(
+    monkeypatch,
+):
+    fingerprint = "a" * 64
+    window = _window(1, fingerprint)
+    tcp_provider = lambda _ids: {}
+    controller, _backend, _capture, _mouse = _controller(
+        (window,),
+        {window.handle: 1},
+        tcp_connection_count_provider=tcp_provider,
+    )
+    controller._step_scoped_activation_ready = True
+    controller._manual_live_fingerprints = frozenset((fingerprint,))
+
+    observed = []
+
+    def fake_scan(instance, *, execute):
+        observed.append((instance._tcp_counts, execute))
+        return "sentinel"
+
+    monkeypatch.setattr(
+        smart_reconnect_base.WindowsSmartReconnectController,
+        "_scan_locked",
+        fake_scan,
+    )
+
+    result = controller._scan_locked(execute=True)
+
+    assert result == "sentinel"
+    assert observed == [(None, True)]
+    assert controller._tcp_counts is tcp_provider
+
+
+def test_minimized_login_can_reach_mouse_backend_through_recovering_route():
     fingerprint = "c" * 64
     window = _window(3, fingerprint, minimized=True)
+    refresh = MarkerCapture({window.handle: 3})
+    controller, _backend, primary, mouse = _controller(
+        (window,),
+        {window.handle: 3},
+        minimized_refresh_capture_provider=refresh,
+    )
+
+    prepared = controller.prepare_execution_snapshot()
+    controller.set_execution_enabled(True)
+    first = controller.reconnect()
+    second = controller.reconnect()
+
+    assert prepared.success is True
+    assert first.details["clicked_windows"] == 0
+    assert second.details["clicked_windows"] == 1
+    assert refresh.calls == [window.handle, window.handle]
+    assert primary.calls == []
+    assert [handle for handle, _point in mouse.clicks] == [window.handle]
+
+
+def test_minimized_activation_uses_dedicated_refresh_provider_without_wgc_access():
+    fingerprint = "f" * 64
+    window = _window(6, fingerprint, minimized=True)
     refresh = MarkerCapture({window.handle: 1})
     permission_calls = []
     controller, _backend, primary, mouse = _controller(
@@ -398,3 +586,51 @@ def test_minimized_activation_uses_dedicated_refresh_provider_without_wgc_access
     assert primary.calls == []
     assert result.details["connected_windows"] == 1
     assert mouse.clicks == []
+
+
+def test_production_scope_wording_never_requires_manual_window_to_join_current_group():
+    result_init = SmartReconnectToggleViewResult.__init__
+    display_method = HomeView._smart_reconnect_failure_display
+    result_marker = getattr(
+        SmartReconnectToggleViewResult,
+        "_fu_reconnect_scope_normalized",
+        None,
+    )
+    home_marker = getattr(HomeView, "_fu_reconnect_scope_normalized", None)
+    try:
+        WindowsSmartReconnectController._install_product_scope_message_normalization()
+        result = SmartReconnectToggleViewResult(
+            False,
+            False,
+            "目前組別的安全視窗身分尚未完成，智慧重連未啟用。",
+        )
+        view = object.__new__(HomeView)
+        view._smart_reconnect_failure_message = result.message
+        display = view._smart_reconnect_failure_display()
+
+        assert "目前組別" not in result.message
+        assert "加入目前組別" not in display
+        assert "唯一可靠捷徑來源" in display
+        assert "智慧重連安全操作尚未完成" in display
+    finally:
+        SmartReconnectToggleViewResult.__init__ = result_init
+        HomeView._smart_reconnect_failure_display = display_method
+        if result_marker is None:
+            try:
+                delattr(
+                    SmartReconnectToggleViewResult,
+                    "_fu_reconnect_scope_normalized",
+                )
+            except AttributeError:
+                pass
+        else:
+            SmartReconnectToggleViewResult._fu_reconnect_scope_normalized = (
+                result_marker
+            )
+        if home_marker is None:
+            try:
+                delattr(HomeView, "_fu_reconnect_scope_normalized")
+            except AttributeError:
+                pass
+        else:
+            HomeView._fu_reconnect_scope_normalized = home_marker
