@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-smart-reconnect-ping-20260820-0606",
+  "action": "ping",
+  "args": {}
+}
