@@ -52,55 +52,44 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
         if not isinstance(message, str):
             return message
         normalized = message
+        changed = False
         for phrase in _OLD_SCOPE_PHRASES:
-            normalized = normalized.replace(
+            replaced = normalized.replace(
                 phrase,
                 "智慧重連安全操作尚未完成",
+            )
+            changed = changed or replaced != normalized
+            normalized = replaced
+        if changed and "唯一可靠捷徑來源" not in normalized:
+            normalized = (
+                normalized.rstrip("。")
+                + "；只有需要自動關閉／重開的視窗，才需要唯一可靠捷徑來源。"
             )
         return normalized
 
     @classmethod
     def _install_product_scope_message_normalization(cls) -> None:
         try:
-            from ui.home import HomeView, SmartReconnectToggleViewResult
+            from ui.home import SmartReconnectToggleViewResult
         except Exception:
             return
-
         result_type = SmartReconnectToggleViewResult
-        if not getattr(result_type, "_fu_reconnect_scope_normalized", False):
-            original_init = result_type.__init__
+        if getattr(result_type, "_fu_reconnect_scope_normalized", False):
+            return
+        original_init = result_type.__init__
 
-            def normalized_init(instance, *args, **kwargs):
-                values = list(args)
-                if len(values) >= 3:
-                    values[2] = cls._normalize_product_scope_message(values[2])
-                elif "message" in kwargs:
-                    kwargs["message"] = cls._normalize_product_scope_message(
-                        kwargs["message"]
-                    )
-                return original_init(instance, *values, **kwargs)
-
-            result_type.__init__ = normalized_init
-            result_type._fu_reconnect_scope_normalized = True
-
-        home_type = HomeView
-        if not getattr(home_type, "_fu_reconnect_scope_normalized", False):
-            def normalized_failure_display(instance) -> str:
-                message = cls._normalize_product_scope_message(
-                    getattr(instance, "_smart_reconnect_failure_message", "")
+        def normalized_init(instance, *args, **kwargs):
+            values = list(args)
+            if len(values) >= 3:
+                values[2] = cls._normalize_product_scope_message(values[2])
+            elif "message" in kwargs:
+                kwargs["message"] = cls._normalize_product_scope_message(
+                    kwargs["message"]
                 )
-                if not isinstance(message, str):
-                    return ""
-                if "智慧重連安全操作尚未完成" not in message:
-                    return message
-                return (
-                    f"{message}\n"
-                    "處理步驟：確認目前 FLASH 視窗皆可唯一辨識；"
-                    "只有需要自動關閉／重開的視窗，才需要唯一可靠捷徑來源。"
-                )
+            return original_init(instance, *values, **kwargs)
 
-            home_type._smart_reconnect_failure_display = normalized_failure_display
-            home_type._fu_reconnect_scope_normalized = True
+        result_type.__init__ = normalized_init
+        result_type._fu_reconnect_scope_normalized = True
 
     @staticmethod
     def _discover_manual_shortcut_resolver(provider):
@@ -197,15 +186,7 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
             and set(global_failures) <= _MANUAL_SCOPE_ONLY_FAILURE_CODES
         )
 
-    def _candidate_window_set(self):
-        windows, global_failures, target_failures = (
-            super()._candidate_window_set()
-        )
-        if not self._manual_scope_fallback_allowed(
-            global_failures,
-            target_failures,
-        ):
-            return windows, global_failures, target_failures
+    def _direct_live_candidate_window_set(self):
         self._tcp_v = None
         try:
             direct_windows = tuple(
@@ -227,6 +208,22 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
             (("window_identity_duplicate",) if blocked else ()),
             {},
         )
+
+    def _candidate_window_set(self):
+        if (
+            self._step_scoped_live_reconnect
+            and self._manual_empty_plan_requested
+        ):
+            return self._direct_live_candidate_window_set()
+        windows, global_failures, target_failures = (
+            super()._candidate_window_set()
+        )
+        if not self._manual_scope_fallback_allowed(
+            global_failures,
+            target_failures,
+        ):
+            return windows, global_failures, target_failures
+        return self._direct_live_candidate_window_set()
 
     def _current_activation_requires_obscured_access(self) -> bool:
         settings = self.capture_settings
@@ -553,9 +550,12 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
             initial_login_authorized=initial_login_authorized,
         )
 
-    @staticmethod
-    def _delivery_window_proxy(window):
-        if window is None or not window.minimized:
+    def _delivery_window_proxy(self, window):
+        if (
+            not self._step_scoped_live_reconnect
+            or window is None
+            or not window.minimized
+        ):
             return window
         frame = inspect.currentframe()
         caller = frame.f_back if frame is not None else None

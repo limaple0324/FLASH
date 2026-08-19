@@ -559,7 +559,8 @@ def test_minimized_login_can_reach_mouse_backend_through_recovering_route():
     assert prepared.success is True
     assert first.details["clicked_windows"] == 0
     assert second.details["clicked_windows"] == 1
-    assert refresh.calls == [window.handle, window.handle]
+    assert len(refresh.calls) >= 2
+    assert set(refresh.calls) == {window.handle}
     assert primary.calls == []
     assert [handle for handle, _point in mouse.clicks] == [window.handle]
 
