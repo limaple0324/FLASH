@@ -1373,6 +1373,7 @@ class HomeView:
         self._sync_key_count_label: Label | None = None
         self._sync_key_summary_label: Label | None = None
         self._sync_key_toggle_button: Button | None = None
+        self._sync_key_hotkey_label: Label | None = None
         self._sync_key_list_frame: Frame | None = None
         self._sync_key_actions_frame: Frame | None = None
         self._feature_hotkey_variables: dict[str, StringVar] = {}
@@ -1396,6 +1397,7 @@ class HomeView:
         self._group_entries_frame: Frame | None = None
         self._group_setting_message_label: Label | None = None
         self._group_selection_status_label: Label | None = None
+        self._group_list_current_label: Label | None = None
         self._group_selection_buttons: dict[str, Button] = {}
         self._role_id_messages: dict[str, str] = {}
         self._group_master_lock_button: Button | None = None
@@ -1862,9 +1864,16 @@ class HomeView:
         card_id: str,
         text: str,
         command: Callable[[], object],
+        *,
+        primary: bool = False,
     ) -> Button:
         widgets = self._feature_cards[card_id]
-        button = self._button(widgets.control_row, text, command)
+        button = self._button(
+            widgets.control_row,
+            text,
+            command,
+            primary=primary,
+        )
         button.pack(side=RIGHT, padx=(8, 0))
         return button
 
@@ -3753,6 +3762,12 @@ class HomeView:
             order_frame=reminder_section,
         )
         reminder.pack(fill=X)
+        self._feature_card_header_button(
+            "home.reminders",
+            "重新查看",
+            self._refresh_from_player_action,
+            primary=True,
+        )
         self._card_label = Label(
             reminder,
             text=_card_text(self.status, self.card_view_state),
@@ -3765,12 +3780,6 @@ class HomeView:
         self._card_label.pack(side=LEFT, fill=X, expand=True)
         self._card_actions_frame = Frame(reminder, bg=SURFACE)
         self._card_actions_frame.pack(side=RIGHT, padx=(8, 0))
-        self._button(
-            reminder,
-            "重新查看",
-            self._refresh_from_player_action,
-            primary=True,
-        ).pack(side=RIGHT)
 
         self._hint_label(
             page,
@@ -3874,6 +3883,12 @@ class HomeView:
             title="依日期與角色搜尋",
         )
         search_card.pack(fill=X, pady=(10, 0))
+        self._feature_card_header_button(
+            "records.search",
+            "搜尋",
+            self._search_operation_records,
+            primary=True,
+        )
         Label(
             search_card,
             text="依日期與角色搜尋",
@@ -3911,12 +3926,6 @@ class HomeView:
             expand=True,
             padx=6,
         )
-        self._button(
-            search_fields,
-            "搜尋",
-            self._search_operation_records,
-            primary=True,
-        ).pack(side=RIGHT, padx=(6, 0))
         self._hint_label(
             search_card,
             text="日期格式：YYYY-MM-DD；角色可輸入完整或部分名稱",
@@ -4244,17 +4253,16 @@ class HomeView:
         menu.pack(fill=X, pady=(8, 0))
         if not names:
             menu.configure(state=DISABLED)
-        launch_row = Frame(selector, bg=SURFACE)
-        launch_row.pack(fill=X, pady=(12, 0))
-        self._group_launch_button = self._button(
-            launch_row,
+        self._group_launch_button = self._feature_card_header_button(
+            "groups.current",
             "啟動本組",
             self._launch_current_group,
             primary=True,
         )
-        self._group_launch_button.pack(side=LEFT)
         if not names or self.on_launch_group is None:
             self._group_launch_button.configure(state=DISABLED)
+        launch_row = Frame(selector, bg=SURFACE)
+        launch_row.pack(fill=X, pady=(12, 0))
         self._group_management_frame = Frame(selector, bg=SURFACE)
         self._group_management_expanded = False
         self._group_management_button = self._button(
@@ -4449,15 +4457,14 @@ class HomeView:
             fg=TEXT,
             anchor="w",
         ).pack(side=LEFT, fill=X, expand=True)
-        entry_primary_actions = Frame(entry_card, bg=SURFACE)
-        entry_primary_actions.pack(fill=X, pady=(8, 0))
-        self._group_add_button = self._button(
-            entry_primary_actions,
+        self._group_add_button = self._feature_card_header_button(
+            "groups.roles",
             "加入角色到組別",
             self._add_shortcuts_to_current_group,
             primary=True,
         )
-        self._group_add_button.pack(side=RIGHT)
+        entry_primary_actions = Frame(entry_card, bg=SURFACE)
+        entry_primary_actions.pack(fill=X, pady=(8, 0))
         self._group_reorder_button = None
         self._group_reorder_finish_button = None
         self._group_reorder_cancel_button = None
@@ -4564,6 +4571,12 @@ class HomeView:
             title="延伸同步範圍",
         )
         sync_card.pack(fill=X, pady=(10, 0))
+        self._feature_card_header_button(
+            "groups.extended_sync",
+            "加入延伸同步",
+            self._add_group_sync_relation,
+            primary=True,
+        )
         Label(
             sync_card,
             text="延伸同步範圍",
@@ -4605,12 +4618,6 @@ class HomeView:
             expand=True,
             padx=(0, 8),
         )
-        self._button(
-            sync_actions,
-            "加入延伸同步",
-            self._add_group_sync_relation,
-            primary=True,
-        ).pack(side=RIGHT)
         self._group_sync_relations_frame = Frame(
             sync_card,
             bg=SURFACE,
@@ -4636,6 +4643,16 @@ class HomeView:
             title="組別清單",
         )
         list_card.pack(fill=BOTH, expand=True)
+        self._group_list_current_label = Label(
+            self._feature_cards["groups.list"].control_row,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="e",
+        )
+        self._group_list_current_label.pack(side=RIGHT, padx=(8, 0))
+        self._refresh_group_list_current_label()
         Label(
             list_card,
             text="組別清單",
@@ -4732,6 +4749,12 @@ class HomeView:
             title="還原／調整遊戲視窗尺寸",
         )
         card.pack(fill=X, pady=(10, 0))
+        self._feature_card_header_button(
+            "groups.window_size",
+            "套用目前組",
+            self._apply_current_group_window_size,
+            primary=True,
+        )
         Label(
             card,
             text="還原／調整遊戲視窗尺寸",
@@ -4788,12 +4811,6 @@ class HomeView:
             "取主窗尺寸",
             self._load_main_window_size,
         ).pack(side=LEFT)
-        self._button(
-            values,
-            "套用目前組",
-            self._apply_current_group_window_size,
-            primary=True,
-        ).pack(side=LEFT, padx=(8, 0))
         self._button(
             values,
             "套用全部遊戲視窗",
@@ -4854,6 +4871,12 @@ class HomeView:
             "sync.input",
             "",
             self._toggle_sync_key_settings,
+        )
+        self._keyboard_sync_button = self._feature_card_header_button(
+            "sync.input",
+            "",
+            self._toggle_keyboard_sync,
+            primary=True,
         )
         Label(
             input_card,
@@ -4959,16 +4982,6 @@ class HomeView:
                 justify=LEFT,
             ).pack(fill=X, anchor="w")
 
-        actions = Frame(input_card, bg=SURFACE)
-        self._sync_key_actions_frame = actions
-        actions.pack(fill=X, pady=(10, 0))
-        self._keyboard_sync_button = self._button(
-            actions,
-            "",
-            self._toggle_keyboard_sync,
-            primary=True,
-        )
-        self._keyboard_sync_button.pack(side=LEFT)
         self._keyboard_sync_label = Label(
             input_card,
             text="",
@@ -4980,6 +4993,7 @@ class HomeView:
             wraplength=720,
         )
         self._keyboard_sync_label.pack(fill=X, pady=(8, 0))
+        self._sync_key_actions_frame = self._keyboard_sync_label
         self._keep_feature_card_status(
             "sync.input",
             self._keyboard_sync_label,
@@ -4989,6 +5003,16 @@ class HomeView:
             "sync",
             "同步啟閉快捷鍵",
         )
+        self._sync_key_hotkey_label = Label(
+            self._feature_cards["sync.input"].control_row,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            bg=SURFACE,
+            fg=MUTED,
+            anchor="e",
+        )
+        self._sync_key_hotkey_label.pack(side=RIGHT, padx=(8, 0))
+        self._refresh_sync_key_hotkey_label()
         self._apply_sync_key_collapsed_state()
         self._refresh_keyboard_sync_controls()
 
@@ -4998,6 +5022,12 @@ class HomeView:
             title="斷線重新連線",
         )
         reconnect_card.pack(fill=X, pady=(10, 0))
+        self._smart_reconnect_button = self._feature_card_header_button(
+            "sync.reconnect",
+            "",
+            self._toggle_smart_reconnect,
+            primary=True,
+        )
         Label(
             reconnect_card,
             text="斷線重新連線",
@@ -5013,6 +5043,8 @@ class HomeView:
             bg=SURFACE,
             fg=MUTED,
             anchor="w",
+            justify=LEFT,
+            wraplength=720,
         )
         self._smart_reconnect_label.pack(fill=X, pady=(10, 0))
         self._keep_feature_card_status(
@@ -5048,13 +5080,6 @@ class HomeView:
             entry.pack(side=LEFT, padx=(0, 8))
             self._smart_reconnect_color_entries[name] = entry
         self._button(color_row, "保存顏色", self._save_smart_reconnect_status_colors).pack(side=LEFT)
-        self._smart_reconnect_button = self._button(
-            reconnect_card,
-            "",
-            self._toggle_smart_reconnect,
-            primary=True,
-        )
-        self._smart_reconnect_button.pack(anchor="w", pady=(10, 0))
         capture_mode_frame = Frame(
             reconnect_card,
             bg=BACKGROUND,
@@ -5169,6 +5194,12 @@ class HomeView:
             title="連續點擊",
         )
         auto_click_card.pack(fill=X, pady=(10, 0))
+        self._auto_click_toggle_button = self._feature_card_header_button(
+            "sync.auto_click",
+            "",
+            self._toggle_auto_click,
+            primary=True,
+        )
         Label(
             auto_click_card,
             text="連續點擊",
@@ -5252,13 +5283,6 @@ class HomeView:
         self._auto_click_count_entry.pack(side=LEFT, padx=(6, 14), ipady=5)
         auto_click_actions = Frame(auto_click_card, bg=SURFACE)
         auto_click_actions.pack(fill=X, pady=(10, 0))
-        self._auto_click_toggle_button = self._button(
-            auto_click_actions,
-            "",
-            self._toggle_auto_click,
-            primary=True,
-        )
-        self._auto_click_toggle_button.pack(side=LEFT)
         self._auto_click_status_label = Label(
             auto_click_actions,
             text="",
@@ -5380,6 +5404,12 @@ class HomeView:
             title="定時按下",
         )
         card.pack(fill=X, pady=(10, 0))
+        self._timed_click_toggle_button = self._feature_card_header_button(
+            "sync.timed_click",
+            "啟用定時",
+            self._toggle_timed_click,
+            primary=True,
+        )
         Label(
             card,
             text="定時按下",
@@ -5448,13 +5478,6 @@ class HomeView:
             "設定按鈕位置",
             self._capture_timed_click_target,
         ).pack(side=LEFT)
-        self._timed_click_toggle_button = self._button(
-            actions,
-            "啟用定時",
-            self._toggle_timed_click,
-            primary=True,
-        )
-        self._timed_click_toggle_button.pack(side=LEFT, padx=(8, 0))
         self._button(
             actions,
             "取消",
@@ -5532,6 +5555,7 @@ class HomeView:
                     variable.set(previous or "未設定")
                     return
             self.feature_hotkeys[feature] = normalized
+            self._refresh_sync_key_hotkey_label()
 
         menu = OptionMenu(row, variable, *display_values, command=changed)
         menu.configure(
@@ -5543,6 +5567,13 @@ class HomeView:
             highlightthickness=0,
         )
         menu.pack(side=LEFT, padx=(8, 0))
+
+    def _refresh_sync_key_hotkey_label(self) -> None:
+        label = getattr(self, "_sync_key_hotkey_label", None)
+        if label is None:
+            return
+        value = self.feature_hotkeys.get("sync", "") or "未設定"
+        label.configure(text=f"同步快捷鍵：{value}")
 
     def _sync_key_selection_changed(self) -> None:
         selected = tuple(
@@ -5736,6 +5767,16 @@ class HomeView:
             return
         self._refresh_smart_reconnect_controls()
 
+    def _smart_reconnect_failure_display(self) -> str:
+        message = getattr(self, "_smart_reconnect_failure_message", "")
+        if "安全視窗身分尚未完成" not in message:
+            return message
+        return (
+            f"{message}\n"
+            "處理步驟：組別管理 → 組別角色：加入角色到組別；"
+            "未分組視窗：加入目前組別；完成唯一身分確認後再啟用智慧重連。"
+        )
+
     def _save_smart_reconnect_status_colors(self) -> None:
         requested = {
             name: entry.get().strip()
@@ -5898,12 +5939,17 @@ class HomeView:
                 ),
             )
         if self._smart_reconnect_label is not None:
+            failure_message = getattr(
+                self,
+                "_smart_reconnect_failure_message",
+                "",
+            )
             self._smart_reconnect_label.configure(
                 text=(
                     "● 自動監看中｜依目前狀態安全重試"
                     if self.smart_reconnect_enabled
-                    else f"● {getattr(self, '_smart_reconnect_failure_message', '')}"
-                    if getattr(self, "_smart_reconnect_failure_message", "")
+                    else f"● {self._smart_reconnect_failure_display()}"
+                    if failure_message
                     else "● 安全停止｜不會點擊遊戲視窗"
                 ),
                 fg=(
@@ -6608,6 +6654,12 @@ class HomeView:
             title="玩家可能想記錄的習慣",
         )
         habit_card.pack(fill=X, pady=(0, 10))
+        self._feature_card_header_button(
+            "settings.habits",
+            "儲存",
+            self._save_habit_observation_days,
+            primary=True,
+        )
         try:
             habit_settings = (
                 self.habit_settings_provider()
@@ -6687,12 +6739,6 @@ class HomeView:
             fg=MUTED,
             padx=8,
         ).pack(side=LEFT)
-        self._button(
-            habit_row,
-            "儲存",
-            self._save_habit_observation_days,
-            primary=True,
-        ).pack(side=LEFT, padx=(8, 0))
         self._habit_management_status_label = Label(
             self._habit_management_frame,
             text="",
@@ -6741,6 +6787,12 @@ class HomeView:
             title="介面風格",
         )
         theme_card.pack(fill=X)
+        self._feature_card_header_button(
+            "settings.theme",
+            "套用風格",
+            self._apply_selected_theme,
+            primary=True,
+        )
         Label(
             theme_card,
             text="介面風格",
@@ -6781,12 +6833,6 @@ class HomeView:
             font=("Microsoft JhengHei UI", 10)
         )
         theme_menu.pack(side=LEFT, fill=X, expand=True)
-        self._button(
-            theme_row,
-            "套用風格",
-            self._apply_selected_theme,
-            primary=True,
-        ).pack(side=RIGHT, padx=(8, 0))
 
         font_row = Frame(theme_card, bg=SURFACE)
         font_row.pack(fill=X, pady=(10, 0))
@@ -6937,6 +6983,12 @@ class HomeView:
             title="背景圖片",
         )
         background_card.pack(fill=X, pady=(10, 0))
+        self._feature_card_header_button(
+            "settings.background",
+            "儲存背景設定",
+            self._save_background_changes,
+            primary=True,
+        )
         Label(
             background_card,
             text="背景圖片",
@@ -7187,12 +7239,6 @@ class HomeView:
         save_row.pack(fill=X, pady=(10, 0))
         self._button(
             save_row,
-            "儲存背景設定",
-            self._save_background_changes,
-            primary=True,
-        ).pack(side=LEFT)
-        self._button(
-            save_row,
             "取消未儲存變更",
             self._discard_background_changes,
         ).pack(side=LEFT, padx=(8, 0))
@@ -7218,6 +7264,12 @@ class HomeView:
             title="提醒顯示時間",
         )
         card.pack(fill=X, pady=(10, 0))
+        self._feature_card_header_button(
+            "settings.reminder_lifetime",
+            "儲存",
+            self._save_card_display_seconds,
+            primary=True,
+        )
         Label(
             card,
             text="提醒顯示時間",
@@ -7260,12 +7312,6 @@ class HomeView:
             fg=MUTED,
             padx=8,
         ).pack(side=LEFT)
-        self._button(
-            settings_row,
-            "儲存",
-            self._save_card_display_seconds,
-            primary=True,
-        ).pack(side=LEFT, padx=(8, 0))
 
         preview_card = self._card(
             page,
@@ -7273,6 +7319,12 @@ class HomeView:
             title="提醒卡樣式",
         )
         preview_card.pack(fill=X, pady=(10, 0))
+        apply_preview_button = self._feature_card_header_button(
+            "settings.reminder_style",
+            "套用樣式",
+            self._apply_card_preview_choice,
+            primary=True,
+        )
         Label(
             preview_card,
             text="提醒卡樣式",
@@ -7329,13 +7381,6 @@ class HomeView:
             font=("Microsoft JhengHei UI", 10)
         )
         preview_menu.pack(side=LEFT, fill=X, expand=True)
-        apply_preview_button = self._button(
-            preview_row,
-            "套用樣式",
-            self._apply_card_preview_choice,
-            primary=True,
-        )
-        apply_preview_button.pack(side=LEFT, padx=(8, 0))
         clear_preview_button = self._button(
             preview_row,
             "停用提醒浮層",
@@ -7570,6 +7615,12 @@ class HomeView:
             title="功能卡片版面",
         )
         layout_card.pack(fill=X, pady=(10, 0))
+        self._feature_card_header_button(
+            "settings.card_layout",
+            "儲存卡片設定",
+            self._save_feature_card_settings,
+            primary=True,
+        )
         Label(
             layout_card,
             text="功能卡片版面",
@@ -7665,12 +7716,6 @@ class HomeView:
             "移除卡片背景",
             self._clear_feature_card_background,
         ).pack(side=LEFT, padx=(8, 0))
-        self._button(
-            background_row,
-            "儲存卡片設定",
-            self._save_feature_card_settings,
-            primary=True,
-        ).pack(side=RIGHT)
         progress_row = Frame(layout_card, bg=SURFACE)
         progress_row.pack(fill=X, pady=(8, 0))
         self._card_background_progress_bar = Progressbar(
@@ -8231,6 +8276,7 @@ class HomeView:
                     existing_variable.set(
                         normalized_hotkey or "未設定"
                     )
+                self._refresh_sync_key_hotkey_label()
             elif group_hotkey and self.current_group_name is not None:
                 previous_hotkey = (
                     self.group_launch_hotkey_provider(
@@ -8291,6 +8337,7 @@ class HomeView:
                             existing_variable.set(
                                 previous_hotkey or "未設定"
                             )
+                        self._refresh_sync_key_hotkey_label()
                     elif (
                         group_hotkey
                         and self.current_group_name is not None
@@ -8570,6 +8617,7 @@ class HomeView:
             variable = self._feature_hotkey_variables.get(hotkey_feature)
             if variable is not None:
                 variable.set(saved_hotkey or "未設定")
+            self._refresh_sync_key_hotkey_label()
         elif hotkey_feature == "group_launch":
             if self._group_launch_hotkey_variable is not None:
                 self._group_launch_hotkey_variable.set(
@@ -9868,7 +9916,16 @@ class HomeView:
                 fg=SUCCESS if success else WARNING,
             )
 
+    def _refresh_group_list_current_label(self) -> None:
+        label = self._group_list_current_label
+        if label is None:
+            return
+        label.configure(
+            text=f"目前組別：{self.current_group_name or '未設定'}"
+        )
+
     def _refresh_group_selection_controls(self) -> None:
+        self._refresh_group_list_current_label()
         for group_name, button in self._group_selection_buttons.items():
             current = group_name == self.current_group_name
             button.configure(

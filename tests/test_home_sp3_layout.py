@@ -1317,7 +1317,17 @@ def test_habit_settings_card_is_first_and_keeps_existing_controls_inline() -> No
             for child in descendants
             if isinstance(child, Button)
         }
-        assert {"儲存", "儲存修改", "刪除", "刪除紀錄", "全部清除玩家習慣"} <= texts
+        assert {"儲存修改", "刪除", "刪除紀錄", "全部清除玩家習慣"} <= texts
+        assert "儲存" not in texts
+        header_buttons = {
+            child.cget("text")
+            for child in habit.control_row.winfo_children()
+            if isinstance(child, Button)
+        }
+        assert "儲存" in header_buttons
+        source = Path("ui/home.py").read_text(encoding="utf-8")
+        habit_source = source[source.index('card_id="settings.habits"') :]
+        assert "_save_habit_observation_days" in habit_source
         assert view._habit_observation_days_entry.winfo_manager() == "pack"
         assert view._habit_preferences_frame.winfo_manager() == "pack"
         view._toggle_habit_management()
@@ -1675,6 +1685,117 @@ def test_group_management_action_rows_fit_three_buttons_at_narrow_width():
     required_pady = _collapsed_card_title_pady(24, 2, 31)
     collapsed_height = 24 - 4 + required_pady * 2
     assert collapsed_height >= 31 + 12
+
+
+def test_group_role_add_button_stays_in_the_title_row():
+    tree = ast.parse(Path("ui/home.py").read_text(encoding="utf-8"))
+    add_button_assignment = next(
+        node
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Attribute)
+                and target.attr == "_group_add_button"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "_feature_card_header_button"
+        )
+    )
+
+    assert (
+        isinstance(add_button_assignment.value.args[0], ast.Constant)
+        and add_button_assignment.value.args[0].value == "groups.roles"
+    )
+    assert "_add_shortcuts_to_current_group" in ast.unparse(
+        add_button_assignment.value
+    )
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_button"
+        and node.args
+        and ast.unparse(node.args[0]) == "entry_primary_actions"
+        and "加入角色到組別" in ast.unparse(node)
+        for node in ast.walk(tree)
+    )
+
+
+def test_primary_feature_actions_use_title_row_without_duplicate_content_action():
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    expected = {
+        "groups.current": ("啟動本組", "_launch_current_group"),
+        "groups.roles": ("加入角色到組別", "_add_shortcuts_to_current_group"),
+        "groups.extended_sync": ("加入延伸同步", "_add_group_sync_relation"),
+        "groups.window_size": ("套用目前組", "_apply_current_group_window_size"),
+        "home.reminders": ("重新查看", "_refresh_from_player_action"),
+        "records.search": ("搜尋", "_search_operation_records"),
+        "settings.habits": ("儲存", "_save_habit_observation_days"),
+        "settings.theme": ("套用風格", "_apply_selected_theme"),
+        "settings.background": ("儲存背景設定", "_save_background_changes"),
+        "settings.reminder_lifetime": ("儲存", "_save_card_display_seconds"),
+        "settings.reminder_style": ("套用樣式", "_apply_card_preview_choice"),
+        "settings.card_layout": ("儲存卡片設定", "_save_feature_card_settings"),
+        "sync.input": ("", "_toggle_keyboard_sync"),
+        "sync.reconnect": ("", "_toggle_smart_reconnect"),
+        "sync.auto_click": ("", "_toggle_auto_click"),
+        "sync.timed_click": ("啟用定時", "_toggle_timed_click"),
+    }
+    header_calls = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_feature_card_header_button"
+            and len(node.args) >= 3
+        ):
+            continue
+        card_id, label = node.args[:2]
+        if not (
+            isinstance(card_id, ast.Constant)
+            and isinstance(card_id.value, str)
+            and isinstance(label, ast.Constant)
+            and isinstance(label.value, str)
+        ):
+            continue
+        header_calls.append((card_id.value, label.value, ast.unparse(node)))
+    for card_id, (label, callback) in expected.items():
+        matches = [
+            call
+            for call in header_calls
+            if call[0] == card_id and call[1] == label and callback in call[2]
+        ]
+        assert len(matches) == 1, card_id
+        assert "primary=True" in matches[0][2], card_id
+
+
+
+def test_group_list_current_name_and_sync_hotkey_stay_visible_in_header():
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+    assert "_group_list_current_label" in source
+    assert "_refresh_group_list_current_label" in source
+    assert 'text=f"目前組別：{self.current_group_name or \'未設定\'}"' in source
+    assert "_sync_key_hotkey_label" in source
+    assert "同步快捷鍵：" in source
+    assert 'self.feature_hotkeys.get("sync", "")' in source
+    assert "_refresh_sync_key_hotkey_label()" in source
+
+
+def test_smart_reconnect_identity_failure_shows_existing_repair_steps():
+    view = object.__new__(HomeView)
+    view._smart_reconnect_failure_message = "安全視窗身分尚未完成：尚有視窗未確認"
+    display = view._smart_reconnect_failure_display()
+    assert "組別管理" in display
+    assert "組別角色：加入角色到組別" in display
+    assert "未分組視窗：加入目前組別" in display
+    assert "完成唯一身分確認後再啟用智慧重連" in display
+    source = Path("ui/home.py").read_text(encoding="utf-8")
+    label_source = source[source.index("self._smart_reconnect_label = Label") :]
+    assert "justify=LEFT" in label_source[:500]
+    assert "wraplength=720" in label_source[:500]
 
 
 def test_batch_card_settings_commit_once_and_updates_only_after_success() -> None:
