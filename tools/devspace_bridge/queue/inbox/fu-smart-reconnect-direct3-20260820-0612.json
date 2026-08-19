@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-smart-reconnect-direct3-20260820-0612",
+  "action": "run_tests",
+  "target_commit": "d371cee2333dbe9c49aff4f0a48c933d74b69207",
+  "args": {
+    "tests": [
+      "tests/test_smart_reconnect_global_identity_scope.py",
+      "tests/test_windows_smart_reconnect.py",
+      "tests/test_main_input_sync.py",
+      "tests/test_home_sp3_layout.py",
+      "tests/test_sync_scope_service.py",
+      "tests/test_ungrouped_window_service.py",
+      "tests/test_windows_background_capture.py",
+      "tests/test_windows_battle_restart.py"
+    ],
+    "timeout_seconds": 1800
+  }
+}
