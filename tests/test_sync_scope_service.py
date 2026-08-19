@@ -1,6 +1,7 @@
 import hashlib
 import json
 
+from adapters.windows_launch_fingerprint import normalize_launch_fingerprint
 from services.group_configuration_service import GroupConfigurationService
 from services.sync_scope_service import SyncScopeService
 
@@ -16,6 +17,18 @@ class Resolver:
 class SharedResolver:
     def resolve(self, paths):
         return {path: "a" * 64 for path in paths}
+
+
+class PartialResolver:
+    def __init__(self, unavailable=()):
+        self.unavailable = {path.resolve() for path in unavailable}
+
+    def resolve(self, paths):
+        return {
+            path: hashlib.sha256(str(path).encode()).hexdigest()
+            for path in paths
+            if path.resolve() not in self.unavailable
+        }
 
 
 def _shortcut(tmp_path, name):
@@ -88,6 +101,58 @@ def test_configured_scope_still_keeps_every_group_for_reconnect(tmp_path):
 
     assert service.scope("甲組").entry_ids == (first_id,)
     assert service.configured_scope().entry_ids == (first_id, second_id)
+
+
+def test_configured_scope_isolates_one_bad_shortcut_without_blocking_reconnect(
+    tmp_path,
+):
+    first = _shortcut(tmp_path, "可用角色")
+    second = _shortcut(tmp_path, "失效角色")
+    configuration = GroupConfigurationService(tmp_path / "groups.json")
+    configuration.add_shortcuts("甲組", (first,))
+    configuration.add_shortcuts("乙組", (second,))
+    first_id = configuration.group("甲組").main_entry.entry_id
+    second_id = configuration.group("乙組").main_entry.entry_id
+    service = SyncScopeService(
+        configuration,
+        PartialResolver((second,)),
+    )
+
+    scope = service.configured_scope()
+
+    assert scope.ready is True
+    assert scope.failure_codes == ()
+    assert scope.entry_ids == (first_id, second_id)
+    assert scope.isolated_entry_ids == (second_id,)
+    assert len(scope.entry_fingerprints) == 2
+    assert scope.entry_fingerprints[0] == hashlib.sha256(
+        str(first).encode()
+    ).hexdigest()
+    assert normalize_launch_fingerprint(scope.entry_fingerprints[1]) is not None
+    assert scope.entry_fingerprints[1] != scope.entry_fingerprints[0]
+
+
+def test_selected_group_controller_still_fails_closed_when_its_identity_is_missing(
+    tmp_path,
+):
+    first = _shortcut(tmp_path, "主控")
+    second = _shortcut(tmp_path, "跟隨")
+    configuration = GroupConfigurationService(tmp_path / "groups.json")
+    configuration.add_shortcuts("測試組", (first, second))
+    service = SyncScopeService(
+        configuration,
+        PartialResolver((first,)),
+    )
+
+    selected = service.scope("測試組")
+    configured = service.configured_scope()
+
+    assert selected.ready is False
+    assert selected.failure_codes == ("shortcut_identity_unresolved",)
+    assert configured.ready is True
+    assert configuration.group("測試組").main_entry.entry_id in (
+        configured.isolated_entry_ids
+    )
 
 
 def test_scope_keeps_shared_launcher_digests_until_live_instance_binding(
