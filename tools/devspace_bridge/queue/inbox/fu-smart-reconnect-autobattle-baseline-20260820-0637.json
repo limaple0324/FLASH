@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-smart-reconnect-autobattle-baseline-20260820-0637",
+  "action": "run_tests",
+  "target_commit": "1302a9c88cc1254eb356f68ce0bd8ff0451cf942",
+  "args": {
+    "tests": ["tests/test_windows_auto_battle.py::test_public_unknown_gameplay_uses_exact_auto_battle_evidence_only"],
+    "timeout_seconds": 300
+  }
+}
