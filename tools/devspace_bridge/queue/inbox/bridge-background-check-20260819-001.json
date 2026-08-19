@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "task_id": "bridge-background-check-20260819-001",
+  "action": "ping",
+  "args": {}
+}
