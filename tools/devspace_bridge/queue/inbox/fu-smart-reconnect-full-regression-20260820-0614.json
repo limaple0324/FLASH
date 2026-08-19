@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-smart-reconnect-full-regression-20260820-0614",
+  "action": "run_tests",
+  "target_commit": "d371cee2333dbe9c49aff4f0a48c933d74b69207",
+  "args": {
+    "tests": ["tests"],
+    "timeout_seconds": 3600
+  }
+}
