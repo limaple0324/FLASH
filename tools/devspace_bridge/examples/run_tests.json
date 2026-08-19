@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-test-20260819-001",
+  "action": "run_tests",
+  "target_commit": "38cf30dc1e4248b967c4900199364ac5ba0d6d96",
+  "args": {
+    "tests": ["tests/test_windows_timed_click.py"],
+    "timeout_seconds": 900
+  }
+}
