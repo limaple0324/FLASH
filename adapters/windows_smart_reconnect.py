@@ -1,645 +1,70 @@
-"""Step-scoped production overrides for Windows smart reconnect."""
+"""Corrective smart-reconnect layer for entry/instance scoped recovery."""
 
 from __future__ import annotations
 
-import inspect
-from dataclasses import replace
-from pathlib import Path
+import hashlib
 
-from . import windows_smart_reconnect_base as _base
+from . import windows_smart_reconnect_step_scoped_base as _step
 
-for _name in dir(_base):
+for _name in dir(_step):
     if not _name.startswith("__"):
-        globals()[_name] = getattr(_base, _name)
+        globals()[_name] = getattr(_step, _name)
 
-_MANUAL_SCOPE_ONLY_FAILURE_CODES = frozenset({
-    "group_name_invalid",
-    "group_entries_unavailable",
-    "configured_entries_unavailable",
-})
-_OLD_SCOPE_PHRASES = (
-    "目前組別的安全視窗身分尚未完成",
-    "目前組別的安全視窗身分尚未完整",
-    "安全視窗身分尚未完成",
-    "安全視窗身分尚未完整",
+_LOCAL_FAILURE_NAMESPACE = b"fu-smart-reconnect-local-failure-v1\0"
+_NEVER_DEMOTE_GLOBAL_FAILURE_CODES = frozenset(
+    {
+        "window_offline",
+        "window_identity_duplicate",
+        "unattributed_candidate_window",
+        "target_failure_unattributed",
+        "target_window_provider_failed",
+        "window_enumeration_failed",
+        "configured_identity_path_conflict",
+        "scope_evidence_changed_during_snapshot",
+        "snapshot_identity_collision",
+    }
 )
 
 
-class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
-    """Grant each safely proved live instance only the authority its step needs."""
-
-    def __init__(
-        self,
-        *args,
-        step_scoped_live_reconnect: bool = False,
-        minimized_refresh_capture_provider=None,
-        manual_shortcut_resolver=None,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self._step_scoped_live_reconnect = bool(step_scoped_live_reconnect)
-        self._step_scoped_activation_ready = False
-        self._minimized_refresh_capture_provider = minimized_refresh_capture_provider
-        self._obscured_capture_access_ready: bool | None = None
-        self._manual_shortcut_resolver = manual_shortcut_resolver
-        self._manual_empty_plan_requested = False
-        self._manual_runtime_plan_installed = False
-        self._manual_live_fingerprints: frozenset[str] = frozenset()
-        self._manual_reopen_targets: dict[str, GroupLaunchTarget] = {}
-
-    @staticmethod
-    def _normalize_product_scope_message(message: object) -> object:
-        if not isinstance(message, str):
-            return message
-        normalized = message
-        changed = False
-        for phrase in _OLD_SCOPE_PHRASES:
-            replaced = normalized.replace(
-                phrase,
-                "智慧重連安全操作尚未完成",
-            )
-            changed = changed or replaced != normalized
-            normalized = replaced
-        if changed and "唯一可靠捷徑來源" not in normalized:
-            normalized = (
-                normalized.rstrip("。")
-                + "；只有需要自動關閉／重開的視窗，才需要唯一可靠捷徑來源。"
-            )
-        return normalized
+class WindowsSmartReconnectController(_step.WindowsSmartReconnectController):
+    """Keep global failures global and isolate only one proven entry/instance."""
 
     @classmethod
     def _install_product_scope_message_normalization(cls) -> None:
-        try:
-            from ui.home import SmartReconnectToggleViewResult
-        except Exception:
-            return
-        result_type = SmartReconnectToggleViewResult
-        if getattr(result_type, "_fu_reconnect_scope_normalized", False):
-            return
-        original_init = result_type.__init__
-
-        def normalized_init(instance, *args, **kwargs):
-            values = list(args)
-            if len(values) >= 3:
-                values[2] = cls._normalize_product_scope_message(values[2])
-            elif "message" in kwargs:
-                kwargs["message"] = cls._normalize_product_scope_message(
-                    kwargs["message"]
-                )
-            return original_init(instance, *values, **kwargs)
-
-        result_type.__init__ = normalized_init
-        result_type._fu_reconnect_scope_normalized = True
-
-    @staticmethod
-    def _discover_manual_shortcut_resolver(provider):
-        candidates = [provider, getattr(provider, "__self__", None)]
-        closure = getattr(provider, "__closure__", None)
-        if closure:
-            for cell in closure:
-                try:
-                    candidates.append(cell.cell_contents)
-                except ValueError:
-                    continue
-        seen: set[int] = set()
-        for candidate in candidates:
-            if candidate is None or id(candidate) in seen:
-                continue
-            seen.add(id(candidate))
-            service = getattr(candidate, "_ungrouped_window_service", None)
-            resolver = getattr(service, "shortcut_for", None)
-            if callable(resolver):
-                return resolver
-            resolver = getattr(candidate, "shortcut_for", None)
-            if (
-                callable(resolver)
-                and candidate.__class__.__name__ == "UngroupedWindowService"
-            ):
-                return resolver
+        """UI result types now own wording; adapters must not monkeypatch UI classes."""
         return None
 
-    @classmethod
-    def for_real_windows(cls, *args, **kwargs):
-        manual_shortcut_resolver = kwargs.pop("manual_shortcut_resolver", None)
-        controller = super().for_real_windows(*args, **kwargs)
-        controller._step_scoped_live_reconnect = True
-        controller._step_scoped_activation_ready = False
-        controller._minimized_refresh_capture_provider = (
-            Win32RecoveringPrintWindowProvider()
-        )
-        controller._obscured_capture_access_ready = None
-        controller._manual_empty_plan_requested = False
-        controller._manual_runtime_plan_installed = False
-        controller._manual_live_fingerprints = frozenset()
-        controller._manual_reopen_targets = {}
-        controller._manual_shortcut_resolver = (
-            manual_shortcut_resolver
-            or cls._discover_manual_shortcut_resolver(
-                getattr(controller, "_target_windows_provider", None)
-            )
-        )
-        controller._tcp_counts = globals()["_ipv4_established_counts_by_pid"]
-        cls._install_product_scope_message_normalization()
-        return controller
-
     @staticmethod
-    def _clean_empty_configured_plan(plan: object) -> bool:
-        return bool(
-            isinstance(plan, GroupLaunchPlan)
-            and plan.group_name.strip().casefold() == "configured"
-            and not plan.targets
-            and not plan.failure_codes
-        )
-
-    def set_group_launch_plan(self, plan: GroupLaunchPlan | None) -> None:
-        self._manual_reopen_targets.clear()
-        self._manual_live_fingerprints = frozenset()
-        self._manual_runtime_plan_installed = False
-        if (
-            self._step_scoped_live_reconnect
-            and self._clean_empty_configured_plan(plan)
-        ):
-            super().set_group_launch_plan(None)
-            self._manual_empty_plan_requested = True
-            return
-        self._manual_empty_plan_requested = False
-        super().set_group_launch_plan(plan)
-
-    def set_capture_settings(self, settings) -> None:
-        previous = self.capture_settings
-        super().set_capture_settings(settings)
-        if (
-            not self._step_scoped_live_reconnect
-            or previous.obscured != settings.obscured
-        ):
-            self._obscured_capture_access_ready = None
-
-    def _manual_scope_fallback_allowed(
-        self,
-        global_failures: tuple[str, ...],
-        target_failures: dict[str, tuple[str, ...]],
-    ) -> bool:
-        return bool(
-            self._step_scoped_live_reconnect
-            and global_failures
-            and not target_failures
-            and set(global_failures) <= _MANUAL_SCOPE_ONLY_FAILURE_CODES
-        )
-
-    def _direct_live_candidate_window_set(self):
-        self._tcp_v = None
-        try:
-            direct_windows = tuple(
-                window
-                for window in self._window_backend.list_windows()
-                if all(
-                    keyword in window.title.casefold()
-                    for keyword in self._keywords
-                )
-            )
-        except Exception:
-            return (), ("window_enumeration_failed",), {}
-        bound, blocked = self._bind_activation_snapshot_window_set(
-            direct_windows,
-            frozenset(),
-        )
+    def _formal_plan(controller):
         return (
-            bound,
-            (("window_identity_duplicate",) if blocked else ()),
-            {},
-        )
-
-    def _candidate_window_set(self):
-        if (
-            self._step_scoped_live_reconnect
-            and self._manual_empty_plan_requested
-        ):
-            return self._direct_live_candidate_window_set()
-        windows, global_failures, target_failures = (
-            super()._candidate_window_set()
-        )
-        if not self._manual_scope_fallback_allowed(
-            global_failures,
-            target_failures,
-        ):
-            return windows, global_failures, target_failures
-        return self._direct_live_candidate_window_set()
-
-    def _current_activation_requires_obscured_access(self) -> bool:
-        settings = self.capture_settings
-        if not settings.obscured or self._capture_access_preparer is None:
-            return False
-        windows, global_failures, _target_failures = self._candidate_window_set()
-        if global_failures:
-            return False
-        for window in windows:
-            if window.minimized:
-                continue
-            if self._window_is_fully_visible_without_capture(window) is False:
-                return True
-        return False
-
-    def _ensure_obscured_capture_access(self) -> bool:
-        if self._capture_access_preparer is None:
-            return True
-        if self._obscured_capture_access_ready is not None:
-            return self._obscured_capture_access_ready
-        try:
-            ready = self._capture_access_preparer() is True
-        except Exception:
-            ready = False
-        self._obscured_capture_access_ready = ready
-        return ready
-
-    def _manual_shortcut_for_source(self, source_fingerprint: str) -> Path | None:
-        resolver = self._manual_shortcut_resolver
-        if not callable(resolver):
-            return None
-        try:
-            candidate = resolver(source_fingerprint)
-        except Exception:
-            return None
-        if candidate is None:
-            return None
-        path = Path(candidate)
-        try:
-            available = path.is_file()
-        except OSError:
-            available = False
-        return path if available and path.suffix.casefold() == ".lnk" else None
-
-    def _build_manual_reopen_authority(self) -> None:
-        snapshot = self._activation_snapshot_instances or {}
-        source_map = self._activation_snapshot_source_fingerprints or {}
-        formal_plan = (
             None
-            if self._manual_runtime_plan_installed
-            else self._group_launch_plan
-        )
-        if formal_plan is None:
-            manual_live = frozenset(snapshot)
-        else:
-            manual_live = frozenset(self._detection_only_fingerprints)
-        self._manual_live_fingerprints = manual_live
-
-        targets: dict[str, GroupLaunchTarget] = {}
-        for order, monitor_fingerprint in enumerate(sorted(manual_live), start=1):
-            source_fingerprint = source_map.get(
-                monitor_fingerprint,
-                monitor_fingerprint,
-            )
-            shortcut = self._manual_shortcut_for_source(source_fingerprint)
-            if shortcut is None:
-                continue
-            try:
-                target = GroupLaunchTarget(
-                    order,
-                    shortcut.stem or "manual-flash",
-                    shortcut,
-                    source_fingerprint,
-                )
-            except (TypeError, ValueError):
-                continue
-            targets[monitor_fingerprint] = target
-        self._manual_reopen_targets = targets
-
-        if formal_plan is None and targets:
-            self._group_launch_plan = GroupLaunchPlan(
-                "manual-live",
-                tuple(targets.values()),
-            )
-            self._manual_runtime_plan_installed = True
-
-    def prepare_execution_snapshot(self):
-        if not self._step_scoped_live_reconnect:
-            return super().prepare_execution_snapshot()
-
-        if self._manual_runtime_plan_installed:
-            self._group_launch_plan = None
-            self._manual_runtime_plan_installed = False
-        self._manual_reopen_targets.clear()
-        self._manual_live_fingerprints = frozenset()
-        self._step_scoped_activation_ready = False
-        self._obscured_capture_access_ready = None
-        original_preparer = self._capture_access_preparer
-
-        needs_obscured_access = self._current_activation_requires_obscured_access()
-        if needs_obscured_access and original_preparer is not None:
-            if not self._ensure_obscured_capture_access():
-                return self._snapshot_failure(
-                    "reconnect.snapshot_capture_access_denied",
-                    "Windows 無彩框背景擷取權限未允許，智慧重連未啟用。",
-                    "borderless_capture_access_denied",
-                )
-
-        if not needs_obscured_access:
-            self._capture_access_preparer = None
-        try:
-            prepared = super().prepare_execution_snapshot()
-        finally:
-            self._capture_access_preparer = original_preparer
-
-        if not prepared.success:
-            return prepared
-
-        self._step_scoped_activation_ready = True
-        snapshot = self._activation_snapshot_instances or {}
-        _settings, capture_revision = self._capture_settings_snapshot()
-        source_generation = self._source_state_generation_snapshot()
-        expires_at = (
-            self._monotonic_clock() + INITIAL_LOGIN_AUTHORIZATION_SECONDS
-        )
-        for fingerprint, instance in snapshot.items():
-            self._initial_login_authorizations.setdefault(
-                fingerprint,
-                _InitialLoginAuthorization(
-                    instance,
-                    capture_revision,
-                    source_generation,
-                    expires_at,
-                ),
-            )
-        self._build_manual_reopen_authority()
-        return prepared
-
-    def set_execution_enabled(self, enabled: bool) -> None:
-        super().set_execution_enabled(enabled)
-        if not enabled:
-            self._step_scoped_activation_ready = False
-            self._obscured_capture_access_ready = None
-
-    def _capture_and_recognize_unobserved(
-        self,
-        window,
-        fingerprint,
-        *,
-        execute: bool = False,
-        expected_source_state_generation: int | None = None,
-    ):
-        if not (
-            self._step_scoped_live_reconnect
-            and self._step_scoped_activation_ready
-        ):
-            return super()._capture_and_recognize_unobserved(
-                window,
-                fingerprint,
-                execute=execute,
-                expected_source_state_generation=expected_source_state_generation,
-            )
-
-        if WindowInstanceToken.from_window(window) is None:
-            return self._unknown_capture_result()
-        if expected_source_state_generation is None:
-            expected_source_state_generation = self._source_state_generation_snapshot()
-        if not self._source_authority_is_current(expected_source_state_generation):
-            return self._unknown_capture_result()
-
-        if window.minimized:
-            route = CAPTURE_ROUTE_MINIMIZED
-            if not self._remember_capture_route_if_source_current(
-                fingerprint,
-                route,
-                expected_source_state_generation,
-            ):
-                return self._unknown_capture_result()
-            settings = self.capture_settings
-            if not settings.minimized:
-                return self._disabled_capture_result(route)
-            provider = self._minimized_refresh_capture_provider
-            if execute and self._execution_allowed() and provider is not None:
-                try:
-                    sample = provider.capture(window.handle)
-                except OSError:
-                    sample = None
-                if sample is not None and sample.api_succeeded:
-                    return (
-                        sample,
-                        self._recognizer.recognize_capture(sample),
-                        True,
-                        route,
-                    )
-            return self._unknown_capture_result(route=route)
-
-        if (
-            execute
-            and self.capture_settings.obscured
-            and self._capture_access_preparer is not None
-            and self._window_is_fully_visible_without_capture(window) is False
-            and not self._ensure_obscured_capture_access()
-        ):
-            if self._remember_capture_route_if_source_current(
-                fingerprint,
-                CAPTURE_ROUTE_OBSCURED,
-                expected_source_state_generation,
-            ):
-                return self._unknown_capture_result(route=CAPTURE_ROUTE_OBSCURED)
-            return self._unknown_capture_result()
-
-        return super()._capture_and_recognize_unobserved(
-            window,
-            fingerprint,
-            execute=execute,
-            expected_source_state_generation=expected_source_state_generation,
+            if getattr(controller, "_manual_runtime_plan_installed", False)
+            else controller._group_launch_plan
         )
 
-    def _target_for_fingerprint(self, fingerprint: object):
-        formal = super()._target_for_fingerprint(fingerprint)
-        if formal is not None:
-            return formal
-        normalized = normalize_launch_fingerprint(fingerprint)
-        if normalized is None:
-            return None
-        return self._manual_reopen_targets.get(normalized)
-
-    def _manual_character_target_is_safe(
-        self,
+    @classmethod
+    def _local_failure_key(
+        cls,
+        plan,
+        entry_id: str,
         fingerprint: str,
-        item,
-        *,
-        initial_login_authorized: bool,
-    ):
-        candidates = tuple(item.character_candidates)
-        pending_target = self._character_selection_targets.get(fingerprint)
-        reconnect_session = self._has_reconnect_session(fingerprint)
-
-        if pending_target is not None:
-            selected_candidates = tuple(
-                candidate for candidate in candidates if candidate.selected
-            )
-            if len(selected_candidates) == 1:
-                selected = selected_candidates[0]
-            elif not candidates and item.character_slot_selected is True:
-                selected = self._candidate_from_recognition(item)
-                if selected is None:
-                    return None
-            else:
-                return None
-            if (
-                selected.slot_index != pending_target.slot_index
-                or (
-                    pending_target.level is not None
-                    and selected.level != pending_target.level
-                )
-                or (
-                    pending_target.digit_count is not None
-                    and selected.digit_count != pending_target.digit_count
-                )
-            ):
-                return None
-            pending_role = self._registered_role_for_candidate(pending_target)
-            selected_role = self._registered_role_for_candidate(selected)
-            expected_recent_role = self._recent_login_role_ids.get(fingerprint)
-            if (
-                pending_role is None
-                or selected_role is None
-                or pending_role.importance is not CharacterImportance.PRIMARY
-                or selected_role.importance is not CharacterImportance.PRIMARY
-                or pending_role.role_id.casefold() != selected_role.role_id.casefold()
-                or (
-                    expected_recent_role is not None
-                    and selected_role.role_id.casefold() != expected_recent_role
-                )
-            ):
-                return None
-            return self._candidate_result(
-                item,
-                selected,
-                CharacterImportance.PRIMARY,
-                selected_role.role_id.casefold(),
-            )
-
-        if initial_login_authorized and not reconnect_session:
-            selection = self._global_character_candidate(fingerprint, item)
-        elif reconnect_session:
-            selection = self._global_character_candidate(fingerprint, item)
-        else:
-            selection = None
-        if selection is None:
-            return None
-        selected, importance = selection
-        registered = self._registered_role_for_candidate(selected)
-        if registered is None:
-            return None
-        return self._candidate_result(
-            item,
-            selected,
-            importance,
-            registered.role_id.casefold(),
+    ) -> str:
+        if plan is None:
+            return fingerprint
+        same_source = tuple(
+            target.entry_id
+            for target in plan.targets
+            if target.fingerprint == fingerprint
         )
-
-    def _character_target_is_safe(
-        self,
-        fingerprint: str,
-        item,
-        *,
-        initial_login_authorized: bool = False,
-    ):
-        if (
-            self._step_scoped_live_reconnect
-            and self._step_scoped_activation_ready
-            and fingerprint in self._manual_live_fingerprints
-        ):
-            return self._manual_character_target_is_safe(
-                fingerprint,
-                item,
-                initial_login_authorized=initial_login_authorized,
-            )
-        return super()._character_target_is_safe(
-            fingerprint,
-            item,
-            initial_login_authorized=initial_login_authorized,
+        if len(same_source) <= 1:
+            return fingerprint
+        payload = (
+            _LOCAL_FAILURE_NAMESPACE
+            + entry_id.encode("utf-8", errors="strict")
+            + b"\0"
+            + fingerprint.encode("ascii", errors="strict")
         )
-
-    def _delivery_window_proxy(self, window):
-        if (
-            not self._step_scoped_live_reconnect
-            or window is None
-            or not window.minimized
-        ):
-            return window
-        frame = inspect.currentframe()
-        caller = frame.f_back if frame is not None else None
-        caller = caller.f_back if caller is not None else None
-        if (
-            caller is not None
-            and caller.f_code.co_name == "deliver_click"
-            and caller.f_code.co_filename == _base.__file__
-        ):
-            return replace(window, minimized=False)
-        return window
-
-    def _current_action_window(self, expected, fingerprint: str):
-        if not (
-            self._step_scoped_live_reconnect
-            and self._step_scoped_activation_ready
-            and fingerprint in self._manual_live_fingerprints
-        ):
-            current = super()._current_action_window(expected, fingerprint)
-            return self._delivery_window_proxy(current)
-
-        candidates, global_failures, target_failures = self._candidate_window_set()
-        expected_instance = (
-            expected
-            if isinstance(expected, WindowInstanceToken)
-            else WindowInstanceToken.from_window(expected)
-        )
-        allowed = self._allowed_fingerprints
-        scoped_candidates = tuple(
-            candidate
-            for candidate in candidates
-            if (
-                allowed is None
-                or normalize_launch_fingerprint(candidate.launch_fingerprint)
-                in allowed
-            )
-        )
-        instances = self._unique_complete_candidate_instances(scoped_candidates)
-        group_failures = tuple(
-            self._group_failures(
-                scoped_candidates,
-                locally_isolated_fingerprints=frozenset(target_failures),
-            )
-        )
-        if self._activation_snapshot_instances is not None:
-            group_failures = tuple(
-                code for code in group_failures
-                if code != "group_identity_set_mismatch"
-            )
-        if (
-            expected_instance is None
-            or global_failures
-            or fingerprint in target_failures
-            or instances is None
-            or group_failures
-        ):
-            with self._screen_state_lock:
-                self._mark_fingerprints_unknown_locked((fingerprint,))
-            return None
-        current = instances.get(fingerprint)
-        if current is None:
-            with self._screen_state_lock:
-                self._mark_fingerprints_unknown_locked((fingerprint,))
-            return None
-        window, instance = current
-        plan = self._group_launch_plan
-        if isinstance(self._tcp_v, ResolvedTargetWindows) and plan is not None:
-            target = plan.target_for_fingerprint(fingerprint)
-            if target is not None and (
-                not target.entry_id
-                or self._tcp_id(self._tcp_v, fingerprint, instance)
-                != target.entry_id
-            ):
-                return None
-        snapshot = self._activation_snapshot_instances
-        if snapshot is not None and snapshot.get(fingerprint) != instance:
-            with self._screen_state_lock:
-                self._mark_fingerprints_unknown_locked((fingerprint,))
-            return None
-        if instance != expected_instance:
-            with self._screen_state_lock:
-                self._mark_fingerprints_unknown_locked((fingerprint,))
-            return None
-        return self._delivery_window_proxy(window)
+        return hashlib.sha256(payload).hexdigest()
 
     def _contract_failure_evidence(self, resolved):
         if not self._step_scoped_live_reconnect:
@@ -654,11 +79,8 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
             tuple[object, ...],
             tuple[object, ...],
         ] = {}
-        formal_plan = (
-            None if self._manual_runtime_plan_installed
-            else self._group_launch_plan
-        )
-        attributed_codes: set[str] = set()
+        plan = self._formal_plan(self)
+        demotable_mirrors: set[str] = set()
 
         for evidence in resolved.target_failure_evidence:
             fingerprint = normalize_launch_fingerprint(evidence.fingerprint)
@@ -668,6 +90,7 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
                 global_failures.extend(failure_codes)
                 global_failures.append("target_failure_unattributed")
                 continue
+
             malformed_candidates = False
             for candidate in evidence.candidate_windows:
                 identity = complete_window_instance_identity(candidate)
@@ -678,8 +101,7 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
                 previous_handle = evidence_handles.setdefault(identity[1], identity)
                 previous_process = evidence_processes.setdefault(identity[2], identity)
                 previous_stable = evidence_stable_tokens.setdefault(
-                    identity[:6],
-                    identity,
+                    identity[:6], identity
                 )
                 if (
                     previous_entry != entry_id
@@ -693,10 +115,11 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
                 global_failures.extend(failure_codes)
                 global_failures.append("target_failure_unattributed")
                 continue
-            if formal_plan is not None:
+
+            if plan is not None:
                 targets = tuple(
                     target
-                    for target in formal_plan.targets
+                    for target in plan.targets
                     if (
                         target.entry_id == entry_id
                         and target.fingerprint == fingerprint
@@ -706,16 +129,25 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
                     global_failures.extend(failure_codes)
                     global_failures.append("target_failure_unattributed")
                     continue
-            if fingerprint in local_failures:
+
+            key = self._local_failure_key(plan, entry_id, fingerprint)
+            if key in local_failures:
                 global_failures.extend(failure_codes)
                 global_failures.append("target_failure_unattributed")
                 continue
-            local_failures[fingerprint] = failure_codes
-            attributed_codes.update(failure_codes)
+            local_failures[key] = failure_codes
+            demotable_mirrors.update(
+                code
+                for code in failure_codes
+                if code not in _NEVER_DEMOTE_GLOBAL_FAILURE_CODES
+            )
 
-        global_failures = [
-            code for code in global_failures if code not in attributed_codes
-        ]
+        if "target_failure_unattributed" not in global_failures:
+            global_failures = [
+                code
+                for code in global_failures
+                if code not in demotable_mirrors
+            ]
         return tuple(dict.fromkeys(global_failures)), local_failures
 
     def _verified_group_activation_snapshot(
@@ -751,33 +183,21 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
             targets_by_entry[target.entry_id] = target
 
         evidence_by_entry = {}
-        failed_fingerprints: set[str] = set()
         for evidence in resolved.target_failure_evidence:
             target = targets_by_entry.get(evidence.entry_id)
             fingerprint = normalize_launch_fingerprint(evidence.fingerprint)
-            if (
-                target is None
-                or evidence.entry_id in evidence_by_entry
-                or fingerprint is None
-                or fingerprint != target.fingerprint
-                or local_failures.get(fingerprint)
-                != tuple(evidence.failure_codes)
-            ):
+            if target is None or evidence.entry_id in evidence_by_entry:
+                return None
+            if fingerprint is None or fingerprint != target.fingerprint:
+                return None
+            key = self._local_failure_key(
+                plan,
+                evidence.entry_id,
+                fingerprint,
+            )
+            if local_failures.get(key) != tuple(evidence.failure_codes):
                 return None
             evidence_by_entry[evidence.entry_id] = evidence
-            failed_fingerprints.add(fingerprint)
-
-        filtered_instances = {
-            monitor_fingerprint: candidate
-            for monitor_fingerprint, candidate in complete_instances.items()
-            if source_fingerprints.get(monitor_fingerprint)
-            not in failed_fingerprints
-        }
-        filtered_sources = {
-            monitor_fingerprint: source
-            for monitor_fingerprint, source in source_fingerprints.items()
-            if monitor_fingerprint in filtered_instances
-        }
 
         plan_entry_ids = tuple(target.entry_id for target in targets)
         required_targets = tuple(
@@ -790,29 +210,37 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
             tuple(resolved.sync_scope_entry_ids) != plan_entry_ids
             or tuple(resolved.sync_entry_ids) != required_entry_ids
             or len(resolved.windows) != len(required_targets)
-            or len(filtered_instances)
+            or len(complete_instances)
             != len(required_targets) + len(resolved.detection_only_windows)
-            or len(filtered_sources) != len(filtered_instances)
+            or len(source_fingerprints) != len(complete_instances)
         ):
             return None
 
+        safe_by_entry = dict(zip(resolved.sync_entry_ids, resolved.windows))
         verified_instances = {}
         verified_sources: dict[str, str] = {}
         detection_only: set[str] = set()
 
         for target in required_targets:
+            safe_window = safe_by_entry.get(target.entry_id)
+            safe_instance = (
+                WindowInstanceToken.from_window(safe_window)
+                if safe_window is not None
+                else None
+            )
+            if (
+                safe_instance is None
+                or normalize_launch_fingerprint(safe_window.launch_fingerprint)
+                != target.fingerprint
+            ):
+                return None
             matches = tuple(
                 (monitor_fingerprint, candidate)
-                for monitor_fingerprint, candidate
-                in filtered_instances.items()
+                for monitor_fingerprint, candidate in complete_instances.items()
                 if (
-                    filtered_sources.get(monitor_fingerprint)
+                    source_fingerprints.get(monitor_fingerprint)
                     == target.fingerprint
-                    and self._tcp_id(
-                        resolved,
-                        target.fingerprint,
-                        candidate[1],
-                    ) == target.entry_id
+                    and candidate[1] == safe_instance
                 )
             )
             if len(matches) != 1 or matches[0][0] in verified_instances:
@@ -832,11 +260,10 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
                 return None
             matches = tuple(
                 (monitor_fingerprint, candidate)
-                for monitor_fingerprint, candidate
-                in filtered_instances.items()
+                for monitor_fingerprint, candidate in complete_instances.items()
                 if (
                     monitor_fingerprint not in verified_instances
-                    and filtered_sources.get(monitor_fingerprint)
+                    and source_fingerprints.get(monitor_fingerprint)
                     == source_fingerprint
                     and candidate[1] == instance
                 )
@@ -848,7 +275,7 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
             verified_instances[monitor_fingerprint] = candidate
             verified_sources[monitor_fingerprint] = source_fingerprint
 
-        if len(verified_instances) != len(filtered_instances):
+        if len(verified_instances) != len(complete_instances):
             return None
         return (
             verified_instances,
@@ -857,21 +284,134 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
             len(evidence_by_entry),
         )
 
-    def _scan_locked(self, *, execute: bool):
-        if not (
-            self._step_scoped_live_reconnect
-            and self._step_scoped_activation_ready
-            and self._manual_live_fingerprints
-            and self._tcp_counts is not None
+    def _tcp_id(
+        self,
+        resolved: object,
+        fingerprint: str,
+        token: WindowInstanceToken,
+    ) -> str | None:
+        if not self._step_scoped_live_reconnect:
+            return super()._tcp_id(resolved, fingerprint, token)
+        plan = self._group_launch_plan
+        if not isinstance(resolved, ResolvedTargetWindows) or plan is None:
+            return None
+        global_failures, local_failures = self._contract_failure_evidence(resolved)
+        if global_failures or not plan.targets:
+            return None
+        entry_ids = tuple(target.entry_id for target in plan.targets)
+        if (
+            any(not entry_id for entry_id in entry_ids)
+            or len(set(entry_ids)) != len(entry_ids)
+            or tuple(resolved.sync_scope_entry_ids) != entry_ids
         ):
-            return super()._scan_locked(execute=execute)
+            return None
 
-        provider = self._tcp_counts
-        self._tcp_counts = None
-        try:
-            return super()._scan_locked(execute=execute)
-        finally:
-            self._tcp_counts = provider
+        source = (
+            (self._activation_snapshot_source_fingerprints or {}).get(fingerprint)
+            or normalize_launch_fingerprint(fingerprint)
+        )
+        if source is None:
+            return None
+        matches = tuple(
+            (entry_id, window)
+            for entry_id, window in zip(
+                resolved.sync_entry_ids,
+                resolved.windows,
+            )
+            if (
+                normalize_launch_fingerprint(window.launch_fingerprint) == source
+                and WindowInstanceToken.from_window(window) == token
+            )
+        )
+        if len(matches) != 1:
+            return None
+        entry_id, _window = matches[0]
+        target = self._target_for_entry(entry_id)
+        if target is None or target.fingerprint != source:
+            return None
+        failure_key = self._local_failure_key(plan, entry_id, source)
+        if failure_key in local_failures:
+            return None
+        return entry_id
+
+    def _ordered_tcp_owner(self, confirmed):
+        if not self._step_scoped_live_reconnect:
+            return super()._ordered_tcp_owner(confirmed)
+
+        plan = self._group_launch_plan
+        if plan is None:
+            return None, None, None
+
+        sessions = []
+        snapshot = self._activation_snapshot_instances or {}
+        for monitor_fingerprint in tuple(self._login_only_recovery_fingerprints):
+            if not self._has_reconnect_session(monitor_fingerprint):
+                continue
+            instance = snapshot.get(monitor_fingerprint)
+            entry_id = (
+                self._tcp_id(self._tcp_v, monitor_fingerprint, instance)
+                if instance is not None
+                else None
+            )
+            if entry_id is not None:
+                target = self._target_for_entry(entry_id)
+                if target is not None and target.role_id:
+                    sessions.append(monitor_fingerprint)
+            elif monitor_fingerprint in self._manual_live_fingerprints:
+                sessions.append(monitor_fingerprint)
+        sessions = tuple(dict.fromkeys(sessions))
+        if len(sessions) > 1:
+            return None, None, "reconnect_owner_ambiguous"
+        if len(sessions) == 1:
+            return sessions[0], None, None
+
+        confirmed_by_entry = {}
+        manual_confirmed = []
+        for monitor_fingerprint, state in confirmed:
+            if monitor_fingerprint in self._tcp_timeout_isolated:
+                continue
+            if state.entry_id:
+                confirmed_by_entry.setdefault(state.entry_id, []).append(
+                    (monitor_fingerprint, state)
+                )
+            elif monitor_fingerprint in self._manual_live_fingerprints:
+                manual_confirmed.append((monitor_fingerprint, state))
+
+        for target in plan.targets:
+            if not target.role_id:
+                continue
+            matches = tuple(confirmed_by_entry.get(target.entry_id, ()))
+            if len(matches) > 1:
+                return None, None, "reconnect_owner_ambiguous"
+            if not matches:
+                continue
+            monitor_fingerprint, state = matches[0]
+            event = _BattleRestartEvent.from_instance(state.instance)
+            if (
+                self._battle_restart_attempts.get((monitor_fingerprint, True))
+                == event
+            ):
+                continue
+            return monitor_fingerprint, state, None
+
+        for monitor_fingerprint, state in sorted(
+            manual_confirmed,
+            key=lambda item: item[0],
+        ):
+            event = _BattleRestartEvent.from_instance(state.instance)
+            if (
+                self._battle_restart_attempts.get((monitor_fingerprint, False))
+                == event
+            ):
+                continue
+            return monitor_fingerprint, state, None
+        return None, None, None
+
+    def _scan_locked(self, *, execute: bool):
+        return _step._base.WindowsSmartReconnectController._scan_locked(
+            self,
+            execute=execute,
+        )
 
 
 globals()["WindowsSmartReconnectController"] = WindowsSmartReconnectController
