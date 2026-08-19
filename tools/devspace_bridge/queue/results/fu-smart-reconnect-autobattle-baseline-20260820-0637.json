@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-smart-reconnect-autobattle-baseline-20260820-0637",
+  "action": "run_tests",
+  "bridge_pid": 18460,
+  "started_at_unix": 1787179304.7618337,
+  "ok": true,
+  "finished_at_unix": 1787179307.6804965,
+  "result": {
+    "commit": "1302a9c88cc1254eb356f68ce0bd8ff0451cf942",
+    "returncode": 1,
+    "passed": false,
+    "stdout": "F                                                                        [100%]\n================================== FAILURES ===================================\n______ test_public_unknown_gameplay_uses_exact_auto_battle_evidence_only ______\n\n    def test_public_unknown_gameplay_uses_exact_auto_battle_evidence_only() -> None:\n        disabled = _red_x_full_sample()\n        controller, _window, mouse = _controller(\n            [disabled, disabled, _enabled_battle_sample()],\n            general_state=ReconnectScreenState.UNKNOWN,\n        )\n    \n        result = controller.reconnect()\n    \n>       assert controller._capture_provider.calls == 3\nE       assert 2 == 3\nE        +  where 2 = <tests.test_windows_auto_battle._Capture object at 0x000001B0F5486FF0>.calls\nE        +    where <tests.test_windows_auto_battle._Capture object at 0x000001B0F5486FF0> = <adapters.windows_smart_reconnect.WindowsSmartReconnectController object at 0x000001B0F5574D40>._capture_provider\n\ntests\\test_windows_auto_battle.py:455: AssertionError\n=========================== short test summary info ===========================\nFAILED tests/test_windows_auto_battle.py::test_public_unknown_gameplay_uses_exact_auto_battle_evidence_only\n1 failed in 0.87s\n",
+    "stderr": ""
+  }
+}
