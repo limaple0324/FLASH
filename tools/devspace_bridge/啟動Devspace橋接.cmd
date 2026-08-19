@@ -1,16 +1,16 @@
 @echo off
 setlocal
 cd /d "%~dp0\..\.."
-where pyw >nul 2>nul
+where py >nul 2>nul
 if %errorlevel%==0 (
-  start "" pyw -3 "%~dp0bridge.py" --repo "%CD%"
-  exit /b 0
+  py -3 "%~dp0bridge_runner.py" --repo "%CD%"
+  exit /b %errorlevel%
 )
-where pythonw >nul 2>nul
+where python >nul 2>nul
 if %errorlevel%==0 (
-  start "" pythonw "%~dp0bridge.py" --repo "%CD%"
-  exit /b 0
+  python "%~dp0bridge_runner.py" --repo "%CD%"
+  exit /b %errorlevel%
 )
-echo 找不到可用的 Python 背景執行器。
+echo ERROR NOPYTHON
 pause
 exit /b 1
