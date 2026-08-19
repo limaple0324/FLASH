@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import shutil
 import subprocess
 import sys
 
@@ -66,6 +67,48 @@ def _fixed_fetch(self: core.QueueClient) -> None:
     )
 
 
+def _detached_writer(self: core.QueueClient) -> None:
+    self.fetch()
+    if self.writer_root.exists():
+        try:
+            core._run(
+                ["git", "worktree", "remove", "--force", str(self.writer_root)],
+                cwd=self.config.repo_root,
+                timeout=30,
+            )
+        except core.BridgeError:
+            shutil.rmtree(self.writer_root, ignore_errors=True)
+    core._run(
+        ["git", "worktree", "prune"],
+        cwd=self.config.repo_root,
+        timeout=30,
+        check=False,
+    )
+    core._run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            "--force",
+            str(self.writer_root),
+            self.config.queue_ref,
+        ],
+        cwd=self.config.repo_root,
+        timeout=60,
+    )
+    core._run(
+        ["git", "config", "user.name", "Devspace Bridge"],
+        cwd=self.writer_root,
+        timeout=10,
+    )
+    core._run(
+        ["git", "config", "user.email", "devspace@local.invalid"],
+        cwd=self.writer_root,
+        timeout=10,
+    )
+
+
 def _acquire_mutex():
     if os.name != "nt":
         return None
@@ -93,6 +136,7 @@ def main() -> int:
     try:
         core._run = _hidden_run
         core.QueueClient.fetch = _fixed_fetch
+        core.QueueClient._prepare_writer = _detached_writer
         return core.main()
     finally:
         if os.name == "nt" and mutex not in (None, False):
