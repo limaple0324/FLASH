@@ -371,6 +371,12 @@ class WindowsSmartReconnectController(_step.WindowsSmartReconnectController):
         if normalized is None:
             return None
 
+        pending_entry_id = self._formal_pending_reopen_entry_id(normalized)
+        if pending_entry_id is not None:
+            target = self._target_for_entry(pending_entry_id)
+            if target is not None:
+                return target
+
         snapshot = self._activation_snapshot_instances or {}
         instance = snapshot.get(normalized)
         if instance is not None:
@@ -381,6 +387,112 @@ class WindowsSmartReconnectController(_step.WindowsSmartReconnectController):
                     return target
 
         return self._manual_reopen_targets.get(normalized)
+
+    def _formal_pending_reopen_entry_id(
+        self,
+        monitor_fingerprint: str,
+    ) -> str | None:
+        """Re-prove one closed formal owner without its former live window.
+
+        The entry binding is captured only after the exact pre-close window
+        passes the normal TCP action gates.  A retry then additionally needs
+        the immutable activation identity, the unchanged formal plan, and one
+        attributable post-close ``window_offline`` fact.  It never promotes an
+        anonymous/manual window or infers an entry from a shared source hash.
+        """
+
+        if (
+            monitor_fingerprint not in self._pending_reopen_fingerprints
+            or monitor_fingerprint in self._manual_live_fingerprints
+            or monitor_fingerprint in self._detection_only_fingerprints
+        ):
+            return None
+        entry_id = self._pending_reopen_entry_ids.get(monitor_fingerprint)
+        plan = self._formal_plan(self)
+        resolved = self._tcp_v
+        snapshot = self._activation_snapshot_instances or {}
+        sources = self._activation_snapshot_source_fingerprints or {}
+        old_instance = snapshot.get(monitor_fingerprint)
+        source = normalize_launch_fingerprint(
+            sources.get(monitor_fingerprint)
+        )
+        if (
+            not entry_id
+            or plan is None
+            or not plan.targets
+            or not isinstance(resolved, ResolvedTargetWindows)
+            or old_instance is None
+            or source is None
+        ):
+            return None
+
+        plan_entry_ids = tuple(target.entry_id for target in plan.targets)
+        if (
+            any(not item for item in plan_entry_ids)
+            or len(set(plan_entry_ids)) != len(plan_entry_ids)
+            or tuple(resolved.sync_scope_entry_ids) != plan_entry_ids
+            or len(resolved.sync_entry_ids) != len(resolved.windows)
+            or len(set(resolved.sync_entry_ids))
+            != len(resolved.sync_entry_ids)
+            or entry_id in resolved.sync_entry_ids
+        ):
+            return None
+
+        target_matches = tuple(
+            target
+            for target in plan.targets
+            if target.entry_id == entry_id and target.fingerprint == source
+        )
+        if len(target_matches) != 1 or not target_matches[0].role_id:
+            return None
+
+        # Every still-live formal entry must remain fully attributable to its
+        # own plan target.  In particular, the closed instance must not have
+        # silently reappeared under a different entry or detection-only slot.
+        for live_entry_id, window in zip(
+            resolved.sync_entry_ids,
+            resolved.windows,
+        ):
+            live_target = self._target_for_entry(live_entry_id)
+            live_instance = WindowInstanceToken.from_window(window)
+            if (
+                live_target is None
+                or live_instance is None
+                or normalize_launch_fingerprint(window.launch_fingerprint)
+                != live_target.fingerprint
+                or live_instance == old_instance
+            ):
+                return None
+        if any(
+            WindowInstanceToken.from_window(window) == old_instance
+            for window in resolved.detection_only_windows
+        ):
+            return None
+
+        global_failures, local_failures = self._contract_failure_evidence(
+            resolved
+        )
+        if global_failures:
+            return None
+        owner_evidence = tuple(
+            evidence
+            for evidence in resolved.target_failure_evidence
+            if (
+                evidence.entry_id == entry_id
+                and normalize_launch_fingerprint(evidence.fingerprint)
+                == source
+            )
+        )
+        if (
+            len(owner_evidence) != 1
+            or owner_evidence[0].failure_codes != ("window_offline",)
+            or owner_evidence[0].candidate_windows
+        ):
+            return None
+        failure_key = self._local_failure_key(plan, entry_id, source)
+        if local_failures.get(failure_key) != ("window_offline",):
+            return None
+        return entry_id
 
     def _ordered_tcp_owner(self, confirmed):
         if not self._step_scoped_live_reconnect:
@@ -395,12 +507,20 @@ class WindowsSmartReconnectController(_step.WindowsSmartReconnectController):
         for monitor_fingerprint in tuple(self._login_only_recovery_fingerprints):
             if not self._has_reconnect_session(monitor_fingerprint):
                 continue
-            instance = snapshot.get(monitor_fingerprint)
-            entry_id = (
-                self._tcp_id(self._tcp_v, monitor_fingerprint, instance)
-                if instance is not None
-                else None
+            entry_id = self._formal_pending_reopen_entry_id(
+                monitor_fingerprint
             )
+            if entry_id is None:
+                instance = snapshot.get(monitor_fingerprint)
+                entry_id = (
+                    self._tcp_id(
+                        self._tcp_v,
+                        monitor_fingerprint,
+                        instance,
+                    )
+                    if instance is not None
+                    else None
+                )
             if entry_id is not None:
                 target = self._target_for_entry(entry_id)
                 if target is not None and target.role_id:

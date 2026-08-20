@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
-from dataclasses import replace
 from pathlib import Path
 
 from . import windows_smart_reconnect_base as _base
@@ -124,9 +122,11 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
         controller = super().for_real_windows(*args, **kwargs)
         controller._step_scoped_live_reconnect = True
         controller._step_scoped_activation_ready = False
-        controller._minimized_refresh_capture_provider = (
-            Win32RecoveringPrintWindowProvider()
-        )
+        # Production step-scoped reconnect must fail closed for minimized
+        # windows.  Restoring a minimized window, even temporarily, changes
+        # visibility/z-order and violates the non-mutating window contract.
+        # Tests may still inject a provider explicitly through __init__.
+        controller._minimized_refresh_capture_provider = None
         controller._obscured_capture_access_ready = None
         controller._manual_empty_plan_requested = False
         controller._manual_runtime_plan_installed = False
@@ -314,53 +314,83 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
         if not self._step_scoped_live_reconnect:
             return super().prepare_execution_snapshot()
 
-        if self._manual_runtime_plan_installed:
-            self._group_launch_plan = None
-            self._manual_runtime_plan_installed = False
-        self._manual_reopen_targets.clear()
-        self._manual_live_fingerprints = frozenset()
-        self._step_scoped_activation_ready = False
-        self._obscured_capture_access_ready = None
-        original_preparer = self._capture_access_preparer
-
-        needs_obscured_access = self._current_activation_requires_obscured_access()
-        if needs_obscured_access and original_preparer is not None:
-            if not self._ensure_obscured_capture_access():
-                return self._snapshot_failure(
-                    "reconnect.snapshot_capture_access_denied",
-                    "Windows 無彩框背景擷取權限未允許，智慧重連未啟用。",
-                    "borderless_capture_access_denied",
-                )
-
-        if not needs_obscured_access:
-            self._capture_access_preparer = None
-        try:
-            prepared = super().prepare_execution_snapshot()
-        finally:
-            self._capture_access_preparer = original_preparer
-
-        if not prepared.success:
-            return prepared
-
-        self._step_scoped_activation_ready = True
-        snapshot = self._activation_snapshot_instances or {}
-        _settings, capture_revision = self._capture_settings_snapshot()
-        source_generation = self._source_state_generation_snapshot()
-        expires_at = (
-            self._monotonic_clock() + INITIAL_LOGIN_AUTHORIZATION_SECONDS
-        )
-        for fingerprint, instance in snapshot.items():
-            self._initial_login_authorizations.setdefault(
-                fingerprint,
-                _InitialLoginAuthorization(
-                    instance,
-                    capture_revision,
-                    source_generation,
-                    expires_at,
-                ),
+        # Preparing a new activation is one atomic transition.  The base
+        # implementation uses this same RLock, so taking it before changing
+        # step-scoped state serializes active scans and concurrent prepares
+        # without weakening any of the base checks.
+        with self._scan_lock:
+            previous_state = (
+                self._group_launch_plan,
+                self._manual_runtime_plan_installed,
+                dict(self._manual_reopen_targets),
+                self._manual_live_fingerprints,
+                self._step_scoped_activation_ready,
+                self._obscured_capture_access_ready,
+                self._tcp_v,
             )
-        self._build_manual_reopen_authority()
-        return prepared
+            original_preparer = self._capture_access_preparer
+
+            def restore_previous_state() -> None:
+                (
+                    self._group_launch_plan,
+                    self._manual_runtime_plan_installed,
+                    manual_reopen_targets,
+                    self._manual_live_fingerprints,
+                    self._step_scoped_activation_ready,
+                    self._obscured_capture_access_ready,
+                    self._tcp_v,
+                ) = previous_state
+                self._manual_reopen_targets = manual_reopen_targets
+
+            if self._manual_runtime_plan_installed:
+                self._group_launch_plan = None
+                self._manual_runtime_plan_installed = False
+            self._manual_reopen_targets.clear()
+            self._manual_live_fingerprints = frozenset()
+            self._step_scoped_activation_ready = False
+            self._obscured_capture_access_ready = None
+
+            try:
+                needs_obscured_access = (
+                    self._current_activation_requires_obscured_access()
+                )
+                if needs_obscured_access and original_preparer is not None:
+                    # Capture permission is optional for activation.  If it is
+                    # unavailable, the affected obscured windows remain
+                    # UNKNOWN while TCP observation and identity monitoring
+                    # continue.
+                    self._ensure_obscured_capture_access()
+                self._capture_access_preparer = None
+                prepared = super().prepare_execution_snapshot()
+            except Exception:
+                restore_previous_state()
+                raise
+            finally:
+                self._capture_access_preparer = original_preparer
+
+            if not prepared.success:
+                restore_previous_state()
+                return prepared
+
+            self._step_scoped_activation_ready = True
+            snapshot = self._activation_snapshot_instances or {}
+            _settings, capture_revision = self._capture_settings_snapshot()
+            source_generation = self._source_state_generation_snapshot()
+            expires_at = (
+                self._monotonic_clock() + INITIAL_LOGIN_AUTHORIZATION_SECONDS
+            )
+            for fingerprint, instance in snapshot.items():
+                self._initial_login_authorizations.setdefault(
+                    fingerprint,
+                    _InitialLoginAuthorization(
+                        instance,
+                        capture_revision,
+                        source_generation,
+                        expires_at,
+                    ),
+                )
+            self._build_manual_reopen_authority()
+            return prepared
 
     def set_execution_enabled(self, enabled: bool) -> None:
         super().set_execution_enabled(enabled)
@@ -550,32 +580,13 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
             initial_login_authorized=initial_login_authorized,
         )
 
-    def _delivery_window_proxy(self, window):
-        if (
-            not self._step_scoped_live_reconnect
-            or window is None
-            or not window.minimized
-        ):
-            return window
-        frame = inspect.currentframe()
-        caller = frame.f_back if frame is not None else None
-        caller = caller.f_back if caller is not None else None
-        if (
-            caller is not None
-            and caller.f_code.co_name == "deliver_click"
-            and caller.f_code.co_filename == _base.__file__
-        ):
-            return replace(window, minimized=False)
-        return window
-
     def _current_action_window(self, expected, fingerprint: str):
         if not (
             self._step_scoped_live_reconnect
             and self._step_scoped_activation_ready
             and fingerprint in self._manual_live_fingerprints
         ):
-            current = super()._current_action_window(expected, fingerprint)
-            return self._delivery_window_proxy(current)
+            return super()._current_action_window(expected, fingerprint)
 
         candidates, global_failures, target_failures = self._candidate_window_set()
         expected_instance = (
@@ -639,7 +650,7 @@ class WindowsSmartReconnectController(_base.WindowsSmartReconnectController):
             with self._screen_state_lock:
                 self._mark_fingerprints_unknown_locked((fingerprint,))
             return None
-        return self._delivery_window_proxy(window)
+        return window
 
     def _contract_failure_evidence(self, resolved):
         if not self._step_scoped_live_reconnect:

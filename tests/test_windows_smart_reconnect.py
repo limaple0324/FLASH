@@ -12,6 +12,7 @@ from PIL import Image
 
 from adapters.game_screen_recognizer import (
     CHARACTER_ENTER_CLICK_POINT,
+    LINE_LIST_SCROLL_POINT,
     LINE_ROUTE_CLICK_POINTS,
     CharacterSelectionCandidate,
     POST_DISCONNECT_WAITING_REFERENCE_FILE,
@@ -1582,6 +1583,7 @@ def make_controller(
     recognizer=None,
     registered_role_provider=None,
     tcp_connection_count_provider=None,
+    step_scoped_live_reconnect=False,
 ):
     if clock is None:
         default_time = [-5.0]
@@ -1658,6 +1660,7 @@ def make_controller(
             registered_role_provider=registered_role_provider,
             operation_gate=operation_gate,
             tcp_connection_count_provider=tcp_connection_count_provider,
+            step_scoped_live_reconnect=step_scoped_live_reconnect,
         )
     if group_launch_plan is not None:
         controller.set_group_launch_plan(group_launch_plan)
@@ -7096,16 +7099,16 @@ def test_unknown_peer_is_never_operated_during_a_known_reconnect_session():
 
 
 def test_recent_line_target_change_requires_two_new_matching_frames():
-    point = [(0.5, 0.665)]
+    route = [8]
 
     class MutableRecentLineRecognizer:
         def recognize_capture(self, _sample):
             return ScreenRecognition(
                 ReconnectScreenState.LINE_SELECTION,
                 0.0,
-                point[0],
+                (0.5, 0.665),
                 "line-selection",
-                line_number=8,
+                line_number=route[0],
                 recent_line_present=True,
             )
 
@@ -7117,13 +7120,15 @@ def test_recent_line_target_change_requires_two_new_matching_frames():
     fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
 
     fixture.controller.reconnect()
-    point[0] = (0.5, 0.722)
+    first = fixture.controller.reconnect()
+    route[0] = 7
     changed = fixture.controller.reconnect()
     confirmed = fixture.controller.reconnect()
 
+    assert first.details["clicked_windows"] == 1
     assert changed.details["clicked_windows"] == 0
-    assert confirmed.details["clicked_windows"] == 1
-    assert fixture.mouse.clicks == [(1, (0.5, 0.722))]
+    assert confirmed.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == [(1, LINE_ROUTE_CLICK_POINTS[8])]
 
 
 def test_real_controller_wires_only_non_mutating_capture_routes(monkeypatch):
@@ -7134,7 +7139,7 @@ def test_real_controller_wires_only_non_mutating_capture_routes(monkeypatch):
         return {}
 
     monkeypatch.setattr(
-        "adapters.windows_smart_reconnect._ipv4_established_counts_by_pid",
+        "adapters.windows_smart_reconnect_step_scoped_base._ipv4_established_counts_by_pid",
         tcp_provider,
     )
     controller = WindowsSmartReconnectController.for_real_windows(
@@ -7202,22 +7207,50 @@ def test_real_obscured_window_stays_unknown_without_revealing_it(
     assert diagnostic["rejection_gate"] == "capture_failed"
 
 
-def test_denied_borderless_access_rejects_snapshot_without_opening_execution():
-    calls = []
+def test_denied_borderless_access_keeps_safe_snapshot_and_unknowns(
+    tmp_path,
+):
+    window = make_window(1, fingerprint="a" * 64)
+    tcp_queries = []
+
+    def tcp_provider(process_ids):
+        tcp_queries.append(process_ids)
+        return {window.process_id: 1}
+
+    resolved = ResolvedTargetWindows(
+        windows=(window,),
+        sync_windows=(window,),
+        sync_entry_ids=("entry-0",),
+        sync_scope_entry_ids=("entry-0",),
+    )
+
     fixture = make_controller(
         [1],
+        windows=[window],
         expected_windows=1,
-        capture_access_preparer=lambda: calls.append("prepare") or False,
+        group_launch_plan=make_tcp_group_plan(tmp_path, [window]),
+        target_windows_provider=lambda: resolved,
+        capture_access_preparer=lambda: False,
+        tcp_connection_count_provider=tcp_provider,
+        window_backend=ObscuredWindowBackend([window]),
+        step_scoped_live_reconnect=True,
     )
 
     fixture.controller.set_execution_enabled(False)
-    result = fixture.controller.prepare_execution_snapshot()
+    prepared = fixture.controller.prepare_execution_snapshot()
 
-    assert result.success is False
-    assert result.code == "reconnect.snapshot_capture_access_denied"
-    assert calls == ["prepare"]
+    assert prepared.success is True
+    assert prepared.details["window_count"] == 1
     assert fixture.controller._execution_enabled.is_set() is False
-    assert fixture.controller._activation_snapshot_instances is None
+
+    fixture.controller.set_execution_enabled(True)
+    result = fixture.controller.reconnect()
+
+    assert result.details["unknown_windows"] == 1
+    assert result.details["clicked_windows"] == 0
+    assert tcp_queries == [frozenset({window.process_id})]
+    assert fixture.capture.calls == []
+    assert fixture.mouse.clicks == []
 
 
 def test_real_minimized_window_stays_unknown_without_restoring_it(
@@ -7231,7 +7264,7 @@ def test_real_minimized_window_stays_unknown_without_restoring_it(
         return {window.process_id: 0}
 
     monkeypatch.setattr(
-        "adapters.windows_smart_reconnect._ipv4_established_counts_by_pid",
+        "adapters.windows_smart_reconnect_step_scoped_base._ipv4_established_counts_by_pid",
         tcp_provider,
     )
     controller = WindowsSmartReconnectController.for_real_windows(
@@ -11609,6 +11642,430 @@ def _recent_line_recognition(
     )
 
 
+class _SequenceScreenRecognizer:
+    def __init__(self, recognitions):
+        self.recognitions = tuple(recognitions)
+        self.calls = 0
+
+    def recognize_capture(self, _sample):
+        index = min(self.calls, len(self.recognitions) - 1)
+        self.calls += 1
+        return self.recognitions[index]
+
+
+def _line_sequence_fixture(recognitions, *, now, mouse=None):
+    window = make_window(1)
+    fixture = make_controller(
+        [4],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        mouse=mouse,
+        recognizer=_SequenceScreenRecognizer(recognitions),
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+    return fixture, window
+
+
+def test_line_selection_one_shot_does_not_repeat_after_sixty_seconds():
+    now = [0.0]
+    recognition = _recent_line_recognition(
+        line_number=8,
+        point=LINE_ROUTE_CLICK_POINTS[8],
+        present=True,
+    )
+    fixture, _window = _line_sequence_fixture(
+        [recognition] * 4,
+        now=now,
+    )
+
+    fixture.controller.reconnect()
+    now[0] = 1.0
+    first = fixture.controller.reconnect()
+    now[0] = 61.0
+    fixture.controller.reconnect()
+    now[0] = 62.0
+    late = fixture.controller.reconnect()
+
+    assert first.details["clicked_windows"] == 1
+    assert late.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == [(1, LINE_ROUTE_CLICK_POINTS[8])]
+
+
+def test_step_scoped_execution_toggle_does_not_rearm_same_line_frame(
+    tmp_path,
+):
+    now = [0.0]
+    window = make_window(1, fingerprint="a" * 64)
+    recognition = _recent_line_recognition(
+        line_number=8,
+        point=LINE_ROUTE_CLICK_POINTS[8],
+        present=True,
+    )
+    resolved = tcp_resolved_targets([window])
+    fixture = make_controller(
+        [4],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        recognizer=RecognitionByMarker({4: recognition}),
+        group_launch_plan=make_tcp_group_plan(tmp_path, [window]),
+        target_windows_provider=lambda: resolved,
+        step_scoped_live_reconnect=True,
+    )
+
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.reconnect()
+    now[0] = 1.0
+    fixture.controller.reconnect()
+    assert fixture.mouse.clicks == [(1, LINE_ROUTE_CLICK_POINTS[8])]
+
+    fixture.controller.set_execution_enabled(False)
+    assert fixture.controller.prepare_execution_snapshot().success is True
+    fixture.controller.set_execution_enabled(True)
+    now[0] = 61.0
+    fixture.controller.reconnect()
+    now[0] = 62.0
+    fixture.controller.reconnect()
+
+    assert fixture.mouse.clicks == [(1, LINE_ROUTE_CLICK_POINTS[8])]
+
+
+def test_formal_group_switch_does_not_rearm_same_instance_and_line_frame(
+    tmp_path,
+):
+    now = [0.0]
+    window = make_window(1, fingerprint="a" * 64)
+    recognition = _recent_line_recognition(
+        line_number=8,
+        point=LINE_ROUTE_CLICK_POINTS[8],
+        present=True,
+    )
+    resolved = tcp_resolved_targets([window])
+    original_plan = make_tcp_group_plan(tmp_path, [window], "group-a")
+    fixture = make_controller(
+        [4],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        recognizer=RecognitionByMarker({4: recognition}),
+        group_launch_plan=original_plan,
+        target_windows_provider=lambda: resolved,
+        step_scoped_live_reconnect=True,
+    )
+
+    assert activate_current_window_snapshot(fixture).success is True
+    fixture.controller.reconnect()
+    now[0] = 1.0
+    fixture.controller.reconnect()
+    assert fixture.mouse.clicks == [(1, LINE_ROUTE_CLICK_POINTS[8])]
+
+    fixture.controller.set_execution_enabled(False)
+    fixture.controller.set_group_launch_plan(
+        replace(original_plan, group_name="group-b")
+    )
+    assert fixture.controller.prepare_execution_snapshot().success is True
+    fixture.controller.set_execution_enabled(True)
+    now[0] = 61.0
+    fixture.controller.reconnect()
+    now[0] = 62.0
+    fixture.controller.reconnect()
+
+    assert fixture.mouse.clicks == [(1, LINE_ROUTE_CLICK_POINTS[8])]
+
+
+@pytest.mark.parametrize("line_number", [2, 7])
+def test_line_selection_normalizes_only_a_present_valid_route(line_number):
+    now = [0.0]
+    wrong_point = LINE_ROUTE_CLICK_POINTS[8]
+    recognition = _recent_line_recognition(
+        line_number=line_number,
+        point=wrong_point,
+        present=True,
+    )
+    fixture, _window = _line_sequence_fixture(
+        [recognition, recognition],
+        now=now,
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [
+        (1, LINE_ROUTE_CLICK_POINTS[line_number])
+    ]
+
+
+def test_line_selection_valid_route_without_point_stays_zero_click():
+    now = [0.0]
+    recognition = _recent_line_recognition(
+        line_number=7,
+        point=None,
+        present=True,
+    )
+    fixture, _window = _line_sequence_fixture(
+        [recognition, recognition],
+        now=now,
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+    assert fixture.mouse.scrolls == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_point",
+    (
+        "not-a-point",
+        (0.5,),
+        (0.5, 0.5, 0.5),
+        (-0.1, 0.5),
+        (1.1, 0.5),
+        (float("nan"), 0.5),
+        (float("inf"), 0.5),
+        (True, 0.5),
+    ),
+)
+def test_line_selection_rejects_malformed_upstream_point(unsafe_point):
+    now = [0.0]
+    recognition = _recent_line_recognition(
+        line_number=7,
+        point=unsafe_point,
+        present=True,
+    )
+    fixture, _window = _line_sequence_fixture(
+        [recognition, recognition],
+        now=now,
+    )
+
+    fixture.controller.reconnect()
+    result = fixture.controller.reconnect()
+
+    assert result.details["clicked_windows"] == 0
+    assert fixture.mouse.clicks == []
+    assert fixture.mouse.scrolls == []
+
+
+def test_line_selection_unknown_frame_does_not_rearm_consumed_action():
+    now = [0.0]
+    line = _recent_line_recognition(
+        line_number=8,
+        point=LINE_ROUTE_CLICK_POINTS[8],
+        present=True,
+    )
+    unknown = ScreenRecognition(
+        ReconnectScreenState.UNKNOWN,
+        None,
+        None,
+        "unknown",
+    )
+    fixture, _window = _line_sequence_fixture(
+        [line, line, unknown, unknown, line, line],
+        now=now,
+    )
+
+    for value in (0.0, 1.0, 61.0, 62.0, 63.0, 64.0):
+        now[0] = value
+        fixture.controller.reconnect()
+
+    assert fixture.mouse.clicks == [(1, LINE_ROUTE_CLICK_POINTS[8])]
+
+
+def test_line_selection_leaving_page_allows_a_new_event():
+    now = [0.0]
+    line = _recent_line_recognition(
+        line_number=8,
+        point=LINE_ROUTE_CLICK_POINTS[8],
+        present=True,
+    )
+    reconnecting = ScreenRecognition(
+        ReconnectScreenState.RECONNECTING,
+        0.0,
+        None,
+        "reconnecting",
+    )
+
+    class MutableRecognizer:
+        def __init__(self):
+            self.current = line
+
+        def recognize_capture(self, _sample):
+            return self.current
+
+    window = make_window(1)
+    recognizer = MutableRecognizer()
+    fixture = make_controller(
+        [4],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        recognizer=recognizer,
+    )
+    fixture.controller._pending_reconnect_fingerprints.add(
+        window.launch_fingerprint
+    )
+
+    for value in (0.0, 1.0):
+        now[0] = value
+        fixture.controller.reconnect()
+    recognizer.current = reconnecting
+    for value in (61.0, 62.0):
+        now[0] = value
+        fixture.controller.reconnect()
+    recognizer.current = line
+    for value in (63.0, 64.0):
+        now[0] = value
+        fixture.controller.reconnect()
+
+    assert fixture.mouse.clicks == [
+        (1, LINE_ROUTE_CLICK_POINTS[8]),
+        (1, LINE_ROUTE_CLICK_POINTS[8]),
+    ]
+
+
+def test_line_selection_instance_change_has_a_new_one_shot_ledger():
+    now = [0.0]
+    line = _recent_line_recognition(
+        line_number=8,
+        point=LINE_ROUTE_CLICK_POINTS[8],
+        present=True,
+    )
+    fixture, old_window = _line_sequence_fixture(
+        [line] * 4,
+        now=now,
+    )
+    fixture.controller.reconnect()
+    now[0] = 1.0
+    fixture.controller.reconnect()
+
+    new_window = make_window(
+        9,
+        fingerprint=old_window.launch_fingerprint,
+    )
+    fixture.controller._window_backend.windows = [new_window]
+    fixture.capture.states[new_window.handle] = 4
+    now[0] = 61.0
+    fixture.controller.reconnect()
+    now[0] = 62.0
+    fixture.controller.reconnect()
+
+    assert fixture.mouse.clicks == [
+        (old_window.handle, LINE_ROUTE_CLICK_POINTS[8]),
+        (new_window.handle, LINE_ROUTE_CLICK_POINTS[8]),
+    ]
+
+
+def test_line_selection_uncertain_delivery_is_consumed_without_retry():
+    now = [0.0]
+    line = _recent_line_recognition(
+        line_number=8,
+        point=LINE_ROUTE_CLICK_POINTS[8],
+        present=True,
+    )
+    mouse = FakeMouseBackend(
+        click_results=(
+            MouseClickResult(
+                False,
+                True,
+                True,
+                "mouse_up_delivery_uncertain",
+            ),
+        )
+    )
+    fixture, _window = _line_sequence_fixture(
+        [line] * 4,
+        now=now,
+        mouse=mouse,
+    )
+
+    fixture.controller.reconnect()
+    now[0] = 1.0
+    first = fixture.controller.reconnect()
+    now[0] = 61.0
+    fixture.controller.reconnect()
+    now[0] = 62.0
+    late = fixture.controller.reconnect()
+
+    assert "click_delivery_uncertain" in first.details["failure_codes"]
+    assert first.details["clicked_windows"] == 0
+    assert late.details["clicked_windows"] == 0
+    assert mouse.clicks == [(1, LINE_ROUTE_CLICK_POINTS[8])]
+
+
+def test_line_scroll_a_b_a_consumes_each_scroll_signature_once():
+    now = [0.0]
+    scroll_a = _recent_line_recognition(
+        line_number=8,
+        point=None,
+        present=True,
+        scroll_delta=120,
+    )
+    scroll_b = _recent_line_recognition(
+        line_number=7,
+        point=None,
+        present=True,
+        scroll_delta=-120,
+    )
+    fixture, _window = _line_sequence_fixture(
+        [scroll_a] * 3 + [scroll_b] * 3 + [scroll_a] * 3,
+        now=now,
+    )
+
+    for value in range(9):
+        now[0] = float(value)
+        fixture.controller.reconnect()
+
+    assert fixture.mouse.scrolls == [
+        (1, LINE_LIST_SCROLL_POINT, 120),
+        (1, LINE_LIST_SCROLL_POINT, -120),
+    ]
+
+
+def test_line_scroll_ocr_role_noise_cannot_rearm_or_grow_ledger():
+    now = [0.0]
+    role = ["role-0"]
+
+    class NoisyRoleRecognizer:
+        def recognize_capture(self, _sample):
+            return _recent_line_recognition(
+                line_number=8,
+                point=None,
+                present=True,
+                scroll_delta=120,
+                recent_role=role[0],
+            )
+
+    window = make_window(1)
+    fixture = make_controller(
+        [4],
+        windows=[window],
+        expected_windows=1,
+        clock=lambda: now[0],
+        recognizer=NoisyRoleRecognizer(),
+    )
+    fingerprint = window.launch_fingerprint
+    fixture.controller._pending_reconnect_fingerprints.add(fingerprint)
+
+    fixture.controller.reconnect()
+    now[0] = 1.0
+    fixture.controller.reconnect()
+    for index in range(1, 101):
+        role[0] = f"role-{index}"
+        now[0] = float(index + 1)
+        fixture.controller.reconnect()
+
+    assert fixture.mouse.scrolls == [
+        (1, LINE_LIST_SCROLL_POINT, 120),
+    ]
+    assert len(fixture.controller._one_shot_action_ledger[fingerprint]) == 1
+
+
 def _registered_primary_candidates(*, selected_slot=0):
     return (
         CharacterSelectionCandidate(
@@ -11856,6 +12313,17 @@ def test_registered_primary_beats_selected_equal_level_then_enters_fresh_slot():
     entered = fixture.controller.reconnect()
 
     assert entered.details["clicked_windows"] == 1
+    assert fixture.mouse.clicks == [
+        (1, (0.651, 0.706)),
+        (1, CHARACTER_ENTER_CLICK_POINT),
+    ]
+
+    now[0] = 61.0
+    fixture.controller.reconnect()
+    now[0] = 62.0
+    late = fixture.controller.reconnect()
+
+    assert late.details["clicked_windows"] == 0
     assert fixture.mouse.clicks == [
         (1, (0.651, 0.706)),
         (1, CHARACTER_ENTER_CLICK_POINT),
@@ -12414,6 +12882,7 @@ def _run_case_tcp_owner(
     on_final=None,
     target_windows_provider=None,
     battle_restarter=None,
+    step_scoped_live_reconnect=False,
 ):
     windows = windows or [
         make_window(index, process_id=100 + index)
@@ -12449,6 +12918,7 @@ def _run_case_tcp_owner(
         ),
         battle_restarter=restarter,
         group_launch_plan=make_tcp_group_plan(tmp_path, windows),
+        step_scoped_live_reconnect=step_scoped_live_reconnect,
     )
     fixture_holder["fixture"] = fixture
     assert activate_current_window_snapshot(fixture).success is True
@@ -12633,6 +13103,73 @@ def test_tcp_reopen_retry_success_waits_for_new_instance_without_relaunch(
     assert len(restarter.calls) == 1
     assert len(restarter.reopen_calls) == 2
     assert fixture.controller._pending_reopen_fingerprints == {fingerprint}
+    assert fixture.mouse.clicks == []
+
+
+def test_step_scoped_formal_offline_owner_retries_exactly_after_interval(
+    tmp_path,
+):
+    restarter = FailFirstReopenRestarter()
+    fixture, restarter, first_attempt, _calls = _run_case_tcp_owner(
+        tmp_path,
+        final_observation={101: 0, 102: 1, 103: 1},
+        battle_restarter=restarter,
+        step_scoped_live_reconnect=True,
+    )
+
+    assert first_attempt.details["restarted_windows"] == 0
+    assert len(restarter.calls) == 1
+    assert len(restarter.reopen_calls) == 1
+    assert len(fixture.controller._pending_reopen_fingerprints) == 1
+    owner = next(iter(fixture.controller._pending_reopen_fingerprints))
+
+    fixture.controller._reopen_retry_after[owner] = 0.0
+    retry = fixture.controller.reconnect()
+
+    assert retry.details["restarted_windows"] == 1
+    assert len(restarter.calls) == 1
+    assert len(restarter.reopen_calls) == 2
+    assert fixture.controller._pending_reopen_fingerprints == {owner}
+    assert fixture.mouse.clicks == []
+
+
+@pytest.mark.parametrize(
+    "evidence_change",
+    ("missing", "duplicate", "identity_mismatch"),
+)
+def test_step_scoped_pending_reopen_rejects_unproven_formal_owner(
+    tmp_path,
+    evidence_change,
+):
+    restarter = FailFirstReopenRestarter()
+    fixture, restarter, _first_attempt, _calls = _run_case_tcp_owner(
+        tmp_path,
+        final_observation={101: 0, 102: 1, 103: 1},
+        battle_restarter=restarter,
+        step_scoped_live_reconnect=True,
+    )
+    valid = fixture.controller._tcp_v
+    assert isinstance(valid, ResolvedTargetWindows)
+    assert len(valid.target_failure_evidence) == 1
+    evidence = valid.target_failure_evidence[0]
+    if evidence_change == "missing":
+        changed_evidence = ()
+    elif evidence_change == "duplicate":
+        changed_evidence = (evidence, evidence)
+    else:
+        changed_evidence = (
+            replace(evidence, fingerprint=valid.windows[0].launch_fingerprint),
+        )
+    unsafe = replace(valid, target_failure_evidence=changed_evidence)
+    fixture.controller._target_windows_provider = lambda: unsafe
+    owner = next(iter(fixture.controller._pending_reopen_fingerprints))
+    fixture.controller._reopen_retry_after[owner] = 0.0
+
+    retry = fixture.controller.reconnect()
+
+    assert retry.details["restarted_windows"] == 0
+    assert len(restarter.calls) == 1
+    assert len(restarter.reopen_calls) == 1
     assert fixture.mouse.clicks == []
 
 

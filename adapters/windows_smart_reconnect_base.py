@@ -1977,6 +1977,26 @@ class _ActionConfirmation:
 
 
 @dataclass(frozen=True, slots=True)
+class _OneShotActionLedger:
+    """Consume one visual action for one immutable window/action phase."""
+
+    instance: WindowInstanceToken
+    state: ReconnectScreenState
+    phase: str
+    signature: tuple[object, ...]
+    outcome: str
+
+
+@dataclass(frozen=True, slots=True)
+class _OneShotPhaseConfirmation:
+    instance: WindowInstanceToken
+    state: ReconnectScreenState
+    phase: str | None
+    signature: tuple[object, ...]
+    consecutive_frames: int
+
+
+@dataclass(frozen=True, slots=True)
 class _BattleRestartEvent:
     handle: int
     process_id: int
@@ -2443,6 +2463,11 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._pending_reopen_fingerprints = (
             runtime_state.pending_reopen_fingerprints
         )
+        # A launch fingerprint can belong to more than one formal group
+        # entry.  Once an authorized TCP recovery closes the exact owner,
+        # retain the already-proven entry binding in memory so a later reopen
+        # retry never has to infer ownership from a now-absent window.
+        self._pending_reopen_entry_ids: dict[str, str] = {}
         self._reopen_retry_after = runtime_state.reopen_retry_after
         self._terminal_ready_after = runtime_state.terminal_ready_after
         self._terminal_evidence: dict[str, _TerminalEvidence] = {}
@@ -2540,6 +2565,14 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         self._action_confirmations: dict[
             str,
             _ActionConfirmation,
+        ] = {}
+        self._one_shot_action_ledger: dict[
+            str,
+            dict[str, _OneShotActionLedger],
+        ] = {}
+        self._one_shot_phase_confirmations: dict[
+            str,
+            _OneShotPhaseConfirmation,
         ] = {}
         self._battle_restart_attempts: dict[
             tuple[str, bool],
@@ -2759,6 +2792,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         with self._screen_state_lock:
             self._pending_reconnect_fingerprints.clear()
             self._pending_reopen_fingerprints.clear()
+            self._pending_reopen_entry_ids.clear()
             self._active_automation_fingerprints.clear()
             self._active_automation_until.clear()
             self._action_retry_after.clear()
@@ -4907,6 +4941,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._activation_snapshot_instance_index = instance_index
             self._activation_snapshot_direct_identity_collisions = frozenset()
             self._detection_only_fingerprints = detection_only_fingerprints
+            self._retain_one_shot_actions_for_activation_snapshot()
             self._pending_reopen_fingerprints.clear()
             self._reopen_retry_after.clear()
             self._auto_battle_evidence.clear()
@@ -5049,6 +5084,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 | set(self._action_state_since)
                 | set(self._flow_pause_until)
                 | set(self._action_confirmations)
+                | set(self._one_shot_phase_confirmations)
                 | set(self._terminal_ready_after)
                 | set(self._terminal_evidence)
                 | set(self._last_screen_states)
@@ -5071,6 +5107,9 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             self._pending_reconnect_fingerprints.intersection_update(fingerprints)
             self._active_automation_fingerprints.intersection_update(fingerprints)
             self._pending_reopen_fingerprints.intersection_update(fingerprints)
+            for fingerprint in tuple(self._pending_reopen_entry_ids):
+                if fingerprint not in fingerprints:
+                    self._pending_reopen_entry_ids.pop(fingerprint, None)
             self._character_selection_pending.intersection_update(fingerprints)
             self._primary_entry_authorized.intersection_update(fingerprints)
             self._primary_connected_fingerprints.intersection_update(
@@ -5090,6 +5129,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 self._action_state_since,
                 self._flow_pause_until,
                 self._action_confirmations,
+                self._one_shot_phase_confirmations,
                 self._terminal_ready_after,
                 self._terminal_evidence,
                 self._character_selection_targets,
@@ -6956,24 +6996,32 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
 
     @staticmethod
+    def _relative_point_is_complete(point: object) -> bool:
+        return bool(
+            isinstance(point, tuple)
+            and len(point) == 2
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and 0.0 <= value <= 1.0
+                for value in point
+            )
+        )
+
+    @staticmethod
     def _action_signature_is_complete(
         item: ScreenRecognition,
         *,
         require_point: bool = True,
     ) -> bool:
-        point = item.click_point
         return bool(
             isinstance(item.reference_name, str)
             and item.reference_name.strip()
             and (
                 not require_point
-                or isinstance(point, tuple)
-                and len(point) == 2
-                and all(
-                    isinstance(value, (int, float))
-                    and not isinstance(value, bool)
-                    and 0.0 <= value <= 1.0
-                    for value in point
+                or WindowsSmartReconnectController._relative_point_is_complete(
+                    item.click_point
                 )
             )
         )
@@ -7000,10 +7048,17 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return replace(item, click_point=LINE_LIST_SCROLL_POINT)
         if (
             item.line_number not in LINE_ROUTE_CLICK_POINTS
-            or item.click_point is None
+            or not self._relative_point_is_complete(item.click_point)
         ):
             return replace(item, click_point=None, line_scroll_delta=0)
-        return item
+        # The route number is the authoritative current-frame decision.  Do
+        # not trust an inconsistent upstream point (for example route 7 with
+        # route 8's point); rebuild the immutable product point instead.
+        return replace(
+            item,
+            click_point=LINE_ROUTE_CLICK_POINTS[item.line_number],
+            line_scroll_delta=0,
+        )
 
     def _clear_action_confirmation(self, fingerprint: str | None = None) -> None:
         if fingerprint is None:
@@ -7011,10 +7066,189 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
             return
         self._action_confirmations.pop(fingerprint, None)
 
+    @staticmethod
+    def _one_shot_action_phase(item: ScreenRecognition) -> str | None:
+        if item.state is ReconnectScreenState.LINE_SELECTION:
+            if item.line_scroll_delta in {-120, 120}:
+                return "line_scroll"
+            return "line_select"
+        if item.state is ReconnectScreenState.CHARACTER_SELECTION:
+            return (
+                "character_enter"
+                if item.character_slot_selected is True
+                else "character_slot"
+            )
+        return None
+
+    @staticmethod
+    def _one_shot_action_key(
+        phase: str,
+        item: ScreenRecognition,
+    ) -> str:
+        if phase != "line_scroll":
+            return phase
+        # Scroll identity is intentionally limited to the real input phase.
+        # OCR role text and unrelated recognition fields are noisy evidence;
+        # letting them into the key would re-arm the same wheel input and grow
+        # the ledger without bound.
+        return f"{phase}:{item.line_number}:{item.line_scroll_delta}"
+
+    @staticmethod
+    def _one_shot_known_frame(
+        item: ScreenRecognition,
+        *,
+        fresh_capture: bool,
+    ) -> bool:
+        return bool(
+            fresh_capture
+            and item.state
+            not in {
+                ReconnectScreenState.UNKNOWN,
+                ReconnectScreenState.CHECK_DISABLED,
+            }
+            and WindowsSmartReconnectController._action_signature_is_complete(
+                item,
+                require_point=False,
+            )
+        )
+
+    def _one_shot_action_is_blocked(
+        self,
+        fingerprint: str,
+        item: ScreenRecognition,
+        *,
+        instance: WindowInstanceToken | None,
+        fresh_capture: bool,
+    ) -> bool:
+        """Keep consumed phases closed until a fresh phase/state is proven."""
+        entries = self._one_shot_action_ledger.get(fingerprint)
+        if not entries:
+            self._one_shot_phase_confirmations.pop(fingerprint, None)
+            return False
+        if instance is None:
+            self._one_shot_phase_confirmations.pop(fingerprint, None)
+            return True
+        if any(entry.instance != instance for entry in entries.values()):
+            self._one_shot_action_ledger.pop(fingerprint, None)
+            self._one_shot_phase_confirmations.pop(fingerprint, None)
+            return False
+
+        phase = self._one_shot_action_phase(item)
+        signature = self._action_signature(item)
+        action_key = (
+            self._one_shot_action_key(phase, item)
+            if phase is not None
+            else None
+        )
+        same_phase_entries = tuple(
+            entry
+            for entry in entries.values()
+            if entry.state is item.state and entry.phase == phase
+        )
+        if same_phase_entries:
+            if phase != "line_scroll" or action_key in entries:
+                self._one_shot_phase_confirmations.pop(fingerprint, None)
+                return True
+
+        if not self._one_shot_known_frame(
+            item,
+            fresh_capture=fresh_capture,
+        ):
+            self._one_shot_phase_confirmations.pop(fingerprint, None)
+            return True
+
+        previous = self._one_shot_phase_confirmations.get(fingerprint)
+        count = (
+            previous.consecutive_frames + 1
+            if (
+                previous is not None
+                and previous.instance == instance
+                and previous.state is item.state
+                and previous.phase == phase
+                and previous.signature == signature
+            )
+            else 1
+        )
+        if count < ACTION_CONFIRMATION_FRAMES:
+            self._one_shot_phase_confirmations[fingerprint] = (
+                _OneShotPhaseConfirmation(
+                    instance=instance,
+                    state=item.state,
+                    phase=phase,
+                    signature=signature,
+                    consecutive_frames=count,
+                )
+            )
+            # The ordinary action confirmation gate owns the first two
+            # frames of a new phase.  This ledger only blocks an already
+            # consumed phase; it must not add a second delay to transitions
+            # such as line-scroll -> line-select or slot -> enter.
+            return False
+
+        # A stable new phase is enough to advance within one page (scroll to
+        # final line, or slot selection to enter), while a stable new state
+        # ends the old page epoch and releases all of its phases.
+        if phase is None or not any(
+            entry.state is item.state for entry in entries.values()
+        ):
+            entries = {
+                entry_phase: entry
+                for entry_phase, entry in entries.items()
+                if entry.state is item.state
+            }
+            if entries:
+                self._one_shot_action_ledger[fingerprint] = entries
+            else:
+                self._one_shot_action_ledger.pop(fingerprint, None)
+        self._one_shot_phase_confirmations.pop(fingerprint, None)
+        return False
+
+    def _record_one_shot_action(
+        self,
+        fingerprint: str,
+        item: ScreenRecognition,
+        instance: WindowInstanceToken,
+        signature: tuple[object, ...],
+        outcome: str,
+    ) -> None:
+        phase = self._one_shot_action_phase(item)
+        if phase is None:
+            return
+        entries = self._one_shot_action_ledger.setdefault(fingerprint, {})
+        entries[self._one_shot_action_key(phase, item)] = _OneShotActionLedger(
+            instance=instance,
+            state=item.state,
+            phase=phase,
+            signature=signature,
+            outcome=outcome,
+        )
+        self._one_shot_phase_confirmations.pop(fingerprint, None)
+
+    def _retain_one_shot_actions_for_activation_snapshot(self) -> None:
+        """Rebind consumed phases only to the same complete live instance."""
+
+        snapshot = self._activation_snapshot_instances or {}
+        previous = self._one_shot_action_ledger
+        retained: dict[str, dict[str, _OneShotActionLedger]] = {}
+        for monitor_fingerprint, instance in snapshot.items():
+            entries = {
+                action_key: entry
+                for prior_entries in previous.values()
+                for action_key, entry in prior_entries.items()
+                if entry.instance == instance
+            }
+            if entries:
+                retained[monitor_fingerprint] = entries
+        self._one_shot_action_ledger = retained
+        # A partial unconsumed phase confirmation is not authority.  Only
+        # delivered/uncertain phases survive an activation refresh.
+        self._one_shot_phase_confirmations.clear()
+
     def _clear_reconnect_session(self, fingerprint: str) -> None:
         """Revoke every permission granted by a completed reconnect flow."""
         self._pending_reconnect_fingerprints.discard(fingerprint)
         self._pending_reopen_fingerprints.discard(fingerprint)
+        self._pending_reopen_entry_ids.pop(fingerprint, None)
         self._active_automation_fingerprints.discard(fingerprint)
         self._active_automation_until.pop(fingerprint, None)
         self._action_retry_after.pop(fingerprint, None)
@@ -8133,6 +8367,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 self._login_only_recovery_fingerprints.discard(normalized)
                 self._pending_reconnect_fingerprints.discard(normalized)
                 self._pending_reopen_fingerprints.discard(normalized)
+                self._pending_reopen_entry_ids.pop(normalized, None)
                 self._active_automation_fingerprints.discard(normalized)
                 self._active_automation_until.pop(normalized, None)
                 self._reopen_retry_after.pop(normalized, None)
@@ -8342,6 +8577,7 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
         )
         self._pending_reopen_fingerprints.difference_update(appeared)
         for fingerprint in appeared:
+            self._pending_reopen_entry_ids.pop(fingerprint, None)
             self._reopen_retry_after.pop(fingerprint, None)
 
         missing = tuple(sorted(self._pending_reopen_fingerprints))
@@ -9362,6 +9598,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                     )
                 )
             )
+            one_shot_action_blocked = bool(
+                not tcp_action
+                and fingerprint in self._one_shot_action_ledger
+                and self._one_shot_action_is_blocked(
+                    fingerprint,
+                    recognition,
+                    instance=instance,
+                    fresh_capture=fresh_capture,
+                )
+            )
+            if one_shot_action_blocked:
+                visual_action_candidate = False
             is_action_candidate = tcp_action or visual_action_candidate
             action_evidence_complete = (
                 not mutation_veto
@@ -10217,6 +10465,15 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                             fingerprint
                         )
                         self._pending_reopen_fingerprints.add(fingerprint)
+                        if tcp_entry is not None:
+                            self._pending_reopen_entry_ids[fingerprint] = (
+                                tcp_entry[0]
+                            )
+                        else:
+                            self._pending_reopen_entry_ids.pop(
+                                fingerprint,
+                                None,
+                            )
                         self._reopen_retry_after[fingerprint] = (
                             mutation_completed_at
                             + self._policy.progress_interval_seconds
@@ -10228,6 +10485,10 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 if tcp_entry is not None:
                     tcp_restart_progressed = True
                 self._pending_reopen_fingerprints.add(fingerprint)
+                if tcp_entry is not None:
+                    self._pending_reopen_entry_ids[fingerprint] = tcp_entry[0]
+                else:
+                    self._pending_reopen_entry_ids.pop(fingerprint, None)
                 reopen_retry_after = (
                     mutation_completed_at
                     + self._policy.progress_interval_seconds
@@ -10571,6 +10832,18 @@ class WindowsSmartReconnectController(SmartReconnectBoundary):
                 if click_result.delivery_uncertain:
                     self._clear_action_confirmation(fingerprint)
                     failures.append("click_delivery_uncertain")
+                if click_result.delivered or click_result.delivery_uncertain:
+                    self._record_one_shot_action(
+                        fingerprint,
+                        item,
+                        confirmed_instance,
+                        confirmation.signature,
+                        (
+                            "uncertain"
+                            if click_result.delivery_uncertain
+                            else "delivered"
+                        ),
+                    )
                 authority_is_current = self._capture_authority_is_current(
                     capture_settings_revision,
                     initial_capture_route,

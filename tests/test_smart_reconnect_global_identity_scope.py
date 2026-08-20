@@ -1,4 +1,6 @@
 import hashlib
+import threading
+from pathlib import Path
 
 import pytest
 
@@ -541,7 +543,16 @@ def test_mixed_manual_scope_temporarily_uses_visual_recovery_without_losing_tcp_
     assert controller._tcp_counts is tcp_provider
 
 
-def test_minimized_login_can_reach_mouse_backend_through_recovering_route():
+def test_production_factory_fails_closed_for_minimized_windows():
+    controller = WindowsSmartReconnectController.for_real_windows(
+        reference_dir=Path("assets") / "reconnect_reference",
+        expected_windows=1,
+    )
+
+    assert controller._minimized_refresh_capture_provider is None
+
+
+def test_minimized_login_never_reaches_mouse_backend_through_recovering_route():
     fingerprint = "c" * 64
     window = _window(3, fingerprint, minimized=True)
     refresh = MarkerCapture({window.handle: 3})
@@ -558,11 +569,11 @@ def test_minimized_login_can_reach_mouse_backend_through_recovering_route():
 
     assert prepared.success is True
     assert first.details["clicked_windows"] == 0
-    assert second.details["clicked_windows"] == 1
+    assert second.details["clicked_windows"] == 0
     assert len(refresh.calls) >= 2
     assert set(refresh.calls) == {window.handle}
     assert primary.calls == []
-    assert [handle for handle, _point in mouse.clicks] == [window.handle]
+    assert mouse.clicks == []
 
 
 def test_minimized_activation_uses_dedicated_refresh_provider_without_wgc_access():
@@ -587,6 +598,162 @@ def test_minimized_activation_uses_dedicated_refresh_provider_without_wgc_access
     assert primary.calls == []
     assert result.details["connected_windows"] == 1
     assert mouse.clicks == []
+
+
+def test_obscured_capture_permission_denial_does_not_block_safe_snapshot(
+    tmp_path,
+):
+    fingerprint = "a" * 64
+    window = _window(7, fingerprint)
+    target = GroupLaunchTarget(
+        1,
+        "遮蔽角色",
+        _shortcut(tmp_path, "遮蔽角色"),
+        fingerprint,
+        entry_id="entry-7",
+    )
+    resolved = ResolvedTargetWindows(
+        windows=(window,),
+        sync_windows=(window,),
+        sync_entry_ids=("entry-7",),
+        sync_scope_entry_ids=("entry-7",),
+    )
+    tcp_provider = lambda process_ids: {
+        process_id: 1 for process_id in process_ids
+    }
+    controller, backend, primary, mouse = _controller(
+        (window,),
+        {window.handle: 1},
+        target_windows_provider=lambda: resolved,
+        capture_access_preparer=lambda: False,
+        tcp_connection_count_provider=tcp_provider,
+    )
+    controller.set_group_launch_plan(GroupLaunchPlan("configured", (target,)))
+    backend.obscured = True
+    controller._primary_capture_is_trusted = False
+
+    prepared = controller.prepare_execution_snapshot()
+    controller.set_execution_enabled(True)
+    result = controller.reconnect()
+
+    assert prepared.success is True
+    assert prepared.details["window_count"] == 1
+    assert result.details["unknown_windows"] == 1
+    assert result.details["clicked_windows"] == 0
+    assert result.details["tcp_observation"]["query_succeeded"] is True
+    assert primary.calls == []
+    assert mouse.clicks == []
+
+
+def test_rejected_step_scoped_prepare_preserves_existing_activation_state(
+    tmp_path,
+):
+    fingerprint = "9" * 64
+    window = _window(9, fingerprint)
+    shortcut = _shortcut(tmp_path, "既有手動角色")
+    controller, _backend, _capture, _mouse = _controller(
+        (window,),
+        {window.handle: 1},
+        manual_shortcut_resolver=(
+            lambda requested: shortcut if requested == fingerprint else None
+        ),
+    )
+    controller.set_group_launch_plan(GroupLaunchPlan("configured", ()))
+    assert controller.prepare_execution_snapshot().success is True
+    controller.set_execution_enabled(True)
+    original_state = (
+        controller._group_launch_plan,
+        controller._manual_runtime_plan_installed,
+        dict(controller._manual_reopen_targets),
+        controller._manual_live_fingerprints,
+        controller._step_scoped_activation_ready,
+        controller._obscured_capture_access_ready,
+        controller._capture_access_preparer,
+        controller._tcp_v,
+    )
+
+    rejected = controller.prepare_execution_snapshot()
+
+    assert rejected.code == "reconnect.snapshot_execution_open"
+    assert (
+        controller._group_launch_plan,
+        controller._manual_runtime_plan_installed,
+        dict(controller._manual_reopen_targets),
+        controller._manual_live_fingerprints,
+        controller._step_scoped_activation_ready,
+        controller._obscured_capture_access_ready,
+        controller._capture_access_preparer,
+        controller._tcp_v,
+    ) == original_state
+
+
+def test_step_scoped_prepare_waits_for_active_scan_before_any_state_change():
+    fingerprint = "8" * 64
+    window = _window(8, fingerprint)
+    provider_called = threading.Event()
+    prepare_started = threading.Event()
+
+    def provider():
+        provider_called.set()
+        return ResolvedTargetWindows(
+            windows=(window,),
+            sync_windows=(window,),
+            sync_entry_ids=("entry-8",),
+            sync_scope_entry_ids=("entry-8",),
+        )
+
+    controller, _backend, _capture, _mouse = _controller(
+        (window,),
+        {window.handle: 1},
+        target_windows_provider=provider,
+    )
+    target = GroupLaunchTarget(
+        1,
+        "角色8",
+        Path("角色8.lnk"),
+        fingerprint,
+        entry_id="entry-8",
+        role_id="role-8",
+    )
+    controller.set_group_launch_plan(GroupLaunchPlan("configured", (target,)))
+    provider_called.clear()
+    controller._step_scoped_activation_ready = True
+    initial_state = (
+        controller._group_launch_plan,
+        controller._manual_runtime_plan_installed,
+        dict(controller._manual_reopen_targets),
+        controller._manual_live_fingerprints,
+        controller._step_scoped_activation_ready,
+        controller._obscured_capture_access_ready,
+        controller._capture_access_preparer,
+        controller._tcp_v,
+    )
+    result = []
+
+    def prepare():
+        prepare_started.set()
+        result.append(controller.prepare_execution_snapshot())
+
+    with controller._scan_lock:
+        worker = threading.Thread(target=prepare)
+        worker.start()
+        assert prepare_started.wait(1.0) is True
+        assert provider_called.wait(0.2) is False
+        assert (
+            controller._group_launch_plan,
+            controller._manual_runtime_plan_installed,
+            dict(controller._manual_reopen_targets),
+            controller._manual_live_fingerprints,
+            controller._step_scoped_activation_ready,
+            controller._obscured_capture_access_ready,
+            controller._capture_access_preparer,
+            controller._tcp_v,
+        ) == initial_state
+    worker.join(2.0)
+
+    assert worker.is_alive() is False
+    assert result and result[0].success is True
+    assert provider_called.is_set() is True
 
 
 def test_production_scope_wording_never_requires_manual_window_to_join_current_group():
