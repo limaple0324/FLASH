@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-v88-installed-hash-20260823-0741",
+  "action": "installed_fu_hash",
+  "bridge_pid": 11196,
+  "started_at_unix": 1787442599.3602717,
+  "ok": true,
+  "finished_at_unix": 1787442599.5876348,
+  "result": {
+    "path": "C:\\Users\\USER\\AppData\\Local\\Programs\\輔\\完整累積版\\FLASH.exe",
+    "sha256": "759EF61CB3D3EA7333EA274E416151543B0D5A37FCEC3F5A40919671425571E0",
+    "size": 194035556
+  }
+}
