@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-v88-process-snapshot-20260823-0742",
+  "action": "process_snapshot",
+  "bridge_pid": 11196,
+  "started_at_unix": 1787442638.5451732,
+  "ok": true,
+  "finished_at_unix": 1787442638.8577785,
+  "result": {
+    "supported": true,
+    "processes": []
+  }
+}
