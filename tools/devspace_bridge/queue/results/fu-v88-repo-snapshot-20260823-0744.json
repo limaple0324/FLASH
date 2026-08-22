@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-v88-repo-snapshot-20260823-0744",
+  "action": "repo_snapshot",
+  "bridge_pid": 11196,
+  "started_at_unix": 1787442750.1878388,
+  "ok": false,
+  "finished_at_unix": 1787442750.1878388,
+  "error": "此動作必須指定完整 40 碼 target_commit",
+  "error_type": "BridgeError",
+  "traceback": "Traceback (most recent call last):\n  File \"C:\\Users\\USER\\AppData\\Local\\DevspaceBridge\\FLASH-bridge\\tools\\devspace_bridge\\bridge.py\", line 216, in execute\n    payload = getattr(self, f\"_action_{action}\")(task, task_id)\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\USER\\AppData\\Local\\DevspaceBridge\\FLASH-bridge\\tools\\devspace_bridge\\bridge.py\", line 225, in _action_repo_snapshot\n    commit = self._exact_commit(task)\n             ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\USER\\AppData\\Local\\DevspaceBridge\\FLASH-bridge\\tools\\devspace_bridge\\bridge.py\", line 192, in _exact_commit\n    raise BridgeError(\"此動作必須指定完整 40 碼 target_commit\")\nbridge.BridgeError: 此動作必須指定完整 40 碼 target_commit\n"
+}
