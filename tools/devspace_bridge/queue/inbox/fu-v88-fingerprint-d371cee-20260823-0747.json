@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-v88-fingerprint-d371cee-20260823-0747",
+  "action": "build_candidate",
+  "target_commit": "d371cee2333dbe9c49aff4f0a48c933d74b69207",
+  "args": {"timeout_seconds": 1800}
+}
