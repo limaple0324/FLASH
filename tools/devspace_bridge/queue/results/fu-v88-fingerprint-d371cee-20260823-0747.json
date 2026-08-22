@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "task_id": "fu-v88-fingerprint-d371cee-20260823-0747",
+  "action": "build_candidate",
+  "bridge_pid": 11196,
+  "started_at_unix": 1787442778.1226654,
+  "ok": true,
+  "finished_at_unix": 1787442868.2393477,
+  "result": {
+    "commit": "d371cee2333dbe9c49aff4f0a48c933d74b69207",
+    "returncode": 0,
+    "built": true,
+    "candidate_path": "C:\\Users\\USER\\AppData\\Local\\輔\\Devspace\\runs\\fu-v88-fingerprint-d371cee-20260823-0747\\candidate\\FLASH.exe",
+    "sha256": "4E2D85FAF9BD1AF69972C5EF23E05AE270604DE836C509386BCB3D8BEEDD0A32",
+    "stdout": "{\"source_digest\": \"1957b6609e5812db5798cf6600becca01df7b5788c51f54f71378a360f6a4924\", \"output_path\": \"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\��\\\\Devspace\\\\runs\\\\fu-v88-fingerprint-d371cee-20260823-0747\\\\candidate\\\\FLASH.exe\", \"cache_hit\": false}\n",
+    "stderr": ""
+  }
+}
