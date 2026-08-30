@@ -103,10 +103,10 @@ def main() -> int:
         errors.append("V0.2 APP_DISPLAY_NAME is not 輔魔.")
     if string_assignment(v02_tree, "APP_VERSION_CODE") != "v0.2":
         errors.append("V0.2 APP_VERSION_CODE is not v0.2.")
-    if string_assignment(v02_tree, "APP_DATA_DIR_NAME") != "輔V0.2":
-        errors.append("V0.2 APP_DATA_DIR_NAME is not 輔V0.2.")
-    if string_assignment(v02_tree, "APP_OUTPUT_CONFIG_BACKUP_FILENAME") != "sync_launch_config_v02.json":
-        errors.append("V0.2 backup filename is not sync_launch_config_v02.json.")
+    if string_assignment(v02_tree, "APP_DATA_DIR_NAME") != "輔V0.2_自動重連獨立版":
+        errors.append("V0.2 APP_DATA_DIR_NAME does not match the current standalone product identity.")
+    if string_assignment(v02_tree, "APP_OUTPUT_CONFIG_BACKUP_FILENAME") != "sync_launch_config_reconnect_standalone_backup.json":
+        errors.append("V0.2 backup filename does not match the current standalone product identity.")
 
     if V01_SOURCE.exists():
         v01_tree = parse_source(V01_SOURCE)

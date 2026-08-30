@@ -28,7 +28,7 @@ class SourceToken:
     identity: SourceIdentity | None
 
 
-def enumerate_source_windows(user, callback_type, is_flash_window, cancel):
+def enumerate_source_windows(user, callback_type, is_flash_window, cancel, approved=None):
     """Checked, background-only enumeration, without changing the manual API."""
     windows, errors = [], []
 
@@ -37,7 +37,8 @@ def enumerate_source_windows(user, callback_type, is_flash_window, cancel):
             return False
         try:
             hwnd = int(hwnd)
-            if user.IsWindow(hwnd) and user.IsWindowVisible(hwnd) and is_flash_window(hwnd):
+            if (user.IsWindow(hwnd) and user.IsWindowVisible(hwnd) and is_flash_window(hwnd)
+                    and approved is not None and approved(hwnd)):
                 windows.append(hwnd)
         except Exception:
             # Exceptions must not escape a ctypes callback and turn a partial

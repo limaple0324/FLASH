@@ -46,19 +46,19 @@ class FixedSizeAndToolbarTests(unittest.TestCase):
     def test_restore_client_size_is_always_900_by_572(self):
         self.assertEqual(Harness().window_size_values(), (900, 572))
 
-    def test_toolbar_uses_short_time_and_clockbar_keeps_full_time(self):
+    def test_toolbar_and_clockbar_keep_the_same_faithful_grouped_value(self):
         app = Harness()
         app.game_time_text = Value("")
         app.clock_bar = MagicMock()
         app.estimated_game_time_text = lambda: "12:08:59.329"
         app.estimated_game_time_ms = lambda: ((12 * 60 + 8) * 60 + 59) * 1000 + 329
         app.update_estimated_game_time_label()
-        self.assertEqual(app.game_time_text.get(), "08:59:329")
+        self.assertEqual(app.game_time_text.get(), "12:08:59.329")
         app.clock_bar.update.assert_called_once_with("12:08:59.329")
         app.estimated_game_time_text = lambda: None
         app.estimated_game_time_ms = lambda: None
         app.update_estimated_game_time_label()
-        self.assertEqual(app.game_time_text.get(), "尚未校正")
+        self.assertEqual(app.game_time_text.get(), "尚未讀取")
 
 
 class ShutdownLifecycleTests(unittest.TestCase):
@@ -82,6 +82,7 @@ class ShutdownLifecycleTests(unittest.TestCase):
         app.closing_app = True
         app.game_time_text = Value("")
         app.estimated_game_time_ms = MagicMock(return_value=1_000)
+        app.estimated_game_time_text = MagicMock(return_value="00:00:01.000")
         app.clock_bar = MagicMock()
         app.update_estimated_game_time_label()
         app.estimated_game_time_ms.assert_not_called()
@@ -186,19 +187,19 @@ class TimedClickTests(unittest.TestCase):
 
     def test_first_click_cannot_trigger_before_target_and_triggers_at_target(self):
         app = self.make_app()
-        app.estimated_game_time_ms = lambda: 539_328
+        app.timed_action_game_time_ms = lambda: 539_328
         app.poll_timed_click()
         app.fire_timed_click.assert_not_called()
         app.schedule_timed_click_poll.assert_called_once()
         app.schedule_timed_click_poll.reset_mock()
-        app.estimated_game_time_ms = lambda: 539_329
+        app.timed_action_game_time_ms = lambda: 539_329
         app.poll_timed_click()
         app.fire_timed_click.assert_called_once_with(539_329, 539_329)
         app.schedule_timed_click_poll.assert_not_called()
 
     def test_invalid_clock_disarms_current_schedule_without_click_or_retry(self):
         app = self.make_app()
-        app.estimated_game_time_ms = lambda: None
+        app.timed_action_game_time_ms = lambda: None
         app.poll_timed_click()
         self.assertFalse(app.timed_click_enabled.get())
         app.fire_timed_click.assert_not_called()

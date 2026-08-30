@@ -34,9 +34,10 @@ from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 from ctypes import wintypes
 
 from v02_game_clock import GameClock
-from v02_game_clock_reader import GameClockReader
+from v02_game_clock_reader import GameClockReader, NativeSource
 from v02_game_clock_source import AutoClockSource, enumerate_source_windows
 from v02_game_clock_bar import ClockBar
+from v02_faithful_game_time import ApprovedShortcutCatalog, MultiGameClockSource
 from v02_wheel_hook import get_process_wheel_hook_service
 from fu_reconnect_integration import EmbeddedAutomationController, LeaseBusy
 from manor_assistant.models import CROP_OPTIONS
@@ -313,6 +314,7 @@ MODULE_API_METHOD_INDEX_V02: dict[str, tuple[str, ...]] = {
         "game_time_hwnd",
         "estimated_game_time_text",
         "estimated_game_time_ms",
+        "timed_action_game_time_ms",
         "update_estimated_game_time_label",
         "read_selected_game_time",
         "create_floating_status_window",
@@ -7139,11 +7141,27 @@ class FlashSyncApp(tk.Tk):
 
     def init_game_clock(self) -> None:
         self.game_clock = GameClock()
-        self.game_clock_reader = GameClockReader()
-        self.game_clock_source = AutoClockSource(
-            self.game_clock, self.game_clock_reader,
-            lambda cancel: enumerate_source_windows(user32, EnumWindowsProc, is_flash_window, cancel),
+        self.game_clock_native = NativeSource()
+        self.game_clock_catalog = ApprovedShortcutCatalog(self.game_clock_native.argument_fingerprint)
+
+        def discover(cancel):
+            bindings = {item.argument_fingerprint: item.label
+                        for item in self.game_clock_catalog.bindings()}
+            identities = {}
+            def approved(hwnd):
+                identity = self.game_clock_native.identity(hwnd)
+                identities[hwnd] = identity
+                return identity.launch_fingerprint in bindings
+            hwnds = enumerate_source_windows(
+                user32, EnumWindowsProc, is_flash_window, cancel, approved=approved,
+            )
+            return tuple((bindings[identities[hwnd].launch_fingerprint], identities[hwnd])
+                         for hwnd in hwnds)
+
+        self.game_clock_source = MultiGameClockSource(
+            lambda: GameClockReader(native=self.game_clock_native), discover,
         )
+        self.game_clock_reader = None
 
     def invalidate_game_clock_source(self, *_args, force=False, reason="來源已改變") -> None:
         # UI group/selection changes no longer select or cancel the clock source.
@@ -7544,24 +7562,20 @@ class FlashSyncApp(tk.Tk):
         return f"{hour:02d}:{minute:02d}:{second:02d}.{milli:03d}"
 
     def estimated_game_time_text(self) -> str | None:
-        return self.game_clock.text()
+        return self.game_clock_source.display.text()
 
     def estimated_game_time_ms(self) -> int | None:
-        return self.game_clock.time_of_day_ms()
+        return self.game_clock_source.exact_time_of_day_ms()
+
+    def timed_action_game_time_ms(self) -> int | None:
+        return self.game_clock_source.timed_action_time_of_day_ms()
 
     def update_estimated_game_time_label(self) -> None:
         if getattr(self, "closing_app", False):
             return
         estimated_ms = self.estimated_game_time_ms()
-        if estimated_ms is not None:
-            minute = (estimated_ms // 60000) % 60
-            second = (estimated_ms // 1000) % 60
-            milli = estimated_ms % 1000
-            self.game_time_text.set(f"{minute:02d}:{second:02d}:{milli:03d}")
-            estimated = self.game_time_ms_to_text(estimated_ms)
-        else:
-            self.game_time_text.set("尚未校正")
-            estimated = None
+        estimated = self.estimated_game_time_text()
+        self.game_time_text.set(estimated or "尚未讀取")
         clock_bar = self.clock_bar
         if clock_bar is not None and getattr(clock_bar, "_destroyed", False) is not True:
             clock_bar.update(estimated)
@@ -7572,7 +7586,7 @@ class FlashSyncApp(tk.Tk):
                 self.after_cancel(self.game_time_tick_after_id)
             except Exception:
                 pass
-        self.game_time_tick_after_id = self.after(33, self.poll_game_time_tick)
+        self.game_time_tick_after_id = self.after(250, self.poll_game_time_tick)
 
     def poll_game_time_tick(self) -> None:
         self.game_time_tick_after_id = None
@@ -7770,7 +7784,7 @@ class FlashSyncApp(tk.Tk):
             self.write_log(f"定時按下未啟用：{failure}。")
             messagebox.showwarning("按鈕位置不可用", failure)
             return
-        if self.estimated_game_time_ms() is None:
+        if self.timed_action_game_time_ms() is None:
             self.timed_click_enabled.set(False)
             self.timed_click_status_text.set("定時按下：時鐘無效，已解除")
             messagebox.showwarning("缺少遊戲時間", "目前遊戲時鐘尚未校正，這次定時不會執行。")
@@ -7804,7 +7818,7 @@ class FlashSyncApp(tk.Tk):
         self.timed_click_after_id = None
         if not self.timed_click_enabled.get() or self.timed_click_fired:
             return
-        now_ms = self.estimated_game_time_ms()
+        now_ms = self.timed_action_game_time_ms()
         target_ms = self.parse_target_time_ms(self.timed_click_target_text.get())
         if now_ms is None:
             self.timed_click_enabled.set(False)
@@ -9539,7 +9553,10 @@ def main() -> int:
             checks["ocr"] = bool(_cv2.__version__ and _np.__version__ and _rapidocr)
             checks["assets"] = all(
                 os.path.exists(app_resource_path(name))
-                for name in ("assets", "manor_assets", "fishing_evidence", "roles", "templates", "sync_plus_icon.ico")
+                for name in (
+                    "assets", "manor_assets", "fishing_evidence", "templates",
+                    "sync_plus_icon.ico", "role_id_templates.json", "sync_launch_config.json",
+                )
             )
             checks["physical_forbidden"] = not bool(_sr.FOREGROUND_PHYSICAL_FALLBACK)
             ok = all(bool(value) for value in checks.values())

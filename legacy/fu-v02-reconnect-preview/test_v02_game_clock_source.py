@@ -87,18 +87,19 @@ class EnumerationTests(unittest.TestCase):
         user = MagicMock()
         user.EnumWindows.return_value = 1
         cancel = threading.Event()
-        self.assertEqual(enumerate_source_windows(user, lambda f: f, lambda _: True, cancel), ())
+        self.assertEqual(enumerate_source_windows(user, lambda f: f, lambda _: True, cancel,
+                                                  approved=lambda _: True), ())
         user.EnumWindows.return_value = 0
         with self.assertRaisesRegex(AcquisitionError, "列舉失敗"):
-            enumerate_source_windows(user, lambda f: f, lambda _: True, cancel)
+            enumerate_source_windows(user, lambda f: f, lambda _: True, cancel, approved=lambda _: True)
         user.EnumWindows.side_effect = lambda callback, _: callback(11, 0)
         def bad(_hwnd):
             raise OSError("private path must not escape")
         with self.assertRaisesRegex(AcquisitionError, "列舉失敗"):
-            enumerate_source_windows(user, lambda f: f, bad, cancel)
+            enumerate_source_windows(user, lambda f: f, bad, cancel, approved=lambda _: True)
         cancel.set()
         with self.assertRaisesRegex(AcquisitionError, "取消"):
-            enumerate_source_windows(user, lambda f: f, lambda _: True, cancel)
+            enumerate_source_windows(user, lambda f: f, lambda _: True, cancel, approved=lambda _: True)
 
     def test_only_open_visible_flash_and_hwnd_dedup(self):
         user = MagicMock()
@@ -109,8 +110,16 @@ class EnumerationTests(unittest.TestCase):
                 self.assertTrue(callback(hwnd, 0))
             return 1
         user.EnumWindows.side_effect = enum
-        found = enumerate_source_windows(user, lambda f: f, lambda hwnd: hwnd != 2, threading.Event())
+        found = enumerate_source_windows(user, lambda f: f, lambda hwnd: hwnd != 2,
+                                         threading.Event(), approved=lambda _: True)
         self.assertEqual(found, (1,))
+
+    def test_no_approved_selector_fails_closed(self):
+        user = MagicMock()
+        user.EnumWindows.side_effect = lambda callback, _: callback(11, 0) or 1
+        user.IsWindow.return_value = user.IsWindowVisible.return_value = True
+        self.assertEqual(enumerate_source_windows(user, lambda f: f, lambda _: True,
+                                                  threading.Event()), ())
 
 
 class AutoSourceTests(unittest.TestCase):

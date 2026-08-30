@@ -314,7 +314,9 @@ class IconContractTests(unittest.TestCase):
         self.assertIn('(str(root / "sync_plus_icon.ico"), ".")', spec)
         self.assertIn('(str(root / "sync_plus_icon.png"), ".")', spec)
         self.assertIn('icon=str(root / "sync_plus_icon.ico")', spec)
-        self.assertIn('name="輔V0.2_自動重連獨立版_v2.1"', spec)
+        self.assertIn('name="輔V0.2_遊戲時間忠實模式_候選版"', spec)
+        self.assertNotIn('roles', spec)
+        self.assertIn('"v02_faithful_game_time"', spec)
 
 
 if __name__ == "__main__":

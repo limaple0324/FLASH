@@ -39,6 +39,6 @@
   "execution": "Codex desktop app",
   "paid_api": "forbidden",
   "github_validation": "required",
-  "status": "IN_PROGRESS",
-  "next_role": "implementation"
+  "status": "IMPLEMENTED",
+  "next_role": "github_validation"
 }

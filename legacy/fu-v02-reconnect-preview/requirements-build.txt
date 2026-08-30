@@ -1,0 +1,16 @@
+PyInstaller==6.22.2
+pywin32==312
+pystray==0.19.5
+Pillow==12.3.0
+numpy==2.2.6
+opencv-python==5.0.0.93
+onnxruntime==1.29.0
+rapidocr-onnxruntime==1.4.4
+PyYAML==6.0.3
+Shapely==2.1.2
+flatbuffers==25.12.19
+protobuf==7.36.0
+pyclipper==1.4.0
+tqdm==4.70.0
+colorama==0.4.6
+six==1.17.0

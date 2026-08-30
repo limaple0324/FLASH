@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "runtime": {
+    "python": "3.12.10",
+    "tcl_tk": "8.6.15",
+    "python_exe_sha256": "4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a",
+    "installer_sha256": "67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb",
+    "installer_signature": "Valid: Python Software Foundation"
+  },
+  "build": {
+    "command": "<work-build-venv>/python -m PyInstaller --noconfirm --clean --distpath <approved-output> --workpath .build-candidate fu_preview.spec",
+    "dependencies": "requirements-build.txt",
+    "candidate": "輔V0.2_遊戲時間忠實模式_候選版.exe",
+    "bytes": 116281322,
+    "sha256": "cce8efeceaa17d5559ac124939ed7729e2428720cf24d60f39a77d2ab87ee307",
+    "authenticode": "NotSigned"
+  },
+  "old_artifacts_unchanged": {
+    "v2_sha256": "f771296fbb74664c3f5d7afd482e8227b70873842f6ef33b3c5e7472cc526ff7",
+    "v2_1_sha256": "9d04131a6a968647021586f67f9e6de090e5ce1116b2fed6dcc515009472c209"
+  },
+  "self_tests": {
+    "source": {"ok": true, "tk": "8.6.15", "native": true, "ocr": true, "assets": true, "physical_forbidden": true},
+    "packaged": {"ok": true, "tk": "8.6.15", "native": true, "ocr": true, "assets": true, "physical_forbidden": true}
+  },
+  "regression": {
+    "top_level": {"run": 227, "passed": 218, "skipped": 9, "failed": 0},
+    "manor": {"run": 59, "passed": 59, "skipped": 0, "failed": 0},
+    "skip_reason": "Historical outputs paths are intentionally absent from the sanitized source closure."
+  },
+  "performance_contract": {
+    "expensive_discovery_hz_max": 0.2,
+    "steady_reads_hz_max_per_source": 4,
+    "ui_publish_hz_max": 4,
+    "unchanged_redraws": 0,
+    "consensus_samples": 3
+  }
+}

@@ -28,7 +28,7 @@ TRAIT_PROFILES = (
     (4_895_474, 1414, "50EC30EFAF03ECF198297E6EB0CBABFEE31EC7EA85E524A13862E33AAC4F2C0C", "Object"),
 )
 IDENTITY_CHECK_NS = 1_000_000_000
-OBSERVATION_SLEEP_SECONDS = 0.001
+OBSERVATION_SLEEP_SECONDS = 0.25
 
 
 class AcquisitionError(Exception):
@@ -98,8 +98,29 @@ class NativeSource:
         offset = int(header.Buffer or 0) - base
         if not (0 <= offset < len(buffer) and 0 < header.Length <= len(buffer) - offset):
             raise AcquisitionError("來源啟動指紋格式不符")
-        # Hash in memory only. Never return/persist/display the command line.
-        return hmac.new(self.secret, buffer.raw[offset:offset + header.Length], hashlib.sha256).hexdigest()
+        try:
+            command_line = buffer.raw[offset:offset + header.Length].decode("utf-16-le")
+        except UnicodeDecodeError:
+            raise AcquisitionError("來源啟動指紋格式不符") from None
+        return self.argument_fingerprint(command_line, includes_executable=True)
+
+    def argument_fingerprint(self, text, *, includes_executable=False):
+        """Session-only HMAC of parsed arguments; raw arguments never escape."""
+        shell = ctypes.WinDLL("shell32", use_last_error=True)
+        local_free = ctypes.WinDLL("kernel32", use_last_error=True).LocalFree
+        argc = ctypes.c_int()
+        command_line = text if includes_executable else 'placeholder.exe ' + text
+        shell.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+        argv = shell.CommandLineToArgvW(command_line, ctypes.byref(argc))
+        if not argv:
+            raise AcquisitionError("來源啟動指紋格式不符")
+        try:
+            values = [argv[index] for index in range(argc.value)]
+        finally:
+            local_free(argv)
+        arguments = values[1:]
+        payload = "\0".join(arguments).encode("utf-8", "surrogatepass")
+        return hmac.new(self.secret, payload, hashlib.sha256).hexdigest()
 
     def identity(self, hwnd):
         pid = wintypes.DWORD()
@@ -232,23 +253,21 @@ class EdgeTracker:
                            PROFILE_ID, residual, (self.last_quality,))
 
 
-def validate_values(raw, start, offset, lag, wall_ms, *, allow_pending_request=False):
+def validate_values(raw, start, offset, lag, _legacy_wall_ms=None, *, allow_pending_request=False):
     # startTime is written before the response updates raw/timeLag. A bounded
     # negative relation can therefore be a pending request, never a valid anchor.
     minimum_relation = -30_000 if allow_pending_request else -10_000
-    return (all(math.isfinite(value) for value in (raw, start, offset, lag, wall_ms))
+    return (all(math.isfinite(value) for value in (raw, start, offset, lag))
             and 1_000_000_000_000 <= raw <= 2_200_000_000_000
             and 1_000_000_000_000 <= start <= 2_200_000_000_000
-            and abs(raw - wall_ms) <= 120_000 and abs(start - wall_ms) <= 120_000
             and offset == -28_800_000.0 and abs(lag) <= 86_400_000
             and minimum_relation <= raw - start - lag <= 10_000)
 
 
 class GameClockReader:
-    def __init__(self, native=None, monotonic_ns=time.perf_counter_ns, wall_ns=time.time_ns):
+    def __init__(self, native=None, monotonic_ns=time.perf_counter_ns, **_legacy):
         self.native = native or NativeSource()
         self.now = monotonic_ns
-        self.wall = wall_ns
         self._profile_cache = None
         self._progress_hook = None
         self._stream_cancel = None
@@ -357,20 +376,20 @@ class GameClockReader:
             raise AcquisitionError("取樣跨越更新或延遲過高")
         raw, start = struct.unpack("<dd", pair)
         offset, lag = struct.unpack_from("<d", core_values)[0], struct.unpack_from("<d", core_values, 16)[0]
-        if not validate_values(raw, start, offset, lag, self.wall() / 1_000_000,
+        if not validate_values(raw, start, offset, lag,
                                allow_pending_request=True):
             raise AcquisitionError("遊戲時間數值或UTC+8關係不符")
         return Observation(raw, start, lag, before, after)
 
     @staticmethod
-    def candidate_addresses(data, base, wall_ms):
+    def candidate_addresses(data, base):
         alignment = (-base) & 7
         count = (len(data) - alignment) // 8
         if count < 2:
             return
         values = array.array("d")
         values.frombytes(data[alignment:alignment + count * 8])
-        low, high = wall_ms - 120_000, wall_ms + 120_000
+        low, high = 1_000_000_000_000, 2_200_000_000_000
         for index, value in enumerate(values[:-1]):
             if low <= value <= high and low <= values[index + 1] <= high:
                 yield base + alignment + index * 8
@@ -398,7 +417,7 @@ class GameClockReader:
                     amount = min(4 * 1024 * 1024, base + size - position)
                     data = self.native.read(handle, position, amount)
                     self._read_progress()
-                    for field in self.candidate_addresses(tail + data, position - len(tail), self.wall() / 1_000_000):
+                    for field in self.candidate_addresses(tail + data, position - len(tail)):
                         if field in seen or field <= 0x410:
                             continue
                         seen.add(field)
@@ -453,36 +472,32 @@ class GameClockReader:
             progress(force=True)
             candidate = self.scan(handle, cancel)
             progress(force=True)
-            previous = self.observe(handle, candidate)
+            self.observe(handle, candidate)  # post-scan baseline; never published
             progress()
-            tracker = EdgeTracker(identity, previous)
             while not cancel.is_set():
-                # High-resolution process-local sleep, never a busy loop.
+                # Four read attempts per second at most; this is a read-only
+                # faithful snapshot stream, not a millisecond polling loop.
                 time.sleep(OBSERVATION_SLEEP_SECONDS)
                 current = self.observe(handle, candidate)
                 progress()
-                sample = tracker.feed(current)
-                if sample is None:
-                    continue
-                # Full live ABC and uniqueness validation before EVERY publication.
-                if self.scan(handle, cancel) != candidate:
-                    raise AcquisitionError("遊戲時間物件已改變")
+                # Identity/structure is checked without repeating the 2 GiB scan or
+                # 26.8 MiB ABC digest for every sample. Any failed check closes the
+                # stream; discovery must establish a fresh generation.
                 self.validate_structure(handle, candidate)
-                progress(force=True)
+                progress()
                 now = self.now()
-                if not 0 <= now - sample.anchor_ns <= SAMPLE_MAX_AGE_NS:
-                    raise AcquisitionError("校時樣本已過期")
+                sample = ClockSample(
+                    identity=identity,
+                    server_ms=current.raw_ms,
+                    anchor_ns=(current.before_ns + current.after_ns) // 2,
+                    observation_bracket_ns=current.after_ns - current.before_ns,
+                    read_latency_ns=current.after_ns - current.before_ns,
+                    transition_ms=1000.0,
+                    profile=PROFILE_ID,
+                )
                 publish(sample, "", now)
                 if cancel.is_set():
                     return
-                # A scan is an observation gap. Do not pair across it.
-                previous = self.observe(handle, candidate)
-                progress()
-                last_request = tracker.last_request
-                tracker = EdgeTracker(identity, previous)
-                # Pairing is unknowable during a scan, but the independently
-                # observed request/QPC chronology must survive across scans.
-                tracker.last_request = last_request
         finally:
             self._progress_hook = self._stream_cancel = None
             self.native.close(handle)
