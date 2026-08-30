@@ -1,6 +1,6 @@
 {
   "batch_id": "FU-BATCH-20260831-001",
-  "source_issue": 32,
+  "source_issue": null,
   "source_pull_request": null,
   "base_commit": "729b87753204d2b5a050c85b5950b9392421ed4f",
   "branch": "work/fu-batch-20260831-001-game-clock",
