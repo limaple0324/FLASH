@@ -1,0 +1,719 @@
+{
+  "schema": 1,
+  "source_label": "fu-v02-reconnect-preview",
+  "base_commit": "729b87753204d2b5a050c85b5950b9392421ed4f",
+  "included": [
+    {
+      "path": "config.json",
+      "sha256": "71fb25322e88c9cbcbcd55a23650067e86e4b2f69eedd4c4788bb4c65fd0a667",
+      "bytes": 5331
+    },
+    {
+      "path": "control_panel.py",
+      "sha256": "caddf624cd5b6c4d10e37a956b691696116386e25c765b16d5ce709c71acf277",
+      "bytes": 122344
+    },
+    {
+      "path": "dpi_policy.py",
+      "sha256": "648d4a53fd2aa67c80165dfa8d8e5f525fb0835f5234c45a6f80d5e7d05995da",
+      "bytes": 15737
+    },
+    {
+      "path": "fishing_profiles.py",
+      "sha256": "125a33b49806fa8abf1e1a0e37af04a5c48259ce9232e656d99f11b45e088197",
+      "bytes": 11542
+    },
+    {
+      "path": "flash_sync_v02.py",
+      "sha256": "45a414f6c659136a00d845e899daae114ba0482fc3735ba30ac981992794a10a",
+      "bytes": 388730
+    },
+    {
+      "path": "flash_sync.py",
+      "sha256": "c692db67fd1ac5145afbc9922ef724eabca2f1710198c8b5005e70a14655d168",
+      "bytes": 341585
+    },
+    {
+      "path": "fu_preview.spec",
+      "sha256": "c62a8be6f10ab59d47ac98771248b4f1335901f3829963f61c2a73e0f76b94b7",
+      "bytes": 1872
+    },
+    {
+      "path": "fu_reconnect_integration.py",
+      "sha256": "9aafc8deba1ad86a03093608213cec83ca88122033f01ae2936907d6caab6269",
+      "bytes": 22893
+    },
+    {
+      "path": "manor_runtime.py",
+      "sha256": "5932596d032fad520a5ba9b915c94c6e1f7b9f205676c627bd0772ba6c0c67bf",
+      "bytes": 11524
+    },
+    {
+      "path": "role_id_templates.json",
+      "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+      "bytes": 3
+    },
+    {
+      "path": "runtime_paths.py",
+      "sha256": "d01779445bebe6fc4aa693854be4309f1e77df4ee29460d1ca86433edab4698a",
+      "bytes": 4214
+    },
+    {
+      "path": "smart_reconnect.py",
+      "sha256": "765289712bb90abe0db843eb123e89cf4588b16b5e0991e27aeca7ceae81749c",
+      "bytes": 417094
+    },
+    {
+      "path": "sync_launch_config.json",
+      "sha256": "fafe1efd979e91acc84afa6e2dde1212caa8c964a9ed4d40861f961498b4e4dd",
+      "bytes": 38
+    },
+    {
+      "path": "sync_plus_icon.ico",
+      "sha256": "bee0b407e622eb87e98aa3517aacecb0f51744b8f19a2565eb3c6c7a6d91c290",
+      "bytes": 63916
+    },
+    {
+      "path": "sync_plus_icon.png",
+      "sha256": "3d29686c2dc29b382de8e17e43fc67f35f2fe1affd335137ef9cc9ded1ecad6e",
+      "bytes": 28308
+    },
+    {
+      "path": "test_flash_sync_status_window.py",
+      "sha256": "46d85dc3469cd6f1eb18b3bd098aeb034f86c6a3294838a16b30f738ccc62ccd",
+      "bytes": 44400
+    },
+    {
+      "path": "test_fu_local_20260828_003.py",
+      "sha256": "39cdde9931005413146aa638b465240f1fdffca91fc7ed4858aa485fd85b1ae4",
+      "bytes": 13440
+    },
+    {
+      "path": "test_fu_local_20260830_002.py",
+      "sha256": "f0251693235c459e1d4ea637bbe130e44a06053a850f0a7ebe9e570d0f52e2d9",
+      "bytes": 15332
+    },
+    {
+      "path": "test_fu_reconnect_integration.py",
+      "sha256": "2a5f71aff79ac0c0733b6f67c5e7272fbe4237502affdc6939bf1785e573910c",
+      "bytes": 28035
+    },
+    {
+      "path": "test_v02_branding.py",
+      "sha256": "418ef20be7c75a6c58c7e5238df835f16e9a6818b7af12e26a668a540e51eaf8",
+      "bytes": 23735
+    },
+    {
+      "path": "test_v02_game_clock_source.py",
+      "sha256": "c61bb5157ebea4eb10a63659c8814e2f816f88edcbd144b7f36936f6b4f97338",
+      "bytes": 20778
+    },
+    {
+      "path": "test_v02_game_clock.py",
+      "sha256": "19d9c04016239c2f3989a4d671c914e88441b821de59d8b913ddb53f916938e6",
+      "bytes": 45669
+    },
+    {
+      "path": "test_v02_notification_bar.py",
+      "sha256": "ef8c369cbcd3bf2691b0ec30247dda38e0fbc10c10ead265ce957f88c993887e",
+      "bytes": 31017
+    },
+    {
+      "path": "test_v02_wheel_hook.py",
+      "sha256": "e73cc0ddf3f1ef529a855f910d4792695ce1096b33c13c14e988f91fefb5e376",
+      "bytes": 30545
+    },
+    {
+      "path": "user_activity_guard.py",
+      "sha256": "8a99fdf4d47ee8278fe78d92f80e39229982d7069a74c3f4d9f26c875541a7f5",
+      "bytes": 3347
+    },
+    {
+      "path": "V0.1_STABLE_BASELINE.md",
+      "sha256": "9d9c370f4eaf3b1a16e9500887844f5a08340d645196852b4a32bdb66712793a",
+      "bytes": 12934
+    },
+    {
+      "path": "V0.2_API_BOUNDARY_INDEX.md",
+      "sha256": "3f67a2ff1e477b95490f2151d6a14c70f4625a55bc265c456126a52af3241a04",
+      "bytes": 2340
+    },
+    {
+      "path": "V0.2_ARCHITECTURE_BASELINE.md",
+      "sha256": "cd6f2028b5a52adf882e01ae287a641cea9c489b33bd5e3eb383877379f8346b",
+      "bytes": 4477
+    },
+    {
+      "path": "v02_game_clock_bar.py",
+      "sha256": "5a96aa552f64964b1b11baed44d5e6f6934e8aa164d69c8338b378eca505c6ba",
+      "bytes": 5859
+    },
+    {
+      "path": "v02_game_clock_reader.py",
+      "sha256": "7da4faca7d1d8493c2350a024fa4e2d0ee7af67070c06a4c18be4315942f05a1",
+      "bytes": 30629
+    },
+    {
+      "path": "v02_game_clock_source.py",
+      "sha256": "0efcbb93ac05ecfa205dd92a71a178c689a9d30874fb8e7f7477e3b6c6fc1813",
+      "bytes": 12098
+    },
+    {
+      "path": "v02_game_clock.py",
+      "sha256": "5f28d317636f882b49773916a9a08d713e3b1de5c8455ae71f0c409256a856ce",
+      "bytes": 6242
+    },
+    {
+      "path": "v02_notification_bar.py",
+      "sha256": "6d3dcde8472da834bf8c8be81b7d630928149b4333d9daf83a59fa967d9c6660",
+      "bytes": 13004
+    },
+    {
+      "path": "v02_wheel_hook.py",
+      "sha256": "86cbb5cbe074bc6bc2e27a7e3077a5562a23c28197552d3877dcefa9bb0f1932",
+      "bytes": 13110
+    },
+    {
+      "path": "verify_v02_api_boundaries.py",
+      "sha256": "41e42bc1404f853ddfcb4043fa7f7412fff8400fb3ec44d929b034bad3ebd14f",
+      "bytes": 4915
+    },
+    {
+      "path": "version_info.txt",
+      "sha256": "e97709708fdf71f2ed5274c7d41561e2112342edd5501e64c12d5ababc83b2fa",
+      "bytes": 687
+    },
+    {
+      "path": "window_geometry.py",
+      "sha256": "1492b305fcac201329ddce9319a4b8dcd330775d02fea1a3703b10b86656d2f1",
+      "bytes": 7973
+    },
+    {
+      "path": "windows_manifest.xml",
+      "sha256": "6920d3d860d7d1d156db3015f7a0811b50c45384082d51c4f870d5909d660c7c",
+      "bytes": 1104
+    },
+    {
+      "path": "assets/auto_reconnect_icon.ico",
+      "sha256": "48ceac804fdba2cdc319e712159ee72af23ac1470048f46f0eaf17ffcaab0501",
+      "bytes": 53077
+    },
+    {
+      "path": "assets/auto_reconnect_icon.png",
+      "sha256": "8e11edfaa2f7a04d018c597cc02df79f1337915af667fb8309da7abd8efa7552",
+      "bytes": 29616
+    },
+    {
+      "path": "fishing_evidence/fishing_chat_prepare_button.png",
+      "sha256": "93fe9dcf93943e6edca3f818594f36a846c6113017c65a0864409eedec8cdea6",
+      "bytes": 863
+    },
+    {
+      "path": "fishing_evidence/fishing_flight_button.png",
+      "sha256": "dd7412177ba05420676e0aef48798e716572c43bdfb2d3b1b499d1f608d1b2a7",
+      "bytes": 2391
+    },
+    {
+      "path": "fishing_evidence/fishing_land_button.png",
+      "sha256": "8fa843f85d430d13cc1f074cf83c0975792fbead89a8ef20c3d2fdbbf300c13c",
+      "bytes": 2235
+    },
+    {
+      "path": "fishing_evidence/fishing_menu_collapse_button.png",
+      "sha256": "6cfa9fabb2079e3d2398303c31e618512ce287be7254afaa3fe9bf90c8a2580f",
+      "bytes": 3617
+    },
+    {
+      "path": "fishing_evidence/fishing_prepare_after.png",
+      "sha256": "82709c6a863789629d68df305426b64a718197ad7b26e68aa03fa64c117bd97e",
+      "bytes": 1150668
+    },
+    {
+      "path": "fishing_evidence/fishing_prepare_before.png",
+      "sha256": "d254e82a273ab44270e76038937f52ef33ce5b2f497a6b1f99fe3e32ebc49b24",
+      "bytes": 1160323
+    },
+    {
+      "path": "manor_assets/action_bar.png",
+      "sha256": "5f52272ab62cd151a07bc48a8504761747bf1ec7a810354ed87c25ed9a92e728",
+      "bytes": 38379
+    },
+    {
+      "path": "manor_assets/all_button.png",
+      "sha256": "f1753679b1f30513bc35eff82b0c784784e8dce982445f24533276df0ea4b3ab",
+      "bytes": 7282
+    },
+    {
+      "path": "manor_assets/breed_button.png",
+      "sha256": "938cd549d4559a74a38852411370958828d699babf896d899b39f3995a0c15cc",
+      "bytes": 7331
+    },
+    {
+      "path": "manor_assets/harvest_cooldown.png",
+      "sha256": "56cd9fd11a8e8bc2a9c06cf22d5a62f128f7e17166049b8944d3156238347c32",
+      "bytes": 6139
+    },
+    {
+      "path": "manor_assets/main_nonbattle.png",
+      "sha256": "8cf967707537bed4fca5e03570dbebf47f0dd38fea824a1ccb70c1dc1f828bcb",
+      "bytes": 892787
+    },
+    {
+      "path": "manor_assets/manor_button.png",
+      "sha256": "3feb1c6f1d18bd939229462338fea3ccf6c20c604b2ac72decd7c0f058a94741",
+      "bytes": 2258
+    },
+    {
+      "path": "manor_assets/manor_close.png",
+      "sha256": "5ac1c0ff7ec840ee39f4838559dd96d61875cea37c715e446f7f732919abb86c",
+      "bytes": 1632
+    },
+    {
+      "path": "manor_assets/manor_empty_full.png",
+      "sha256": "0bc9fe90186b657de0adc6d45191e1ca4a8bd17ad6b09e71bcdc7b16b73b4dbf",
+      "bytes": 1043719
+    },
+    {
+      "path": "manor_assets/manor_occupied.png",
+      "sha256": "2f07276c24cd65aaf7140ac8ae97c3a04d367f205c6ddc44dc9424322f3f0ad8",
+      "bytes": 857097
+    },
+    {
+      "path": "manor_assets/manor_one.png",
+      "sha256": "332bccf66a5843945b8ec4c0235d4dbd2124cd692d703cd1f3efa269fbc995dd",
+      "bytes": 841859
+    },
+    {
+      "path": "manor_assets/network_status.png",
+      "sha256": "130e92c7ff3dc1d8742dd0fd0b51c0d73cd16c62f0f10c1179cad40755879668",
+      "bytes": 4945
+    },
+    {
+      "path": "manor_assets/nonbattle_line.png",
+      "sha256": "0a1f48dd075934b95d56355fc00bf99033d7c5426152139534d14912097e22d3",
+      "bytes": 8897
+    },
+    {
+      "path": "manor_assets/shop_panel.png",
+      "sha256": "ad1f94cdaa12a3f5f3a384f87f0d3242e0c80d24f471b48a8f67809f9ec6dd45",
+      "bytes": 148859
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_01.png",
+      "sha256": "10cdf6c85fe6328569a403620466bb0fdf5afd1dbe5430374fbe8980b1b38847",
+      "bytes": 6449
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_02.png",
+      "sha256": "105c2c90ee66a345501ba1f73e89206c593d963ece5d23ff75d3a0c74ca0766a",
+      "bytes": 6423
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_03.png",
+      "sha256": "8e27fb83835a120a44b21823e8ad3733675bd393a4b4f0a3017ef04de4137afa",
+      "bytes": 6636
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_04.png",
+      "sha256": "5857f44fd8d7182f26e123fcdb79ef1a7eedb38919f54c289dee2c84498d7f73",
+      "bytes": 6434
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_05.png",
+      "sha256": "7c26037156fe7a4d01f37e49e017ed5ae462826bbcdf2a51bc59c1901775dd37",
+      "bytes": 6427
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_06.png",
+      "sha256": "5f1d5530c21588935eba0f79189746c98afb8d21b39feae15b8cebfd1e296032",
+      "bytes": 6385
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_07.png",
+      "sha256": "33d6baba7bbb9511dc1a397f620ee7fe55d867fe8e3cf7af59c60bac51ac0667",
+      "bytes": 6411
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_08.png",
+      "sha256": "28a1e25e0faad2da49f3b7fde0ae9bca7f4199a8847777ebe66d25b99124b928",
+      "bytes": 6405
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_09.png",
+      "sha256": "3614c3f75dd2da62654ad7f9f11d5c5ee7404ebf80fabfbcb7048bb94f763d8e",
+      "bytes": 6421
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_10.png",
+      "sha256": "6cc8f7c813bd0abac6c162630a2df2df1694e503176ac8717bffd9c583e820e7",
+      "bytes": 5911
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_11.png",
+      "sha256": "1bb9e63ba51480fed2c79308a8a1637031d91dc56812649078a42f2742346677",
+      "bytes": 6441
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_12.png",
+      "sha256": "293151be696955e1dc4b4fb89277867c517417ac489e9b1c15e653ed4204cc84",
+      "bytes": 6408
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_13.png",
+      "sha256": "8fbe01787125bbe506afb97238b23e3f34bcd3aef56bdf53816dcb136f8ee55b",
+      "bytes": 6442
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_14.png",
+      "sha256": "2a8c8f6956782c38e149a7f348615ddd1b0f0c6a5f836dcfad3b142a5eeb8b33",
+      "bytes": 6457
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_15.png",
+      "sha256": "6d2ac36d568cf53f4484dc59b3847683f58e25bb04a146230123271913c652ae",
+      "bytes": 6405
+    },
+    {
+      "path": "manor_assets/empty_plots/plot_16.png",
+      "sha256": "91b18a805dae1eb4956b037cf68fb9a8cdc651cf055da388992130df339a07cc",
+      "bytes": 6476
+    },
+    {
+      "path": "manor_assistant/__init__.py",
+      "sha256": "c45c2ed8a7bf29fbfad2809ce8c6c4d90291d11987467be3946c523c524ab3d7",
+      "bytes": 74
+    },
+    {
+      "path": "manor_assistant/config_store.py",
+      "sha256": "47c1c6cdc7017d9ef4766372e3d34bed89b6fdadb31329b0d482b065514c5e3f",
+      "bytes": 1382
+    },
+    {
+      "path": "manor_assistant/models.py",
+      "sha256": "86c9052f86a27aeb1a746a8092582bce76393ccfbea8dbf3196bfcd186520714",
+      "bytes": 3585
+    },
+    {
+      "path": "manor_assistant/scheduler.py",
+      "sha256": "66131ac9fa1c99b2c3a5e322b7019aef3d782dad406d55e733d636427f19ea3f",
+      "bytes": 10053
+    },
+    {
+      "path": "manor_assistant/ui.py",
+      "sha256": "eb571f076fd55d04d9909569ba29156386db3573699ffe11bae3f86d4c77dc54",
+      "bytes": 30589
+    },
+    {
+      "path": "manor_assistant/vision.py",
+      "sha256": "f6da4207cdf93bd5e905225d6adfc4772d7d13dcb05cef539f04d96130132ca9",
+      "bytes": 10298
+    },
+    {
+      "path": "manor_assistant/win32_api.py",
+      "sha256": "16e8e1c6ebbad0360539039ed9e2793066a9b601b636d1dbf3311f80dd8f0622",
+      "bytes": 16667
+    },
+    {
+      "path": "manor_assistant/workflow.py",
+      "sha256": "05ef55878e42776f3a07664bd807544f871bde623fc981db56e2eb343439e7f2",
+      "bytes": 18792
+    },
+    {
+      "path": "manor_tests/test_config.py",
+      "sha256": "67001e909bef98eac5d65ea0c4d42c78240efdd14267962a73374b84df6c058e",
+      "bytes": 1212
+    },
+    {
+      "path": "manor_tests/test_fishing_background_resume.py",
+      "sha256": "b6e7692bb6f6260f62aa82b6708e9ba7a4c2344a35740053c25e80024bec1ea2",
+      "bytes": 16935
+    },
+    {
+      "path": "manor_tests/test_fishing_link_tolerance.py",
+      "sha256": "05359701a79dfea386bbdbf1b71e6774d7dcbf6dc2f344d763c39e41aab80b13",
+      "bytes": 3491
+    },
+    {
+      "path": "manor_tests/test_fishing_opencv_compat.py",
+      "sha256": "a58206d6dfcca96c906bc46815ca80fcbe4b6a8d99a9960c82f0d4acfa1f2aae",
+      "bytes": 927
+    },
+    {
+      "path": "manor_tests/test_integration.py",
+      "sha256": "154361c070aa0de036b22ed7b3d556d2a1e13af9402a50c7a626b5d9e74834bb",
+      "bytes": 2939
+    },
+    {
+      "path": "manor_tests/test_role_line_and_input_policy.py",
+      "sha256": "7b6468dd4e444ab5b9832c3b4a4006ea88a47d7bfcc67fbdf86801f47f1be9ef",
+      "bytes": 6139
+    },
+    {
+      "path": "manor_tests/test_unexpected_panel_close.py",
+      "sha256": "d2eba38474242655a40070d232dc87df27636b25c318ee05422b37b5dbd26c6d",
+      "bytes": 3849
+    },
+    {
+      "path": "manor_tests/test_vision.py",
+      "sha256": "c68007781abbbfe6ad18e1c4c6e7014b4884ea44f05983fd5b3245a996833ad0",
+      "bytes": 1613
+    },
+    {
+      "path": "manor_tests/test_workflow.py",
+      "sha256": "c40c15149ef4bcb123988de4795de7c4e0067932c541857b3c58ca9a4231a744",
+      "bytes": 3225
+    },
+    {
+      "path": "templates/auto_battle_no_x_correct_v1182.png",
+      "sha256": "b4b318c038692d33a2cbec40a31b74e382ef03488cbde97065c9b5823aaf5462",
+      "bytes": 2915
+    },
+    {
+      "path": "templates/auto_battle_other_latest.png",
+      "sha256": "de872cbdefcaa86b86698705fd432a4b3999df4e8ceeb664ffbd6fcf16f6e9dd",
+      "bytes": 1886
+    },
+    {
+      "path": "templates/auto_battle_other.png",
+      "sha256": "60aeb95f29cb1bef9e366e067ea53f96ae2d4f5266fc18bf311c2749b5947f08",
+      "bytes": 2874
+    },
+    {
+      "path": "templates/auto_battle_target_full_sample.png",
+      "sha256": "b6a96f193d87c4b18c463cf4fc3c384e3d8fac27a61aaf9e67e1a94933d5d6e6",
+      "bytes": 3021
+    },
+    {
+      "path": "templates/auto_battle_target_user_crop.png",
+      "sha256": "91c3ac4d43c6e02daa6926b5167ae78e36e82f6f176befb8f828ae36ffaae238",
+      "bytes": 2872
+    },
+    {
+      "path": "templates/auto_battle_target.png",
+      "sha256": "b6a96f193d87c4b18c463cf4fc3c384e3d8fac27a61aaf9e67e1a94933d5d6e6",
+      "bytes": 3021
+    },
+    {
+      "path": "templates/auto_battle_x_wrong_v1182.png",
+      "sha256": "3be66855c7290a872e9822dbc8fec8066b4de29eb8dce462e759bfd5fadd5999",
+      "bytes": 3004
+    },
+    {
+      "path": "templates/battle_auto_title.png",
+      "sha256": "80fad0fc9d2155438fd092804366c20c0e12670056910ae0d163285d0303ef02",
+      "bytes": 15689
+    },
+    {
+      "path": "templates/chat_current_active_context_v1182.png",
+      "sha256": "7fa82f5739373b37cb43bf9c79b03769a481c1bfd0e9e812afce6e8e40295e42",
+      "bytes": 8947
+    },
+    {
+      "path": "templates/chat_current_inactive_context_v1182.png",
+      "sha256": "3c78325729a73f964f6f027732f10c3ff19383578666ecc77972dacee42d2547",
+      "bytes": 23055
+    },
+    {
+      "path": "templates/chat_header.png",
+      "sha256": "50c3fbc0e9db34b2d8b5d0ae3703077ddc58e1f3d6801559d4b14fd5b3cbec31",
+      "bytes": 11364
+    },
+    {
+      "path": "templates/chat_sender_channel_menu_v1183.png",
+      "sha256": "ea265a9ffb88d704e47e5497871e05ed43892555c14bfc75a0266e5c88a46521",
+      "bytes": 9863
+    },
+    {
+      "path": "templates/chat_sender_current_context_v1183.png",
+      "sha256": "3c78325729a73f964f6f027732f10c3ff19383578666ecc77972dacee42d2547",
+      "bytes": 23055
+    },
+    {
+      "path": "templates/chat_sender_world_context_v1183.png",
+      "sha256": "931ab77cf389331a7b9a0756b385954d380a3eae1a686aa40d05cabc51d08c8d",
+      "bytes": 20300
+    },
+    {
+      "path": "templates/close_auto_instance.png",
+      "sha256": "c959b7eb18f2ce6b59eb6d867d8a06ce5bdb0ff7f5615427c19ffbbfd06cb280",
+      "bytes": 2160
+    },
+    {
+      "path": "templates/close_daily_activity.png",
+      "sha256": "63bd7e59213a715951b49fc8b5dedd5f5a66e92237bb790d9c6f5af897e7ef0b",
+      "bytes": 2113
+    },
+    {
+      "path": "templates/disconnect_confirm.png",
+      "sha256": "205f01dc64cd490973144014dbf58656f7bd9f8eabbeb81b30ecb887edb2d44e",
+      "bytes": 572
+    },
+    {
+      "path": "templates/disconnect_other_login.png",
+      "sha256": "77c9bcfe0f494fbe2af6e4600894ef1762a475c9d1550cb710f724bfd0ffd23d",
+      "bytes": 42296
+    },
+    {
+      "path": "templates/disconnect_server.png",
+      "sha256": "240bd0937068da8afb434faa1d74330a530da14a6a6384e16bbd7d0df9f02ee9",
+      "bytes": 37695
+    },
+    {
+      "path": "templates/disconnect_timeout.png",
+      "sha256": "f24d163fbe311f3d8c099a15fe69038704823ce1fa560b145327d718342f9dfe",
+      "bytes": 37523
+    },
+    {
+      "path": "templates/enter_game.png",
+      "sha256": "bffece01a67493ea5e1678f3614acbc081fecedc12c61bcf8b6ecf0242519614",
+      "bytes": 1927
+    },
+    {
+      "path": "templates/fishing_chat_prepare_button.png",
+      "sha256": "93fe9dcf93943e6edca3f818594f36a846c6113017c65a0864409eedec8cdea6",
+      "bytes": 863
+    },
+    {
+      "path": "templates/fishing_flight_button_current.png",
+      "sha256": "a854f005c0d8c854b4e2012ff7a641d346baff59b88762e1b086f827e63322a6",
+      "bytes": 2325
+    },
+    {
+      "path": "templates/fishing_flight_button.png",
+      "sha256": "dd7412177ba05420676e0aef48798e716572c43bdfb2d3b1b499d1f608d1b2a7",
+      "bytes": 2391
+    },
+    {
+      "path": "templates/fishing_land_button_120fu.png",
+      "sha256": "54972abeae4e40fdbd5b6df283a0175cf56046753c2f3478abb8af23beb5efbd",
+      "bytes": 2215
+    },
+    {
+      "path": "templates/fishing_land_button.png",
+      "sha256": "8fa843f85d430d13cc1f074cf83c0975792fbead89a8ef20c3d2fdbbf300c13c",
+      "bytes": 2235
+    },
+    {
+      "path": "templates/fishing_menu_collapse_button_live.png",
+      "sha256": "f9fecd31a2ed6c148ef8fced85a236197e745c3283322b24589b2387dd70a2bf",
+      "bytes": 824
+    },
+    {
+      "path": "templates/fishing_menu_collapse_button.png",
+      "sha256": "6cfa9fabb2079e3d2398303c31e618512ce287be7254afaa3fe9bf90c8a2580f",
+      "bytes": 3617
+    },
+    {
+      "path": "templates/fishing_menu_expand_button_120fu.png",
+      "sha256": "d9c7c581298f7a32903e1f865433a38c0afd7ff3a5ee45ca2e75fa035a1f2de1",
+      "bytes": 1068
+    },
+    {
+      "path": "templates/force_login_context.png",
+      "sha256": "5f43a98c9d709e7809f4f20cb4af935c4630453949a2e4d4989cf1d74cf65cf1",
+      "bytes": 1664
+    },
+    {
+      "path": "templates/force_login.png",
+      "sha256": "bcf536835b6f335bf4107b0743d2e51b31ee51c6e0034defe47367b1c80a2e34",
+      "bytes": 1429
+    },
+    {
+      "path": "templates/last_login_title.png",
+      "sha256": "b1edb401b6a42452250fff7aca84a554a31cd9577854f283fd3d46037a3a9f2c",
+      "bytes": 2965
+    },
+    {
+      "path": "templates/line_1.png",
+      "sha256": "307b851aa9efdd72a41410b49f4e91f401942c60df17f00ca8aeacf7291aaff8",
+      "bytes": 1718
+    },
+    {
+      "path": "templates/line_2.png",
+      "sha256": "68753e4a26e062576f73a0dfdc0ab08b889d237f0e28352f51711c0d70e8c6b4",
+      "bytes": 1651
+    },
+    {
+      "path": "templates/line_3.png",
+      "sha256": "cf954224072c41d22dd4c8626c91af19cb06692b3010c844860ee1daa5c81d5a",
+      "bytes": 1721
+    },
+    {
+      "path": "templates/line_4.png",
+      "sha256": "41907394cb30c317388dc1d219de8a601edbc4d8d5855b9c785956cb19d5677a",
+      "bytes": 1710
+    },
+    {
+      "path": "templates/line_5.png",
+      "sha256": "a27d488e6ccdf25061bc19d892df9109d0a46cca92037fc8175a17abc1c0aa3d",
+      "bytes": 1757
+    },
+    {
+      "path": "templates/line_6.png",
+      "sha256": "523ba1a27658b8317d5f8bede48a0cff3fed68139922651dcd4a62ed5667771b",
+      "bytes": 1752
+    },
+    {
+      "path": "templates/line_7.png",
+      "sha256": "375de1afc2641538444afbe0b21c3afa74391acf418b935d680c14114d145978",
+      "bytes": 1684
+    },
+    {
+      "path": "templates/line_8.png",
+      "sha256": "b0d45392ec0b5a8bf04909294589bb1feb9e789a4ab5c517c8c3769958373f07",
+      "bytes": 1837
+    },
+    {
+      "path": "templates/login_buttons_panel.png",
+      "sha256": "193fdf5d1cc5eb1ae29a3613d25abefe834a30dd3200086250e6fefe38c3869f",
+      "bytes": 16784
+    },
+    {
+      "path": "templates/role_select_title.png",
+      "sha256": "070ec48cc8a76125d757f2d2c4bd6f576fb783e41b835cc5e53932322ea36d7b",
+      "bytes": 5595
+    },
+    {
+      "path": "templates/start_game.png",
+      "sha256": "b7173294f0db3736802aaf1782bcde954b2fc72a72d9ac7a1f5798bc34553560",
+      "bytes": 1851
+    }
+  ],
+  "excluded": [
+    {
+      "path": "sync_launch_config.json",
+      "sha256": "ba3ed50158d467696463c9e3bbc459f77fff2a158fa732b2c48d5026a1b03658",
+      "reason": "excluded: contains local paths, machine state, or user role identity data"
+    },
+    {
+      "path": "sync_launch_config_v02.json",
+      "sha256": "2ce53b4e4b82930dd5705d42f718e58194b4cff9770088e38fa4705b3434a06e",
+      "reason": "excluded: contains local paths, machine state, or user role identity data"
+    },
+    {
+      "path": "role_id_templates.json",
+      "sha256": "e701c398b10c933cd1750fd76404dead0050531fc11c873839b0a2ea1f5a5b99",
+      "reason": "excluded: contains local paths, machine state, or user role identity data"
+    },
+    {
+      "path": "roles",
+      "sha256": null,
+      "reason": "excluded subtree: contains user role identity data"
+    }
+  ],
+  "blank_templates": [
+    "sync_launch_config.json",
+    "role_id_templates.json"
+  ],
+  "global_exclusions": [
+    "outputs",
+    "build*",
+    "dist*",
+    "logs",
+    ".test-appdata",
+    "__pycache__",
+    "*.pyc",
+    "runtime status and diagnostic JSON",
+    "compiled executables"
+  ]
+}

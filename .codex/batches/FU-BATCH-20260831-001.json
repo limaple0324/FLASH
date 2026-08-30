@@ -1,0 +1,44 @@
+{
+  "batch_id": "FU-BATCH-20260831-001",
+  "source_issue": 32,
+  "source_pull_request": null,
+  "base_commit": "729b87753204d2b5a050c85b5950b9392421ed4f",
+  "branch": "work/fu-batch-20260831-001-game-clock",
+  "category": ["feature", "api", "performance", "packaging"],
+  "scope": "Import a sanitized rebuildable V0.2 source closure and implement faithful multi-GameLoader game-time reading for the four approved desktop shortcut identities.",
+  "allowed_paths": [
+    ".codex/batches/FU-BATCH-20260831-001.json",
+    "legacy/fu-v02-reconnect-preview/**"
+  ],
+  "forbidden": [
+    "main merge or formal release",
+    "desktop overwrite",
+    "starting or stopping GameLoader",
+    "sending game input",
+    "paid APIs or secrets",
+    "raw runtime configuration, user paths, role identity data, or compiled binaries"
+  ],
+  "acceptance": [
+    "Only 120古, 120靈, 大排, and 餐廳 desktop shortcuts define eligible GameLoader sources.",
+    "Displayed values come only from game-owned data, preserve observed precision, and never use Windows wall time, NTP, extrapolation, or fallback.",
+    "At least three same-generation samples form consensus; minute transitions resample all sources.",
+    "Equal values are grouped once, unequal values are all shown with source labels, and unreadable sources are listed separately.",
+    "The timer-action exception remains internal and cannot feed display, grouping, status, or other consumers.",
+    "Expensive discovery runs at no more than 0.2 Hz, steady reads and UI publishing at no more than 4 Hz per source, and unchanged values do not redraw.",
+    "API validation reflects the current application identity; packaging embeds only sanitized defaults and fails closed."
+  ],
+  "minimum_tests": [
+    "test_v02_game_clock.py",
+    "test_v02_game_clock_source.py",
+    "test_fu_local_20260830_002.py",
+    "verify_v02_api_boundaries.py",
+    "direct shortcut selector and rate-limit tests"
+  ],
+  "full_regression": true,
+  "windows_artifact_validation": true,
+  "execution": "Codex desktop app",
+  "paid_api": "forbidden",
+  "github_validation": "required",
+  "status": "IN_PROGRESS",
+  "next_role": "implementation"
+}
