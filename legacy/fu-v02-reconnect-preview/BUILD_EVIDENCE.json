@@ -1,32 +1,113 @@
 {
-  "schema": 1,
+  "schema": 2,
+  "round2_base_commit": "40e504d57da0344fb44400b8029e7fb2596d528c",
   "runtime": {
     "python": "3.12.10",
     "tcl_tk": "8.6.15",
-    "python_exe_sha256": "4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a",
-    "installer_sha256": "67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb",
-    "installer_signature": "Valid: Python Software Foundation"
+    "pyinstaller": "6.22.2",
+    "environment": "isolated build venv outside the repository",
+    "dependencies": "requirements-build.txt",
+    "dependency_check": "PASS"
   },
   "build": {
-    "command": "<work-build-venv>/python -m PyInstaller --noconfirm --clean --distpath <approved-output> --workpath .build-candidate fu_preview.spec",
-    "dependencies": "requirements-build.txt",
+    "command": "<isolated-build-venv>/python -m PyInstaller --noconfirm --clean --distpath <approved-round2-output> --workpath <round2-build-work> fu_preview.spec",
     "candidate": "輔V0.2_遊戲時間忠實模式_候選版.exe",
-    "bytes": 116281322,
-    "sha256": "cce8efeceaa17d5559ac124939ed7729e2428720cf24d60f39a77d2ab87ee307",
-    "authenticode": "NotSigned"
-  },
-  "old_artifacts_unchanged": {
-    "v2_sha256": "f771296fbb74664c3f5d7afd482e8227b70873842f6ef33b3c5e7472cc526ff7",
-    "v2_1_sha256": "9d04131a6a968647021586f67f9e6de090e5ce1116b2fed6dcc515009472c209"
+    "output_directory": "FU-BATCH-20260831-001-ROUND2-CANDIDATE",
+    "bytes": 116294427,
+    "sha256": "75fe2b2890320ba1ea1af8caec4d20306ca97aa9309fa1d2555cd88b84c85699",
+    "authenticode": "NotSigned",
+    "file_version": "0.2.1.0",
+    "product_name": "輔V0.2 自動重連獨立版"
   },
   "self_tests": {
-    "source": {"ok": true, "tk": "8.6.15", "native": true, "ocr": true, "assets": true, "physical_forbidden": true},
-    "packaged": {"ok": true, "tk": "8.6.15", "native": true, "ocr": true, "assets": true, "physical_forbidden": true}
+    "source": {
+      "ok": true,
+      "tk": "8.6.15",
+      "native": true,
+      "ocr": true,
+      "assets": true,
+      "asset_count": 82,
+      "physical_forbidden": true
+    },
+    "packaged": {
+      "ok": true,
+      "tk": "8.6.15",
+      "native": true,
+      "ocr": true,
+      "assets": true,
+      "asset_count": 82,
+      "physical_forbidden": true
+    }
+  },
+  "asset_manifest": {
+    "path": "RUNTIME_ASSET_MANIFEST.json",
+    "binary_asset_count": 82,
+    "required_data_file_count": 3,
+    "categories": {
+      "root_icons": 2,
+      "assets": 2,
+      "fishing_evidence": 6,
+      "manor_assets": 29,
+      "templates": 43
+    },
+    "source_validation": "PASS",
+    "packaged_validation": "PASS",
+    "missing_asset_fail_closed_tests": [
+      "templates",
+      "manor_assets",
+      "fishing_evidence"
+    ]
+  },
+  "api_shape": {
+    "validation": "PASS",
+    "api_count": 11,
+    "method_reference_count": 239,
+    "sha256": "ee7fa008654412b58fa04c43c6444d92413961469a20a53af4de943de58cecce"
   },
   "regression": {
-    "top_level": {"run": 227, "passed": 218, "skipped": 9, "failed": 0},
-    "manor": {"run": 59, "passed": 59, "skipped": 0, "failed": 0},
-    "skip_reason": "Historical outputs paths are intentionally absent from the sanitized source closure."
+    "affected_final": {
+      "run": 157,
+      "passed": 157,
+      "failed": 0,
+      "skipped": 0,
+      "subtests": 27
+    },
+    "top_level_single_run": {
+      "run": 259,
+      "passed": 247,
+      "failed": 7,
+      "skipped": 5,
+      "subtests": 39,
+      "classification": "seven stale test-harness failures and five historical-output API-baseline skips; no product failure"
+    },
+    "post_run_targeted_remediation": {
+      "run": 18,
+      "passed": 18,
+      "failed": 0,
+      "skipped": 0,
+      "coverage": "all seven prior failure IDs and all five formerly skipped API-boundary IDs"
+    },
+    "manor_single_run": {
+      "run": 59,
+      "passed": 59,
+      "failed": 0,
+      "skipped": 0
+    },
+    "top_level_rerun": "not run; the single full-run constraint was preserved"
+  },
+  "red_green_milestone": {
+    "initial": {
+      "run": 14,
+      "passed": 0,
+      "failed": 14,
+      "skipped": 0
+    },
+    "implemented": {
+      "run": 14,
+      "passed": 14,
+      "failed": 0,
+      "skipped": 0
+    }
   },
   "performance_contract": {
     "expensive_discovery_hz_max": 0.2,

@@ -1,24 +1,85 @@
-"""Fail-closed faithful game-time selection, consensus, grouping and throttling."""
+"""Fail-closed four-shortcut game-time selection, consensus and scheduling."""
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 import os
 import queue
 import threading
 import time
+import uuid
+
+from v02_game_clock import HEALTH_MAX_GAP_NS, SourceIdentity
+
 
 APPROVED_SHORTCUTS = ("120古", "120靈", "大排", "餐廳")
 DISCOVERY_INTERVAL_NS = 5_000_000_000
 READ_INTERVAL_NS = 250_000_000
 PUBLISH_INTERVAL_NS = 250_000_000
 CONSENSUS_SAMPLES = 3
+EVENT_QUEUE_SIZE = 64
+FIRST_SAMPLE_TIMEOUT_NS = 105_000_000_000
+FRESHNESS_TTL_NS = HEALTH_MAX_GAP_NS
+FOLDERID_DESKTOP = "B4BFCC3A-DB2C-424C-B029-7FE99A87C641"
+
+
+def _normalized_target(path: str) -> str:
+    value = str(path or "").strip()
+    if not value:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.expandvars(value)))
+    except (OSError, ValueError):
+        return ""
+
+
+def windows_desktop_known_folder() -> str | None:
+    """Resolve the current user's Desktop Known Folder, never Public Desktop."""
+    if os.name != "nt":
+        return None
+
+    class GUID(ctypes.Structure):
+        _fields_ = (("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8))
+
+    folder_id = GUID.from_buffer_copy(uuid.UUID(FOLDERID_DESKTOP).bytes_le)
+    result = ctypes.c_wchar_p()
+    ole32 = None
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+        shell32.SHGetKnownFolderPath.argtypes = (
+            ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+            ctypes.POINTER(ctypes.c_wchar_p),
+        )
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        ole32.CoTaskMemFree.argtypes = (ctypes.c_void_p,)
+        if shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None, ctypes.byref(result)) != 0:
+            return None
+        path = _normalized_target(result.value or "")
+        return path or None
+    except (AttributeError, OSError):
+        return None
+    finally:
+        if result and ole32 is not None:
+            try:
+                ole32.CoTaskMemFree(result)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True)
 class ShortcutBinding:
     label: str
-    argument_fingerprint: str
+    normalized_target: str
+    launch_identity: str
+
+    @property
+    def argument_fingerprint(self) -> str:
+        """Compatibility spelling; the value is still session-only HMAC data."""
+        return self.launch_identity
 
 
 @dataclass(frozen=True)
@@ -42,60 +103,97 @@ class FaithfulDisplay:
 
 
 class ApprovedShortcutCatalog:
-    """Resolve only the four named desktop shortcuts; never invent a fallback."""
+    """Resolve only exact names on the current user's Desktop Known Folder."""
     def __init__(self, fingerprint, resolver=None, desktop=None):
         self.fingerprint = fingerprint
         self.resolver = resolver or self._resolve_windows_shortcut
-        self.desktop = desktop or os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+        self.desktop = _normalized_target(desktop) if desktop is not None else windows_desktop_known_folder()
 
     @staticmethod
     def _resolve_windows_shortcut(path):
-        import win32com.client  # packaged Windows dependency
+        import win32com.client
         shortcut = win32com.client.Dispatch("WScript.Shell").CreateShortcut(path)
         return shortcut.TargetPath, shortcut.Arguments
 
     def bindings(self):
+        if not self.desktop or not os.path.isdir(self.desktop):
+            return ()
         result = []
+        seen_labels = set()
+        seen_keys = set()
+        seen_launch_identities = set()
         for label in APPROVED_SHORTCUTS:
             path = os.path.join(self.desktop, label + ".lnk")
             if not os.path.isfile(path):
                 continue
             try:
                 target, arguments = self.resolver(path)
-                if not target or not arguments:
-                    continue
-                result.append(ShortcutBinding(label, self.fingerprint(arguments)))
+                normalized_target = _normalized_target(target)
+                launch_identity = self.fingerprint(arguments) if arguments else ""
             except Exception:
                 continue
+            key = (normalized_target, launch_identity)
+            if (not normalized_target or not launch_identity or label in seen_labels
+                    or key in seen_keys or launch_identity in seen_launch_identities):
+                return ()
+            seen_labels.add(label)
+            seen_keys.add(key)
+            seen_launch_identities.add(launch_identity)
+            result.append(ShortcutBinding(label, normalized_target, launch_identity))
         return tuple(result)
 
     def select(self, identities):
-        by_fingerprint = {item.argument_fingerprint: item.label for item in self.bindings()}
-        selected = []
+        bindings = self.bindings()
+        binding_keys = {(item.normalized_target, item.launch_identity): item for item in bindings}
+        binding_launches = {item.launch_identity for item in bindings}
+        if len(binding_keys) != len(bindings):
+            return ()
+        matches = {}
+        seen_hwnds = set()
+        seen_processes = set()
+        seen_identities = set()
         for identity in identities:
-            label = by_fingerprint.get(identity.launch_fingerprint)
-            if label:
-                selected.append((label, identity))
-        return tuple(selected)
+            try:
+                key = (_normalized_target(identity.normalized_target), identity.launch_fingerprint)
+                process = (int(identity.pid), int(identity.created))
+                hwnd = int(identity.hwnd)
+                full = (hwnd, process, int(identity.tid), key, identity.image_sha256)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            binding = binding_keys.get(key)
+            if binding is None:
+                if identity.launch_fingerprint in binding_launches:
+                    return ()
+                continue
+            if (hwnd in seen_hwnds or process in seen_processes or full in seen_identities
+                    or binding.label in matches):
+                return ()
+            seen_hwnds.add(hwnd)
+            seen_processes.add(process)
+            seen_identities.add(full)
+            matches[binding.label] = identity
+        return tuple((label, matches[label]) for label in APPROVED_SHORTCUTS if label in matches)
 
 
 class FaithfulConsensus:
     def __init__(self):
         self.samples = {name: deque(maxlen=CONSENSUS_SAMPLES) for name in APPROVED_SHORTCUTS}
         self.committed = {}
-        self.generation = {}
+        self.generation = {name: 0 for name in APPROVED_SHORTCUTS}
         self.resample_all = False
 
     def invalidate(self, label, generation):
+        if label not in self.samples or generation < self.generation[label]:
+            return False
         self.samples[label].clear()
         self.committed.pop(label, None)
         self.generation[label] = generation
+        return True
 
     def add(self, sample: FaithfulSample):
-        if sample.label not in self.samples or not sample.value:
+        if (sample.label not in self.samples or not sample.value
+                or self.generation[sample.label] != sample.generation):
             return False
-        if self.generation.get(sample.label) != sample.generation:
-            self.invalidate(sample.label, sample.generation)
         bucket = self.samples[sample.label]
         bucket.append(sample)
         if len(bucket) < CONSENSUS_SAMPLES:
@@ -111,6 +209,17 @@ class FaithfulConsensus:
         self.committed[sample.label] = current
         return changed
 
+    def confirmed(self, sample: FaithfulSample) -> bool:
+        bucket = self.samples.get(sample.label, ())
+        return (len(bucket) == CONSENSUS_SAMPLES
+                and all(item == sample for item in bucket)
+                and self.committed.get(sample.label) == (sample.value, sample.precision))
+
+    def pause_for_boundary(self):
+        for label in APPROVED_SHORTCUTS:
+            self.invalidate(label, self.generation[label])
+        self.resample_all = False
+
     def display(self, readable_labels=APPROVED_SHORTCUTS):
         groups = defaultdict(list)
         for label in APPROVED_SHORTCUTS:
@@ -122,41 +231,45 @@ class FaithfulConsensus:
 
 
 class FaithfulScheduler:
-    """Injectable rate gates used by the production source and direct tests."""
     def __init__(self, monotonic_ns=time.perf_counter_ns):
         self.now = monotonic_ns
         self.last_discovery = None
         self.last_read = {}
         self.last_publish = None
         self.last_payload = None
+        self._lock = threading.Lock()
 
     def allow_discovery(self):
-        now = self.now()
-        if self.last_discovery is not None and now - self.last_discovery < DISCOVERY_INTERVAL_NS:
-            return False
-        self.last_discovery = now
-        return True
+        with self._lock:
+            now = self.now()
+            if (self.last_discovery is not None
+                    and now - self.last_discovery < DISCOVERY_INTERVAL_NS):
+                return False
+            self.last_discovery = now
+            return True
 
-    def allow_read(self, label):
-        now = self.now()
-        previous = self.last_read.get(label)
-        if previous is not None and now - previous < READ_INTERVAL_NS:
-            return False
-        self.last_read[label] = now
-        return True
+    def allow_read(self, label, checked_ns=None):
+        with self._lock:
+            now = self.now() if checked_ns is None else checked_ns
+            previous = self.last_read.get(label)
+            if previous is not None and not now - previous >= READ_INTERVAL_NS:
+                return False
+            self.last_read[label] = now
+            return True
 
     def allow_publish(self, payload):
-        now = self.now()
-        if payload == self.last_payload:
-            return False
-        if self.last_publish is not None and now - self.last_publish < PUBLISH_INTERVAL_NS:
-            return False
-        self.last_publish, self.last_payload = now, payload
-        return True
+        with self._lock:
+            now = self.now()
+            if payload == self.last_payload:
+                return False
+            if self.last_publish is not None and now - self.last_publish < PUBLISH_INTERVAL_NS:
+                return False
+            self.last_publish, self.last_payload = now, payload
+            return True
 
 
 class MultiGameClockSource:
-    """One read-only stream per approved shortcut identity, with grouped output."""
+    """Control-plane generations fence every discovery and stream event."""
     def __init__(self, reader_factory, discover, *, monotonic_ns=time.perf_counter_ns,
                  thread_factory=threading.Thread):
         self.reader_factory = reader_factory
@@ -164,71 +277,145 @@ class MultiGameClockSource:
         self.scheduler = FaithfulScheduler(monotonic_ns)
         self.thread_factory = thread_factory
         self.consensus = FaithfulConsensus()
-        self.events = queue.Queue(maxsize=64)
+        self.events = queue.Queue(maxsize=EVENT_QUEUE_SIZE)
+        self.event_epoch = 0
+        self.overflow_fault = threading.Event()
+        self._overflow_epoch = None
+        self._event_lock = threading.Lock()
         self.streams = {}
         self.discovery = None
         self.discovery_cancel = threading.Event()
-        self.available = set(APPROVED_SHORTCUTS)
+        self._retired_workers = []
         self.anchors = {}
+        self.last_checked_ns = {}
+        self.last_sample_ns = {}
+        self.committed_ns = {}
+        self.stream_started_ns = {}
+        self.last_poll_ns = None
+        self.revalidating = False
+        self.source_faulted = True
         self.display = FaithfulDisplay((), APPROVED_SHORTCUTS)
-        self.status = "遊戲時間：尚未讀取（僅四個核准桌面捷徑）"
+        self.status = "來源失效"
         self.closed = False
 
     @property
     def token(self):
-        return tuple((label, self.consensus.generation.get(label, 0)) for label in APPROVED_SHORTCUTS)
+        return (self.event_epoch,
+                tuple((label, self.consensus.generation[label]) for label in APPROVED_SHORTCUTS))
 
     def is_busy(self):
+        workers = [item[1] for item in self.streams.values()] + self._retired_workers
         return ((self.discovery is not None and self.discovery.is_alive())
-                or any(worker.is_alive() for _identity, worker, _cancel, _generation
-                       in self.streams.values()))
+                or any(worker.is_alive() for worker in workers))
 
-    def invalidate(self, reason="來源已失效"):
+    def _cancel_workers(self):
+        self.discovery_cancel.set()
+        if self.discovery is not None:
+            self._retired_workers.append(self.discovery)
+        for _identity, worker, cancel, _generation, _epoch in self.streams.values():
+            cancel.set()
+            self._retired_workers.append(worker)
+        self.streams.clear()
+
+    def invalidate(self, reason="來源失效"):
+        self._cancel_workers()
+        self.event_epoch += 1
+        self.events = queue.Queue(maxsize=EVENT_QUEUE_SIZE)
+        self.overflow_fault.clear()
+        self._overflow_epoch = None
         for label in APPROVED_SHORTCUTS:
-            self.consensus.invalidate(label, self.consensus.generation.get(label, 0) + 1)
+            self.consensus.invalidate(label, self.consensus.generation[label] + 1)
         self.anchors.clear()
-        self.status = f"遊戲時間：尚未讀取（{reason}）"
+        self.last_checked_ns.clear()
+        self.last_sample_ns.clear()
+        self.committed_ns.clear()
+        self.stream_started_ns.clear()
+        self.revalidating = False
+        self.source_faulted = True
+        self.display = FaithfulDisplay((), APPROVED_SHORTCUTS)
+        self.status = "來源失效"
 
-    def _emit(self, event):
-        try:
-            self.events.put_nowait(event)
-        except queue.Full:
-            pass
+    def _emit(self, kind, payload, checked_ns, epoch):
+        with self._event_lock:
+            if epoch != self.event_epoch:
+                return False
+            try:
+                self.events.put_nowait((epoch, kind, payload, checked_ns))
+                return True
+            except queue.Full:
+                self._overflow_epoch = epoch
+                self.overflow_fault.set()
+                self.discovery_cancel.set()
+                for _identity, _worker, cancel, _generation, item_epoch in self.streams.values():
+                    if item_epoch == epoch:
+                        cancel.set()
+                return False
 
     def _start_discovery(self):
         if self.discovery is not None and self.discovery.is_alive():
             return
         self.discovery_cancel = threading.Event()
+        epoch = self.event_epoch
+        cancel = self.discovery_cancel
+
         def run():
             try:
-                self._emit(("discovered", tuple(self.discover(self.discovery_cancel))))
+                result = tuple(self.discover(cancel))
+                self._emit("discovered", result, self.scheduler.now(), epoch)
             except Exception:
-                self._emit(("discovery_error", ()))
+                self._emit("discovery_error", (), self.scheduler.now(), epoch)
+
         self.discovery = self.thread_factory(target=run, name="v02-clock-discovery", daemon=True)
         self.discovery.start()
 
     def _start_stream(self, label, identity):
         prior = self.streams.get(label)
-        if prior and prior[0] == identity and prior[1].is_alive():
+        if prior is not None:
+            if prior[0] == identity and prior[1].is_alive():
+                return
+            self.invalidate("來源失效")
             return
-        if prior:
-            prior[2].set()
         cancel = threading.Event()
-        generation = self.consensus.generation.get(label, 0) + 1
+        generation = self.consensus.generation[label] + 1
         self.consensus.invalidate(label, generation)
+        epoch = self.event_epoch
         reader = self.reader_factory()
+        try:
+            reader.expected_identity = identity
+        except Exception:
+            pass
+
         def run():
             try:
-                def publish(sample, reason, _checked):
-                    if reason:
-                        raise RuntimeError("source invalid")
-                    if sample is not None and self.scheduler.allow_read(label):
-                        self._emit(("sample", (label, generation, sample)))
+                native = getattr(reader, "native", None)
+                if native is None or native.identity(identity.hwnd) != identity:
+                    raise RuntimeError("identity")
+
+                def publish(item, reason, checked_ns):
+                    if cancel.is_set():
+                        return
+                    if native.identity(identity.hwnd) != identity:
+                        raise RuntimeError("identity")
+                    if item is not None and item.identity != identity:
+                        raise RuntimeError("identity")
+                    self._emit(
+                        "progress", (label, generation, identity, item, bool(reason)),
+                        checked_ns, epoch,
+                    )
+
                 reader.stream(identity.hwnd, cancel, publish)
+                if not cancel.is_set() and native.identity(identity.hwnd) != identity:
+                    raise RuntimeError("identity")
+                if not cancel.is_set():
+                    self._emit("stream_error", (label, generation), self.scheduler.now(), epoch)
             except Exception:
-                self._emit(("stream_error", (label, generation)))
+                self._emit("stream_error", (label, generation), self.scheduler.now(), epoch)
+
         worker = self.thread_factory(target=run, name=f"v02-clock-{label}", daemon=True)
-        self.streams[label] = (identity, worker, cancel, generation)
+        self.streams[label] = (identity, worker, cancel, generation, epoch)
+        started = self.scheduler.now()
+        self.stream_started_ns[label] = started
+        self.last_checked_ns[label] = started
         worker.start()
 
     @staticmethod
@@ -236,43 +423,144 @@ class MultiGameClockSource:
         value = int(server_ms + 28_800_000) % 86_400_000
         return f"{value // 3_600_000:02d}:{value // 60_000 % 60:02d}:{value // 1000 % 60:02d}.{value % 1000:03d}"
 
+    @staticmethod
+    def _valid_discovery(payload):
+        selected = {}
+        seen_processes = set()
+        seen_identities = set()
+        for row in payload:
+            if not isinstance(row, tuple) or len(row) != 2:
+                return None
+            label, identity = row
+            if label not in APPROVED_SHORTCUTS or not isinstance(identity, SourceIdentity):
+                return None
+            process = (identity.pid, identity.created)
+            if (label in selected or process in seen_processes or identity in seen_identities
+                    or not identity.normalized_target):
+                return None
+            selected[label] = identity
+            seen_processes.add(process)
+            seen_identities.add(identity)
+        return selected
+
+    def _fresh_checked(self, label, checked_ns, now):
+        if not isinstance(checked_ns, int) or not 0 <= now - checked_ns <= FRESHNESS_TTL_NS:
+            return False
+        previous = self.last_checked_ns.get(label)
+        return previous is None or checked_ns >= previous
+
+    def _health_fault(self, now):
+        for label in self.streams:
+            checked = self.last_checked_ns.get(label)
+            if checked is None or not 0 <= now - checked <= FRESHNESS_TTL_NS:
+                return True
+            if label in self.consensus.committed:
+                sample_checked = self.last_sample_ns.get(label)
+                committed_checked = self.committed_ns.get(label)
+                anchor = self.anchors.get(label)
+                if (sample_checked is None or committed_checked is None or anchor is None
+                        or not 0 <= now - sample_checked <= FRESHNESS_TTL_NS
+                        or not 0 <= now - committed_checked <= FRESHNESS_TTL_NS
+                        or not 0 <= now - anchor[2] <= FRESHNESS_TTL_NS):
+                    return True
+            elif now - self.stream_started_ns.get(label, now) > FIRST_SAMPLE_TIMEOUT_NS:
+                return True
+        return False
+
     def poll(self):
         if self.closed:
             return
-        if self.scheduler.allow_discovery():
-            self._start_discovery()
-        for _ in range(64):
+        now = self.scheduler.now()
+        previous = self.last_poll_ns
+        self.last_poll_ns = now
+        if previous is not None and not 0 <= now - previous <= FRESHNESS_TTL_NS:
+            self.invalidate("來源失效")
+            return
+        if self.overflow_fault.is_set() and self._overflow_epoch == self.event_epoch:
+            self.invalidate("來源失效")
+            return
+        if self._health_fault(now):
+            self.invalidate("來源失效")
+            return
+        if not self.streams and (self.discovery is None or not self.discovery.is_alive()):
+            if self.scheduler.allow_discovery():
+                self._start_discovery()
+        boundary = False
+        for _ in range(EVENT_QUEUE_SIZE):
             try:
-                kind, payload = self.events.get_nowait()
+                epoch, kind, payload, checked_ns = self.events.get_nowait()
             except queue.Empty:
                 break
+            if epoch != self.event_epoch:
+                continue
+            if kind == "discovery_error":
+                self.invalidate("來源失效")
+                return
             if kind == "discovered":
-                selected = {label: identity for label, identity in payload if label in APPROVED_SHORTCUTS}
-                for label, identity in selected.items():
-                    self._start_stream(label, identity)
-                for label in set(self.streams) - set(selected):
-                    self.streams[label][2].set()
-                    self.streams.pop(label, None)
-                    self.consensus.invalidate(label, self.consensus.generation.get(label, 0) + 1)
-            elif kind == "sample":
-                label, generation, sample = payload
-                current = self.streams.get(label)
-                if current and current[3] == generation:
-                    value = self._format_server_ms(sample.server_ms)
-                    self.consensus.add(FaithfulSample(label, generation, value, "millisecond"))
-                    self.anchors[label] = (int(sample.server_ms), sample.anchor_ns)
-            elif kind == "stream_error":
+                if not isinstance(checked_ns, int) or not 0 <= now - checked_ns <= FRESHNESS_TTL_NS:
+                    self.invalidate("來源失效")
+                    return
+                selected = self._valid_discovery(payload)
+                if selected is None:
+                    self.invalidate("來源失效")
+                    return
+                if not selected:
+                    self.source_faulted = True
+                    self.status = "來源失效"
+                    continue
+                self.source_faulted = False
+                for label in APPROVED_SHORTCUTS:
+                    if label in selected:
+                        self._start_stream(label, selected[label])
+                continue
+            if kind == "stream_error":
                 label, generation = payload
                 current = self.streams.get(label)
-                if current and current[3] == generation:
-                    self.consensus.invalidate(label, generation + 1)
-        if self.consensus.resample_all:
-            # A source crossed a displayed boundary. All sources must earn a new
-            # three-sample same-generation consensus before a new grouping appears.
-            for label in APPROVED_SHORTCUTS:
-                generation = self.consensus.generation.get(label, 0)
-                self.consensus.invalidate(label, generation)
-            self.consensus.resample_all = False
+                if current is not None and current[3] == generation:
+                    self.invalidate("來源失效")
+                    return
+                continue
+            if kind != "progress":
+                continue
+            label, generation, expected, item, has_reason = payload
+            current = self.streams.get(label)
+            if current is None or current[3] != generation or current[4] != epoch:
+                continue
+            if (expected != current[0] or has_reason
+                    or not self._fresh_checked(label, checked_ns, now)):
+                self.invalidate("來源失效")
+                return
+            self.last_checked_ns[label] = checked_ns
+            if item is None:
+                continue
+            if (item.identity != expected or not isinstance(item.anchor_ns, int)
+                    or not 0 <= checked_ns - item.anchor_ns <= FRESHNESS_TTL_NS):
+                self.invalidate("來源失效")
+                return
+            if not self.scheduler.allow_read(label, checked_ns):
+                continue
+            self.last_sample_ns[label] = checked_ns
+            value = self._format_server_ms(item.server_ms)
+            faithful = FaithfulSample(label, generation, value, "millisecond")
+            self.consensus.add(faithful)
+            if self.consensus.confirmed(faithful):
+                self.anchors[label] = (int(item.server_ms), item.anchor_ns, checked_ns, generation)
+                self.committed_ns[label] = checked_ns
+            boundary = boundary or self.consensus.resample_all
+        if boundary:
+            self.consensus.pause_for_boundary()
+            self.anchors.clear()
+            self.committed_ns.clear()
+            self.revalidating = True
+            boundary_started_ns = self.scheduler.now()
+            for label in self.streams:
+                self.stream_started_ns[label] = boundary_started_ns
+        active = set(self.streams)
+        if self.revalidating and active and active.issubset(self.consensus.committed):
+            self.revalidating = False
+        if self._health_fault(self.scheduler.now()):
+            self.invalidate("來源失效")
+            return
         display = self.consensus.display(APPROVED_SHORTCUTS)
         payload = (display.groups, display.unreadable)
         if self.scheduler.allow_publish(payload):
@@ -280,6 +568,8 @@ class MultiGameClockSource:
             self.status = display.text()
 
     def exact_time_of_day_ms(self):
+        if self.revalidating or self.source_faulted:
+            return None
         values = {value for value, _precision in self.consensus.committed.values()}
         if len(values) != 1:
             return None
@@ -288,20 +578,36 @@ class MultiGameClockSource:
         second, millis = rest.split(".")
         return (((int(hour) * 60 + int(minute)) * 60 + int(second)) * 1000 + int(millis))
 
+    def timed_source_state(self):
+        now = self.scheduler.now()
+        if (self.source_faulted or self.last_poll_ns is None
+                or not 0 <= now - self.last_poll_ns <= FRESHNESS_TTL_NS
+                or self._health_fault(now)):
+            return "fault"
+        if self.revalidating or self.exact_time_of_day_ms() is None:
+            return "waiting"
+        return "valid"
+
     def timed_action_time_of_day_ms(self):
-        """Internal-only QPC estimate; never returned by display/status/grouping."""
-        if self.exact_time_of_day_ms() is None:
+        if self.timed_source_state() != "valid":
             return None
         labels = [label for label in APPROVED_SHORTCUTS if label in self.consensus.committed]
-        if not labels or labels[0] not in self.anchors:
+        if not labels:
             return None
-        server_ms, anchor_ns = self.anchors[labels[0]]
-        elapsed = max(0, self.scheduler.now() - anchor_ns) // 1_000_000
+        anchor = self.anchors.get(labels[0])
+        if anchor is None:
+            return None
+        server_ms, anchor_ns, checked_ns, generation = anchor
+        now = self.scheduler.now()
+        if (generation != self.consensus.generation[labels[0]]
+                or not 0 <= now - checked_ns <= FRESHNESS_TTL_NS
+                or not 0 <= now - anchor_ns <= FRESHNESS_TTL_NS):
+            return None
+        elapsed = (now - anchor_ns) // 1_000_000
         return int(server_ms + 28_800_000 + elapsed) % 86_400_000
 
     def shutdown(self):
+        if self.closed:
+            return
         self.closed = True
-        self.invalidate("程式正在關閉")
-        self.discovery_cancel.set()
-        for _identity, _worker, cancel, _generation in self.streams.values():
-            cancel.set()
+        self.invalidate("來源失效")

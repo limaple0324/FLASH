@@ -24,6 +24,11 @@ LOCAL_APP_DATA = Path(
 USER_DATA_DIR = LOCAL_APP_DATA / APP_NAME
 APP_DATA_DIR = USER_DATA_DIR if IS_FROZEN else SOURCE_DIR
 
+_SENSITIVE_PERSISTED_KEYS = {
+    "process_command_line", "process_identity", "command_line", "command_marker",
+    "username", "password", "account_identity", "launch_identity",
+}
+
 
 def initialize_app_data() -> None:
     """Create writable state and seed defaults without copying versioned assets."""
@@ -42,14 +47,13 @@ def initialize_app_data() -> None:
 def sanitized_record(value: object) -> dict:
     """Return a binding/profile record safe for persistence.
 
-    The process command line may contain login tokens. The SHA-256 process identity
-    is retained, but the raw command line must never be written to user data.
+    Raw launch/account material and process-lifetime identities must never be
+    written to user data. Legacy variants are removed recursively.
     """
     if not isinstance(value, dict):
         return {}
-    result = dict(value)
-    result.pop("process_command_line", None)
-    return result
+    result, _changed = _remove_sensitive_fields(value)
+    return result if isinstance(result, dict) else {}
 
 
 def _remove_sensitive_fields(value: object) -> tuple[object, bool]:
@@ -57,7 +61,7 @@ def _remove_sensitive_fields(value: object) -> tuple[object, bool]:
     if isinstance(value, dict):
         cleaned = {}
         for key, item in value.items():
-            if key == "process_command_line":
+            if str(key).casefold() in _SENSITIVE_PERSISTED_KEYS:
                 changed = True
                 continue
             nested, nested_changed = _remove_sensitive_fields(item)
@@ -96,7 +100,9 @@ def scrub_legacy_sensitive_data(timeout: float = 2.5) -> None:
                     time.sleep(0.025)
             if not locked:
                 return
-        for path in (USER_DATA_DIR / "bindings.json", USER_DATA_DIR / "identity_profiles.json"):
+        for name in ("bindings.json", "identity_profiles.json", "automation_settings.json",
+                     "sync_launch_config.json", "config.json"):
+            path = USER_DATA_DIR / name
             if not path.is_file():
                 continue
             try:

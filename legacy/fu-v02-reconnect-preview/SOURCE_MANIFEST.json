@@ -1,7 +1,8 @@
 {
-  "schema": 1,
+  "schema": 2,
   "source_label": "fu-v02-reconnect-preview",
   "base_commit": "729b87753204d2b5a050c85b5950b9392421ed4f",
+  "round2_base_commit": "40e504d57da0344fb44400b8029e7fb2596d528c",
   "included": [
     {
       "path": "config.json",
@@ -10,13 +11,13 @@
     },
     {
       "path": "control_panel.py",
-      "sha256": "caddf624cd5b6c4d10e37a956b691696116386e25c765b16d5ce709c71acf277",
-      "bytes": 122344
+      "sha256": "7ce1df89da454a00c5987433b44105441341f2d479d67212c04af6b223e9a80a",
+      "bytes": 122261
     },
     {
       "path": "dpi_policy.py",
-      "sha256": "648d4a53fd2aa67c80165dfa8d8e5f525fb0835f5234c45a6f80d5e7d05995da",
-      "bytes": 15737
+      "sha256": "e0fdc65ad50143fd056091f88d97b56b2de288c32678e14b12efe34d8c3f1ec0",
+      "bytes": 15649
     },
     {
       "path": "fishing_profiles.py",
@@ -25,8 +26,8 @@
     },
     {
       "path": "flash_sync_v02.py",
-      "sha256": "45a414f6c659136a00d845e899daae114ba0482fc3735ba30ac981992794a10a",
-      "bytes": 388730
+      "sha256": "34ffa4c6d3ac3e60ab3383aafc370791e89f6afea519192064a008332a38a831",
+      "bytes": 389104
     },
     {
       "path": "flash_sync.py",
@@ -35,13 +36,13 @@
     },
     {
       "path": "fu_preview.spec",
-      "sha256": "c62a8be6f10ab59d47ac98771248b4f1335901f3829963f61c2a73e0f76b94b7",
-      "bytes": 1872
+      "sha256": "8342f249d8daf67df8d54502de5c27a254c0d9890688ace4445eb56a31f654a1",
+      "bytes": 2025
     },
     {
       "path": "fu_reconnect_integration.py",
-      "sha256": "9aafc8deba1ad86a03093608213cec83ca88122033f01ae2936907d6caab6269",
-      "bytes": 22893
+      "sha256": "a0d0c719c417099887a6ee3f3e2b224e65ae77bf110c0a38ace6a60afb829f47",
+      "bytes": 22579
     },
     {
       "path": "manor_runtime.py",
@@ -55,13 +56,13 @@
     },
     {
       "path": "runtime_paths.py",
-      "sha256": "d01779445bebe6fc4aa693854be4309f1e77df4ee29460d1ca86433edab4698a",
-      "bytes": 4214
+      "sha256": "30a8023760982f232f6b747ae0330d4d88332990dc061369d5ca34c80d0e4e47",
+      "bytes": 4518
     },
     {
       "path": "smart_reconnect.py",
-      "sha256": "765289712bb90abe0db843eb123e89cf4588b16b5e0991e27aeca7ceae81749c",
-      "bytes": 417094
+      "sha256": "1c40962f5a76632a4477ed5c0bea616e784d64157b9aaedffd136a537f00f4ad",
+      "bytes": 409508
     },
     {
       "path": "sync_launch_config.json",
@@ -80,18 +81,18 @@
     },
     {
       "path": "test_flash_sync_status_window.py",
-      "sha256": "46d85dc3469cd6f1eb18b3bd098aeb034f86c6a3294838a16b30f738ccc62ccd",
-      "bytes": 44400
+      "sha256": "0719607fd02168a11cc18c691273e0be13cf71c96167a5b946842f1ecb63ef70",
+      "bytes": 44453
     },
     {
       "path": "test_fu_local_20260828_003.py",
-      "sha256": "39cdde9931005413146aa638b465240f1fdffca91fc7ed4858aa485fd85b1ae4",
-      "bytes": 13440
+      "sha256": "c1bdf5226145bb4642ab0024d9dbcd3f96221098daf9e6aa6be7eac04d07c1a2",
+      "bytes": 14089
     },
     {
       "path": "test_fu_local_20260830_002.py",
-      "sha256": "f0251693235c459e1d4ea637bbe130e44a06053a850f0a7ebe9e570d0f52e2d9",
-      "bytes": 15332
+      "sha256": "e90da6835b02366b9caae86f1eb046934a543891c43cfa58aca7523d2f4f0cd6",
+      "bytes": 15436
     },
     {
       "path": "test_fu_reconnect_integration.py",
@@ -100,28 +101,28 @@
     },
     {
       "path": "test_v02_branding.py",
-      "sha256": "418ef20be7c75a6c58c7e5238df835f16e9a6818b7af12e26a668a540e51eaf8",
-      "bytes": 23735
+      "sha256": "e62ad670807a3721f7ab047566c25e8672a73179cdfab872df693543cfb409e6",
+      "bytes": 24383
     },
     {
       "path": "test_v02_game_clock_source.py",
-      "sha256": "c61bb5157ebea4eb10a63659c8814e2f816f88edcbd144b7f36936f6b4f97338",
-      "bytes": 20778
+      "sha256": "17ca81cd87d450d860577957ba8fcdc800acfa043957891a2f95ea73faf8cbe6",
+      "bytes": 21387
     },
     {
       "path": "test_v02_game_clock.py",
-      "sha256": "19d9c04016239c2f3989a4d671c914e88441b821de59d8b913ddb53f916938e6",
-      "bytes": 45669
+      "sha256": "0cab73977940903145cf56bcec4422628a5bb5c6a8cf4444782cb304be9362eb",
+      "bytes": 43993
     },
     {
       "path": "test_v02_notification_bar.py",
-      "sha256": "ef8c369cbcd3bf2691b0ec30247dda38e0fbc10c10ead265ce957f88c993887e",
-      "bytes": 31017
+      "sha256": "af6eeb02a363a74fc9c6ba6070e04eee3aa8895b07ba9df5706b2a2cf220ca7d",
+      "bytes": 32114
     },
     {
       "path": "test_v02_wheel_hook.py",
-      "sha256": "e73cc0ddf3f1ef529a855f910d4792695ce1096b33c13c14e988f91fefb5e376",
-      "bytes": 30545
+      "sha256": "fc4e8536a78ca8f914487ccaad70153cb3f0644618a91c09ae2ba9cc2c9c81bf",
+      "bytes": 30661
     },
     {
       "path": "user_activity_guard.py",
@@ -150,18 +151,18 @@
     },
     {
       "path": "v02_game_clock_reader.py",
-      "sha256": "7da4faca7d1d8493c2350a024fa4e2d0ee7af67070c06a4c18be4315942f05a1",
-      "bytes": 30629
+      "sha256": "c075794286af9d1a9b0608ebbec24797a3795ac58fa55fe8f045dd2fc7970d66",
+      "bytes": 35531
     },
     {
       "path": "v02_game_clock_source.py",
-      "sha256": "0efcbb93ac05ecfa205dd92a71a178c689a9d30874fb8e7f7477e3b6c6fc1813",
-      "bytes": 12098
+      "sha256": "8c3d8506792a0db04031ec5ac340ae2ad20de463ae3fc5b103e1cda8999a8737",
+      "bytes": 12176
     },
     {
       "path": "v02_game_clock.py",
-      "sha256": "5f28d317636f882b49773916a9a08d713e3b1de5c8455ae71f0c409256a856ce",
-      "bytes": 6242
+      "sha256": "61ecf6fb4331308fa9f650524d417c620afe9ecec7662bb0c907be90251c4f0e",
+      "bytes": 6271
     },
     {
       "path": "v02_notification_bar.py",
@@ -175,8 +176,8 @@
     },
     {
       "path": "verify_v02_api_boundaries.py",
-      "sha256": "41e42bc1404f853ddfcb4043fa7f7412fff8400fb3ec44d929b034bad3ebd14f",
-      "bytes": 4915
+      "sha256": "29eaf1d3fd25a2f9057e4de22a65a71d542036b71a62f3d2f7e5e330a5dec0bc",
+      "bytes": 9427
     },
     {
       "path": "version_info.txt",
@@ -192,6 +193,51 @@
       "path": "windows_manifest.xml",
       "sha256": "6920d3d860d7d1d156db3015f7a0811b50c45384082d51c4f870d5909d660c7c",
       "bytes": 1104
+    },
+    {
+      "path": "RUNTIME_ASSET_MANIFEST.json",
+      "sha256": "7fd1bb1189ed73a41d79a6572d53850d84709ee54df2f8bde453a360bfc382f2",
+      "bytes": 11958
+    },
+    {
+      "path": "V02_API_SHAPE_BASELINE.json",
+      "sha256": "613b122c75adb335a0c32d5294a538909cca1a7e399f60c69264d2c164312b55",
+      "bytes": 220
+    },
+    {
+      "path": "requirements-build.txt",
+      "sha256": "690a60bc851f8c95ff90c0f4167233ad1ad41d1c807e7760a6ca14ba3643da04",
+      "bytes": 275
+    },
+    {
+      "path": "runtime_asset_manifest.py",
+      "sha256": "98d161ef670cad69b6a011fd3d6987d5abd2fdf54c02649a39215db432298537",
+      "bytes": 2373
+    },
+    {
+      "path": "session_identity.py",
+      "sha256": "74a5f2c73c5867c65c53728b90b4b9819700a6293e3c4d0c323cd81474f9ea7e",
+      "bytes": 1875
+    },
+    {
+      "path": "test_v02_faithful_game_time.py",
+      "sha256": "1e22af9a42203c1cf270e9fe76c1dc051031eb88fc271b87f8e70bdfda83450e",
+      "bytes": 4134
+    },
+    {
+      "path": "test_v02_round2_e2e.py",
+      "sha256": "ae0a73c4352a1e3fd8805d5b8c419192ffdb1ba87bb442299c55f1a8b54e11b7",
+      "bytes": 19217
+    },
+    {
+      "path": "test_v02_round2_security.py",
+      "sha256": "477a982415f13109491341922df37cf12c96a8f27e7374f018d5dd7b36373eed",
+      "bytes": 11153
+    },
+    {
+      "path": "v02_faithful_game_time.py",
+      "sha256": "e401e223a19424e921e6b7a6c5e0f301476b1da31cd4c90f9c4c3e97a07cdc32",
+      "bytes": 24686
     },
     {
       "path": "assets/auto_reconnect_icon.ico",

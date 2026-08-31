@@ -37,11 +37,15 @@ from v02_game_clock import GameClock
 from v02_game_clock_reader import GameClockReader, NativeSource
 from v02_game_clock_source import AutoClockSource, enumerate_source_windows
 from v02_game_clock_bar import ClockBar
-from v02_faithful_game_time import ApprovedShortcutCatalog, MultiGameClockSource
+from v02_faithful_game_time import (
+    FRESHNESS_TTL_NS, ApprovedShortcutCatalog, MultiGameClockSource,
+)
 from v02_wheel_hook import get_process_wheel_hook_service
 from fu_reconnect_integration import EmbeddedAutomationController, LeaseBusy
 from manor_assistant.models import CROP_OPTIONS
 from fishing_profiles import load_profiles
+from session_identity import account_launch_identity
+from runtime_asset_manifest import verify_runtime_assets
 
 
 APP_DISPLAY_NAME = "輔魔"
@@ -54,6 +58,15 @@ APP_OUTPUT_CONFIG_BACKUP_FILENAME = "sync_launch_config_reconnect_standalone_bac
 LEGACY_APP_DATA_DIR_NAME = "輔V0.2"
 LEGACY_CONFIG_FILENAMES = ("sync_launch_config_v02.json", "sync_launch_config.json")
 STANDALONE_APP_USER_MODEL_ID = "limaple0324.FuV02.AutoReconnect.Standalone"
+DAY_MS = 86_400_000
+TIMED_STATUS_ENABLED = "定時按下：已啟用"
+TIMED_STATUS_WAITING = "定時按下：等待目標時間"
+TIMED_STATUS_TRIGGERED = "定時按下：已觸發"
+TIMED_STATUS_SOURCE_INVALID = "定時按下：來源失效"
+TIMED_STATUS_VALUES = frozenset({
+    TIMED_STATUS_ENABLED, TIMED_STATUS_WAITING,
+    TIMED_STATUS_TRIGGERED, TIMED_STATUS_SOURCE_INVALID,
+})
 STATUS_PANEL_HEIGHT = 42
 STATUS_PANEL_LEGACY_WIDTH = 600  # Only for migration of the previous fixed-width settings.
 STATUS_PANEL_DEFAULT_FONT_SIZE = 14  # Pixels, independent of Tk's point scaling.
@@ -1140,10 +1153,11 @@ $result | ConvertTo-Json -Compress
         if not isinstance(item, dict):
             continue
         item_path = str(item.get("Path") or "")
+        arguments = str(item.get("Args") or "")
         specs[path_key(item_path)] = {
             "path": item_path,
             "target": str(item.get("Target") or ""),
-            "args": str(item.get("Args") or ""),
+            "launch_identity": launch_identity_from_text(arguments),
             "working_dir": str(item.get("WorkingDir") or ""),
             "exists": "1" if item.get("Exists") else "",
         }
@@ -1179,23 +1193,17 @@ ConvertTo-Json -InputObject @($items) -Compress
         if not pid:
             complete = False
             continue
+        command_line = str(item.get("CommandLine") or "")
         infos[pid] = {
             "path": str(item.get("ExecutablePath") or ""),
-            "command_line": str(item.get("CommandLine") or ""),
+            "identity": launch_identity_from_text(command_line),
             "creation_time": str(item.get("CreationDate") or ""),
         }
     return infos, complete
 
 
 def launch_identity_from_text(text: str) -> str:
-    lowered = (text or "").lower()
-    user_match = re.search(r"(?:[?&])user=([0-9a-f]+)", lowered)
-    pass_match = re.search(r"(?:[?&])pass=([0-9a-f]+)", lowered)
-    if user_match and pass_match:
-        return f"user={user_match.group(1)}&pass={pass_match.group(1)}"
-    if user_match:
-        return f"user={user_match.group(1)}"
-    return ""
+    return account_launch_identity(text)
 
 
 def get_client_rect(hwnd: int) -> RECT:
@@ -2687,6 +2695,8 @@ class FlashSyncApp(tk.Tk):
         self.game_time_hover_point: tuple[int, int] | None = None
         self.game_time_text = tk.StringVar(value="尚未校正")
         self.game_time_source_text = tk.StringVar(value="伺服器時間：尚未校正（自動尋找已開啟的遊戲）")
+        self._game_time_text_payload = self.game_time_text.get()
+        self._game_time_source_payload = self.game_time_source_text.get()
         self.init_game_clock()
         self.game_time_sample_text = tk.StringVar(value="")
         self.auto_game_time = tk.BooleanVar(value=True)
@@ -2706,13 +2716,15 @@ class FlashSyncApp(tk.Tk):
         self.game_time_overlay_windows: list[tk.Toplevel] = []
         self.timed_click_enabled = tk.BooleanVar(value=False)
         self.timed_click_target_text = tk.StringVar(value="")
-        self.timed_click_status_text = tk.StringVar(value="定時按下：未啟用")
+        self.timed_click_status_text = tk.StringVar(value=TIMED_STATUS_SOURCE_INVALID)
         self.timed_click_point_text = tk.StringVar(value="按鈕位置：未設定")
         self.timed_click_hwnd: int | None = None
         self.timed_click_point: tuple[int, int] | None = None
         self.timed_click_overlay_windows: list[tk.Toplevel] = []
         self.timed_click_after_id: str | None = None
         self.timed_click_fired = False
+        self.timed_click_remaining_ms: int | None = None
+        self.timed_click_last_clock_ms: int | None = None
         self.autoclick_interval_ms_text = tk.StringVar(value="20")
         self.autoclick_button_text = tk.StringVar(value="左鍵")
         self.autoclick_repeat_forever = tk.BooleanVar(value=True)
@@ -2779,7 +2791,7 @@ class FlashSyncApp(tk.Tk):
         return {
             "pid": pid,
             "creation_time": str(info.get("creation_time", "")),
-            "identity": launch_identity_from_text(info.get("command_line", "")),
+            "identity": str(info.get("identity", "")),
         }
 
     def parse_main_window_geometry(self, geometry: str) -> tuple[int, int, int, int] | None:
@@ -5528,18 +5540,12 @@ class FlashSyncApp(tk.Tk):
                 return index
         pid = get_window_process_id(hwnd)
         process_info = flash_process_infos()[0].get(pid, {})
-        actual_identity = launch_identity_from_text(process_info.get("command_line", ""))
+        actual_identity = str(process_info.get("identity", ""))
         if actual_identity:
             specs = resolve_launch_specs([entry.path for entry in group.launch_entries])
             for index, entry in enumerate(group.launch_entries):
-                expected_identity = launch_identity_from_text(
-                    " ".join(
-                        [
-                            entry.path,
-                            specs.get(path_key(entry.path), {}).get("target", ""),
-                            specs.get(path_key(entry.path), {}).get("args", ""),
-                        ]
-                    )
+                expected_identity = str(
+                    specs.get(path_key(entry.path), {}).get("launch_identity", "")
                 )
                 if expected_identity and expected_identity == actual_identity:
                     return index
@@ -5697,15 +5703,7 @@ class FlashSyncApp(tk.Tk):
         used: set[int] = set()
         specs = resolve_launch_specs([entry.path for entry in entries])
         entry_identities = {
-            index: launch_identity_from_text(
-                " ".join(
-                    [
-                        entry.path,
-                        specs.get(path_key(entry.path), {}).get("target", ""),
-                        specs.get(path_key(entry.path), {}).get("args", ""),
-                    ]
-                )
-            )
+            index: str(specs.get(path_key(entry.path), {}).get("launch_identity", ""))
             for index, entry in enumerate(entries)
         }
         process_infos, _snapshot_complete = flash_process_infos()
@@ -5716,9 +5714,7 @@ class FlashSyncApp(tk.Tk):
             if not expected:
                 return True
             pid = get_window_process_id(hwnd)
-            actual = launch_identity_from_text(
-                process_infos.get(pid, {}).get("command_line", "")
-            )
+            actual = str(process_infos.get(pid, {}).get("identity", ""))
             return bool(actual and actual == expected)
 
         valid_master = (
@@ -5817,15 +5813,7 @@ class FlashSyncApp(tk.Tk):
             return
         specs = resolve_launch_specs([entry.path for entry in entries])
         entry_identities = {
-            index: launch_identity_from_text(
-                " ".join(
-                    [
-                        entry.path,
-                        specs.get(path_key(entry.path), {}).get("target", ""),
-                        specs.get(path_key(entry.path), {}).get("args", ""),
-                    ]
-                )
-            )
+            index: str(specs.get(path_key(entry.path), {}).get("launch_identity", ""))
             for index, entry in enumerate(entries)
         }
         wanted = {
@@ -5843,7 +5831,7 @@ class FlashSyncApp(tk.Tk):
                 continue
             pid = get_window_process_id(hwnd)
             info = process_infos.get(pid, {})
-            identity = launch_identity_from_text(info.get("command_line", ""))
+            identity = str(info.get("identity", ""))
             if identity in wanted:
                 identity_to_hwnds.setdefault(identity, []).append(hwnd)
         for hwnds in identity_to_hwnds.values():
@@ -6164,15 +6152,7 @@ class FlashSyncApp(tk.Tk):
         windows = [hwnd for hwnd in windows if hwnd and user32.IsWindow(hwnd)]
         specs = resolve_launch_specs([entry.path for _entry_index, entry in entries])
         entry_identities = {
-            entry_index: launch_identity_from_text(
-                " ".join(
-                    [
-                        entry.path,
-                        specs.get(path_key(entry.path), {}).get("target", ""),
-                        specs.get(path_key(entry.path), {}).get("args", ""),
-                    ]
-                )
-            )
+            entry_index: str(specs.get(path_key(entry.path), {}).get("launch_identity", ""))
             for entry_index, entry in entries
         }
         process_infos, candidate_snapshot_complete = flash_process_infos()
@@ -6188,7 +6168,6 @@ class FlashSyncApp(tk.Tk):
                 "identity": entry_identities.get(entry_index, ""),
                 "path": entry.path,
                 "name": self.launch_entry_display_name(entry),
-                "command_marker": str(specs.get(path_key(entry.path), {}).get("args", "") or specs.get(path_key(entry.path), {}).get("target", "")),
             }
             for entry_index, entry in entries
         ]
@@ -6200,8 +6179,7 @@ class FlashSyncApp(tk.Tk):
                 "hwnd": hwnd,
                 "pid": pid,
                 "creation_time": info.get("creation_time", ""),
-                "identity": launch_identity_from_text(info.get("command_line", "")),
-                "command_line": str(info.get("command_line", "")),
+                "identity": str(info.get("identity", "")),
             })
         managed = self.automation.authorize_launch_transaction(
             strict_entries,
@@ -6218,9 +6196,7 @@ class FlashSyncApp(tk.Tk):
         identity_to_hwnds: dict[str, list[int]] = {}
         for hwnd in windows:
             pid = get_window_process_id(hwnd)
-            identity = launch_identity_from_text(
-                process_infos.get(pid, {}).get("command_line", "")
-            )
+            identity = str(process_infos.get(pid, {}).get("identity", ""))
             if identity:
                 identity_to_hwnds.setdefault(identity, []).append(hwnd)
         for hwnds in identity_to_hwnds.values():
@@ -7145,29 +7121,42 @@ class FlashSyncApp(tk.Tk):
         self.game_clock_catalog = ApprovedShortcutCatalog(self.game_clock_native.argument_fingerprint)
 
         def discover(cancel):
-            bindings = {item.argument_fingerprint: item.label
-                        for item in self.game_clock_catalog.bindings()}
             identities = {}
+
             def approved(hwnd):
                 identity = self.game_clock_native.identity(hwnd)
                 identities[hwnd] = identity
-                return identity.launch_fingerprint in bindings
+                return True
+
             hwnds = enumerate_source_windows(
                 user32, EnumWindowsProc, is_flash_window, cancel, approved=approved,
             )
-            return tuple((bindings[identities[hwnd].launch_fingerprint], identities[hwnd])
-                         for hwnd in hwnds)
+            return self.game_clock_catalog.select(tuple(identities[hwnd] for hwnd in hwnds))
 
         self.game_clock_source = MultiGameClockSource(
             lambda: GameClockReader(native=self.game_clock_native), discover,
         )
         self.game_clock_reader = None
 
+    def _set_game_time_source_text(self, payload: str) -> None:
+        value = str(payload or "來源失效")
+        if getattr(self, "_game_time_source_payload", None) == value:
+            return
+        self._game_time_source_payload = value
+        self.game_time_source_text.set(value)
+
+    def _set_game_time_text(self, payload: str) -> None:
+        value = str(payload or "尚未讀取")
+        if getattr(self, "_game_time_text_payload", None) == value:
+            return
+        self._game_time_text_payload = value
+        self.game_time_text.set(value)
+
     def invalidate_game_clock_source(self, *_args, force=False, reason="來源已改變") -> None:
         # UI group/selection changes no longer select or cancel the clock source.
         if force:
             self.game_clock_source.invalidate(reason)
-            self.game_time_source_text.set(self.game_clock_source.status)
+            self._set_game_time_source_text(self.game_clock_source.status)
 
     def game_time_source_token(self):
         return self.game_clock_source.token
@@ -7176,7 +7165,7 @@ class FlashSyncApp(tk.Tk):
         if self.closing_app:
             return
         self.game_clock_source.poll()
-        self.game_time_source_text.set(self.game_clock_source.status)
+        self._set_game_time_source_text(self.game_clock_source.status)
 
     def capture_game_time_point(self, point_number: int) -> None:
         hwnd = self.game_time_hwnd()
@@ -7407,7 +7396,7 @@ class FlashSyncApp(tk.Tk):
             self.reset_game_time_anchor(seed_minutes)
             baseline_ok = self.set_game_time_baseline_from_image(image_path)
             if seed_minutes is not None:
-                self.game_time_text.set(
+                self._set_game_time_text(
                     f"遊戲時間：{self.minutes_to_time_text(seed_minutes)}（等跳分校準）"
                 )
             self.write_log(message)
@@ -7575,7 +7564,7 @@ class FlashSyncApp(tk.Tk):
             return
         estimated_ms = self.estimated_game_time_ms()
         estimated = self.estimated_game_time_text()
-        self.game_time_text.set(estimated or "尚未讀取")
+        self._set_game_time_text(estimated or "尚未讀取")
         clock_bar = self.clock_bar
         if clock_bar is not None and getattr(clock_bar, "_destroyed", False) is not True:
             clock_bar.update(estimated)
@@ -7678,12 +7667,10 @@ class FlashSyncApp(tk.Tk):
             return
         failure = self.timed_click_target_failure(hwnd, (x, y))
         if failure:
-            self.write_log(f"設定定時按下位置失敗：{failure}。")
             return
         self.timed_click_hwnd = hwnd
         self.timed_click_point = (x, y)
         self.timed_click_point_text.set(f"按鈕位置：X={x}, Y={y}")
-        self.write_log(f"已設定定時按下位置：{window_summary(hwnd)} X={x}, Y={y}")
 
     def timed_click_target_failure(
         self, hwnd: int | None = None, point: tuple[int, int] | None = None
@@ -7720,9 +7707,6 @@ class FlashSyncApp(tk.Tk):
         self.clear_timed_click_overlay()
         failure = self.timed_click_target_failure()
         if failure:
-            status = f"顯示定位失敗：{failure}"
-            self.timed_click_status_text.set(status)
-            self.write_log(status + "。")
             messagebox.showwarning("無法顯示定位", failure)
             return False
         hwnd = int(self.timed_click_hwnd)
@@ -7738,9 +7722,6 @@ class FlashSyncApp(tk.Tk):
         except Exception:
             converted = False
         if not converted:
-            status = "顯示定位失敗：無法換算目前保存座標"
-            self.timed_click_status_text.set(status)
-            self.write_log(status + "。")
             messagebox.showwarning("無法顯示定位", "無法換算目前保存座標。")
             return False
         parts = (
@@ -7760,10 +7741,21 @@ class FlashSyncApp(tk.Tk):
             overlay.configure(bg="#ff2020")
             overlay.geometry(f"{width}x{height}{left:+d}{top:+d}")
             self.timed_click_overlay_windows.append(overlay)
-        self.timed_click_status_text.set("顯示定位：約 3 秒")
-        self.write_log(f"顯示目前保存的定時按下位置：X={x}, Y={y}；未送出點擊。")
         self.after(max(1, int(duration_ms)), self.clear_timed_click_overlay)
         return True
+
+    def _set_timed_semantic(self, value: str) -> None:
+        if value not in TIMED_STATUS_VALUES:
+            raise ValueError("invalid timed-action semantic")
+        if self.timed_click_status_text.get() == value:
+            return
+        self.timed_click_status_text.set(value)
+        self.write_log(value)
+
+    @staticmethod
+    def _timed_target_remaining_ms(current_ms: int, target_ms: int) -> int:
+        """Earlier time-of-day is always the next day, never an immediate fire."""
+        return (int(target_ms) - int(current_ms)) % DAY_MS
 
     def toggle_timed_click(self) -> None:
         if self.timed_click_enabled.get():
@@ -7780,18 +7772,19 @@ class FlashSyncApp(tk.Tk):
         failure = self.timed_click_target_failure()
         if failure:
             self.timed_click_enabled.set(False)
-            self.timed_click_status_text.set(f"定時按下：{failure}，未啟用")
-            self.write_log(f"定時按下未啟用：{failure}。")
+            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
             messagebox.showwarning("按鈕位置不可用", failure)
             return
-        if self.timed_action_game_time_ms() is None:
+        current_ms = self.timed_action_game_time_ms()
+        if current_ms is None:
             self.timed_click_enabled.set(False)
-            self.timed_click_status_text.set("定時按下：時鐘無效，已解除")
+            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
             messagebox.showwarning("缺少遊戲時間", "目前遊戲時鐘尚未校正，這次定時不會執行。")
             return
         self.timed_click_fired = False
-        self.timed_click_status_text.set("定時按下：已啟用")
-        self.write_log("定時按下已啟用。")
+        self.timed_click_remaining_ms = self._timed_target_remaining_ms(current_ms, target_ms)
+        self.timed_click_last_clock_ms = current_ms
+        self._set_timed_semantic(TIMED_STATUS_ENABLED)
         self.schedule_timed_click_poll()
 
     def cancel_timed_click(self) -> None:
@@ -7802,7 +7795,9 @@ class FlashSyncApp(tk.Tk):
             except Exception:
                 pass
             self.timed_click_after_id = None
-        self.timed_click_status_text.set("定時按下：未啟用")
+        self.timed_click_remaining_ms = None
+        self.timed_click_last_clock_ms = None
+        self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
 
     def schedule_timed_click_poll(self) -> None:
         if not self.timed_click_enabled.get():
@@ -7821,20 +7816,33 @@ class FlashSyncApp(tk.Tk):
         now_ms = self.timed_action_game_time_ms()
         target_ms = self.parse_target_time_ms(self.timed_click_target_text.get())
         if now_ms is None:
+            state = getattr(self.game_clock_source, "timed_source_state", lambda: "fault")()
+            if state == "waiting":
+                self._set_timed_semantic(TIMED_STATUS_WAITING)
+                self.schedule_timed_click_poll()
+                return
             self.timed_click_enabled.set(False)
-            self.timed_click_status_text.set("定時按下：時鐘失效，已解除")
-            self.write_log("定時按下已解除：遊戲時鐘失效，未送出點擊。")
+            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
             return
         if target_ms is None:
             self.timed_click_enabled.set(False)
-            self.timed_click_status_text.set("定時按下：目標時間無效，已解除")
-            self.write_log("定時按下已解除：目標時間無效，未送出點擊。")
+            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
             return
-        if now_ms >= target_ms:
+        if self.timed_click_remaining_ms is None or self.timed_click_last_clock_ms is None:
+            self.timed_click_enabled.set(False)
+            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
+            return
+        advance = (now_ms - self.timed_click_last_clock_ms) % DAY_MS
+        if advance > FRESHNESS_TTL_NS // 1_000_000:
+            self.timed_click_enabled.set(False)
+            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
+            return
+        self.timed_click_last_clock_ms = now_ms
+        self.timed_click_remaining_ms -= advance
+        if self.timed_click_remaining_ms <= 0:
             self.fire_timed_click(now_ms, target_ms)
             return
-        remaining = target_ms - now_ms
-        self.timed_click_status_text.set(f"定時按下：剩 {remaining} ms")
+        self._set_timed_semantic(TIMED_STATUS_WAITING)
         self.schedule_timed_click_poll()
 
     def fire_timed_click(self, now_ms: int, target_ms: int) -> None:
@@ -7847,19 +7855,17 @@ class FlashSyncApp(tk.Tk):
             )
         self.timed_click_fired = True
         self.timed_click_enabled.set(False)
-        delta = now_ms - target_ms
-        self.timed_click_status_text.set("定時按下：已觸發三下，請明日手動重新啟用")
-        self.write_log(
-            f"定時按下已觸發；固定三下於 0/50/100ms 排程，第一下觸發時差值 {delta} ms。"
-        )
+        self.timed_click_remaining_ms = None
+        self.timed_click_last_clock_ms = None
+        self._set_timed_semantic(TIMED_STATUS_TRIGGERED)
 
     def send_timed_click_once(self, hwnd: int, point: tuple[int, int]) -> bool:
         if not hwnd or point is None:
-            self.write_log("定時按下略過：目標窗口或按鈕座標未設定；未送出點擊。")
+            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
             return False
         failure = self.timed_click_target_failure(hwnd, point)
         if failure:
-            self.write_log(f"定時按下略過：{failure}；未送出點擊。")
+            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
             return False
         x, y = point
         target, local_x, local_y = child_at_client_point(hwnd, x, y)
@@ -7979,12 +7985,12 @@ class FlashSyncApp(tk.Tk):
 
         value, detail = read_time_text_from_image(image_path)
         if value:
-            self.game_time_text.set(f"遊戲時間：{value}")
+            self._set_game_time_text(f"遊戲時間：{value}")
             self.write_log(f"讀取遊戲時間：{value}")
             if detail and detail != value:
                 self.write_log(f"OCR 原文：{detail}")
         else:
-            self.game_time_text.set("遊戲時間：讀取失敗")
+            self._set_game_time_text("遊戲時間：讀取失敗")
             self.write_log(f"讀取遊戲時間失敗：{detail} 截圖：{image_path}")
 
     def any_group_running(self) -> bool:
@@ -9551,17 +9557,13 @@ def main() -> int:
             import rapidocr_onnxruntime as _rapidocr
             import smart_reconnect as _sr
             checks["ocr"] = bool(_cv2.__version__ and _np.__version__ and _rapidocr)
-            checks["assets"] = all(
-                os.path.exists(app_resource_path(name))
-                for name in (
-                    "assets", "manor_assets", "fishing_evidence", "templates",
-                    "sync_plus_icon.ico", "role_id_templates.json", "sync_launch_config.json",
-                )
-            )
+            asset_check = verify_runtime_assets(Path(app_resource_path(".")))
+            checks["assets"] = bool(asset_check["ok"])
+            checks["asset_count"] = int(asset_check["asset_count"])
             checks["physical_forbidden"] = not bool(_sr.FOREGROUND_PHYSICAL_FALLBACK)
             ok = all(bool(value) for value in checks.values())
-        except Exception as exc:
-            checks["error"] = repr(exc)
+        except Exception:
+            checks["error"] = "self_test_failed"
             ok = False
         output = ""
         if "--self-test-output" in sys.argv:

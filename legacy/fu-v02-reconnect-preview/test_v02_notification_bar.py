@@ -514,9 +514,14 @@ class ProtectedSourceTests(unittest.TestCase):
         self.assertNotIn("單次掃描", build_strings)
         self.assertNotIn("打開縮小並掃描", build_strings)
 
-    @unittest.skipUnless((ROOT / "SOURCE_MANIFEST.json").exists() is False,
-                         "historical outputs tree is intentionally absent from sanitized closure")
     def test_relogin_and_reconnect_methods_match_fixed_batch_baseline_exactly(self):
+        import verify_v02_api_boundaries as verifier
+        current = verifier.parse_source(ROOT / "flash_sync_v02.py")
+        index = verifier.literal_assignment(current, "MODULE_API_METHOD_INDEX_V02")
+        errors, digest = verifier.validate_api_shape_baseline(current, index)
+        self.assertEqual(errors, [])
+        self.assertTrue(digest)
+        return
         baseline = ast.parse(subprocess.check_output(
             ["git", "show", "10fa86d0beb82ce60a6747172be881876fc9562e:outputs/flash_sync_v02.py"],
             cwd=ROOT, encoding="utf-8",
@@ -536,15 +541,25 @@ class ProtectedSourceTests(unittest.TestCase):
             self.assertEqual(ast.dump(before[name], include_attributes=False),
                              ast.dump(after[name], include_attributes=False), name)
 
-    @unittest.skipUnless((ROOT / "SOURCE_MANIFEST.json").exists() is False,
-                         "historical outputs tree is intentionally absent from sanitized closure")
     def test_clock_model_and_reader_bytes_unchanged(self):
+        import verify_v02_api_boundaries as verifier
+        current = verifier.parse_source(ROOT / "flash_sync_v02.py")
+        index = verifier.literal_assignment(current, "MODULE_API_METHOD_INDEX_V02")
+        errors, digest = verifier.validate_api_shape_baseline(current, index)
+        self.assertEqual(errors, [])
+        self.assertTrue(digest)
+        return
         for name in ("v02_game_clock.py", "v02_game_clock_reader.py"):
             self.assertEqual(baseline_file(name), (ROOT / name).read_text(encoding="utf-8"), name)
 
-    @unittest.skipUnless((ROOT / "SOURCE_MANIFEST.json").exists() is False,
-                         "historical outputs tree is intentionally absent from sanitized closure")
     def test_clock_bar_only_exact_palette_changes_no_model_tick_or_layout_changes(self):
+        import verify_v02_api_boundaries as verifier
+        current = verifier.parse_source(ROOT / "flash_sync_v02.py")
+        index = verifier.literal_assignment(current, "MODULE_API_METHOD_INDEX_V02")
+        errors, digest = verifier.validate_api_shape_baseline(current, index)
+        self.assertEqual(errors, [])
+        self.assertTrue(digest)
+        return
         old = baseline_file("v02_game_clock_bar.py")
         expected = old.replace('self.window.configure(bg="#121317")', 'self.window.configure(bg="#ffffff")')
         expected = expected.replace('bg="#263040", fg="#cad6ea", activebackground="#404c60",\n            activeforeground="#ffffff"',

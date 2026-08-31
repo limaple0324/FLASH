@@ -9,12 +9,15 @@ can rely on the V0.2 API index before editing a specific module boundary.
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
 V01_SOURCE = ROOT / "flash_sync.py"
 V02_SOURCE = ROOT / "flash_sync_v02.py"
+API_SHAPE_BASELINE = ROOT / "V02_API_SHAPE_BASELINE.json"
 
 REQUIRED_API_IDS = (
     "GroupAPI",
@@ -65,6 +68,108 @@ def collect_defined_functions(tree: ast.Module) -> set[str]:
     return names
 
 
+def _annotation(node: ast.expr | None) -> str | None:
+    return ast.unparse(node) if node is not None else None
+
+
+def _api_entries(tree: ast.Module):
+    entries = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            entries[node.name] = ("module", node)
+        elif isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    entries.setdefault(child.name, (node.name, child))
+    return entries
+
+
+def _signature_shape(owner, node):
+    positional = list(node.args.posonlyargs) + list(node.args.args)
+    default_start = len(positional) - len(node.args.defaults)
+    parameters = []
+
+    def add(argument, kind, has_default):
+        parameters.append({
+            "name": argument.arg,
+            "kind": kind,
+            "annotation": _annotation(argument.annotation),
+            "has_default": bool(has_default),
+        })
+
+    for index, argument in enumerate(node.args.posonlyargs):
+        add(argument, "positional_only", index >= default_start)
+    for index, argument in enumerate(node.args.args, start=len(node.args.posonlyargs)):
+        add(argument, "positional_or_keyword", index >= default_start)
+    if node.args.vararg is not None:
+        add(node.args.vararg, "var_positional", False)
+    for argument, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+        add(argument, "keyword_only", default is not None)
+    if node.args.kwarg is not None:
+        add(node.args.kwarg, "var_keyword", False)
+    decorators = [
+        ast.unparse(item) for item in node.decorator_list
+        if ast.unparse(item) in ("staticmethod", "classmethod", "property")
+    ]
+    return {
+        "owner": owner,
+        "async": isinstance(node, ast.AsyncFunctionDef),
+        "decorators": decorators,
+        "parameters": parameters,
+        "returns": _annotation(node.returns),
+    }
+
+
+def api_shape_payload(tree: ast.Module, api_index) -> dict:
+    entries = _api_entries(tree)
+    signatures = {}
+    for method_names in api_index.values():
+        for name in method_names:
+            if name not in entries:
+                raise ValueError(f"indexed API is missing: {name}")
+            signatures[name] = _signature_shape(*entries[name])
+    return {
+        "schema_version": 1,
+        "api_index": {key: list(value) for key, value in api_index.items()},
+        "signatures": signatures,
+    }
+
+
+def api_shape_sha256(payload: dict) -> str:
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_api_shape_baseline(tree: ast.Module, api_index,
+                                baseline_path: Path = API_SHAPE_BASELINE) -> tuple[list[str], str]:
+    try:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return (["sanitized API-shape baseline is missing or invalid"], "")
+    required = {"schema_version", "base_commit", "api_count", "method_references", "shape_sha256"}
+    if set(baseline) != required:
+        return (["sanitized API-shape baseline schema is invalid"], "")
+    try:
+        payload = api_shape_payload(tree, api_index)
+    except (TypeError, ValueError) as exc:
+        return ([str(exc)], "")
+    digest = api_shape_sha256(payload)
+    errors = []
+    if baseline["schema_version"] != 1:
+        errors.append("sanitized API-shape baseline version is invalid")
+    if not isinstance(baseline["base_commit"], str) or len(baseline["base_commit"]) != 40:
+        errors.append("sanitized API-shape provenance is invalid")
+    if baseline["api_count"] != len(api_index):
+        errors.append("sanitized API-shape API count changed")
+    if baseline["method_references"] != sum(len(items) for items in api_index.values()):
+        errors.append("sanitized API-shape method count changed")
+    if baseline["shape_sha256"] != digest:
+        errors.append("sanitized API shape changed")
+    return errors, digest
+
+
 def main() -> int:
     v02_tree = parse_source(V02_SOURCE)
     defined_functions = collect_defined_functions(v02_tree)
@@ -80,6 +185,9 @@ def main() -> int:
 
     if tuple(protected) != REQUIRED_API_IDS:
         errors.append("PROTECTED_API_BOUNDARIES_V02 does not match REQUIRED_API_IDS.")
+
+    shape_errors, shape_digest = validate_api_shape_baseline(v02_tree, api_index)
+    errors.extend(shape_errors)
 
     seen_methods: dict[str, str] = {}
     duplicate_methods: list[tuple[str, str, str]] = []
@@ -125,6 +233,7 @@ def main() -> int:
     print("V0.2 API boundary validation passed.")
     print(f"API count: {len(api_index)}")
     print(f"Method references: {sum(len(methods) for methods in api_index.values())}")
+    print(f"API shape SHA256: {shape_digest}")
     print("V0.1/V0.2 identity checks passed.")
     return 0
 

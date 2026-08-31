@@ -25,6 +25,7 @@ class SourceIdentity:
     created: int
     launch_fingerprint: str
     image_sha256: str
+    normalized_target: str = ""
 
 
 @dataclass(frozen=True)

@@ -38,6 +38,9 @@ class Harness:
     show_timed_click_point = appmod.FlashSyncApp.show_timed_click_point
     game_time_ms_to_text = appmod.FlashSyncApp.game_time_ms_to_text
     update_estimated_game_time_label = appmod.FlashSyncApp.update_estimated_game_time_label
+    _set_game_time_text = appmod.FlashSyncApp._set_game_time_text
+    _set_timed_semantic = appmod.FlashSyncApp._set_timed_semantic
+    _timed_target_remaining_ms = appmod.FlashSyncApp._timed_target_remaining_ms
     poll_game_time_tick = appmod.FlashSyncApp.poll_game_time_tick
     on_close = appmod.FlashSyncApp.on_close
 
@@ -178,7 +181,10 @@ class TimedClickTests(unittest.TestCase):
         app.timed_click_fired = False
         app.timed_click_after_id = "old"
         app.timed_click_target_text = Value("08:59:329")
-        app.timed_click_status_text = Value("")
+        app.timed_click_status_text = Value("定時按下：來源失效")
+        app.timed_click_remaining_ms = 1
+        app.timed_click_last_clock_ms = 539_328
+        app.game_clock_source = SimpleNamespace(timed_source_state=lambda: "fault")
         app.parse_target_time_ms = lambda _text: 539_329
         app.schedule_timed_click_poll = MagicMock()
         app.fire_timed_click = MagicMock()
@@ -204,7 +210,7 @@ class TimedClickTests(unittest.TestCase):
         self.assertFalse(app.timed_click_enabled.get())
         app.fire_timed_click.assert_not_called()
         app.schedule_timed_click_poll.assert_not_called()
-        self.assertIn("時鐘失效", app.timed_click_status_text.get())
+        self.assertEqual(app.timed_click_status_text.get(), "定時按下：來源失效")
 
     def test_fire_uses_exact_three_safe_delays_and_disarms(self):
         app = Harness()
@@ -212,7 +218,7 @@ class TimedClickTests(unittest.TestCase):
         app.timed_click_point = (20, 30)
         app.timed_click_fired = False
         app.timed_click_enabled = Value(True)
-        app.timed_click_status_text = Value("")
+        app.timed_click_status_text = Value("定時按下：來源失效")
         app.write_log = MagicMock()
         app.send_timed_click_once = MagicMock()
         scheduled = []
@@ -229,6 +235,7 @@ class TimedClickTests(unittest.TestCase):
         app = Harness()
         app.timed_click_hwnd = 11
         app.timed_click_point = (20, 30)
+        app.timed_click_status_text = Value("定時按下：已啟用")
         app.write_log = MagicMock()
         app.after = MagicMock()
         native = MagicMock()
@@ -266,7 +273,7 @@ class TimedClickTests(unittest.TestCase):
         app.timed_click_overlay_windows = []
         app.timed_click_hwnd = 11
         app.timed_click_point = (20, 30)
-        app.timed_click_status_text = Value("")
+        app.timed_click_status_text = Value("定時按下：來源失效")
         app.timed_click_target_failure = lambda: None
         app.write_log = MagicMock()
         app.after = MagicMock()
@@ -283,7 +290,7 @@ class TimedClickTests(unittest.TestCase):
         leave.assert_called_once()
         top_level.assert_not_called()
         self.assertEqual(app.timed_click_overlay_windows, [])
-        self.assertIn("無法換算", app.timed_click_status_text.get())
+        self.assertEqual(app.timed_click_status_text.get(), "定時按下：來源失效")
         warning.assert_called_once_with("無法顯示定位", "無法換算目前保存座標。")
         native.PostMessageW.assert_not_called()
         native.mouse_event.assert_not_called()

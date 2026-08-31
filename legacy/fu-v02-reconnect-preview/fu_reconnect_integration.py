@@ -380,8 +380,6 @@ class EmbeddedAutomationController:
                         hwnd, pid = 0, 0
                     created = str(item.get("creation_time", ""))
                     created_dt = self._parse_utc_iso(created)
-                    command_line = str(item.get("command_line", ""))
-                    marker = str(entry.get("command_marker", ""))
                     if not hwnd or not pid or created_dt is None or not self.is_window(hwnd):
                         reason = "身份不足：CIM/PID/建立時間驗證失敗"
                     elif hwnd in before_hwnds:
@@ -390,8 +388,6 @@ class EmbeddedAutomationController:
                         reason = "身份不足：交易前已存在的程序晚出視窗"
                     elif created_dt < started_dt:
                         reason = "身份不足：程序建立時間早於本次啟動交易"
-                    elif marker and marker.casefold() not in command_line.casefold():
-                        reason = "身份不足：期望啟動參數與完整命令列不符"
                     else:
                         self.records[eid] = ManagedRecord(
                             eid, hwnd, pid, created, identity,

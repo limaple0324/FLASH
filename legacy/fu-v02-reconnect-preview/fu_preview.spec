@@ -17,6 +17,7 @@ datas = [
     (str(root / "role_id_templates.json"), "."),
     (str(root / "sync_launch_config.json"), "."),
     (str(root / "config.json"), "."),
+    (str(root / "RUNTIME_ASSET_MANIFEST.json"), "."),
 ]
 datas += collect_data_files("rapidocr_onnxruntime", include_py_files=False)
 
@@ -28,7 +29,7 @@ a = Analysis(
     hiddenimports=[
         "fu_reconnect_integration", "smart_reconnect", "manor_runtime", "fishing_profiles",
         "runtime_paths", "dpi_policy", "window_geometry", "user_activity_guard",
-        "v02_faithful_game_time", "win32com.client",
+        "v02_faithful_game_time", "runtime_asset_manifest", "session_identity", "win32com.client",
         "manor_assistant.models", "manor_assistant.vision", "manor_assistant.win32_api",
         "manor_assistant.workflow", "cv2", "numpy", "onnxruntime", "rapidocr_onnxruntime",
         "win32api", "win32con", "win32gui", "win32ui",

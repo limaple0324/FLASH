@@ -630,6 +630,11 @@ def transfer_window_binding(old_hwnd: int, new_hwnd: int):
             LOG.warning("轉移視窗綁定失敗：%s", e)
 
 def _apply_process_identity_to_item(hwnd: int, item: dict) -> dict:
+    """Refresh only non-sensitive executable metadata.
+
+    Process-lifetime HMACs are never copied into binding/profile dictionaries,
+    because those dictionaries are persisted by several callers.
+    """
     cur = dict(item or {})
     try:
         ident = dpi_policy.window_process_identity(int(hwnd))
@@ -637,171 +642,32 @@ def _apply_process_identity_to_item(hwnd: int, item: dict) -> dict:
         ident = {}
     if ident.get("process_exe"):
         cur["process_exe"] = str(ident.get("process_exe") or "")
-    if ident.get("process_identity"):
-        cur["process_identity"] = str(ident.get("process_identity") or "")
+    cur.pop("process_identity", None)
+    cur.pop("process_command_line", None)
     return cur
 
 
 def backfill_live_binding_process_identities() -> int:
-    """One-time migration for bindings created before V11.6. No window is restarted."""
-    changed = 0
-    with BINDINGS_FILE_LOCK:
-        try:
-            with binding_file_lock():
-                raw, profiles = _read_binding_store_unlocked()
-                dirty = False
-                for hwnd, item in list(raw.items()):
-                    if not _is_live_game_window(int(hwnd)):
-                        continue
-                    if str(item.get("process_identity", "") or ""):
-                        continue
-                    new_item = _apply_process_identity_to_item(int(hwnd), item)
-                    if not str(new_item.get("process_identity", "") or ""):
-                        continue
-                    raw[int(hwnd)] = new_item
-                    pkey = str(new_item.get("profile_key", "") or _profile_key(new_item.get("shortcut_path", "")))
-                    if pkey:
-                        prof = dict(profiles.get(pkey, {}))
-                        prof.update({k:v for k,v in new_item.items() if k != "pid"})
-                        prof["profile_key"] = pkey
-                        prof["updated_at"] = time.time()
-                        profiles[pkey] = prof
-                    dirty = True
-                    changed += 1
-                if dirty:
-                    _write_binding_store_unlocked(raw, profiles)
-        except Exception as e:
-            LOG.warning("V11.6 舊綁定程序身分補全失敗：%s", e)
-    return changed
+    """Legacy API: deterministic process identities are deliberately not rebuilt."""
+    return 0
 
 
 _AUTO_REBIND_LAST_SCAN = 0.0
 
 
 def auto_rebind_profiles_to_live_windows(hwnds: List[int], claimed_hwnds: set[int]) -> int:
-    """Re-associate a naturally restarted Flash window by exact process identity.
+    """Fail closed across processes/sessions.
 
-    Never guesses between multiple candidates. This is what makes a one-time binding
-    survive HWND/PID changes without reopening or changing the user's shortcut/window.
-    The relatively expensive process-command-line scan is batched and throttled.
+    A process-lifetime HMAC cannot be persisted or compared by another process.
+    Exact launch-transaction binding remains available in ``flash_sync_v02``;
+    background natural-restart guessing is intentionally disabled.
     """
     global _AUTO_REBIND_LAST_SCAN
     now = time.monotonic()
     if now - float(_AUTO_REBIND_LAST_SCAN) < 5.0:
         return 0
     _AUTO_REBIND_LAST_SCAN = now
-    rebound = 0
-    with BINDINGS_FILE_LOCK:
-        try:
-            with binding_file_lock():
-                raw, profiles = _read_binding_store_unlocked()
-                dirty = False
-                live_bound_profile_keys = set()
-                for old_hwnd, item in raw.items():
-                    if _is_live_game_window(int(old_hwnd)):
-                        pk = str(item.get("profile_key", "") or _profile_key(item.get("shortcut_path", "")))
-                        if pk:
-                            live_bound_profile_keys.add(pk)
-                candidate_hwnds = [
-                    int(h) for h in hwnds
-                    if int(h) not in claimed_hwnds and int(h) not in raw and _is_live_game_window(int(h))
-                ]
-                identities = dpi_policy.window_process_identities(candidate_hwnds) if candidate_hwnds else {}
-                for hwnd in candidate_hwnds:
-                    ident = dict(identities.get(int(hwnd), {}) or {})
-                    ident_key = str(ident.get("process_identity", "") or "")
-                    if not ident_key:
-                        continue
-                    matches = []
-                    for pk, prof in profiles.items():
-                        if not isinstance(prof, dict):
-                            continue
-                        if pk in live_bound_profile_keys:
-                            continue
-                        if str(prof.get("process_identity", "") or "") == ident_key:
-                            matches.append((str(pk), dict(prof)))
-                    if len(matches) != 1:
-                        continue
-                    pk, prof = matches[0]
-                    # Remove only stale HWND records for the same exact profile.
-                    for old_hwnd, old_item in list(raw.items()):
-                        old_pk = str(old_item.get("profile_key", "") or _profile_key(old_item.get("shortcut_path", "")))
-                        if old_pk == pk and not _is_live_game_window(int(old_hwnd)):
-                            raw.pop(int(old_hwnd), None)
-                    item = dict(prof)
-                    item.update({
-                        "pid": get_window_pid(hwnd),
-                        "last_hwnd": hwnd,
-                        "bound_at": time.time(),
-                        "process_exe": str(ident.get("process_exe", "") or item.get("process_exe", "")),
-                        "process_identity": ident_key,
-                        "profile_key": pk,
-                    })
-                    raw[hwnd] = item
-                    prof.update({k:v for k,v in item.items() if k != "pid"})
-                    prof["updated_at"] = time.time()
-                    profiles[pk] = prof
-                    live_bound_profile_keys.add(pk)
-                    dirty = True
-                    rebound += 1
-                    LOG.info("[%s] V11.6 自動接回自然重啟視窗：HWND=%s；不需重新綁定。", str(item.get("shortcut_name", "") or "已綁定"), hwnd)
-
-                # 程序命令列在不同 Windows/捷徑環境可能產生不同身分雜湊。
-                # 若現場「只剩一個未綁定 Flash」且「只剩一份完整未使用設定」，
-                # 候選是唯一的，允許自動接回；多一個候選就完全不猜。
-                remaining_hwnds = [h for h in candidate_hwnds if int(h) not in raw]
-                available_profiles = []
-                for pk, prof in profiles.items():
-                    if not isinstance(prof, dict) or str(pk) in live_bound_profile_keys:
-                        continue
-                    if not str(prof.get("shortcut_path", "") or "").strip():
-                        continue
-                    if not str(prof.get("preferred_role", "") or "").strip():
-                        continue
-                    available_profiles.append((str(pk), dict(prof)))
-                if (
-                    bool(CONFIG.get("唯一候選自動綁定", True))
-                    and len(remaining_hwnds) == 1
-                    and len(available_profiles) == 1
-                ):
-                    hwnd = int(remaining_hwnds[0])
-                    pk, prof = available_profiles[0]
-                    ident = dict(identities.get(hwnd, {}) or {})
-                    live_exe = str(ident.get("process_exe", "") or "").strip()
-                    saved_exe = str(prof.get("process_exe", "") or "").strip()
-                    same_host = True
-                    if live_exe and saved_exe:
-                        same_host = Path(live_exe).name.casefold() == Path(saved_exe).name.casefold()
-                    if same_host:
-                        for old_hwnd, old_item in list(raw.items()):
-                            old_pk = str(old_item.get("profile_key", "") or _profile_key(old_item.get("shortcut_path", "")))
-                            if old_pk == pk and not _is_live_game_window(int(old_hwnd)):
-                                raw.pop(int(old_hwnd), None)
-                        item = dict(prof)
-                        item.update({
-                            "pid": get_window_pid(hwnd),
-                            "last_hwnd": hwnd,
-                            "bound_at": time.time(),
-                            "process_exe": live_exe or saved_exe,
-                            "process_identity": str(ident.get("process_identity", "") or item.get("process_identity", "")),
-                            "profile_key": pk,
-                        })
-                        raw[hwnd] = item
-                        prof.update({k: v for k, v in item.items() if k != "pid"})
-                        prof["updated_at"] = time.time()
-                        profiles[pk] = prof
-                        live_bound_profile_keys.add(pk)
-                        dirty = True
-                        rebound += 1
-                        LOG.info(
-                            "[%s] 唯一視窗＋唯一完整設定，自動接回 HWND=%s；沒有多候選猜測。",
-                            str(item.get("shortcut_name", "") or "已綁定"), hwnd,
-                        )
-                if dirty:
-                    _write_binding_store_unlocked(raw, profiles)
-        except Exception as e:
-            LOG.warning("V11.6 自動接回綁定失敗：%s", e)
-    return rebound
+    return 0
 
 def shortcut_display_name(path_text: str, fallback: str = "") -> str:
     path_text = str(path_text or "").strip()

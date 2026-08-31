@@ -914,7 +914,6 @@ def save_user_binding_atomic(hwnd: int, shortcut_path: str, shortcut_name: str, 
             "bound_at": time.time(),
             "last_hwnd": hwnd,
             "process_exe": str(proc_ident.get("process_exe", "") or ""),
-            "process_identity": str(proc_ident.get("process_identity", "") or ""),
         })
         # Backward compatibility: roles created before the three independent
         # switches keep their previous behavior on first upgrade.

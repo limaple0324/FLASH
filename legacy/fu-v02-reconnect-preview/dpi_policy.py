@@ -4,13 +4,14 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import json
-import hashlib
 import re
 import os
 from pathlib import Path
 import subprocess
 import time
 from typing import Iterable
+
+from session_identity import process_identity as _session_process_identity
 
 try:
     import winreg
@@ -240,7 +241,6 @@ def process_identities_for_pids(pids: Iterable[int]) -> dict[int, dict]:
             cmd = str(row.get('CommandLine', '') or '')
             out[pid] = {
                 'process_exe': _norm_path(exe) if exe else '',
-                'process_command_line': cmd,
                 'process_identity': process_identity(exe, cmd),
             }
         return out
@@ -265,9 +265,7 @@ def window_process_identities(hwnds: Iterable[int]) -> dict[int, dict]:
 def process_identity(exe_path: str, command_line: str) -> str:
     exe = _norm_path(exe_path).lower() if exe_path else ''
     cmd = _normalize_command_line(command_line)
-    if not exe or not cmd:
-        return ''
-    return hashlib.sha256((exe + '\n' + cmd).encode('utf-8', errors='replace')).hexdigest()
+    return _session_process_identity(exe, cmd) if exe and cmd else ''
 
 
 def window_process_identity(hwnd: int) -> dict:
@@ -282,7 +280,6 @@ def window_process_identity(hwnd: int) -> dict:
     cmd = get_process_command_line(pid)
     return {
         'process_exe': exe,
-        'process_command_line': cmd,
         'process_identity': process_identity(exe, cmd),
     }
 

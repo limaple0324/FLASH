@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import os
+import tempfile
 import unittest
 
 from v02_faithful_game_time import (
@@ -12,24 +13,31 @@ from v02_faithful_game_time import (
 
 class SelectorTests(unittest.TestCase):
     def test_only_four_exact_desktop_names_are_resolved_and_selected(self):
-        existing = {name + ".lnk" for name in APPROVED_SHORTCUTS}
-        old_isfile = os.path.isfile
-        os.path.isfile = lambda path: os.path.basename(path) in existing
-        try:
+        with tempfile.TemporaryDirectory() as desktop:
+            for name in APPROVED_SHORTCUTS:
+                open(os.path.join(desktop, name + ".lnk"), "wb").close()
             resolver = lambda path: ("GameLoader.exe", "arg=" + os.path.splitext(os.path.basename(path))[0])
             fingerprint = lambda arguments: "fp:" + arguments
-            catalog = ApprovedShortcutCatalog(fingerprint, resolver=resolver, desktop="X:\\Desktop")
-            identities = [SimpleNamespace(launch_fingerprint="fp:arg=" + name) for name in APPROVED_SHORTCUTS]
-            identities.append(SimpleNamespace(launch_fingerprint="fp:arg=not-approved"))
+            catalog = ApprovedShortcutCatalog(fingerprint, resolver=resolver, desktop=desktop)
+            target = os.path.normcase(os.path.abspath("GameLoader.exe"))
+            identities = [SimpleNamespace(
+                hwnd=index + 1, pid=index + 10, tid=index + 20, created=index + 30,
+                image_sha256="image", normalized_target=target,
+                launch_fingerprint="fp:arg=" + name,
+            ) for index, name in enumerate(APPROVED_SHORTCUTS)]
+            identities.append(SimpleNamespace(
+                hwnd=99, pid=99, tid=99, created=99, image_sha256="image",
+                normalized_target=target, launch_fingerprint="fp:arg=not-approved",
+            ))
             selected = catalog.select(identities)
-        finally:
-            os.path.isfile = old_isfile
         self.assertEqual(tuple(label for label, _identity in selected), APPROVED_SHORTCUTS)
 
 
 class ConsensusTests(unittest.TestCase):
     def test_three_same_generation_samples_group_equal_values_and_list_unreadable(self):
         consensus = FaithfulConsensus()
+        for label in ("120古", "120靈", "大排"):
+            consensus.invalidate(label, 1)
         for label in ("120古", "120靈", "大排"):
             for _ in range(3):
                 consensus.add(FaithfulSample(label, 1, "12:34", "minute"))
@@ -39,6 +47,8 @@ class ConsensusTests(unittest.TestCase):
 
     def test_different_values_remain_separate_with_sources(self):
         consensus = FaithfulConsensus()
+        for label in APPROVED_SHORTCUTS:
+            consensus.invalidate(label, 7)
         for label, value in zip(APPROVED_SHORTCUTS, ("12:34", "12:34", "12:35", "12:36")):
             for _ in range(3):
                 consensus.add(FaithfulSample(label, 7, value, "minute"))
@@ -48,8 +58,10 @@ class ConsensusTests(unittest.TestCase):
 
     def test_generation_change_and_transition_require_fresh_consensus(self):
         consensus = FaithfulConsensus()
+        consensus.invalidate("120古", 1)
         for _ in range(3):
             consensus.add(FaithfulSample("120古", 1, "12:34", "minute"))
+        consensus.invalidate("120古", 2)
         consensus.add(FaithfulSample("120古", 2, "12:35", "minute"))
         self.assertNotIn("120古", consensus.committed)
         for _ in range(2):

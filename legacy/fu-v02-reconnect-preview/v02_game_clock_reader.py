@@ -29,6 +29,7 @@ TRAIT_PROFILES = (
 )
 IDENTITY_CHECK_NS = 1_000_000_000
 OBSERVATION_SLEEP_SECONDS = 0.25
+FULL_SCAN_INTERVAL_NS = 5_000_000_000
 
 
 class AcquisitionError(Exception):
@@ -37,6 +38,66 @@ class AcquisitionError(Exception):
 
 class NonTargetObject(AcquisitionError):
     """A completed check positively ruled out a target, not an incomplete read."""
+
+
+class FullScanCoordinator:
+    """One cancellable process-wide expensive scan, started at most every 5s."""
+    def __init__(self, monotonic_ns=time.perf_counter_ns, interval_ns=FULL_SCAN_INTERVAL_NS,
+                 wait_slice_seconds=0.05):
+        self.now = monotonic_ns
+        self.interval_ns = int(interval_ns)
+        self.wait_slice_seconds = float(wait_slice_seconds)
+        self._condition = threading.Condition()
+        self._busy = False
+        self._last_start_ns = None
+
+    @property
+    def last_start_ns(self):
+        with self._condition:
+            return self._last_start_ns
+
+    def reset(self):
+        with self._condition:
+            if self._busy:
+                raise RuntimeError("cannot reset an active full scan")
+            self._last_start_ns = None
+            self._condition.notify_all()
+
+    def run(self, cancel, operation):
+        while True:
+            if cancel.is_set():
+                raise AcquisitionError("來源發現已取消")
+            with self._condition:
+                now = self.now()
+                if self._last_start_ns is not None and now < self._last_start_ns:
+                    raise AcquisitionError("完整掃描單調時鐘逆序")
+                remaining_ns = (0 if self._last_start_ns is None else
+                                self.interval_ns - (now - self._last_start_ns))
+                if not self._busy and remaining_ns <= 0:
+                    self._busy = True
+                    self._last_start_ns = now
+                    break
+            wait_seconds = self.wait_slice_seconds
+            if remaining_ns > 0:
+                wait_seconds = min(wait_seconds, remaining_ns / 1_000_000_000)
+            if cancel.wait(max(0.001, wait_seconds)):
+                raise AcquisitionError("來源發現已取消")
+        try:
+            return operation()
+        finally:
+            with self._condition:
+                self._busy = False
+                self._condition.notify_all()
+
+
+_GLOBAL_SCAN_COORDINATOR = FullScanCoordinator()
+
+
+def reset_global_scan_coordinator(monotonic_ns=time.perf_counter_ns):
+    """Deterministic-test hook; production readers share the module singleton."""
+    global _GLOBAL_SCAN_COORDINATOR
+    _GLOBAL_SCAN_COORDINATOR = FullScanCoordinator(monotonic_ns)
+    return _GLOBAL_SCAN_COORDINATOR
 
 
 class MemoryInfo(ctypes.Structure):
@@ -157,7 +218,11 @@ class NativeSource:
             if image_hash != PLAYER_SHA256:
                 raise AcquisitionError("不支援的播放器版本")
             fingerprint = self.launch_digest(handle)
-            identity = SourceIdentity(int(hwnd), pid.value, int(tid), created, fingerprint, image_hash)
+            normalized_target = os.path.normcase(os.path.abspath(path.value))
+            identity = SourceIdentity(
+                int(hwnd), pid.value, int(tid), created, fingerprint, image_hash,
+                normalized_target,
+            )
             current_pid = wintypes.DWORD()
             current_tid = self.user.GetWindowThreadProcessId(hwnd, ctypes.byref(current_pid))
             if current_pid.value != identity.pid or current_tid != identity.tid:
@@ -265,9 +330,13 @@ def validate_values(raw, start, offset, lag, _legacy_wall_ms=None, *, allow_pend
 
 
 class GameClockReader:
-    def __init__(self, native=None, monotonic_ns=time.perf_counter_ns, **_legacy):
+    def __init__(self, native=None, monotonic_ns=time.perf_counter_ns,
+                 scan_coordinator=None, **_legacy):
         self.native = native or NativeSource()
         self.now = monotonic_ns
+        self.scan_coordinator = scan_coordinator or _GLOBAL_SCAN_COORDINATOR
+        self._scan_coordinator_explicit = scan_coordinator is not None
+        self.expected_identity = None
         self._profile_cache = None
         self._progress_hook = None
         self._stream_cancel = None
@@ -438,6 +507,14 @@ class GameClockReader:
             raise AcquisitionError("沒有唯一且版本已驗證的遊戲時間物件")
         return next(iter(candidates))
 
+    def full_scan(self, handle, cancel):
+        # Test readers often replace scan with a tiny deterministic fixture. They
+        # are coordinated only when the coordinator is explicitly injected.
+        if (type(self).scan is not GameClockReader.scan
+                and not getattr(self, "_scan_coordinator_explicit", False)):
+            return self.scan(handle, cancel)
+        return self.scan_coordinator.run(cancel, lambda: self.scan(handle, cancel))
+
     def stream(self, hwnd, cancel, publish):
         """One long-lived read-only handle; each accepted edge gets a FULL rescan.
 
@@ -445,7 +522,10 @@ class GameClockReader:
         A scan can miss a natural edge: the post-scan baseline discards all pairing
         state, never inventing requests or rebasing the original sample anchor.
         """
-        identity = self.native.identity(hwnd)
+        observed = self.native.identity(hwnd)
+        identity = self.expected_identity or observed
+        if observed != identity:
+            raise AcquisitionError("來源身分已改變")
         handle = self.native.open(identity.pid)
         last_progress = self.now()
         last_identity_check = None
@@ -469,23 +549,35 @@ class GameClockReader:
 
         self._stream_cancel, self._progress_hook = cancel, progress
         try:
+            if self.native.identity(hwnd) != identity:
+                raise AcquisitionError("來源身分已改變")
             progress(force=True)
-            candidate = self.scan(handle, cancel)
+            candidate = self.full_scan(handle, cancel)
+            if self.native.identity(hwnd) != identity:
+                raise AcquisitionError("來源身分已改變")
             progress(force=True)
             self.observe(handle, candidate)  # post-scan baseline; never published
+            if self.native.identity(hwnd) != identity:
+                raise AcquisitionError("來源身分已改變")
             progress()
             while not cancel.is_set():
                 # Four read attempts per second at most; this is a read-only
                 # faithful snapshot stream, not a millisecond polling loop.
                 time.sleep(OBSERVATION_SLEEP_SECONDS)
+                if self.native.identity(hwnd) != identity:
+                    raise AcquisitionError("來源身分已改變")
                 current = self.observe(handle, candidate)
-                progress()
+                if self.native.identity(hwnd) != identity:
+                    raise AcquisitionError("來源身分已改變")
+                progress(force=True)
                 # Identity/structure is checked without repeating the 2 GiB scan or
                 # 26.8 MiB ABC digest for every sample. Any failed check closes the
                 # stream; discovery must establish a fresh generation.
                 self.validate_structure(handle, candidate)
-                progress()
-                now = self.now()
+                if self.native.identity(hwnd) != identity:
+                    raise AcquisitionError("來源身分已改變")
+                progress(force=True)
+                checked_ns = self.now()
                 sample = ClockSample(
                     identity=identity,
                     server_ms=current.raw_ms,
@@ -495,7 +587,9 @@ class GameClockReader:
                     transition_ms=1000.0,
                     profile=PROFILE_ID,
                 )
-                publish(sample, "", now)
+                if sample.identity != identity or self.native.identity(hwnd) != identity:
+                    raise AcquisitionError("來源身分已改變")
+                publish(sample, "", checked_ns)
                 if cancel.is_set():
                     return
         finally:
@@ -508,7 +602,7 @@ class GameClockReader:
         try:
             if self.native.identity(hwnd) != identity:
                 raise AcquisitionError("來源身分已改變")
-            candidate = self.scan(handle, cancel)
+            candidate = self.full_scan(handle, cancel)
             if cancel.is_set() or self.native.identity(hwnd) != identity:
                 raise AcquisitionError("來源身分已改變")
             # A NEW read after the complete uniqueness scan: scan samples are never anchors.
@@ -583,7 +677,7 @@ class GameClockReader:
                              quality_observations=tuple(qualities))
             # Objects/uniqueness may change while waiting. Rescan before acceptance,
             # keeping the ORIGINAL edge QPC anchor (never the later scan time).
-            if self.scan(handle, cancel) != candidate:
+            if self.full_scan(handle, cancel) != candidate:
                 raise AcquisitionError("遊戲時間物件已改變")
             self.validate_structure(handle, candidate)
             if cancel.is_set() or self.native.identity(hwnd) != identity:

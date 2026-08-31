@@ -39,6 +39,16 @@
   "execution": "Codex desktop app",
   "paid_api": "forbidden",
   "github_validation": "required",
-  "status": "IMPLEMENTED",
-  "next_role": "github_validation"
+  "round2_base_commit": "40e504d57da0344fb44400b8029e7fb2596d528c",
+  "round2_evidence": {
+    "affected_tests": {"passed": 157, "failed": 0, "skipped": 0, "subtests": 27},
+    "targeted_post_regression": {"passed": 18, "failed": 0, "skipped": 0},
+    "manor_regression": {"passed": 59, "failed": 0, "skipped": 0},
+    "source_self_test": "PASS",
+    "packaged_self_test": "PASS",
+    "binary_asset_count": 82,
+    "candidate_sha256": "75fe2b2890320ba1ea1af8caec4d20306ca97aa9309fa1d2555cd88b84c85699"
+  },
+  "status": "ROUND2_IMPLEMENTATION_COMPLETE",
+  "next_role": "fixed_commit_review"
 }

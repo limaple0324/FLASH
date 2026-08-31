@@ -26,6 +26,7 @@ STATUS_METHODS = set(ast.literal_eval(INDEX_NODE.value)["StatusWindowAPI"])
 METHODS = STATUS_METHODS | {
     "load_launch_config", "save_launch_config", "current_group", "running_groups",
     "int_from_text", "queue_wheel_sync_at_point", "check_mouse_buttons",
+    "_set_game_time_source_text", "_set_game_time_text",
 }
 CONSTANTS = {
     "STATUS_PANEL_HEIGHT", "STATUS_PANEL_LEGACY_WIDTH", "STATUS_PANEL_DEFAULT_FONT_SIZE",

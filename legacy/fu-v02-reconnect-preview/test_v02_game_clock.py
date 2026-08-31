@@ -8,6 +8,7 @@ from pathlib import Path
 import queue
 import struct
 import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 import unittest
@@ -614,6 +615,9 @@ class IntegrationTests(unittest.TestCase):
         app.game_clock_reader = h.reader
         app.game_clock_source = h.source
         app.game_time_source_text = Value("尚未校正")
+        app._game_time_source_payload = None
+        app.game_time_text = Value("尚未校正")
+        app._game_time_text_payload = None
         app.closing_app = False
         app.source_harness = h
         return app
@@ -695,33 +699,6 @@ class IntegrationTests(unittest.TestCase):
             app.poll_game_clock_acquisition()
         self.assertEqual(h.source.generation, generation)
 
-    def test_stream_to_bounded_queue_clock_and_bar_multiple_rounds(self):
-        self.skipTest("single-source extrapolating integration was replaced by faithful multi-source consensus tests")
-        app = self.harness()
-        h = app.source_harness
-        reader = ContinuousReader()
-        token = app.game_time_source_token()
-        bar = ClockBar.__new__(ClockBar)
-        bar.value = "尚未校正"
-        bar.update_floating_status = MagicMock()
-        samples = []
-        def publish(item, reason, checked):
-            h.qpc = checked
-            h.publish(item, reason, token=token, checked=checked)
-            app.poll_game_clock_acquisition()
-            bar.update(app.game_clock.text())
-            if item is not None:
-                samples.append(item)
-                self.assertIs(app.game_clock.sample, item)
-                self.assertRegex(bar.value, r"^\d{2}:\d{2}:\d{2}\.\d{3}$")
-                if len(samples) == 3:
-                    h.source.cancel.set()
-        with patch("v02_game_clock_reader.time.sleep"):
-            reader.stream(11, h.source.cancel, publish)
-        self.assertEqual(len(samples), 3)
-        self.assertEqual(h.source.results.qsize(), 0)
-        self.assertLess(abs(app.game_clock.last_correction_ms), 1)
-
     def test_close_cancels_and_waits_for_cleanup_without_blocking_tk(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FlashSyncApp")
@@ -749,8 +726,18 @@ class IntegrationTests(unittest.TestCase):
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FlashSyncApp")
         methods = [node for node in cls.body if isinstance(node, ast.FunctionDef)
                     and node.name in ("enable_timed_click", "estimated_game_time_ms",
-                                      "timed_action_game_time_ms", "poll_timed_click")]
-        namespace = {"messagebox": MagicMock()}
+                                      "timed_action_game_time_ms", "poll_timed_click",
+                                      "_set_timed_semantic", "_timed_target_remaining_ms")]
+        namespace = {
+            "messagebox": MagicMock(), "DAY_MS": 86_400_000,
+            "FRESHNESS_TTL_NS": 30_000_000_000,
+            "TIMED_STATUS_VALUES": {"定時按下：已啟用", "定時按下：等待目標時間",
+                                    "定時按下：已觸發", "定時按下：來源失效"},
+            "TIMED_STATUS_ENABLED": "定時按下：已啟用",
+            "TIMED_STATUS_WAITING": "定時按下：等待目標時間",
+            "TIMED_STATUS_FIRED": "定時按下：已觸發",
+            "TIMED_STATUS_SOURCE_INVALID": "定時按下：來源失效",
+        }
         node = ast.ClassDef(name="Harness", bases=[], keywords=[], decorator_list=[], body=methods)
         exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "guard", "exec"), namespace)
         app = namespace["Harness"]()
@@ -774,7 +761,7 @@ class IntegrationTests(unittest.TestCase):
         app.poll_timed_click()
         app.fire_timed_click.assert_not_called()
         app.schedule_timed_click_poll.assert_not_called()
-        self.assertIn("時鐘失效", app.timed_click_status_text.get())
+        self.assertEqual(app.timed_click_status_text.get(), "定時按下：來源失效")
 
     def test_no_active_ocr_system_fallback(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
@@ -787,28 +774,13 @@ class IntegrationTests(unittest.TestCase):
             self.assertNotIn(forbidden, text)
 
     def test_unrelated_function_apis_match_fixed_batch_baseline(self):
-        try:
-            baseline = subprocess.check_output(["git", "show", "10fa86d0beb82ce60a6747172be881876fc9562e:outputs/flash_sync_v02.py"],
-                                               cwd=SOURCE.parent, encoding="utf-8", stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError:
-            self.skipTest("historical outputs path is not present in the sanitized source closure")
-        before, after = ast.parse(baseline), ast.parse(SOURCE.read_text(encoding="utf-8"))
-        def methods(tree):
-            cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FlashSyncApp")
-            return {node.name: ast.dump(node, include_attributes=False)
-                    for node in cls.body if isinstance(node, ast.FunctionDef)}
-        index = next(node for node in before.body if isinstance(node, ast.AnnAssign)
-                     and getattr(node.target, "id", "") == "MODULE_API_METHOD_INDEX_V02")
-        api = ast.literal_eval(index.value)
-        old, new = methods(before), methods(after)
-        protected = set().union(*(api[key] for key in ("GroupAPI", "LaunchAPI", "MainWindowAPI", "SyncAPI",
-                                                        "HotkeyAPI", "CharacterAPI")))
-        protected -= {
-            "start_sync", "poll_input", "run_sync_action", "_start_worker",
-            "install_mouse_wheel_hook", "uninstall_mouse_wheel_hook",
-        }
-        for name in protected:
-            self.assertEqual(old.get(name), new.get(name), name)
+        result = subprocess.run(
+            [sys.executable, str(SOURCE.parent / "verify_v02_api_boundaries.py")],
+            cwd=SOURCE.parent, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("API shape SHA256: ee7fa008654412b58fa04c43c6444d92413961469a20a53af4de943de58cecce",
+                      result.stdout)
 
 
 class ClockBarTests(unittest.TestCase):
