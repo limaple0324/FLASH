@@ -1,24 +1,74 @@
 {
-  "schema": 3,
+  "schema": 4,
   "round2_base_commit": "40e504d57da0344fb44400b8029e7fb2596d528c",
   "race_fix_base_commit": "571a3f2b16f8762adbc8b56ed5be50c7a8a0d90a",
+  "final_repair_base_commit": "12a7bbb8bc18ef064971386507003a6753a96293",
+  "candidate_commit": null,
+  "candidate_source_state": {
+    "description": "pre-evidence working-tree diff containing the eight source and test files used for the build",
+    "base_commit": "12a7bbb8bc18ef064971386507003a6753a96293",
+    "changed_file_count": 8,
+    "diff_bytes": 261844,
+    "diff_sha256": "4b038590a9ac84009fb387908e9b6f765a4303acabaf829fc48fda8cc6accf4a"
+  },
   "runtime": {
     "python": "3.12.10",
     "tcl_tk": "8.6.15",
     "pyinstaller": "6.22.2",
-    "environment": "isolated build venv outside the repository",
+    "pyinstaller_hooks_contrib": "2026.6",
+    "environment": "worktree-local isolated offline venv; removed after final validation",
     "dependencies": "requirements-build.txt",
-    "dependency_check": "PASS"
+    "locked_metadata": {"matched": 16, "required": 16},
+    "import_smoke": {"passed": 20, "failed": 0},
+    "native_smoke": {
+      "numpy": "PASS",
+      "onnxruntime_cpu_provider": "PASS",
+      "protobuf_upb": "PASS",
+      "pystray_win32": "PASS"
+    },
+    "worktree_local_origins": ["PyInstaller", "numpy", "onnxruntime", "protobuf", "pystray"]
+  },
+  "offline_materialization": {
+    "pyinstaller": {
+      "record_rows": 1137,
+      "site_package_rows": 1131,
+      "verified_script_rows_not_copied": 6,
+      "record_hash_verified": 578,
+      "record_hash_unspecified": 559,
+      "destination_rows_verified": 1131
+    },
+    "locked_distributions": {
+      "record_rows": 2099,
+      "site_package_rows": 2096,
+      "verified_script_rows_not_copied": 3,
+      "destination_rows_verified": 2096,
+      "collision_backup_count": 0,
+      "distributions": {
+        "pystray_0_19_5": {"record_rows": 35, "site_package_rows": 35},
+        "numpy_2_2_6": {"record_rows": 1311, "site_package_rows": 1309},
+        "onnxruntime_1_29_0": {"record_rows": 632, "site_package_rows": 631},
+        "protobuf_7_36_0": {"record_rows": 121, "site_package_rows": 121}
+      }
+    },
+    "network_used": false,
+    "pip_install_used": false,
+    "per_user_python_modified": false
   },
   "build": {
-    "command": "<isolated-build-venv>/python -m PyInstaller --noconfirm --clean --distpath <approved-race-fix-output> --workpath <race-fix-build-work> fu_preview.spec",
+    "command": "<worktree-venv>/python -m PyInstaller --noconfirm --clean --distpath <approved-final-output> --workpath <worktree-build-work> fu_preview.spec",
     "candidate": "輔V0.2_遊戲時間忠實模式_候選版.exe",
-    "output_directory": "FU-BATCH-20260831-001-ROUND2-RACE-CANDIDATE",
-    "bytes": 116294620,
-    "sha256": "7ac5583c4abcc16ccc7f6f4282c5ee3e8cfffc76727cde108a1fecd3c1186ef5",
+    "candidate_relative_path": "outputs/FU-BATCH-20260831-001-ROUND2-FINAL-CANDIDATE/輔V0.2_遊戲時間忠實模式_候選版.exe",
+    "output_directory": "FU-BATCH-20260831-001-ROUND2-FINAL-CANDIDATE",
+    "bytes": 122793905,
+    "sha256": "69f202102b82746385c495122a9e02710add2aa89b2da60e9a770584ab6aa3e7",
+    "prior_candidate_hash_comparisons": {
+      "cce8efeceaa17d5559ac124939ed7729e2428720cf24d60f39a77d2ab87ee307": "DIFFERENT",
+      "7ac5583c4abcc16ccc7f6f4282c5ee3e8cfffc76727cde108a1fecd3c1186ef5": "DIFFERENT"
+    },
     "authenticode": "NotSigned",
     "file_version": "0.2.1.0",
-    "product_name": "輔V0.2 自動重連獨立版"
+    "product_name": "輔V0.2 自動重連獨立版",
+    "result": "PASS"
   },
   "self_tests": {
     "source": {
@@ -31,6 +81,7 @@
       "physical_forbidden": true
     },
     "packaged": {
+      "exit_code": 0,
       "ok": true,
       "tk": "8.6.15",
       "native": true,
@@ -44,6 +95,13 @@
     "path": "RUNTIME_ASSET_MANIFEST.json",
     "binary_asset_count": 82,
     "required_data_file_count": 3,
+    "pkg_toc_entry_count": 1201,
+    "pkg_assets_matched": 82,
+    "pkg_assets_missing": 0,
+    "pkg_assets_extra": 0,
+    "pkg_required_files_matched": 3,
+    "pkg_required_files_missing": 0,
+    "pkg_manifest_present": true,
     "categories": {
       "root_icons": 2,
       "assets": 2,
@@ -53,11 +111,42 @@
     },
     "source_validation": "PASS",
     "packaged_validation": "PASS",
-    "missing_asset_fail_closed_tests": [
-      "templates",
-      "manor_assets",
-      "fishing_evidence"
-    ]
+    "missing_asset_fail_closed": {
+      "templates/auto_battle_no_x_correct_v1182.png": "asset_missing_or_size",
+      "manor_assets/action_bar.png": "asset_missing_or_size",
+      "fishing_evidence/fishing_chat_prepare_button.png": "asset_missing_or_size"
+    }
+  },
+  "regression": {
+    "direct_final": {
+      "passed": 48,
+      "failed": 0,
+      "skipped": 0,
+      "subtests": 51
+    },
+    "affected_final": {
+      "files": 7,
+      "passed": 180,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 0,
+      "subtests": 73,
+      "seconds": 5.51
+    },
+    "top_level_final": {
+      "modules": 12,
+      "passed": 310,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 0,
+      "subtests": 90,
+      "seconds": 12.95
+    },
+    "compileall_final": {
+      "python_files": 50,
+      "result": "PASS",
+      "note": "An initial Windows long-path cache attempt produced five output FileNotFound errors and no SyntaxError; the full rerun used a worktree-local extended-length cache and passed."
+    }
   },
   "api_shape": {
     "validation": "PASS",
@@ -65,76 +154,33 @@
     "method_reference_count": 239,
     "sha256": "ee7fa008654412b58fa04c43c6444d92413961469a20a53af4de943de58cecce"
   },
-  "regression": {
-    "race_fix_direct_red": {
-      "run": 1,
-      "passed": 0,
-      "failed": 1,
-      "skipped": 0,
-      "observed": "overflow=true while timed_source_state remained valid and timed action remained available"
-    },
-    "race_fix_direct_green": {
-      "run": 1,
-      "passed": 1,
-      "failed": 0,
-      "skipped": 0
-    },
-    "race_fix_affected_final": {
-      "run": 117,
-      "passed": 117,
-      "failed": 0,
-      "skipped": 0,
-      "subtests": 22
-    },
-    "prior_round2_affected_at_571a3f2": {
-      "run": 157,
-      "passed": 157,
-      "failed": 0,
-      "skipped": 0,
-      "subtests": 27
-    },
-    "prior_round2_top_level_single_run": {
-      "run": 259,
-      "passed": 247,
-      "failed": 7,
-      "skipped": 5,
-      "subtests": 39,
-      "classification": "seven stale test-harness failures and five historical-output API-baseline skips; no product failure"
-    },
-    "prior_round2_post_run_targeted_remediation": {
-      "run": 18,
-      "passed": 18,
-      "failed": 0,
-      "skipped": 0,
-      "coverage": "all seven prior failure IDs and all five formerly skipped API-boundary IDs"
-    },
-    "prior_round2_manor_single_run": {
-      "run": 59,
-      "passed": 59,
-      "failed": 0,
-      "skipped": 0
-    },
-    "race_fix_top_level_and_manor": "not rerun by explicit instruction; only the directly affected zero-skip suite was run"
+  "audit": {
+    "final_p0": 0,
+    "final_p1": 0,
+    "final_p2": 0
   },
-  "red_green_milestone": {
-    "initial": {
-      "run": 14,
-      "passed": 0,
-      "failed": 14,
-      "skipped": 0
+  "warnings": {
+    "pytest": 0,
+    "build_errors": 0,
+    "third_party_syntax_warning": {
+      "count": 1,
+      "classification": "rapidocr optional PyTorch module invalid escape sequence; packaged self-test passed"
     },
-    "implemented": {
-      "run": 14,
-      "passed": 14,
-      "failed": 0,
-      "skipped": 0
+    "pyinstaller_advisory": {
+      "missing_module_records": 266,
+      "excluded_module_records": 1,
+      "classification": "platform-specific and optional imports reported by PyInstaller; packaged self-test passed"
     }
   },
-  "performance_contract": {
-    "expensive_discovery_hz_max": 0.2,
-    "steady_reads_hz_max_per_source": 4,
-    "ui_publish_hz_max": 4,
-    "unchanged_redraws": 0,
-    "consensus_samples": 3
-  }
+  "source_manifest": {
+    "included_count": 144,
+    "validation": "PASS"
+  },
+  "remaining_unverified": [
+    "real shortcut-to-process binding on the target desktop",
+    "server_ms precision against a live GameLoader process",
+    "Windows 10 runtime behavior",
+    "GitHub validation chain"
+  ],
+  "known_design_limit": "Generation-startup uniqueness is re-established after identity, roster, generation, structural, or health failure; a second otherwise-valid candidate introduced without any such change is not continuously rescanned every 250 ms."
 }

@@ -27,8 +27,8 @@
     },
     {
       "path": "flash_sync_v02.py",
-      "sha256": "34ffa4c6d3ac3e60ab3383aafc370791e89f6afea519192064a008332a38a831",
-      "bytes": 389104
+      "sha256": "350686e9419095666b13678661279262cb0d038d3195eb988bf8070fe2f123dc",
+      "bytes": 392898
     },
     {
       "path": "flash_sync.py",
@@ -87,8 +87,8 @@
     },
     {
       "path": "test_fu_local_20260828_003.py",
-      "sha256": "c1bdf5226145bb4642ab0024d9dbcd3f96221098daf9e6aa6be7eac04d07c1a2",
-      "bytes": 14089
+      "sha256": "22dd9c3ecaed671c90fa6eaab5407e0a763bcd856fb5a75bca503c02d8d35578",
+      "bytes": 14716
     },
     {
       "path": "test_fu_local_20260830_002.py",
@@ -112,8 +112,8 @@
     },
     {
       "path": "test_v02_game_clock.py",
-      "sha256": "0cab73977940903145cf56bcec4422628a5bb5c6a8cf4444782cb304be9362eb",
-      "bytes": 43993
+      "sha256": "0f0128dcb2fffbc05dd58045b152284502b48a08665d95f98fa4c5a2a63397a9",
+      "bytes": 71862
     },
     {
       "path": "test_v02_notification_bar.py",
@@ -152,13 +152,13 @@
     },
     {
       "path": "v02_game_clock_reader.py",
-      "sha256": "c075794286af9d1a9b0608ebbec24797a3795ac58fa55fe8f045dd2fc7970d66",
-      "bytes": 35531
+      "sha256": "d494263f074f99da0b85d5ddf39044e513289ff782ee54a6dee83ce3ec7b2889",
+      "bytes": 49610
     },
     {
       "path": "v02_game_clock_source.py",
-      "sha256": "8c3d8506792a0db04031ec5ac340ae2ad20de463ae3fc5b103e1cda8999a8737",
-      "bytes": 12176
+      "sha256": "d469c848bd64c0e2cb7d9778a5191a4d64ff482682ec4724e247f21a941050b9",
+      "bytes": 12664
     },
     {
       "path": "v02_game_clock.py",
@@ -227,18 +227,18 @@
     },
     {
       "path": "test_v02_round2_e2e.py",
-      "sha256": "ae0a73c4352a1e3fd8805d5b8c419192ffdb1ba87bb442299c55f1a8b54e11b7",
-      "bytes": 19217
+      "sha256": "73fafd7c6922c32276f927a36e96edf79d9355071ad9728b8f271782cb2b34d6",
+      "bytes": 32195
     },
     {
       "path": "test_v02_round2_security.py",
-      "sha256": "5af409dea5c39318788598e7bbf0813bd6643f85af89fa346167bc56dcd879e2",
-      "bytes": 14456
+      "sha256": "e6ad1b83a4ba3d2298f55fc3251fd81017eb82b92a6ebaff9643389709a6af49",
+      "bytes": 105778
     },
     {
       "path": "v02_faithful_game_time.py",
-      "sha256": "ca59f576826778de3f3aa7ecf01a375cf15f90bc743341125282c8ae09741ace",
-      "bytes": 25828
+      "sha256": "031949b8f176b64805a3a784aad069a0f478b5aa809ab9ff0f26a41015331a47",
+      "bytes": 60620
     },
     {
       "path": "assets/auto_reconnect_icon.ico",
@@ -762,5 +762,14 @@
     "*.pyc",
     "runtime status and diagnostic JSON",
     "compiled executables"
-  ]
+  ],
+  "final_repair_base_commit": "12a7bbb8bc18ef064971386507003a6753a96293",
+  "provenance": {
+    "state": "pre-commit working tree",
+    "candidate_commit": null,
+    "candidate_source_diff_base": "12a7bbb8bc18ef064971386507003a6753a96293",
+    "candidate_source_diff_bytes": 261844,
+    "candidate_source_diff_sha256": "4b038590a9ac84009fb387908e9b6f765a4303acabaf829fc48fda8cc6accf4a",
+    "candidate_source_changed_file_count": 8
+  }
 }

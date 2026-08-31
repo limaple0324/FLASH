@@ -67,6 +67,7 @@ TIMED_STATUS_VALUES = frozenset({
     TIMED_STATUS_ENABLED, TIMED_STATUS_WAITING,
     TIMED_STATUS_TRIGGERED, TIMED_STATUS_SOURCE_INVALID,
 })
+TIMED_BACKWARD_CORRECTION_MAX_MS = 100
 STATUS_PANEL_HEIGHT = 42
 STATUS_PANEL_LEGACY_WIDTH = 600  # Only for migration of the previous fixed-width settings.
 STATUS_PANEL_DEFAULT_FONT_SIZE = 14  # Pixels, independent of Tk's point scaling.
@@ -2725,6 +2726,10 @@ class FlashSyncApp(tk.Tk):
         self.timed_click_fired = False
         self.timed_click_remaining_ms: int | None = None
         self.timed_click_last_clock_ms: int | None = None
+        self.timed_click_deadline_ns: int | None = None
+        self.timed_click_target_ms: int | None = None
+        self.timed_click_missed_target_ms: int | None = None
+        self.timed_click_waiting_seen_after_init = False
         self.autoclick_interval_ms_text = tk.StringVar(value="20")
         self.autoclick_button_text = tk.StringVar(value="左鍵")
         self.autoclick_repeat_forever = tk.BooleanVar(value=True)
@@ -7757,6 +7762,37 @@ class FlashSyncApp(tk.Tk):
         """Earlier time-of-day is always the next day, never an immediate fire."""
         return (int(target_ms) - int(current_ms)) % DAY_MS
 
+    @staticmethod
+    def _timed_monotonic_ns() -> int:
+        return time.perf_counter_ns()
+
+    @staticmethod
+    def _timed_signed_delta_ms(previous_ms: int, current_ms: int) -> int:
+        delta = (int(current_ms) - int(previous_ms)) % DAY_MS
+        return delta - DAY_MS if delta > DAY_MS // 2 else delta
+
+    def _initialize_timed_deadline(self, current_ms: int, target_ms: int) -> None:
+        if self.timed_click_deadline_ns is not None:
+            return
+        remaining_ms = self._timed_target_remaining_ms(current_ms, target_ms)
+        self.timed_click_remaining_ms = remaining_ms
+        self.timed_click_last_clock_ms = int(current_ms)
+        self.timed_click_deadline_ns = (
+            self._timed_monotonic_ns() + remaining_ms * 1_000_000
+        )
+        self.timed_click_waiting_seen_after_init = False
+
+    def _stop_timed_click_invalid(self, *, missed: bool = False) -> None:
+        if missed:
+            self.timed_click_missed_target_ms = self.timed_click_target_ms
+        self.timed_click_enabled.set(False)
+        self.timed_click_remaining_ms = None
+        self.timed_click_last_clock_ms = None
+        self.timed_click_deadline_ns = None
+        self.timed_click_target_ms = None
+        self.timed_click_waiting_seen_after_init = False
+        self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
+
     def toggle_timed_click(self) -> None:
         if self.timed_click_enabled.get():
             self.enable_timed_click()
@@ -7775,17 +7811,26 @@ class FlashSyncApp(tk.Tk):
             self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
             messagebox.showwarning("按鈕位置不可用", failure)
             return
-        current_ms = self.timed_action_game_time_ms()
-        if current_ms is None:
-            self.timed_click_enabled.set(False)
-            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
-            messagebox.showwarning("缺少遊戲時間", "目前遊戲時鐘尚未校正，這次定時不會執行。")
-            return
         self.timed_click_fired = False
-        self.timed_click_remaining_ms = self._timed_target_remaining_ms(current_ms, target_ms)
-        self.timed_click_last_clock_ms = current_ms
+        self.timed_click_remaining_ms = None
+        self.timed_click_last_clock_ms = None
+        self.timed_click_deadline_ns = None
+        self.timed_click_target_ms = target_ms
+        self.timed_click_missed_target_ms = None
+        self.timed_click_waiting_seen_after_init = False
+        current_ms = self.timed_action_game_time_ms()
+        state = getattr(
+            self.game_clock_source, "timed_source_state", lambda: "fault",
+        )()
+        if state == "fault" or (state == "valid" and current_ms is None):
+            self._stop_timed_click_invalid()
+            return
+        if state == "valid":
+            self._initialize_timed_deadline(current_ms, target_ms)
         self._set_timed_semantic(TIMED_STATUS_ENABLED)
-        self.schedule_timed_click_poll()
+        self.schedule_timed_click_poll(
+            5 if self.timed_click_deadline_ns is not None else 250,
+        )
 
     def cancel_timed_click(self) -> None:
         self.timed_click_enabled.set(False)
@@ -7797,9 +7842,13 @@ class FlashSyncApp(tk.Tk):
             self.timed_click_after_id = None
         self.timed_click_remaining_ms = None
         self.timed_click_last_clock_ms = None
+        self.timed_click_deadline_ns = None
+        self.timed_click_target_ms = None
+        self.timed_click_missed_target_ms = None
+        self.timed_click_waiting_seen_after_init = False
         self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
 
-    def schedule_timed_click_poll(self) -> None:
+    def schedule_timed_click_poll(self, delay_ms: int = 5) -> None:
         if not self.timed_click_enabled.get():
             return
         if self.timed_click_after_id:
@@ -7807,43 +7856,80 @@ class FlashSyncApp(tk.Tk):
                 self.after_cancel(self.timed_click_after_id)
             except Exception:
                 pass
-        self.timed_click_after_id = self.after(5, self.poll_timed_click)
+        delay_ms = 250 if int(delay_ms) >= 250 else 5
+        self.timed_click_after_id = self.after(delay_ms, self.poll_timed_click)
 
     def poll_timed_click(self) -> None:
         self.timed_click_after_id = None
         if not self.timed_click_enabled.get() or self.timed_click_fired:
             return
+        monotonic_now = self._timed_monotonic_ns()
+        state = getattr(
+            self.game_clock_source, "timed_source_state", lambda: "fault",
+        )()
         now_ms = self.timed_action_game_time_ms()
-        target_ms = self.parse_target_time_ms(self.timed_click_target_text.get())
-        if now_ms is None:
-            state = getattr(self.game_clock_source, "timed_source_state", lambda: "fault")()
-            if state == "waiting":
-                self._set_timed_semantic(TIMED_STATUS_WAITING)
-                self.schedule_timed_click_poll()
-                return
-            self.timed_click_enabled.set(False)
-            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
+        target_ms = self.timed_click_target_ms
+        if state == "fault":
+            self._stop_timed_click_invalid()
             return
         if target_ms is None:
-            self.timed_click_enabled.set(False)
-            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
+            self._stop_timed_click_invalid()
             return
-        if self.timed_click_remaining_ms is None or self.timed_click_last_clock_ms is None:
-            self.timed_click_enabled.set(False)
-            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
+        if self.timed_click_deadline_ns is None:
+            if state == "waiting" and now_ms is None:
+                self._set_timed_semantic(TIMED_STATUS_WAITING)
+                self.schedule_timed_click_poll(250)
+                return
+            if state != "valid" or now_ms is None:
+                self._stop_timed_click_invalid()
+                return
+            self._initialize_timed_deadline(now_ms, target_ms)
+            monotonic_now = self._timed_monotonic_ns()
+            if self.timed_click_remaining_ms == 0:
+                self.fire_timed_click(now_ms, target_ms)
+                return
+            self._set_timed_semantic(TIMED_STATUS_WAITING)
+            self.schedule_timed_click_poll(5)
             return
-        advance = (now_ms - self.timed_click_last_clock_ms) % DAY_MS
-        if advance > FRESHNESS_TTL_NS // 1_000_000:
-            self.timed_click_enabled.set(False)
-            self._set_timed_semantic(TIMED_STATUS_SOURCE_INVALID)
+        deadline_ns = self.timed_click_deadline_ns
+        if deadline_ns is None:
+            self._stop_timed_click_invalid()
             return
-        self.timed_click_last_clock_ms = now_ms
-        self.timed_click_remaining_ms -= advance
-        if self.timed_click_remaining_ms <= 0:
+        if state == "waiting":
+            if monotonic_now >= deadline_ns:
+                self._stop_timed_click_invalid(missed=True)
+                return
+            self.timed_click_waiting_seen_after_init = True
+            self._set_timed_semantic(TIMED_STATUS_WAITING)
+            self.schedule_timed_click_poll(250)
+            return
+        if state != "valid" or now_ms is None:
+            self._stop_timed_click_invalid()
+            return
+        if (self.timed_click_waiting_seen_after_init
+                and monotonic_now >= deadline_ns):
+            self._stop_timed_click_invalid(missed=True)
+            return
+        previous_ms = self.timed_click_last_clock_ms
+        remaining_ms = self.timed_click_remaining_ms
+        if previous_ms is None or remaining_ms is None:
+            self._stop_timed_click_invalid()
+            return
+        advance_ms = self._timed_signed_delta_ms(previous_ms, now_ms)
+        if (advance_ms > FRESHNESS_TTL_NS // 1_000_000
+                or advance_ms < -TIMED_BACKWARD_CORRECTION_MAX_MS):
+            self._stop_timed_click_invalid()
+            return
+        if advance_ms >= 0 and advance_ms >= remaining_ms:
             self.fire_timed_click(now_ms, target_ms)
             return
+        remaining_ms -= advance_ms
+        self.timed_click_last_clock_ms = int(now_ms)
+        self.timed_click_remaining_ms = remaining_ms
+        self.timed_click_deadline_ns = monotonic_now + remaining_ms * 1_000_000
+        self.timed_click_waiting_seen_after_init = False
         self._set_timed_semantic(TIMED_STATUS_WAITING)
-        self.schedule_timed_click_poll()
+        self.schedule_timed_click_poll(5)
 
     def fire_timed_click(self, now_ms: int, target_ms: int) -> None:
         hwnd = self.timed_click_hwnd
@@ -7857,6 +7943,10 @@ class FlashSyncApp(tk.Tk):
         self.timed_click_enabled.set(False)
         self.timed_click_remaining_ms = None
         self.timed_click_last_clock_ms = None
+        self.timed_click_deadline_ns = None
+        self.timed_click_target_ms = None
+        self.timed_click_missed_target_ms = None
+        self.timed_click_waiting_seen_after_init = False
         self._set_timed_semantic(TIMED_STATUS_TRIGGERED)
 
     def send_timed_click_once(self, hwnd: int, point: tuple[int, int]) -> bool:

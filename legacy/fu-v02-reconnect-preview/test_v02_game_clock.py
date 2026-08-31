@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 from dataclasses import replace
 from pathlib import Path
 import queue
@@ -16,8 +17,14 @@ from unittest.mock import MagicMock, patch
 
 from v02_game_clock import (ClockSample, GameClock, SourceIdentity, HEALTH_MAX_GAP_NS,
                             SAMPLE_MAX_AGE_NS, MAX_SLEW_ERROR_MS, SLEW_MS_PER_SECOND)
-from v02_game_clock_reader import (AcquisitionError, Candidate, GameClockReader,
-                                   EdgeTracker, NonTargetObject, Observation, PLAYER_SHA256, validate_values)
+from v02_game_clock_reader import (
+    ADAPTIVE_BURST_HARD_MAX_NS, ADAPTIVE_BURST_SAMPLE_MAX_NS,
+    AcquisitionError, BURST_OBSERVATION_SLACK_NS, BURST_POLL_INTERVAL_NS,
+    Candidate, EDGE_RESPONSE_MAX_MS, GameClockReader, EdgeTracker,
+    NonTargetObject, Observation, PLAYER_SHA256,
+    PREDICTIVE_REQUEST_WINDOW_MAX_NS, predict_burst_window, validate_values,
+)
+from v02_faithful_game_time import APPROVED_SHORTCUTS, MultiGameClockSource
 from v02_game_clock_bar import ClockBar
 from test_flash_sync_status_window import Panel, Value, Group, NAMESPACE
 
@@ -406,8 +413,14 @@ class ReaderTests(unittest.TestCase):
         reader.validate_structure = MagicMock()
         pair = struct.pack("<dd", EPOCH, EPOCH - 1000)
         core = struct.pack("<ddd", -28_800_000, 0, 970)
-        reader.native.read.side_effect = [pair, core, struct.pack("<dd", EPOCH + 10000, EPOCH - 1000)]
-        with self.assertRaises(AcquisitionError):
+        changed = struct.pack("<dd", EPOCH + 10000, EPOCH - 1000)
+        reader.native.read.side_effect = [pair, core, changed, pair, core, pair]
+        with patch("v02_game_clock_reader.time.sleep") as retry_sleep:
+            self.assertEqual(reader.observe(99, Candidate(1, 2)).raw_ms, EPOCH)
+        retry_sleep.assert_called_once_with(0.001)
+
+        reader.native.read.side_effect = [pair, core, changed] * 3
+        with patch("v02_game_clock_reader.time.sleep"), self.assertRaises(AcquisitionError):
             reader.observe(99, Candidate(1, 2))
         reader.native.read.side_effect = [pair, core, pair]
         self.assertEqual(reader.observe(99, Candidate(1, 2)).raw_ms, EPOCH)
@@ -433,7 +446,7 @@ class ContinuousReader(GameClockReader):
             self._read_progress()
         return self.expected
 
-    def observe(self, handle, candidate):
+    def _read_observation_values(self, handle, candidate):
         self.observations += 1
         self.qpc += 1_000_000
         elapsed = (self.qpc - 1_000_000_000) // 1_000_000
@@ -446,24 +459,657 @@ class ContinuousReader(GameClockReader):
 
 
 class ContinuousReaderTests(unittest.TestCase):
-    def test_multiple_live_edges_reuse_validated_candidate_at_four_hz_or_less(self):
+    def test_stream_docstring_matches_layered_identity_and_structure_cadence(self):
+        doc = inspect.getdoc(GameClockReader.stream) or ""
+        self.assertIn("cheap live token on every sample", doc)
+        self.assertIn("full SourceIdentity at startup and about once per second", doc)
+        self.assertIn("ABC profile at startup or when its structure key changes", doc)
+        self.assertNotIn("Each later read rechecks the complete source identity", doc)
+
+    def test_normal_four_hz_stream_uses_cheap_token_per_sample_and_full_identity_at_one_hz(self):
+        class SpyNative:
+            def __init__(self):
+                self.full_calls = 0
+                self.cheap_calls = 0
+
+            def identity(self, _hwnd):
+                self.full_calls += 1
+                return IDENTITY
+
+            def live_token(self, _hwnd, _handle):
+                self.cheap_calls += 1
+                return (IDENTITY.hwnd, IDENTITY.pid, IDENTITY.tid, IDENTITY.created)
+
+            @staticmethod
+            def open(_pid):
+                return 99
+
+            @staticmethod
+            def close(_handle):
+                return None
+
+        class SpyReader(GameClockReader):
+            def __init__(self, native):
+                self.qpc = 1_000_000_000
+                super().__init__(native=native, monotonic_ns=lambda: self.qpc)
+
+            @staticmethod
+            def full_scan(_handle, _cancel):
+                return Candidate(0x1000, 0x2000)
+
+            @staticmethod
+            def validate_structure(_handle, _candidate):
+                return None
+
+            def _read_observation_values(self, _handle, _candidate):
+                return Observation(EPOCH, EPOCH, 0, self.qpc, self.qpc + 10_000)
+
+        native = SpyNative()
+        reader = SpyReader(native)
+        cancel = threading.Event()
+        snapshots = []
+
+        def sleep(seconds):
+            reader.qpc += int(round(seconds * 1_000_000_000))
+
+        def publish(item, _reason, _checked_ns):
+            if item is not None:
+                snapshots.append(item)
+                if len(snapshots) == 8:
+                    cancel.set()
+
+        with patch("v02_game_clock_reader.time.sleep", side_effect=sleep):
+            reader.stream(IDENTITY.hwnd, cancel, publish)
+
+        self.assertEqual(len(snapshots), 8)
+        self.assertGreaterEqual(native.cheap_calls, len(snapshots))
+        self.assertLessEqual(native.full_calls, 7)
+
+    def test_creation_token_reuse_faults_on_next_sample_without_waiting_for_full_identity(self):
+        class ReuseNative:
+            def __init__(self):
+                self.reused = False
+                self.full_calls = 0
+                self.cheap_calls = 0
+
+            def identity(self, _hwnd):
+                self.full_calls += 1
+                return IDENTITY
+
+            def live_token(self, _hwnd, _handle):
+                self.cheap_calls += 1
+                created = IDENTITY.created + int(self.reused)
+                return (IDENTITY.hwnd, IDENTITY.pid, IDENTITY.tid, created)
+
+            @staticmethod
+            def open(_pid):
+                return 99
+
+            @staticmethod
+            def close(_handle):
+                return None
+
+        class ReuseReader(GameClockReader):
+            def __init__(self, native):
+                self.qpc = 1_000_000_000
+                super().__init__(native=native, monotonic_ns=lambda: self.qpc)
+
+            @staticmethod
+            def full_scan(_handle, _cancel):
+                return Candidate(0x1000, 0x2000)
+
+            @staticmethod
+            def validate_structure(_handle, _candidate):
+                return None
+
+            def _read_observation_values(self, _handle, _candidate):
+                return Observation(EPOCH, EPOCH, 0, self.qpc, self.qpc + 10_000)
+
+        native = ReuseNative()
+        reader = ReuseReader(native)
+        cancel = threading.Event()
+        snapshots = []
+
+        def sleep(seconds):
+            reader.qpc += int(round(seconds * 1_000_000_000))
+            if snapshots:
+                native.reused = True
+
+        def publish(item, _reason, _checked_ns):
+            if item is not None:
+                snapshots.append(item)
+                if len(snapshots) == 3:
+                    cancel.set()
+
+        with patch("v02_game_clock_reader.time.sleep", side_effect=sleep):
+            with self.assertRaises(AcquisitionError):
+                reader.stream(IDENTITY.hwnd, cancel, publish)
+        self.assertEqual(len(snapshots), 1)
+        self.assertGreaterEqual(native.cheap_calls, 2)
+
+    def test_multi_wrapper_trusts_reader_identity_fence_and_reuse_faults_cheaply(self):
+        class InlineThread:
+            def __init__(self, *, target, **_kwargs):
+                self.target = target
+                self.alive = False
+
+            def start(self):
+                self.alive = True
+                try:
+                    self.target()
+                finally:
+                    self.alive = False
+
+            def is_alive(self):
+                return self.alive
+
+        class SpyNative:
+            def __init__(self):
+                self.full_calls = 0
+                self.cheap_calls = 0
+                self.created = IDENTITY.created
+
+            def identity(self, _hwnd):
+                self.full_calls += 1
+                return IDENTITY
+
+            def live_token(self, _hwnd, _handle):
+                self.cheap_calls += 1
+                return (IDENTITY.hwnd, IDENTITY.pid, IDENTITY.tid, self.created)
+
+            @staticmethod
+            def open(_pid):
+                return 99
+
+            @staticmethod
+            def close(_handle):
+                return None
+
+        class SpyReader(GameClockReader):
+            # The override delegates acquisition to the base stream and only
+            # observes callbacks, so it explicitly preserves its attestation.
+            stream_identity_verified = True
+
+            def __init__(self, native, *, reuse=False):
+                self.qpc = 1_000_000_000
+                self.snapshots = []
+                self.full_after_first = None
+                self.reuse = reuse
+                super().__init__(native=native, monotonic_ns=lambda: self.qpc)
+
+            @staticmethod
+            def full_scan(_handle, _cancel):
+                return Candidate(0x1000, 0x2000)
+
+            @staticmethod
+            def validate_structure(_handle, _candidate):
+                return None
+
+            def _read_observation_values(self, _handle, _candidate):
+                return Observation(EPOCH, EPOCH, 0, self.qpc, self.qpc + 10_000)
+
+            def stream(self, hwnd, cancel, publish):
+                def capture(item, reason, checked_ns):
+                    publish(item, reason, checked_ns)
+                    if item is None:
+                        return
+                    self.snapshots.append(item)
+                    if len(self.snapshots) == 1 and self.reuse:
+                        self.full_after_first = self.native.full_calls
+                        self.native.created += 1
+                    if len(self.snapshots) == 8:
+                        cancel.set()
+                return super().stream(hwnd, cancel, capture)
+
+        for reuse in (False, True):
+            with self.subTest(reuse=reuse):
+                native = SpyNative()
+                reader = SpyReader(native, reuse=reuse)
+                model = MultiGameClockSource(
+                    lambda: reader, lambda _cancel: (),
+                    monotonic_ns=lambda: reader.qpc,
+                    thread_factory=InlineThread,
+                )
+                epoch = model.event_epoch
+
+                def sleep(seconds):
+                    reader.qpc += int(round(seconds * 1_000_000_000))
+
+                with patch("v02_game_clock_reader.time.sleep", side_effect=sleep):
+                    self.assertTrue(model._start_stream(APPROVED_SHORTCUTS[0], IDENTITY))
+
+                if reuse:
+                    self.assertEqual(len(reader.snapshots), 1)
+                    self.assertGreater(model.event_epoch, epoch)
+                    self.assertTrue(model.source_faulted)
+                    self.assertEqual(native.full_calls, reader.full_after_first)
+                    self.assertGreaterEqual(native.cheap_calls, 2)
+                else:
+                    self.assertEqual(len(reader.snapshots), 8)
+                    self.assertEqual(model.event_epoch, epoch)
+                    self.assertLessEqual(native.full_calls, 5)
+                    self.assertGreaterEqual(native.cheap_calls, len(reader.snapshots))
+
+    def test_burst_full_fences_are_bounded_and_stalled_final_fence_faults(self):
+        class InlineThread:
+            def __init__(self, *, target, **_kwargs):
+                self.target = target
+                self.alive = False
+
+            def start(self):
+                self.alive = True
+                try:
+                    self.target()
+                finally:
+                    self.alive = False
+
+            def is_alive(self):
+                return self.alive
+
+        class SpyNative:
+            def __init__(self):
+                self.full_calls = 0
+                self.cheap_calls = 0
+
+            def identity(self, _hwnd):
+                self.full_calls += 1
+                return IDENTITY
+
+            def live_token(self, _hwnd, _handle):
+                self.cheap_calls += 1
+                return (IDENTITY.hwnd, IDENTITY.pid, IDENTITY.tid, IDENTITY.created)
+
+            @staticmethod
+            def open(_pid):
+                return 99
+
+            @staticmethod
+            def close(_handle):
+                return None
+
+        class BurstReader(GameClockReader):
+            stream_identity_verified = True
+
+            def __init__(self, native, *, stall_final=False):
+                self.qpc = 1_000_000_000
+                self.structure_calls = 0
+                self.edge_publications = 0
+                self.stall_final = stall_final
+                super().__init__(native=native, monotonic_ns=lambda: self.qpc)
+
+            @staticmethod
+            def full_scan(_handle, _cancel):
+                return Candidate(0x1000, 0x2000)
+
+            def validate_structure(self, _handle, _candidate):
+                self.structure_calls += 1
+                if self.stall_final and self.structure_calls == 4:
+                    self.qpc += HEALTH_MAX_GAP_NS + 1
+
+            def _read_observation_values(self, _handle, _candidate):
+                start = EPOCH + (1_000 if self.qpc >= 1_250_000_000 else 0)
+                raw = EPOCH + (1_020 if self.qpc >= 1_260_000_000 else 0)
+                return Observation(raw, start, 0, self.qpc, self.qpc + 10_000)
+
+            def stream(self, hwnd, cancel, publish):
+                def capture(item, reason, checked_ns):
+                    publish(item, reason, checked_ns)
+                    if item is not None and item.edge is not None:
+                        self.edge_publications += 1
+                        cancel.set()
+                return super().stream(hwnd, cancel, capture)
+
+        for stall_final in (False, True):
+            with self.subTest(stall_final=stall_final):
+                native = SpyNative()
+                reader = BurstReader(native, stall_final=stall_final)
+                model = MultiGameClockSource(
+                    lambda: reader, lambda _cancel: (),
+                    monotonic_ns=lambda: reader.qpc,
+                    thread_factory=InlineThread,
+                )
+                epoch = model.event_epoch
+
+                def sleep(seconds):
+                    reader.qpc += int(round(seconds * 1_000_000_000))
+
+                with patch("v02_game_clock_reader.time.sleep", side_effect=sleep):
+                    self.assertTrue(model._start_stream(APPROVED_SHORTCUTS[0], IDENTITY))
+
+                if stall_final:
+                    self.assertEqual(reader.edge_publications, 0)
+                    self.assertGreater(model.event_epoch, epoch)
+                    self.assertTrue(model.source_faulted)
+                else:
+                    self.assertEqual(reader.edge_publications, 1)
+                    self.assertEqual(model.event_epoch, epoch)
+                    self.assertEqual(native.full_calls, 4)
+                    self.assertGreater(native.cheap_calls, native.full_calls)
+                self.assertEqual(reader.structure_calls, 4)
+
+    def test_prediction_renews_three_consecutive_edges_with_bounded_fast_reads(self):
+        class RenewalReader(GameClockReader):
+            def __init__(self):
+                self.qpc = 9_750_000_000
+                native = MagicMock()
+                native.identity.return_value = IDENTITY
+                native.open.return_value = 99
+                super().__init__(native=native, monotonic_ns=lambda: self.qpc)
+                self.structure_checks = []
+                self.small_reads = 0
+                native.read.side_effect = self.read_memory
+
+            @staticmethod
+            def full_scan(_handle, _cancel):
+                return Candidate(0x1000, 0x2000)
+
+            def validate_structure(self, _handle, _candidate):
+                self.structure_checks.append(self.qpc)
+
+            def read_memory(self, _handle, address, amount):
+                request_cycle = (0 if self.qpc < 9_800_000_000 else
+                                 1 + (self.qpc - 9_800_000_000) // 10_000_000_000)
+                response_cycle = (0 if self.qpc < 9_820_000_000 else
+                                  1 + (self.qpc - 9_820_000_000) // 10_000_000_000)
+                start = EPOCH + request_cycle * 10_000
+                raw = (EPOCH if response_cycle == 0
+                       else EPOCH + response_cycle * 10_000 + 20)
+                self.small_reads += 1
+                if address == 0x1410 and amount == 16:
+                    return struct.pack("<dd", raw, start)
+                if address == 0x2158 and amount == 24:
+                    return struct.pack("<ddd", -28_800_000.0, 0.0, 0.0)
+                raise AssertionError((address, amount))
+
+        reader = RenewalReader()
+        cancel = threading.Event()
+        readings = []
+        edge_checks = []
+        one_ms_sleeps = []
+
+        def sleep(seconds):
+            reader.qpc += int(round(seconds * 1_000_000_000))
+            if seconds == 0.001:
+                one_ms_sleeps.append(reader.qpc)
+
+        def publish(item, reason, checked_ns):
+            self.assertFalse(reason)
+            if item is None:
+                return
+            readings.append(item)
+            if item.edge is not None:
+                self.assertFalse(item.reset_anchor)
+                edge_checks.append(checked_ns)
+                if len(edge_checks) == 3:
+                    cancel.set()
+
+        with patch("v02_game_clock_reader.time.sleep", side_effect=sleep):
+            reader.stream(IDENTITY.hwnd, cancel, publish)
+
+        edges = [item.edge for item in readings if item.edge is not None]
+        self.assertEqual(sum(item.reset_anchor for item in readings), 1)
+        self.assertEqual(len(edges), 3)
+        self.assertEqual(
+            [edge.server_ms for edge in edges],
+            [EPOCH + 20_020, EPOCH + 30_020, EPOCH + 40_020],
+        )
+        self.assertEqual(edge_checks, [19_820_000_000, 29_820_000_000,
+                                       39_820_000_000])
+        groups = []
+        for instant in one_ms_sleeps:
+            if not groups or instant - groups[-1][-1] != BURST_POLL_INTERVAL_NS:
+                groups.append([instant])
+            else:
+                groups[-1].append(instant)
+        self.assertEqual(len(groups), len(edges))
+        for group, checked_ns in zip(groups, edge_checks):
+            burst_start_ns = group[0] - BURST_POLL_INTERVAL_NS
+            burst_fences = [instant for instant in reader.structure_checks
+                            if burst_start_ns <= instant <= checked_ns]
+            self.assertEqual(burst_fences, [burst_start_ns, checked_ns])
+        self.assertLessEqual(
+            len(one_ms_sleeps),
+            len(edges) * (ADAPTIVE_BURST_HARD_MAX_NS // BURST_POLL_INTERVAL_NS),
+        )
+        self.assertGreater(reader.small_reads, 3 * len(reader.structure_checks))
+
+    def test_fixed_phase_miss_predicts_next_edge_without_structure_scan_per_ms(self):
+        class PhaseReader(GameClockReader):
+            def __init__(self):
+                self.qpc = 9_750_000_000
+                native = MagicMock()
+                native.identity.return_value = IDENTITY
+                native.open.return_value = 99
+                super().__init__(native=native, monotonic_ns=lambda: self.qpc)
+                self.structure_checks = []
+                self.small_reads = 0
+                native.read.side_effect = self.read_memory
+
+            @staticmethod
+            def full_scan(_handle, _cancel):
+                return Candidate(0x1000, 0x2000)
+
+            def validate_structure(self, _handle, _candidate):
+                self.structure_checks.append(self.qpc)
+
+            def read_memory(self, _handle, address, amount):
+                if self.qpc > 20_500_000_000:
+                    raise AssertionError("fixed 250 ms phase lock was not broken")
+                cycle = 0 if self.qpc < 9_800_000_000 else 1 if self.qpc < 19_800_000_000 else 2
+                start = EPOCH + cycle * 10_000
+                if self.qpc < 9_820_000_000:
+                    raw = EPOCH
+                elif self.qpc < 19_900_000_000:
+                    raw = EPOCH + 10_020
+                else:
+                    # The predicted request is observed at the final instant of
+                    # its 50 ms slice; a quality-limit 100 ms response is still
+                    # read at the inclusive sample deadline.
+                    raw = EPOCH + 20_100
+                self.small_reads += 1
+                if address == 0x1410 and amount == 16:
+                    return struct.pack("<dd", raw, start)
+                if address == 0x2158 and amount == 24:
+                    return struct.pack("<ddd", -28_800_000.0, 0.0, 0.0)
+                raise AssertionError((address, amount))
+
+        reader = PhaseReader()
+        cancel = threading.Event()
+        readings = []
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            reader.qpc += int(round(seconds * 1_000_000_000))
+
+        def publish(item, reason, _checked):
+            self.assertFalse(reason)
+            if item is not None:
+                readings.append(item)
+                if getattr(item, "edge", None) is not None:
+                    cancel.set()
+
+        with patch("v02_game_clock_reader.time.sleep", side_effect=sleep):
+            reader.stream(IDENTITY.hwnd, cancel, publish)
+
+        edge = readings[-1].edge
+        same_poll = next(
+            item for item in readings
+            if item.edge is None and item.server_ms == EPOCH + 10_020
+        )
+        self.assertTrue(same_poll.reset_anchor)
+        self.assertIsInstance(edge, ClockSample)
+        self.assertFalse(readings[-1].reset_anchor)
+        self.assertEqual(edge.server_ms, EPOCH + 20_100)
+        self.assertEqual(edge.response_interval_ms, EDGE_RESPONSE_MAX_MS)
+        self.assertLessEqual(edge.observation_bracket_ns, 25_000_000)
+        self.assertTrue(any(value == 0.001 for value in sleeps))
+        burst_structure = [value for value in reader.structure_checks
+                           if 19_740_000_000 <= value <= 19_910_000_000]
+        self.assertEqual(len(burst_structure), 2)
+        burst_polls = [value for value in sleeps if value == 0.001]
+        self.assertGreaterEqual(len(burst_polls), 150)
+        self.assertLessEqual(
+            len(burst_polls), ADAPTIVE_BURST_SAMPLE_MAX_NS // 1_000_000,
+        )
+        self.assertLessEqual(sum(burst_polls), ADAPTIVE_BURST_HARD_MAX_NS / 1e9)
+        self.assertGreater(reader.small_reads, 3 * len(burst_structure))
+
+    def test_one_prediction_window_covers_full_uncertainty_response_and_slack(self):
+        previous = Observation(EPOCH, EPOCH, 0, 9_750_000_000, 9_750_010_000)
+        current = Observation(EPOCH + 10_020, EPOCH + 10_000, 0,
+                              10_000_000_000, 10_000_010_000)
+        earliest = previous.after_ns + 10_000_000_000
+        latest = current.after_ns + 10_000_000_000
+        start, sample_deadline, hard_deadline = predict_burst_window(previous, current)
+
+        self.assertEqual(start, earliest)
+        self.assertEqual(latest - earliest, 250_000_000)
+        self.assertLessEqual(latest - earliest, PREDICTIVE_REQUEST_WINDOW_MAX_NS)
+        self.assertEqual(
+            sample_deadline,
+            latest + EDGE_RESPONSE_MAX_MS * 1_000_000 + BURST_POLL_INTERVAL_NS,
+        )
+        self.assertEqual(
+            hard_deadline,
+            latest + EDGE_RESPONSE_MAX_MS * 1_000_000 + BURST_OBSERVATION_SLACK_NS,
+        )
+        self.assertLessEqual(hard_deadline - start, ADAPTIVE_BURST_HARD_MAX_NS)
+
+        too_wide = replace(current, before_ns=current.before_ns + 22_000_000,
+                           after_ns=current.after_ns + 22_000_000)
+        self.assertIsNone(predict_burst_window(previous, too_wide))
+
+    def test_272ms_slow_structure_rejects_only_prediction_and_keeps_stream(self):
+        class SlowStructureReader(GameClockReader):
+            def __init__(self):
+                self.qpc = 1_000_000_000
+                native = MagicMock()
+                native.identity.return_value = IDENTITY
+                native.open.return_value = 99
+                super().__init__(native=native, monotonic_ns=lambda: self.qpc)
+                self.structure_checks = 0
+
+            @staticmethod
+            def full_scan(_handle, _cancel):
+                return Candidate(0x1000, 0x2000)
+
+            def validate_structure(self, _handle, _candidate):
+                self.structure_checks += 1
+                if self.structure_checks == 2:
+                    self.qpc += 22_000_000
+
+            def _read_observation_values(self, _handle, _candidate):
+                changed = self.qpc >= 1_272_000_000
+                return Observation(
+                    EPOCH + (1020 if changed else 0),
+                    EPOCH + (1000 if changed else 0), 0,
+                    self.qpc, self.qpc + 10_000,
+                )
+
+        reader = SlowStructureReader()
+        cancel = threading.Event()
+        readings = []
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            reader.qpc += int(round(seconds * 1_000_000_000))
+
+        def publish(item, _reason, _checked):
+            if item is not None:
+                readings.append(item)
+                if getattr(item, "reset_anchor", False):
+                    cancel.set()
+
+        with patch("v02_game_clock_reader.time.sleep", side_effect=sleep):
+            reader.stream(IDENTITY.hwnd, cancel, publish)
+
+        self.assertTrue(readings[-1].reset_anchor)
+        self.assertIsNone(readings[-1].edge)
+        self.assertEqual(reader.qpc, 1_272_000_000)
+        self.assertNotIn(0.001, sleeps)
+
+    def test_pending_request_uses_bounded_one_ms_burst_for_qualified_edge(self):
+        class BurstReader(GameClockReader):
+            def __init__(self):
+                self.qpc = 1_000_000_000
+                native = MagicMock()
+                native.identity.return_value = IDENTITY
+                native.open.return_value = 99
+                super().__init__(native=native, monotonic_ns=lambda: self.qpc)
+                self.observation_count = 0
+
+            @staticmethod
+            def full_scan(_handle, _cancel):
+                return Candidate(0x1000, 0x2000)
+
+            @staticmethod
+            def validate_structure(_handle, _candidate):
+                return None
+
+            def _read_observation_values(self, _handle, _candidate):
+                call = self.observation_count
+                self.observation_count += 1
+                if call == 0:
+                    self.qpc = 1_000_000_000
+                    raw, start = EPOCH, EPOCH
+                elif call == 1:
+                    self.qpc = 1_250_000_000
+                    raw, start = EPOCH, EPOCH + 1000
+                elif call <= 21:
+                    burst_ms = call - 1
+                    self.qpc = 1_250_000_000 + burst_ms * 1_000_000
+                    raw = EPOCH + 1020 if burst_ms == 20 else EPOCH
+                    start = EPOCH + 1000
+                else:
+                    raise AssertionError("qualified edge was not captured during bounded burst")
+                return Observation(raw, start, 0, self.qpc, self.qpc + 10_000)
+
+        reader = BurstReader()
+        cancel = threading.Event()
+        sleeps = []
+        readings = []
+
+        def publish(item, reason, _checked):
+            self.assertFalse(reason)
+            if item is not None:
+                readings.append(item)
+                if getattr(item, "edge", None) is not None:
+                    cancel.set()
+
+        with patch("v02_game_clock_reader.time.sleep",
+                   side_effect=lambda seconds: sleeps.append(seconds)):
+            reader.stream(IDENTITY.hwnd, cancel, publish)
+
+        edge = readings[-1].edge
+        self.assertIsInstance(edge, ClockSample)
+        self.assertEqual(edge.server_ms, EPOCH + 1020)
+        self.assertLessEqual(edge.observation_bracket_ns, 25_000_000)
+        self.assertEqual(edge.response_interval_ms, 20)
+        self.assertEqual(edge.anchor_ns, (1_269_000_000 + 1_270_010_000) // 2)
+        burst_sleeps = [value for value in sleeps if value == 0.001]
+        self.assertEqual(len(burst_sleeps), 20)
+        self.assertLessEqual(sum(burst_sleeps), 0.150)
+        self.assertTrue(all(not isinstance(item, ClockSample) for item in readings))
+
+    def test_multiple_live_snapshots_reuse_validated_candidate_at_four_hz_or_less(self):
         reader = ContinuousReader()
         cancel = threading.Event()
-        samples, health = [], []
+        readings, health = [], []
         def publish(item, reason, checked):
             self.assertFalse(reason)
             if item is None:
                 health.append(checked)
             else:
-                samples.append(item)
-                self.assertLess(checked - item.anchor_ns, 25_000_000)
-                if len(samples) == 3:
+                readings.append(item)
+                if len(readings) == 3:
                     cancel.set()
         with patch("v02_game_clock_reader.time.sleep") as sleep:
             reader.stream(11, cancel, publish)
         self.assertEqual(reader.scan_count, 1)
-        self.assertEqual([row.server_ms for row in samples], [EPOCH, EPOCH, EPOCH])
-        self.assertTrue(all(row.response_interval_ms == 0 for row in samples))
+        self.assertEqual([row.server_ms for row in readings], [EPOCH, EPOCH, EPOCH])
+        self.assertTrue(all(row.edge is None for row in readings))
         self.assertTrue(all(b - a < HEALTH_MAX_GAP_NS for a, b in zip(health, health[1:])))
         self.assertEqual(sleep.call_count, 3)
         self.assertEqual(reader.observations, 4)
@@ -497,7 +1143,7 @@ class ContinuousReaderTests(unittest.TestCase):
         with patch("v02_game_clock_reader.time.sleep"):
             reader.stream(11, cancel, publish)
         self.assertEqual(reader.scan_count, 1)
-        self.assertEqual(checks, [reader.expected])
+        self.assertEqual(checks, [reader.expected, reader.expected])
         reader.native.close.assert_called_once()
 
     def test_scan_no_progress_or_qpc_rollback_is_not_health(self):
@@ -535,6 +1181,26 @@ class ContinuousReaderTests(unittest.TestCase):
         tracker.feed(obs(0, 10000, 1_001_000_000))
         with self.assertRaisesRegex(AcquisitionError, "重疊"):
             tracker.feed(obs(0, 20000, 1_002_000_000))
+
+    def test_same_poll_251ms_miss_never_becomes_a_fake_request_qpc(self):
+        def obs(raw, start, ns):
+            return Observation(EPOCH + raw, EPOCH + start, 0, ns, ns + 10_000)
+
+        tracker = EdgeTracker(IDENTITY, obs(0, 0, 1_000_000_000))
+        # The first request and response were both missed during a 251 ms
+        # observation interval.  Its observation QPC is not the request QPC.
+        self.assertIsNone(tracker.feed(obs(10_020, 10_000, 1_251_000_000)))
+        self.assertIsNone(tracker.last_request)
+
+        # The next cadence is observed faithfully.  Reusing 1.251 s as the old
+        # request QPC would create a 251 ms continuity error and false fault.
+        for instant in (3_000_000_000, 5_000_000_000, 7_000_000_000,
+                        9_000_000_000):
+            self.assertIsNone(tracker.feed(obs(10_020, 10_000, instant)))
+        self.assertIsNone(tracker.feed(obs(10_020, 20_000, 11_000_000_000)))
+        qualified = tracker.feed(obs(20_020, 20_000, 11_020_000_000))
+        self.assertIsInstance(qualified, ClockSample)
+        self.assertEqual(qualified.response_interval_ms, 20)
 
 
 class ProfileTests(unittest.TestCase):
@@ -743,6 +1409,7 @@ class IntegrationTests(unittest.TestCase):
         app = namespace["Harness"]()
         app.game_clock_source = MagicMock()
         app.game_clock_source.timed_action_time_of_day_ms.return_value = None
+        app.game_clock_source.timed_source_state.return_value = "waiting"
         app.parse_target_time_ms = lambda text: 3600000
         app.timed_click_target_text = Value("01:00")
         app.timed_click_enabled = Value(True)
@@ -751,17 +1418,23 @@ class IntegrationTests(unittest.TestCase):
         app.timed_click_status_text = Value("")
         app.write_log = MagicMock()
         app.schedule_timed_click_poll = MagicMock()
-        app.enable_timed_click()
-        self.assertFalse(app.timed_click_enabled.get())
-        app.schedule_timed_click_poll.assert_not_called()
-        app.timed_click_enabled.set(True)
-        app.timed_click_fired = False
-        app.timed_click_after_id = "scheduled"
         app.fire_timed_click = MagicMock()
+        app._timed_monotonic_ns = lambda: 1_000_000_000
+        app.enable_timed_click()
+        self.assertTrue(app.timed_click_enabled.get())
+        self.assertIsNone(app.timed_click_deadline_ns)
+        self.assertIsNone(app.timed_click_remaining_ms)
+        app.fire_timed_click.assert_not_called()
+        app.schedule_timed_click_poll.assert_called_once_with(250)
+
+        app.schedule_timed_click_poll.reset_mock()
+        app.timed_click_after_id = "scheduled"
         app.poll_timed_click()
         app.fire_timed_click.assert_not_called()
-        app.schedule_timed_click_poll.assert_not_called()
-        self.assertEqual(app.timed_click_status_text.get(), "定時按下：來源失效")
+        app.schedule_timed_click_poll.assert_called_once_with(250)
+        self.assertTrue(app.timed_click_enabled.get())
+        self.assertIsNone(app.timed_click_deadline_ns)
+        self.assertEqual(app.timed_click_status_text.get(), "定時按下：等待目標時間")
 
     def test_no_active_ocr_system_fallback(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))

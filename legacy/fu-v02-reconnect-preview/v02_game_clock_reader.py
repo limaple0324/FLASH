@@ -6,6 +6,7 @@ or logs memory/launch arguments. A missed/partial region invalidates uniqueness.
 from __future__ import annotations
 
 import array
+from collections import deque
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass, replace
@@ -29,7 +30,35 @@ TRAIT_PROFILES = (
 )
 IDENTITY_CHECK_NS = 1_000_000_000
 OBSERVATION_SLEEP_SECONDS = 0.25
+ADAPTIVE_BURST_SLEEP_SECONDS = 0.001
+OBSERVATION_READ_MAX_NS = 20_000_000
+BURST_POLL_INTERVAL_NS = int(ADAPTIVE_BURST_SLEEP_SECONDS * 1_000_000_000)
+EDGE_RESPONSE_MAX_MS = 100
+NORMAL_OBSERVATION_INTERVAL_NS = int(OBSERVATION_SLEEP_SECONDS * 1_000_000_000)
+PREDICTIVE_REQUEST_WINDOW_MAX_NS = (
+    NORMAL_OBSERVATION_INTERVAL_NS + OBSERVATION_READ_MAX_NS + BURST_POLL_INTERVAL_NS
+)
+# A response at the last request-window instant may take 100 ms, followed by
+# one 1 ms poll and a fixed-field RPM taking at most 20 ms.  Five more ms are a
+# named scheduling allowance, not a widened response-quality threshold.
+BURST_OBSERVATION_SLACK_NS = 25_000_000
+BURST_REQUIRED_SLACK_NS = OBSERVATION_READ_MAX_NS + BURST_POLL_INTERVAL_NS
+if BURST_OBSERVATION_SLACK_NS < BURST_REQUIRED_SLACK_NS:
+    raise RuntimeError("adaptive burst observation slack is insufficient")
+ADAPTIVE_BURST_SAMPLE_MAX_NS = (
+    PREDICTIVE_REQUEST_WINDOW_MAX_NS
+    + EDGE_RESPONSE_MAX_MS * 1_000_000
+    + BURST_POLL_INTERVAL_NS
+)
+ADAPTIVE_BURST_HARD_MAX_NS = (
+    PREDICTIVE_REQUEST_WINDOW_MAX_NS
+    + EDGE_RESPONSE_MAX_MS * 1_000_000
+    + BURST_OBSERVATION_SLACK_NS
+)
+OUTER_TRANSIENT_RETRY_LIMIT = 3
+OUTER_TRANSIENT_RETRY_BUDGET_NS = OBSERVATION_READ_MAX_NS
 FULL_SCAN_INTERVAL_NS = 5_000_000_000
+FULL_SCAN_DEADLINE_NS = 30_000_000_000
 
 
 class AcquisitionError(Exception):
@@ -38,6 +67,10 @@ class AcquisitionError(Exception):
 
 class NonTargetObject(AcquisitionError):
     """A completed check positively ruled out a target, not an incomplete read."""
+
+
+class TransientObservation(Exception):
+    """The fixed-field pair changed during its seqlock read; retry is bounded."""
 
 
 class FullScanCoordinator:
@@ -50,6 +83,7 @@ class FullScanCoordinator:
         self._condition = threading.Condition()
         self._busy = False
         self._last_start_ns = None
+        self._waiters = deque()
 
     @property
     def last_start_ns(self):
@@ -63,31 +97,51 @@ class FullScanCoordinator:
             self._last_start_ns = None
             self._condition.notify_all()
 
-    def run(self, cancel, operation):
-        while True:
-            if cancel.is_set():
-                raise AcquisitionError("來源發現已取消")
-            with self._condition:
-                now = self.now()
-                if self._last_start_ns is not None and now < self._last_start_ns:
-                    raise AcquisitionError("完整掃描單調時鐘逆序")
-                remaining_ns = (0 if self._last_start_ns is None else
-                                self.interval_ns - (now - self._last_start_ns))
-                if not self._busy and remaining_ns <= 0:
-                    self._busy = True
-                    self._last_start_ns = now
-                    break
-            wait_seconds = self.wait_slice_seconds
-            if remaining_ns > 0:
-                wait_seconds = min(wait_seconds, remaining_ns / 1_000_000_000)
-            if cancel.wait(max(0.001, wait_seconds)):
-                raise AcquisitionError("來源發現已取消")
+    def run(self, cancel, operation, wait_progress=None):
+        """Run one FIFO scan; report cancellable waiting progress outside the lock."""
+        ticket = object()
+        acquired = False
+        with self._condition:
+            self._waiters.append(ticket)
+            self._condition.notify_all()
         try:
-            return operation()
+            while True:
+                if cancel.is_set():
+                    raise AcquisitionError("來源發現已取消")
+                with self._condition:
+                    now = self.now()
+                    if self._last_start_ns is not None and now < self._last_start_ns:
+                        raise AcquisitionError("完整掃描單調時鐘逆序")
+                    remaining_ns = (0 if self._last_start_ns is None else
+                                    self.interval_ns - (now - self._last_start_ns))
+                    first = bool(self._waiters) and self._waiters[0] is ticket
+                    if first and not self._busy and remaining_ns <= 0:
+                        self._waiters.popleft()
+                        self._busy = True
+                        self._last_start_ns = now
+                        acquired = True
+                        break
+                if wait_progress is not None:
+                    wait_progress()
+                wait_seconds = self.wait_slice_seconds
+                if remaining_ns > 0:
+                    wait_seconds = min(wait_seconds, remaining_ns / 1_000_000_000)
+                if cancel.wait(max(0.001, wait_seconds)):
+                    raise AcquisitionError("來源發現已取消")
+            try:
+                return operation()
+            finally:
+                with self._condition:
+                    self._busy = False
+                    self._condition.notify_all()
         finally:
-            with self._condition:
-                self._busy = False
-                self._condition.notify_all()
+            if not acquired:
+                with self._condition:
+                    try:
+                        self._waiters.remove(ticket)
+                    except ValueError:
+                        pass
+                    self._condition.notify_all()
 
 
 _GLOBAL_SCAN_COORDINATOR = FullScanCoordinator()
@@ -124,6 +178,7 @@ class NativeSource:
             (self.kernel.VirtualQueryEx, [wintypes.HANDLE, ctypes.c_void_p,
                                          ctypes.POINTER(MemoryInfo), ctypes.c_size_t], ctypes.c_size_t),
             (self.kernel.GetProcessTimes, [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4, wintypes.BOOL),
+            (self.kernel.GetExitCodeProcess, [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
             (self.kernel.QueryFullProcessImageNameW, [wintypes.HANDLE, wintypes.DWORD,
                                                     wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
             (self.user.IsWindow, [wintypes.HWND], wintypes.BOOL),
@@ -142,6 +197,24 @@ class NativeSource:
 
     def close(self, handle):
         self.kernel.CloseHandle(handle)
+
+    def _process_created(self, handle):
+        stamps = [wintypes.FILETIME() for _ in range(4)]
+        if not self.kernel.GetProcessTimes(
+                handle, *(ctypes.byref(value) for value in stamps)):
+            raise AcquisitionError("來源生命週期無法確認")
+        return (stamps[0].dwHighDateTime << 32) | stamps[0].dwLowDateTime
+
+    def live_token(self, hwnd, handle):
+        """Cheap per-sample HWND/process-lifetime token using the open handle."""
+        pid = wintypes.DWORD()
+        tid = self.user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        exit_code = wintypes.DWORD()
+        if (not self.user.IsWindow(hwnd) or not pid.value or not tid
+                or not self.kernel.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                or exit_code.value != 259):  # STILL_ACTIVE
+            raise AcquisitionError("來源視窗已失效")
+        return (int(hwnd), pid.value, int(tid), self._process_created(handle))
 
     def launch_digest(self, handle):
         class UnicodeString(ctypes.Structure):
@@ -190,10 +263,7 @@ class NativeSource:
             raise AcquisitionError("來源視窗已失效")
         handle = self.open(pid.value)
         try:
-            stamps = [wintypes.FILETIME() for _ in range(4)]
-            if not self.kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in stamps)):
-                raise AcquisitionError("來源生命週期無法確認")
-            created = (stamps[0].dwHighDateTime << 32) | stamps[0].dwLowDateTime
+            created = self._process_created(handle)
             path = ctypes.create_unicode_buffer(32768)
             length = wintypes.DWORD(len(path))
             if not self.kernel.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(length)):
@@ -265,18 +335,30 @@ class Observation:
     after_ns: int
 
 
+@dataclass(frozen=True)
+class ClockReading:
+    """A faithful display snapshot with an optional independently qualified edge."""
+    identity: SourceIdentity
+    server_ms: float
+    edge: ClockSample | None = None
+    reset_anchor: bool = False
+
+
 class EdgeTracker:
     """Only separately observed natural request/response pairs can be anchors."""
     def __init__(self, identity, previous):
         self.identity, self.previous = identity, previous
         self.pending_request = None
+        self.pending_request_bracket = None
         self.last_request = None
+        self.last_request_bracket = None
+        self.last_cadence_ms = None
         self.last_quality = None
 
     def feed(self, current):
         previous = self.previous
         if (current.before_ns < previous.after_ns
-                or not 0 <= current.after_ns - current.before_ns <= 20_000_000):
+                or not 0 <= current.after_ns - current.before_ns <= OBSERVATION_READ_MAX_NS):
             raise AcquisitionError("觀察時間逆序或讀取延遲過高")
         if current.before_ns - previous.after_ns > HEALTH_MAX_GAP_NS:
             raise AcquisitionError("自然更新觀察中斷")
@@ -285,15 +367,28 @@ class EdgeTracker:
         if request_changed:
             if self.pending_request is not None:
                 raise AcquisitionError("偵測到請求重疊，無法可靠配對回應")
-            if not 1000 <= current.start_ms - previous.start_ms <= 30_000:
+            cadence_ms = current.start_ms - previous.start_ms
+            if not 1000 <= cadence_ms <= 30_000:
                 raise AcquisitionError("請求時間逆序或不連續")
-            if self.last_request is not None:
-                elapsed_ms = (current.before_ns - self.last_request[1]) / 1_000_000
-                if abs(current.start_ms - self.last_request[0] - elapsed_ms) > 250:
-                    raise AcquisitionError("請求時間與單調時鐘不連續")
-            self.last_request = (current.start_ms, current.before_ns)
+            self.last_cadence_ms = cadence_ms
             if not response_changed:
+                if self.last_request is not None:
+                    elapsed_ms = (current.before_ns - self.last_request[1]) / 1_000_000
+                    if abs(current.start_ms - self.last_request[0] - elapsed_ms) > 250:
+                        raise AcquisitionError("請求時間與單調時鐘不連續")
+                # Only a separately observed request has a quality-usable QPC.
+                # A same-poll request+response supplies cadence bounds to the
+                # predictor but must never become a fabricated request anchor.
+                self.last_request = (current.start_ms, current.before_ns)
+                self.last_request_bracket = (
+                    current.start_ms, previous.after_ns, current.after_ns,
+                )
                 self.pending_request = (current.start_ms, current.before_ns)
+                self.pending_request_bracket = (
+                    previous.after_ns, current.after_ns,
+                )
+            else:
+                self.last_request_bracket = None
         self.previous = current
         if not response_changed:
             return None
@@ -301,11 +396,23 @@ class EdgeTracker:
         bracket = current.after_ns - previous.before_ns
         residual = current.raw_ms - current.start_ms - current.lag_ms
         paired = self.pending_request is not None and self.pending_request[0] == current.start_ms
-        elapsed_ms = ((current.after_ns - self.pending_request[1]) / 1_000_000
-                      if paired else float("inf"))
+        if paired and self.pending_request_bracket is not None:
+            request_earliest, request_latest = self.pending_request_bracket
+            elapsed_low = (current.before_ns - request_latest) / 1_000_000
+            elapsed_high = (current.after_ns - request_earliest) / 1_000_000
+            if elapsed_low <= residual <= elapsed_high:
+                residual_distance = 0
+            else:
+                residual_distance = min(
+                    abs(residual - elapsed_low), abs(residual - elapsed_high),
+                )
+        else:
+            residual_distance = float("inf")
         quality = (1000 <= delta <= 30_000 and 0 < bracket <= 25_000_000
-                   and paired and 0 <= residual <= 100 and abs(residual - elapsed_ms) <= 25)
+                   and paired and 0 <= residual <= EDGE_RESPONSE_MAX_MS
+                   and residual_distance <= 25)
         self.pending_request = None
+        self.pending_request_bracket = None
         reason = ("accepted-quality" if quality else "unpaired-response" if not paired
                   else "interval-or-bracket-rejected")
         self.last_quality = (residual, bracket / 1_000_000,
@@ -316,6 +423,43 @@ class EdgeTracker:
                            (previous.before_ns + current.after_ns) // 2,
                            bracket, current.after_ns - current.before_ns, delta,
                            PROFILE_ID, residual, (self.last_quality,))
+
+
+def _prediction_window(earliest, latest):
+    if latest < earliest:
+        raise AcquisitionError("預測請求時間逆序")
+    uncertainty = latest - earliest
+    if uncertainty > PREDICTIVE_REQUEST_WINDOW_MAX_NS:
+        return None
+    response_deadline = latest + EDGE_RESPONSE_MAX_MS * 1_000_000
+    return (
+        earliest,
+        response_deadline + BURST_POLL_INTERVAL_NS,
+        response_deadline + BURST_OBSERVATION_SLACK_NS,
+    )
+
+
+def predict_burst_window(previous, current):
+    """Cover the complete next request uncertainty interval in one burst."""
+    if (current.start_ms == previous.start_ms
+            or current.raw_ms == previous.raw_ms):
+        return None
+    cadence_ms = current.start_ms - previous.start_ms
+    if not 1000 <= cadence_ms <= 30_000:
+        return None
+    cadence_ns = int(round(cadence_ms * 1_000_000))
+    earliest = previous.after_ns + cadence_ns
+    latest = current.after_ns + cadence_ns
+    return _prediction_window(earliest, latest)
+
+
+def predict_qualified_burst_window(tracker):
+    """Schedule the next cadence from a separately observed request QPC."""
+    if tracker.last_request_bracket is None or tracker.last_cadence_ms is None:
+        return None
+    _start_ms, earliest, latest = tracker.last_request_bracket
+    cadence_ns = int(round(tracker.last_cadence_ms * 1_000_000))
+    return _prediction_window(earliest + cadence_ns, latest + cadence_ns)
 
 
 def validate_values(raw, start, offset, lag, _legacy_wall_ms=None, *, allow_pending_request=False):
@@ -330,6 +474,11 @@ def validate_values(raw, start, offset, lag, _legacy_wall_ms=None, *, allow_pend
 
 
 class GameClockReader:
+    # stream() owns the handle-lifetime live-token checks and full identity
+    # fences.  MultiGameClockSource may rely on this attestation instead of
+    # repeating command-line/image identity work for every heartbeat/sample.
+    stream_identity_verified = True
+
     def __init__(self, native=None, monotonic_ns=time.perf_counter_ns,
                  scan_coordinator=None, **_legacy):
         self.native = native or NativeSource()
@@ -433,22 +582,46 @@ class GameClockReader:
             raise AcquisitionError("遊戲版本結構已改變")
         self._profile_cache = key
 
-    def observe(self, handle, candidate):
-        self.validate_structure(handle, candidate)
+    def _read_observation_values(self, handle, candidate):
+        """Read only the fixed clock fields with a pair seqlock.
+
+        The caller owns the complete structure/identity fence.  This small read
+        path is used inside a bounded adaptive window so the 26.8 MiB profile is
+        never revalidated at 1 kHz.
+        """
         before = self.now()
         pair = self.native.read(handle, candidate.object_address + 0x410, 16)
         core_values = self.native.read(handle, candidate.core_address + 0x158, 24)
         # Seqlock-style reread rejects a game update split across the two reads.
         repeated = self.native.read(handle, candidate.object_address + 0x410, 16)
         after = self.now()
-        if pair != repeated or not 0 <= after - before <= 20_000_000:
-            raise AcquisitionError("取樣跨越更新或延遲過高")
+        if pair != repeated:
+            raise TransientObservation("clock pair changed during observation")
+        if not 0 <= after - before <= OBSERVATION_READ_MAX_NS:
+            raise AcquisitionError("取樣讀取延遲過高")
         raw, start = struct.unpack("<dd", pair)
         offset, lag = struct.unpack_from("<d", core_values)[0], struct.unpack_from("<d", core_values, 16)[0]
         if not validate_values(raw, start, offset, lag,
                                allow_pending_request=True):
             raise AcquisitionError("遊戲時間數值或UTC+8關係不符")
         return Observation(raw, start, lag, before, after)
+
+    def observe(self, handle, candidate):
+        self.validate_structure(handle, candidate)
+        retry_started_ns = self.now()
+        for attempt in range(OUTER_TRANSIENT_RETRY_LIMIT):
+            try:
+                return self._read_observation_values(handle, candidate)
+            except TransientObservation:
+                elapsed = self.now() - retry_started_ns
+                if (attempt + 1 >= OUTER_TRANSIENT_RETRY_LIMIT
+                        or not 0 <= elapsed < OUTER_TRANSIENT_RETRY_BUDGET_NS):
+                    raise AcquisitionError("取樣持續跨越更新") from None
+                time.sleep(ADAPTIVE_BURST_SLEEP_SECONDS)
+                elapsed = self.now() - retry_started_ns
+                if not 0 <= elapsed <= OUTER_TRANSIENT_RETRY_BUDGET_NS:
+                    raise AcquisitionError("取樣持續跨越更新") from None
+        raise AcquisitionError("取樣持續跨越更新")
 
     @staticmethod
     def candidate_addresses(data, base):
@@ -465,7 +638,7 @@ class GameClockReader:
 
     def scan(self, handle, cancel):
         self._profile_cache = None  # revalidate the full live ABC at each uniqueness scan
-        deadline = self.now() + 30_000_000_000
+        deadline = self.now() + FULL_SCAN_DEADLINE_NS
         candidates = set()
         seen = set()
         address = 0
@@ -513,14 +686,22 @@ class GameClockReader:
         if (type(self).scan is not GameClockReader.scan
                 and not getattr(self, "_scan_coordinator_explicit", False)):
             return self.scan(handle, cancel)
-        return self.scan_coordinator.run(cancel, lambda: self.scan(handle, cancel))
+        return self.scan_coordinator.run(
+            cancel, lambda: self.scan(handle, cancel), wait_progress=self._read_progress,
+        )
 
     def stream(self, hwnd, cancel, publish):
-        """One long-lived read-only handle; each accepted edge gets a FULL rescan.
+        """One generation-startup uniqueness scan, then a long-lived read-only handle.
 
         publish(sample-or-None, reason, validated-progress-QPC) is background-only.
         A scan can miss a natural edge: the post-scan baseline discards all pairing
-        state, never inventing requests or rebasing the original sample anchor.
+        state, never inventing requests or rebasing the original sample anchor.  The
+        handle-lifetime cheap live token on every sample detects HWND/PID reuse; the
+        full SourceIdentity at startup and about once per second (plus named boundary
+        and burst fences) verifies image and launch identity.  Fixed clock structure
+        and raw/start/lag values are checked on normal snapshots, while the expensive
+        ABC profile at startup or when its structure key changes is cached otherwise.
+        Any failed layer ends the generation.
         """
         observed = self.native.identity(hwnd)
         identity = self.expected_identity or observed
@@ -528,70 +709,197 @@ class GameClockReader:
             raise AcquisitionError("來源身分已改變")
         handle = self.native.open(identity.pid)
         last_progress = self.now()
-        last_identity_check = None
+        last_full_identity_check = last_progress
+        expected_live_token = (
+            identity.hwnd, identity.pid, identity.tid, identity.created,
+        )
 
-        def progress(force=False):
-            nonlocal last_progress, last_identity_check
+        def check_live_token():
+            live_method = getattr(type(self.native), "live_token", None)
+            if callable(live_method):
+                token = self.native.live_token(hwnd, handle)
+                if token != expected_live_token:
+                    raise AcquisitionError("來源身分已改變")
+            elif self.native.identity(hwnd) != identity:
+                # Deterministic legacy test doubles without the cheap-token API
+                # remain fail-closed; production NativeSource never takes this.
+                raise AcquisitionError("來源身分已改變")
+
+        def progress(force=False, full_identity=False, periodic_full=True):
+            nonlocal last_progress, last_full_identity_check
             now = self.now()
             if cancel.is_set():
                 raise AcquisitionError("來源選擇已改變")
             if not 0 <= now - last_progress <= HEALTH_MAX_GAP_NS:
                 raise AcquisitionError("來源讀取中斷或單調時鐘逆序")
+            check_live_token()
             last_progress = now
-            if force or last_identity_check is None or now - last_identity_check >= IDENTITY_CHECK_NS:
+            checked_full = False
+            if (full_identity or (
+                    periodic_full
+                    and now - last_full_identity_check >= IDENTITY_CHECK_NS)):
                 if self.native.identity(hwnd) != identity:
                     raise AcquisitionError("來源身分已改變")
                 checked = self.now()
                 if not 0 <= checked - now <= HEALTH_MAX_GAP_NS:
                     raise AcquisitionError("來源身分驗證中斷")
-                last_progress = last_identity_check = checked
+                check_live_token()
+                last_progress = last_full_identity_check = checked
+                checked_full = True
+            if force or checked_full:
+                checked = self.now()
                 publish(None, "", checked)
+
+        def full_fence(candidate):
+            progress(full_identity=True)
+            self.validate_structure(handle, candidate)
+            # The structure/RPM fence itself may stall.  Recheck cancellation,
+            # QPC health, and the cheap handle-lifetime token afterwards, but
+            # do not perform a second expensive full identity in this fence.
+            progress(periodic_full=False)
+
+        def publish_anchor_reset(server_ms):
+            progress()
+            checked_ns = self.now()
+            publish(ClockReading(identity, server_ms, None, True), "", checked_ns)
+
+        def adaptive_burst(candidate, tracker, sample_deadline_ns, hard_deadline_ns):
+            """Probe one bounded request slice plus its response-quality tail."""
+            full_fence(candidate)
+            transient_pending = False
+            transient_retry_deadline_ns = hard_deadline_ns - OBSERVATION_READ_MAX_NS
+            while True:
+                if cancel.is_set():
+                    return None
+                current_ns = self.now()
+                if transient_pending:
+                    if current_ns >= transient_retry_deadline_ns:
+                        raise AcquisitionError("取樣持續跨越更新")
+                elif current_ns >= sample_deadline_ns:
+                    return None
+                time.sleep(ADAPTIVE_BURST_SLEEP_SECONDS)
+                if cancel.is_set():
+                    return None
+                current_ns = self.now()
+                if transient_pending:
+                    if current_ns > transient_retry_deadline_ns:
+                        raise AcquisitionError("取樣持續跨越更新")
+                elif current_ns > sample_deadline_ns:
+                    return None
+                # Non-forced progress checks cancellation, QPC health and the
+                # periodic full identity without enqueueing a 1 kHz heartbeat.
+                progress()
+                try:
+                    burst = self._read_observation_values(handle, candidate)
+                except TransientObservation:
+                    transient_pending = True
+                    continue
+                transient_pending = False
+                progress()
+                edge = tracker.feed(burst)
+                if edge is None:
+                    if self.now() >= sample_deadline_ns:
+                        return None
+                    continue
+                if self.now() > hard_deadline_ns:
+                    raise AcquisitionError("自然更新觀察超過高頻視窗")
+                full_fence(candidate)
+                checked_ns = self.now()
+                if checked_ns > hard_deadline_ns:
+                    raise AcquisitionError("自然更新觀察超過高頻視窗")
+                publish(ClockReading(identity, burst.raw_ms, edge), "", checked_ns)
+                return edge
+            return None
 
         self._stream_cancel, self._progress_hook = cancel, progress
         try:
-            if self.native.identity(hwnd) != identity:
-                raise AcquisitionError("來源身分已改變")
             progress(force=True)
             candidate = self.full_scan(handle, cancel)
-            if self.native.identity(hwnd) != identity:
-                raise AcquisitionError("來源身分已改變")
+            progress(force=True, full_identity=True)
+            previous = self.observe(handle, candidate)  # post-scan baseline; never published
+            tracker = EdgeTracker(identity, previous)
+            prediction = None
             progress(force=True)
-            self.observe(handle, candidate)  # post-scan baseline; never published
-            if self.native.identity(hwnd) != identity:
-                raise AcquisitionError("來源身分已改變")
-            progress()
             while not cancel.is_set():
-                # Four read attempts per second at most; this is a read-only
-                # faithful snapshot stream, not a millisecond polling loop.
-                time.sleep(OBSERVATION_SLEEP_SECONDS)
-                if self.native.identity(hwnd) != identity:
-                    raise AcquisitionError("來源身分已改變")
-                current = self.observe(handle, candidate)
-                if self.native.identity(hwnd) != identity:
-                    raise AcquisitionError("來源身分已改變")
-                progress(force=True)
-                # Identity/structure is checked without repeating the 2 GiB scan or
-                # 26.8 MiB ABC digest for every sample. Any failed check closes the
-                # stream; discovery must establish a fresh generation.
-                self.validate_structure(handle, candidate)
-                if self.native.identity(hwnd) != identity:
-                    raise AcquisitionError("來源身分已改變")
-                progress(force=True)
-                checked_ns = self.now()
-                sample = ClockSample(
-                    identity=identity,
-                    server_ms=current.raw_ms,
-                    anchor_ns=(current.before_ns + current.after_ns) // 2,
-                    observation_bracket_ns=current.after_ns - current.before_ns,
-                    read_latency_ns=current.after_ns - current.before_ns,
-                    transition_ms=1000.0,
-                    profile=PROFILE_ID,
-                )
-                if sample.identity != identity or self.native.identity(hwnd) != identity:
-                    raise AcquisitionError("來源身分已改變")
-                publish(sample, "", checked_ns)
+                # Faithful display snapshots run at four reads per second. Only
+                # a pending or cadence-predicted request enters a bounded burst.
+                if prediction is not None:
+                    burst_start_ns, sample_deadline_ns, hard_deadline_ns = prediction
+                    delay_ns = burst_start_ns - self.now()
+                    if delay_ns <= 0:
+                        prediction = None
+                        captured = adaptive_burst(
+                            candidate, tracker, sample_deadline_ns, hard_deadline_ns,
+                        )
+                        if captured is not None:
+                            prediction = predict_qualified_burst_window(tracker)
+                        else:
+                            if cancel.is_set():
+                                return
+                            publish_anchor_reset(tracker.previous.raw_ms)
+                        continue
+                    sleep_seconds = min(OBSERVATION_SLEEP_SECONDS,
+                                        delay_ns / 1_000_000_000)
+                else:
+                    sleep_seconds = OBSERVATION_SLEEP_SECONDS
+                time.sleep(sleep_seconds)
                 if cancel.is_set():
                     return
+                if prediction is not None and self.now() >= prediction[0]:
+                    continue
+                progress()
+                prior = tracker.previous
+                current = self.observe(handle, candidate)
+                minute_boundary = (
+                    int(current.raw_ms // 60_000)
+                    != int(prior.raw_ms // 60_000)
+                )
+                progress(force=True, full_identity=minute_boundary)
+                edge = tracker.feed(current)
+                predicted = None
+                # Any observed response without a quality-qualified request
+                # edge can carry a server correction.  It revokes the old
+                # timed anchor even if the request transition was missed.
+                reset_anchor = (
+                    edge is None and current.raw_ms != prior.raw_ms
+                )
+                same_poll_unqualified = (
+                    edge is None and tracker.pending_request is None
+                    and current.start_ms != prior.start_ms
+                    and current.raw_ms != prior.raw_ms
+                )
+                if same_poll_unqualified:
+                    predicted = predict_burst_window(prior, current)
+                    # A same-poll response can establish only cadence bounds.
+                    # It is never quality-qualified, so any old timed anchor is
+                    # revoked even while its next-cadence prediction is kept.
+                checked_ns = self.now()
+                publish(ClockReading(
+                    identity, current.raw_ms, edge, reset_anchor,
+                ), "", checked_ns)
+                if cancel.is_set():
+                    return
+                if edge is not None:
+                    prediction = predict_qualified_burst_window(tracker)
+                    continue
+                if tracker.pending_request is not None:
+                    burst_start_ns = self.now()
+                    response_window = _prediction_window(
+                        burst_start_ns, burst_start_ns,
+                    )
+                    captured = adaptive_burst(
+                        candidate, tracker,
+                        response_window[1], response_window[2],
+                    )
+                    if captured is not None:
+                        prediction = predict_qualified_burst_window(tracker)
+                    else:
+                        if cancel.is_set():
+                            return
+                        publish_anchor_reset(tracker.previous.raw_ms)
+                    continue
+                if predicted is not None:
+                    prediction = predicted
         finally:
             self._progress_hook = self._stream_cancel = None
             self.native.close(handle)
@@ -651,7 +959,7 @@ class GameClockReader:
                 elapsed_ms = ((current.after_ns - pending_request[1]) / 1_000_000
                               if paired else float("inf"))
                 quality = (1000 <= delta <= 30_000 and 0 < bracket <= 25_000_000
-                           and paired and 0 <= residual <= 100
+                           and paired and 0 <= residual <= EDGE_RESPONSE_MAX_MS
                            and abs(residual - elapsed_ms) <= 25)
                 reason = ("accepted-quality" if quality else "unpaired-response" if not paired
                           else "interval-or-bracket-rejected")

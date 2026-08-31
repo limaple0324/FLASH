@@ -12,7 +12,7 @@ import threading
 import time
 
 from v02_game_clock import HEALTH_MAX_GAP_NS, SourceIdentity
-from v02_game_clock_reader import AcquisitionError
+from v02_game_clock_reader import AcquisitionError, ClockReading
 
 DISCOVERY_INTERVAL_NS = 5_000_000_000
 FAILED_SOURCE_BACKOFF_NS = 5_000_000_000
@@ -165,6 +165,13 @@ class AutoClockSource:
                         # stream's own identity may race its initial open.
                         if self.reader.native.identity(identity.hwnd) != identity:
                             raise AcquisitionError("來源身分已改變")
+                        if isinstance(sample, ClockReading):
+                            if sample.identity != identity:
+                                raise AcquisitionError("來源身分已改變")
+                            # Legacy AutoClockSource calibrates only from a
+                            # qualified edge. A display snapshot is health, never
+                            # a ClockSample or a synthetic clock anchor.
+                            sample = sample.edge
                         self._put(token, cancel, "progress", (sample, reason), checked_ns)
 
                     self.reader.stream(identity.hwnd, cancel, publish)
