@@ -317,12 +317,13 @@ class MultiGameClockSource:
             self._retired_workers.append(worker)
         self.streams.clear()
 
-    def invalidate(self, reason="來源失效"):
+    def _invalidate_locked(self, reason="來源失效", *, preserve_overflow=False):
         self._cancel_workers()
         self.event_epoch += 1
         self.events = queue.Queue(maxsize=EVENT_QUEUE_SIZE)
-        self.overflow_fault.clear()
-        self._overflow_epoch = None
+        if not preserve_overflow:
+            self.overflow_fault.clear()
+            self._overflow_epoch = None
         for label in APPROVED_SHORTCUTS:
             self.consensus.invalidate(label, self.consensus.generation[label] + 1)
         self.anchors.clear()
@@ -335,6 +336,10 @@ class MultiGameClockSource:
         self.display = FaithfulDisplay((), APPROVED_SHORTCUTS)
         self.status = "來源失效"
 
+    def invalidate(self, reason="來源失效"):
+        with self._event_lock:
+            self._invalidate_locked(reason)
+
     def _emit(self, kind, payload, checked_ns, epoch):
         with self._event_lock:
             if epoch != self.event_epoch:
@@ -343,12 +348,9 @@ class MultiGameClockSource:
                 self.events.put_nowait((epoch, kind, payload, checked_ns))
                 return True
             except queue.Full:
-                self._overflow_epoch = epoch
+                self._invalidate_locked("來源失效", preserve_overflow=True)
+                self._overflow_epoch = self.event_epoch
                 self.overflow_fault.set()
-                self.discovery_cancel.set()
-                for _identity, _worker, cancel, _generation, item_epoch in self.streams.values():
-                    if item_epoch == epoch:
-                        cancel.set()
                 return False
 
     def _start_discovery(self):
@@ -476,9 +478,18 @@ class MultiGameClockSource:
         if previous is not None and not 0 <= now - previous <= FRESHNESS_TTL_NS:
             self.invalidate("來源失效")
             return
-        if self.overflow_fault.is_set() and self._overflow_epoch == self.event_epoch:
-            self.invalidate("來源失效")
-            return
+        with self._event_lock:
+            if self.overflow_fault.is_set() and self._overflow_epoch == self.event_epoch:
+                self.overflow_fault.clear()
+                self._overflow_epoch = None
+                return
+            poll_epoch = self.event_epoch
+            pending = []
+            for _ in range(EVENT_QUEUE_SIZE):
+                try:
+                    pending.append(self.events.get_nowait())
+                except queue.Empty:
+                    break
         if self._health_fault(now):
             self.invalidate("來源失效")
             return
@@ -486,12 +497,8 @@ class MultiGameClockSource:
             if self.scheduler.allow_discovery():
                 self._start_discovery()
         boundary = False
-        for _ in range(EVENT_QUEUE_SIZE):
-            try:
-                epoch, kind, payload, checked_ns = self.events.get_nowait()
-            except queue.Empty:
-                break
-            if epoch != self.event_epoch:
+        for epoch, kind, payload, checked_ns in pending:
+            if epoch != poll_epoch or poll_epoch != self.event_epoch:
                 continue
             if kind == "discovery_error":
                 self.invalidate("來源失效")
@@ -558,16 +565,22 @@ class MultiGameClockSource:
         active = set(self.streams)
         if self.revalidating and active and active.issubset(self.consensus.committed):
             self.revalidating = False
-        if self._health_fault(self.scheduler.now()):
-            self.invalidate("來源失效")
-            return
-        display = self.consensus.display(APPROVED_SHORTCUTS)
-        payload = (display.groups, display.unreadable)
-        if self.scheduler.allow_publish(payload):
-            self.display = display
-            self.status = display.text()
+        with self._event_lock:
+            if (poll_epoch != self.event_epoch
+                    or (self.overflow_fault.is_set()
+                        and self._overflow_epoch == self.event_epoch)):
+                self._invalidate_locked("來源失效")
+                return
+            if self._health_fault(self.scheduler.now()):
+                self._invalidate_locked("來源失效")
+                return
+            display = self.consensus.display(APPROVED_SHORTCUTS)
+            payload = (display.groups, display.unreadable)
+            if self.scheduler.allow_publish(payload):
+                self.display = display
+                self.status = display.text()
 
-    def exact_time_of_day_ms(self):
+    def _exact_time_of_day_ms_locked(self):
         if self.revalidating or self.source_faulted:
             return None
         values = {value for value, _precision in self.consensus.committed.values()}
@@ -578,33 +591,45 @@ class MultiGameClockSource:
         second, millis = rest.split(".")
         return (((int(hour) * 60 + int(minute)) * 60 + int(second)) * 1000 + int(millis))
 
-    def timed_source_state(self):
-        now = self.scheduler.now()
+    def exact_time_of_day_ms(self):
+        with self._event_lock:
+            return self._exact_time_of_day_ms_locked()
+
+    def _timed_source_state_locked(self, now):
+        if (self.overflow_fault.is_set() and self._overflow_epoch == self.event_epoch):
+            return "fault"
         if (self.source_faulted or self.last_poll_ns is None
                 or not 0 <= now - self.last_poll_ns <= FRESHNESS_TTL_NS
                 or self._health_fault(now)):
             return "fault"
-        if self.revalidating or self.exact_time_of_day_ms() is None:
+        if self.revalidating or self._exact_time_of_day_ms_locked() is None:
             return "waiting"
         return "valid"
 
-    def timed_action_time_of_day_ms(self):
-        if self.timed_source_state() != "valid":
-            return None
-        labels = [label for label in APPROVED_SHORTCUTS if label in self.consensus.committed]
-        if not labels:
-            return None
-        anchor = self.anchors.get(labels[0])
-        if anchor is None:
-            return None
-        server_ms, anchor_ns, checked_ns, generation = anchor
+    def timed_source_state(self):
         now = self.scheduler.now()
-        if (generation != self.consensus.generation[labels[0]]
-                or not 0 <= now - checked_ns <= FRESHNESS_TTL_NS
-                or not 0 <= now - anchor_ns <= FRESHNESS_TTL_NS):
-            return None
-        elapsed = (now - anchor_ns) // 1_000_000
-        return int(server_ms + 28_800_000 + elapsed) % 86_400_000
+        with self._event_lock:
+            return self._timed_source_state_locked(now)
+
+    def timed_action_time_of_day_ms(self):
+        now = self.scheduler.now()
+        with self._event_lock:
+            if self._timed_source_state_locked(now) != "valid":
+                return None
+            labels = [label for label in APPROVED_SHORTCUTS
+                      if label in self.consensus.committed]
+            if not labels:
+                return None
+            anchor = self.anchors.get(labels[0])
+            if anchor is None:
+                return None
+            server_ms, anchor_ns, checked_ns, generation = anchor
+            if (generation != self.consensus.generation[labels[0]]
+                    or not 0 <= now - checked_ns <= FRESHNESS_TTL_NS
+                    or not 0 <= now - anchor_ns <= FRESHNESS_TTL_NS):
+                return None
+            elapsed = (now - anchor_ns) // 1_000_000
+            return int(server_ms + 28_800_000 + elapsed) % 86_400_000
 
     def shutdown(self):
         if self.closed:

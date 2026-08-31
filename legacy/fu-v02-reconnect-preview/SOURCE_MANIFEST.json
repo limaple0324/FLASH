@@ -3,6 +3,7 @@
   "source_label": "fu-v02-reconnect-preview",
   "base_commit": "729b87753204d2b5a050c85b5950b9392421ed4f",
   "round2_base_commit": "40e504d57da0344fb44400b8029e7fb2596d528c",
+  "race_fix_base_commit": "571a3f2b16f8762adbc8b56ed5be50c7a8a0d90a",
   "included": [
     {
       "path": "config.json",
@@ -231,13 +232,13 @@
     },
     {
       "path": "test_v02_round2_security.py",
-      "sha256": "477a982415f13109491341922df37cf12c96a8f27e7374f018d5dd7b36373eed",
-      "bytes": 11153
+      "sha256": "5af409dea5c39318788598e7bbf0813bd6643f85af89fa346167bc56dcd879e2",
+      "bytes": 14456
     },
     {
       "path": "v02_faithful_game_time.py",
-      "sha256": "e401e223a19424e921e6b7a6c5e0f301476b1da31cd4c90f9c4c3e97a07cdc32",
-      "bytes": 24686
+      "sha256": "ca59f576826778de3f3aa7ecf01a375cf15f90bc743341125282c8ae09741ace",
+      "bytes": 25828
     },
     {
       "path": "assets/auto_reconnect_icon.ico",

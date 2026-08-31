@@ -19,6 +19,7 @@ from v02_game_clock import ClockSample, SourceIdentity
 from v02_faithful_game_time import (
     APPROVED_SHORTCUTS,
     ApprovedShortcutCatalog,
+    EVENT_QUEUE_SIZE,
     FaithfulConsensus,
     FaithfulSample,
     MultiGameClockSource,
@@ -168,6 +169,88 @@ class ConsensusAndEventTests(unittest.TestCase):
         model.poll()
         self.assertGreater(model.event_epoch, epoch)
         self.assertEqual(model.status, "來源失效")
+
+    def test_mid_poll_overflow_is_immediate_and_rolls_back_without_publish(self):
+        now = 1_000_000_000
+        source_id = identity()
+        label = APPROVED_SHORTCUTS[0]
+        server_ms = 16_440_000
+        model = MultiGameClockSource(
+            lambda: None, lambda _cancel: (), monotonic_ns=lambda: now,
+            thread_factory=InlineThread,
+        )
+        generation = 1
+        model.consensus.invalidate(label, generation)
+        faithful = FaithfulSample(label, generation, "12:34:00.000", "millisecond")
+        for _ in range(3):
+            model.consensus.add(faithful)
+        cancel = threading.Event()
+        worker = SimpleNamespace(is_alive=lambda: True)
+        model.streams[label] = (source_id, worker, cancel, generation, model.event_epoch)
+        model.stream_started_ns[label] = now
+        model.last_checked_ns[label] = now
+        model.last_sample_ns[label] = now
+        model.committed_ns[label] = now
+        model.anchors[label] = (server_ms, now, now, generation)
+        model.source_faulted = False
+        model.last_poll_ns = now
+        model.display = model.consensus.display((label,))
+        model.status = model.display.text()
+
+        item = sample(source_id, server_ms, now)
+        model.events.put_nowait((
+            model.event_epoch, "progress",
+            (label, generation, source_id, item, False), now,
+        ))
+        for _ in range(EVENT_QUEUE_SIZE - 1):
+            model.events.put_nowait((model.event_epoch, "noise", (), now))
+
+        processing = threading.Barrier(2)
+        overflow_done = threading.Event()
+        immediate = []
+        original_add = model.consensus.add
+
+        def add_with_interleaving(value):
+            processing.wait(timeout=2)
+            if not overflow_done.wait(2):
+                raise AssertionError("overflow worker did not finish")
+            return original_add(value)
+
+        model.consensus.add = add_with_interleaving
+        published = []
+        original_publish = model.scheduler.allow_publish
+
+        def record_publish(payload):
+            published.append(payload)
+            return original_publish(payload)
+
+        model.scheduler.allow_publish = record_publish
+
+        def overflow_worker():
+            processing.wait(timeout=2)
+            while True:
+                try:
+                    model.events.put_nowait((model.event_epoch, "noise", (), now))
+                except queue.Full:
+                    break
+            emitted = model._emit("noise", (), now, model.event_epoch)
+            immediate.append((
+                emitted, model.overflow_fault.is_set(),
+                model.timed_source_state(), model.timed_action_time_of_day_ms(),
+            ))
+            overflow_done.set()
+
+        race = threading.Thread(target=overflow_worker, daemon=True)
+        race.start()
+        model.poll()
+        race.join(2)
+        self.assertFalse(race.is_alive(), "overflow interleaving deadlocked")
+        self.assertEqual(immediate, [(False, True, "fault", None)])
+        self.assertFalse(model.anchors)
+        self.assertFalse(model.consensus.committed)
+        self.assertEqual(model.status, "來源失效")
+        self.assertEqual(published, [])
+        self.assertIsNone(model.timed_action_time_of_day_ms())
 
 
 class PrivacyAndUiTests(unittest.TestCase):

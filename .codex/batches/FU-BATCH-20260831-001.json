@@ -40,15 +40,18 @@
   "paid_api": "forbidden",
   "github_validation": "required",
   "round2_base_commit": "40e504d57da0344fb44400b8029e7fb2596d528c",
+  "race_fix_base_commit": "571a3f2b16f8762adbc8b56ed5be50c7a8a0d90a",
   "round2_evidence": {
-    "affected_tests": {"passed": 157, "failed": 0, "skipped": 0, "subtests": 27},
+    "race_fix_direct": {"passed": 1, "failed": 0, "skipped": 0},
+    "affected_tests": {"passed": 117, "failed": 0, "skipped": 0, "subtests": 22},
+    "prior_round2_affected_at_571a3f2": {"passed": 157, "failed": 0, "skipped": 0, "subtests": 27},
     "targeted_post_regression": {"passed": 18, "failed": 0, "skipped": 0},
     "manor_regression": {"passed": 59, "failed": 0, "skipped": 0},
     "source_self_test": "PASS",
     "packaged_self_test": "PASS",
     "binary_asset_count": 82,
-    "candidate_sha256": "75fe2b2890320ba1ea1af8caec4d20306ca97aa9309fa1d2555cd88b84c85699"
+    "candidate_sha256": "7ac5583c4abcc16ccc7f6f4282c5ee3e8cfffc76727cde108a1fecd3c1186ef5"
   },
-  "status": "ROUND2_IMPLEMENTATION_COMPLETE",
+  "status": "ROUND2_RACE_FIX_IMPLEMENTATION_COMPLETE",
   "next_role": "fixed_commit_review"
 }

@@ -1,6 +1,7 @@
 {
-  "schema": 2,
+  "schema": 3,
   "round2_base_commit": "40e504d57da0344fb44400b8029e7fb2596d528c",
+  "race_fix_base_commit": "571a3f2b16f8762adbc8b56ed5be50c7a8a0d90a",
   "runtime": {
     "python": "3.12.10",
     "tcl_tk": "8.6.15",
@@ -10,11 +11,11 @@
     "dependency_check": "PASS"
   },
   "build": {
-    "command": "<isolated-build-venv>/python -m PyInstaller --noconfirm --clean --distpath <approved-round2-output> --workpath <round2-build-work> fu_preview.spec",
+    "command": "<isolated-build-venv>/python -m PyInstaller --noconfirm --clean --distpath <approved-race-fix-output> --workpath <race-fix-build-work> fu_preview.spec",
     "candidate": "輔V0.2_遊戲時間忠實模式_候選版.exe",
-    "output_directory": "FU-BATCH-20260831-001-ROUND2-CANDIDATE",
-    "bytes": 116294427,
-    "sha256": "75fe2b2890320ba1ea1af8caec4d20306ca97aa9309fa1d2555cd88b84c85699",
+    "output_directory": "FU-BATCH-20260831-001-ROUND2-RACE-CANDIDATE",
+    "bytes": 116294620,
+    "sha256": "7ac5583c4abcc16ccc7f6f4282c5ee3e8cfffc76727cde108a1fecd3c1186ef5",
     "authenticode": "NotSigned",
     "file_version": "0.2.1.0",
     "product_name": "輔V0.2 自動重連獨立版"
@@ -65,14 +66,34 @@
     "sha256": "ee7fa008654412b58fa04c43c6444d92413961469a20a53af4de943de58cecce"
   },
   "regression": {
-    "affected_final": {
+    "race_fix_direct_red": {
+      "run": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "observed": "overflow=true while timed_source_state remained valid and timed action remained available"
+    },
+    "race_fix_direct_green": {
+      "run": 1,
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0
+    },
+    "race_fix_affected_final": {
+      "run": 117,
+      "passed": 117,
+      "failed": 0,
+      "skipped": 0,
+      "subtests": 22
+    },
+    "prior_round2_affected_at_571a3f2": {
       "run": 157,
       "passed": 157,
       "failed": 0,
       "skipped": 0,
       "subtests": 27
     },
-    "top_level_single_run": {
+    "prior_round2_top_level_single_run": {
       "run": 259,
       "passed": 247,
       "failed": 7,
@@ -80,20 +101,20 @@
       "subtests": 39,
       "classification": "seven stale test-harness failures and five historical-output API-baseline skips; no product failure"
     },
-    "post_run_targeted_remediation": {
+    "prior_round2_post_run_targeted_remediation": {
       "run": 18,
       "passed": 18,
       "failed": 0,
       "skipped": 0,
       "coverage": "all seven prior failure IDs and all five formerly skipped API-boundary IDs"
     },
-    "manor_single_run": {
+    "prior_round2_manor_single_run": {
       "run": 59,
       "passed": 59,
       "failed": 0,
       "skipped": 0
     },
-    "top_level_rerun": "not run; the single full-run constraint was preserved"
+    "race_fix_top_level_and_manor": "not rerun by explicit instruction; only the directly affected zero-skip suite was run"
   },
   "red_green_milestone": {
     "initial": {
