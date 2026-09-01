@@ -71,7 +71,7 @@ def _protect(text: str) -> str:
     source = Blob(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
     target = Blob()
     if not ctypes.windll.crypt32.CryptProtectData(
-        ctypes.byref(source), "輔 LINE 橋接", None, None, None, 0, ctypes.byref(target)
+        ctypes.byref(source), None, None, None, None, 0, ctypes.byref(target)
     ):
         raise ctypes.WinError()
     try:
