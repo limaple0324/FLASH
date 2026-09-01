@@ -151,3 +151,9 @@ def test_valid_empty_webhook_returns_200() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_setup_module_imports() -> None:
+    from tools.devspace_bridge import line_setup
+
+    assert callable(line_setup.main)
