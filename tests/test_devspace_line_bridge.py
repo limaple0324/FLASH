@@ -47,7 +47,8 @@ def test_pairing_requires_exact_code_and_persists(
     monkeypatch.setattr(main, "write_runtime", lambda **_kwargs: None)
     app = main.LineBridgeApp(cfg, api=FakeApi())
     code = app.pairing.code
-    assert not app._pair("U1", "配對 000000").startswith("配對完成")
+    wrong = "000001" if code == "000000" else "000000"
+    assert not app._pair("U1", f"配對 {wrong}").startswith("配對完成")
     assert app._pair("U1", f"配對 {code}").startswith("配對完成")
     assert common.load_config(path).allowed_user_ids == ("U1",)
 
