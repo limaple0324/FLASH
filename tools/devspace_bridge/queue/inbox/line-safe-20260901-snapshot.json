@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "task_id": "line-safe-20260901-snapshot",
+  "action": "repo_snapshot",
+  "target_commit": "7b2177c0240ef04c55637655d9a06c803a693a04",
+  "args": {}
+}
