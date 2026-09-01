@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "task_id": "line-safe-20260901-001",
+  "action": "run_tests",
+  "bridge_pid": 16780,
+  "started_at_unix": 1788263228.3997777,
+  "ok": true,
+  "finished_at_unix": 1788263236.0952034,
+  "result": {
+    "commit": "b13087bf29410e6fe28913c0acbea0d62a9bc1c6",
+    "returncode": 0,
+    "passed": true,
+    "stdout": "...............                                                          [100%]\n15 passed in 1.87s\n",
+    "stderr": ""
+  }
+}
