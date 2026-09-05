@@ -43,12 +43,17 @@ jobs:
                       if f is None: raise SystemExit(f'UNREADABLE_TAR_MEMBER {m.name!r}')
                       out.write_bytes(f.read())
           extract(brotli.decompress(base),src)
-          ov=pkg/'fu842_overlay_b64_12k'; parts=[]
+          ov=pkg/'fu842_overlay_b64_12k'; decoded=[]
           for i in range(20):
               if i in (3,10):
-                  parts += [(ov/f'{i:03d}a.b64').read_text('ascii').strip(),(ov/f'{i:03d}b.b64').read_text('ascii').strip()]
-              else: parts.append((ov/f'{i:03d}.b64').read_text('ascii').strip())
-          overlay=base64.b64decode(''.join(parts),validate=True)
+                  text=(ov/f'{i:03d}a.b64').read_text('ascii').strip()+(ov/f'{i:03d}b.b64').read_text('ascii').strip()
+              else: text=(ov/f'{i:03d}.b64').read_text('ascii').strip()
+              expected_chars=12000 if i<19 else 9732
+              print('OVERLAY_CHUNK',f'{i:03d}','B64_CHARS',len(text))
+              if len(text)!=expected_chars: raise SystemExit(f'OVERLAY_CHUNK_B64_LENGTH {i:03d}: {len(text)} != {expected_chars}')
+              try: decoded.append(base64.b64decode(text,validate=True))
+              except Exception as e: raise SystemExit(f'OVERLAY_CHUNK_BASE64_INVALID {i:03d}: {e}') from e
+          overlay=b''.join(decoded)
           expect='d4eac19786c913f9ac8eae4b7c33327b00d04545a8ad765345595593b7ed1a9c'; sha=hashlib.sha256(overlay).hexdigest()
           print('OVERLAY_BYTES',len(overlay)); print('OVERLAY_SHA256',sha)
           if len(overlay)!=178298: raise SystemExit(f'OVERLAY_SIZE {len(overlay)}')
