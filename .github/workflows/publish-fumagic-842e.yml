@@ -1,0 +1,168 @@
+name: Publish verified FU magic channel
+
+on:
+  push:
+    branches:
+      - package/fu-recover-a7-20260905
+    paths:
+      - .github/workflows/publish-fumagic-842e.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      SOURCE_RUN_ID: '33972498459'
+      SOURCE_ARTIFACT: 'fumagic-842e2b-final'
+      EXPECTED_EXE_SHA256: '1e279a3bcf66c4db5d513e35c010a9d2ffa76c13f732a53f50314982d5c2d97a'
+      RELEASE_TAG: 'fumagic-842e2b-20260906'
+      RELEASE_ASSET: '輔魔.exe'
+      CHANNEL_BRANCH: 'release/fumagic'
+    steps:
+      - name: Checkout publisher branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download already verified executable artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.SOURCE_ARTIFACT }}
+          path: verified
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+
+      - name: Reverify exact executable identity
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'verified/輔魔.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          if ($hash -ne $env:EXPECTED_EXE_SHA256) { throw "Verified artifact SHA mismatch: $hash" }
+          $size = (Get-Item -LiteralPath $exe).Length
+          if ($size -ne 116510382) { throw "Verified artifact size mismatch: $size" }
+          Write-Host "FUMAGIC_EXE_VERIFIED sha256=$hash size=$size"
+
+      - name: Create dedicated updater files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force channel | Out-Null
+          $assetUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/$([uri]::EscapeDataString($env:RELEASE_ASSET))"
+          $index = [ordered]@{
+            schema = 1
+            product = '輔魔'
+            channel = $env:CHANNEL_BRANCH
+            tag = $env:RELEASE_TAG
+            asset = $env:RELEASE_ASSET
+            asset_url = $assetUrl
+            sha256 = $env:EXPECTED_EXE_SHA256
+            size = 116510382
+            source_zip_sha256 = '748ea8dba2dd194e9d32567f6c0a115213f61b43ed6e99c7fde4fa100b160f68'
+            source_tree_sha256 = '842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a'
+          }
+          $index | ConvertTo-Json | Set-Content -LiteralPath channel/release-index.json -Encoding utf8
+
+          @'
+          @echo off
+          chcp 65001 >nul
+          setlocal
+          set "ROOT=%~dp0"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%輔魔更新核心.ps1" -InstallDirectory "%ROOT%"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" pause
+          exit /b %RC%
+          '@ | Set-Content -LiteralPath 'channel/更新輔魔.cmd' -Encoding ascii
+
+          @'
+          param([string]$InstallDirectory = "")
+          $ErrorActionPreference = 'Stop'
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          if ([string]::IsNullOrWhiteSpace($InstallDirectory)) { $InstallDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path }
+          $InstallDirectory = [IO.Path]::GetFullPath($InstallDirectory)
+          $IndexUrl = 'https://raw.githubusercontent.com/limaple0324/FLASH/release/fumagic/release-index.json'
+          $ExpectedProduct = '輔魔'
+          $tmpRoot = Join-Path $env:TEMP ('fumagic-update-' + [Guid]::NewGuid().ToString('N'))
+          $stageExe = Join-Path $tmpRoot '輔魔.exe'
+          $targetExe = Join-Path $InstallDirectory '輔魔.exe'
+          $backupExe = Join-Path $tmpRoot '輔魔.exe.backup'
+          New-Item -ItemType Directory -Force $tmpRoot | Out-Null
+          try {
+            $index = Invoke-RestMethod -Uri $IndexUrl -Method Get -TimeoutSec 20 -Headers @{'Cache-Control'='no-cache'}
+            if ([int]$index.schema -ne 1 -or [string]$index.product -ne $ExpectedProduct -or [string]$index.channel -ne 'release/fumagic') { throw '更新索引身分不正確。' }
+            $sha = ([string]$index.sha256).ToLowerInvariant()
+            if ($sha -notmatch '^[0-9a-f]{64}$') { throw '更新索引 SHA-256 無效。' }
+            $size = [int64]$index.size
+            if ($size -le 0) { throw '更新索引檔案大小無效。' }
+            $assetUrl = [string]$index.asset_url
+            if ($assetUrl -notmatch '^https://github\.com/limaple0324/FLASH/releases/download/fumagic-[A-Za-z0-9._-]+/.+$') { throw '更新下載位置不受信任。' }
+            Invoke-WebRequest -Uri $assetUrl -OutFile $stageExe -UseBasicParsing -TimeoutSec 300
+            if ((Get-Item -LiteralPath $stageExe).Length -ne $size) { throw '下載檔案大小不符。' }
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $stageExe).Hash.ToLowerInvariant()
+            if ($actual -ne $sha) { throw '下載檔案 SHA-256 不符。' }
+            $bytes = [IO.File]::ReadAllBytes($stageExe)
+            if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw '下載檔案不是 Windows PE 執行檔。' }
+            Get-Process -Name '輔魔' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+            if (Test-Path -LiteralPath $targetExe) { Copy-Item -LiteralPath $targetExe -Destination $backupExe -Force }
+            try {
+              Copy-Item -LiteralPath $stageExe -Destination $targetExe -Force
+              $installed = (Get-FileHash -Algorithm SHA256 -LiteralPath $targetExe).Hash.ToLowerInvariant()
+              if ($installed -ne $sha) { throw '安裝後 SHA-256 驗證失敗。' }
+            } catch {
+              if (Test-Path -LiteralPath $backupExe) { Copy-Item -LiteralPath $backupExe -Destination $targetExe -Force }
+              throw
+            }
+            Write-Host '輔魔更新完成。'
+            Write-Host "SHA-256: $sha"
+            exit 0
+          } catch {
+            Write-Host ('輔魔更新失敗：' + $_.Exception.Message) -ForegroundColor Red
+            exit 1
+          } finally {
+            Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          '@ | Set-Content -LiteralPath 'channel/輔魔更新核心.ps1' -Encoding utf8
+
+      - name: Publish immutable prerelease asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG 'verified/輔魔.exe' 'verified/BUILD_INFO.txt' 'channel/更新輔魔.cmd' 'channel/輔魔更新核心.ps1' --repo $env:GITHUB_REPOSITORY --title '輔魔 842e2b verified Windows build' --notes 'Reviewed source tree 842e2b; Windows build, PE validation, launch smoke test and UI rendering evidence completed.' --prerelease
+            if ($LASTEXITCODE -ne 0) { throw 'GitHub prerelease creation failed.' }
+          } else {
+            gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern '輔魔.exe' --dir release-check --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Could not read back existing release asset.' }
+            $existing = (Get-FileHash -Algorithm SHA256 -LiteralPath 'release-check/輔魔.exe').Hash.ToLowerInvariant()
+            if ($existing -ne $env:EXPECTED_EXE_SHA256) { throw "Existing release tag has different executable: $existing" }
+          }
+
+      - name: Publish isolated release/fumagic channel
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout --orphan fumagic-channel-stage
+          git rm -rf .
+          Copy-Item -LiteralPath "$env:GITHUB_WORKSPACE/channel/release-index.json" -Destination release-index.json
+          Copy-Item -LiteralPath "$env:GITHUB_WORKSPACE/channel/更新輔魔.cmd" -Destination '更新輔魔.cmd'
+          Copy-Item -LiteralPath "$env:GITHUB_WORKSPACE/channel/輔魔更新核心.ps1" -Destination '輔魔更新核心.ps1'
+          git add release-index.json '更新輔魔.cmd' '輔魔更新核心.ps1'
+          git commit -m "Publish 輔魔 update channel $env:RELEASE_TAG"
+          git push origin HEAD:refs/heads/release/fumagic --force
+
+      - name: Anonymous channel readback
+        shell: pwsh
+        run: |
+          $nonce = [Guid]::NewGuid().ToString('N')
+          $url = "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/release/fumagic/release-index.json?readback=$nonce"
+          $index = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 30 -Headers @{'Cache-Control'='no-cache'}
+          if ([string]$index.sha256 -ne $env:EXPECTED_EXE_SHA256) { throw 'Anonymous channel SHA readback mismatch.' }
+          if ([string]$index.tag -ne $env:RELEASE_TAG) { throw 'Anonymous channel tag readback mismatch.' }
+          Write-Host 'FUMAGIC_CHANNEL_READBACK_PASS'
