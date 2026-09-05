@@ -24,7 +24,7 @@ jobs:
       - name: Verify and overlay reviewed runtime delta
         shell: pwsh
         run: |
-          $expected = '2da532daa81f55ef59253793373982dd045feebfb347e76d505bcf16b66c4fc1'
+          $expected = 'e86d88d865049eac95d697b55381825881e4733f7a7a3ab292eec609d4ae834f'
           $actual = (Get-FileHash '.packaging/runtime_delta.tar.br' -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $expected) { throw "runtime delta SHA-256 mismatch: $actual" }
           python -m pip install --disable-pip-version-check brotli
@@ -39,6 +39,40 @@ jobs:
                   if root not in target.parents and target != root:
                       raise SystemExit(f'unsafe tar member: {member.name}')
               tf.extractall(root)
+          '@ | python -
+
+      - name: Verify exact reviewed source tree
+        shell: pwsh
+        run: |
+          @'
+          import hashlib, json, pathlib
+          root = pathlib.Path('.').resolve()
+          manifest_path = root / 'SOURCE_MANIFEST.json'
+          if not manifest_path.is_file():
+              raise SystemExit('SOURCE_MANIFEST.json missing after overlay')
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+          expected_tree = '842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a'
+          if manifest.get('source_tree_sha256') != expected_tree:
+              raise SystemExit(f"source_tree_sha256 mismatch: {manifest.get('source_tree_sha256')!r}")
+          included = manifest.get('included')
+          if not isinstance(included, list) or len(included) != 159 or manifest.get('included_count') != 159:
+              raise SystemExit(f"unexpected manifest count: included={len(included) if isinstance(included, list) else None}, declared={manifest.get('included_count')!r}")
+          failures = []
+          for entry in included:
+              rel = entry['path']
+              p = root / rel
+              if not p.is_file():
+                  failures.append(f'{rel}: missing')
+                  continue
+              data = p.read_bytes()
+              size = len(data)
+              digest = hashlib.sha256(data).hexdigest()
+              if size != int(entry['bytes']) or digest != entry['sha256']:
+                  failures.append(f"{rel}: bytes={size}/{entry['bytes']} sha256={digest}/{entry['sha256']}")
+          if failures:
+              print('\n'.join(failures[:50]))
+              raise SystemExit(f'exact reviewed source verification failed: {len(failures)} file(s)')
+          print(f'Exact reviewed source verified: {len(included)} files, tree={expected_tree}')
           '@ | python -
 
       - name: Install build dependencies
@@ -62,6 +96,7 @@ jobs:
           "source_zip_sha256=748ea8dba2dd194e9d32567f6c0a115213f61b43ed6e99c7fde4fa100b160f68" | Out-File -Encoding utf8 'dist/BUILD_INFO.txt'
           "source_tree_sha256=842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a" | Out-File -Encoding utf8 -Append 'dist/BUILD_INFO.txt'
           "base_commit=32ad4ae780c8c3b68c4a068aba3fb6c59977466f" | Out-File -Encoding utf8 -Append 'dist/BUILD_INFO.txt'
+          "runtime_delta_sha256=e86d88d865049eac95d697b55381825881e4733f7a7a3ab292eec609d4ae834f" | Out-File -Encoding utf8 -Append 'dist/BUILD_INFO.txt'
           "exe_sha256=$hash" | Out-File -Encoding utf8 -Append 'dist/BUILD_INFO.txt'
           "exe_bytes=$size" | Out-File -Encoding utf8 -Append 'dist/BUILD_INFO.txt'
           Get-Content 'dist/BUILD_INFO.txt'
