@@ -14,40 +14,33 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install brotli
-      - name: Recover tar metadata from verified Brotli prefix
+      - name: Recover exact tar metadata from verified Brotli prefix
         shell: bash
         run: |
           python - <<'PY'
           import base64, brotli, pathlib
           root = pathlib.Path('.packaging')
-          parts = []
+          parts=[]
           for i in range(4):
-              fix = root / 'runtime24fresh_fix' / f'{i:03d}.bin'
-              if fix.exists():
-                  b = fix.read_bytes()
-              else:
-                  b64 = (root / 'runtime24fresh_b64' / f'{i:03d}.b64').read_text(encoding='ascii')
-                  b = base64.b64decode(b64, validate=True)
-              assert len(b) == 4096, (i, len(b))
-              parts.append(b)
-          d = brotli.Decompressor()
-          out = d.process(b''.join(parts))
-          print('PREFIX_COMPRESSED', sum(map(len, parts)))
-          print('PREFIX_DECOMPRESSED', len(out))
-          pos = 0
-          count = 0
-          while pos + 512 <= len(out):
-              h = out[pos:pos+512]
-              if h == b'\0' * 512:
-                  break
-              name = h[0:100].split(b'\0',1)[0].decode('utf-8','replace')
-              try:
-                  size = int(h[124:136].rstrip(b'\0 ').decode() or '0', 8)
-                  mtime = int(h[136:148].rstrip(b'\0 ').decode() or '0', 8)
-              except Exception as e:
-                  print('HEADER_PARSE_STOP', pos, repr(e), h[:32].hex())
-                  break
-              print('TAR_HEADER', count, 'POS', pos, 'NAME', repr(name), 'SIZE', size, 'MTIME', mtime)
-              pos += 512 + ((size + 511)//512)*512
-              count += 1
+              fix=root/'runtime24fresh_fix'/f'{i:03d}.bin'
+              if fix.exists(): b=fix.read_bytes()
+              else: b=base64.b64decode((root/'runtime24fresh_b64'/f'{i:03d}.b64').read_text(encoding='ascii'), validate=True)
+              assert len(b)==4096,(i,len(b)); parts.append(b)
+          out=brotli.Decompressor().process(b''.join(parts))
+          print('PREFIX_DECOMPRESSED',len(out))
+          pos=0; count=0
+          def octal(field):
+              return int(field.rstrip(b'\0 ').decode() or '0',8)
+          while pos+512<=len(out):
+              h=out[pos:pos+512]
+              if h==b'\0'*512: break
+              name=h[:100].split(b'\0',1)[0].decode('utf-8','replace')
+              mode=octal(h[100:108]); uid=octal(h[108:116]); gid=octal(h[116:124]); size=octal(h[124:136]); mtime=octal(h[136:148])
+              uname=h[265:297].split(b'\0',1)[0].decode('ascii','replace')
+              gname=h[297:329].split(b'\0',1)[0].decode('ascii','replace')
+              typ=h[156:157]
+              print('HDR',count,'POS',pos,'NAME',repr(name),'TYPE',repr(typ),'MODE',oct(mode),'UID',uid,'GID',gid,'SIZE',size,'MTIME',mtime,'UNAME',repr(uname),'GNAME',repr(gname))
+              data=out[pos+512:pos+512+size]
+              if name=='././@PaxHeader': print('PAX_DATA',repr(data.decode('utf-8','replace')))
+              pos += 512 + ((size+511)//512)*512; count+=1
           PY
