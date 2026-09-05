@@ -1,0 +1,40 @@
+name: Smoke FU 842e2b Exact Artifact
+on:
+  push:
+    branches: [package/fu-smoke-842e-20260905]
+permissions:
+  actions: read
+  contents: read
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fumagic-842e2b-final
+          path: artifact
+          github-token: ${{ github.token }}
+          repository: limaple0324/FLASH
+          run-id: 33972498459
+      - name: Verify exact artifact identity
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'artifact\輔魔.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw '輔魔.exe missing' }
+          $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          if ($h -ne '1e279a3bcf66c4db5d513e35c010a9d2ffa76c13f732a53f50314982d5c2d97a') { throw "EXE SHA mismatch: $h" }
+          if ((Get-Item -LiteralPath $exe).Length -ne 116510382) { throw 'EXE size mismatch' }
+          Write-Host "EXACT_EXE_SHA256=$h"
+      - name: Launch smoke test
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'artifact\輔魔.exe'
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 12
+          $p.Refresh()
+          if ($p.HasExited) { throw "輔魔.exe exited early; exit=$($p.ExitCode)" }
+          Write-Host "SMOKE_PROCESS_ALIVE pid=$($p.Id)"
+          Stop-Process -Id $p.Id -Force
+          Start-Sleep -Milliseconds 500
+          Write-Host 'SMOKE_LAUNCH_PASS'
