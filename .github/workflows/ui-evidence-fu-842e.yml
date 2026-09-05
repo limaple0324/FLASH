@@ -17,6 +17,12 @@ jobs:
           github-token: ${{ github.token }}
           repository: limaple0324/FLASH
           run-id: 33972498459
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install capture dependencies
+        shell: pwsh
+        run: python -m pip install Pillow pywin32
       - name: Verify exact executable
         shell: pwsh
         run: |
@@ -27,77 +33,104 @@ jobs:
       - name: Launch and capture top-level window
         shell: pwsh
         run: |
-          $exe = Join-Path $env:GITHUB_WORKSPACE 'artifact\輔魔.exe'
-          $p = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 10
-          $p.Refresh()
-          if ($p.HasExited) { throw "輔魔.exe exited early: $($p.ExitCode)" }
+          @'
+          import ctypes
+          import os
+          import pathlib
+          import subprocess
+          import time
+          from ctypes import wintypes
+          from PIL import Image
+          import win32con
+          import win32gui
+          import win32ui
+          import win32process
 
-          Add-Type -AssemblyName System.Drawing
-          Add-Type @'
-          using System;
-          using System.Text;
-          using System.Runtime.InteropServices;
-          using System.Drawing;
-          using System.Drawing.Imaging;
-          public static class WindowCapture {
-            public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-            [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
-            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-            [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint flags);
-            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
-            public static string Title(IntPtr h) { var sb=new StringBuilder(1024); GetWindowText(h,sb,sb.Capacity); return sb.ToString(); }
-            public static bool Capture(IntPtr h, string path) {
-              RECT r; if(!GetWindowRect(h,out r)) return false;
-              int w=Math.Max(1,r.Right-r.Left), ht=Math.Max(1,r.Bottom-r.Top);
-              using(var bmp=new Bitmap(w,ht,PixelFormat.Format32bppArgb))
-              using(var g=Graphics.FromImage(bmp)) {
-                IntPtr dc=g.GetHdc(); bool ok=false;
-                try { ok=PrintWindow(h,dc,2); if(!ok) ok=PrintWindow(h,dc,0); }
-                finally { g.ReleaseHdc(dc); }
-                bmp.Save(path,ImageFormat.Png); return ok;
-              }
-            }
-          }
-          '@
+          root = pathlib.Path.cwd()
+          artifact = root / 'artifact'
+          exe = artifact / '輔魔.exe'
+          evidence = artifact / 'UI_EVIDENCE.txt'
+          proc = subprocess.Popen([str(exe)])
+          time.sleep(12)
+          if proc.poll() is not None:
+              raise SystemExit(f'輔魔.exe exited early: {proc.returncode}')
 
-          $targets = New-Object System.Collections.Generic.List[object]
-          $names = @('輔魔')
-          [WindowCapture]::EnumWindows({
-            param($h,$l)
-            if (-not [WindowCapture]::IsWindowVisible($h)) { return $true }
-            [uint32]$pid = 0
-            [WindowCapture]::GetWindowThreadProcessId($h, [ref]$pid) | Out-Null
-            $title = [WindowCapture]::Title($h)
-            $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
-            if ($proc -and (($names -contains $proc.ProcessName) -or $title -match '輔|魔')) {
-              $targets.Add([pscustomobject]@{ hwnd=$h; pid=$pid; process=$proc.ProcessName; title=$title }) | Out-Null
-            }
-            return $true
-          }, [IntPtr]::Zero) | Out-Null
+          # The launcher can create a second same-name process, so collect all live 輔魔.exe PIDs.
+          ps = subprocess.run(
+              ['powershell.exe','-NoProfile','-Command',"Get-Process -Name '輔魔' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }"],
+              capture_output=True, text=True, encoding='utf-8', errors='replace'
+          )
+          pids = {int(x.strip()) for x in ps.stdout.splitlines() if x.strip().isdigit()}
+          pids.add(proc.pid)
 
-          "process_alive_pid=$($p.Id)" | Add-Content -Encoding UTF8 artifact\UI_EVIDENCE.txt
-          "visible_target_windows=$($targets.Count)" | Add-Content -Encoding UTF8 artifact\UI_EVIDENCE.txt
-          $i=0
-          foreach($t in $targets) {
-            $i++
-            "window_$i pid=$($t.pid) process=$($t.process) hwnd=$($t.hwnd) title=$($t.title)" | Add-Content -Encoding UTF8 artifact\UI_EVIDENCE.txt
-            $png = Join-Path $env:GITHUB_WORKSPACE ("artifact\window-{0:D2}.png" -f $i)
-            $ok = [WindowCapture]::Capture($t.hwnd, $png)
-            "window_$i capture_ok=$ok file=$([IO.Path]::GetFileName($png))" | Add-Content -Encoding UTF8 artifact\UI_EVIDENCE.txt
-          }
-          if ($targets.Count -eq 0) { throw 'No visible FU window found after launch.' }
-          Stop-Process -Name '輔魔' -Force -ErrorAction SilentlyContinue
-          Get-Content artifact\UI_EVIDENCE.txt
+          user32 = ctypes.windll.user32
+          targets = []
+          EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+          def callback(hwnd, lparam):
+              if not user32.IsWindowVisible(hwnd):
+                  return True
+              _, pid = win32process.GetWindowThreadProcessId(hwnd)
+              title = win32gui.GetWindowText(hwnd)
+              if pid in pids or ('輔' in title) or ('魔' in title):
+                  rect = win32gui.GetWindowRect(hwnd)
+                  targets.append((hwnd, pid, title, rect))
+              return True
+
+          user32.EnumWindows(EnumProc(callback), 0)
+
+          lines = [evidence.read_text(encoding='utf-8-sig').strip()]
+          lines.append('launcher_pid=' + str(proc.pid))
+          lines.append('live_fu_pids=' + ','.join(str(x) for x in sorted(pids)))
+          lines.append('visible_target_windows=' + str(len(targets)))
+
+          def capture(hwnd, path):
+              left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+              width = max(1, right-left)
+              height = max(1, bottom-top)
+              hwnd_dc = win32gui.GetWindowDC(hwnd)
+              mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+              save_dc = mfc_dc.CreateCompatibleDC()
+              bitmap = win32ui.CreateBitmap()
+              bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+              save_dc.SelectObject(bitmap)
+              try:
+                  ok = user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
+                  if not ok:
+                      ok = user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 0)
+                  info = bitmap.GetInfo()
+                  bits = bitmap.GetBitmapBits(True)
+                  image = Image.frombuffer('RGB', (info['bmWidth'], info['bmHeight']), bits, 'raw', 'BGRX', 0, 1)
+                  image.save(path)
+                  extrema = image.getextrema()
+                  return bool(ok), image.size, extrema
+              finally:
+                  win32gui.DeleteObject(bitmap.GetHandle())
+                  save_dc.DeleteDC()
+                  mfc_dc.DeleteDC()
+                  win32gui.ReleaseDC(hwnd, hwnd_dc)
+
+          for idx, (hwnd, pid, title, rect) in enumerate(targets, 1):
+              png = artifact / f'window-{idx:02d}.png'
+              ok, size, extrema = capture(hwnd, str(png))
+              lines.append(f'window_{idx} pid={pid} hwnd={hwnd} title={title!r} rect={rect} capture_ok={ok} image_size={size} extrema={extrema} file={png.name}')
+
+          evidence.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          print(evidence.read_text(encoding='utf-8'))
+          if not targets:
+              raise SystemExit('No visible FU window found after launch.')
+          if not any((artifact / f'window-{i:02d}.png').is_file() for i in range(1, len(targets)+1)):
+              raise SystemExit('No window PNG created.')
+          subprocess.run(['powershell.exe','-NoProfile','-Command',"Get-Process -Name '輔魔' -ErrorAction SilentlyContinue | Stop-Process -Force"], check=False)
+          '@ | Set-Content -Encoding UTF8 artifact\capture_ui.py
+          python artifact\capture_ui.py
       - name: Upload UI evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fumagic-842e2b-ui-evidence
           path: |
             artifact/UI_EVIDENCE.txt
             artifact/window-*.png
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
