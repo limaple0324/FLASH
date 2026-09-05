@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "product": "輔魔",
+  "channel": "release/fumagic",
+  "tag": "fumagic-842e2b-20260906",
+  "asset": "輔魔.exe",
+  "asset_url": "https://github.com/limaple0324/FLASH/releases/download/fumagic-842e2b-20260906/%E8%BC%94%E9%AD%94.exe",
+  "sha256": "1e279a3bcf66c4db5d513e35c010a9d2ffa76c13f732a53f50314982d5c2d97a",
+  "size": 116510382,
+  "source_zip_sha256": "748ea8dba2dd194e9d32567f6c0a115213f61b43ed6e99c7fde4fa100b160f68",
+  "source_tree_sha256": "842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a"
+}
