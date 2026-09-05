@@ -1,0 +1,103 @@
+name: Capture FU 842e2b UI Evidence
+on:
+  push:
+    branches: [package/fu-ui-842e-20260905]
+permissions:
+  actions: read
+  contents: read
+jobs:
+  capture:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fumagic-842e2b-final
+          path: artifact
+          github-token: ${{ github.token }}
+          repository: limaple0324/FLASH
+          run-id: 33972498459
+      - name: Verify exact executable
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'artifact\輔魔.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          if ($hash -ne '1e279a3bcf66c4db5d513e35c010a9d2ffa76c13f732a53f50314982d5c2d97a') { throw "SHA mismatch: $hash" }
+          "exe_sha256=$hash" | Set-Content -Encoding UTF8 artifact\UI_EVIDENCE.txt
+      - name: Launch and capture top-level window
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'artifact\輔魔.exe'
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 10
+          $p.Refresh()
+          if ($p.HasExited) { throw "輔魔.exe exited early: $($p.ExitCode)" }
+
+          Add-Type -AssemblyName System.Drawing
+          Add-Type @'
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          using System.Drawing;
+          using System.Drawing.Imaging;
+          public static class WindowCapture {
+            public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+            [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+            [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint flags);
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+            public static string Title(IntPtr h) { var sb=new StringBuilder(1024); GetWindowText(h,sb,sb.Capacity); return sb.ToString(); }
+            public static bool Capture(IntPtr h, string path) {
+              RECT r; if(!GetWindowRect(h,out r)) return false;
+              int w=Math.Max(1,r.Right-r.Left), ht=Math.Max(1,r.Bottom-r.Top);
+              using(var bmp=new Bitmap(w,ht,PixelFormat.Format32bppArgb))
+              using(var g=Graphics.FromImage(bmp)) {
+                IntPtr dc=g.GetHdc(); bool ok=false;
+                try { ok=PrintWindow(h,dc,2); if(!ok) ok=PrintWindow(h,dc,0); }
+                finally { g.ReleaseHdc(dc); }
+                bmp.Save(path,ImageFormat.Png); return ok;
+              }
+            }
+          }
+          '@
+
+          $targets = New-Object System.Collections.Generic.List[object]
+          $names = @('輔魔')
+          [WindowCapture]::EnumWindows({
+            param($h,$l)
+            if (-not [WindowCapture]::IsWindowVisible($h)) { return $true }
+            [uint32]$pid = 0
+            [WindowCapture]::GetWindowThreadProcessId($h, [ref]$pid) | Out-Null
+            $title = [WindowCapture]::Title($h)
+            $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+            if ($proc -and (($names -contains $proc.ProcessName) -or $title -match '輔|魔')) {
+              $targets.Add([pscustomobject]@{ hwnd=$h; pid=$pid; process=$proc.ProcessName; title=$title }) | Out-Null
+            }
+            return $true
+          }, [IntPtr]::Zero) | Out-Null
+
+          "process_alive_pid=$($p.Id)" | Add-Content -Encoding UTF8 artifact\UI_EVIDENCE.txt
+          "visible_target_windows=$($targets.Count)" | Add-Content -Encoding UTF8 artifact\UI_EVIDENCE.txt
+          $i=0
+          foreach($t in $targets) {
+            $i++
+            "window_$i pid=$($t.pid) process=$($t.process) hwnd=$($t.hwnd) title=$($t.title)" | Add-Content -Encoding UTF8 artifact\UI_EVIDENCE.txt
+            $png = Join-Path $env:GITHUB_WORKSPACE ("artifact\window-{0:D2}.png" -f $i)
+            $ok = [WindowCapture]::Capture($t.hwnd, $png)
+            "window_$i capture_ok=$ok file=$([IO.Path]::GetFileName($png))" | Add-Content -Encoding UTF8 artifact\UI_EVIDENCE.txt
+          }
+          if ($targets.Count -eq 0) { throw 'No visible FU window found after launch.' }
+          Stop-Process -Name '輔魔' -Force -ErrorAction SilentlyContinue
+          Get-Content artifact\UI_EVIDENCE.txt
+      - name: Upload UI evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fumagic-842e2b-ui-evidence
+          path: |
+            artifact/UI_EVIDENCE.txt
+            artifact/window-*.png
+          if-no-files-found: error
+          retention-days: 7
