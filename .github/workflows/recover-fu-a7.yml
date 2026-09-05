@@ -45,24 +45,22 @@ jobs:
           extract(brotli.decompress(base),src)
           ov=pkg/'fu842_overlay_b64_12k'; decoded=[]
           for i in range(20):
-              if i in (3,10):
+              if i in (0,3,10):
                   text=(ov/f'{i:03d}a.b64').read_text('ascii').strip()+(ov/f'{i:03d}b.b64').read_text('ascii').strip()
-              else: text=(ov/f'{i:03d}.b64').read_text('ascii').strip()
-              expected_chars=12000 if i<19 else 9732
+              else:
+                  text=(ov/f'{i:03d}.b64').read_text('ascii').strip()
+              expected=12000 if i<19 else 9732
               print('OVERLAY_CHUNK',f'{i:03d}','B64_CHARS',len(text))
-              if len(text)!=expected_chars: raise SystemExit(f'OVERLAY_CHUNK_B64_LENGTH {i:03d}: {len(text)} != {expected_chars}')
+              if len(text)!=expected: raise SystemExit(f'OVERLAY_CHUNK_B64_LENGTH {i:03d}: {len(text)} != {expected}')
               try: decoded.append(base64.b64decode(text,validate=True))
               except Exception as e: raise SystemExit(f'OVERLAY_CHUNK_BASE64_INVALID {i:03d}: {e}') from e
-          overlay=b''.join(decoded)
-          expect='d4eac19786c913f9ac8eae4b7c33327b00d04545a8ad765345595593b7ed1a9c'; sha=hashlib.sha256(overlay).hexdigest()
-          print('OVERLAY_BYTES',len(overlay)); print('OVERLAY_SHA256',sha)
-          if len(overlay)!=178298: raise SystemExit(f'OVERLAY_SIZE {len(overlay)}')
-          if sha!=expect: raise SystemExit('OVERLAY_SHA_MISMATCH')
+          overlay=b''.join(decoded); expect='d4eac19786c913f9ac8eae4b7c33327b00d04545a8ad765345595593b7ed1a9c'; h=hashlib.sha256(overlay).hexdigest()
+          print('OVERLAY_BYTES',len(overlay)); print('OVERLAY_SHA256',h)
+          if len(overlay)!=178298 or h!=expect: raise SystemExit('OVERLAY_IDENTITY_MISMATCH')
           ot=brotli.decompress(overlay)
           if len(ot)!=1382400: raise SystemExit(f'OVERLAY_TAR_SIZE {len(ot)}')
           extract(ot,src)
-          mf=json.loads((src/'SOURCE_MANIFEST.json').read_text('utf-8')); tree='842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a'
-          inc=mf.get('included')
+          mf=json.loads((src/'SOURCE_MANIFEST.json').read_text('utf-8')); tree='842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a'; inc=mf.get('included')
           if mf.get('source_tree_sha256')!=tree: raise SystemExit('SOURCE_TREE_ID_MISMATCH')
           if not isinstance(inc,list) or len(inc)!=159 or mf.get('included_count')!=159: raise SystemExit('MANIFEST_COUNT_MISMATCH')
           bad=[]
@@ -70,11 +68,11 @@ jobs:
               r=pathlib.PurePosixPath(rec['path']); p=src.joinpath(*r.parts)
               if r.is_absolute() or '..' in r.parts: raise SystemExit(f'UNSAFE_MANIFEST_PATH {rec["path"]!r}')
               if not p.is_file(): bad.append(f'{rec["path"]}: missing'); continue
-              d=p.read_bytes(); h=hashlib.sha256(d).hexdigest()
-              if len(d)!=int(rec['bytes']) or h!=rec['sha256']: bad.append(f'{rec["path"]}: bytes={len(d)}/{rec["bytes"]} sha={h}/{rec["sha256"]}')
+              d=p.read_bytes(); sh=hashlib.sha256(d).hexdigest()
+              if len(d)!=int(rec['bytes']) or sh!=rec['sha256']: bad.append(f'{rec["path"]}: bytes={len(d)}/{rec["bytes"]} sha={sh}/{rec["sha256"]}')
           if bad:
               print('\n'.join(bad)); raise SystemExit(f'EXACT_SOURCE_MISMATCH_COUNT={len(bad)}')
-          (pkg/'FINAL_OVERLAY_SHA256.txt').write_text(sha+'\n',encoding='ascii')
+          (pkg/'FINAL_OVERLAY_SHA256.txt').write_text(h+'\n',encoding='ascii')
           print('SOURCE_MANIFEST_VERIFIED 159 / 159'); print('SOURCE_TREE_SHA256',tree)
           '@ | Set-Content -Encoding UTF8 .packaging\reconstruct_final.py
           python .packaging\reconstruct_final.py
@@ -123,10 +121,10 @@ jobs:
           m='\n'.join(texts)
           for needle in ('processorArchitecture="amd64"','requestedExecutionLevel level="asInvoker"','<dpiAware','true/pm','<longPathAware','>true</longPathAware>'):
               if needle not in m: raise SystemExit(f'MANIFEST_ASSERTION_MISSING: {needle}')
-          h=hashlib.sha256(d).hexdigest(); o=pathlib.Path('.packaging/FINAL_OVERLAY_SHA256.txt').read_text('ascii').strip()
+          sh=hashlib.sha256(d).hexdigest(); ov=pathlib.Path('.packaging/FINAL_OVERLAY_SHA256.txt').read_text('ascii').strip()
           info=pathlib.Path(r'legacy/fu-v02-reconnect-preview/dist/BUILD_INFO.txt')
-          info.write_text('\n'.join(['source_zip_sha256=748ea8dba2dd194e9d32567f6c0a115213f61b43ed6e99c7fde4fa100b160f68','source_tree_sha256=842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a','base_commit=32ad4ae780c8c3b68c4a068aba3fb6c59977466f',f'overlay_sha256={o}',f'exe_sha256={h}',f'exe_bytes={len(d)}','pe_machine=AMD64','rt_manifest=verified'])+'\n',encoding='utf-8')
-          print('EXE_BYTES',len(d)); print('EXE_SHA256',h); print('PE_MACHINE AMD64'); print('RT_MANIFEST verified')
+          info.write_text('\n'.join(['source_zip_sha256=748ea8dba2dd194e9d32567f6c0a115213f61b43ed6e99c7fde4fa100b160f68','source_tree_sha256=842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a','base_commit=32ad4ae780c8c3b68c4a068aba3fb6c59977466f',f'overlay_sha256={ov}',f'exe_sha256={sh}',f'exe_bytes={len(d)}','pe_machine=AMD64','rt_manifest=verified'])+'\n',encoding='utf-8')
+          print('EXE_BYTES',len(d)); print('EXE_SHA256',sh); print('PE_MACHINE AMD64'); print('RT_MANIFEST verified')
           '@ | Set-Content -Encoding UTF8 .packaging\verify_final_exe.py
           python .packaging\verify_final_exe.py
           Get-Content -LiteralPath 'legacy\fu-v02-reconnect-preview\dist\BUILD_INFO.txt'
