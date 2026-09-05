@@ -1,4 +1,4 @@
-name: Package FU 842e2b
+name: Package FU 842e2b Final
 
 on:
   push:
@@ -9,75 +9,169 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
+  package:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Diagnose recovered payload against exact 159-file manifest
+
+      - name: Install reconstruction tools
+        shell: pwsh
+        run: python -m pip install brotli pefile
+
+      - name: Reconstruct exact reviewed source
         shell: pwsh
         run: |
-          python -m pip install brotli
           @'
           import base64, brotli, hashlib, io, json, pathlib, tarfile
           repo = pathlib.Path.cwd()
-          packaging = repo / '.packaging'
-          b64_root = packaging / 'runtime24fresh_b64'
-          fix_root = packaging / 'runtime24fresh_fix'
-          source_root = repo / 'legacy' / 'fu-v02-reconnect-preview'
+          pkg = repo / '.packaging'
+          srcroot = repo / 'legacy' / 'fu-v02-reconnect-preview'
+          b64root = pkg / 'runtime24fresh_b64'
+          fixroot = pkg / 'runtime24fresh_fix'
           fixed = {0, 1, 3, 4, 6, 7}
           chunks = []
           for i in range(70):
-              p = (fix_root / f'{i:03d}.bin') if i in fixed else (b64_root / f'{i:03d}.b64')
-              if not p.is_file():
-                  raise SystemExit(f'MISSING_CHUNK {i:03d}')
-              data = p.read_bytes() if i in fixed else base64.b64decode(p.read_text(encoding='ascii').strip(), validate=True)
-              expected_len = 4096 if i < 69 else 3716
-              if len(data) != expected_len:
-                  raise SystemExit(f'CHUNK_LENGTH_MISMATCH {i:03d}: {len(data)} != {expected_len}')
+              p = (fixroot / f'{i:03d}.bin') if i in fixed else (b64root / f'{i:03d}.b64')
+              if not p.is_file(): raise SystemExit(f'MISSING_BASE_CHUNK {i:03d}')
+              data = p.read_bytes() if i in fixed else base64.b64decode(p.read_text('ascii').strip(), validate=True)
+              expected = 4096 if i < 69 else 3716
+              if len(data) != expected: raise SystemExit(f'BASE_CHUNK_LENGTH {i:03d} {len(data)} != {expected}')
               chunks.append(data)
-          payload = b''.join(chunks)
-          print('PAYLOAD_BYTES', len(payload))
-          print('PAYLOAD_SHA256', hashlib.sha256(payload).hexdigest())
-          tar_bytes = brotli.decompress(payload)
-          print('TAR_BYTES', len(tar_bytes))
-          with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r:') as tf:
-              for member in tf.getmembers():
-                  rel = pathlib.PurePosixPath(member.name)
-                  if rel.is_absolute() or '..' in rel.parts or not member.isfile():
-                      raise SystemExit(f'UNSAFE_TAR_MEMBER {member.name!r}')
-                  target = source_root.joinpath(*rel.parts)
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  src = tf.extractfile(member)
-                  if src is None:
-                      raise SystemExit(f'UNREADABLE_TAR_MEMBER {member.name!r}')
-                  target.write_bytes(src.read())
-          manifest = json.loads((source_root / 'SOURCE_MANIFEST.json').read_text(encoding='utf-8'))
-          if manifest.get('source_tree_sha256') != '842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a':
-              raise SystemExit('SOURCE_TREE_ID_MISMATCH')
+          base_payload = b''.join(chunks)
+          if len(base_payload) != 286340: raise SystemExit('BASE_PAYLOAD_SIZE')
+          base_tar = brotli.decompress(base_payload)
+
+          def extract_regular(tar_bytes, dest):
+              with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r:') as tf:
+                  for m in tf.getmembers():
+                      rel = pathlib.PurePosixPath(m.name)
+                      if rel.is_absolute() or '..' in rel.parts or not m.isfile():
+                          raise SystemExit(f'UNSAFE_TAR_MEMBER {m.name!r}')
+                      target = dest.joinpath(*rel.parts)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      f = tf.extractfile(m)
+                      if f is None: raise SystemExit(f'UNREADABLE_TAR_MEMBER {m.name!r}')
+                      target.write_bytes(f.read())
+          extract_regular(base_tar, srcroot)
+
+          ovroot = pkg / 'fu842_overlay_b64_12k'
+          encoded = ''.join((ovroot / f'{i:03d}.b64').read_text('ascii').strip() for i in range(20))
+          overlay = base64.b64decode(encoded, validate=True)
+          expected_overlay_sha = 'd4eac19786c913f9ac8eae4b7c33327b00d04545a8ad765345595593b7ed1a9c'
+          overlay_sha = hashlib.sha256(overlay).hexdigest()
+          print('OVERLAY_BYTES', len(overlay))
+          print('OVERLAY_SHA256', overlay_sha)
+          if len(overlay) != 178298: raise SystemExit(f'OVERLAY_SIZE {len(overlay)}')
+          if overlay_sha != expected_overlay_sha: raise SystemExit('OVERLAY_SHA_MISMATCH')
+          overlay_tar = brotli.decompress(overlay)
+          if len(overlay_tar) != 1382400: raise SystemExit(f'OVERLAY_TAR_SIZE {len(overlay_tar)}')
+          extract_regular(overlay_tar, srcroot)
+
+          manifest = json.loads((srcroot / 'SOURCE_MANIFEST.json').read_text('utf-8'))
+          expected_tree = '842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a'
+          if manifest.get('source_tree_sha256') != expected_tree: raise SystemExit('SOURCE_TREE_ID_MISMATCH')
           included = manifest.get('included')
           if not isinstance(included, list) or len(included) != 159 or manifest.get('included_count') != 159:
               raise SystemExit('MANIFEST_COUNT_MISMATCH')
           failures = []
-          for record in included:
-              rel = pathlib.PurePosixPath(record['path'])
-              p = source_root.joinpath(*rel.parts)
-              if not p.is_file():
-                  failures.append((record['path'], 'MISSING', int(record['bytes']), record['sha256'], None, None))
-                  continue
+          for rec in included:
+              rel = pathlib.PurePosixPath(rec['path'])
+              if rel.is_absolute() or '..' in rel.parts: raise SystemExit(f'UNSAFE_MANIFEST_PATH {rec["path"]!r}')
+              p = srcroot.joinpath(*rel.parts)
+              if not p.is_file(): failures.append(f'{rec["path"]}: missing'); continue
               data = p.read_bytes()
-              actual_sha = hashlib.sha256(data).hexdigest()
-              if len(data) != int(record['bytes']) or actual_sha != record['sha256']:
-                  failures.append((record['path'], 'MISMATCH', int(record['bytes']), record['sha256'], len(data), actual_sha))
-          print('MANIFEST_TOTAL', len(included))
-          print('MISMATCH_COUNT', len(failures))
-          for item in failures:
-              print('MISMATCH', json.dumps(item, ensure_ascii=False))
+              sha = hashlib.sha256(data).hexdigest()
+              if len(data) != int(rec['bytes']) or sha != rec['sha256']:
+                  failures.append(f'{rec["path"]}: bytes={len(data)}/{rec["bytes"]} sha={sha}/{rec["sha256"]}')
           if failures:
+              print('\n'.join(failures[:100]))
               raise SystemExit(f'EXACT_SOURCE_MISMATCH_COUNT={len(failures)}')
+          (pkg / 'FINAL_OVERLAY_SHA256.txt').write_text(overlay_sha + '\n', encoding='ascii')
           print('SOURCE_MANIFEST_VERIFIED 159 / 159')
-          '@ | Set-Content -Encoding UTF8 .packaging\diagnose_payload.py
-          python .packaging\diagnose_payload.py
+          print('SOURCE_TREE_SHA256', expected_tree)
+          '@ | Set-Content -Encoding UTF8 .packaging\reconstruct_final.py
+          python .packaging\reconstruct_final.py
+
+      - name: Install build requirements
+        shell: pwsh
+        working-directory: legacy/fu-v02-reconnect-preview
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Compile check
+        shell: pwsh
+        working-directory: legacy/fu-v02-reconnect-preview
+        run: python -m compileall -q automation_input_safety.py control_panel.py fishing_profiles.py flash_sync_v02.py fu_reconnect_integration.py manor_runtime.py quick_code_library.py runtime_paths.py settings_bundle.py smart_reconnect.py user_activity_guard.py v02_faithful_game_time.py v02_game_clock_reader.py v02_sync_scheduler.py v02_wheel_hook.py manor_assistant
+
+      - name: Build Windows EXE
+        shell: pwsh
+        working-directory: legacy/fu-v02-reconnect-preview
+        run: python -m PyInstaller --clean --noconfirm fu_preview.spec
+
+      - name: Verify Windows EXE
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'legacy\fu-v02-reconnect-preview\dist\輔魔.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw '輔魔.exe missing' }
+          if ((Get-Item -LiteralPath $exe).Length -le 0) { throw '輔魔.exe empty' }
+          $vi = (Get-Item -LiteralPath $exe).VersionInfo
+          if ($vi.FileDescription -ne '輔魔') { throw "FileDescription mismatch: $($vi.FileDescription)" }
+          if ($vi.InternalName -ne '輔魔') { throw "InternalName mismatch: $($vi.InternalName)" }
+          if ($vi.ProductName -ne '輔魔') { throw "ProductName mismatch: $($vi.ProductName)" }
+          if ($vi.OriginalFilename -ne '輔魔.exe') { throw "OriginalFilename mismatch: $($vi.OriginalFilename)" }
+          if ($vi.FileVersion -ne '0.2.1.0') { throw "FileVersion mismatch: $($vi.FileVersion)" }
+          if ($vi.ProductVersion -ne '0.2.1.0') { throw "ProductVersion mismatch: $($vi.ProductVersion)" }
+          @'
+          import hashlib, pathlib, struct, pefile
+          exe = pathlib.Path(r'legacy/fu-v02-reconnect-preview/dist/輔魔.exe')
+          data = exe.read_bytes()
+          if data[:2] != b'MZ': raise SystemExit('MZ_HEADER_MISSING')
+          peoff = struct.unpack_from('<I', data, 0x3C)[0]
+          if data[peoff:peoff+4] != b'PE\0\0': raise SystemExit('PE_SIGNATURE_MISSING')
+          if struct.unpack_from('<H', data, peoff + 4)[0] != 0x8664: raise SystemExit('PE_MACHINE_MISMATCH')
+          pe = pefile.PE(str(exe), fast_load=False)
+          texts = []
+          if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE'):
+              for t in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+                  tid = t.id if t.name is None else str(t.name)
+                  if tid != 24: continue
+                  for n in t.directory.entries:
+                      for lang in n.directory.entries:
+                          raw = pe.get_memory_mapped_image()[lang.data.struct.OffsetToData:lang.data.struct.OffsetToData+lang.data.struct.Size]
+                          for enc in ('utf-8-sig','utf-16','utf-16le'):
+                              try: s = raw.decode(enc)
+                              except UnicodeError: continue
+                              if '<assembly' in s: texts.append(s); break
+          if not texts: raise SystemExit('RT_MANIFEST_MISSING')
+          manifest = '\n'.join(texts)
+          for needle in ('processorArchitecture="amd64"','requestedExecutionLevel level="asInvoker"','<dpiAware','true/pm','<longPathAware','>true</longPathAware>'):
+              if needle not in manifest: raise SystemExit(f'MANIFEST_ASSERTION_MISSING: {needle}')
+          sha = hashlib.sha256(data).hexdigest()
+          overlay_sha = pathlib.Path('.packaging/FINAL_OVERLAY_SHA256.txt').read_text('ascii').strip()
+          info = pathlib.Path(r'legacy/fu-v02-reconnect-preview/dist/BUILD_INFO.txt')
+          info.write_text('\n'.join([
+              'source_zip_sha256=748ea8dba2dd194e9d32567f6c0a115213f61b43ed6e99c7fde4fa100b160f68',
+              'source_tree_sha256=842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a',
+              'base_commit=32ad4ae780c8c3b68c4a068aba3fb6c59977466f',
+              f'overlay_sha256={overlay_sha}', f'exe_sha256={sha}', f'exe_bytes={len(data)}',
+              'pe_machine=AMD64', 'rt_manifest=verified']) + '\n', encoding='utf-8')
+          print('EXE_BYTES', len(data)); print('EXE_SHA256', sha); print('PE_MACHINE AMD64'); print('RT_MANIFEST verified')
+          '@ | Set-Content -Encoding UTF8 .packaging\verify_final_exe.py
+          python .packaging\verify_final_exe.py
+          Get-Content -LiteralPath 'legacy\fu-v02-reconnect-preview\dist\BUILD_INFO.txt'
+
+      - name: Upload 輔魔 EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: fumagic-842e2b-final
+          path: |
+            legacy/fu-v02-reconnect-preview/dist/輔魔.exe
+            legacy/fu-v02-reconnect-preview/dist/BUILD_INFO.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
