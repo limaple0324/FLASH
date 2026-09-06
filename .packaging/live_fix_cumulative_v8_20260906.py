@@ -6,6 +6,7 @@ PATCHES = (
     Path('.packaging/live_fix_existing_window_reattach_test_import_20260906.py'),
     Path('.packaging/live_fix_existing_window_identityless_reattach_v3_20260906.py'),
     Path('.packaging/live_fix_identityless_reattach_helper_20260906.py'),
+    Path('.packaging/live_fix_sync_window_restore_v10_compat_20260906.py'),
     Path('.packaging/live_fix_sync_window_restore_v10_20260906.py'),
 )
 
