@@ -1,4 +1,4 @@
-name: Smoke FU Cumulative Live Fix
+name: Smoke FU Cumulative Live Fix 5
 on:
   push:
     branches: [repair/fumagic-runtime-init-smoke-20260906]
@@ -16,17 +16,17 @@ jobs:
           path: repaired
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
-          run-id: 34004829357
-      - name: Verify exact cumulative executable
+          run-id: 34006609674
+      - name: Verify exact cumulative v5 executable
         shell: pwsh
         run: |
           $exe = Resolve-Path 'repaired/輔魔.exe'
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
-          if ($hash -ne 'a84e9607374ab908d4698086ada6b07b95cc97187179e46f69072feb991c719a') { throw "SHA mismatch: $hash" }
+          if ($hash -ne 'c6fae5162fbe002434baaed556a6d709bcdb91819729629b28ec845638da9d37') { throw "SHA mismatch: $hash" }
           $size = (Get-Item -LiteralPath $exe).Length
-          if ($size -ne 116514020) { throw "Size mismatch: $size" }
-          Write-Host "CUMULATIVE_EXE_VERIFIED sha256=$hash size=$size"
-      - name: Launch exact cumulative executable
+          if ($size -ne 116519196) { throw "Size mismatch: $size" }
+          Write-Host "CUMULATIVE_V5_EXE_VERIFIED sha256=$hash size=$size"
+      - name: Launch exact cumulative v5 executable
         shell: pwsh
         run: |
           $exe = Resolve-Path 'repaired/輔魔.exe'
@@ -35,5 +35,5 @@ jobs:
           $live = @(Get-Process -Name '輔魔' -ErrorAction SilentlyContinue)
           if ($live.Count -lt 1) { throw 'No live 輔魔 process after 12 seconds.' }
           Write-Host ('SMOKE_PROCESS_ALIVE pids=' + (($live | ForEach-Object Id) -join ','))
-          Write-Host 'SMOKE_CUMULATIVE_LIVE_FIX_PASS'
+          Write-Host 'SMOKE_CUMULATIVE_V5_PASS'
           $live | Stop-Process -Force -ErrorAction SilentlyContinue
