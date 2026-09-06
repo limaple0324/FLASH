@@ -89,7 +89,7 @@ jobs:
         shell: pwsh
         working-directory: legacy/fu-v02-reconnect-preview
         run: |
-          python -m unittest -q test_fu_reconnect_integration.EmbeddedRecognitionRuntimeTests test_fu_reconnect_integration.LiveLaunchAddSafetyTests manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests
+          python -m unittest -q test_fu_reconnect_integration.EmbeddedRecognitionRuntimeTests test_fu_reconnect_integration.LiveLaunchAddSafetyTests manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests.test_non_flyable_scene_sends_yellow_link_before_trying_flight_again manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests.test_non_flyable_relocation_single_clicks_link_then_flies_after_map_stable
       - name: Compile check
         shell: pwsh
         working-directory: legacy/fu-v02-reconnect-preview
