@@ -3,6 +3,7 @@ from pathlib import Path
 PATCHES = (
     Path('.packaging/live_fix_cumulative_20260906.py'),
     Path('.packaging/live_fix_existing_window_reattach_20260906.py'),
+    Path('.packaging/live_fix_existing_window_reattach_test_import_20260906.py'),
 )
 
 for patch in PATCHES:
