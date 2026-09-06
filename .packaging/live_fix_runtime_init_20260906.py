@@ -36,4 +36,9 @@ if not quick_scale_patch.is_file():
     raise SystemExit("missing quick-code scaling cumulative repair script")
 exec(compile(quick_scale_patch.read_text(encoding="utf-8"), str(quick_scale_patch), "exec"), {})
 
-print("LIVE_FIX_APPLIED embedded recognition runtime + no-flight relocation + quick-code scaling")
+batch_disable_patch = Path(".packaging/live_fix_batch_disable_automation_20260906.py")
+if not batch_disable_patch.is_file():
+    raise SystemExit("missing current-group all-off cumulative repair script")
+exec(compile(batch_disable_patch.read_text(encoding="utf-8"), str(batch_disable_patch), "exec"), {})
+
+print("LIVE_FIX_APPLIED embedded recognition runtime + no-flight relocation + quick-code scaling + current-group automation all-off")
