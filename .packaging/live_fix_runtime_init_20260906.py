@@ -20,7 +20,7 @@ INTEGRATION.write_text(source, encoding="utf-8", newline="\n")
 
 text = TEST.read_text(encoding="utf-8")
 test_anchor = '''class StrictRegistryTests(unittest.TestCase):\n'''
-test_case = '''class EmbeddedRecognitionRuntimeTests(unittest.TestCase):\n    def test_controller_initializes_shared_recognition_runtime_for_embedded_mode(self):\n        fake_ocr = object()\n        fake_tb = object()\n        with tempfile.TemporaryDirectory() as td, \\\n             mock.patch.object(sr, "OCR", None), \\\n             mock.patch.object(sr, "TB", None), \\\n             mock.patch.object(sr, "OCRReader", return_value=fake_ocr) as ocr_ctor, \\\n             mock.patch.object(sr, "TemplateBank", return_value=fake_tb) as tb_ctor:\n            ctl = EmbeddedAutomationController(Path(td) / "settings.json", lambda _hwnd: True)\n            try:\n                self.assertIs(sr.OCR, fake_ocr)\n                self.assertIs(sr.TB, fake_tb)\n                ocr_ctor.assert_called_once_with(bool(sr.CONFIG.get("啟用OCR", True)))\n                tb_ctor.assert_called_once_with()\n            finally:\n                ctl.stop()\n\n\n'''
+test_case = '''class EmbeddedRecognitionRuntimeTests(unittest.TestCase):\n    def test_controller_initializes_shared_recognition_runtime_for_embedded_mode(self):\n        fake_ocr = object()\n        fake_tb = object()\n        with tempfile.TemporaryDirectory() as td, \\\n             mock.patch.object(sr, "OCR", None), \\\n             mock.patch.object(sr, "TB", None), \\\n             mock.patch.object(sr, "OCRReader", return_value=fake_ocr) as ocr_ctor, \\\n             mock.patch.object(sr, "TemplateBank", return_value=fake_tb) as tb_ctor:\n            ctl = EmbeddedAutomationController(Path(td) / "settings.json", lambda _hwnd: True)\n            try:\n                self.assertIs(sr.OCR, fake_ocr)\n                self.assertIs(sr.TB, fake_tb)\n                ocr_ctor.assert_called_once_with(bool(sr.CONFIG.get("啟用OCR", True)))\n                tb_ctor.assert_called_once_with()\n            finally:\n                ctl.stop()\n\n    def test_quick_code_scale_is_present_in_same_cumulative_build(self):\n        root = Path(__file__).parent\n        quick = (root / "quick_code_library.py").read_text(encoding="utf-8")\n        app = (root / "flash_sync_v02.py").read_text(encoding="utf-8")\n        self.assertIn('"<ButtonRelease-3>"', quick)\n        self.assertIn('text="縮小"', quick)\n        self.assertIn('text="100%"', quick)\n        self.assertIn('text="放大"', quick)\n        self.assertIn('style=self._popup_style_name', quick)\n        self.assertNotIn('SetForegroundWindow', quick.split('class QuickCodeFloatingControl:', 1)[1])\n        self.assertIn('"quick_code_floating_scale": float(floating_scale)', app)\n        self.assertIn('save_scale=self.save_quick_code_floating_scale', app)\n\n\n'''
 if text.count(test_anchor) != 1:
     raise SystemExit(f"test anchor count={text.count(test_anchor)}")
 text = text.replace(test_anchor, test_case + test_anchor, 1)
@@ -30,4 +30,10 @@ arena_patch = Path(".packaging/live_fix_arena_flight_wait_20260906.py")
 if not arena_patch.is_file():
     raise SystemExit("missing arena/no-flight live repair script")
 exec(compile(arena_patch.read_text(encoding="utf-8"), str(arena_patch), "exec"), {})
-print("LIVE_FIX_APPLIED embedded recognition runtime initialization + arena/no-flight wait")
+
+quick_scale_patch = Path(".packaging/live_fix_quick_code_scale_20260906.py")
+if not quick_scale_patch.is_file():
+    raise SystemExit("missing quick-code scaling cumulative repair script")
+exec(compile(quick_scale_patch.read_text(encoding="utf-8"), str(quick_scale_patch), "exec"), {})
+
+print("LIVE_FIX_APPLIED embedded recognition runtime + no-flight relocation + quick-code scaling")
