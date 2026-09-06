@@ -5,8 +5,8 @@ INTEGRATION = ROOT / "fu_reconnect_integration.py"
 TEST = ROOT / "test_fu_reconnect_integration.py"
 
 source = INTEGRATION.read_text(encoding="utf-8")
-old = '''        self._validated_at: dict[int, float] = {}\n        self._load_settings()\n        self._install_policy()\n        self._monitor_thread = threading.Thread(target=self._monitor_loop, name="fu-strict-identity-monitor", daemon=True)\n'''
-new = '''        self._validated_at: dict[int, float] = {}\n        self._load_settings()\n        self._ensure_recognition_runtime()\n        self._install_policy()\n        self._monitor_thread = threading.Thread(target=self._monitor_loop, name="fu-strict-identity-monitor", daemon=True)\n'''
+old = '''        self.settings_recovery_error = ""\n        self._load_settings()\n        from manor_assistant import win32_api\n'''
+new = '''        self.settings_recovery_error = ""\n        self._load_settings()\n        self._ensure_recognition_runtime()\n        from manor_assistant import win32_api\n'''
 if source.count(old) != 1:
     raise SystemExit(f"integration init anchor count={source.count(old)}")
 source = source.replace(old, new, 1)
