@@ -3,6 +3,7 @@ from pathlib import Path
 ROOT = Path("legacy/fu-v02-reconnect-preview")
 SOURCE = ROOT / "smart_reconnect.py"
 TEST = ROOT / "manor_tests" / "test_fishing_background_resume.py"
+INTEGRATION_TEST = ROOT / "test_fu_reconnect_integration.py"
 
 source = SOURCE.read_text(encoding="utf-8")
 
@@ -39,5 +40,13 @@ if test.count(anchor) != 1:
     raise SystemExit(f"test insertion anchor count={test.count(anchor)}")
 test = test.replace(anchor, case + anchor, 1)
 TEST.write_text(test, encoding="utf-8", newline="\n")
+
+integration_test = INTEGRATION_TEST.read_text(encoding="utf-8")
+class_anchor = '''class EmbeddedRecognitionRuntimeTests(unittest.TestCase):\n'''
+integration_case = '''class EmbeddedRecognitionRuntimeTests(unittest.TestCase):\n    def test_no_flight_wait_is_bounded_and_no_x_maintenance_runs_before_wait_dispatch(self):\n        prepare = inspect.getsource(sr.GameWorker._fishing_prepare_step)\n        self.assertIn('self.fishing_flight_confirm_failures += 1', prepare)\n        self.assertIn('self.fishing_phase = "等待可飛行場景"', prepare)\n        step = inspect.getsource(sr.GameWorker._fishing_step)\n        maintain = step.index('if not fishing_action_active and not self._maintain_no_x_auto_battle')\n        wait = step.index('if self.fishing_phase == "等待可飛行場景"')\n        self.assertLess(maintain, wait)\n\n'''
+if integration_test.count(class_anchor) != 1:
+    raise SystemExit(f"integration targeted-test anchor count={integration_test.count(class_anchor)}")
+integration_test = integration_test.replace(class_anchor, integration_case, 1)
+INTEGRATION_TEST.write_text(integration_test, encoding="utf-8", newline="\n")
 
 print("LIVE_FIX_APPLIED arena/no-flight bounded wait with no-X monitoring preserved")
