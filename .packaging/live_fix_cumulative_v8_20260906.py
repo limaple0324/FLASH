@@ -4,7 +4,7 @@ PATCHES = (
     Path('.packaging/live_fix_cumulative_20260906.py'),
     Path('.packaging/live_fix_existing_window_reattach_20260906.py'),
     Path('.packaging/live_fix_existing_window_reattach_test_import_20260906.py'),
-    Path('.packaging/live_fix_existing_window_identityless_reattach_20260906.py'),
+    Path('.packaging/live_fix_existing_window_identityless_reattach_v2_20260906.py'),
 )
 
 for patch in PATCHES:
@@ -12,4 +12,4 @@ for patch in PATCHES:
         raise SystemExit(f'missing cumulative repair script: {patch}')
     exec(compile(patch.read_text(encoding='utf-8'), str(patch), 'exec'), {})
 
-print('LIVE_FIX_CUMULATIVE_V9_APPLIED v8 + blank-identity exact existing-window reattach + no notice strip')
+print('LIVE_FIX_CUMULATIVE_V9_APPLIED v8 + exact blank-identity existing-window reattach + no notice strip')
