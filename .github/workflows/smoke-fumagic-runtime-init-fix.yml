@@ -1,0 +1,39 @@
+name: Smoke FU Runtime Init Fix
+on:
+  push:
+    branches: [repair/fumagic-runtime-init-smoke-20260906]
+permissions:
+  actions: read
+  contents: read
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fumagic-842e2b-runtime-init-fix
+          path: repaired
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 34001374301
+      - name: Verify exact repaired executable
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'repaired/輔魔.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          if ($hash -ne '51492c01f15f93ab5d3720a9c34ebcabd32252a8a9990b0e991eea97768b3e95') { throw "SHA mismatch: $hash" }
+          $size = (Get-Item -LiteralPath $exe).Length
+          if ($size -ne 116511216) { throw "Size mismatch: $size" }
+          Write-Host "REPAIRED_EXE_VERIFIED sha256=$hash size=$size"
+      - name: Launch repaired executable
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'repaired/輔魔.exe'
+          Start-Process -FilePath $exe | Out-Null
+          Start-Sleep -Seconds 12
+          $live = @(Get-Process -Name '輔魔' -ErrorAction SilentlyContinue)
+          if ($live.Count -lt 1) { throw 'No live 輔魔 process after 12 seconds.' }
+          Write-Host ('SMOKE_PROCESS_ALIVE pids=' + (($live | ForEach-Object Id) -join ','))
+          Write-Host 'SMOKE_RUNTIME_INIT_FIX_PASS'
+          $live | Stop-Process -Force -ErrorAction SilentlyContinue
