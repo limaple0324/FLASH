@@ -1,4 +1,4 @@
-name: Smoke FU Cumulative Live Fix 7
+name: Smoke FU Cumulative Live Fix 8
 on:
   push:
     branches: [repair/fumagic-runtime-init-smoke-20260906]
@@ -12,21 +12,21 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: fumagic-842e2b-cumulative-live-fix
+          name: fumagic-842e2b-cumulative-live-fix-v8
           path: repaired
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
-          run-id: 34016525176
-      - name: Verify exact cumulative v7 executable
+          run-id: 34017583495
+      - name: Verify exact cumulative v8 executable
         shell: pwsh
         run: |
           $exe = Resolve-Path 'repaired/輔魔.exe'
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
-          if ($hash -ne 'f6d778d08a3d378551f2a4086e7e3ddf82ed68eb769c75b61c5f1868040ebf61') { throw "SHA mismatch: $hash" }
+          if ($hash -ne 'e63978739d1680d40170a5bf15d8a353144d4e9dca9ca7f5105b86110fb1a607') { throw "SHA mismatch: $hash" }
           $size = (Get-Item -LiteralPath $exe).Length
-          if ($size -ne 116521332) { throw "Size mismatch: $size" }
-          Write-Host "CUMULATIVE_V7_EXE_VERIFIED sha256=$hash size=$size"
-      - name: Launch exact cumulative v7 executable
+          if ($size -ne 116523548) { throw "Size mismatch: $size" }
+          Write-Host "CUMULATIVE_V8_EXE_VERIFIED sha256=$hash size=$size"
+      - name: Launch exact cumulative v8 executable
         shell: pwsh
         run: |
           $exe = Resolve-Path 'repaired/輔魔.exe'
@@ -35,5 +35,5 @@ jobs:
           $live = @(Get-Process -Name '輔魔' -ErrorAction SilentlyContinue)
           if ($live.Count -lt 1) { throw 'No live 輔魔 process after 12 seconds.' }
           Write-Host ('SMOKE_PROCESS_ALIVE pids=' + (($live | ForEach-Object Id) -join ','))
-          Write-Host 'SMOKE_CUMULATIVE_V7_PASS'
+          Write-Host 'SMOKE_CUMULATIVE_V8_PASS'
           $live | Stop-Process -Force -ErrorAction SilentlyContinue
