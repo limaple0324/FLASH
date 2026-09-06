@@ -26,4 +26,8 @@ if text.count(test_anchor) != 1:
 text = text.replace(test_anchor, test_case + test_anchor, 1)
 TEST.write_text(text, encoding="utf-8", newline="\n")
 
-print("LIVE_FIX_APPLIED embedded recognition runtime initialization")
+arena_patch = Path(".packaging/live_fix_arena_flight_wait_20260906.py")
+if not arena_patch.is_file():
+    raise SystemExit("missing arena/no-flight live repair script")
+exec(compile(arena_patch.read_text(encoding="utf-8"), str(arena_patch), "exec"), {})
+print("LIVE_FIX_APPLIED embedded recognition runtime initialization + arena/no-flight wait")
