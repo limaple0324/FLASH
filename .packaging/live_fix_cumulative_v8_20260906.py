@@ -9,6 +9,7 @@ PATCHES = (
     Path('.packaging/live_fix_identityless_sync_lifecycle_v11_20260906.py'),
     Path('.packaging/live_fix_identityless_new_launch_v12_20260907.py'),
     Path('.packaging/live_fix_v12_regression_attach_20260907.py'),
+    Path('.packaging/live_fix_identityless_actual_identity_v13_20260907.py'),
 )
 
 for patch in PATCHES:
@@ -16,4 +17,4 @@ for patch in PATCHES:
         raise SystemExit(f'missing cumulative repair script: {patch}')
     exec(compile(patch.read_text(encoding='utf-8'), str(patch), 'exec'), {})
 
-print('LIVE_FIX_CUMULATIVE_V12_APPLIED v11 + identityless windows launched by Fu become managed; UI unchanged')
+print('LIVE_FIX_CUMULATIVE_V13_APPLIED v12 + identityless launch/reattach actual process identity; UI unchanged')
