@@ -8,6 +8,7 @@ PATCHES = (
     Path('.packaging/live_fix_identityless_reattach_helper_20260906.py'),
     Path('.packaging/live_fix_identityless_sync_lifecycle_v11_20260906.py'),
     Path('.packaging/live_fix_identityless_new_launch_v12_20260907.py'),
+    Path('.packaging/live_fix_v12_regression_attach_20260907.py'),
 )
 
 for patch in PATCHES:
