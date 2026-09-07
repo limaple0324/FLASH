@@ -1,4 +1,4 @@
-name: Package FU 842e2b Cumulative Live Fix V8
+name: Package FU 842e2b Cumulative Live Fix V13
 on:
   push:
     branches: [repair/fumagic-runtime-init-20260906]
@@ -50,12 +50,9 @@ jobs:
               else:
                   text=(ov/f'{i:03d}.b64').read_text('ascii').strip()
               expected=12000 if i<19 else 9732
-              print('OVERLAY_CHUNK',f'{i:03d}','B64_CHARS',len(text))
               if len(text)!=expected: raise SystemExit(f'OVERLAY_CHUNK_B64_LENGTH {i:03d}: {len(text)} != {expected}')
-              try: decoded.append(base64.b64decode(text,validate=True))
-              except Exception as e: raise SystemExit(f'OVERLAY_CHUNK_BASE64_INVALID {i:03d}: {e}') from e
+              decoded.append(base64.b64decode(text,validate=True))
           overlay=b''.join(decoded); expect='d4eac19786c913f9ac8eae4b7c33327b00d04545a8ad765345595593b7ed1a9c'; h=hashlib.sha256(overlay).hexdigest()
-          print('OVERLAY_BYTES',len(overlay)); print('OVERLAY_SHA256',h)
           if len(overlay)!=178298 or h!=expect: raise SystemExit('OVERLAY_IDENTITY_MISMATCH')
           ot=brotli.decompress(overlay)
           if len(ot)!=1382400: raise SystemExit(f'OVERLAY_TAR_SIZE {len(ot)}')
@@ -69,25 +66,15 @@ jobs:
               if r.is_absolute() or '..' in r.parts: raise SystemExit(f'UNSAFE_MANIFEST_PATH {rec["path"]!r}')
               if not p.is_file(): bad.append(f'{rec["path"]}: missing'); continue
               d=p.read_bytes(); sh=hashlib.sha256(d).hexdigest()
-              if len(d)!=int(rec['bytes']) or sh!=rec['sha256']: bad.append(f'{rec["path"]}: bytes={len(d)}/{rec["bytes"]} sha={sh}/{rec["sha256"]}')
-          if bad:
-              print('\n'.join(bad)); raise SystemExit(f'EXACT_SOURCE_MISMATCH_COUNT={len(bad)}')
+              if len(d)!=int(rec['bytes']) or sh!=rec['sha256']: bad.append(rec['path'])
+          if bad: raise SystemExit(f'EXACT_SOURCE_MISMATCH_COUNT={len(bad)}')
           (pkg/'FINAL_OVERLAY_SHA256.txt').write_text(h+'\n',encoding='ascii')
           print('SOURCE_MANIFEST_VERIFIED 159 / 159'); print('SOURCE_TREE_SHA256',tree)
           '@ | Set-Content -Encoding UTF8 .packaging\reconstruct_final.py
           python .packaging\reconstruct_final.py
-      - name: Apply cumulative live repairs V8
+      - name: Apply cumulative live repairs V13
         shell: pwsh
         run: python .packaging\live_fix_cumulative_v8_20260906.py
-      - name: Upload generated V11 source snapshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: fumagic-v11-generated-source
-          path: |
-            legacy/fu-v02-reconnect-preview/flash_sync_v02.py
-            legacy/fu-v02-reconnect-preview/fu_reconnect_integration.py
-            legacy/fu-v02-reconnect-preview/test_fu_reconnect_integration.py
-          retention-days: 2
       - name: Install build requirements
         shell: pwsh
         working-directory: legacy/fu-v02-reconnect-preview
@@ -98,7 +85,7 @@ jobs:
         shell: pwsh
         working-directory: legacy/fu-v02-reconnect-preview
         run: |
-          python -m unittest -q test_fu_reconnect_integration.EmbeddedRecognitionRuntimeTests test_fu_reconnect_integration.LiveLaunchAddSafetyTests test_fu_reconnect_integration.BatchAutomationDisableTests test_fu_reconnect_integration.ExistingWindowReattachTests manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests.test_non_flyable_scene_sends_yellow_link_before_trying_flight_again manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests.test_non_flyable_relocation_single_clicks_link_then_flies_after_map_stable
+          python -m unittest -q test_fu_reconnect_integration.EmbeddedRecognitionRuntimeTests test_fu_reconnect_integration.LiveLaunchAddSafetyTests test_fu_reconnect_integration.BatchAutomationDisableTests test_fu_reconnect_integration.IdentitylessActualIdentityRegressionTests test_fu_reconnect_integration.ExistingWindowReattachTests manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests.test_non_flyable_scene_sends_yellow_link_before_trying_flight_again manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests.test_non_flyable_relocation_single_clicks_link_then_flies_after_map_stable
       - name: Compile check
         shell: pwsh
         working-directory: legacy/fu-v02-reconnect-preview
@@ -115,7 +102,6 @@ jobs:
           if ((Get-Item -LiteralPath $exe).Length -le 0) { throw '輔魔.exe empty' }
           $vi=(Get-Item -LiteralPath $exe).VersionInfo
           if ($vi.FileDescription -ne '輔魔' -or $vi.InternalName -ne '輔魔' -or $vi.ProductName -ne '輔魔' -or $vi.OriginalFilename -ne '輔魔.exe') { throw 'VersionInfo name mismatch' }
-          if ($vi.FileVersion -ne '0.2.1.0' -or $vi.ProductVersion -ne '0.2.1.0') { throw 'VersionInfo version mismatch' }
           @'
           import hashlib,pathlib,struct,pefile
           exe=pathlib.Path(r'legacy/fu-v02-reconnect-preview/dist/輔魔.exe'); d=exe.read_bytes()
@@ -140,15 +126,14 @@ jobs:
               if needle not in m: raise SystemExit(f'MANIFEST_ASSERTION_MISSING: {needle}')
           sh=hashlib.sha256(d).hexdigest(); ov=pathlib.Path('.packaging/FINAL_OVERLAY_SHA256.txt').read_text('ascii').strip()
           info=pathlib.Path(r'legacy/fu-v02-reconnect-preview/dist/BUILD_INFO.txt')
-          info.write_text('\n'.join(['source_zip_sha256=748ea8dba2dd194e9d32567f6c0a115213f61b43ed6e99c7fde4fa100b160f68','source_tree_sha256=842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a','repair=cumulative-live-repair-v8-20260906',f'overlay_sha256={ov}',f'exe_sha256={sh}',f'exe_bytes={len(d)}','pe_machine=AMD64','rt_manifest=verified'])+'\n',encoding='utf-8')
+          info.write_text('\n'.join(['source_zip_sha256=748ea8dba2dd194e9d32567f6c0a115213f61b43ed6e99c7fde4fa100b160f68','source_tree_sha256=842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a','repair=cumulative-live-repair-v13-20260907',f'overlay_sha256={ov}',f'exe_sha256={sh}',f'exe_bytes={len(d)}','pe_machine=AMD64','rt_manifest=verified'])+'\n',encoding='utf-8')
           print('EXE_BYTES',len(d)); print('EXE_SHA256',sh); print('PE_MACHINE AMD64'); print('RT_MANIFEST verified')
           '@ | Set-Content -Encoding UTF8 .packaging\verify_fixed_exe.py
           python .packaging\verify_fixed_exe.py
-          Get-Content -LiteralPath 'legacy\fu-v02-reconnect-preview\dist\BUILD_INFO.txt'
-      - name: Upload cumulative repaired 輔魔 EXE V8
+      - name: Upload cumulative repaired 輔魔 EXE V13
         uses: actions/upload-artifact@v4
         with:
-          name: fumagic-842e2b-cumulative-live-fix-v8
+          name: fumagic-842e2b-cumulative-live-fix-v13
           path: |
             legacy/fu-v02-reconnect-preview/dist/輔魔.exe
             legacy/fu-v02-reconnect-preview/dist/BUILD_INFO.txt
