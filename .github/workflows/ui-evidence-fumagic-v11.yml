@@ -1,4 +1,4 @@
-name: UI Evidence FU Cumulative Live Fix 11
+name: UI Evidence FU Cumulative Live Fix 15
 on:
   push:
     branches: [repair/fumagic-ui-v11-20260906]
@@ -12,29 +12,29 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: fumagic-842e2b-cumulative-live-fix-v8
+          name: fumagic-842e2b-cumulative-live-fix-v15
           path: repaired
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
-          run-id: 34030780303
+          run-id: 34129290304
       - name: Install capture dependency
         shell: pwsh
         run: python -m pip install pillow pywin32
-      - name: Launch and capture visible UI
+      - name: Launch and capture exact V15 visible UI
         shell: pwsh
         env:
           PYTHONIOENCODING: utf-8
         run: |
           $exe = Resolve-Path 'repaired/輔魔.exe'
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
-          if ($hash -ne 'b3195b551b022359e8cca8b456e2fd5872342a3ed8cd80fe2f87298e179e7bcb') { throw "SHA mismatch: $hash" }
+          if ($hash -ne '0859ca5eceb73ec285225a3f31da620f1cb3c6a1609b99d2e5c79e3e71d38dcb') { throw "SHA mismatch: $hash" }
           Start-Process -FilePath $exe | Out-Null
           Start-Sleep -Seconds 5
           @'
-          import ctypes, os, subprocess
+          import ctypes, json, os, subprocess
           from PIL import Image
           import win32gui, win32ui, win32process
-          out='ui-v11'; os.makedirs(out, exist_ok=True)
+          out='ui-v15'; os.makedirs(out, exist_ok=True)
           ps=subprocess.check_output(['powershell','-NoProfile','-Command',"(Get-Process -Name '輔魔' -ErrorAction SilentlyContinue).Id -join ','"], text=True).strip()
           pids={int(x) for x in ps.split(',') if x.strip().isdigit()}; rows=[]
           def enum(hwnd, _):
@@ -44,17 +44,21 @@ jobs:
               title=win32gui.GetWindowText(hwnd); l,t,r,b=win32gui.GetWindowRect(hwnd); w=r-l; h=b-t
               if w>=40 and h>=20: rows.append((w*h,hwnd,pid,title,(l,t,r,b)))
           win32gui.EnumWindows(enum,None); rows.sort(reverse=True)
+          evidence=[]
           for i,(_,hwnd,pid,title,rect) in enumerate(rows,1):
               l,t,r,b=rect; w=r-l; h=b-t; dc=win32gui.GetWindowDC(hwnd); src=win32ui.CreateDCFromHandle(dc); mem=src.CreateCompatibleDC(); bmp=win32ui.CreateBitmap(); bmp.CreateCompatibleBitmap(src,w,h); mem.SelectObject(bmp)
               ok=ctypes.windll.user32.PrintWindow(hwnd,mem.GetSafeHdc(),2); info=bmp.GetInfo(); bits=bmp.GetBitmapBits(True); img=Image.frombuffer('RGB',(info['bmWidth'],info['bmHeight']),bits,'raw','BGRX',0,1); path=os.path.join(out,f'window-{i:02d}.png'); img.save(path)
               win32gui.DeleteObject(bmp.GetHandle()); mem.DeleteDC(); src.DeleteDC(); win32gui.ReleaseDC(hwnd,dc)
-          if not rows: raise SystemExit('No visible FU windows')
-          print('CAPTURED', len(rows))
+              evidence.append({'index':i,'pid':pid,'hwnd':hwnd,'title':title,'rect':rect,'capture':bool(ok),'file':path})
+          open(os.path.join(out,'windows.json'),'w',encoding='utf-8').write(json.dumps(evidence,ensure_ascii=False,indent=2))
+          print('VISIBLE_FU_WINDOWS',len(rows))
+          if len(rows) != 3:
+              raise SystemExit(f'Expected exactly main + sync/status + quick-code windows, got {len(rows)}')
           '@ | Set-Content -Encoding UTF8 capture.py
           python capture.py
           Get-Process -Name '輔魔' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
       - uses: actions/upload-artifact@v4
         with:
-          name: fumagic-v11-ui-evidence
-          path: ui-v11/*.png
+          name: fumagic-v15-ui-evidence
+          path: ui-v15/*
           retention-days: 7
