@@ -79,6 +79,15 @@ jobs:
       - name: Apply cumulative live repairs V8
         shell: pwsh
         run: python .packaging\live_fix_cumulative_v8_20260906.py
+      - name: Upload generated V11 source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: fumagic-v11-generated-source
+          path: |
+            legacy/fu-v02-reconnect-preview/flash_sync_v02.py
+            legacy/fu-v02-reconnect-preview/fu_reconnect_integration.py
+            legacy/fu-v02-reconnect-preview/test_fu_reconnect_integration.py
+          retention-days: 2
       - name: Install build requirements
         shell: pwsh
         working-directory: legacy/fu-v02-reconnect-preview
