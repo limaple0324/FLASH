@@ -1,0 +1,37 @@
+name: Single Instance Evidence FU V15
+on:
+  push:
+    branches: [repair/fumagic-ui-v11-20260906]
+permissions:
+  actions: read
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fumagic-842e2b-cumulative-live-fix-v15
+          path: repaired
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 34129290304
+      - name: Verify second launch cannot create second FU process
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'repaired/輔魔.exe'
+          $first = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 5
+          if ($first.HasExited) { throw "first FU exited unexpectedly: $($first.ExitCode)" }
+          $before = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe.Path })
+          if ($before.Count -ne 1) { throw "expected exactly one FU before second launch, got $($before.Count)" }
+          $second = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 3
+          $second.Refresh()
+          if (-not $second.HasExited) { throw "second FU instance stayed alive pid=$($second.Id)" }
+          $after = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe.Path })
+          if ($after.Count -ne 1) { throw "expected exactly one FU after second launch, got $($after.Count)" }
+          if ($after[0].Id -ne $first.Id) { throw "original FU pid changed unexpectedly" }
+          Write-Host "SINGLE_INSTANCE_VERIFIED first_pid=$($first.Id) second_pid=$($second.Id) second_exit=$($second.ExitCode) live_count=$($after.Count)"
+          Stop-Process -Id $first.Id -Force -ErrorAction SilentlyContinue
