@@ -1,4 +1,4 @@
-name: Package FU 842e2b Cumulative Live Fix V15
+name: Package FU 842e2b Cumulative Live Fix V16
 on:
   push:
     branches: [repair/fumagic-runtime-init-20260906]
@@ -72,7 +72,7 @@ jobs:
           print('SOURCE_MANIFEST_VERIFIED 159 / 159'); print('SOURCE_TREE_SHA256',tree)
           '@ | Set-Content -Encoding UTF8 .packaging\reconstruct_final.py
           python .packaging\reconstruct_final.py
-      - name: Apply cumulative live repairs V15
+      - name: Apply cumulative live repairs V16
         shell: pwsh
         run: python .packaging\live_fix_cumulative_v8_20260906.py
       - name: Install build requirements
@@ -85,7 +85,7 @@ jobs:
         shell: pwsh
         working-directory: legacy/fu-v02-reconnect-preview
         run: |
-          python -m unittest -q test_fu_reconnect_integration.EmbeddedRecognitionRuntimeTests test_fu_reconnect_integration.LiveLaunchAddSafetyTests test_fu_reconnect_integration.BatchAutomationDisableTests test_fu_reconnect_integration.IdentitylessActualIdentityRegressionTests test_fu_reconnect_integration.LaunchPositionRestoreRegressionTests test_fu_reconnect_integration.RemovedTimeDisplayRegressionTests test_fu_reconnect_integration.ExistingWindowReattachTests manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests.test_non_flyable_scene_sends_yellow_link_before_trying_flight_again manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests.test_non_flyable_relocation_single_clicks_link_then_flies_after_map_stable
+          python -m unittest -q test_fu_reconnect_integration.EmbeddedRecognitionRuntimeTests test_fu_reconnect_integration.LiveLaunchAddSafetyTests test_fu_reconnect_integration.BatchAutomationDisableTests test_fu_reconnect_integration.IdentitylessActualIdentityRegressionTests test_fu_reconnect_integration.LaunchPositionRestoreRegressionTests test_fu_reconnect_integration.RemovedTimeDisplayRegressionTests test_fu_reconnect_integration.SingleInstanceVersionGuardRegressionTests test_fu_reconnect_integration.ExistingWindowReattachTests manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests.test_non_flyable_scene_sends_yellow_link_before_trying_flight_again manor_tests.test_fishing_background_resume.FishingBackgroundResumeTests.test_non_flyable_relocation_single_clicks_link_then_flies_after_map_stable
       - name: Compile check
         shell: pwsh
         working-directory: legacy/fu-v02-reconnect-preview
@@ -126,14 +126,14 @@ jobs:
               if needle not in m: raise SystemExit(f'MANIFEST_ASSERTION_MISSING: {needle}')
           sh=hashlib.sha256(d).hexdigest(); ov=pathlib.Path('.packaging/FINAL_OVERLAY_SHA256.txt').read_text('ascii').strip()
           info=pathlib.Path(r'legacy/fu-v02-reconnect-preview/dist/BUILD_INFO.txt')
-          info.write_text('\n'.join(['source_zip_sha256=748ea8dba2dd194e9d32567f6c0a115213f61b43ed6e99c7fde4fa100b160f68','source_tree_sha256=842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a','repair=cumulative-live-repair-v15-20260907',f'overlay_sha256={ov}',f'exe_sha256={sh}',f'exe_bytes={len(d)}','pe_machine=AMD64','rt_manifest=verified'])+'\n',encoding='utf-8')
+          info.write_text('\n'.join(['source_zip_sha256=748ea8dba2dd194e9d32567f6c0a115213f61b43ed6e99c7fde4fa100b160f68','source_tree_sha256=842e2b0021d8c374976b01ff81157a4992394c86c94eca8f668a2aab380e290a','repair=cumulative-live-repair-v16-20260908',f'overlay_sha256={ov}',f'exe_sha256={sh}',f'exe_bytes={len(d)}','pe_machine=AMD64','rt_manifest=verified'])+'\n',encoding='utf-8')
           print('EXE_BYTES',len(d)); print('EXE_SHA256',sh); print('PE_MACHINE AMD64'); print('RT_MANIFEST verified')
           '@ | Set-Content -Encoding UTF8 .packaging\verify_fixed_exe.py
           python .packaging\verify_fixed_exe.py
-      - name: Upload cumulative repaired 輔魔 EXE V15
+      - name: Upload cumulative repaired 輔魔 EXE V16
         uses: actions/upload-artifact@v4
         with:
-          name: fumagic-842e2b-cumulative-live-fix-v15
+          name: fumagic-842e2b-cumulative-live-fix-v16
           path: |
             legacy/fu-v02-reconnect-preview/dist/輔魔.exe
             legacy/fu-v02-reconnect-preview/dist/BUILD_INFO.txt
