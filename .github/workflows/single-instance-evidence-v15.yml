@@ -17,7 +17,7 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: 34129290304
-      - name: Verify second launch cannot create second FU process
+      - name: Verify second launch cannot create another FU application instance
         shell: pwsh
         run: |
           $exe = Resolve-Path 'repaired/輔魔.exe'
@@ -25,13 +25,15 @@ jobs:
           Start-Sleep -Seconds 5
           if ($first.HasExited) { throw "first FU exited unexpectedly: $($first.ExitCode)" }
           $before = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe.Path })
-          if ($before.Count -ne 1) { throw "expected exactly one FU before second launch, got $($before.Count)" }
+          if ($before.Count -lt 1) { throw "no FU process found before second launch" }
+          $beforeIds = @($before | ForEach-Object Id | Sort-Object)
           $second = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 3
           $second.Refresh()
-          if (-not $second.HasExited) { throw "second FU instance stayed alive pid=$($second.Id)" }
+          if (-not $second.HasExited) { throw "second launcher stayed alive pid=$($second.Id)" }
           $after = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe.Path })
-          if ($after.Count -ne 1) { throw "expected exactly one FU after second launch, got $($after.Count)" }
-          if ($after[0].Id -ne $first.Id) { throw "original FU pid changed unexpectedly" }
-          Write-Host "SINGLE_INSTANCE_VERIFIED first_pid=$($first.Id) second_pid=$($second.Id) second_exit=$($second.ExitCode) live_count=$($after.Count)"
-          Stop-Process -Id $first.Id -Force -ErrorAction SilentlyContinue
+          $afterIds = @($after | ForEach-Object Id | Sort-Object)
+          if ($after.Count -ne $before.Count) { throw "FU process count changed after second launch: before=$($before.Count) after=$($after.Count) beforeIds=$($beforeIds -join ',') afterIds=$($afterIds -join ',')" }
+          if (($afterIds -join ',') -ne ($beforeIds -join ',')) { throw "original FU process set changed after second launch: beforeIds=$($beforeIds -join ',') afterIds=$($afterIds -join ',')" }
+          Write-Host "SINGLE_INSTANCE_VERIFIED pyinstaller_processes=$($before.Count) first_pid=$($first.Id) second_pid=$($second.Id) second_exit=$($second.ExitCode) stable_ids=$($afterIds -join ',')"
+          $after | Stop-Process -Force -ErrorAction SilentlyContinue
