@@ -58,10 +58,19 @@ jobs:
               return rows
 
           def main_hwnds():
-              return {h for h,t in windows() if t.startswith('輔魔 - ')}
+              return {h for h,t in windows() if t == '輔魔' or t.startswith('輔魔 - ')}
 
           def dialog_hwnds():
               return {h for h,t in windows() if t == '輔魔版本切換'}
+
+          def wait_for_one_main(timeout=18):
+              end=time.time()+timeout
+              while time.time() < end:
+                  found=main_hwnds()
+                  if len(found) == 1:
+                      return found
+                  time.sleep(0.5)
+              return main_hwnds()
 
           def kill_all():
               subprocess.run(['powershell','-NoProfile','-Command',"Get-Process -Name '輔魔' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"], check=False)
@@ -69,34 +78,30 @@ jobs:
 
           kill_all()
 
-          # Cross-version: V16 must not silently look like it started. It should
-          # keep the old GUI as the sole main instance and show an explicit warning.
-          p_old=subprocess.Popen([old]); time.sleep(6)
-          old_main=main_hwnds()
+          p_old=subprocess.Popen([old])
+          old_main=wait_for_one_main()
           if len(old_main) != 1:
-              raise SystemExit(f'expected one V15 main window, got {old_main}')
+              raise SystemExit(f'expected one V15 main window, got {old_main}; windows={windows()}')
           p_new=subprocess.Popen([new]); time.sleep(7)
           dialogs=dialog_hwnds(); mains=main_hwnds()
           if len(dialogs) != 1:
               raise SystemExit(f'expected one cross-version warning, got {dialogs}; windows={windows()}')
           if mains != old_main:
-              raise SystemExit(f'cross-version launch changed main instance: before={old_main} after={mains}')
+              raise SystemExit(f'cross-version launch changed main instance: before={old_main} after={mains}; windows={windows()}')
           for h in dialogs:
               user32.PostMessageW(wintypes.HWND(h), WM_CLOSE, 0, 0)
           time.sleep(3)
           print('CROSS_VERSION_GUARD_VERIFIED main_hwnd', next(iter(old_main)))
           kill_all()
 
-          # Same V16: a second click must only reactivate the existing instance,
-          # with no extra main GUI and no version-switch warning.
-          p1=subprocess.Popen([new]); time.sleep(6)
-          first=main_hwnds()
+          p1=subprocess.Popen([new])
+          first=wait_for_one_main()
           if len(first) != 1:
-              raise SystemExit(f'expected one V16 main window, got {first}')
+              raise SystemExit(f'expected one V16 main window, got {first}; windows={windows()}')
           p2=subprocess.Popen([new]); time.sleep(7)
           second=main_hwnds(); dialogs=dialog_hwnds()
           if second != first:
-              raise SystemExit(f'same-version duplicate changed main instance: before={first} after={second}')
+              raise SystemExit(f'same-version duplicate changed main instance: before={first} after={second}; windows={windows()}')
           if dialogs:
               raise SystemExit(f'same-version duplicate incorrectly showed version warning: {dialogs}')
           print('SAME_VERSION_SINGLETON_VERIFIED main_hwnd', next(iter(first)))
