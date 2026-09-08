@@ -1,4 +1,4 @@
-name: Single Instance Evidence FU V16
+name: Single Instance Evidence FU V17
 on:
   push:
     branches: [repair/fumagic-ui-v11-20260906]
@@ -19,12 +19,12 @@ jobs:
           run-id: 34129290304
       - uses: actions/download-artifact@v4
         with:
-          name: fumagic-842e2b-cumulative-live-fix-v16
+          name: fumagic-842e2b-cumulative-live-fix-v17
           path: new
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
-          run-id: 34184381693
-      - name: Verify same-version singleton and cross-version warning
+          run-id: 34184984731
+      - name: Verify hard singleton and cross-version warning
         shell: pwsh
         env:
           PYTHONIOENCODING: utf-8
@@ -58,7 +58,7 @@ jobs:
               return rows
 
           def main_hwnds():
-              return {h for h,t in windows() if t == '輔魔' or t.startswith('輔魔 - ')}
+              return {h for h,t in windows() if t.startswith('輔魔 - ')}
 
           def dialog_hwnds():
               return {h for h,t in windows() if t == '輔魔版本切換'}
@@ -78,33 +78,37 @@ jobs:
 
           kill_all()
 
-          p_old=subprocess.Popen([old])
+          # V15 is an older build without the new file lock. V17 must still see
+          # its hidden/main Tk window before constructing a second application UI.
+          subprocess.Popen([old])
           old_main=wait_for_one_main()
           if len(old_main) != 1:
               raise SystemExit(f'expected one V15 main window, got {old_main}; windows={windows()}')
-          p_new=subprocess.Popen([new]); time.sleep(7)
+          subprocess.Popen([new]); time.sleep(7)
           dialogs=dialog_hwnds(); mains=main_hwnds()
           if len(dialogs) != 1:
               raise SystemExit(f'expected one cross-version warning, got {dialogs}; windows={windows()}')
           if mains != old_main:
-              raise SystemExit(f'cross-version launch changed main instance: before={old_main} after={mains}; windows={windows()}')
+              raise SystemExit(f'V17 created a second main UI beside V15: before={old_main} after={mains}; windows={windows()}')
           for h in dialogs:
               user32.PostMessageW(wintypes.HWND(h), WM_CLOSE, 0, 0)
           time.sleep(3)
-          print('CROSS_VERSION_GUARD_VERIFIED main_hwnd', next(iter(old_main)))
+          print('LEGACY_CROSS_VERSION_BLOCK_VERIFIED main_hwnd', next(iter(old_main)))
           kill_all()
 
-          p1=subprocess.Popen([new])
+          # With V17 already running, the second V17 must fail the OS file lock
+          # before a second Tk application window is created.
+          subprocess.Popen([new])
           first=wait_for_one_main()
           if len(first) != 1:
-              raise SystemExit(f'expected one V16 main window, got {first}; windows={windows()}')
-          p2=subprocess.Popen([new]); time.sleep(7)
+              raise SystemExit(f'expected one V17 main window, got {first}; windows={windows()}')
+          subprocess.Popen([new]); time.sleep(7)
           second=main_hwnds(); dialogs=dialog_hwnds()
           if second != first:
-              raise SystemExit(f'same-version duplicate changed main instance: before={first} after={second}; windows={windows()}')
+              raise SystemExit(f'V17 duplicate created another main UI: before={first} after={second}; windows={windows()}')
           if dialogs:
               raise SystemExit(f'same-version duplicate incorrectly showed version warning: {dialogs}')
-          print('SAME_VERSION_SINGLETON_VERIFIED main_hwnd', next(iter(first)))
+          print('V17_FILELOCK_SINGLETON_VERIFIED main_hwnd', next(iter(first)))
           kill_all()
-          '@ | Set-Content -Encoding UTF8 verify_single_v16.py
-          python verify_single_v16.py
+          '@ | Set-Content -Encoding UTF8 verify_single_v17.py
+          python verify_single_v17.py
