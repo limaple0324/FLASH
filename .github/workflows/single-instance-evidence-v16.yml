@@ -1,4 +1,4 @@
-name: Single Instance Evidence FU V17
+name: Single Instance Evidence FU V18
 on:
   push:
     branches: [repair/fumagic-ui-v11-20260906]
@@ -23,7 +23,7 @@ jobs:
           path: new
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
-          run-id: 34184984731
+          run-id: 34185409281
       - name: Verify hard singleton and cross-version warning
         shell: pwsh
         env:
@@ -78,7 +78,7 @@ jobs:
 
           kill_all()
 
-          # V15 is an older build without the new file lock. V17 must still see
+          # V15 is an older build without the new file lock. V18 must still see
           # its hidden/main Tk window before constructing a second application UI.
           subprocess.Popen([old])
           old_main=wait_for_one_main()
@@ -89,26 +89,26 @@ jobs:
           if len(dialogs) != 1:
               raise SystemExit(f'expected one cross-version warning, got {dialogs}; windows={windows()}')
           if mains != old_main:
-              raise SystemExit(f'V17 created a second main UI beside V15: before={old_main} after={mains}; windows={windows()}')
+              raise SystemExit(f'V18 created a second main UI beside V15: before={old_main} after={mains}; windows={windows()}')
           for h in dialogs:
               user32.PostMessageW(wintypes.HWND(h), WM_CLOSE, 0, 0)
           time.sleep(3)
           print('LEGACY_CROSS_VERSION_BLOCK_VERIFIED main_hwnd', next(iter(old_main)))
           kill_all()
 
-          # With V17 already running, the second V17 must fail the OS file lock
+          # With V18 already running, the second V18 must fail the OS file lock
           # before a second Tk application window is created.
           subprocess.Popen([new])
           first=wait_for_one_main()
           if len(first) != 1:
-              raise SystemExit(f'expected one V17 main window, got {first}; windows={windows()}')
+              raise SystemExit(f'expected one V18 main window, got {first}; windows={windows()}')
           subprocess.Popen([new]); time.sleep(7)
           second=main_hwnds(); dialogs=dialog_hwnds()
           if second != first:
-              raise SystemExit(f'V17 duplicate created another main UI: before={first} after={second}; windows={windows()}')
+              raise SystemExit(f'V18 duplicate created another main UI: before={first} after={second}; windows={windows()}')
           if dialogs:
               raise SystemExit(f'same-version duplicate incorrectly showed version warning: {dialogs}')
-          print('V17_FILELOCK_SINGLETON_VERIFIED main_hwnd', next(iter(first)))
+          print('V18_FILELOCK_SINGLETON_VERIFIED main_hwnd', next(iter(first)))
           kill_all()
-          '@ | Set-Content -Encoding UTF8 verify_single_v17.py
-          python verify_single_v17.py
+          '@ | Set-Content -Encoding UTF8 verify_single_v18.py
+          python verify_single_v18.py
