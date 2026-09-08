@@ -14,6 +14,7 @@ PATCHES = (
     Path('.packaging/live_fix_remove_clock_bar_v15_20260907.py'),
     Path('.packaging/live_fix_single_instance_version_guard_v16_20260908.py'),
     Path('.packaging/live_fix_single_instance_filelock_v17_20260908.py'),
+    Path('.packaging/live_fix_single_instance_legacy_window_v18_20260908.py'),
 )
 
 for patch in PATCHES:
@@ -21,4 +22,4 @@ for patch in PATCHES:
         raise SystemExit(f'missing cumulative repair script: {patch}')
     exec(compile(patch.read_text(encoding='utf-8'), str(patch), 'exec'), {})
 
-print('LIVE_FIX_CUMULATIVE_V17_APPLIED v16 + robust OS file-lock singleton and legacy hidden-window guard')
+print('LIVE_FIX_CUMULATIVE_V18_APPLIED v17 + legacy window detection independent of process path')
