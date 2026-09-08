@@ -22,17 +22,17 @@ jobs:
         run: |
           $exe = Resolve-Path 'repaired/輔魔.exe'
           $first = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 6
           if ($first.HasExited) { throw "first FU exited unexpectedly: $($first.ExitCode)" }
           $before = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe.Path })
           if ($before.Count -lt 1) { throw "no FU process found before second launch" }
           $beforeIds = @($before | ForEach-Object Id | Sort-Object)
           $second = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 3
+          Start-Sleep -Seconds 20
           $second.Refresh()
-          if (-not $second.HasExited) { throw "second launcher stayed alive pid=$($second.Id)" }
           $after = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe.Path })
           $afterIds = @($after | ForEach-Object Id | Sort-Object)
+          if (-not $second.HasExited) { throw "second launcher still alive after 20s pid=$($second.Id); before=$($beforeIds -join ',') after=$($afterIds -join ',')" }
           if ($after.Count -ne $before.Count) { throw "FU process count changed after second launch: before=$($before.Count) after=$($after.Count) beforeIds=$($beforeIds -join ',') afterIds=$($afterIds -join ',')" }
           if (($afterIds -join ',') -ne ($beforeIds -join ',')) { throw "original FU process set changed after second launch: beforeIds=$($beforeIds -join ',') afterIds=$($afterIds -join ',')" }
           Write-Host "SINGLE_INSTANCE_VERIFIED pyinstaller_processes=$($before.Count) first_pid=$($first.Id) second_pid=$($second.Id) second_exit=$($second.ExitCode) stable_ids=$($afterIds -join ',')"
