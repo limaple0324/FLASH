@@ -1,0 +1,105 @@
+name: Single Instance Evidence FU V16
+on:
+  push:
+    branches: [repair/fumagic-ui-v11-20260906]
+permissions:
+  actions: read
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fumagic-842e2b-cumulative-live-fix-v15
+          path: old
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 34129290304
+      - uses: actions/download-artifact@v4
+        with:
+          name: fumagic-842e2b-cumulative-live-fix-v16
+          path: new
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 34184381693
+      - name: Verify same-version singleton and cross-version warning
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          @'
+          import ctypes, os, subprocess, time
+          from ctypes import wintypes
+
+          user32 = ctypes.windll.user32
+          EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+          user32.EnumWindows.argtypes = [EnumProc, wintypes.LPARAM]
+          user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+          user32.GetWindowTextLengthW.restype = ctypes.c_int
+          user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+          user32.GetWindowTextW.restype = ctypes.c_int
+          user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+          WM_CLOSE = 0x0010
+
+          old = os.path.abspath(r'old\輔魔.exe')
+          new = os.path.abspath(r'new\輔魔.exe')
+
+          def windows():
+              rows=[]
+              def cb(hwnd, _):
+                  n=user32.GetWindowTextLengthW(hwnd)
+                  if n <= 0: return True
+                  b=ctypes.create_unicode_buffer(n+1); user32.GetWindowTextW(hwnd,b,n+1)
+                  rows.append((int(hwnd),b.value))
+                  return True
+              user32.EnumWindows(EnumProc(cb),0)
+              return rows
+
+          def main_hwnds():
+              return {h for h,t in windows() if t.startswith('輔魔 - ')}
+
+          def dialog_hwnds():
+              return {h for h,t in windows() if t == '輔魔版本切換'}
+
+          def kill_all():
+              subprocess.run(['powershell','-NoProfile','-Command',"Get-Process -Name '輔魔' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"], check=False)
+              time.sleep(2)
+
+          kill_all()
+
+          # Cross-version: V16 must not silently look like it started. It should
+          # keep the old GUI as the sole main instance and show an explicit warning.
+          p_old=subprocess.Popen([old]); time.sleep(6)
+          old_main=main_hwnds()
+          if len(old_main) != 1:
+              raise SystemExit(f'expected one V15 main window, got {old_main}')
+          p_new=subprocess.Popen([new]); time.sleep(7)
+          dialogs=dialog_hwnds(); mains=main_hwnds()
+          if len(dialogs) != 1:
+              raise SystemExit(f'expected one cross-version warning, got {dialogs}; windows={windows()}')
+          if mains != old_main:
+              raise SystemExit(f'cross-version launch changed main instance: before={old_main} after={mains}')
+          for h in dialogs:
+              user32.PostMessageW(wintypes.HWND(h), WM_CLOSE, 0, 0)
+          time.sleep(3)
+          print('CROSS_VERSION_GUARD_VERIFIED main_hwnd', next(iter(old_main)))
+          kill_all()
+
+          # Same V16: a second click must only reactivate the existing instance,
+          # with no extra main GUI and no version-switch warning.
+          p1=subprocess.Popen([new]); time.sleep(6)
+          first=main_hwnds()
+          if len(first) != 1:
+              raise SystemExit(f'expected one V16 main window, got {first}')
+          p2=subprocess.Popen([new]); time.sleep(7)
+          second=main_hwnds(); dialogs=dialog_hwnds()
+          if second != first:
+              raise SystemExit(f'same-version duplicate changed main instance: before={first} after={second}')
+          if dialogs:
+              raise SystemExit(f'same-version duplicate incorrectly showed version warning: {dialogs}')
+          print('SAME_VERSION_SINGLETON_VERIFIED main_hwnd', next(iter(first)))
+          kill_all()
+          '@ | Set-Content -Encoding UTF8 verify_single_v16.py
+          python verify_single_v16.py
