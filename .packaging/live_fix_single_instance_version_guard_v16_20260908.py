@@ -1,0 +1,23 @@
+from pathlib import Path
+
+ROOT = Path('legacy/fu-v02-reconnect-preview')
+APP = ROOT / 'flash_sync_v02.py'
+TEST = ROOT / 'test_fu_reconnect_integration.py'
+
+app = APP.read_text(encoding='utf-8')
+old = '''def notify_existing_instance() -> None:\n    if not SINGLE_INSTANCE_RESTORE_MESSAGE:\n        return\n    for _ in range(3):\n        user32.PostMessageW(\n            wintypes.HWND(HWND_BROADCAST),\n            SINGLE_INSTANCE_RESTORE_MESSAGE,\n            0,\n            0,\n        )\n        time.sleep(0.08)\n'''
+new = '''def find_existing_fu_instance_path() -> str:\n    current_pid = os.getpid()\n    paths: list[str] = []\n\n    def callback(hwnd, _lparam):\n        try:\n            hwnd_value = int(hwnd)\n            if get_window_process_id(hwnd_value) == current_pid:\n                return True\n            title = get_window_title(hwnd_value).strip()\n            if not title.startswith(APP_DISPLAY_NAME):\n                return True\n            path = get_window_process_path(hwnd_value).strip()\n            if not path:\n                return True\n            filename = os.path.basename(path)\n            if APP_DISPLAY_NAME not in filename:\n                return True\n            paths.append(path)\n        except Exception:\n            pass\n        return True\n\n    try:\n        user32.EnumWindows(EnumWindowsProc(callback), 0)\n    except Exception:\n        return ''\n    return paths[0] if paths else ''\n\n\ndef notify_existing_instance() -> None:\n    existing_path = find_existing_fu_instance_path()\n    if SINGLE_INSTANCE_RESTORE_MESSAGE:\n        for _ in range(3):\n            user32.PostMessageW(\n                wintypes.HWND(HWND_BROADCAST),\n                SINGLE_INSTANCE_RESTORE_MESSAGE,\n                0,\n                0,\n            )\n            time.sleep(0.08)\n\n    # Same EXE: normal second click only restores the already-running instance.\n    # Different EXE path: make the version handoff explicit instead of silently\n    # making the user believe the newly-clicked build has started.\n    if existing_path:\n        try:\n            current_path = os.path.abspath(sys.executable)\n            if os.path.normcase(os.path.abspath(existing_path)) != os.path.normcase(current_path):\n                message_box = user32.MessageBoxW\n                message_box.argtypes = [\n                    wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT\n                ]\n                message_box.restype = ctypes.c_int\n                message_box(\n                    None,\n                    '偵測到另一個版本的輔魔仍在執行。\\n\\n'\n                    f'目前執行：{os.path.basename(existing_path)}\\n'\n                    f'你剛啟動：{os.path.basename(current_path)}\\n\\n'\n                    '為避免不同版本同時控制同一批 Flash，本次不啟動第二份；'\n                    '已把目前執行中的輔魔叫回前景。\\n'\n                    '若你正在換新版，請先用目前輔魔的齒輪選單「關閉輔魔」，再開新版。',\n                    '輔魔版本切換',\n                    0x00000030 | 0x00010000,\n                )\n        except Exception:\n            pass\n'''
+if app.count(old) != 1:
+    raise SystemExit(f'v16 notify-existing anchor count={app.count(old)}')
+app = app.replace(old, new, 1)
+APP.write_text(app, encoding='utf-8', newline='\n')
+
+text = TEST.read_text(encoding='utf-8')
+anchor = '''class ExistingWindowReattachTests(unittest.TestCase):\n'''
+case = '''class SingleInstanceVersionGuardRegressionTests(unittest.TestCase):\n    def test_duplicate_launch_keeps_single_instance_mutex_and_restore_contract(self):\n        source = Path(__file__).with_name("flash_sync_v02.py").read_text(encoding="utf-8")\n        self.assertIn("def acquire_single_instance_lock() -> bool:", source)\n        self.assertIn("if not acquire_single_instance_lock():", source)\n        self.assertIn("notify_existing_instance()", source)\n        self.assertIn("SINGLE_INSTANCE_RESTORE_MESSAGE", source)\n\n    def test_cross_version_duplicate_is_not_silent_anymore(self):\n        source = Path(__file__).with_name("flash_sync_v02.py").read_text(encoding="utf-8")\n        self.assertIn("def find_existing_fu_instance_path() -> str:", source)\n        self.assertIn("輔魔版本切換", source)\n        self.assertIn("另一個版本的輔魔仍在執行", source)\n        self.assertIn("os.path.normcase(os.path.abspath(existing_path))", source)\n        self.assertIn("os.path.abspath(sys.executable)", source)\n\n\n'''
+if text.count(anchor) != 1:
+    raise SystemExit(f'v16 regression anchor count={text.count(anchor)}')
+text = text.replace(anchor, case + anchor, 1)
+TEST.write_text(text, encoding='utf-8', newline='\n')
+
+print('LIVE_FIX_V16_APPLIED single-instance version guard only; product UI and automation unchanged')
